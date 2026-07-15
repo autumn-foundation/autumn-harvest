@@ -211,3 +211,83 @@ async fn worker_session_command_is_rejected_loudly_not_silently_dropped() {
         other => panic!("expected SqliteError::Unsupported, got {other:?}"),
     }
 }
+
+// ── FINDING B class audit: the RAW path honors the registered default_start_to_close ──
+//
+// Sibling of the `default_retry_policy` finding (`runtime.rs:331`). The tests above prove
+// the TYPED path (which carries `start_to_close_override` on the ScheduleActivity command
+// from `ActivityInfo::default_start_to_close`). The RAW `execute_activity_raw` path
+// carries NO override, so — like `default_retry_policy` — the declared
+// `default_start_to_close` was silently dropped: a raw call to an info-registered activity
+// lost its per-attempt budget. The worker now resolves it BY NAME from the registered
+// ActivitySpec at CLAIM time, so the raw path honors the budget too.
+
+// Calls the RAW dispatch path BY NAME — no start_to_close_override on the command.
+#[workflow]
+async fn raw_stc_wf(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    match ctx
+        .execute_activity_raw("raw_stc_act", json!(n), "default")
+        .await
+    {
+        Ok(_) => Ok("completed".to_string()),
+        Err(HarvestError::Timeout { .. }) => Ok("timed_out".to_string()),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+// The activity's `_info()` supplies a real `ActivityHandlerFn`; the test sets a tight
+// `default_start_to_close` on it below (no attribute duration-string dependency).
+#[activity]
+#[allow(clippy::unused_async)]
+async fn raw_stc_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+// RED pre-fix: the raw command carried no start_to_close_override and the registered spec
+// had no start_to_close field, so `task.start_to_close_ms == None` → the ~40ms body ran to
+// completion and recorded `ActivityCompleted`, ignoring the declared 1ms budget.
+#[tokio::test]
+async fn raw_path_honors_registered_default_start_to_close() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&raw_stc_wf_info());
+
+    // A tight per-attempt budget declared on the ActivityInfo (set directly to avoid a
+    // duration-string dependency). The INFO-based registration must persist it onto the
+    // spec so the RAW dispatch can fall back to it at claim time.
+    let mut info = raw_stc_act_info();
+    info.default_start_to_close = Some(Duration::from_millis(1));
+    rt.register_activity(&info, |input: serde_json::Value| {
+        // Real blocking sleep — the crate runs a synchronous body, and start-to-close is
+        // a REAL wall-clock budget (measured via Instant).
+        std::thread::sleep(Duration::from_millis(40));
+        Ok(input)
+    });
+
+    let exec = rt.start_workflow("raw_stc_wf", json!(7)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "timed_out"),
+        "a raw-path call to an info-registered activity must observe the registered \
+         start_to_close budget, got {state:?} (RED pre-fix: the budget was dropped and \
+         the body completed)"
+    );
+
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: autumn_harvest::TimeoutType::StartToClose,
+                ..
+            }
+        )),
+        "the raw path must record a terminal ActivityTimedOut {{ StartToClose }} \
+         (RED pre-fix: recorded ActivityCompleted):\n{history:?}"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        "an over-budget raw-path body must NOT record ActivityCompleted (RED pre-fix):\n{history:?}"
+    );
+}

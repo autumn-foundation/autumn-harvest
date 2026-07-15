@@ -467,6 +467,167 @@ async fn policy_non_retryable_error_class_is_not_retried() {
     );
 }
 
+// ── FINDING B (`runtime.rs:331`): the RAW path falls back to the registered
+//    ActivityInfo default_retry_policy (backoff + non_retryable_errors) ────────────
+//
+// The tests in the `FIX 2` sections above prove the TYPED `execute_activity` path (which
+// carries the resolved `RetryPolicy` on the `ScheduleActivity` command as
+// `retry_policy_override`). Finding B is the RAW path: a workflow that schedules an
+// info-registered activity BY NAME via `execute_activity_raw` — so the command carries
+// NO override (`task.retry_policy == None`). The registration path used to collapse the
+// declared `default_retry_policy` down to only `max_attempts`, so the raw path lost BOTH
+// the backoff timing AND the `non_retryable_errors` list. The Postgres dispatch path
+// falls back to the registered activity's FULL `default_retry_policy` when the command
+// carries no override; this backend must do the same, resolved at CLAIM time from the
+// registered `ActivitySpec` (mirroring `schedule_to_close`/`start_to_close`).
+
+// Carries a fixed 60s retry policy on its `_info()`. Scheduled below via the RAW path
+// (`execute_activity_raw`), so the command carries no override and the backoff must come
+// from the CLAIM-time fallback to the registered spec's `default_retry_policy`.
+#[activity(retry = RetryPolicy::fixed(3, Duration::from_secs(60)))]
+async fn raw_backoff_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+// Calls the RAW dispatch path BY NAME — no `retry_policy_override` on the command.
+#[workflow]
+async fn raw_backoff_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let out = ctx
+        .execute_activity_raw("raw_backoff_act", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out.as_i64().unwrap() * 2)
+}
+
+// RED pre-fix (`runtime.rs:331`): the registered spec collapsed `default_retry_policy`
+// to only `max_attempts`, and the raw command carried no override, so `task.retry_policy
+// == None` → the worker requeued IMMEDIATELY at `now` (no backoff). The run converged in
+// one drain pass (Completed) and the body ran twice with no wait, instead of blocking on
+// the registered 60s backoff after one failure.
+#[tokio::test]
+async fn raw_path_falls_back_to_registered_default_retry_policy_backoff() {
+    let (_dir, path) = temp_db();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body_calls = calls.clone();
+
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&raw_backoff_wf_info());
+    // INFO-based registration: the spec must carry the FULL `default_retry_policy`, so a
+    // raw (no-override) dispatch can fall back to it at claim time.
+    rt.register_activity(&raw_backoff_act_info(), move |input: serde_json::Value| {
+        // Fail attempt 1, succeed attempt 2 (like `flaky_wf`).
+        if body_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err("transient".to_string())
+        } else {
+            Ok(input)
+        }
+    });
+
+    let t0 = fixed_now();
+    let exec = rt.start_workflow("raw_backoff_wf", json!(21)).unwrap();
+
+    // Drive at t0: attempt 1 fails and MUST be requeued 60s out (the registered policy's
+    // backoff), so the run blocks on the backing-off activity — it does NOT converge, and
+    // the body ran exactly ONCE.
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingTimer),
+        "a raw-path call to an info-registered activity must honor the registered \
+         default_retry_policy backoff and block (WaitingTimer); got {state:?} \
+         (RED pre-fix: requeued immediately and the run converged)"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the body ran once, then backed off (RED pre-fix ran it repeatedly with no backoff)"
+    );
+
+    // The requeued task's run_at is ≈ t0 + 60s (60_000 ms), not t0.
+    let run_at = pending_task_run_at(&path, exec).expect("a pending backing-off task");
+    assert_eq!(
+        run_at,
+        t0.timestamp_millis() + 60_000,
+        "the registered fixed(3, 60s) policy must delay the raw-path requeue by 60s, \
+         not requeue at now"
+    );
+
+    // Past the backoff deadline the retry runs and the run completes (2 body calls).
+    let done = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .await
+        .unwrap();
+    assert!(
+        matches!(done, RunState::Completed(ref v) if v.as_i64() == Some(42)),
+        "past the backoff deadline the retry runs and the run completes; got {done:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "body ran exactly twice (fail, ok)"
+    );
+}
+
+// Policy `non_retryable_errors` on a legacy `Err(String)`, scheduled via the RAW path.
+fn raw_fatal_policy() -> RetryPolicy {
+    RetryPolicy {
+        non_retryable_errors: vec!["fatal".to_string()],
+        ..RetryPolicy::fixed(5, Duration::from_secs(1))
+    }
+}
+
+#[activity(retry = raw_fatal_policy())]
+async fn raw_nonret_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[workflow]
+async fn raw_nonret_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    match ctx
+        .execute_activity_raw("raw_nonret_act", json!(n), "default")
+        .await
+    {
+        Ok(_) => Ok(0),
+        Err(_) => Err("failed".to_string()),
+    }
+}
+
+// RED pre-fix (`runtime.rs:331`): the raw path carried no override, so `task.retry_policy
+// == None` and the registered policy's `non_retryable_errors` list was ignored → the body
+// was retried up to `max_attempts` (5) instead of failing terminally on the first attempt.
+#[tokio::test]
+async fn raw_path_honors_registered_policy_non_retryable_errors() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body_calls = calls.clone();
+
+    rt.register_workflow(&raw_nonret_wf_info());
+    // INFO-based registration carries the full policy (incl. `non_retryable_errors`).
+    rt.register_activity(&raw_nonret_act_info(), move |_input: serde_json::Value| {
+        body_calls.fetch_add(1, Ordering::SeqCst);
+        Err("fatal".to_string())
+    });
+
+    let exec = rt.start_workflow("raw_nonret_wf", json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(_)),
+        "run fails terminally; got {state:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a raw-path call to an info-registered activity must honor the registered policy's \
+         non_retryable_errors and run the body exactly ONCE (RED pre-fix retried to max_attempts)"
+    );
+    match only_activity_failed(&rt, exec) {
+        WorkflowEvent::ActivityFailed { attempt, .. } => {
+            assert_eq!(attempt, 1, "terminal after the first attempt");
+        }
+        other => panic!("expected ActivityFailed, got {other:?}"),
+    }
+}
+
 // ── FIX 3: pending signals consumed in ARRIVAL order, not insertion order ──────
 
 const ONE_HOUR: Duration = Duration::from_secs(3600);

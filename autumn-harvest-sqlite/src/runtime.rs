@@ -51,6 +51,38 @@ pub struct ActivitySpec {
     /// `HandlerRegistry`. `None` = no total deadline.
     #[allow(clippy::redundant_pub_crate)]
     pub(crate) schedule_to_close: Option<std::time::Duration>,
+    /// The activity's declared full default retry policy
+    /// (`#[activity(retry = …)]` → `ActivityInfo::default_retry_policy`). Populated
+    /// ONLY by the info-based [`register_activity`](SqliteRuntime::register_activity)
+    /// — the hand-made [`ActivitySpec::new`] path has no `ActivityInfo` and so is
+    /// always `None` (it carries only [`Self::max_attempts`]).
+    ///
+    /// The whole policy also reaches the worker per-dispatch via the command's
+    /// `retry_policy_override` — but ONLY on the TYPED `execute_activity` path. The
+    /// RAW `execute_activity_raw` path carries NO override (`task.retry_policy ==
+    /// None`), so — mirroring the Postgres dispatch fallback to the registered
+    /// activity's `default_retry_policy` — the worker resolves this registry entry
+    /// BY NAME at CLAIM time (Codex #1069 P2, `runtime.rs:331`), so a raw call to an
+    /// info-registered activity honors the WHOLE policy (backoff timing +
+    /// `non_retryable_errors`), not just [`Self::max_attempts`]. `None` = no declared
+    /// policy (raw-registered, or `#[activity]` with no `retry`).
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) default_retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
+    /// The activity's declared per-attempt start-to-close budget
+    /// (`#[activity(start_to_close = "…")]` → `ActivityInfo::default_start_to_close`,
+    /// issue #1069 P2). Populated ONLY by the info-based
+    /// [`register_activity`](SqliteRuntime::register_activity); the hand-made
+    /// [`ActivitySpec::new`] path leaves it `None`.
+    ///
+    /// Like [`Self::default_retry_policy`], it reaches the worker per-dispatch via the
+    /// command's `start_to_close_override` ONLY on the TYPED path. The RAW
+    /// `execute_activity_raw` path carries NO override, so the worker resolves this
+    /// registry entry BY NAME at CLAIM time (Codex #1069 P2 class audit, sibling of
+    /// `runtime.rs:331`) — otherwise a raw call to an info-registered activity would
+    /// silently lose its declared start-to-close budget. `None` = no per-attempt
+    /// budget (unbounded).
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) start_to_close: Option<std::time::Duration>,
 }
 
 impl ActivitySpec {
@@ -72,6 +104,8 @@ impl ActivitySpec {
             body: Box::new(body),
             max_attempts: max_attempts.max(1),
             schedule_to_close: None,
+            default_retry_policy: None,
+            start_to_close: None,
         }
     }
 }
@@ -281,11 +315,14 @@ impl SqliteRuntime {
     /// - **HONORED**: `default_schedule_to_close` (issue #378 — the total,
     ///   cross-retry wall-clock deadline; persisted onto each dispatched task and
     ///   enforced as a terminal `ActivityTimedOut { ScheduleToClose }`),
-    ///   `default_retry_policy` (its `max_attempts` becomes the registered fallback
-    ///   attempt cap; the *whole* policy also reaches the worker via the command's
-    ///   `retry_policy_override`), `default_start_to_close` (honored via the
-    ///   command's `start_to_close_override`), and `default_queue`
-    ///   (recorded; single-writer routing is a no-op).
+    ///   `default_retry_policy` (the *whole* policy — backoff timing +
+    ///   `non_retryable_errors`, not just `max_attempts` — reaches the worker via the
+    ///   command's `retry_policy_override` on the TYPED path AND, for the RAW
+    ///   `execute_activity_raw` path (no override), via a CLAIM-time fallback to this
+    ///   registry entry, Codex #1069 P2 `runtime.rs:331`), `default_start_to_close`
+    ///   (honored via the command's `start_to_close_override` on the TYPED path AND
+    ///   via the same claim-time registry fallback on the RAW path), and
+    ///   `default_queue` (recorded; single-writer routing is a no-op).
     /// - **REJECTED** at registration (setup-time panic, mirroring
     ///   [`register_workflow`]): `default_heartbeat_timeout`,
     ///   `default_schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
@@ -321,10 +358,13 @@ impl SqliteRuntime {
                 info.name,
             );
         }
-        // Derive the fallback attempt cap from the declared retry policy (the WHOLE
-        // policy also reaches the worker per-dispatch via the command's
-        // `retry_policy_override`, which wins over this fallback). No declared
-        // policy ⇒ a single attempt (matching `ActivitySpec::new`'s `>= 1` clamp).
+        // Derive the fallback attempt cap from the declared retry policy. On the TYPED
+        // `execute_activity` path the WHOLE policy also reaches the worker per-dispatch
+        // via the command's `retry_policy_override`, which wins over the registry
+        // fallback; on the RAW `execute_activity_raw` path the command carries NO
+        // override, so the worker resolves the full `default_retry_policy` (below) from
+        // this registry entry at CLAIM time. No declared policy ⇒ a single attempt
+        // (matching `ActivitySpec::new`'s `>= 1` clamp).
         let max_attempts = info
             .default_retry_policy
             .as_ref()
@@ -335,6 +375,13 @@ impl SqliteRuntime {
                 body: Box::new(body),
                 max_attempts,
                 schedule_to_close: info.default_schedule_to_close,
+                // Store the WHOLE policy (backoff + `non_retryable_errors`), not just
+                // its `max_attempts` — the RAW dispatch path falls back to it at claim
+                // time (Codex #1069 P2, `runtime.rs:331`).
+                default_retry_policy: info.default_retry_policy.clone(),
+                // Store the declared start-to-close so the RAW path can fall back to it
+                // at claim time too (class-audit sibling of `default_retry_policy`).
+                start_to_close: info.default_start_to_close,
             },
         );
     }
@@ -1770,9 +1817,11 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 ///
 /// - **HONORED** (handled by [`register_activity`], NOT reported here):
 ///   `default_schedule_to_close` (persisted + enforced as terminal
-///   `ActivityTimedOut { ScheduleToClose }`), `default_retry_policy` (fallback
-///   attempt cap; the whole policy reaches the worker per-dispatch),
-///   `default_start_to_close` (via the command), `default_queue` (recorded).
+///   `ActivityTimedOut { ScheduleToClose }`), `default_retry_policy` (the whole
+///   policy — backoff + `non_retryable_errors` — via the command on the TYPED path
+///   and a claim-time registry fallback on the RAW path, `runtime.rs:331`),
+///   `default_start_to_close` (via the command on the TYPED path and the same
+///   claim-time fallback on the RAW path), `default_queue` (recorded).
 /// - **REJECTED** (reported here) — a dispatch-admission / cross-worker semantic
 ///   this single-writer backend has no analog for, or a cap raiser that would
 ///   otherwise silently apply the STRICTER global cap:

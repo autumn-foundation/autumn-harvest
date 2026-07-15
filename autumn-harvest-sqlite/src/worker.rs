@@ -112,6 +112,41 @@ pub fn drain_ready(
                 .saturating_add(crate::runtime::duration_to_millis_saturating(d))
         });
 
+        // Resolve the effective RETRY POLICY at CLAIM time (FINDING B, Codex #1069 P2
+        // `runtime.rs:331`). The scheduling command's `retry_policy_override` (persisted
+        // as `task.retry_policy`) wins — that is the TYPED `execute_activity` path, which
+        // resolves the activity's declared/per-call policy into the command. But the RAW
+        // `execute_activity_raw` path carries NO override, so `task.retry_policy == None`;
+        // without a fallback the worker would requeue IMMEDIATELY at `now` (no backoff)
+        // and IGNORE the policy's `non_retryable_errors` list — losing BOTH the backoff
+        // timing (`compute_retry_delay`) and the non-retryable classification for a raw
+        // call to an info-registered activity. Mirror the Postgres dispatch fallback to
+        // the registered activity's FULL `default_retry_policy`: resolve it BY NAME from
+        // the now-guaranteed-present `ActivitySpec` (an unregistered activity was released
+        // above and never reaches here), exactly as `schedule_to_close_at` is resolved.
+        // The registry entry is the WHOLE policy (backoff params + `non_retryable_errors`
+        // + `max_attempts`), NOT a collapsed `max_attempts`. A hand-made
+        // `register_activity_raw` spec carries no policy (`None`), so its raw-path task
+        // keeps the prior attempt-cap-only behavior. The `max_attempts` resolution below
+        // stays consistent — `spec.max_attempts` is derived from this same policy in
+        // `register_activity`.
+        if task.retry_policy.is_none() {
+            task.retry_policy.clone_from(&spec.default_retry_policy);
+        }
+
+        // Resolve the per-attempt START-TO-CLOSE budget at CLAIM time (FINDING B class
+        // audit — the sibling of the retry-policy fallback above). The command's
+        // `start_to_close_override` (persisted as `task.start_to_close_ms`) wins on the
+        // TYPED path; the RAW path carries no override, so fall back to the registered
+        // spec's declared `start_to_close` BY NAME — otherwise a raw call to an
+        // info-registered activity silently loses its declared per-attempt budget. A
+        // hand-made raw spec carries `None`, so its behavior is unchanged.
+        if task.start_to_close_ms.is_none() {
+            task.start_to_close_ms = spec
+                .start_to_close
+                .map(crate::runtime::duration_to_millis_saturating);
+        }
+
         // Enforce the activity's TOTAL (cross-retry) schedule-to-close deadline
         // BEFORE running the body (issue #378, Codex #1069 P2 `runtime.rs:39`). A
         // task drained at/after its absolute deadline — the "idle past the deadline,
@@ -209,31 +244,39 @@ pub fn drain_ready(
         // THIS instant, not the pre-body cycle `now`.
         let finalize_now = failure_now();
 
-        // Recheck the TOTAL (cross-retry) schedule-to-close deadline at FINALIZE
-        // time, for a body that SUCCEEDED (issue #378, Codex #1069 P2
-        // `worker.rs:211`). The pre-body check above used the cycle-start `now`; the
-        // absolute deadline may have ELAPSED WHILE the body ran — a body that started
-        // just before its cap and returned `Ok` after it, or whose deadline expired
-        // mid-run. Left only to the normal finalize path, such a success would record
-        // `ActivityCompleted` PAST the declared total cap. This scanner-less backend
-        // enforces `schedule_to_close` entirely inline, so the pre-body check is not
-        // enough — nothing else re-checks the deadline once the body returns. The
-        // Postgres backend enforces it on a RUNNING activity via its background
-        // timeout scanner (`find_timed_out_tasks` with `TimeoutReason::ScheduleToClose`
-        // over RUNNING/PENDING), so a body that runs past the cap is timed out there
-        // and its late completion LOSES the race against `complete` (which finds the
-        // task no longer RUNNING and no-ops). Mirror that here: when the POST-BODY
-        // `finalize_now` (NOT the cycle-start `now`) has reached the absolute deadline,
-        // seal terminal `ActivityTimedOut { ScheduleToClose }` through the SAME
-        // `finalize_activity_timeout` path the pre-body check uses — byte-equivalent to
-        // the Postgres scanner's `ActivityTimedOut` + `fail_task` (terminal, NOT
-        // retried; the workflow observes `HistoryMatch::TimedOut` and drives its own
-        // branch). Scoped to a SUCCESS: a FAILED body is left to the retry path in
-        // `finalize_within_tx`, which already enforces the deadline against the next
-        // attempt's `run_at`. The body already ran (at-least-once, side effect done
-        // once) — we only CHOOSE which terminal event to record, exactly as the
-        // Postgres scanner does when it wins the race against a completing activity.
-        if result.is_ok() && schedule_to_close_exceeded(finalize_now, task.schedule_to_close_at) {
+        // Recheck the TOTAL (cross-retry) schedule-to-close deadline at FINALIZE time,
+        // for ANY body result — Ok OR Err (issue #378, FINDING A, Codex #1069 P2
+        // `worker.rs:236`). This is the FIRST finalize decision, ahead of the
+        // Ok-complete / Err-terminal-fail / Err-retry branching in
+        // `finalize_activity_result`. The pre-body check above used the cycle-start
+        // `now`; the absolute deadline may have ELAPSED WHILE the body ran — a body that
+        // started just before its cap and returned after it, or whose deadline expired
+        // mid-run. The core Postgres backend enforces `schedule_to_close` on a RUNNING
+        // activity via its background timeout scanner (`find_timed_out_tasks` with
+        // `TimeoutReason::ScheduleToClose` over RUNNING/PENDING) — timing out the row
+        // REGARDLESS of the eventual Ok/Err (a late Ok/Err loses the race against a
+        // finalize that finds the task no longer RUNNING). This scanner-less backend
+        // enforces the cap entirely inline, so it must seal terminal
+        // `ActivityTimedOut { ScheduleToClose }` once the total wall-clock cap has
+        // elapsed at finalize time, for ANY result. Covering the Err case too closes two
+        // holes the earlier `result.is_ok()`-only recheck left:
+        //   - a NON-RETRYABLE / FINAL-ATTEMPT Err past the deadline was recorded as an
+        //     ordinary `ActivityFailed` instead of a `ScheduleToClose` timeout; and
+        //   - a ZERO-DELAY retry whose deadline elapsed mid-body was requeued and re-ran
+        //     past the cap, because the `finalize_within_tx` retry check compares the next
+        //     attempt's `run_at` (== the STALE cycle `now` for a zero-delay retry) — not
+        //     the POST-body `finalize_now` — against the deadline.
+        // Using the POST-body `finalize_now` (NOT the cycle-start `now`) is what catches
+        // both. The retry-path check in `finalize_within_tx` remains for the DISTINCT case
+        // where the deadline has NOT yet elapsed at finalize time but the next attempt's
+        // positive-backoff `run_at` WOULD land at/after it. Terminal, NOT retried — the
+        // workflow observes `HistoryMatch::TimedOut` and drives its own branch. The body
+        // already ran (at-least-once, side effect done once); we only CHOOSE which
+        // terminal event to record, exactly as the Postgres scanner does when it wins the
+        // race against a completing/failing activity. Because this seals + `continue`s
+        // before `finalize_activity_result`, a timed-out activity never ALSO records
+        // `ActivityCompleted`/`ActivityFailed` (no double-record).
+        if schedule_to_close_exceeded(finalize_now, task.schedule_to_close_at) {
             finalize_activity_timeout(conn, exec_id, &task, TimeoutType::ScheduleToClose)?;
             produced = true;
             continue;
@@ -1542,6 +1585,159 @@ mod tests {
                 autumn_harvest::WorkflowEvent::ActivityCompleted { .. }
             ),
             "an under-deadline success completes normally:\n{history:?}"
+        );
+    }
+
+    // FINDING A (Codex #1069 P2, `worker.rs:236`): the finalize-time schedule-to-close
+    // recheck must run for a FAILING body too, not only a successful one. A body that
+    // starts before its total deadline but returns `Err` after the deadline has elapsed
+    // (a body that ran real time and crossed the cap) would otherwise fall through to the
+    // ordinary terminal `ActivityFailed` branch — misreporting a past-cap timeout as an
+    // ordinary failure. The core Postgres backend times out ANY RUNNING activity past its
+    // `schedule_to_close` via its scanner regardless of the eventual Ok/Err, so this
+    // scanner-less backend must seal `ActivityTimedOut { ScheduleToClose }` once the total
+    // wall-clock cap has elapsed at finalize time, for ANY result. `max_attempts = 1` so
+    // the failing body would otherwise take the terminal `ActivityFailed` branch (not the
+    // retry branch): pre-body now = 0 (< deadline 1000, body runs), post-body finalize_now
+    // = 1500 (>= deadline → seal timeout).
+    //
+    // RED pre-fix: the finalize-time recheck was guarded `result.is_ok()`, so an Err body
+    // past the deadline recorded a terminal `ActivityFailed` instead of `ActivityTimedOut`.
+    #[test]
+    fn drain_ready_seals_schedule_to_close_for_a_failing_body_finalized_past_the_deadline() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        // scheduled_at == run_at == 0 → resolved absolute deadline = 0 + 1000ms = 1000.
+        seed_pending_activity(&conn, exec, "act");
+
+        let mut activities = std::collections::HashMap::new();
+        activities.insert(
+            "act".to_string(),
+            spec_with_schedule_to_close(1_000, |_| Err("boom".to_string())),
+        );
+
+        // Cycle-start now = 0 (< deadline 1000 → pre-body check passes, body runs);
+        // post-body finalize clock = 1500 (>= deadline → generalized finalize recheck
+        // seals the timeout even though the body returned Err).
+        let failure_now = || 1_500_i64;
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        assert!(produced, "a terminal timeout event was appended");
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert!(
+            history.iter().any(|e| matches!(
+                e,
+                autumn_harvest::WorkflowEvent::ActivityTimedOut {
+                    timeout_type: autumn_harvest::TimeoutType::ScheduleToClose,
+                    ..
+                }
+            )),
+            "a FAILING body finalized past its total deadline must seal ActivityTimedOut \
+             {{ ScheduleToClose }} (RED pre-fix: recorded ActivityFailed):\n{history:?}"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|e| matches!(e, autumn_harvest::WorkflowEvent::ActivityFailed { .. })),
+            "the past-deadline failure must NOT record ActivityFailed (RED pre-fix):\n{history:?}"
+        );
+        let task_state: String = conn
+            .query_row("SELECT state FROM harvest_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            task_state, "DONE",
+            "the timed-out task is terminal (not requeued)"
+        );
+    }
+
+    // FINDING A (Codex #1069 P2, `worker.rs:236`): a ZERO-DELAY retry whose deadline
+    // elapsed WHILE the body ran must seal `ActivityTimedOut { ScheduleToClose }`, NOT
+    // requeue for another attempt past the cap. The pre-requeue check in
+    // `finalize_within_tx` compares the next attempt's `run_at` (== the STALE cycle-start
+    // `now` for a zero-delay retry) against the deadline — so with the deadline crossed
+    // mid-body, `now < deadline` still held and the task was requeued and re-ran past the
+    // cap. The generalized finalize-time recheck uses the POST-body finalize clock, so it
+    // catches this: `finalize_now >= deadline` seals the timeout BEFORE the retry branch
+    // is reached. `max_attempts = 2` and NO retry policy → the zero-delay (immediate)
+    // requeue path (`run_at = now`).
+    //
+    // RED pre-fix: the finalize-time recheck was `result.is_ok()`-only, so the Err body
+    // requeued at the stale cycle `now` (0 < 1000) and re-ran a second attempt past the cap.
+    #[test]
+    fn drain_ready_seals_schedule_to_close_for_a_zero_delay_retry_finalized_past_the_deadline() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        // scheduled_at == run_at == 0 → resolved absolute deadline = 0 + 1000ms = 1000.
+        seed_pending_activity(&conn, exec, "act");
+
+        // max_attempts = 2, NO retry policy → the immediate/zero-delay requeue path
+        // (`run_at = now`). The body counts its invocations so the RED "retried past the
+        // cap" behavior is observable (2 calls) vs GREEN "sealed after one run" (1 call).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let body_calls = Arc::clone(&calls);
+        let spec = {
+            let mut s = ActivitySpec::new(2, move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Err("boom".to_string())
+            });
+            s.schedule_to_close = Some(Duration::from_millis(1_000));
+            s
+        };
+        let mut activities = std::collections::HashMap::new();
+        activities.insert("act".to_string(), spec);
+
+        // Cycle-start now = 0 (< deadline 1000 → pre-body check passes AND the stale
+        // zero-delay run_at = now = 0 would NOT be caught by the retry-path check);
+        // post-body finalize clock = 1500 (>= deadline → the generalized finalize recheck
+        // seals the timeout).
+        let failure_now = || 1_500_i64;
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        assert!(produced);
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert!(
+            history.iter().any(|e| matches!(
+                e,
+                autumn_harvest::WorkflowEvent::ActivityTimedOut {
+                    timeout_type: autumn_harvest::TimeoutType::ScheduleToClose,
+                    ..
+                }
+            )),
+            "a zero-delay retry past the total deadline must seal ActivityTimedOut \
+             {{ ScheduleToClose }} (RED pre-fix: requeued at the stale cycle now and \
+             retried past the cap):\n{history:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the body must run ONCE then be sealed — NOT retried past the cap \
+             (RED pre-fix ran it twice)"
+        );
+        let task_state: String = conn
+            .query_row("SELECT state FROM harvest_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            task_state, "DONE",
+            "the timed-out task is terminal, not requeued PENDING"
         );
     }
 }
