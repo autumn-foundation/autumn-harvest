@@ -18,26 +18,39 @@
 //! fresh testcontainers Postgres is booted with the full migration bundle
 //! (`autumn_harvest::full_migrations_sql()`).
 
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{
     ERROR_TYPE_RESOURCE_EXHAUSTED, ERROR_TYPE_SANDBOX_DENIED, ERROR_TYPE_WASM_MODULE_INVALID,
     ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED, ERROR_TYPE_WASM_MODULE_UNAVAILABLE, ERROR_TYPE_WASM_TRAP,
 };
+use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
+use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
+use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::wasm_activities::{WasmCapabilities, WasmLimits, WasmModuleStore};
 use autumn_harvest::wasm_store::{
     MAX_WASM_MODULE_BYTES, WasmBinding, WasmDispatch, fetch_wasm_module_bytes, list_wasm_modules,
     publish_registered_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
     resolve_active_wasm_module, resolve_wasm_dispatch,
 };
-use autumn_harvest::worker::DbPool;
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{WorkflowContext, store};
+use chrono::Utc;
+use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use uuid::Uuid;
 
 fn init_sql() -> Vec<u8> {
     autumn_harvest::full_migrations_sql().as_bytes().to_vec()
@@ -132,7 +145,10 @@ fn wasm_error_type_constants_are_stable() {
     assert_eq!(ERROR_TYPE_WASM_TRAP, "WasmTrap");
     assert_eq!(ERROR_TYPE_WASM_MODULE_UNAVAILABLE, "WasmModuleUnavailable");
     assert_eq!(ERROR_TYPE_WASM_MODULE_INVALID, "WasmModuleInvalid");
-    assert_eq!(ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED, "WasmModuleLookupFailed");
+    assert_eq!(
+        ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+        "WasmModuleLookupFailed"
+    );
 }
 
 // ── storage: publish/resolve/fetch round-trip ───────────────────────────────
@@ -408,9 +424,14 @@ async fn resolve_dispatch_invokes_a_published_echo() {
         capabilities: WasmCapabilities::default(),
         limits: WasmLimits::default(),
     };
-    let dispatch =
-        resolve_wasm_dispatch(&mut conn, &store, &binding, "echo", Some(Duration::from_secs(5)))
-            .await;
+    let dispatch = resolve_wasm_dispatch(
+        &mut conn,
+        &store,
+        &binding,
+        "echo",
+        Some(Duration::from_secs(5)),
+    )
+    .await;
     let prepared = match dispatch {
         WasmDispatch::Invoke(prepared) => prepared,
         WasmDispatch::Fail(payload) => panic!("expected invoke, got: {payload}"),
@@ -420,7 +441,11 @@ async fn resolve_dispatch_invokes_a_published_echo() {
     assert_eq!(out, input);
 
     // Second resolution serves the cached compiled module (no bytes fetch).
-    assert!(store.cached(&WasmModuleStore::compute_hash(&echo_bytes())).is_some());
+    assert!(
+        store
+            .cached(&WasmModuleStore::compute_hash(&echo_bytes()))
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -485,4 +510,548 @@ async fn total_rows_all(conn: &mut AsyncPgConnection) -> i64 {
         .await
         .expect("count all")
         .n
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Worker dispatch seam (AC1/AC2/AC4/AC5): a published WASM activity dispatched
+// through the real worker poll loop. Harness modelled on
+// activity_interceptor_tests.rs. Each test uses a unique task queue so a shared
+// HARVEST_TEST_DATABASE_URL run cannot cross-claim tasks.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn connect(url: &str) -> AsyncPgConnection {
+    <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .expect("connect")
+}
+
+/// Guest returning a fixed JSON literal `{"version":1}` (13 bytes), so callers
+/// can tell which module version actually ran (AC4 pinning).
+const VERSION1_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (data (i32.const 100) "{\"version\":1}")
+      (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+      (func (export "run") (param i32 i32) (result i64)
+        (i64.or (i64.shl (i64.const 100) (i64.const 32)) (i64.const 13))))
+"#;
+
+const VERSION2_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (data (i32.const 100) "{\"version\":2}")
+      (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+      (func (export "run") (param i32 i32) (result i64)
+        (i64.or (i64.shl (i64.const 100) (i64.const 32)) (i64.const 13))))
+"#;
+
+/// Guest that imports an ungranted host function (`fs_read`) → denied at
+/// instantiation → non-retryable `SandboxDenied`.
+const DENY_WAT: &str = r#"
+    (module
+      (import "env" "fs_read" (func $imported (param i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+      (func (export "run") (param i32 i32) (result i64) (i64.const 0)))
+"#;
+
+/// Guest that spins forever → exhausts CPU fuel → retryable `ResourceExhausted`.
+const FUEL_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+      (func (export "run") (param i32 i32) (result i64)
+        (loop $l (br $l))
+        (i64.const 0)))
+"#;
+
+fn assemble(wat: &str) -> Vec<u8> {
+    wat::parse_str(wat).expect("wat assembles")
+}
+
+/// Capturing metrics recorder for the retry assertion (AC5).
+#[derive(Default)]
+struct RecordingMetrics {
+    retried: Mutex<Vec<String>>,
+    failed: Mutex<Vec<String>>,
+}
+impl MetricsRecorder for RecordingMetrics {
+    fn record_activity_retried(&self, activity_name: &str, _queue: &str) {
+        self.retried.lock().unwrap().push(activity_name.to_string());
+    }
+    fn record_activity_failed(
+        &self,
+        activity_name: &str,
+        _workflow_type: &str,
+        _error_type: &str,
+        _non_retryable: bool,
+    ) {
+        self.failed.lock().unwrap().push(activity_name.to_string());
+    }
+}
+
+/// One WASM activity to register on a worker registry.
+struct WasmActivitySpec {
+    name: &'static str,
+    bytes: Vec<u8>,
+    caps: WasmCapabilities,
+    limits: WasmLimits,
+    retry: Option<RetryPolicy>,
+}
+
+/// Build a `HandlerRegistry` wired with WASM activities (bindings, shared store,
+/// and startup-publish registrations), so `worker.run()` publishes the modules
+/// to the DB before polling.
+fn build_wasm_registry(
+    workflows: Vec<WorkflowInfo>,
+    wasm: Vec<WasmActivitySpec>,
+    metrics: Arc<dyn MetricsRecorder>,
+) -> Arc<HandlerRegistry> {
+    let mut activities = Vec::new();
+    let mut bindings = HashMap::new();
+    let mut registrations = Vec::new();
+    for spec in wasm {
+        activities.push(ActivityInfo::wasm(
+            spec.name,
+            None,
+            spec.retry.clone(),
+            Some(Duration::from_secs(5)),
+        ));
+        bindings.insert(
+            spec.name.to_string(),
+            WasmBinding {
+                capabilities: spec.caps,
+                limits: spec.limits,
+            },
+        );
+        registrations.push((spec.name.to_string(), spec.bytes));
+    }
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
+    let store = Arc::new(WasmModuleStore::new());
+    Arc::new(
+        HandlerRegistry::with_state_and_telemetry(
+            workflows,
+            activities,
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
+        )
+        .with_wasm_activities(store, bindings, registrations),
+    )
+}
+
+fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
+    Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: worker_id.to_string(),
+                queues: vec![queue.to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                workflow_task_timeout: Duration::from_secs(30),
+                workflow_panic_max_attempts: 3,
+                labels: HashMap::new(),
+                queue_weights: HashMap::new(),
+                max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
+                shard_notification_database_urls: Vec::new(),
+                sharded_pool: None,
+                slot_tuner: None,
+                max_concurrent_sessions: 0,
+            },
+            registry,
+        )
+        .expect("worker builds"),
+    )
+}
+
+async fn seed_workflow(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    input: serde_json::Value,
+    queue: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id: &format!("wf-{}", exec_id.as_uuid()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: input.clone(),
+        parent_id: None,
+        queue_name: queue,
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("insert execution");
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::workflow_started(input.clone(), Utc::now())],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted");
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue workflow");
+    exec_id
+}
+
+async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
+    let mut conn = connect(url).await;
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("reload execution")
+}
+
+async fn load_history(url: &str, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
+    let mut conn = connect(url).await;
+    store::load_history(&mut conn, exec_id)
+        .await
+        .expect("load_history")
+        .events
+}
+
+async fn wait_for_state(
+    url: &str,
+    exec_id: ExecutionId,
+    want: &str,
+    timeout: Duration,
+) -> WorkflowExecution {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let e = load_execution(url, exec_id).await;
+            if e.state == want {
+                break e;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("execution did not reach {want} within {timeout:?}"))
+}
+
+async fn run_to_state(
+    url: &str,
+    pool: &DbPool,
+    worker: Arc<Worker>,
+    exec_id: ExecutionId,
+    want: &str,
+    timeout: Duration,
+) -> WorkflowExecution {
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+    let execution = wait_for_state(url, exec_id, want, timeout).await;
+    worker.shutdown();
+    handle.await.expect("worker joins cleanly");
+    execution
+}
+
+fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name,
+        module: "wasm_activities_tests",
+        handler,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
+type BoxFut<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+>;
+
+/// Workflow that dispatches the single WASM activity `echo_wasm` and returns it.
+fn wf_run_wasm(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw("echo_wasm", input, &queue)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn find_activity_completed(history: &[WorkflowEvent]) -> Option<serde_json::Value> {
+    history.iter().find_map(|e| match e {
+        WorkflowEvent::ActivityCompleted { output, .. } => Some(output.clone()),
+        _ => None,
+    })
+}
+
+fn find_activity_failed(history: &[WorkflowEvent]) -> Option<(String, String, bool)> {
+    history.iter().find_map(|e| match e {
+        WorkflowEvent::ActivityFailed {
+            error,
+            error_type,
+            non_retryable,
+            ..
+        } => Some((error.clone(), error_type.clone(), *non_retryable)),
+        _ => None,
+    })
+}
+
+// ── AC1/AC6: worker-e2e echo → COMPLETED with only ordinary events ──────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-echo";
+    let mut conn = connect(&url).await;
+    let input = serde_json::json!({"hello": "wasm", "n": 7});
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
+
+    // Register a WASM echo activity (deny-all caps). Startup-publish seeds it.
+    let echo = assemble(ECHO_WAT);
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: echo,
+            caps: WasmCapabilities::default(),
+            limits: WasmLimits::default(),
+            retry: None,
+        }],
+        Arc::new(RecordingMetrics::default()),
+    );
+    let worker = build_worker("w-wasm-echo", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    // Echoed output matches the input.
+    assert_eq!(find_activity_completed(&history), Some(input.clone()));
+    // History carries ordinary ActivityScheduled + ActivityCompleted; NO
+    // wasm-specific event type exists.
+    let types: Vec<&str> = history.iter().map(WorkflowEvent::type_name).collect();
+    assert!(types.contains(&"ActivityScheduled"), "types: {types:?}");
+    assert!(types.contains(&"ActivityCompleted"), "types: {types:?}");
+    assert!(
+        !types.iter().any(|t| t.to_lowercase().contains("wasm")),
+        "no wasm-specific event variant may appear: {types:?}"
+    );
+}
+
+// ── AC2: sandbox denial in the worker → SandboxDenied terminal FAILED ───────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_wasm_sandbox_denial_fails_workflow_terminally() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-deny";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
+
+    let deny = assemble(DENY_WAT);
+    let metrics = Arc::new(RecordingMetrics::default());
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: deny,
+            caps: WasmCapabilities::default(), // deny-all: fs_read is never granted
+            limits: WasmLimits::default(),
+            retry: Some(RetryPolicy::fixed(3, Duration::from_millis(50))),
+        }],
+        metrics.clone(),
+    );
+    let worker = build_worker("w-wasm-deny", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    // Non-retryable → terminal FAILED without exhausting the retry curve.
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    let (error, error_type, non_retryable) =
+        find_activity_failed(&history).expect("an ActivityFailed event must exist");
+    assert_eq!(error_type, ERROR_TYPE_SANDBOX_DENIED, "error was: {error}");
+    assert!(non_retryable, "sandbox denial is non-retryable");
+    // Non-retryable → not retried.
+    assert!(
+        metrics.retried.lock().unwrap().is_empty(),
+        "a non-retryable sandbox denial must not be retried"
+    );
+}
+
+// ── AC4: an in-flight attempt is pinned to the loaded module version ────────
+//
+// Deterministic (no wall-clock race): the worker resolves+compiles a module
+// ONCE per attempt at dispatch and holds the resulting `Arc<Module>` for the
+// attempt's whole lifetime. This test proves that invariant at the dispatch
+// primitive: a `PreparedWasmActivity` resolved for v1 keeps running v1 even
+// after v2 is published as the new active version; a fresh resolution sees v2.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_dispatch_is_pinned_across_a_mid_flight_republish() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    publish_wasm_module(&mut conn, "pin", &assemble(VERSION1_WAT))
+        .await
+        .expect("publish v1");
+
+    let store = Arc::new(WasmModuleStore::new());
+    let binding = WasmBinding {
+        capabilities: WasmCapabilities::default(),
+        limits: WasmLimits::default(),
+    };
+    // Resolve while v1 is active → prepared is pinned to v1's compiled module.
+    let prepared = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None).await {
+        WasmDispatch::Invoke(prepared) => prepared,
+        WasmDispatch::Fail(p) => panic!("expected invoke: {p}"),
+    };
+
+    // A concurrent operator publishes v2 as the new active version.
+    publish_wasm_module(&mut conn, "pin", &assemble(VERSION2_WAT))
+        .await
+        .expect("publish v2");
+
+    // The already-resolved (in-flight) dispatch still runs v1.
+    let out = prepared.invoke(&serde_json::json!(null)).expect("invoke");
+    assert_eq!(
+        out,
+        serde_json::json!({"version": 1}),
+        "in-flight is pinned to v1"
+    );
+
+    // A FRESH resolution now sees v2.
+    let fresh = match resolve_wasm_dispatch(&mut conn, &store, &binding, "pin", None).await {
+        WasmDispatch::Invoke(prepared) => prepared,
+        WasmDispatch::Fail(p) => panic!("expected invoke: {p}"),
+    };
+    let out2 = fresh.invoke(&serde_json::json!(null)).expect("invoke v2");
+    assert_eq!(
+        out2,
+        serde_json::json!({"version": 2}),
+        "a fresh dispatch sees v2"
+    );
+}
+
+// ── AC5: a retryable resource exhaustion is retried, then terminal ──────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
+    let (url, _c) = setup_db().await;
+    let queue = "q-wasm-fuel";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, "wf_run_wasm", serde_json::json!(null), queue).await;
+
+    // Small fuel budget → the spin loop always exhausts it → ResourceExhausted
+    // (retryable). Retry policy allows one retry (max_attempts = 2).
+    let limits = WasmLimits {
+        fuel: 10_000,
+        ..WasmLimits::default()
+    };
+    let metrics = Arc::new(RecordingMetrics::default());
+    let registry = build_wasm_registry(
+        vec![wf_info("wf_run_wasm", wf_run_wasm)],
+        vec![WasmActivitySpec {
+            name: "echo_wasm",
+            bytes: assemble(FUEL_WAT),
+            caps: WasmCapabilities::default(),
+            limits,
+            retry: Some(RetryPolicy::fixed(2, Duration::from_millis(50))),
+        }],
+        metrics.clone(),
+    );
+    let worker = build_worker("w-wasm-fuel", queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    // Retries exhaust → the workflow fails terminally.
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    let (error, error_type, non_retryable) =
+        find_activity_failed(&history).expect("an ActivityFailed event must exist");
+    assert_eq!(
+        error_type, ERROR_TYPE_RESOURCE_EXHAUSTED,
+        "error was: {error}"
+    );
+    assert!(!non_retryable, "resource exhaustion is retryable");
+    // The activity was retried at least once before exhausting the budget.
+    assert!(
+        !metrics.retried.lock().unwrap().is_empty(),
+        "a retryable resource exhaustion must be retried"
+    );
 }

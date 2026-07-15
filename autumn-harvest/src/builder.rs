@@ -138,6 +138,17 @@ pub struct HarvestBuilder {
     /// execution; after it elapses the key is reusable. `None` uses
     /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
     start_idempotency_window: Option<Duration>,
+    /// Sandbox policy per registered WASM activity (issue #965), keyed by name.
+    #[cfg(feature = "wasm-activities")]
+    wasm_bindings: std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared WASM engine + compiled-module cache, created lazily on the first
+    /// `wasm_activity(...)` call (issue #965). `None` = no WASM activities.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for HarvestBuilder {
@@ -177,6 +188,12 @@ impl Default for HarvestBuilder {
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
             start_idempotency_window: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: Vec::new(),
         }
     }
 }
@@ -295,6 +312,17 @@ pub struct BuiltHarvest {
     /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
     /// (24h) when unset on the builder.
     pub start_idempotency_window: Duration,
+    /// Sandbox policy per registered WASM activity (issue #965), keyed by name.
+    #[cfg(feature = "wasm-activities")]
+    wasm_bindings: std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared WASM engine + compiled-module cache (issue #965). `None` = no WASM
+    /// activities registered.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -664,6 +692,14 @@ impl BuiltHarvest {
         &self.payload_codecs
     }
 
+    /// The `(activity_name, module_bytes)` WASM module registrations to publish
+    /// at worker startup (issue #965). Empty when no WASM activity is registered.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
+        &self.wasm_module_registrations
+    }
+
     /// The configured large-payload offloader, if a [`PayloadStore`] is
     /// registered (issue #524).
     ///
@@ -839,25 +875,35 @@ impl BuiltHarvest {
         // a second execution. Install the configured window here too so every
         // worker (plugin-embedded or standalone) sweeps on the same window.
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
+        #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
+        let mut registry = crate::worker::HandlerRegistry::with_state_and_telemetry(
+            self.workflows,
+            self.activities,
+            Arc::new(self.state),
+            self.telemetry,
+        )
+        .with_handler_infos(self.query_handlers, self.update_handlers)
+        .with_history_policy(self.history_policy)
+        .with_payload_caps(
+            self.max_activity_input_bytes,
+            self.max_workflow_input_bytes,
+            self.max_activity_result_bytes,
+            self.max_signal_payload_bytes,
+        )
+        .with_current_details_cap(self.max_current_details_bytes)
+        .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_payload_offloader(self.payload_offloader.clone())
+        .with_activity_interceptors(self.activity_interceptors.clone());
+        #[cfg(feature = "wasm-activities")]
+        if let Some(store) = self.wasm_store {
+            registry = registry.with_wasm_activities(
+                store,
+                self.wasm_bindings,
+                self.wasm_module_registrations,
+            );
+        }
         (
-            crate::worker::HandlerRegistry::with_state_and_telemetry(
-                self.workflows,
-                self.activities,
-                Arc::new(self.state),
-                self.telemetry,
-            )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy)
-            .with_payload_caps(
-                self.max_activity_input_bytes,
-                self.max_workflow_input_bytes,
-                self.max_activity_result_bytes,
-                self.max_signal_payload_bytes,
-            )
-            .with_current_details_cap(self.max_current_details_bytes)
-            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
-            .with_payload_offloader(self.payload_offloader.clone())
-            .with_activity_interceptors(self.activity_interceptors.clone()),
+            registry,
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -886,25 +932,35 @@ impl BuiltHarvest {
         );
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
+        #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
+        let mut registry = crate::worker::HandlerRegistry::with_state_and_telemetry(
+            self.workflows,
+            self.activities,
+            Arc::new(self.state),
+            self.telemetry,
+        )
+        .with_handler_infos(self.query_handlers, self.update_handlers)
+        .with_history_policy(self.history_policy)
+        .with_payload_caps(
+            self.max_activity_input_bytes,
+            self.max_workflow_input_bytes,
+            self.max_activity_result_bytes,
+            self.max_signal_payload_bytes,
+        )
+        .with_current_details_cap(self.max_current_details_bytes)
+        .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_payload_offloader(self.payload_offloader.clone())
+        .with_activity_interceptors(self.activity_interceptors.clone());
+        #[cfg(feature = "wasm-activities")]
+        if let Some(store) = self.wasm_store {
+            registry = registry.with_wasm_activities(
+                store,
+                self.wasm_bindings,
+                self.wasm_module_registrations,
+            );
+        }
         (
-            crate::worker::HandlerRegistry::with_state_and_telemetry(
-                self.workflows,
-                self.activities,
-                Arc::new(self.state),
-                self.telemetry,
-            )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy)
-            .with_payload_caps(
-                self.max_activity_input_bytes,
-                self.max_workflow_input_bytes,
-                self.max_activity_result_bytes,
-                self.max_signal_payload_bytes,
-            )
-            .with_current_details_cap(self.max_current_details_bytes)
-            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
-            .with_payload_offloader(self.payload_offloader.clone())
-            .with_activity_interceptors(self.activity_interceptors.clone()),
+            registry,
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -1207,6 +1263,49 @@ impl HarvestBuilder {
         interceptor: impl crate::interceptor::ActivityInterceptor,
     ) -> Self {
         self.activity_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Register a sandboxed WebAssembly activity (issue #965).
+    ///
+    /// The activity is registered as a normal (non-local) `ActivityInfo` whose
+    /// module bytes are published to each worker's shard database at startup and
+    /// whose guest is run through the worker's WASM dispatch seam instead of a
+    /// native handler. Capabilities are deny-all by default; grant them (and
+    /// override the resource limits, queue, retry policy, or start-to-close) via
+    /// the [`WasmActivityRegistration`](crate::wasm_store::WasmActivityRegistration)
+    /// fluent setters.
+    ///
+    /// The shared WASM engine + compiled-module cache is created lazily on the
+    /// first call and reused across every registered WASM activity.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_activity(
+        mut self,
+        registration: crate::wasm_store::WasmActivityRegistration,
+    ) -> Self {
+        // Leak the name/queue to `'static` for the placeholder `ActivityInfo`
+        // (mirrors the MCP-tool route-generation precedent). A builder is a
+        // one-time process-startup object, so a bounded leak per registered
+        // activity is acceptable.
+        let name: &'static str = Box::leak(registration.name.clone().into_boxed_str());
+        let queue: Option<&'static str> = registration
+            .queue
+            .as_ref()
+            .map(|q| &*Box::leak(q.clone().into_boxed_str()));
+        self.activities.push(crate::info::ActivityInfo::wasm(
+            name,
+            queue,
+            Some(registration.retry.clone()),
+            registration.start_to_close,
+        ));
+        self.wasm_bindings
+            .insert(registration.name.clone(), registration.binding());
+        if self.wasm_store.is_none() {
+            self.wasm_store = Some(Arc::new(crate::wasm_activities::WasmModuleStore::new()));
+        }
+        self.wasm_module_registrations
+            .push((registration.name, registration.wasm_bytes));
         self
     }
 
@@ -1673,6 +1772,12 @@ impl HarvestBuilder {
             start_idempotency_window: self
                 .start_idempotency_window
                 .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
+            #[cfg(feature = "wasm-activities")]
+            wasm_bindings: self.wasm_bindings,
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: self.wasm_store,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: self.wasm_module_registrations,
         })
     }
 }

@@ -448,6 +448,23 @@ pub struct HandlerRegistry {
     /// the OUTERMOST wrapper. Empty (the default) = no interceptors, and the
     /// dispatch path takes a zero-overhead direct handler call.
     activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
+    /// Sandbox policy per WASM-backed activity (issue #965), keyed by activity
+    /// name. The worker dispatch seam consults this before running a native
+    /// handler: when a binding is present the activity's active module is
+    /// resolved and its guest run instead. Empty = no WASM activities.
+    #[cfg(feature = "wasm-activities")]
+    wasm_activities: HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared engine + compiled-module cache for WASM activities (issue #965).
+    /// One per worker, created lazily by the builder. `None` = no WASM
+    /// activities registered.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to the worker's shard
+    /// database at startup (issue #965), so an embedder that only calls
+    /// `HarvestBuilder::wasm_activity(...)` gets a working WASM activity with no
+    /// manual publish step.
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl HandlerRegistry {
@@ -586,6 +603,12 @@ impl HandlerRegistry {
             max_workflow_attempts_ceiling: None,
             payload_offloader: None,
             activity_interceptors: Vec::new(),
+            #[cfg(feature = "wasm-activities")]
+            wasm_activities: HashMap::new(),
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: Vec::new(),
         }
     }
 
@@ -703,6 +726,46 @@ impl HandlerRegistry {
         &self.activity_interceptors
     }
 
+    /// Install the WASM activity sandbox policies, shared module store, and the
+    /// startup-publish module registrations (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn with_wasm_activities(
+        mut self,
+        store: Arc<crate::wasm_activities::WasmModuleStore>,
+        bindings: HashMap<String, crate::wasm_store::WasmBinding>,
+        registrations: Vec<(String, Vec<u8>)>,
+    ) -> Self {
+        self.wasm_store = Some(store);
+        self.wasm_activities = bindings;
+        self.wasm_module_registrations = registrations;
+        self
+    }
+
+    /// Borrow the WASM sandbox policy for `activity_name`, if it is WASM-backed
+    /// (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_binding(&self, activity_name: &str) -> Option<&crate::wasm_store::WasmBinding> {
+        self.wasm_activities.get(activity_name)
+    }
+
+    /// Borrow the shared WASM module store, if any WASM activity is registered
+    /// (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub const fn wasm_store(&self) -> Option<&Arc<crate::wasm_activities::WasmModuleStore>> {
+        self.wasm_store.as_ref()
+    }
+
+    /// The `(activity_name, module_bytes)` registrations to publish at worker
+    /// startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
+        &self.wasm_module_registrations
+    }
+
     /// Clone the shared state reference for runtime contexts.
     #[must_use]
     pub fn shared_state(&self) -> SharedState {
@@ -780,8 +843,8 @@ impl HandlerRegistry {
 
 impl std::fmt::Debug for HandlerRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HandlerRegistry")
-            .field("workflows", &self.workflows.keys())
+        let mut d = f.debug_struct("HandlerRegistry");
+        d.field("workflows", &self.workflows.keys())
             .field("activities", &self.activities.keys())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
@@ -802,8 +865,15 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "activity_interceptor_count",
                 &self.activity_interceptors.len(),
-            )
-            .finish()
+            );
+        #[cfg(feature = "wasm-activities")]
+        d.field("wasm_activity_count", &self.wasm_activities.len())
+            .field("wasm_store_configured", &self.wasm_store.is_some())
+            .field(
+                "wasm_module_registration_count",
+                &self.wasm_module_registrations.len(),
+            );
+        d.finish()
     }
 }
 
@@ -2110,6 +2180,19 @@ async fn run_local_activity_inline(
     let activity = registry.activities.get(&run.name).ok_or_else(|| {
         HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
     })?;
+    // Issue #965: a WASM-backed activity is dispatched through the remote
+    // task-queue seam (`process_activity_task`), never inline. `wasm_activity()`
+    // always registers a non-local activity, so this is unreachable via the
+    // public API; guard defensively for a hand-built local `ActivityInfo` that
+    // also has a WASM binding, rather than silently running the native stub.
+    #[cfg(feature = "wasm-activities")]
+    if registry.wasm_binding(&run.name).is_some() {
+        return Err(HarvestError::Config(format!(
+            "activity '{}' is WASM-backed and cannot run as a local activity; \
+             register it as a non-local activity",
+            run.name
+        )));
+    }
     if activity.default_schedule_to_close.is_some() {
         return Err(HarvestError::Config(format!(
             "activity '{}' is local but has schedule_to_close set; \
@@ -7461,9 +7544,91 @@ async fn process_activity_task(
     let invocation =
         crate::interceptor::ActivityInvocation::new(activity_name, false, &task.queue_name);
     let activity_handler = activity.handler;
-    let mut activity_future = {
-        use futures::FutureExt as _;
-        match crate::error::catch_construct(|| {
+
+    // Issue #965: sandboxed WASM activity dispatch seam. When the activity is
+    // WASM-bound (a `WasmBinding` is registered AND a shared module store is
+    // configured), resolve its active module version and run the guest through
+    // the SAME interceptor chain / `catch_construct` / `catch_unwind` /
+    // cancellation wrapper as a native handler — so retry, circuit-breaker,
+    // metrics, and DLQ behavior are identical. A pool-checkout failure during
+    // resolution is mapped to a RETRYABLE typed failure (so the row leaves
+    // RUNNING and can retry) rather than a raw `?` that would strand it. A
+    // non-WASM activity takes the native path below byte-for-byte unchanged.
+    #[cfg(feature = "wasm-activities")]
+    let wasm_dispatch: Option<crate::wasm_store::WasmDispatch> =
+        match (registry.wasm_binding(activity_name), registry.wasm_store()) {
+            (Some(binding), Some(store)) => Some(match pool.get().await {
+                Ok(mut conn) => {
+                    crate::wasm_store::resolve_wasm_dispatch(
+                        &mut conn,
+                        store,
+                        binding,
+                        activity_name,
+                        activity.default_start_to_close,
+                    )
+                    .await
+                    // `conn` is dropped at the end of this arm, before the guest runs.
+                }
+                Err(e) => {
+                    use crate::failure::IntoActivityErrorString as _;
+                    crate::wasm_store::WasmDispatch::Fail(
+                        crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
+                            "failed to acquire a database connection to resolve the wasm module \
+                             for activity '{activity_name}': {e}"
+                        ))
+                        .into_error_payload(),
+                    )
+                }
+            }),
+            _ => None,
+        };
+
+    // A `map_or_else` here would nest the ~50-line WASM-invoke terminal closure
+    // inside a closure argument, which is markedly harder to read than the match.
+    #[cfg(feature = "wasm-activities")]
+    #[allow(clippy::option_if_let_else)]
+    let constructed = match wasm_dispatch {
+        Some(dispatch) => crate::error::catch_construct(|| {
+            crate::interceptor::dispatch_with_interceptors(
+                activity_interceptors,
+                &invocation,
+                &ctx,
+                task.input.clone(),
+                // `move` captures the resolved dispatch; it does NOT borrow
+                // `&ctx`, so it composes with the chain's own `&ctx` borrow. The
+                // explicit return type unifies the two `Box::pin` arms.
+                move |input| -> crate::interceptor::ActivityInterceptorFuture<'_> {
+                    match dispatch {
+                        crate::wasm_store::WasmDispatch::Invoke(prepared) => {
+                            Box::pin(async move {
+                                // `invoke` is CPU-bound + blocking, so drive it on
+                                // the blocking pool.
+                                match tokio::task::spawn_blocking(move || prepared.invoke(&input))
+                                    .await
+                                {
+                                    Ok(Ok(value)) => Ok(value),
+                                    Ok(Err(failure)) => {
+                                        use crate::failure::IntoActivityErrorString as _;
+                                        Err(failure.into_error_payload())
+                                    }
+                                    Err(join_err) => {
+                                        use crate::failure::IntoActivityErrorString as _;
+                                        Err(crate::failure::ActivityFailure::wasm_trap(format!(
+                                            "wasm blocking task failed to join: {join_err}"
+                                        ))
+                                        .into_error_payload())
+                                    }
+                                }
+                            })
+                        }
+                        crate::wasm_store::WasmDispatch::Fail(payload) => {
+                            Box::pin(futures::future::ready(Err(payload)))
+                        }
+                    }
+                },
+            )
+        }),
+        None => crate::error::catch_construct(|| {
             crate::interceptor::dispatch_with_interceptors(
                 activity_interceptors,
                 &invocation,
@@ -7471,7 +7636,23 @@ async fn process_activity_task(
                 task.input.clone(),
                 |input| (activity_handler)(&ctx, input),
             )
-        }) {
+        }),
+    };
+
+    #[cfg(not(feature = "wasm-activities"))]
+    let constructed = crate::error::catch_construct(|| {
+        crate::interceptor::dispatch_with_interceptors(
+            activity_interceptors,
+            &invocation,
+            &ctx,
+            task.input.clone(),
+            |input| (activity_handler)(&ctx, input),
+        )
+    });
+
+    let mut activity_future = {
+        use futures::FutureExt as _;
+        match constructed {
             Ok(fut) => std::panic::AssertUnwindSafe(fut)
                 .catch_unwind()
                 .map(|caught| match caught {
@@ -12677,6 +12858,50 @@ impl Worker {
             .iter()
             .map(|shard| (*shard, pool.clone()))
             .collect();
+
+        // Issue #965: startup-publish. Publish every builder-registered WASM
+        // activity module to each shard's database before the poll loop begins,
+        // so an embedder who only calls `HarvestBuilder::wasm_activity(...)` and
+        // starts the worker gets a working WASM activity with no manual publish.
+        // Idempotent (a re-run re-activates the same content-addressed rows), and
+        // per-shard so each shard's `harvest_wasm_modules` is seeded. A failure
+        // is logged but does not abort startup: the module is simply unavailable
+        // on that shard until a later (re)publish, and a dispatch there fails
+        // with a typed `WasmModuleUnavailable`.
+        #[cfg(feature = "wasm-activities")]
+        {
+            let registrations = self.registry.wasm_module_registrations();
+            if !registrations.is_empty() {
+                for (shard, shard_pool) in &shard_targets {
+                    match shard_pool.get().await {
+                        Ok(mut conn) => {
+                            if let Err(e) = crate::wasm_store::publish_registered_wasm_modules(
+                                &mut conn,
+                                registrations,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    worker_id = %self.config.worker_id,
+                                    shard = ?shard,
+                                    error = %e,
+                                    "failed to publish registered wasm modules; wasm activities \
+                                     may be unavailable on this shard until published"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                worker_id = %self.config.worker_id,
+                                shard = ?shard,
+                                error = %e,
+                                "failed to acquire a connection to publish registered wasm modules"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // More than one distinct shard target → multi-shard loop.
         // One or zero targets (or single-pool fallback) → existing path.

@@ -114,7 +114,7 @@ impl WasmActivityRegistration {
 
     /// Override the start-to-close timeout (`None` = unbounded).
     #[must_use]
-    pub fn with_start_to_close(mut self, start_to_close: Option<Duration>) -> Self {
+    pub const fn with_start_to_close(mut self, start_to_close: Option<Duration>) -> Self {
         self.start_to_close = start_to_close;
         self
     }
@@ -417,12 +417,14 @@ pub async fn list_wasm_modules(
         .map_err(database_error)?;
     Ok(rows
         .into_iter()
-        .map(|(hash, activity_name, active, published_at)| WasmModuleRow {
-            hash,
-            activity_name,
-            active,
-            published_at,
-        })
+        .map(
+            |(hash, activity_name, active, published_at)| WasmModuleRow {
+                hash,
+                activity_name,
+                active,
+                published_at,
+            },
+        )
         .collect())
 }
 

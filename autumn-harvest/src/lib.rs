@@ -250,8 +250,7 @@ pub mod store;
 pub mod timeout;
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_activities;
-/// Postgres content-hash storage and worker-dispatch resolution for sandboxed
-/// WebAssembly activities (issue #965).
+/// Postgres storage and dispatch resolution for WASM activities (issue #965).
 #[cfg(feature = "wasm-activities")]
 pub mod wasm_store;
 #[cfg(feature = "db")]
@@ -460,9 +459,9 @@ pub use wasm_activities::{
 #[cfg(feature = "wasm-activities")]
 pub use wasm_store::{
     MAX_WASM_MODULE_BYTES, PreparedWasmActivity, WasmActivityRegistration, WasmBinding,
-    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module,
-    publish_registered_wasm_modules, resolve_active_wasm_hash, resolve_active_wasm_module,
-    resolve_wasm_dispatch,
+    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules,
+    publish_registered_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
+    resolve_active_wasm_module, resolve_wasm_dispatch,
 };
 
 #[cfg(feature = "db")]
