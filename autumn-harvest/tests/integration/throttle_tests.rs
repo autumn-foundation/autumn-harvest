@@ -262,7 +262,23 @@ async fn start(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str, input: serde
     .expect("start");
 }
 
+// issue #1053 (review C): the throttle scanner now consults the process-global
+// `GLOBAL_ADMISSION_GATE_CACHE` at fire time (debounce/event_batch do not). This
+// `integration` binary shares that static with the admission-gate suites, so hold
+// their serial guard (`admission_gate_authoritative_tests::TEST_SERIAL`) and clear
+// any leftover/concurrent gate before firing — otherwise a gate armed by a sibling
+// test (or left behind by a panicked one) would spuriously BLOCK these fires. The
+// guard also makes the reset non-stomping: it is mutually exclusive with the gate
+// suites, which hold the same guard for their whole body. Holding a std guard
+// across the fire `.await` mirrors the gate suites (hence the scoped allows); the
+// guard is `!Send`, but these `#[tokio::test]` helpers run on a current-thread
+// runtime, so the future is never sent across threads.
+#[allow(clippy::await_holding_lock, clippy::future_not_send)]
 async fn drain(conn: &mut AsyncPgConnection, metrics: &RecordingMetrics) -> usize {
+    let _serial = crate::admission_gate_authoritative_tests::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
     fire_due_throttled_starts(conn, &None, &[] as &[ShardId], metrics)
         .await
         .expect("fire due")

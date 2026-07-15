@@ -98,6 +98,17 @@ fn throttled_info(rate: &str, burst: f64) -> WorkflowInfo {
     }
 }
 
+/// A plain, NON-throttled workflow. The batch route runs `_collect` immediately
+/// (no defer) for such a workflow, so its Phase-1 idempotent-retry pre-check —
+/// the code #1053 makes reuse-policy-aware — is exercised synchronously. Used by
+/// `batch_bypass_uses_start_will_create_predicate_not_bare_existence`.
+fn plain_info() -> WorkflowInfo {
+    let mut info = throttled_info("100/m", 1.0);
+    info.name = "plain_job";
+    info.throttle = None;
+    info
+}
+
 /// A workflow with BOTH a throttle policy and a debounce policy configured
 /// (code-review fix, issue #607): the batch-start endpoint must reject items
 /// for this workflow with a clear mutual-exclusion error instead of silently
@@ -1280,6 +1291,83 @@ async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
         body3["results"][0]["status"],
         json!("rejected"),
         "a genuinely fresh item must still be blocked by the gate: {body3:?}"
+    );
+}
+
+/// issue #1053, item 1 (STRUCTURAL / DEFENSIVE). The batch Phase-1 idempotent-
+/// retry pre-check decides whether a batch item BYPASSES the admission gate.
+/// #1053 swaps its bare `has_execution` existence boolean for
+/// `start_will_create_new_execution(prior_state, AllowDuplicate)`, mirroring the
+/// single-start route (#1051). Under the batch route's hardcoded `AllowDuplicate`
+/// policy those two implementations AGREE for every prior state (both attach for
+/// any present non-sealed prior, both CREATE for `None`/sealed), so this test
+/// cannot behaviorally distinguish them today — it PASSES against both the old
+/// and the new code. Its value is (a) locking the AllowDuplicate=attach bypass
+/// contract at the batch route so a future per-item reuse policy inherits the
+/// predicate-based gate decision, and (b) providing the red→green anchor #1053
+/// asks for. The SUBSTANTIVE batch residual (a bypass-prior force-terminated
+/// between the unlocked read and the deferred fire) is closed BEHAVIORALLY by the
+/// item-2 core test `throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate`,
+/// since a throttled batch item defers through the SAME `fire_claimed_throttle_row`
+/// scanner. (Compile-checked only in this sandbox: this plugin suite spins a
+/// testcontainers Postgres unconditionally; CI runs it Docker-backed.)
+#[tokio::test]
+async fn batch_bypass_uses_start_will_create_predicate_not_bare_existence() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, api_state) = build_app_with_state(&pool, plain_info());
+    let mut conn = raw_connect(&url).await;
+
+    // A COMPLETED prior for this explicit workflow_id. Under AllowDuplicate the
+    // predicate `start_will_create_new_execution(Some("COMPLETED"), AllowDuplicate)`
+    // is `false` (attach), so the item bypasses the gate — identical to the old
+    // bare-existence heuristic (a COMPLETED row exists).
+    seed_execution(&mut conn, "plain_job", "batch-predicate-job", "COMPLETED").await;
+    assert_eq!(
+        execution_count(&mut conn, "plain_job").await,
+        1,
+        "one COMPLETED prior seeded"
+    );
+
+    // Arm a fleet-wide admission gate blocking all NEW (creating) admissions.
+    api_state.initialize_gate_cache(vec![autumn_harvest::AdmissionGate {
+        id: autumn_harvest::AdmissionGateId(uuid::Uuid::new_v4()),
+        scope: autumn_harvest::GateScope::Fleet,
+        reason: "incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        expires_at: None,
+    }]);
+
+    // Submit a non-atomic batch item for the SAME workflow_id. AllowDuplicate
+    // attaches to the COMPLETED prior (will NOT create), so it is NOT rejected by
+    // the gate.
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                {
+                    "workflow_name": "plain_job",
+                    "workflow_id": "batch-predicate-job",
+                    "input": { "hello": "world" },
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "batch request: {body:?}");
+    assert_ne!(
+        body["results"][0]["status"],
+        json!("rejected"),
+        "an AllowDuplicate attach to a COMPLETED prior must bypass the gate, not be rejected: {body:?}"
+    );
+    assert_eq!(
+        execution_count(&mut conn, "plain_job").await,
+        1,
+        "attaching to the COMPLETED prior must not create a second execution row"
     );
 }
 
