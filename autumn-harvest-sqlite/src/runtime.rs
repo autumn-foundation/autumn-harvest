@@ -929,20 +929,20 @@ impl SqliteRuntime {
             std::collections::HashSet::new();
         for cmd in commands {
             match cmd {
-                cmd @ WorkflowCommand::ScheduleActivity { name, .. } => {
-                    // Resolve the activity's total (cross-retry) deadline BY NAME
-                    // from the registry (Codex #1069 P2, `runtime.rs:39`). The
-                    // `ScheduleActivity` command does not carry
-                    // `default_schedule_to_close`, so — exactly as the Postgres
-                    // worker resolves `ActivityInfo` from its `HandlerRegistry` at
-                    // enqueue — the dispatch site reads it here. Only the info-based
-                    // `register_activity(&info, …)` populates it; a raw-registered
-                    // body yields `None`. Disjoint-field borrow: `tx` holds
-                    // `&mut self.conn`, this reads `&self.activities` (same shape as
-                    // the `drain_ready(&mut self.conn, …, &self.activities)` call).
-                    let schedule_to_close =
-                        self.activities.get(name).and_then(|s| s.schedule_to_close);
-                    if apply_schedule_activity(&tx, exec, history, cmd, now, schedule_to_close)? {
+                cmd @ WorkflowCommand::ScheduleActivity { .. } => {
+                    // The activity's total (cross-retry) `schedule_to_close` deadline
+                    // (issue #378) is NOT resolved here (Codex #1069 P2,
+                    // `runtime.rs:944`). It is not carried on the `ScheduleActivity`
+                    // command, and resolving it at THIS (schedule) time from the
+                    // registry would silently DROP it for an activity scheduled before
+                    // its body/`ActivityInfo` is registered (`self.activities.get(name)`
+                    // would be `None`), never backfilling it on the later re-drive.
+                    // The stable schedule instant (`now`) is recorded as `scheduled_at`,
+                    // and [`worker::drain_ready`] resolves the deadline from the
+                    // registered spec at CLAIM time — when the body is guaranteed
+                    // present — exactly as the Postgres worker resolves `ActivityInfo`
+                    // from its `HandlerRegistry`.
+                    if apply_schedule_activity(&tx, exec, history, cmd, now)? {
                         produced = true;
                     }
                 }
@@ -1185,12 +1185,15 @@ impl SqliteRuntime {
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
 ///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
 ///   timeout scanner). `None` = no budget (unbounded).
-/// - `schedule_to_close` (the caller-resolved `ActivityInfo::default_schedule_to_close`,
-///   issue #378, Codex #1069 P2 `runtime.rs:39`) — honored: an ABSOLUTE deadline
-///   `now + schedule_to_close` is persisted on the task row so the worker enforces
-///   the total cross-retry cap (terminal `ActivityTimedOut { ScheduleToClose }`).
-///   NOT a command field — resolved by name from the registry at the call site.
-///   `None` = no total deadline.
+/// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378,
+///   Codex #1069 P2 `runtime.rs:944`) — honored, but resolved at CLAIM time, NOT
+///   here. It is not a command field, and resolving it at schedule time from the
+///   registry would silently DROP it for an activity scheduled before its body is
+///   registered. This site records only the stable schedule instant (`now`) as
+///   `scheduled_at`; [`worker::drain_ready`](crate::worker::drain_ready) resolves the
+///   absolute deadline (`scheduled_at + default_schedule_to_close`) from the
+///   guaranteed-present registered spec at claim, enforcing the total cross-retry cap
+///   (terminal `ActivityTimedOut { ScheduleToClose }`).
 /// - `session_id`/`session_worker_id` (worker sessions, issue #606) and the
 ///   session-acquire-only `schedule_to_start_override` — REJECTED LOUDLY with
 ///   [`SqliteError::Unsupported`]: they are outside the single-writer subset (worker
@@ -1207,7 +1210,6 @@ fn apply_schedule_activity(
     history: &[WorkflowEvent],
     cmd: &WorkflowCommand,
     now: i64,
-    schedule_to_close: Option<std::time::Duration>,
 ) -> SqliteResult<bool> {
     let WorkflowCommand::ScheduleActivity {
         activity_id,
@@ -1252,15 +1254,12 @@ fn apply_schedule_activity(
         .map(serde_json::to_string)
         .transpose()?;
     let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
-    // The total (cross-retry) deadline is ABSOLUTE: `now + schedule_to_close`, so it
-    // stays valid across a restart (like the timer's absolute `fire_at`) — there is
-    // no virtual clock to reset. `duration_to_millis_saturating` clamps a
-    // pathological duration; `checked_add` keeps a saturating duration from
-    // wrapping to an early deadline. `None` = no total deadline.
-    let schedule_to_close_at = schedule_to_close.map(|d| {
-        let ms = duration_to_millis_saturating(d);
-        now.checked_add(ms).unwrap_or(i64::MAX)
-    });
+    // The total (cross-retry) `schedule_to_close` deadline is NOT resolved/persisted
+    // here (Codex #1069 P2, `runtime.rs:944`) — `now` is recorded as the stable
+    // `scheduled_at` anchor (inside `persist_scheduled_activity` → `enqueue_activity`,
+    // where the initial `run_at` doubles as `scheduled_at`), and the worker resolves
+    // the deadline from the registered spec at claim time so a LATE-registered
+    // activity keeps its declared deadline.
     persist_scheduled_activity(
         conn,
         exec,
@@ -1272,7 +1271,6 @@ fn apply_schedule_activity(
         max_attempts,
         retry_policy_json.as_deref(),
         start_to_close_ms,
-        schedule_to_close_at,
     )?;
     Ok(true)
 }
@@ -1296,10 +1294,11 @@ fn apply_schedule_activity(
 /// onto the task row so the worker enforces it as a post-execution outcome; `None`
 /// leaves it NULL (no budget, prior behavior).
 ///
-/// `schedule_to_close_at` carries the ABSOLUTE total (cross-retry) deadline
-/// resolved from the registered `ActivityInfo::default_schedule_to_close` (issue
-/// #378, Codex #1069 P2 `runtime.rs:39`): `Some(at)` persists it so the worker
-/// enforces the total cap; `None` leaves it NULL (no total deadline).
+/// The total (cross-retry) `schedule_to_close` deadline is deliberately **not** a
+/// parameter (issue #378, Codex #1069 P2 `runtime.rs:944`): `run_at` is recorded as
+/// the stable `scheduled_at` anchor (see [`queue::enqueue_activity`]), and the worker
+/// resolves the deadline from the registered spec at claim time so a LATE-registered
+/// activity keeps its declared deadline.
 #[allow(clippy::too_many_arguments)]
 pub fn persist_scheduled_activity(
     conn: &Connection,
@@ -1312,7 +1311,6 @@ pub fn persist_scheduled_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
-    schedule_to_close_at: Option<i64>,
 ) -> SqliteResult<()> {
     store::append_event(
         conn,
@@ -1335,7 +1333,6 @@ pub fn persist_scheduled_activity(
         max_attempts,
         retry_policy_json,
         start_to_close_ms,
-        schedule_to_close_at,
     )?;
     Ok(())
 }
@@ -1511,8 +1508,10 @@ fn apply_cancel_race_losers(
 /// Convert a [`std::time::Duration`] budget to whole milliseconds, saturating a
 /// pathologically-large value to [`i64::MAX`] rather than panicking/overflowing
 /// (issue #1069 P2). Used to persist an activity's `start_to_close_override` onto
-/// the task row on the same millisecond clock as every other epoch value.
-fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
+/// the task row on the same millisecond clock as every other epoch value, and by
+/// [`worker::drain_ready`](crate::worker::drain_ready) to resolve an activity's
+/// `schedule_to_close` deadline at claim time (Codex #1069 P2, `runtime.rs:944`).
+pub fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
@@ -2034,7 +2033,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -2061,7 +2059,6 @@ mod tests {
                 &serde_json::json!({}),
                 "default",
                 0,
-                None,
                 None,
                 None,
                 None,

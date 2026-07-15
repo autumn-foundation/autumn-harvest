@@ -89,6 +89,29 @@ pub fn drain_ready(
             return Err(crate::error::SqliteError::unregistered(&task.name));
         };
 
+        // Resolve the activity's TOTAL (cross-retry) schedule-to-close deadline at
+        // CLAIM time — NOT schedule time (Codex #1069 P2, `runtime.rs:944`). The
+        // `default_schedule_to_close` (issue #378) is NOT carried on the
+        // `ScheduleActivity` command; the backend resolves it BY NAME from the
+        // registered `ActivitySpec`. Resolving it at schedule time DROPPED it for a
+        // LATE-registered activity — one scheduled before its body/`ActivityInfo` was
+        // registered (the crate's supported flow: the task waits `PENDING` until the
+        // body appears, then a re-drive picks it up), because no spec existed yet and
+        // the later re-drive never backfilled it. By CLAIM time the spec is guaranteed
+        // present: an unregistered activity can never be claimed — it is released back
+        // to `PENDING` above. Anchor the absolute deadline to the task's ORIGINAL
+        // schedule instant (`scheduled_at`, never mutated by a retry requeue), NOT
+        // claim time (which would extend the wall-clock budget by however long the
+        // task waited for registration) and NOT `run_at` (which retries bump forward).
+        // For a normally-registered activity `scheduled_at == the schedule `now``, so
+        // the resolved absolute deadline is byte-identical to the old schedule-time
+        // value — no behavior change for the common case.
+        let mut task = task;
+        task.schedule_to_close_at = spec.schedule_to_close.map(|d| {
+            task.scheduled_at
+                .saturating_add(crate::runtime::duration_to_millis_saturating(d))
+        });
+
         // Enforce the activity's TOTAL (cross-retry) schedule-to-close deadline
         // BEFORE running the body (issue #378, Codex #1069 P2 `runtime.rs:39`). A
         // task drained at/after its absolute deadline — the "idle past the deadline,
@@ -736,7 +759,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .unwrap();
         conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
@@ -753,6 +775,7 @@ mod tests {
             max_attempts: None,
             retry_policy: None,
             start_to_close_ms: None,
+            scheduled_at: 0,
             schedule_to_close_at: None,
         }
     }

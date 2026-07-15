@@ -30,7 +30,8 @@ use std::time::Duration;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{HarvestError, TimeoutType};
-use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+use autumn_harvest_sqlite::{RunState, SqliteError, SqliteRuntime};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
 // ── HONORED: default_schedule_to_close (the finding's headline, issue #378) ────────
@@ -217,5 +218,171 @@ async fn a_plain_activity_registers_and_runs_unchanged() {
     assert!(
         matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(21)),
         "a plain, only-honored-defaults activity must run to completion, got {state:?}"
+    );
+}
+
+// ── HONORED across LATE registration (Codex P2, runtime.rs:944) ─────────────────────
+//
+// The `schedule_to_close` deadline (issue #378) is NOT carried on the ScheduleActivity
+// command — the backend resolves it BY NAME from the registered `ActivityInfo`. If the
+// activity is SCHEDULED before its body/`ActivityInfo` is registered (the crate's
+// supported late-registration flow: the task waits `PENDING` until the body appears,
+// then a re-drive picks it up), a *schedule-time* resolution finds no spec and persists
+// NULL — silently DROPPING the declared deadline forever, because the later re-drive
+// never backfills it.
+//
+// The fix resolves `schedule_to_close_at` at CLAIM time from the guaranteed-present
+// registered spec (an unregistered activity can never be claimed — it is released back
+// to PENDING), anchored to the task's ORIGINAL schedule instant (`scheduled_at`, never
+// mutated by retries), NOT claim time (which would extend the budget by the
+// registration wait). So a body registered LATE, past a deadline that already elapsed
+// while it waited, is sealed terminal `ActivityTimedOut { ScheduleToClose }` — exactly
+// as it would be had the body been registered up front.
+//
+// A body that would SUCCEED is used, and the deadline is passed BEFORE the re-drive, so
+// the assertion is strong: the activity is timed out even though its body would have
+// returned `Ok` — proving the deadline was honored, not the (never-run, past-deadline)
+// body result.
+#[activity(schedule_to_close = "1s")]
+async fn late_reg_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[workflow]
+async fn late_reg_wf(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    match ctx
+        .execute_activity::<_, i64>(&late_reg_act_info(), n)
+        .await
+    {
+        Ok(_) => Ok("completed".to_string()),
+        Err(HarvestError::Timeout { .. }) => Ok("sched_timed_out".to_string()),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+// RED pre-fix: `schedule_to_close` was resolved at SCHEDULE time, when the activity was
+// not yet registered, so a NULL deadline was persisted and never backfilled — the
+// late-registered body simply ran and recorded `ActivityCompleted`, silently ignoring
+// its declared 1s total deadline.
+#[tokio::test]
+async fn schedule_to_close_survives_late_activity_registration() {
+    // Deterministic clock (the `_as_of` seam): the activity is scheduled at t0 and the
+    // re-drive is 10s later — well past the 1s deadline — with no wall-clock coupling.
+    let t0: DateTime<Utc> = DateTime::from_timestamp(7_000_000, 0).unwrap();
+
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&late_reg_wf_info());
+    // NOTE: `late_reg_act` is deliberately NOT registered yet — it is scheduled first,
+    // then registered LATE (the crate's supported late-registration flow).
+    let exec = rt.start_workflow("late_reg_wf", json!(7)).unwrap();
+
+    // First drive at t0: schedules the activity (scheduled_at = t0), claims it, misses
+    // the (unregistered) body → releases the claim → surfaces UnregisteredActivity. The
+    // task is now PENDING with a stable scheduled_at = t0.
+    let err = rt.run_until_blocked_as_of(exec, t0).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::UnregisteredActivity(ref n) if n == "late_reg_act"),
+        "expected UnregisteredActivity(late_reg_act), got {err}"
+    );
+
+    // Register the body LATE, carrying the declared 1s deadline. A body that would
+    // SUCCEED (`Ok`) — yet it must still be timed out below, because the deadline
+    // elapsed while it waited for registration.
+    rt.register_activity(&late_reg_act_info(), Ok);
+
+    // Re-drive 10s later — well past the 1s total deadline. The claim resolves the
+    // deadline from the now-registered spec anchored to scheduled_at(t0), sees it has
+    // passed, and seals a terminal `ActivityTimedOut { ScheduleToClose }` BEFORE running
+    // the (would-succeed) body.
+    let state = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "sched_timed_out"),
+        "the workflow must observe the schedule-to-close timeout even for a \
+         LATE-registered activity, got {state:?}"
+    );
+
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: TimeoutType::ScheduleToClose,
+                ..
+            }
+        )),
+        "a late-registered activity past its total deadline must record a terminal \
+         ActivityTimedOut {{ ScheduleToClose }} (RED pre-fix: the deadline was dropped \
+         at schedule time and the body simply completed):\n{history:?}"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        "a body past its (honored) total deadline must NOT complete — even a \
+         would-succeed body (RED pre-fix recorded ActivityCompleted):\n{history:?}"
+    );
+}
+
+// ── Control: a LATE-registered activity WITHIN its deadline still completes ─────────
+//
+// Symmetric to the timeout case: registering late, but re-driving BEFORE the deadline,
+// must complete normally — the claim-time resolution anchored to the ORIGINAL schedule
+// instant must not spuriously time out a body that is genuinely in-deadline.
+#[activity(schedule_to_close = "300s")]
+async fn late_reg_ok_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[workflow]
+async fn late_reg_ok_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let out: i64 = ctx
+        .execute_activity(&late_reg_ok_act_info(), n)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+#[tokio::test]
+async fn late_registered_activity_within_deadline_completes_normally() {
+    let t0: DateTime<Utc> = DateTime::from_timestamp(8_000_000, 0).unwrap();
+
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&late_reg_ok_wf_info());
+    let exec = rt.start_workflow("late_reg_ok_wf", json!(9)).unwrap();
+
+    // Schedule at t0 with the body still unregistered.
+    let err = rt.run_until_blocked_as_of(exec, t0).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::UnregisteredActivity(ref n) if n == "late_reg_ok_act"),
+        "expected UnregisteredActivity(late_reg_ok_act), got {err}"
+    );
+
+    // Register late and re-drive only 5s later — well within the 300s deadline.
+    rt.register_activity(&late_reg_ok_act_info(), Ok);
+    let state = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(5))
+        .await
+        .unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(9)),
+        "a late-registered, in-deadline body must complete normally, got {state:?}"
+    );
+
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        "an in-deadline late-registered body records ActivityCompleted:\n{history:?}"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityTimedOut { .. })),
+        "an in-deadline body must NOT be falsely timed out by the claim-time \
+         resolution:\n{history:?}"
     );
 }

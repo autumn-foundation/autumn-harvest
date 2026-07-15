@@ -91,22 +91,28 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
                                            -- { StartToClose } instead of ActivityCompleted,
                                            -- byte-equivalent to what the Postgres timeout
                                            -- scanner durably records.
-    schedule_to_close_at INTEGER           -- ABSOLUTE epoch-millisecond total deadline
-                                           -- (issue #378) resolved at DISPATCH from the
-                                           -- registered ActivityInfo's default_schedule_to_close
-                                           -- (Codex #1069 P2, runtime.rs:39). NOT carried on
-                                           -- the ScheduleActivity command — the registry
-                                           -- supplies it by name at dispatch, exactly as the
-                                           -- Postgres worker resolves ActivityInfo from its
-                                           -- HandlerRegistry. NULL = no total deadline (the
-                                           -- retry policy's max_attempts is the only bound).
-                                           -- Enforced by the worker as the cross-retry
-                                           -- wall-clock cap: a task drained past it, or a
-                                           -- retry whose next attempt would land at/after it,
-                                           -- records a terminal ActivityTimedOut
-                                           -- { ScheduleToClose } instead of retrying/completing,
-                                           -- byte-equivalent to the Postgres
-                                           -- schedule_to_close enforcement.
+    scheduled_at INTEGER NOT NULL          -- ABSOLUTE epoch-millisecond the ScheduleActivity
+                                           -- command was persisted (== the initial `run_at`).
+                                           -- The STABLE anchor for the activity's total
+                                           -- (cross-retry) schedule_to_close deadline (issue
+                                           -- #378, Codex #1069 P2 runtime.rs:944): unlike
+                                           -- `run_at`, it is NEVER mutated by a retry requeue,
+                                           -- so it always denotes when the activity was first
+                                           -- scheduled. The deadline itself is NOT persisted
+                                           -- here — the `ActivityInfo::default_schedule_to_close`
+                                           -- is NOT carried on the ScheduleActivity command,
+                                           -- so it is resolved by name from the registered spec
+                                           -- at CLAIM time (when the body is guaranteed
+                                           -- registered — an unregistered activity can never be
+                                           -- claimed) as `scheduled_at + default_schedule_to_close`,
+                                           -- exactly as the Postgres worker resolves ActivityInfo
+                                           -- from its HandlerRegistry. Resolving at CLAIM time
+                                           -- (not schedule time) preserves the deadline for a
+                                           -- LATE-registered activity, whose spec was absent at
+                                           -- schedule time; anchoring to `scheduled_at` (not
+                                           -- claim time) keeps the wall-clock budget measured
+                                           -- from when the activity was scheduled, so a
+                                           -- registration wait does not extend it.
 );
 
 CREATE TABLE IF NOT EXISTS harvest_timers (
