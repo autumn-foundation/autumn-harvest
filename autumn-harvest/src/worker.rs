@@ -2263,6 +2263,12 @@ async fn run_local_activity_inline(
             activity_id: run.activity_id,
             name: run.name.clone(),
             input: run.input.clone(),
+            // Issue #620 (AC8): freeze the fully-resolved retry policy (already
+            // call → activity → builder resolved in `execute_local_activity_raw`)
+            // so a crash-recovery replay keeps this original budget even if the
+            // builder-level default changed in the crash window. `None` when no
+            // retry policy was resolved (pre-#620 behaviour preserved).
+            retry_policy: run.retry_policy.clone(),
         });
     }
     prefix_events.extend(post_schedule_events);
@@ -4560,10 +4566,24 @@ async fn persist_scheduled_activities(
         }
 
         // Issue #620: call-site override → activity default → builder default.
+        //
+        // Reserved worker-session internal activities (issue #606,
+        // `__harvest_session_acquire` / `__harvest_session_release`) are
+        // engine-internal machinery bounded by schedule_to_start /
+        // SessionOptions::acquisition_timeout, NOT by a user retry/timeout
+        // floor. They must NOT inherit the builder-level default — fall back to
+        // the pre-feature resolution (call-site override → activity default) for
+        // them so an operator's floor never governs session acquire/release.
+        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
+        let builder_retry_default = if is_reserved {
+            None
+        } else {
+            registry.default_activity_retry_policy()
+        };
         let effective_retry = crate::policy::resolve_effective_retry(
             scheduled.retry_policy_override.clone(),
             activity.default_retry_policy.clone(),
-            registry.default_activity_retry_policy(),
+            builder_retry_default,
         );
         if let Some(retry_policy) = effective_retry {
             params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
@@ -4580,10 +4600,17 @@ async fn persist_scheduled_activities(
                 Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
         }
         // Issue #620: call-site override → activity default → builder default.
+        // Reserved session-internal activities skip the builder floor (see the
+        // retry resolution above for the rationale).
+        let builder_stc_default = if is_reserved {
+            None
+        } else {
+            registry.default_activity_start_to_close()
+        };
         let effective_stc = crate::policy::resolve_effective_start_to_close(
             scheduled.start_to_close_override,
             activity.default_start_to_close,
-            registry.default_activity_start_to_close(),
+            builder_stc_default,
         );
         if let Some(timeout) = effective_stc {
             params.start_to_close =

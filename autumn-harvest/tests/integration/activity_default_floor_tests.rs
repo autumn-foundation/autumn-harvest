@@ -157,6 +157,29 @@ fn slow_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) 
     })
 }
 
+/// Workflow: schedule the reserved session-acquire internal activity via the
+/// raw path (mirroring how `create_session` dispatches it). Used to prove the
+/// builder-level floor does NOT leak onto engine-internal session machinery.
+/// The worker is shut down at enqueue time, so the reserved dispatch handler
+/// never runs.
+fn wf_session_acquire(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        // Reserved engine-internal session-acquire activity name (issue #606);
+        // the public `is_reserved_session_activity_name` helper classifies it,
+        // and the worker auto-registers an `ActivityInfo` stub for it so the
+        // enqueue-time lookup succeeds.
+        ctx.execute_activity_raw(RESERVED_SESSION_ACQUIRE, input, &queue)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The reserved worker-session acquire activity name (issue #606). Kept in sync
+/// with `autumn_harvest::context`'s `pub(crate)` constant via the public
+/// `is_reserved_session_activity_name` classifier (asserted in the test below).
+const RESERVED_SESSION_ACQUIRE: &str = "__harvest_session_acquire";
+
 // ---------------------------------------------------------------------------
 // Registry / worker construction.
 // ---------------------------------------------------------------------------
@@ -296,6 +319,97 @@ async fn seed_workflow(
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
+
+    exec_id
+}
+
+/// Seed a RUNNING execution whose local activity is MID-RETRY: its history
+/// already carries `LocalActivityScheduled` (frozen with `recorded_retry`) and
+/// one `LocalActivityFailed(attempt=1)`, and a workflow task is enqueued so a
+/// worker resumes it. This reproduces the crash-recovery window for AC8: the
+/// original retry budget is frozen in history and must survive a later change to
+/// the builder-level default.
+async fn seed_local_activity_in_progress(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    activity_name: &str,
+    input: serde_json::Value,
+    queue: &str,
+    recorded_retry: Option<RetryPolicy>,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id: &format!("wf-{}", exec_id.as_uuid()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: input.clone(),
+        parent_id: None,
+        queue_name: queue,
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("insert workflow execution");
+
+    let activity_id = autumn_harvest::types::ActivityExecId::new();
+    store::append_events(
+        conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: activity_name.to_string(),
+                input: input.clone(),
+                retry_policy: recorded_retry,
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error: "attempt 1 failed (pre-crash)".to_string(),
+                attempt: 1,
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append partial local-activity history");
+
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue resume workflow task");
 
     exec_id
 }
@@ -859,5 +973,209 @@ async fn local_activity_builder_default_stc_clamped_by_max() {
             .iter()
             .any(|e| matches!(e, WorkflowEvent::LocalActivityFailed { .. })),
         "the clamped local activity must record a LocalActivityFailed (timeout)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 1 (issue #606 interaction) — the builder-level floor must NOT leak onto
+// the reserved worker-session internal activities. They are engine machinery
+// bounded by schedule_to_start / acquisition-timeout, not a user retry/timeout
+// floor; inheriting a builder default would govern session acquire/release.
+// The enqueued reserved task must therefore keep the PRE-FEATURE resolution:
+// the EnqueueParams default (max_attempts = 3) and a NULL start_to_close.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_session_activity_does_not_inherit_builder_default() {
+    // Sanity: the literal used by the workflow handler is the classified
+    // reserved name, so this test cannot silently drift from the engine const.
+    assert!(
+        autumn_harvest::context::is_reserved_session_activity_name(RESERVED_SESSION_ACQUIRE),
+        "the test's reserved-name literal must match the engine classifier"
+    );
+
+    let (url, _container) = setup_db().await;
+    let queue = "q620-reserved-session";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_session_acquire",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // A deliberately conspicuous builder default (max_attempts = 9, STC = 30s).
+    // The reserved session-acquire activity declares neither its own retry nor
+    // start_to_close, so WITHOUT the guard it would inherit 9 / 30s; WITH the
+    // guard it must stay at the pre-feature values (3 / NULL).
+    let registry = build_registry(
+        vec![wf_info("wf_session_acquire", wf_session_acquire)],
+        // No user activity registration needed — the worker auto-registers the
+        // reserved session-acquire ActivityInfo stub for the enqueue lookup.
+        vec![],
+        Some(RetryPolicy::fixed(9, Duration::from_millis(10))),
+        Some(Duration::from_secs(30)),
+    );
+    let worker = build_worker(
+        "w620-reserved",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let task = run_until_activity_enqueued(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        RESERVED_SESSION_ACQUIRE,
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        task.max_attempts, 3,
+        "a reserved session-internal activity must NOT inherit the builder \
+         default retry (9); it keeps the EnqueueParams default (3)"
+    );
+    assert!(
+        task.retry_policy.is_none(),
+        "a reserved session-internal activity must carry a NULL retry_policy — \
+         the builder default must not be resolved for it"
+    );
+    assert!(
+        task.start_to_close.is_none(),
+        "a reserved session-internal activity must carry a NULL start_to_close — \
+         the builder default (30s) must not be resolved for it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2 (AC8) — a local activity mid-retry must keep its ORIGINAL retry budget
+// across a crash even if the builder-level default is changed in the recovery
+// window. The budget is frozen into the `LocalActivityScheduled` event at first
+// schedule; the recovery path reads it back rather than re-deriving from the
+// (now-changed) builder default.
+//
+// Scenario: original builder default fixed(2). The activity ran attempt 1 and
+// crashed (history: LocalActivityScheduled{retry=fixed(2)} + Failed(1)). The
+// operator then LOWERS the builder default to fixed(1) and the worker resumes.
+// With the fix, the recorded fixed(2) governs → attempt 2 runs → 2 failures.
+// WITHOUT the fix, the re-derived fixed(1) would exhaust immediately (only the
+// 1 pre-crash failure), never running attempt 2.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_mid_retry_keeps_original_budget_across_default_change() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-ac8-recovery";
+    let mut conn = connect(&url).await;
+
+    // Freeze the ORIGINAL builder default (fixed(2)) into the scheduled event,
+    // exactly as the worker would have at first schedule.
+    let exec_id = seed_local_activity_in_progress(
+        &mut conn,
+        "wf_failing_local",
+        "failing_local",
+        serde_json::json!({"v": 1}),
+        queue,
+        Some(RetryPolicy::fixed(2, Duration::from_millis(10))),
+    )
+    .await;
+
+    // The operator has since LOWERED the builder default to fixed(1). If the
+    // recovery path re-derived from this, the activity would exhaust at once.
+    let registry = build_registry(
+        vec![wf_info("wf_failing_local", wf_failing_local)],
+        vec![act_info("failing_local", failing_local, true, None, None)],
+        Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
+        None,
+    );
+    let worker = build_worker(
+        "w620-ac8",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        count_local_failed(&history),
+        2,
+        "the ORIGINAL frozen retry budget (fixed(2)) must survive the builder \
+         default change to fixed(1): attempt 2 must still run, yielding 2 \
+         LocalActivityFailed events — not 1 (which a re-derived fixed(1) would \
+         produce by exhausting immediately)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2 (backward compat) — a PRE-#620 partial history (no recorded
+// `retry_policy` on `LocalActivityScheduled`, i.e. `None`) falls back to the
+// current re-derived builder default on recovery, exactly as today. Here the
+// resumed builder default is fixed(3): with no frozen budget the recovery path
+// re-derives fixed(3) and runs to 3 failures.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_mid_retry_without_recorded_budget_uses_current_default() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-ac8-legacy";
+    let mut conn = connect(&url).await;
+
+    // Pre-#620 event: no frozen retry_policy.
+    let exec_id = seed_local_activity_in_progress(
+        &mut conn,
+        "wf_failing_local",
+        "failing_local",
+        serde_json::json!({"v": 1}),
+        queue,
+        None,
+    )
+    .await;
+
+    let registry = build_registry(
+        vec![wf_info("wf_failing_local", wf_failing_local)],
+        vec![act_info("failing_local", failing_local, true, None, None)],
+        Some(RetryPolicy::fixed(3, Duration::from_millis(10))),
+        None,
+    );
+    let worker = build_worker(
+        "w620-ac8-legacy",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        count_local_failed(&history),
+        3,
+        "with NO frozen budget (pre-#620 event), recovery re-derives the current \
+         builder default (fixed(3)) — 1 pre-crash failure + 2 more = 3 total"
     );
 }

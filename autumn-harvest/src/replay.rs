@@ -4954,6 +4954,9 @@ impl HistoryMatcher {
                 activity_id,
                 name: recorded_name,
                 input: recorded_input,
+                // Issue #620: the recorded resolved retry policy is not part of
+                // strict-replay matching (name + input only), so ignore it here.
+                ..
             } => {
                 if recorded_name != activity_name {
                     return HistoryMatch::Diverged {
@@ -4994,6 +4997,32 @@ impl HistoryMatcher {
             } => HistoryMatch::NoMatch,
             other => other,
         }
+    }
+
+    /// The retry policy a local activity was frozen with at first-schedule time
+    /// (issue #620, AC8). Read-only, cursor-independent: scans recorded history
+    /// for the `LocalActivityScheduled` event carrying `activity_id` and clones
+    /// its recorded `retry_policy`.
+    ///
+    /// Returns `None` for a pre-#620 event (the field is absent → deserializes
+    /// to `None`) or when no retry policy was resolved at schedule time. The
+    /// crash-recovery path in
+    /// [`WorkflowContext::execute_local_activity_raw`](crate::context::WorkflowContext::execute_local_activity_raw)
+    /// consults this so a builder-default change in the crash-recovery window
+    /// cannot shrink an in-flight local activity's retry budget.
+    #[must_use]
+    pub(crate) fn recorded_local_activity_retry(
+        &self,
+        activity_id: ActivityExecId,
+    ) -> Option<crate::policy::RetryPolicy> {
+        self.events.iter().find_map(|ev| match ev {
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: recorded_id,
+                retry_policy,
+                ..
+            } if *recorded_id == activity_id => retry_policy.clone(),
+            _ => None,
+        })
     }
 
     /// Versioning mechanism for safe workflow code changes.
@@ -8584,6 +8613,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -8609,6 +8639,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8646,6 +8677,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8681,6 +8713,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8736,6 +8769,7 @@ mod tests {
             activity_id: id,
             name: "other_activity".into(),
             input: Value::Null,
+            retry_policy: None,
         }];
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
@@ -8758,6 +8792,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8798,6 +8833,7 @@ mod tests {
                 activity_id: local_id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: local_id,
@@ -8950,6 +8986,7 @@ mod tests {
                 activity_id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,

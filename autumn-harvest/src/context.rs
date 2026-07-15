@@ -4644,10 +4644,26 @@ impl WorkflowContext {
                     ));
                 }
 
+                // Issue #620 (AC8): the retry budget for an in-flight local
+                // activity must come from the policy it was ORIGINALLY scheduled
+                // with — frozen into the `LocalActivityScheduled` event — not a
+                // re-derivation from the current builder default, which may have
+                // changed during the crash-recovery window. Recorded (original)
+                // wins; `None` for a pre-#620 event falls back to today's
+                // re-derived `retry_policy`, preserving backward compatibility.
+                // A pure, cursor-independent read: lock the matcher directly
+                // rather than routing through `match_history` so the
+                // signal-handler pump is not triggered a second time here.
+                let recorded_retry = {
+                    let matcher = self.matcher.lock().expect("matcher lock poisoned");
+                    matcher.recorded_local_activity_retry(activity_id)
+                };
+                let effective_retry = recorded_retry.or(retry_policy);
+
                 // If the recorded failure count already covers all retry
                 // attempts, return the last error immediately — no handler
                 // execution is needed and no command should be pushed.
-                let max_attempts = retry_policy.as_ref().map_or(1, |p| p.max_attempts);
+                let max_attempts = effective_retry.as_ref().map_or(1, |p| p.max_attempts);
                 if failed_attempts >= max_attempts {
                     let error = last_error.unwrap_or_else(|| {
                         format!("local activity '{name}' failed after {failed_attempts} attempts")
@@ -4657,13 +4673,16 @@ impl WorkflowContext {
 
                 // Some retry attempts remain — push the command so the worker
                 // re-runs the handler starting from the next unrecorded attempt.
+                // Thread the ORIGINAL resolved policy so the worker's own
+                // `max_attempts`/backoff derivation stays consistent with the
+                // budget check above (issue #620 AC8).
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::RunLocalActivity {
                     activity_id,
                     name: name.to_string(),
                     input,
                     start_to_close_secs,
-                    retry_policy,
+                    retry_policy: effective_retry,
                     result_tx: tx,
                     already_scheduled: true,
                     failed_attempts,
@@ -15778,6 +15797,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -15808,6 +15828,7 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -17696,6 +17717,7 @@ mod tests {
                 activity_id,
                 name: "checksum".into(),
                 input: serde_json::json!("data"),
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id,

@@ -323,6 +323,20 @@ pub enum WorkflowEvent {
         name: String,
         /// JSON input for the activity.
         input: serde_json::Value,
+        /// The fully-resolved retry policy this local activity was scheduled
+        /// with (call-site → activity default → builder default; issue #620).
+        ///
+        /// Additive/optional: pre-#620 events deserialize to `None` and fall
+        /// back to today's live re-derivation. Populated only when a retry
+        /// policy was resolved at first-schedule time. Frozen here so a local
+        /// activity mid-retry across a worker crash keeps its ORIGINAL retry
+        /// budget even if the builder-level default (`WorkerConfig::
+        /// with_default_activity_retry_policy`) is changed in the crash-recovery
+        /// window (AC8: an in-flight execution is unaffected by later default
+        /// changes). Recorded on the live frontier at first schedule; read on
+        /// crash-recovery replay — the established side-effect pattern.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_policy: Option<crate::policy::RetryPolicy>,
     },
     /// A local activity finished executing successfully.
     LocalActivityCompleted {
@@ -1136,6 +1150,7 @@ mod tests {
             activity_id: ActivityExecId::new(),
             name: "format_data".into(),
             input: serde_json::json!({"x": 1}),
+            retry_policy: None,
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
@@ -1302,6 +1317,7 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 name: "format_data".into(),
                 input: serde_json::Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: ActivityExecId::new(),

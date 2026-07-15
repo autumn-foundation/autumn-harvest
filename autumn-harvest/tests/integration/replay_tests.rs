@@ -411,6 +411,7 @@ async fn local_activity_completes_from_full_history() {
             activity_id: local_id,
             name: "format_data".into(),
             input: Value::Null,
+            retry_policy: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: local_id,
@@ -491,6 +492,7 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             activity_id: id1,
             name: "step_1".into(),
             input: Value::Null,
+            retry_policy: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id1,
@@ -500,6 +502,7 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             activity_id: id2,
             name: "step_2".into(),
             input: out1.clone(),
+            retry_policy: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id2,
@@ -538,6 +541,7 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             activity_id: id1,
             name: "step_1".into(),
             input: Value::Null,
+            retry_policy: None,
         },
         WorkflowEvent::LocalActivityFailed {
             activity_id: id1,
@@ -557,6 +561,7 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             activity_id: id2,
             name: "step_2".into(),
             input: final_out.clone(),
+            retry_policy: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id2,
@@ -592,6 +597,7 @@ async fn local_activity_exhausted_retries_fails_the_workflow() {
             activity_id: id,
             name: "step_1".into(),
             input: Value::Null,
+            retry_policy: None,
         },
         WorkflowEvent::LocalActivityFailed {
             activity_id: id,

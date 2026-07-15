@@ -1839,6 +1839,7 @@ mod tests {
                 activity_id,
                 name: "compute".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -1873,6 +1874,7 @@ mod tests {
                 activity_id,
                 name: "compute".into(),
                 input: Value::Null,
+                retry_policy: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
