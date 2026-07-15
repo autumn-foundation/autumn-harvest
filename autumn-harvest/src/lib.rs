@@ -429,6 +429,7 @@ pub use timeline::{
     SlowestStep, StepKind, StepOutcome, Timeline, TimelineEventRow, TimelineRollup, TimelineStep,
     derive_timeline,
 };
+pub use timeline_export::{export_timeline_chrome_trace, export_timeline_mermaid_gantt};
 #[cfg(any(test, feature = "testing"))]
 pub use trace_export::export_chrome_trace;
 pub use types::{
@@ -618,3 +619,4 @@ mod tests {
         assert_eq!(task_duration("0000010m"), Some(Duration::from_secs(600)));
     }
 }
+pub mod timeline_export;
