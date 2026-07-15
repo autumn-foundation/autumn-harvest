@@ -1274,6 +1274,38 @@ pub fn compute_jitter_offset(
     Duration::from_nanos(hash % jitter_nanos)
 }
 
+/// Resolve the effective activity retry policy at schedule time (issue #620).
+///
+/// Precedence, highest first:
+///   call-site override → activity `#[activity(retry = …)]` default →
+///   builder-level default (`WorkerConfig::with_default_activity_retry_policy`).
+///
+/// Returns `None` when nothing is set anywhere, preserving today's implicit
+/// fallback (the enqueue path's own `max_attempts` default). Opt-in: an unset
+/// builder default is a pure no-op via `.or(None)`.
+#[must_use]
+pub(crate) fn resolve_effective_retry(
+    call: Option<RetryPolicy>,
+    activity: Option<RetryPolicy>,
+    builder: Option<RetryPolicy>,
+) -> Option<RetryPolicy> {
+    call.or(activity).or(builder)
+}
+
+/// Resolve the effective activity `start_to_close` at schedule time (issue #620).
+///
+/// Same precedence as [`resolve_effective_retry`]: call-site override →
+/// activity default → builder default. `None` when unset (no timeout enforced),
+/// preserving today's behaviour.
+#[must_use]
+pub(crate) fn resolve_effective_start_to_close(
+    call: Option<Duration>,
+    activity: Option<Duration>,
+    builder: Option<Duration>,
+) -> Option<Duration> {
+    call.or(activity).or(builder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

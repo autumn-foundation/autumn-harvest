@@ -319,11 +319,7 @@ async fn load_history(url: &str, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
 }
 
 /// Load the single enqueued *activity* task row for `activity_name`.
-async fn load_activity_task(
-    url: &str,
-    exec_id: ExecutionId,
-    activity_name: &str,
-) -> TaskQueueItem {
+async fn load_activity_task(url: &str, exec_id: ExecutionId, activity_name: &str) -> TaskQueueItem {
     let mut conn = connect(url).await;
     let rows: Vec<TaskQueueItem> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
@@ -483,7 +479,13 @@ async fn no_retry_activity_under_builder_default_gets_max_attempts_n() {
     let (url, _container) = setup_db().await;
     let queue = "q620-builder-default";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     // Builder default max_attempts = 4; activity declares no retry.
     let registry = build_registry(
@@ -492,7 +494,12 @@ async fn no_retry_activity_under_builder_default_gets_max_attempts_n() {
         Some(RetryPolicy::fixed(4, Duration::from_millis(10))),
         None,
     );
-    let worker = build_worker("w620-default", queue, Arc::clone(&registry), Duration::from_secs(60));
+    let worker = build_worker(
+        "w620-default",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
     let pool = build_pool(&url);
 
     let task = run_until_activity_enqueued(
@@ -524,7 +531,13 @@ async fn raw_dispatched_activity_honours_builder_default() {
     let (url, _container) = setup_db().await;
     let queue = "q620-raw-default";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     // `wf_one_activity` uses `ctx.execute_activity_raw` — the DAG/raw path.
     let registry = build_registry(
@@ -533,7 +546,12 @@ async fn raw_dispatched_activity_honours_builder_default() {
         Some(RetryPolicy::fixed(4, Duration::from_millis(10))),
         None,
     );
-    let worker = build_worker("w620-raw", queue, Arc::clone(&registry), Duration::from_secs(60));
+    let worker = build_worker(
+        "w620-raw",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
     let pool = build_pool(&url);
 
     let task = run_until_activity_enqueued(
@@ -561,7 +579,13 @@ async fn declared_retry_activity_unaffected_by_builder_default() {
     let (url, _container) = setup_db().await;
     let queue = "q620-declared-wins";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     // Activity declares its own retry (max_attempts=2); builder default is 9.
     let registry = build_registry(
@@ -576,7 +600,12 @@ async fn declared_retry_activity_unaffected_by_builder_default() {
         Some(RetryPolicy::fixed(9, Duration::from_millis(10))),
         None,
     );
-    let worker = build_worker("w620-declared", queue, Arc::clone(&registry), Duration::from_secs(60));
+    let worker = build_worker(
+        "w620-declared",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
     let pool = build_pool(&url);
 
     let task = run_until_activity_enqueued(
@@ -622,7 +651,12 @@ async fn call_site_override_wins_over_builder_default() {
         Some(RetryPolicy::fixed(9, Duration::from_millis(10))),
         None,
     );
-    let worker = build_worker("w620-call", queue, Arc::clone(&registry), Duration::from_secs(60));
+    let worker = build_worker(
+        "w620-call",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
     let pool = build_pool(&url);
 
     let task = run_until_activity_enqueued(
@@ -659,7 +693,13 @@ async fn no_defaults_set_is_byte_for_byte_current_behaviour() {
     let (url, _container) = setup_db().await;
     let queue = "q620-no-defaults";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     // No builder default, no activity default, no call-site override.
     let registry = build_registry(
@@ -668,7 +708,12 @@ async fn no_defaults_set_is_byte_for_byte_current_behaviour() {
         None,
         None,
     );
-    let worker = build_worker("w620-nodefault", queue, Arc::clone(&registry), Duration::from_secs(60));
+    let worker = build_worker(
+        "w620-nodefault",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
     let pool = build_pool(&url);
 
     let task = run_until_activity_enqueued(
@@ -705,7 +750,13 @@ async fn local_activity_honours_builder_default_retry() {
     let (url, _container) = setup_db().await;
     let queue = "q620-local-retry";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_failing_local", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_failing_local",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     // Builder default retry max_attempts=3; local activity always fails; the
     // workflow supplies NO call-site retry override, so the builder default is
@@ -716,10 +767,23 @@ async fn local_activity_honours_builder_default_retry() {
         Some(RetryPolicy::fixed(3, Duration::from_millis(10))),
         None,
     );
-    let worker = build_worker("w620-local-retry", queue, Arc::clone(&registry), Duration::from_secs(60));
+    let worker = build_worker(
+        "w620-local-retry",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
     let pool = build_pool(&url);
 
-    run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
 
     let history = load_history(&url, exec_id).await;
     assert_eq!(
@@ -749,7 +813,13 @@ async fn local_activity_builder_default_stc_clamped_by_max() {
     let (url, _container) = setup_db().await;
     let queue = "q620-local-stc";
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, "wf_slow_local", serde_json::json!({"v": 1}), queue).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_slow_local",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
 
     // Builder default STC = 300s, worker max_local_activity_start_to_close =
     // 200ms. A 500ms-sleeping local activity must NOT be granted the full 300s;
@@ -768,8 +838,15 @@ async fn local_activity_builder_default_stc_clamped_by_max() {
     );
     let pool = build_pool(&url);
 
-    let execution =
-        run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+    let execution = run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
 
     assert_eq!(
         execution.state, "FAILED",

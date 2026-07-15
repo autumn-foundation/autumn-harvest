@@ -909,7 +909,11 @@ impl BuiltHarvest {
         .with_current_details_cap(self.max_current_details_bytes)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_payload_offloader(self.payload_offloader.clone())
-        .with_activity_interceptors(self.activity_interceptors.clone());
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -966,7 +970,11 @@ impl BuiltHarvest {
         .with_current_details_cap(self.max_current_details_bytes)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_payload_offloader(self.payload_offloader.clone())
-        .with_activity_interceptors(self.activity_interceptors.clone());
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -2402,6 +2410,23 @@ pub struct WorkerConfig {
     /// Any local activity registered with `start_to_close > cap` is rejected
     /// at builder `try_build()` time.
     pub max_local_activity_start_to_close: Duration,
+    /// Builder-level default activity retry policy (issue #620).
+    ///
+    /// Applied at schedule time as the lowest-priority fallback in the
+    /// precedence chain: call-site override → activity `#[activity(retry = …)]`
+    /// default → this builder default → implicit fallback. `None` (the default)
+    /// is opt-in — an unset floor leaves today's behaviour byte-for-byte
+    /// unchanged. Set via [`WorkerConfig::with_default_activity_retry_policy`].
+    pub default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
+    /// call-site override → activity default → this builder default → no
+    /// timeout. `None` (the default) is opt-in. For *local* activities the
+    /// resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
+    /// [`WorkerConfig::with_default_activity_start_to_close`].
+    pub default_activity_start_to_close: Option<Duration>,
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
@@ -2559,6 +2584,8 @@ impl Default for WorkerConfig {
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -2957,6 +2984,32 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_max_concurrent_sessions(mut self, n: i32) -> Self {
         self.max_concurrent_sessions = n;
+        self
+    }
+
+    /// Set the builder-level default activity retry policy (issue #620).
+    ///
+    /// Resolved at schedule time as the lowest-priority fallback: a call-site
+    /// override or an activity's own `#[activity(retry = …)]` default both win
+    /// over this floor. Unset (the default) leaves today's behaviour
+    /// byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_default_activity_retry_policy(
+        mut self,
+        policy: crate::policy::RetryPolicy,
+    ) -> Self {
+        self.default_activity_retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
+    /// For *local* activities the resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`].
+    #[must_use]
+    pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
+        self.default_activity_start_to_close = Some(timeout);
         self
     }
 }

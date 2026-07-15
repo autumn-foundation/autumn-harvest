@@ -1796,6 +1796,12 @@ pub struct WorkflowContext {
     /// size cap is not tripped by it. `None` means no store registered — caps are
     /// enforced exactly as before.
     payload_offload_threshold: Option<u64>,
+    /// Builder-level default activity retry policy (issue #620). Used by the
+    /// LOCAL activity path as the lowest-priority fallback. `None` = no floor.
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` (issue #620). Used by the
+    /// LOCAL activity path (still clamped by the worker's local-STC cap). `None`.
+    default_activity_start_to_close: Option<Duration>,
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
@@ -2193,6 +2199,8 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             payload_offload_threshold: None,
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -2335,6 +2343,8 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             payload_offload_threshold: None,
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -2392,6 +2402,8 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             payload_offload_threshold: None,
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -2479,6 +2491,23 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_offload_threshold = threshold;
+        self
+    }
+
+    /// Install the builder-level default activity retry/timeout floor (issue #620).
+    ///
+    /// Consumed by the LOCAL activity path (`execute_local_activity_with_opts`)
+    /// as the lowest-priority fallback. Both `None` (the default) preserves
+    /// today's behaviour. The regular/DAG activity path resolves the same floor
+    /// worker-side in `persist_scheduled_activities`.
+    #[must_use]
+    pub fn with_activity_defaults(
+        mut self,
+        retry: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<Duration>,
+    ) -> Self {
+        self.default_activity_retry_policy = retry;
+        self.default_activity_start_to_close = start_to_close;
         self
     }
 
@@ -4530,6 +4559,18 @@ impl WorkflowContext {
         retry_policy: Option<crate::policy::RetryPolicy>,
         start_to_close_secs: Option<u64>,
     ) -> HarvestResult<Value> {
+        // Issue #620: builder-level default activity floor, applied as the
+        // lowest-priority fallback. `_with_opts` has already resolved
+        // call-site → activity-level into `retry_policy`/`start_to_close_secs`,
+        // so appending the builder default here yields the full precedence
+        // (call → activity → builder). A direct `_raw` caller with `None`
+        // (e.g. a DAG/raw local dispatch) falls straight through to the builder
+        // default. Both `None` = today's behaviour, byte-for-byte. The
+        // regular/remote path resolves the same floor worker-side via the
+        // shared `policy::resolve_effective_*` helpers.
+        let retry_policy = retry_policy.or_else(|| self.default_activity_retry_policy.clone());
+        let start_to_close_secs = start_to_close_secs
+            .or_else(|| self.default_activity_start_to_close.map(|d| d.as_secs()));
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_local_activity_strict(name, &input))
         } else {

@@ -465,6 +465,13 @@ pub struct HandlerRegistry {
     /// manual publish step.
     #[cfg(feature = "wasm-activities")]
     wasm_module_registrations: Vec<(String, Vec<u8>)>,
+    /// Builder-level default activity retry policy (issue #620). `None` = no
+    /// floor configured; the schedule-time resolution is a pure no-op preserving
+    /// today's behaviour byte-for-byte.
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` (issue #620). `None` = no
+    /// floor configured.
+    default_activity_start_to_close: Option<Duration>,
 }
 
 impl HandlerRegistry {
@@ -609,6 +616,8 @@ impl HandlerRegistry {
             wasm_store: None,
             #[cfg(feature = "wasm-activities")]
             wasm_module_registrations: Vec::new(),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
         }
     }
 
@@ -764,6 +773,35 @@ impl HandlerRegistry {
     #[must_use]
     pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
         &self.wasm_module_registrations
+    }
+
+    /// Install the builder-level default activity retry/timeout floor (issue #620).
+    ///
+    /// Both are `None` by default — an unset floor is a pure no-op preserving
+    /// today's behaviour byte-for-byte. Resolved at schedule time as the
+    /// lowest-priority fallback: a call-site override or an activity's own
+    /// `#[activity(retry = …/start_to_close = …)]` default both win.
+    #[must_use]
+    pub fn with_activity_defaults(
+        mut self,
+        retry: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<Duration>,
+    ) -> Self {
+        self.default_activity_retry_policy = retry;
+        self.default_activity_start_to_close = start_to_close;
+        self
+    }
+
+    /// Borrow the builder-level default activity retry policy (issue #620).
+    #[must_use]
+    pub fn default_activity_retry_policy(&self) -> Option<crate::policy::RetryPolicy> {
+        self.default_activity_retry_policy.clone()
+    }
+
+    /// The builder-level default activity `start_to_close` (issue #620).
+    #[must_use]
+    pub const fn default_activity_start_to_close(&self) -> Option<Duration> {
+        self.default_activity_start_to_close
     }
 
     /// Clone the shared state reference for runtime contexts.
@@ -10406,6 +10444,10 @@ async fn process_workflow_task(
                     .payload_offloader()
                     .map(crate::payload_store::PayloadOffloader::threshold),
                 telemetry.metrics.clone(),
+                // Issue #620: builder-level default activity retry/timeout floor,
+                // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
+                registry.default_activity_retry_policy(),
+                registry.default_activity_start_to_close(),
             )
             .await;
 
