@@ -1304,8 +1304,25 @@ impl HarvestBuilder {
         if self.wasm_store.is_none() {
             self.wasm_store = Some(Arc::new(crate::wasm_activities::WasmModuleStore::new()));
         }
-        self.wasm_module_registrations
-            .push((registration.name, registration.wasm_bytes));
+        // Keep the registration byte-blobs last-wins consistent with the binding
+        // (`wasm_bindings.insert`) and the `ActivityInfo` registry, both of which
+        // use the LATER definition on a duplicate name (issue #965 review). A
+        // blind append would leave the STALE first blob's bytes in the vector;
+        // `seed_registered_wasm_modules` activates the first same-name row when
+        // none is active, so on a clean shard it would seed+activate those stale
+        // bytes under the newer binding/retry/queue metadata — a mismatch.
+        // Replace-on-insert so exactly one entry per name survives, matching the
+        // last registration.
+        if let Some(existing) = self
+            .wasm_module_registrations
+            .iter_mut()
+            .find(|(existing_name, _)| *existing_name == registration.name)
+        {
+            existing.1 = registration.wasm_bytes;
+        } else {
+            self.wasm_module_registrations
+                .push((registration.name, registration.wasm_bytes));
+        }
         self
     }
 
@@ -4480,5 +4497,34 @@ mod tests {
             built.completion_callback_config().retry_policy.max_attempts,
             5
         );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn duplicate_wasm_activity_registration_is_last_wins() {
+        use crate::policy::RetryPolicy;
+        use crate::wasm_store::WasmActivityRegistration;
+        use std::time::Duration;
+
+        let builder = HarvestBuilder::new()
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", vec![1, 1, 1])
+                    .with_queue("first")
+                    .with_retry(RetryPolicy::fixed(2, Duration::from_millis(10))),
+            )
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", vec![2, 2, 2])
+                    .with_queue("second")
+                    .with_retry(RetryPolicy::fixed(7, Duration::from_millis(20))),
+            );
+
+        // Exactly one registration entry for the name, carrying the LATER bytes.
+        let regs: Vec<&(String, Vec<u8>)> = builder
+            .wasm_module_registrations
+            .iter()
+            .filter(|(n, _)| n == "checksum")
+            .collect();
+        assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
+        assert_eq!(regs[0].1, vec![2, 2, 2], "must retain the later bytes");
     }
 }

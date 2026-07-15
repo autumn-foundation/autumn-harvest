@@ -34,10 +34,12 @@ use autumn_harvest::wasm_activities::{
     WasmCapabilities, WasmLimits, WasmModuleStore, invoke_wasm_activity,
 };
 use autumn_harvest::wasm_store::{
-    MAX_WASM_MODULE_BYTES, WasmBinding, WasmDispatch, fetch_wasm_module_bytes, list_wasm_modules,
-    publish_registered_wasm_modules, publish_wasm_module, resolve_active_wasm_hash,
-    resolve_active_wasm_module, resolve_wasm_dispatch, seed_wasm_module,
+    MAX_WASM_MODULE_BYTES, WasmActivityRegistration, WasmBinding, WasmDispatch,
+    fetch_wasm_module_bytes, list_wasm_modules, publish_registered_wasm_modules,
+    publish_wasm_module, resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_wasm_module,
 };
+use autumn_harvest::HarvestBuilder;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
 use chrono::Utc;
@@ -603,6 +605,56 @@ async fn seed_does_not_clobber_an_existing_active_version() {
         "the seeded v1 bytes are still fetchable by hash"
     );
     assert_eq!(total_rows(&mut conn, "echo").await, 2);
+}
+
+#[tokio::test]
+async fn duplicate_registration_seeds_the_later_bytes() {
+    // Finding 12 (issue #965 review): registering the same activity name twice
+    // with DIFFERENT bytes must keep only the LATER blob in the builder's
+    // registration vector, so seeding a clean shard activates the module that
+    // matches the last binding/retry/queue metadata — not the stale first blob.
+    let v1 = echo_bytes();
+    let v2 = echo_bytes_v2();
+    assert_ne!(v1, v2, "the two versions must differ for this test");
+    let h2 = WasmModuleStore::compute_hash(&v2);
+
+    let built = HarvestBuilder::new()
+        .wasm_activity(WasmActivityRegistration::new("echo", v1).with_queue("first"))
+        .wasm_activity(WasmActivityRegistration::new("echo", v2).with_queue("second"))
+        .build();
+
+    // Exactly one registration entry survives, carrying the later bytes.
+    let regs: Vec<&(String, Vec<u8>)> = built
+        .wasm_module_registrations()
+        .iter()
+        .filter(|(n, _)| n == "echo")
+        .collect();
+    assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
+    assert_eq!(regs[0].1, echo_bytes_v2(), "must retain the later bytes");
+
+    // Seeding those registrations into a clean shard activates the later module.
+    let (pool, _c) = conn_and_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+
+    seed_registered_wasm_modules(&mut conn, built.wasm_module_registrations())
+        .await
+        .expect("seed registered modules");
+
+    assert_eq!(
+        resolve_active_wasm_hash(&mut conn, "echo")
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some(h2.as_str()),
+        "the ACTIVE module must be the later (second) registration's bytes"
+    );
+    assert_eq!(active_count(&mut conn, "echo").await, 1);
+    assert_eq!(
+        total_rows(&mut conn, "echo").await,
+        1,
+        "only one row (the later bytes) is seeded, not the stale first blob"
+    );
 }
 
 // ── small query helpers ─────────────────────────────────────────────────────
