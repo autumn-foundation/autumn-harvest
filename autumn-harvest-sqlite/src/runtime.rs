@@ -9,7 +9,9 @@ use autumn_harvest::builder::{
     DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
 };
 use autumn_harvest::context::{DEFAULT_CURRENT_DETAILS_CAP_BYTES, empty_shared_state};
-use autumn_harvest::executor::run_workflow_with_state_history_policy_and_caps;
+use autumn_harvest::executor::{
+    WorkflowExecuteSpanMeta, run_workflow_with_state_history_policy_and_caps,
+};
 use autumn_harvest::{
     ActivityExecId, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand,
     WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowInfo, WorkflowOutcome,
@@ -352,6 +354,13 @@ impl SqliteRuntime {
 
     /// Start a fresh workflow execution, appending its `WorkflowStarted` event.
     ///
+    /// The run's business `workflow_id` (the value `ctx.info().workflow_id` reports,
+    /// issue #698 — documented for minting idempotency keys) defaults to the
+    /// generated [`ExecutionId`]'s string form, so it is never empty and distinct
+    /// per run. To supply your own business id (cross-backend parity with the
+    /// Postgres `StartWorkflowParams.workflow_id`), use
+    /// [`start_workflow_with_id`](Self::start_workflow_with_id).
+    ///
     /// # Errors
     ///
     /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
@@ -360,6 +369,44 @@ impl SqliteRuntime {
     pub fn start_workflow(
         &mut self,
         workflow_name: &str,
+        input: Value,
+    ) -> SqliteResult<ExecutionId> {
+        self.start_workflow_inner(workflow_name, None, input)
+    }
+
+    /// Like [`start_workflow`](Self::start_workflow) but with a caller-supplied
+    /// business `workflow_id` — the run-scoped identifier `ctx.info().workflow_id`
+    /// reports (issue #698), for minting idempotency keys or correlating a run to
+    /// an external entity. This is the cross-backend analog of the Postgres
+    /// `StartWorkflowParams.workflow_id`: the workflow observes EXACTLY the id
+    /// passed here, stable across every replay.
+    ///
+    /// An empty/whitespace-only `workflow_id` falls back to the generated
+    /// [`ExecutionId`]'s string form (guaranteeing `ctx.info().workflow_id` is
+    /// never empty), matching the [`start_workflow`](Self::start_workflow) default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
+    /// registered handler, or [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a
+    /// persistence failure.
+    pub fn start_workflow_with_id(
+        &mut self,
+        workflow_name: &str,
+        workflow_id: &str,
+        input: Value,
+    ) -> SqliteResult<ExecutionId> {
+        self.start_workflow_inner(workflow_name, Some(workflow_id), input)
+    }
+
+    /// Shared start path for [`start_workflow`](Self::start_workflow) and
+    /// [`start_workflow_with_id`](Self::start_workflow_with_id). `workflow_id`:
+    /// `Some(id)` uses the caller's business id (falling back to the exec-id string
+    /// form when blank); `None` defaults to the exec-id string form.
+    fn start_workflow_inner(
+        &mut self,
+        workflow_name: &str,
+        workflow_id: Option<&str>,
         input: Value,
     ) -> SqliteResult<ExecutionId> {
         if !self.workflows.contains_key(workflow_name) {
@@ -387,8 +434,18 @@ impl SqliteRuntime {
             }
         }
         let exec = ExecutionId::new();
+        // Resolve the run-scoped business `workflow_id` (issue #698, Codex #1069 P2
+        // runtime.rs:780). Default — and fall back for a blank caller-supplied id —
+        // to the exec-id string form, so `ctx.info().workflow_id` is NEVER empty and
+        // is DISTINCT per run (mirroring the Postgres worker, which injects a
+        // non-empty `StartWorkflowParams.workflow_id`). A non-blank caller id is used
+        // verbatim, so the workflow observes exactly what it was started with.
+        let workflow_id = workflow_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map_or_else(|| exec.to_string(), str::to_string);
         let tx = self.conn.transaction()?;
-        store::insert_execution(&tx, exec, workflow_name, &input)?;
+        store::insert_execution(&tx, exec, workflow_name, &workflow_id, &input)?;
         store::append_event(
             &tx,
             exec,
@@ -744,6 +801,10 @@ impl SqliteRuntime {
         let history = store::load_history(&self.conn, exec)?;
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
+        // Re-read the persisted business `workflow_id` on EVERY cycle (issue #698,
+        // Codex #1069 P2 runtime.rs:780) so `ctx.info().workflow_id` is STABLE across
+        // replays — it is threaded into the context below, never regenerated.
+        let workflow_id = store::workflow_id_of(&self.conn, exec)?;
         let handler = *self
             .workflows
             .get(&workflow_name)
@@ -761,15 +822,16 @@ impl SqliteRuntime {
         //
         // FIX C (cross-backend fidelity, Codex #1069): thread the real
         // `workflow_name` into the context via the dedicated `workflow_name`
-        // parameter (the one that populates `ctx.info().workflow_type`, issue #698 —
-        // `span_meta.workflow_name` feeds only the OTel span, which this backend has
-        // no worker for). The lighter `run_workflow_with_state` hard-codes it to
-        // `""`, so a workflow that records/branches on the replay-safe
-        // `ctx.info().workflow_type` would persist `""` here while the Postgres
-        // worker injects the real handler name — a divergence on the very
-        // byte-identity guarantee this crate makes. All other arguments reproduce
-        // `run_workflow_with_state`'s own defaults exactly (unchanged behavior);
-        // `span_meta` stays `None` (OTel-only) and there is no queue notion here.
+        // parameter (the one that populates `ctx.info().workflow_type`, issue #698).
+        // The lighter `run_workflow_with_state` hard-codes it to `""`, so a workflow
+        // that records/branches on the replay-safe `ctx.info().workflow_type` would
+        // persist `""` here while the Postgres worker injects the real handler name.
+        //
+        // FIX (Codex #1069 P2, runtime.rs:780): the business `workflow_id` has NO
+        // dedicated parameter on this entry point — the core reads it ONLY from
+        // `span_meta.workflow_id`, so build a minimal meta carrying it (see
+        // [`drive_span_meta`]).
+        let span_meta = drive_span_meta(&workflow_name, &workflow_id);
         let (outcome, pending, _span) = run_workflow_with_state_history_policy_and_caps(
             exec,
             history.clone(),
@@ -777,10 +839,10 @@ impl SqliteRuntime {
             input,
             empty_shared_state(),
             WorkflowHistoryPolicy::default(),
-            None,           // span_meta — OTel span only; this backend has no OTel worker.
-            &[],            // declarative query handlers (none on this backend)
-            &[],            // declarative update handlers (none on this backend)
-            &workflow_name, // FIX C: the load-bearing name → ctx.info().workflow_type
+            Some(&span_meta), // FIX: the sole seam carrying business workflow_id → ctx.info()
+            &[],              // declarative query handlers (none on this backend)
+            &[],              // declarative update handlers (none on this backend)
+            &workflow_name,   // FIX C: the load-bearing name → ctx.info().workflow_type
             DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -1522,6 +1584,42 @@ pub fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
 /// future core `WorkflowCommand` variant becomes a compile error here, forcing
 /// this backend to make an explicit supported/unsupported decision for it rather
 /// than silently mislabelling it `"Unknown"`.
+/// Build the [`WorkflowExecuteSpanMeta`] the drive path threads into the core
+/// executor each cycle (Codex #1069 P2, `runtime.rs:780`).
+///
+/// The `run_workflow_with_state_history_policy_and_caps` entry point reads the
+/// business `workflow_id` (`ctx.info().workflow_id`, issue #698 — documented for
+/// minting idempotency keys) ONLY from `span_meta.workflow_id`; there is no
+/// dedicated parameter for it (unlike `workflow_name`, which populates
+/// `ctx.info().workflow_type`). Passing `span_meta = None` therefore left
+/// `ctx.info().workflow_id` empty for EVERY execution, collapsing all `SQLite` runs
+/// onto one empty id while the Postgres worker injects the real
+/// `StartWorkflowParams.workflow_id` — a silent divergence on a documented core
+/// surface.
+///
+/// Every field OTHER than `workflow_id`/`workflow_name` is set to the exact value
+/// the prior `None` produced (`queue ""`, build/timeout/deadline/parent `None`,
+/// `is_replay = false`), so the ONLY behavioral change is a non-empty
+/// `ctx.info().workflow_id`. `parent_execution_id` stays `None` because this
+/// backend rejects child-workflow commands as Unsupported (see [`command_name`]),
+/// so every `SQLite` run is top-level by design and `ctx.info().parent_execution_id`
+/// is correctly always `None`. The recorded span fields are inert here (no `OTel`
+/// worker/subscriber on this backend).
+fn drive_span_meta(workflow_name: &str, workflow_id: &str) -> WorkflowExecuteSpanMeta {
+    WorkflowExecuteSpanMeta {
+        workflow_name: workflow_name.to_string(),
+        workflow_id: workflow_id.to_string(),
+        shard_id: 0,
+        queue_name: String::new(),
+        is_replay: false,
+        link_traceparent: None,
+        build_id: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+    }
+}
+
 const fn command_name(cmd: &WorkflowCommand) -> &'static str {
     match cmd {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
@@ -2018,7 +2116,14 @@ mod tests {
     fn schedule_activity_pair_rolls_back_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
 
         {
             let tx = conn.transaction().unwrap();
@@ -2047,7 +2152,14 @@ mod tests {
     fn schedule_activity_pair_commits_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
 
         {
             let tx = conn.transaction().unwrap();
@@ -2077,7 +2189,14 @@ mod tests {
     fn start_timer_pair_rolls_back_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
 
         {
             let tx = conn.transaction().unwrap();

@@ -45,6 +45,17 @@ pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS harvest_executions (
     exec_id       TEXT PRIMARY KEY,
     workflow_name TEXT NOT NULL,
+    workflow_id   TEXT NOT NULL DEFAULT '', -- the run-scoped BUSINESS workflow id
+                                           -- (issue #698, Codex #1069 P2 runtime.rs:780):
+                                           -- the value `ctx.info().workflow_id` reports,
+                                           -- documented for minting idempotency keys.
+                                           -- Persisted at start and re-read into the
+                                           -- WorkflowContext on EVERY drive cycle, so it is
+                                           -- STABLE across replays (never regenerated).
+                                           -- Defaults to the `exec_id` string form when the
+                                           -- caller supplies none, so it is never empty and
+                                           -- distinct per run (mirrors the Postgres worker,
+                                           -- which injects StartWorkflowParams.workflow_id).
     input_json    TEXT NOT NULL,
     state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED
     output_json   TEXT,

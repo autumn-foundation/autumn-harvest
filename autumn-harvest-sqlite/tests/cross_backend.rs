@@ -300,6 +300,131 @@ async fn workflow_type_reaches_ctx_info_and_replays_on_core() {
     );
 }
 
+// ── FIX (Codex #1069 P2, runtime.rs:780): the real workflow_id reaches ctx.info() ──
+//
+// A workflow that reads the documented replay-safe `ctx.info().workflow_id` (issue
+// #698 — the run-scoped BUSINESS id, documented for minting idempotency keys) must
+// observe a NON-EMPTY, per-run-DISTINCT value on this backend, exactly as the
+// Postgres worker (which injects `StartWorkflowParams.workflow_id`) does. Pre-fix,
+// the drive path passed `span_meta = None`, so the core set `ctx.info().workflow_id`
+// to `""` for EVERY execution — collapsing all runs onto the same empty id and
+// silently diverging from Postgres on a documented core surface. The value is
+// routed through an activity input so it is recorded in history and must replay
+// byte-identically (the cross-backend byte-identity guarantee).
+
+#[workflow]
+async fn records_workflow_id(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    // Read the run's own business id and route it through an activity input (so the
+    // value is recorded in history and must replay byte-identically).
+    let wf_id = ctx.info().workflow_id;
+    let echoed = ctx
+        .execute_activity_raw("echo_str", json!(wf_id), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(echoed.as_str().unwrap_or_default().to_string())
+}
+
+#[tokio::test]
+async fn workflow_id_is_never_empty_and_distinct_across_executions() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&records_workflow_id_info());
+    rt.register_activity_raw(
+        "echo_str",
+        ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
+    );
+
+    // Two DISTINCT executions of the same workflow, neither given a business id.
+    let e1 = rt.start_workflow("records_workflow_id", json!(0)).unwrap();
+    let e2 = rt.start_workflow("records_workflow_id", json!(0)).unwrap();
+
+    let s1 = rt.run_until_blocked(e1).await.unwrap();
+    let s2 = rt.run_until_blocked(e2).await.unwrap();
+
+    let RunState::Completed(v1) = s1 else {
+        panic!("e1 did not complete: {s1:?}");
+    };
+    let RunState::Completed(v2) = s2 else {
+        panic!("e2 did not complete: {s2:?}");
+    };
+    let id1 = v1.as_str().unwrap_or_default().to_string();
+    let id2 = v2.as_str().unwrap_or_default().to_string();
+
+    // (a) never empty — RED pre-fix (both `""`).
+    assert!(
+        !id1.is_empty(),
+        "workflow_id must never be empty, got e1={id1:?}"
+    );
+    assert!(
+        !id2.is_empty(),
+        "workflow_id must never be empty, got e2={id2:?}"
+    );
+    // (c) distinct across distinct executions — RED pre-fix (both `""`, so equal →
+    // ALL runs would collapse onto one idempotency key).
+    assert_ne!(
+        id1, id2,
+        "distinct executions must observe distinct workflow_id (no collapse)"
+    );
+    // Default parity: when no business id is supplied the default is the execution
+    // id's string form, guaranteeing (a) never-empty and (c) distinct by construction.
+    assert_eq!(
+        id1,
+        e1.to_string(),
+        "default workflow_id must be the exec id's string form"
+    );
+    assert_eq!(
+        id2,
+        e2.to_string(),
+        "default workflow_id must be the exec id's string form"
+    );
+}
+
+#[tokio::test]
+async fn caller_supplied_workflow_id_is_observed_exactly_and_replays() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&records_workflow_id_info());
+    rt.register_activity_raw(
+        "echo_str",
+        ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
+    );
+
+    // (d) A caller-supplied business id must be observed EXACTLY (cross-backend
+    // parity with Postgres `StartWorkflowParams.workflow_id`).
+    let exec = rt
+        .start_workflow_with_id("records_workflow_id", "subscription-42", json!(0))
+        .unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "subscription-42"),
+        "ctx.info().workflow_id must equal the caller-supplied business id, got {state:?}"
+    );
+
+    // The activity input recorded the business id into history.
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { input, .. }
+                if input.as_str() == Some("subscription-42")
+        )),
+        "the recorded activity input must carry the business workflow_id:\n{history:?}"
+    );
+
+    // (b) Replay-stability: a core replay re-drives the recorded history across
+    // every cycle, threading the same business id; a per-cycle-varying workflow_id
+    // would diverge the recorded activity input and fail replay. The replayer sources
+    // `workflow_id` from the execution row (issue #698), so thread it explicitly —
+    // mirroring how the Postgres worker injects it.
+    let report = WorkflowReplayer::new()
+        .register_fn("records_workflow_id", records_workflow_id_info().handler)
+        .with_workflow_id("subscription-42")
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a history recording ctx.info().workflow_id must replay on the core:\n{report}"
+    );
+}
+
 // ── FIX 1 (Codex #1069 P2, runtime.rs:660): typed workflow failures preserve
 //    metadata and stay byte-equivalent to the Postgres path ─────────────────────
 //

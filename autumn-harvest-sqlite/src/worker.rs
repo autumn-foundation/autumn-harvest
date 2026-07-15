@@ -791,7 +791,14 @@ mod tests {
     fn requeued_run_at(policy: Option<RetryPolicy>, now: i64, failure_now: i64) -> i64 {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         let mut task = seed_running_task(&conn, exec, "act");
         task.retry_policy = policy;
         let tx = conn.transaction().unwrap();
@@ -854,7 +861,14 @@ mod tests {
     fn finalize_rolls_back_terminal_event_and_task_transition_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         let task = seed_running_task(&conn, exec, "act");
 
         {
@@ -880,7 +894,14 @@ mod tests {
     fn finalize_commits_terminal_event_and_done_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         let task = seed_running_task(&conn, exec, "act");
 
         {
@@ -907,7 +928,14 @@ mod tests {
     fn finalize_retryable_failure_requeues_without_terminal_event() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         let task = seed_running_task(&conn, exec, "act");
 
         let produced =
@@ -933,7 +961,14 @@ mod tests {
     fn timer_fire_commits_event_and_flag_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         queue::enqueue_timer(&conn, exec, "t1", 0).unwrap();
 
         fire_timer(&mut conn, exec, "t1").unwrap();
@@ -957,7 +992,14 @@ mod tests {
     fn timer_fire_rolls_back_event_and_flag_together() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         queue::enqueue_timer(&conn, exec, "t1", 0).unwrap();
 
         {
@@ -1077,7 +1119,14 @@ mod tests {
     fn ingest_reorders_only_the_raced_deadline_timer_ahead_of_the_signal() {
         let conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
 
         // Signal arrives at t=100.
         store::stage_signal(&conn, exec, "go", &serde_json::json!("v"), 100).unwrap();
@@ -1302,7 +1351,14 @@ mod tests {
     fn finalize_oversized_result_records_non_retryable_payload_too_large_terminal() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         let task = seed_running_task(&conn, exec, "act");
 
         // A JSON string whose SERIALIZED length exceeds the 2 MiB result cap.
@@ -1355,7 +1411,14 @@ mod tests {
     fn finalize_under_cap_result_completes_normally() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         let task = seed_running_task(&conn, exec, "act");
 
         let produced = super::finalize_activity_result(
@@ -1398,7 +1461,14 @@ mod tests {
     fn drain_ready_seals_schedule_to_close_when_deadline_elapses_during_a_successful_body() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         // scheduled_at == run_at == 0 → resolved absolute deadline = 0 + 1000ms = 1000.
         seed_pending_activity(&conn, exec, "act");
 
@@ -1446,7 +1516,14 @@ mod tests {
     fn drain_ready_completes_a_successful_body_finalized_before_the_deadline() {
         let mut conn = open();
         let exec = ExecutionId::new();
-        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
         seed_pending_activity(&conn, exec, "act");
 
         let mut activities = std::collections::HashMap::new();

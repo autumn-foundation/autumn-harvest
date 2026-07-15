@@ -37,14 +37,16 @@ pub fn insert_execution(
     conn: &Connection,
     exec_id: ExecutionId,
     workflow_name: &str,
+    workflow_id: &str,
     input: &Value,
 ) -> SqliteResult<()> {
     conn.execute(
-        "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
-         VALUES (?1, ?2, ?3, 'RUNNING')",
+        "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state) \
+         VALUES (?1, ?2, ?3, ?4, 'RUNNING')",
         params![
             exec_id.to_string(),
             workflow_name,
+            workflow_id,
             serde_json::to_string(input)?
         ],
     )?;
@@ -102,6 +104,18 @@ pub fn execution_error(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<
 pub fn workflow_name_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
     Ok(conn.query_row(
         "SELECT workflow_name FROM harvest_executions WHERE exec_id = ?1",
+        params![exec_id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// The run-scoped business `workflow_id` recorded at start (issue #698). Re-read on
+/// every drive cycle and threaded into the [`WorkflowContext`] so
+/// `ctx.info().workflow_id` is stable across replays and never empty (defaults to
+/// the `exec_id` string form when the caller supplied no business id).
+pub fn workflow_id_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
+    Ok(conn.query_row(
+        "SELECT workflow_id FROM harvest_executions WHERE exec_id = ?1",
         params![exec_id.to_string()],
         |row| row.get(0),
     )?)
