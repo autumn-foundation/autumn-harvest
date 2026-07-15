@@ -4551,10 +4551,12 @@ async fn persist_scheduled_activities(
             params.required_capabilities = Some(serde_json::to_value(&reqs)?);
         }
 
-        let effective_retry = scheduled
-            .retry_policy_override
-            .clone()
-            .or_else(|| activity.default_retry_policy.clone());
+        // Issue #620: call-site override → activity default → builder default.
+        let effective_retry = crate::policy::resolve_effective_retry(
+            scheduled.retry_policy_override.clone(),
+            activity.default_retry_policy.clone(),
+            registry.default_activity_retry_policy(),
+        );
         if let Some(retry_policy) = effective_retry {
             params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
                 HarvestError::Config(format!(
@@ -4569,9 +4571,12 @@ async fn persist_scheduled_activities(
             params.heartbeat_timeout =
                 Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
         }
-        let effective_stc = scheduled
-            .start_to_close_override
-            .or(activity.default_start_to_close);
+        // Issue #620: call-site override → activity default → builder default.
+        let effective_stc = crate::policy::resolve_effective_start_to_close(
+            scheduled.start_to_close_override,
+            activity.default_start_to_close,
+            registry.default_activity_start_to_close(),
+        );
         if let Some(timeout) = effective_stc {
             params.start_to_close =
                 Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
