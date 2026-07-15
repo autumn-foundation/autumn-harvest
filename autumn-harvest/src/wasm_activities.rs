@@ -79,6 +79,31 @@ pub const WASM_MAX_TABLE_ELEMENTS: usize = 100_000;
 /// (issue #965 review).
 pub const WASM_MAX_TABLES: usize = 16;
 
+/// Maximum number of linear memories a single guest may instantiate
+/// (issue #965 review round 3).
+///
+/// The JSON-over-linear-memory ABI uses exactly one exported `memory`. The
+/// `memory_size` limit caps each memory's *bytes*, but wasmtime otherwise
+/// permits many memories per store, so N individually sub-ceiling memories
+/// could collectively exceed the sandbox. This caps the memory *count*; the
+/// multi-memory proposal is *also* disabled at the engine (`wasm_multi_memory`)
+/// so a multi-memory module fails validation outright — belt-and-braces.
+pub const WASM_MAX_MEMORIES: usize = 1;
+
+/// Maximum number of module instances a single guest invocation may create
+/// (issue #965 review round 3).
+///
+/// One instance per invocation — the runtime instantiates exactly one module.
+pub const WASM_MAX_INSTANCES: usize = 1;
+
+/// Guest call-stack ceiling in bytes (issue #965 review round 3).
+///
+/// Matches wasmtime's own default (512 KiB); set explicitly so deeply-recursive
+/// guest code always traps (a retryable `WasmTrap`) rather than overflowing the
+/// host worker thread's stack, independent of any future wasmtime default
+/// change. Host-function stack usage counts toward this bound too.
+pub const WASM_MAX_STACK_BYTES: usize = 512 * 1024;
+
 /// Default hard wall-clock ceiling for a single guest invocation: 5 minutes.
 ///
 /// This is the *mandatory* upper bound — even a caller that passes no
@@ -246,8 +271,42 @@ impl WasmModuleStore {
     #[must_use]
     pub fn with_cache_capacity(cap: usize) -> Self {
         let mut config = Config::new();
+        // CPU + wall-clock bounding (retained).
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        // Bound the guest call stack so deep recursion traps (retryable) rather
+        // than overflowing the host worker thread. Matches wasmtime's default;
+        // set explicitly so a future default change cannot silently unbound it.
+        config.max_wasm_stack(WASM_MAX_STACK_BYTES);
+        // Minimal-proposal core-WASM engine (issue #965 review round 3): disable
+        // every post-MVP proposal the JSON-over-linear-memory `alloc`/`run` ABI
+        // does not use, so an untrusted guest cannot reach a resource dimension
+        // *outside* the store limiter (extra linear memories, a GC heap, shared
+        // memory, fibers, ...) and the module-validation surface stays minimal.
+        // Each setter below is only reached because the corresponding wasmtime
+        // crate feature (`gc`/`threads`/`component-model`) is enabled by our
+        // default-features dependency.
+        config.wasm_multi_memory(false); // one memory per module (P1)
+        config.wasm_gc(false); // GC heap lives outside the memory-size ceiling (P1)
+        config.wasm_function_references(false); // typed non-null refs; GC prereq
+        config.wasm_threads(false); // shared memory + atomics — no cross-invocation sharing
+        config.wasm_shared_everything_threads(false);
+        config.wasm_component_model(false); // core modules only, never components
+        config.wasm_relaxed_simd(false); // host-nondeterministic instructions
+        config.wasm_tail_call(false); // unused by the ABI / rustc-emitted guests
+        config.wasm_wide_arithmetic(false);
+        config.wasm_stack_switching(false); // fibers — a separate stack resource
+        config.wasm_custom_page_sizes(false); // fixed 64 KiB pages
+        config.wasm_extended_const(false);
+        config.wasm_memory64(false); // 32-bit addressing keeps the memory bound meaningful
+        config.wasm_exceptions(false); // requires GC (disabled above)
+        config.wasm_legacy_exceptions(false);
+        // Deliberately KEPT enabled: required by the ABI or rustc-emitted guests
+        // and bounded by fuel/memory/table limits, so not host-resource-escape
+        // vectors — `reference_types` (funcref tables + `ref.null func`),
+        // `bulk_memory` (`memory.copy`/`fill`, and a `reference_types`
+        // prerequisite), `multi_value`, `simd` (`v128` is a bounded value type),
+        // `backtrace` (trap diagnostics).
         let engine = Engine::new(&config)
             .expect("wasmtime engine construction from a fixed valid config never fails");
 
@@ -633,10 +692,14 @@ fn invoke_wasm_activity_inner(
     let host = HostState {
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
-            // Bound table resources too, not just linear memory: a table lives in
-            // host storage outside the byte ceiling (issue #965 review).
-            .table_elements(WASM_MAX_TABLE_ELEMENTS)
+            // Cap every store resource dimension, not just linear-memory bytes
+            // (issue #965 review round 3): a table lives in host storage outside
+            // the byte ceiling, and multiple memories/instances would each be
+            // individually sub-cap yet collectively exceed the sandbox.
+            .memories(WASM_MAX_MEMORIES)
+            .instances(WASM_MAX_INSTANCES)
             .tables(WASM_MAX_TABLES)
+            .table_elements(WASM_MAX_TABLE_ELEMENTS)
             .trap_on_grow_failure(true)
             .build(),
         rng: seed,
