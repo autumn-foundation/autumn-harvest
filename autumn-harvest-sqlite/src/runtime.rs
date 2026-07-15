@@ -996,15 +996,41 @@ impl SqliteRuntime {
                 Err(SqliteError::Unsupported("ContinueAsNew".to_string()))
             }
             WorkflowOutcome::Suspended { commands } => {
-                let applied = self.apply_commands(exec, &history, &commands, now)?;
-                let drained =
-                    worker::drain_ready(&mut self.conn, exec, now, failure_now, &self.activities)?;
-                if applied || drained {
-                    Ok(RunState::InProgress)
-                } else {
-                    self.classify_block(exec, &commands)
-                }
+                self.drive_suspension(exec, &history, &commands, now, failure_now)
             }
+        }
+    }
+
+    /// Handle a `WorkflowOutcome::Suspended` decision cycle: persist the batch,
+    /// drain ready work, and classify the resulting block.
+    ///
+    /// `drain_ready` is gated by `worker::activity_race_in_flight` (issue #600;
+    /// Codex #1069 P1): under an unsettled activity `ctx.race()` it drains only ONE
+    /// branch to terminal so the workflow re-settles and cancels the losers before
+    /// they run. Fan-out and ordinary activities never trip the gate, so the drain
+    /// is the byte-for-byte prior drain-ALL behavior.
+    fn drive_suspension(
+        &mut self,
+        exec: ExecutionId,
+        history: &[WorkflowEvent],
+        commands: &[WorkflowCommand],
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
+        let applied = self.apply_commands(exec, history, commands, now)?;
+        let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
+        let drained = worker::drain_ready(
+            &mut self.conn,
+            exec,
+            now,
+            failure_now,
+            &self.activities,
+            settle_after_first_terminal,
+        )?;
+        if applied || drained {
+            Ok(RunState::InProgress)
+        } else {
+            self.classify_block(exec, commands)
         }
     }
 

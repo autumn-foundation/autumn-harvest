@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
-use autumn_harvest::{ExecutionId, TimeoutType, TimerId, WorkflowEvent};
+use autumn_harvest::{ExecutionId, TimeoutType, TimerId, WorkflowCommand, WorkflowEvent};
 use rusqlite::Connection;
 
 use crate::error::SqliteResult;
@@ -58,6 +58,34 @@ use crate::store;
 ///
 /// Returns `true` if any terminal event was appended (i.e. the workflow may have
 /// made progress and should be re-run).
+///
+/// # Race settling — drain ONE branch at a time (issue #600; Codex #1069 P1)
+///
+/// `settle_after_first_terminal` gates a critical `ctx.race()` correctness
+/// behavior. When a workflow is awaiting an activity `ctx.race()`, all N branches
+/// are scheduled in one suspension batch, then this loop would ordinarily drain
+/// EVERY ready branch to a terminal event before the workflow is re-polled — so by
+/// the time the core's `settle_race` picks a winner and emits `CancelRaceLosers`,
+/// every loser is already `DONE` (its body already ran, e.g. a second provider
+/// charged) and there is nothing left to cancel. That silently violates the race
+/// contract (only the winner runs; still-pending losers are cancelled) and
+/// diverges from the Postgres backend, where each activity completion wakes the
+/// workflow (one NOTIFY → one poll) so the race settles while the siblings are
+/// still pending.
+///
+/// When `settle_after_first_terminal` is `true` (the caller detected an unsettled
+/// activity race in flight — see [`history_has_unsettled_activity_race`] /
+/// [`commands_open_activity_race`]), this pass stops as soon as ONE branch
+/// produces a terminal event, so the outer `drive_one_cycle` loop re-polls the
+/// workflow BEFORE the sibling branches are drained. The re-poll lets `settle_race`
+/// pick the just-completed branch as the winner and emit `CancelRaceLosers`, which
+/// cancels the still-`PENDING` losers (a synthetic `ActivityFailed` — body never
+/// runs). Retry requeues (which append no terminal event) do NOT stop the pass, so
+/// the loop keeps draining until one branch reaches a genuine terminal, matching
+/// "first branch to finish wins". `false` is the default drain-ALL behavior, so
+/// fan-out (wait-all, N schedules in one batch, resolves only when every branch
+/// completes) and ordinary single/sequential activities are byte-for-byte
+/// unchanged — they never set the flag.
 pub fn drain_ready(
     conn: &mut Connection,
     exec_id: ExecutionId,
@@ -67,12 +95,18 @@ pub fn drain_ready(
     // `NowFn` `Arc` (wall-clock) or a `Copy` `i64` (`_as_of`), so both satisfy it.
     failure_now: &(dyn Fn() -> i64 + Send + Sync),
     activities: &HashMap<String, ActivitySpec>,
+    settle_after_first_terminal: bool,
 ) -> SqliteResult<bool> {
     let mut produced = false;
 
     // Drain activity tasks. A retry requeues at `run_at = now`, so it becomes
     // immediately ready again and this loop re-claims it — the whole retry
     // sequence converges in one drain pass under the polling model.
+    //
+    // EXCEPTION (`settle_after_first_terminal`, issue #600): under an unsettled
+    // activity `ctx.race()`, break as soon as ONE branch reaches a terminal event
+    // so the workflow re-settles and cancels the still-pending losers before they
+    // are drained (see the fn doc). A retry (no terminal) never breaks.
     while let Some(task) = queue::claim_next_ready_task(conn, exec_id, now)? {
         // `claim_next_ready_task` has already committed this row to `RUNNING`. If
         // the activity name has no registered body, RELEASE the claim back to
@@ -160,6 +194,9 @@ pub fn drain_ready(
         if schedule_to_close_exceeded(now, task.schedule_to_close_at) {
             finalize_activity_timeout(conn, exec_id, &task, TimeoutType::ScheduleToClose)?;
             produced = true;
+            if settle_after_first_terminal {
+                break;
+            }
             continue;
         }
 
@@ -230,6 +267,9 @@ pub fn drain_ready(
         if start_to_close_exceeded(elapsed, task.start_to_close_ms) {
             finalize_activity_timeout(conn, exec_id, &task, TimeoutType::StartToClose)?;
             produced = true;
+            if settle_after_first_terminal {
+                break;
+            }
             continue;
         }
 
@@ -279,6 +319,9 @@ pub fn drain_ready(
         if schedule_to_close_exceeded(finalize_now, task.schedule_to_close_at) {
             finalize_activity_timeout(conn, exec_id, &task, TimeoutType::ScheduleToClose)?;
             produced = true;
+            if settle_after_first_terminal {
+                break;
+            }
             continue;
         }
 
@@ -292,6 +335,14 @@ pub fn drain_ready(
             result,
         )? {
             produced = true;
+            // A terminal event was appended for this branch. Under an unsettled
+            // race, stop so the workflow re-settles and cancels the losers before
+            // they are drained (issue #600). A retryable failure returns `false`
+            // (requeued, no terminal) and does NOT break — keep draining until one
+            // branch genuinely finishes.
+            if settle_after_first_terminal {
+                break;
+            }
         }
     }
 
@@ -302,6 +353,69 @@ pub fn drain_ready(
     }
 
     Ok(produced)
+}
+
+/// True iff the recorded `history` contains an **unsettled** activity `ctx.race()`
+/// (issue #600; Codex #1069 P1) — an "open" race marker (`race:{seq}`, recorded on
+/// first dispatch to fix the branch count) with no matching "winner" marker
+/// (`race_winner:{seq}`, recorded by `settle_race` once a winner is known).
+///
+/// The core lowers an activity/child race onto these two `MarkerRecorded` events
+/// (an inline `format!("race:{seq}")` / `format!("race_winner:{seq}")` in
+/// `autumn_harvest::context` — there is no exported constant, so the naming
+/// convention is matched here, exactly as [`is_signal_timeout_deadline_timer`]
+/// matches the `__signal_timeout:` timer-id convention). The timer+signal race
+/// shape (`race_timer_signal_impl`) reuses the `wait_for_signal_timeout` machinery
+/// and records NO `race:` marker, so it is correctly never detected here (it has no
+/// multi-branch drain to gate). Used by `drive_one_cycle` to decide whether
+/// [`drain_ready`] must settle after the first terminal on the CURRENT cycle: the
+/// open marker is present from the first dispatch cycle onward (once committed),
+/// covering backing-off race cycles whose re-dispatch commands carry only
+/// `WaitForActivity` and no fresh open marker.
+#[must_use]
+pub fn history_has_unsettled_activity_race(history: &[WorkflowEvent]) -> bool {
+    let mut open: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for event in history {
+        if let WorkflowEvent::MarkerRecorded { name, .. } = event {
+            // Check the winner prefix first; `"race_winner:{seq}"` does not start
+            // with `"race:"` (5th char `_` vs `:`), so the two are disjoint, but
+            // ordering keeps the intent obvious.
+            if let Some(seq) = name.strip_prefix("race_winner:") {
+                settled.insert(seq);
+            } else if let Some(seq) = name.strip_prefix("race:") {
+                open.insert(seq);
+            }
+        }
+    }
+    open.iter().any(|seq| !settled.contains(seq))
+}
+
+/// True iff this decision cycle's suspension `commands` OPEN an activity `ctx.race()`
+/// — a `RecordMarker` whose name starts with `race:` (issue #600; Codex #1069 P1).
+///
+/// The open marker is pushed as a bookkeeping command on the FIRST race-dispatch
+/// cycle, at which point it is not yet in the loaded `history`; on later
+/// still-pending cycles it is already in history (see
+/// [`history_has_unsettled_activity_race`]). Checking both covers every cycle the
+/// race is in flight. A `race_winner:` marker does not start with `race:`, so this
+/// never matches the settle cycle's winner marker.
+#[must_use]
+pub fn commands_open_activity_race(commands: &[WorkflowCommand]) -> bool {
+    commands.iter().any(|cmd| {
+        matches!(cmd, WorkflowCommand::RecordMarker { name, .. } if name.starts_with("race:"))
+    })
+}
+
+/// True iff an activity `ctx.race()` is in flight on this decision cycle (issue
+/// #600; Codex #1069 P1) — either the loaded `history` still has an unsettled open
+/// marker ([`history_has_unsettled_activity_race`]) or this cycle's `commands` open
+/// one ([`commands_open_activity_race`], the first-dispatch case before the marker
+/// is committed to history). The gate for [`drain_ready`]'s
+/// `settle_after_first_terminal`.
+#[must_use]
+pub fn activity_race_in_flight(history: &[WorkflowEvent], commands: &[WorkflowCommand]) -> bool {
+    history_has_unsettled_activity_race(history) || commands_open_activity_race(commands)
 }
 
 /// Encode a contained **activity** handler-panic message as the typed
@@ -785,8 +899,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        drain_ready, finalize_within_tx, fire_timer, fire_timer_within_tx,
-        handler_panic_activity_envelope, ingest_awaited_signal, is_signal_timeout_deadline_timer,
+        commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
+        fire_timer_within_tx, handler_panic_activity_envelope, history_has_unsettled_activity_race,
+        ingest_awaited_signal, is_signal_timeout_deadline_timer,
         payload_too_large_activity_envelope, schedule_to_close_exceeded, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
@@ -1522,7 +1637,7 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → finalize recheck seals the
         // timeout).
         let failure_now = || 1_500_i64;
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -1574,7 +1689,7 @@ mod tests {
 
         // finalize clock = 500 < deadline 1000 → normal completion.
         let failure_now = || 500_i64;
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced);
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -1628,7 +1743,7 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → generalized finalize recheck
         // seals the timeout even though the body returned Err).
         let failure_now = || 1_500_i64;
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -1710,7 +1825,7 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → the generalized finalize recheck
         // seals the timeout).
         let failure_now = || 1_500_i64;
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities).unwrap();
+        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced);
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -1739,5 +1854,66 @@ mod tests {
             task_state, "DONE",
             "the timed-out task is terminal, not requeued PENDING"
         );
+    }
+
+    // Issue #600 / Codex #1069 P1: the race-in-flight detection helpers that gate
+    // `drain_ready`'s settle-after-first-terminal behavior.
+    fn marker(name: &str) -> autumn_harvest::WorkflowEvent {
+        autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: name.to_string(),
+            details: serde_json::json!(2),
+        }
+    }
+
+    #[test]
+    fn history_unsettled_race_detects_open_marker_without_a_winner() {
+        // An open race marker with no winner yet → unsettled.
+        assert!(history_has_unsettled_activity_race(&[marker("race:0")]));
+        // Open + matching winner (same seq) → settled.
+        assert!(!history_has_unsettled_activity_race(&[
+            marker("race:0"),
+            marker("race_winner:0"),
+        ]));
+        // A winner for a DIFFERENT seq does not settle the open one.
+        assert!(history_has_unsettled_activity_race(&[
+            marker("race:0"),
+            marker("race_winner:1"),
+        ]));
+        // Two races, one still open.
+        assert!(history_has_unsettled_activity_race(&[
+            marker("race:0"),
+            marker("race_winner:0"),
+            marker("race:1"),
+        ]));
+        // No race markers at all → not in flight.
+        assert!(!history_has_unsettled_activity_race(&[
+            marker("fan_out:3"),
+            marker("side_effect:0"),
+        ]));
+        assert!(!history_has_unsettled_activity_race(&[]));
+    }
+
+    #[test]
+    fn commands_open_race_matches_only_the_open_marker() {
+        use autumn_harvest::WorkflowCommand;
+        let open = WorkflowCommand::RecordMarker {
+            name: "race:0".to_string(),
+            details: serde_json::json!(2),
+        };
+        assert!(commands_open_activity_race(std::slice::from_ref(&open)));
+        // The winner marker (`race_winner:`) must NOT be mistaken for opening a
+        // race — it does not start with `race:`.
+        let winner = WorkflowCommand::RecordMarker {
+            name: "race_winner:0".to_string(),
+            details: serde_json::json!(0),
+        };
+        assert!(!commands_open_activity_race(std::slice::from_ref(&winner)));
+        // A fan-out marker is not a race.
+        let fan_out = WorkflowCommand::RecordMarker {
+            name: "fan_out:3".to_string(),
+            details: serde_json::json!(3),
+        };
+        assert!(!commands_open_activity_race(std::slice::from_ref(&fan_out)));
+        assert!(!commands_open_activity_race(&[]));
     }
 }
