@@ -116,6 +116,33 @@ pub const THROTTLE_FIRE_BATCH_SIZE: i64 = 100;
 /// keys are never starved by an unbounded single-key backlog.
 pub const THROTTLE_FIRE_PER_KEY_CAP: i64 = 10;
 
+/// Backoff applied to a throttle row's `deferred_at` when its fire is blocked by
+/// an admission gate (issue #1053, review finding B-G1).
+///
+/// A gate is **queue-scoped**, so the SQL candidate pre-filter cannot see it (it
+/// only knows token levels + `expires_at`). Without bumping `deferred_at`, a
+/// gate-blocked-but-tokened row keeps its original (older) `deferred_at`, so it
+/// stays at the front of the `ORDER BY deferred_at ASC` fire ordering and keeps
+/// being re-selected every tick. If ≥[`THROTTLE_FIRE_BATCH_SIZE`] such rows are
+/// gated together (a queue-wide incident gate over many tenant keys), they
+/// monopolize the fixed-size fire batch and **starve newer un-gated throttle
+/// keys on other queues indefinitely** — reopening exactly the cross-key
+/// fairness pathology the per-key cap + token pre-filter above closed.
+///
+/// Bumping `deferred_at` forward on re-defer rotates a gated row *behind* every
+/// un-gated row (whose `deferred_at` is its real, earlier deferral time) in the
+/// fire ordering, so un-gated keys are selected and fire first, and a gated row
+/// is re-attempted less often (fewer per-tick block-metric increments + log
+/// lines). It is a modest fixed tuning value, not a config knob.
+///
+/// This is safe against the `schedule_to_start` staleness drop (AC-c, issue
+/// #607): the candidate SELECT surfaces expired rows via an OR-`expires_at`
+/// clause that is independent of `deferred_at` (there is no `deferred_at <= NOW()`
+/// candidate floor), so pushing `deferred_at` into the future never hides an
+/// expired row from its drop — `expires_at` is left untouched, so a gated row
+/// still times out at its original deadline.
+const GATE_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Maximum allowed byte length for a resolved throttle key.
 ///
 /// Keys longer than this are rejected at admission with
@@ -813,6 +840,31 @@ async fn delete_throttle_row(
     Ok(())
 }
 
+/// Push a gate-blocked throttle row's `deferred_at` forward by
+/// [`GATE_REDEFER_BACKOFF`] (issue #1053, review finding B-G1) so it yields the
+/// oldest-candidate fire slot to un-gated keys and is re-attempted less often.
+///
+/// `expires_at` is deliberately left untouched: the row still times out at its
+/// original `schedule_to_start` deadline (AC-c). Runs inside the caller's fire
+/// transaction so the row-level `FOR UPDATE` lock is held through the update.
+/// Mirrors [`delete_throttle_row`]'s parameterized `sql_query` style (the
+/// file-wide convention for row mutations).
+#[cfg(feature = "db")]
+async fn redefer_throttle_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    row_id: uuid::Uuid,
+    new_deferred_at: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query("UPDATE harvest_start_throttle SET deferred_at = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(row_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_deferred_at)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 /// Fire one already-claimed (row-locked) throttle row: reserve a token, start
 /// the execution, and delete the record. Must run inside the caller's
 /// transaction so the `FOR UPDATE` lock is held through the delete.
@@ -1024,14 +1076,33 @@ async fn fire_claimed_throttle_row(
         // it is held (not dropped) until the gate opens or `expires_at` passes.
         Err(crate::error::HarvestError::AdmissionBlocked { gate_id, reason }) => {
             crate::queue::refund_rate_limit_token(conn, &bucket).await?;
-            tracing::info!(
+            // Cross-key fairness (issue #1053, review finding B-G1): bump
+            // `deferred_at` forward by `GATE_REDEFER_BACKOFF` so this gated row
+            // rotates behind un-gated rows in the `ORDER BY deferred_at ASC` fire
+            // ordering. A queue-scoped gate is invisible to the SQL candidate
+            // pre-filter, so without this a gated-but-tokened row keeps its
+            // original (older) `deferred_at`, stays the oldest candidate, and is
+            // re-selected every tick — ≥100 such rows would monopolize the
+            // fixed-size fire batch and starve newer un-gated keys on other
+            // queues indefinitely. `expires_at` is untouched, so the row still
+            // times out at its original `schedule_to_start` deadline (AC-c), and
+            // the candidate SELECT surfaces expired rows independent of
+            // `deferred_at`, so the bump never hides the drop. Runs in the same
+            // fire transaction as the refund (the `FOR UPDATE` lock is held).
+            redefer_throttle_row(conn, row_id, now + GATE_REDEFER_BACKOFF).await?;
+            // `debug!`, not `info!`: this arm re-fires per gated row per scanner
+            // tick (the block metric is intentionally per-attempt, backed off by
+            // the bump above), so an `info!` here would flood logs during exactly
+            // the high-load incident window operators are reading — matching the
+            // silent no-token re-defer twin above.
+            tracing::debug!(
                 workflow_name = %workflow_name,
                 throttle_key = %throttle_key,
                 workflow_id = %workflow_id,
                 gate_id = %gate_id,
                 reason = %reason,
                 "throttled start blocked by an admission gate at fire time; \
-                 re-deferred (row left, token refunded)",
+                 re-deferred with backoff (row left, token refunded)",
             );
             Ok(None)
         }

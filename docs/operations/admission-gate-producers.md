@@ -24,7 +24,7 @@ and whether it is **gated**, **gated-at-admission**, **gated-at-relay**, or
 | `webhook_delegate` | gated | Inbound webhooks (issue #344) delegate to the gated HTTP start / signal-with-start route. |
 | `scheduler` | gated | Each due schedule slot checks the gate before firing. |
 | `debounce` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
-| `throttle` | gated-at-relay | Gated **authoritatively at fire time** (issue #1053): the scanner re-checks the gate on the workflow's real queue immediately before firing a deferred start; a matching gate blocks + counts `harvest.admission.blocked` and **re-defers** the row (nothing dropped — it fires once the gate opens or its `schedule_to_start` deadline passes); no gate → fires + counts `harvest.admission.bypassed`. |
+| `throttle` | gated-at-relay | Gated **authoritatively at fire time** (issue #1053): the scanner re-checks the gate on the workflow's real queue immediately before firing a deferred start; a matching gate blocks + counts `harvest.admission.blocked` and **re-defers** the row with a backoff (a gate block never drops — it fires once the gate opens; a row held past its own `schedule_to_start` deadline is still dropped as stale, as it would be for any missed deadline); no gate → fires + counts `harvest.admission.bypassed`. |
 | `event_batch` | gated-at-admission | Gated at HTTP admission; the deferred scanner fire relays an already-admitted start and is exempt-with-bypass-counter. |
 | `completion_trigger_outbox` | gated-at-relay | Cross-shard completion-trigger relay, gated authoritatively at relay time on the target shard's real queue: a matching gate blocks + drops the row + counts `harvest.admission.blocked`; when no gate matches the relay starts + counts `harvest.admission.bypassed`. |
 | `outbox` | exempt-by-design | Relays workflow-start requests durably committed before the gate was raised. |
@@ -59,20 +59,42 @@ a start deferred *before* a gate was armed would otherwise fire gate-exempt once
 tokens refill).
 
 - **A gate matches the real queue → BLOCK + RE-DEFER:** the scanner counts
-  `harvest.admission.blocked` and **leaves** the `harvest_start_throttle` row
-  (refunding the token it reserved) so the held start fires the instant the gate
-  opens (or is dropped only if its `schedule_to_start` deadline passes first).
-  **Nothing is lost** — the throttle deferred-start `202` promise becomes "will
-  run when tokens allow **and** the gate is open at fire time".
+  `harvest.admission.blocked`, **leaves** the `harvest_start_throttle` row
+  (refunding the token it reserved), and bumps the row's `deferred_at` forward by
+  a modest backoff (`GATE_REDEFER_BACKOFF`, 5s) so the held start fires the
+  instant the gate opens. **A gate block never drops a start** — the row is
+  re-deferred, not deleted — so the throttle deferred-start `202` promise becomes
+  "will run when tokens allow **and** the gate is open at fire time".
 - **No gate matches → fire + count the bypass** on
   `harvest.admission.bypassed{producer="throttle"}`.
+
+**One pre-existing, orthogonal caveat.** A start given a `schedule_to_start`
+deadline (issue #607 AC-c) that is held under a gate *past that deadline* is still
+dropped as stale (the row is deleted, a `warn!` is logged) — exactly as it would
+be for any other reason it missed its deadline. The gate does not exempt a start
+from its own staleness bound, and because the gate can hold a start until its
+deadline elapses, a long-armed gate makes such staleness drops materially more
+likely. The staleness drop is `warn!`-logged only (no dedicated metric today).
+
+**Cross-key fairness — the re-defer backoff (issue #1053, review finding B-G1).**
+A gate is **queue-scoped**, so the SQL candidate pre-filter that selects each
+tick's fire batch cannot see it. Bumping `deferred_at` forward on re-defer rotates
+a gated row *behind* every un-gated row in the `ORDER BY deferred_at ASC` fire
+ordering, so un-gated throttle keys on other queues are selected and fire first —
+without the bump, ≥100 gated-but-tokened rows (a queue-wide incident gate over
+many tenant keys on one shard) would monopolize the fixed-size fire batch and
+starve newer un-gated keys until the gate lifts.
 
 This shares the `check_cached` relay-time mechanism with the completion-trigger
 outbox but **differs in disposition**: the completion-trigger outbox **drops** its
 row on block (its source terminal decision has already fired, so a permanently
-gated relay must not accumulate); the throttle scanner **re-defers** its row
-(nothing lost). Block-vs-bypass never double-counts: a blocked fire returns
-without starting, so it is never in the "fired" set that counts a bypass.
+gated relay must not accumulate); the throttle scanner **re-defers** its row (the
+`202` promise). Because the re-defer is per-tick, throttle's
+`harvest.admission.blocked` reflects re-defer **attempt volume** (at-least-once per
+gated row per tick), not distinct blocked rows — unlike the completion-trigger
+outbox, which drops on block and so counts once per row. Block-vs-bypass never
+double-counts *for one fire*: a blocked fire returns without starting, so it is
+never in the "fired" set that counts a bypass.
 
 ### Fail-closed handling (completion triggers)
 
@@ -187,8 +209,8 @@ and how much, already-committed work is still draining past the gate.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `harvest.admission.blocked` | counter | `scope`, `reason_hash` | A new start was blocked by an active gate (any gated producer). |
-| `harvest.admission.bypassed` | counter | `producer` | An exempt / deferred-fire producer relayed a start (`outbox`, `completion_trigger_outbox`, `debounce`, `throttle`, `event_batch`). |
+| `harvest.admission.blocked` | counter | `scope`, `reason_hash` | A new start was blocked by an active gate (any gated producer). Note: `throttle` re-defers a blocked row **every tick** it stays gated, so its contribution here reflects re-defer *attempt volume* (at-least-once per gated row per tick), not distinct blocked rows — unlike `completion_trigger_outbox`, which drops on block and counts once per row. |
+| `harvest.admission.bypassed` | counter | `producer` | A deferred-fire or exempt-by-design producer relayed a start it did not re-check the gate for (or re-checked and found open): `outbox` / `completion_trigger_outbox` (the cross-shard relay, which *does* re-check and only counts a bypass when no gate matched), `debounce`, `throttle` (counts a bypass only on a genuine fire — it is no longer exempt: it is authoritatively gated at fire time, so a gate block counts `blocked` instead), `event_batch`. |
 | `harvest.admission.gates_active` | gauge | — | Current number of active gates. |
 
 `execution.id` is never a metric label (ADR-0001 §7).

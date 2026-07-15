@@ -49,7 +49,16 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 /// Serialises the process-global gate cache + shard router across tests.
-static TEST_SERIAL: Mutex<()> = Mutex::new(());
+///
+/// `pub(crate)` so sibling scanner suites that now consult the same
+/// process-global gate cache at fire time (e.g. `throttle_tests`, issue #1053)
+/// can hold this guard while firing, preventing a gate armed by a concurrent
+/// gate test from spuriously blocking (or being stomped by) their fires.
+// `pub(crate)` is required (a sibling test module references it via
+// `crate::admission_gate_authoritative_tests::TEST_SERIAL`); clippy's
+// `redundant_pub_crate` flags it only because this test module is private.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 // The test DB is seeded from `autumn_harvest::full_migrations_sql()` — the
 // build.rs-generated full migration bundle (identical to `diesel migration run`),
@@ -318,6 +327,26 @@ async fn throttle_rows_for(conn: &mut AsyncPgConnection, workflow_id: &str) -> i
         .await
         .expect("count throttle rows")
         .n
+}
+
+/// issue #1053 (review B-G1) helper — read the `deferred_at` of a pending
+/// `harvest_start_throttle` row so a test can assert a gate-blocked fire BUMPED it
+/// forward (the re-defer backoff that rotates a gated row behind un-gated keys).
+async fn throttle_deferred_at_for(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> chrono::DateTime<Utc> {
+    #[derive(diesel::QueryableByName)]
+    struct DeferredRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        deferred_at: chrono::DateTime<Utc>,
+    }
+    diesel::sql_query("SELECT deferred_at FROM harvest_start_throttle WHERE workflow_id = $1")
+        .bind::<Text, _>(workflow_id)
+        .get_result::<DeferredRow>(conn)
+        .await
+        .expect("read throttle deferred_at")
+        .deferred_at
 }
 
 /// issue #1053 helper — directly seed a prior `ag_target_wf` execution row
@@ -975,6 +1004,7 @@ async fn deferred_scanner_fires_are_counted_as_bypass() {
 /// so Phase A FIRES despite the gate (`n == 1`, row deleted, execution created,
 /// token spent, no block counted) and the `assert_eq!(n, 0)` fails.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
     let _guard = TEST_SERIAL
         .lock()
@@ -1013,6 +1043,10 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
     let metrics = CapturingMetrics::default();
     let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
 
+    // Capture the row's original (past) `deferred_at` so Phase A can prove the
+    // gate-block re-defer BUMPED it forward (review B-G1 backoff).
+    let deferred_before = throttle_deferred_at_for(&mut conn, "thr-redefer").await;
+
     // ── Phase A: gate CLOSED — block + re-defer ──
     set_global_admission_gate_cache(Some(fleet_cache("redefer-incident")));
     let n = autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
@@ -1023,6 +1057,18 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
         throttle_rows_for(&mut conn, "thr-redefer").await,
         1,
         "the blocked row is LEFT (re-deferred), not deleted"
+    );
+    // review B-G1: the gate-blocked row's `deferred_at` is bumped forward by
+    // GATE_REDEFER_BACKOFF, rotating it behind un-gated keys in the fire ordering.
+    let deferred_after = throttle_deferred_at_for(&mut conn, "thr-redefer").await;
+    assert!(
+        deferred_after > deferred_before,
+        "the gate-blocked row's deferred_at is advanced by the re-defer backoff \
+         (before={deferred_before}, after={deferred_after})"
+    );
+    assert!(
+        deferred_after > Utc::now(),
+        "the backed-off deferred_at is now in the future (behind newly-arriving un-gated rows)"
     );
     assert_eq!(
         target_exec_count(&mut conn).await,
@@ -1049,6 +1095,17 @@ async fn throttle_scanner_re_defers_under_a_closed_gate_and_fires_when_open() {
     );
 
     // ── Phase B: gate OPEN — the held start fires ──
+    // The re-defer backoff pushed `deferred_at` into the future; make the row
+    // due again before driving the open-gate fire (defensive: the candidate
+    // SELECT has no `deferred_at <= NOW()` floor today, so it would fire anyway,
+    // but resetting keeps the assertion robust if a floor is ever added).
+    diesel::sql_query(
+        "UPDATE harvest_start_throttle SET deferred_at = NOW() - INTERVAL '1 second' \
+         WHERE workflow_id = 'thr-redefer'",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
     set_global_admission_gate_cache(None);
     let n2 =
         autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
@@ -1228,6 +1285,194 @@ async fn throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate() {
         metrics.blocked().len(),
         1,
         "the block is counted on the passed recorder"
+    );
+}
+
+/// issue #1053 (review B-G1 regression pin): a queue-scoped gate must NOT starve
+/// throttle starts on OTHER (un-gated) queues. A gate-blocked throttle row's
+/// `deferred_at` is bumped forward (the re-defer backoff), so it rotates behind
+/// un-gated rows in the `ORDER BY deferred_at ASC` fire ordering; an un-gated row
+/// on a different queue FIRES in the same tick while the gated row is HELD and
+/// backed off.
+///
+/// The gate is scoped `GateScope::Queue("gated-q")`, matching only the gated
+/// row's queue. The un-gated row targets `open-q` (gate does not match) and must
+/// fire even though the gated row is OLDER (would otherwise be selected first and,
+/// without the backoff, keep monopolizing the fire batch across ticks).
+#[tokio::test]
+async fn throttle_gate_backoff_does_not_starve_ungated_keys() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    // Two full buckets + two due throttle rows on DIFFERENT queues. The gated row
+    // is OLDER (deferred earlier) so without the backoff it would sit ahead of the
+    // un-gated row and be re-selected every tick.
+    let gated_bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-gated");
+    let open_bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-open");
+    for b in [&gated_bucket, &open_bucket] {
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets
+                (key, refill_rate, burst, tokens, last_refilled_at)
+             VALUES ($1, 0.0, 10.0, 10.0, NOW())",
+        )
+        .bind::<Text, _>(b)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // Gated row on `gated-q`, older deferral.
+    diesel::sql_query(
+        "INSERT INTO harvest_start_throttle
+            (workflow_name, throttle_key, bucket_key, workflow_id, queue_name,
+             input, start_options, deferred_at)
+         VALUES ('ag_target_wf', 'k-gated', $1, 'gated-starve', 'gated-q', '{}'::jsonb,
+                 '{}'::jsonb, NOW() - INTERVAL '10 seconds')",
+    )
+    .bind::<Text, _>(&gated_bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    // Un-gated row on `open-q`, newer deferral.
+    diesel::sql_query(
+        "INSERT INTO harvest_start_throttle
+            (workflow_name, throttle_key, bucket_key, workflow_id, queue_name,
+             input, start_options, deferred_at)
+         VALUES ('ag_target_wf', 'k-open', $1, 'ung-starve', 'open-q', '{}'::jsonb,
+                 '{}'::jsonb, NOW() - INTERVAL '1 second')",
+    )
+    .bind::<Text, _>(&open_bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
+
+    let gated_deferred_before = throttle_deferred_at_for(&mut conn, "gated-starve").await;
+
+    // Arm a gate scoped ONLY to `gated-q`, then fire once.
+    set_global_admission_gate_cache(Some(scoped_cache(GateScope::Queue("gated-q".to_string()))));
+    let n = autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
+        .await
+        .unwrap();
+
+    // The un-gated row FIRED; the gated row was HELD + backed off.
+    assert_eq!(
+        n, 1,
+        "exactly the un-gated row fires under a queue-scoped gate"
+    );
+    assert_eq!(
+        throttle_rows_for(&mut conn, "ung-starve").await,
+        0,
+        "the un-gated row FIRES (row deleted) — it is not starved by the gated row"
+    );
+    assert_eq!(
+        throttle_rows_for(&mut conn, "gated-starve").await,
+        1,
+        "the gated row is HELD (re-deferred), not fired and not dropped"
+    );
+    let gated_deferred_after = throttle_deferred_at_for(&mut conn, "gated-starve").await;
+    assert!(
+        gated_deferred_after > gated_deferred_before,
+        "the gated row's deferred_at is advanced by the backoff so it rotates behind \
+         un-gated keys (before={gated_deferred_before}, after={gated_deferred_after})"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        1,
+        "only the un-gated start created an execution"
+    );
+    assert!(
+        metrics.bypassed().contains(&"throttle".to_string()),
+        "the un-gated fire counts a throttle bypass"
+    );
+    assert_eq!(
+        metrics.blocked().len(),
+        1,
+        "exactly the gated row's block is counted"
+    );
+}
+
+/// issue #1053 (review B-G2 / FIX-2 contract pin): a throttle row held under a
+/// CLOSED gate that reaches its own `schedule_to_start` deadline is DROPPED as
+/// stale (issue #607 AC-c) — NOT held forever by the re-defer. The gate does not
+/// exempt a start from its own staleness bound; the AC-c expiry check runs before
+/// the gate is ever consulted, so an expired row drops regardless of the gate.
+#[tokio::test]
+async fn throttle_gated_row_past_schedule_to_start_deadline_is_dropped_not_held() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    install_global_router(ShardRouter::default());
+    set_global_admission_gate_cache(None);
+
+    // Full bucket + a due throttle row whose schedule_to_start deadline has ALREADY
+    // passed (expires_at in the past).
+    let bucket = autumn_harvest::throttle::bucket_key("ag_target_wf", "k-stale");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets
+            (key, refill_rate, burst, tokens, last_refilled_at)
+         VALUES ($1, 0.0, 10.0, 10.0, NOW())",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO harvest_start_throttle
+            (workflow_name, throttle_key, bucket_key, workflow_id, queue_name,
+             input, start_options, deferred_at, expires_at)
+         VALUES ('ag_target_wf', 'k-stale', $1, 'thr-stale', 'default', '{}'::jsonb,
+                 '{}'::jsonb, NOW() - INTERVAL '10 seconds', NOW() - INTERVAL '1 second')",
+    )
+    .bind::<Text, _>(&bucket)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let metrics = CapturingMetrics::default();
+    let metrics_ref: &(dyn MetricsRecorder + Send + Sync) = &metrics;
+
+    // Keep the gate CLOSED; the row is past its deadline, so it must be dropped as
+    // stale (not held indefinitely by the re-defer).
+    set_global_admission_gate_cache(Some(fleet_cache("stale-under-gate-incident")));
+    let n = autumn_harvest::throttle::fire_due_throttled_starts(&mut conn, &None, &[], metrics_ref)
+        .await
+        .unwrap();
+
+    assert_eq!(n, 0, "no start fires for a stale row");
+    assert_eq!(
+        throttle_rows_for(&mut conn, "thr-stale").await,
+        0,
+        "the row past its schedule_to_start deadline is DROPPED (deleted), not held under the gate"
+    );
+    assert_eq!(
+        target_exec_count(&mut conn).await,
+        0,
+        "no execution is created for a dropped-stale row"
+    );
+    // The AC-c expiry check runs BEFORE the token reserve and BEFORE the gate, so
+    // the drop is a staleness timeout — NOT a gate block. The token is untouched
+    // (never reserved) and no `harvest.admission.blocked` is counted.
+    assert!(
+        (bucket_tokens(&mut conn, &bucket).await - 10.0).abs() < 1e-9,
+        "no token is consumed for a stale-dropped row (expiry precedes the token reserve)"
+    );
+    assert_eq!(
+        metrics.blocked().len(),
+        0,
+        "a staleness drop is NOT a gate block — the gate is never consulted for an expired row"
     );
 }
 
