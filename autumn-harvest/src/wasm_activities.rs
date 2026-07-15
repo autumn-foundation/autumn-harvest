@@ -1387,6 +1387,96 @@ mod tests {
     }
 
     #[test]
+    fn multi_memory_module_is_rejected_at_validation() {
+        // The JSON-over-linear-memory ABI uses exactly one memory. A module
+        // declaring TWO linear memories must be rejected — `memory_size` caps
+        // each memory's bytes individually, so N sub-cap memories would
+        // collectively exceed the sandbox. The multi-memory proposal is disabled
+        // at the engine, so this fails at COMPILE/validation (a typed
+        // `HarvestError::Config`), not a host OOM or panic; the store's
+        // `.memories(1)` cap is the belt-and-braces instantiation backstop.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (memory 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32 i32) (result i64) (i64.const 0)))
+        "#;
+        let bytes = wat::parse_str(wat).expect("wat assembles a 2-memory module");
+        let hash = WasmModuleStore::compute_hash(&bytes);
+        let err = store
+            .get_or_compile(&hash, &bytes)
+            .expect_err("a multi-memory module must be rejected at validation");
+        assert!(
+            matches!(err, HarvestError::Config(_)),
+            "multi-memory rejection is a typed config error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn gc_module_is_rejected_at_validation() {
+        // The ABI does not use Wasm GC. GC allocations go into a separate GC heap
+        // NOT covered by the `memory_size` ceiling, so a tiny GC-using module
+        // could allocate beyond the sandbox. GC is disabled at the engine, so a
+        // module declaring a GC (`struct`) type is rejected at validation (a
+        // typed `HarvestError::Config`) with no unbounded GC-heap allocation.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (type $pair (struct (field i32) (field i32)))
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32 i32) (result i64) (i64.const 0)))
+        "#;
+        let bytes = wat::parse_str(wat).expect("wat assembles a GC-typed module");
+        let hash = WasmModuleStore::compute_hash(&bytes);
+        let err = store
+            .get_or_compile(&hash, &bytes)
+            .expect_err("a GC-using module must be rejected at validation");
+        assert!(
+            matches!(err, HarvestError::Config(_)),
+            "GC rejection is a typed config error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deep_recursion_is_bounded_trap_not_host_stack_overflow() {
+        // Unbounded recursion must trap on the bounded guest stack
+        // (`max_wasm_stack`), a retryable `WasmTrap`, rather than overflowing the
+        // host worker thread. Fuel is set effectively unlimited so the STACK
+        // bound — not fuel — is what stops the guest, exercising the stack
+        // ceiling specifically.
+        let store = WasmModuleStore::new();
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func $rec (param $n i64) (result i64)
+                (local $a i64) (local $b i64) (local $c i64) (local $d i64)
+                (local $e i64) (local $f i64) (local $g i64) (local $h i64)
+                (call $rec (local.get $n)))
+              (func (export "run") (param i32 i32) (result i64)
+                (call $rec (i64.const 0))))
+        "#;
+        let module = compile(&store, wat);
+        let err = invoke_wasm_activity(
+            &store,
+            &module,
+            &serde_json::json!(null),
+            &WasmCapabilities::default(),
+            &fast_limits(u64::MAX),
+            None,
+        )
+        .expect_err("deep recursion must trap on the bounded stack");
+        assert_eq!(
+            err.error_type, ERROR_TYPE_WASM_TRAP,
+            "a stack overflow on the bounded guest stack is a retryable WasmTrap"
+        );
+        assert!(!err.non_retryable, "a stack-overflow trap is retryable");
+    }
+
+    #[test]
     fn wall_clock_deadline_is_resource_exhausted() {
         let store = WasmModuleStore::new();
         let module = compile(&store, INFINITE_LOOP_WAT);
