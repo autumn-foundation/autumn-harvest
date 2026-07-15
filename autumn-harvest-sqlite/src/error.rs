@@ -49,6 +49,32 @@ pub enum SqliteError {
     #[error("unsupported workflow command for the sqlite backend: {0}")]
     Unsupported(String),
 
+    /// A caller-supplied payload exceeded its configured byte cap at an ingress
+    /// boundary (issue #252). Mirrors the Postgres path's
+    /// [`HarvestError::PayloadTooLarge`](autumn_harvest::HarvestError::PayloadTooLarge)
+    /// rejection: the oversized payload is refused BEFORE it is persisted, so an
+    /// unbounded workflow input or signal payload can never enter `harvest_events`
+    /// (which would bloat history and make this backend accept a payload other
+    /// backends reject). `kind` names the boundary (`"workflow_input"` /
+    /// `"signal_payload"`); `observed_bytes`/`cap_bytes` mirror the core error's
+    /// fields. An oversized activity *result* is NOT surfaced through this variant
+    /// — it is normalized into a non-retryable `PayloadTooLarge` `ActivityFailed`
+    /// event (the workflow observes the failure), exactly as the Postgres worker
+    /// does, so the run continues rather than the caller erroring.
+    #[error(
+        "payload too large: {kind} exceeded cap of {cap_bytes} bytes \
+         (observed {observed_bytes} bytes)"
+    )]
+    PayloadTooLarge {
+        /// The ingress boundary that was violated (`"workflow_input"` /
+        /// `"signal_payload"`).
+        kind: &'static str,
+        /// Actual serialized byte length of the rejected payload.
+        observed_bytes: u64,
+        /// The configured cap (bytes) at that boundary.
+        cap_bytes: u64,
+    },
+
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
     Corrupt(String),

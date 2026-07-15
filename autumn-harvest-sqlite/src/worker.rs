@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 
+use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::{ExecutionId, TimeoutType, TimerId, WorkflowEvent};
 use rusqlite::Connection;
 
@@ -209,6 +210,33 @@ fn handler_panic_activity_envelope(message: String) -> String {
         .into_error_payload()
 }
 
+/// Encode a `PayloadTooLarge` activity-result-cap violation as the typed
+/// `harvest_activity_failure_v1` envelope carrying `error_type = "PayloadTooLarge"`
+/// and `non_retryable = true` (issue #252, Codex #1069 `worker.rs:340`).
+///
+/// This mirrors the Postgres worker's `handle_activity_result` normalization
+/// VERBATIM: an oversized SUCCESSFUL result is refused, and instead of an
+/// `ActivityCompleted` a NON-RETRYABLE `PayloadTooLarge` `ActivityFailed` is
+/// recorded (so the workflow observes the same failure the Postgres worker would,
+/// and no unbounded result row is ever stored). Routing it through the SAME
+/// terminal-failure path as [`finalize_within_tx`]'s `Err` arm means the terminal
+/// event's typed metadata (`error_type = "PayloadTooLarge"`, `non_retryable = true`,
+/// the human `message`) is derived by the SAME `parse_error_payload_full` decode
+/// the Postgres `finalize_activity_failure` uses — keeping the histories
+/// byte-equivalent. Built from the same `pub` `autumn_harvest::failure` primitives
+/// (`ActivityFailure::non_retryable(...).into_error_payload()`) the core uses, so
+/// no core export is needed.
+fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: u64) -> String {
+    use autumn_harvest::failure::IntoActivityErrorString as _;
+    autumn_harvest::failure::ActivityFailure::non_retryable(
+        "PayloadTooLarge",
+        format!(
+            "activity '{activity_name}' result exceeds cap: {observed} bytes (cap {cap} bytes)"
+        ),
+    )
+    .into_error_payload()
+}
+
 /// True iff `timer_id` is the deadline timer of a `wait_for_signal_timeout` /
 /// `receive_signal_timeout` race for the signal named `signal_name`.
 ///
@@ -326,6 +354,39 @@ pub fn finalize_within_tx(
     failure_now: i64,
     result: Result<serde_json::Value, String>,
 ) -> SqliteResult<bool> {
+    // Enforce the activity-result cap (issue #252, Codex #1069 `worker.rs:340`).
+    // Mirror the Postgres worker's `handle_activity_result` normalization: an
+    // oversized SUCCESSFUL result is NOT stored as `ActivityCompleted` (which would
+    // bloat history and make the workflow observe a success other backends reject);
+    // it is normalized here into a NON-RETRYABLE `PayloadTooLarge` `ActivityFailure`
+    // envelope and routed through the terminal-failure path below (a non-retryable
+    // failure never retries → terminal on the first attempt, exactly like the
+    // Postgres path). Normalizing BEFORE `record_attempt` keeps the whole function
+    // consistent — the audit row, the terminal decision, and the appended
+    // `ActivityFailed { error_type: "PayloadTooLarge", non_retryable: true, .. }`
+    // event all reflect the same outcome. The reused core context already enforces
+    // the activity-INPUT cap at schedule time; the result cap is the one boundary
+    // the executor leaves to the worker (`with_payload_caps(.., 0 /*result*/, ..)`),
+    // so it must be enforced here. This backend has no per-activity result-cap
+    // override (like the input cap, which uses the global), so the GLOBAL
+    // `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` (2 MiB) is the faithful cap — the same
+    // constant the core resolves each activity's cap against. A zero cap = uncapped.
+    let result = match result {
+        Ok(output) if DEFAULT_MAX_ACTIVITY_RESULT_BYTES > 0 => {
+            let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+            if observed > DEFAULT_MAX_ACTIVITY_RESULT_BYTES {
+                Err(payload_too_large_activity_envelope(
+                    &task.name,
+                    observed,
+                    DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+                ))
+            } else {
+                Ok(output)
+            }
+        }
+        other => other,
+    };
+
     let attempt_num = task.attempt + 1;
     store::record_attempt(conn, exec_id, &task.name, attempt_num, &result)?;
 
@@ -563,7 +624,8 @@ mod tests {
 
     use super::{
         finalize_within_tx, fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
-        ingest_awaited_signal, is_signal_timeout_deadline_timer, start_to_close_exceeded,
+        ingest_awaited_signal, is_signal_timeout_deadline_timer,
+        payload_too_large_activity_envelope, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::{schema, store};
@@ -1023,5 +1085,119 @@ mod tests {
         );
         assert_eq!(full.message, "activity boom", "raw panic message preserved");
         assert!(!full.non_retryable);
+    }
+
+    // Issue #252 (Codex #1069 `worker.rs:340`): the result-cap violation is encoded
+    // as the TYPED `harvest_activity_failure_v1` envelope with `error_type =
+    // "PayloadTooLarge"` and `non_retryable = true`, so the finalize path classifies
+    // it terminal (never retried) and records byte-equivalent typed metadata to the
+    // Postgres worker's normalization.
+    #[test]
+    fn payload_too_large_activity_envelope_encodes_non_retryable() {
+        let payload = payload_too_large_activity_envelope("act", 4_000, 2_000);
+        let typed = autumn_harvest::failure::parse_typed_payload(&payload)
+            .expect("a cap violation encodes a TYPED envelope, not a plain string");
+        assert_eq!(typed.error_type, "PayloadTooLarge");
+        assert!(
+            typed.non_retryable,
+            "a result-cap violation is non-retryable (terminal on first attempt)"
+        );
+        let full = autumn_harvest::failure::parse_error_payload_full(&payload);
+        assert_eq!(full.error_type, "PayloadTooLarge");
+        assert!(full.non_retryable);
+        assert!(
+            full.message.contains("result exceeds cap"),
+            "human message names the boundary: {}",
+            full.message
+        );
+    }
+
+    // Issue #252: an oversized SUCCESSFUL activity result is normalized into a
+    // NON-RETRYABLE `PayloadTooLarge` terminal `ActivityFailed` — NOT stored as an
+    // (unbounded) `ActivityCompleted`, and NOT retried despite `max_attempts = 3`.
+    // Mirrors the Postgres worker's `handle_activity_result` normalization.
+    // RED pre-fix: `finalize_within_tx` appended `ActivityCompleted` with the full
+    // oversized payload.
+    #[test]
+    fn finalize_oversized_result_records_non_retryable_payload_too_large_terminal() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+
+        // A JSON string whose SERIALIZED length exceeds the 2 MiB result cap.
+        let cap = usize::try_from(autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES)
+            .expect("cap fits usize");
+        let oversized = serde_json::json!("x".repeat(cap + 1));
+
+        // max_attempts = 3, yet the non-retryable normalization fails terminally
+        // on the FIRST attempt (produced = true, a workflow-visible terminal event).
+        let produced =
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(oversized))
+                .unwrap();
+        assert!(
+            produced,
+            "an oversized result is a terminal event, not a retry"
+        );
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1, "exactly one terminal event");
+        match &history[0] {
+            autumn_harvest::WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                error,
+                ..
+            } => {
+                assert_eq!(error_type, "PayloadTooLarge");
+                assert!(*non_retryable, "must be non-retryable");
+                assert!(
+                    error.contains("result exceeds cap"),
+                    "human message names the boundary: {error}"
+                );
+                assert!(
+                    !error.contains("harvest_activity_failure_v1"),
+                    "the raw wire envelope must not leak into the event message"
+                );
+            }
+            other => panic!("expected a PayloadTooLarge ActivityFailed, got {other:?}"),
+        }
+        assert_eq!(
+            queue::task_state(&conn, &task.task_id).unwrap().as_deref(),
+            Some("DONE"),
+            "the task is terminal (not requeued for retry)"
+        );
+    }
+
+    // Issue #252: a result UNDER the cap still completes normally — the cap check
+    // only diverts oversized successes.
+    #[test]
+    fn finalize_under_cap_result_completes_normally() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &serde_json::json!(null)).unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+
+        let produced = super::finalize_activity_result(
+            &mut conn,
+            exec,
+            &task,
+            3,
+            0,
+            0,
+            Ok(serde_json::json!({"ok": true})),
+        )
+        .unwrap();
+        assert!(produced);
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(
+            matches!(
+                history[0],
+                autumn_harvest::WorkflowEvent::ActivityCompleted { .. }
+            ),
+            "an under-cap result completes normally"
+        );
     }
 }

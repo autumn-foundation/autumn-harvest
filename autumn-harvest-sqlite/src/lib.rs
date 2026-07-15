@@ -112,6 +112,28 @@
 //!   `harvest_activity_failure_v1` envelope) — byte-equivalent to the Postgres worker's
 //!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
 //!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
+//! - **Payload-size caps are enforced at every boundary, matching the core** (issue
+//!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
+//!   can enter `harvest_events`, so this backend never stores an unbounded history
+//!   row or accepts a payload the Postgres path rejects. The **workflow START input**
+//!   (`start_workflow`) and an **inbound signal payload** (`send_signal`) over their
+//!   caps (`DEFAULT_MAX_WORKFLOW_INPUT_BYTES` = 2 MiB /
+//!   `DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES` = 256 KiB) are rejected at ingress with
+//!   [`SqliteError::PayloadTooLarge`] BEFORE anything is persisted (the signal cap is
+//!   checked AFTER the not-found / terminal-target rejections). An oversized
+//!   **activity RESULT** (over `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` = 2 MiB) is
+//!   normalized — exactly as the Postgres worker's `handle_activity_result` does —
+//!   into a NON-RETRYABLE `PayloadTooLarge` `ActivityFailed` (the workflow observes
+//!   the failure and drives its own error branch) rather than stored as an unbounded
+//!   `ActivityCompleted`. The **activity INPUT** (schedule time), **side-effect
+//!   value**, and **continue-as-new input** caps are enforced by the reused core
+//!   [`WorkflowContext`] itself (the executor threads the same global caps), so the
+//!   only boundaries this backend enforces directly are the two ingress rejections
+//!   and the activity-result normalization. All caps use the GLOBAL default constants
+//!   (this backend has no per-workflow / per-activity cap override); a `0` cap means
+//!   uncapped, matching the core convention. Child-workflow input and external-signal
+//!   payloads have no cap surface because those primitives are
+//!   [`SqliteError::Unsupported`] here.
 //!
 //! # Crash-model bound (accepted non-goal)
 //!

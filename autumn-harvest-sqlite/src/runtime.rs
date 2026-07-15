@@ -259,6 +259,27 @@ impl SqliteRuntime {
         if !self.workflows.contains_key(workflow_name) {
             return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
         }
+        // Enforce the workflow-input cap BEFORE inserting the execution row or
+        // appending `WorkflowStarted` (issue #252, Codex #1069 `runtime.rs:264`).
+        // The Postgres start path rejects an oversized input with
+        // `PayloadTooLarge` before persisting anything; without this the SQLite
+        // backend would store/replay an unbounded input and accept a start other
+        // backends reject. Measured as the serialized-JSON byte length, exactly as
+        // the core does (`serde_json::to_string(&input).len()`). A zero cap means
+        // uncapped (the core convention); the default `DEFAULT_MAX_WORKFLOW_INPUT_BYTES`
+        // (2 MiB) is > 0, so the check is active. The reused core context already
+        // enforces the *continue-as-new* and *side-effect* input caps; this closes
+        // the one boundary the executor never sees — the fresh START input.
+        if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
+            let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+            if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
+                return Err(SqliteError::PayloadTooLarge {
+                    kind: "workflow_input",
+                    observed_bytes: observed,
+                    cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+                });
+            }
+        }
         let exec = ExecutionId::new();
         let tx = self.conn.transaction()?;
         store::insert_execution(&tx, exec, workflow_name, &input)?;
@@ -338,6 +359,29 @@ impl SqliteRuntime {
                 execution_id: exec,
                 state,
             });
+        }
+        // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
+        // `runtime.rs:346`), before staging the `harvest_signals` row — otherwise
+        // the next `wait_for_signal` records an oversized `SignalReceived` event,
+        // bloating history and accepting a payload the Postgres path rejects at its
+        // boundary. Checked AFTER the not-found / terminal rejections above: the
+        // target's existence/state is a precondition for accepting ANY signal, so a
+        // typoed or sealed target reports that (the more actionable error) rather
+        // than a size complaint — the prompt's chosen order. (The Postgres HTTP
+        // boundary happens to check the cap *before* `send_signal`'s state check;
+        // both reject and neither stages the row, so the only observable difference
+        // is the error KIND for the pathological "oversized payload to an
+        // unknown/terminal target" case — a caller bug either way.) Measured as the
+        // serialized-JSON byte length, matching the core (`serde_json::to_string`).
+        if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
+            let observed = serde_json::to_string(&payload).map_or(0, |s| s.len() as u64);
+            if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
+                return Err(SqliteError::PayloadTooLarge {
+                    kind: "signal_payload",
+                    observed_bytes: observed,
+                    cap_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+                });
+            }
         }
         // Millisecond precision (issue #1069 P2): `received_at` is compared against
         // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
@@ -1746,5 +1790,73 @@ mod feature_gate_tests {
         info.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
         let (feature, _) = unsupported_workflow_feature(&info).expect("rejected");
         assert!(feature.contains("execution_timeout"), "got `{feature}`");
+    }
+
+    // ── Payload caps: direct "nothing persisted" proofs (issue #252) ───────────
+    // These reuse `base_wf` and access the runtime's private `conn` (a descendant
+    // module of `runtime`) to assert the ROW COUNTS directly — the strongest proof
+    // that an oversized ingress payload never enters storage.
+
+    // FIX A (Codex #1069 `runtime.rs:264`): an oversized START input is rejected
+    // BEFORE the insert transaction is opened — no execution row, no
+    // `WorkflowStarted` event. RED pre-fix: both were inserted.
+    #[test]
+    fn oversized_start_input_persists_nothing() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+
+        let big = serde_json::json!("x".repeat(2 * 1024 * 1024 + 1)); // > 2 MiB
+        let err = rt.start_workflow("base_wf", big).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::SqliteError::PayloadTooLarge {
+                    kind: "workflow_input",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        let execs: i64 = rt
+            .conn
+            .query_row("SELECT COUNT(*) FROM harvest_executions", [], |r| r.get(0))
+            .unwrap();
+        let events: i64 = rt
+            .conn
+            .query_row("SELECT COUNT(*) FROM harvest_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(execs, 0, "no execution row persisted");
+        assert_eq!(events, 0, "no WorkflowStarted event persisted");
+    }
+
+    // FIX C (Codex #1069 `runtime.rs:346`): an oversized signal payload to a
+    // RUNNING target is rejected at ingress — no `harvest_signals` row staged. A
+    // fresh (undriven) execution is RUNNING, so the cap check (which runs AFTER the
+    // not-found/terminal checks) is reached. RED pre-fix: the oversized row staged.
+    #[test]
+    fn oversized_signal_payload_stages_no_row() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&base_wf_info());
+        let exec = rt.start_workflow("base_wf", serde_json::json!(0)).unwrap();
+
+        let big = serde_json::json!("y".repeat(256 * 1024 + 1)); // > 256 KiB
+        let err = rt.send_signal(exec, "go", big).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::SqliteError::PayloadTooLarge {
+                    kind: "signal_payload",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        let signals: i64 = rt
+            .conn
+            .query_row("SELECT COUNT(*) FROM harvest_signals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(signals, 0, "no signal row staged");
     }
 }
