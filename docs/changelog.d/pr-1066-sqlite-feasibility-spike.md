@@ -123,16 +123,41 @@ on the shipped Postgres path).
   bookkeeping, timer-id reuse) are documented in report §5.1/§5.2 as *evidence for*
   the go/no-go: they are exactly the deep coordination/matcher-coupling surface that
   motivates the "separate companion crate reusing the core, not a trivial port"
-  recommendation. **Two further prototype edges surfaced by a later review round —
-  activity-body panic containment (`worker.rs:156`) and timer-vs-activity
-  drain-order replay divergence (`worker.rs:108`) — are likewise documented in
-  report §5.1 and deliberately declined (not fixed) per the spike's timebox: both
-  are inherent to the minimal single-process prototype, are unexercised by the four
-  required scenarios, do not touch the default Postgres build, and are handled
+  recommendation. **Three further prototype edges surfaced by later review rounds —
+  activity-body panic containment (`worker.rs:156`), timer-vs-activity drain-order
+  replay divergence (`worker.rs:108`), and its **multi-timer variant**
+  (`queue.rs:214`; two-plus classic timers armed in one suspension batch fire
+  by `fire_at` deadline, not command order, so a later-command earlier-deadline
+  timer's `TimerFired` interleaves ahead and `match_timer_strict` for the first
+  timer wedges at `Stuck`) — are likewise documented in report §5.1 and
+  deliberately declined (not fixed) per the spike's timebox: all are inherent to
+  the minimal single-process prototype, are unexercised by the four required
+  scenarios (none arms multiple classic timers in one batch — `scenario_two_timers`
+  arms them sequentially), do not touch the default Postgres build, and are handled
   natively by the productized engine (issue #782 panic containment; command-order
-  persistence + interleave-tolerant `HistoryMatcher`).**
-- **An 18-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
-  (18/18 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
+  persistence + a `HistoryMatcher` that tolerates an interleaved `TimerFired` for a
+  *different* timer id).**
+- **One further review edge FIXED (Codex P1) — engine-detected non-determinism is
+  now DETECT-AND-HELD (non-sealing, recoverable), not sealed FAILED.** After
+  round-5 switched `drive_one_cycle` to `run_workflow_with_state`, whose `Failed`
+  outcome carries `non_deterministic_details`, the `Failed` arm still appended a
+  durable `WorkflowFailed` unconditionally — so a replay divergence (e.g. a
+  mismatched cross-backend import) permanently sealed the run FAILED, violating
+  harvest's core replay-safety invariant (issue #603 / Phase 3.45: engine-detected
+  non-determinism must never terminally fail a workflow — it blocks non-terminally
+  so a rollback / re-import / code-fix can recover). The arm now branches on
+  `non_deterministic_details`: on a divergence it opens no persist transaction at
+  all (no `WorkflowFailed`, no divergent-cycle bookkeeping persisted, execution
+  left non-terminal) and surfaces the distinct, recoverable
+  `SpikeError::NonDeterministic` — a scoped analogue of the engine's non-terminal
+  ND-block gate (the throwaway prototype captures only the non-sealing/recoverable
+  property, not the engine's backoff + `nd_blocked_*` columns). Regressed by
+  `scenario_nondeterministic_import_is_recoverable_not_sealed` (an
+  `other_activity`-named imported schedule vs. the handler's `work` diverges →
+  recoverable ND, no `WorkflowFailed`, no bookkeeping, re-drive re-detects; fails
+  pre-fix, which sealed FAILED).
+- **A 19-test smoke suite** `autumn-harvest/tests/integration/sqlite_spike_tests.rs`
+  (19/19 pass, no Docker via `rusqlite`'s `bundled` feature): activity retry,
   durable timer across process restart, signal delivery, deterministic replay
   after a simulated crash, **cross-backend replay executed in both directions** —
   a SQLite-written history (success-path *and* a retry-produced history) replays

@@ -131,6 +131,30 @@ pub enum SpikeError {
     Unsupported(String),
     /// A stored value could not be parsed back into its type.
     Corrupt(String),
+    /// Engine-detected replay **non-determinism** — the durable history and the
+    /// registered workflow code diverge (e.g. a cross-backend import whose
+    /// recorded command stream does not match what the handler re-produces on
+    /// replay, or a code change that reorders/renames a recorded command).
+    ///
+    /// **This is a RECOVERABLE condition, not a durable failure.** Per harvest's
+    /// core replay-safety invariant (issue #603 / Phase 3.45), engine-detected
+    /// non-determinism must NEVER terminally seal a workflow: a rollback, a
+    /// re-import, or a corrected build can still drive the run to a faithful
+    /// terminal. The spike's scoped analogue is **detect-and-hold** — the
+    /// execution is left exactly as it was (non-terminal, no `WorkflowFailed`
+    /// appended, the divergent cycle's pending bookkeeping NOT persisted) and
+    /// this error is surfaced so the caller can act. It is deliberately a
+    /// *distinct* error from [`Self::Stuck`] (a genuinely unclassifiable
+    /// no-progress wedge). The productized engine's full non-terminal ND-block
+    /// gate additionally applies capped-exponential backoff and stamps
+    /// `nd_blocked_*` columns so a rolled-back build resumes automatically; the
+    /// throwaway prototype captures only the essential *non-sealing /
+    /// recoverable* property, not that machinery.
+    NonDeterministic {
+        /// Structured divergence details (expected vs. actual event, the
+        /// diverging event index, workflow type, build id).
+        details: crate::error::NonDeterministicDetails,
+    },
     /// The runtime made no progress and could not classify the block — should
     /// not happen for the supported primitives; surfaced instead of looping.
     Stuck,
@@ -154,6 +178,12 @@ impl std::fmt::Display for SpikeError {
             Self::UnregisteredActivity(n) => write!(f, "unregistered activity: {n}"),
             Self::Unsupported(n) => write!(f, "unsupported command for spike: {n}"),
             Self::Corrupt(field) => write!(f, "corrupt stored value: {field}"),
+            Self::NonDeterministic { details } => write!(
+                f,
+                "non-deterministic replay (recoverable, not sealed): expected {:?}, got {:?} \
+                 at event index {:?}",
+                details.expected, details.actual, details.event_index
+            ),
             Self::Stuck => write!(
                 f,
                 "runtime made no progress and could not classify the block"
@@ -575,7 +605,38 @@ impl SqliteRuntime {
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
-            WorkflowOutcome::Failed { error, .. } => {
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                ..
+            } => {
+                // `run_workflow_with_state`'s `Failed` outcome carries
+                // `non_deterministic_details: Some(_)` when replay detected a
+                // history/code DIVERGENCE (as opposed to the workflow's own logic
+                // returning `Err`). These two must be handled differently:
+                //
+                //   * ND divergence (`Some`): DETECT-AND-HOLD. Harvest's core
+                //     replay-safety invariant (#603 / Phase 3.45) is that an
+                //     engine-detected non-determinism must NEVER terminally seal a
+                //     workflow — it is a RECOVERABLE condition a rollback /
+                //     re-import / code-fix can still drive to a faithful terminal.
+                //     So we do NOT open the persist transaction at all: no
+                //     `persist_terminal_bookkeeping` (the divergent cycle's pending
+                //     `RecordSideEffect`/`RecordMarker` must not pollute history
+                //     against a rollback), no `WorkflowFailed` append, no state
+                //     flip. The execution is left exactly as it was (non-terminal),
+                //     and the divergence is surfaced as the distinct, recoverable
+                //     `SpikeError::NonDeterministic` — NOT `Stuck` (a genuine
+                //     wedge) and NOT a durable seal. This is directly on the
+                //     spike's cross-backend-import path: a mismatched imported
+                //     history is held for re-import rather than sealed unrecoverably.
+                //
+                //   * Genuine author failure (`None`): the workflow's own logic
+                //     returned `Err`. Seal it, unchanged (below).
+                if let Some(details) = non_deterministic_details {
+                    return Err(SpikeError::NonDeterministic { details });
+                }
+
                 // Terminal-cycle bookkeeping + terminal event + state flip in ONE
                 // transaction (same duplicate-terminal + drop-the-side-effect
                 // hazards as the completed arm above).

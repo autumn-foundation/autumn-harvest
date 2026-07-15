@@ -1502,3 +1502,114 @@ async fn scenario_import_sealed_unrepresentable_terminal_is_rejected() {
         RunState::Completed(ref v) if v == &json!(18)
     ));
 }
+
+// ── Codex P1 regression: engine-detected non-determinism is RECOVERABLE, not sealed ──
+//
+// `run_workflow_with_state`'s `Failed` outcome carries
+// `non_deterministic_details: Some(_)` when deterministic replay detected a
+// history/code DIVERGENCE (as opposed to the workflow's own logic returning
+// `Err`). Harvest's core replay-safety invariant (#603 / Phase 3.45) is that an
+// engine-detected non-determinism must NEVER terminally seal a workflow — it is a
+// RECOVERABLE condition a rollback / re-import / code-fix can still drive. Before
+// the fix, `drive_one_cycle`'s `Failed` arm unconditionally appended a durable
+// `WorkflowFailed` and flipped the row to FAILED, so a mismatched imported history
+// (directly on the spike's cross-backend-import path) was sealed unrecoverably.
+//
+// Here we import a history whose recorded `ActivityScheduled` is for a DIFFERENT
+// activity name than the registered `single_activity` handler produces on replay
+// (it schedules "work"; the imported history has "other_activity"). Replay's
+// `match_activity` diverges → `WorkflowOutcome::Failed { non_deterministic_details:
+// Some(_) }`. The runtime must DETECT-AND-HOLD: surface the distinct, recoverable
+// `SpikeError::NonDeterministic` and leave the execution exactly as it was —
+// non-terminal, no `WorkflowFailed` appended, no divergent-cycle bookkeeping
+// persisted.
+#[tokio::test]
+async fn scenario_nondeterministic_import_is_recoverable_not_sealed() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&single_activity_info());
+    // Register "work" so the setup is realistic; the body must NEVER be invoked —
+    // replay diverges before any worker pass could claim the (materialized) task.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r2 = ran.clone();
+    rt.register_activity(
+        "work",
+        ActivitySpec::new(1, move |input: serde_json::Value| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(input.as_i64().unwrap() * 10))
+        }),
+    );
+
+    // A history that does NOT match the registered workflow: `single_activity`
+    // schedules "work", but the imported open activity is named "other_activity".
+    let divergent_history = vec![
+        WorkflowEvent::workflow_started(json!(4), chrono::Utc::now()),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "other_activity".to_string(),
+            input: json!(4),
+            queue: "default".to_string(),
+        },
+    ];
+    let exec = rt
+        .import_execution("single_activity", json!(4), divergent_history)
+        .unwrap();
+
+    // (a) The divergence surfaces as the distinct, recoverable
+    // `SpikeError::NonDeterministic` — NOT a sealed `RunState::Failed` and NOT the
+    // generic `Stuck` wedge.
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(err, SpikeError::NonDeterministic { .. }),
+        "engine-detected non-determinism must surface as the recoverable \
+         SpikeError::NonDeterministic, not a seal or Stuck: {err:?}"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "replay diverges before any activity body runs"
+    );
+
+    // (b) NO durable `WorkflowFailed` was appended — the history is unchanged from
+    // the import (the two imported events, nothing sealed on top).
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::WorkflowFailed { .. }
+        )),
+        0,
+        "a non-deterministic divergence must NOT append a terminal WorkflowFailed"
+    );
+
+    // (c) NO divergent-cycle bookkeeping (`SideEffectRecorded`/`MarkerRecorded`)
+    // was persisted — the divergent cycle's pending commands must not pollute the
+    // durable history against a rollback (the `persist_terminal_bookkeeping`
+    // hazard the fix skips on the ND path).
+    assert_eq!(
+        count_events(&events, |e| matches!(
+            e,
+            WorkflowEvent::SideEffectRecorded { .. } | WorkflowEvent::MarkerRecorded { .. }
+        )),
+        0,
+        "the divergent cycle must persist no bookkeeping events"
+    );
+    // The history is byte-for-byte the imported one (WorkflowStarted + the open
+    // ActivityScheduled), proving the divergent cycle wrote nothing at all.
+    assert_eq!(
+        events.len(),
+        2,
+        "history unchanged from the import: {events:?}"
+    );
+
+    // (recoverability) The execution was NOT sealed: re-driving STILL detects the
+    // divergence (and would resume faithfully once the mismatch is corrected /
+    // re-imported), rather than short-circuiting on a stored terminal FAILED at the
+    // top-of-cycle "already terminal?" check.
+    let err2 = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(err2, SpikeError::NonDeterministic { .. }),
+        "a held (non-sealed) execution re-detects the divergence on re-drive, \
+         proving it was left recoverable: {err2:?}"
+    );
+}

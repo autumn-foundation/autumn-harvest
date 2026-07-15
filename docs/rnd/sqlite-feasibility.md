@@ -485,10 +485,56 @@ while reusing the core unchanged.
   replay, and this untested edge shape is a documented limitation, not a regression
   in what was proven.
 
+  - **Multi-timer variant (`queue.rs:214`, same root cause).** The same
+    fire-by-deadline-vs-command-order mismatch also bites **two or more classic
+    timers armed in one suspension batch**. `due_timers` selects rows by their
+    absolute `fire_at` deadline, **not** by `TimerStarted` command/record order,
+    so a `join!(slow, fast)` batch where `fast` has an earlier (or equal) deadline
+    can persist as `TimerStarted(slow) → TimerStarted(fast) → TimerFired(fast) →
+    …`. On replay `match_timer_strict` for `slow` (the first `TimerStarted` in
+    command order) stops at the unconsumed `TimerFired(fast)` before it reaches
+    `slow`'s own fire, and the run wedges at `SpikeError::Stuck` — the exact
+    activity/timer shape above, one level up (timer-vs-timer rather than
+    timer-vs-activity). The real engine again persists in **command order** and its
+    `HistoryMatcher` **tolerates an interleaved `TimerFired` for a *different*
+    timer id**, so the same batch replays cleanly. None of the four required
+    scenarios arm multiple classic timers in one batch (`scenario_two_timers` arms
+    them *sequentially*, each awaited before the next), so this too is a **latent
+    divergence unexercised by the tested scenarios**, further evidence for the
+    "separate companion crate, not a trivial port" recommendation (§5.2 / §9):
+    faithful multi-timer ordering is native to the engine's matcher + real
+    `harvest_timers` schema and is exactly the coordination the from-scratch
+    persistence layer would have to rebuild.
+
+**Non-determinism is DETECTED-AND-HELD (non-sealing, recoverable), not sealed
+FAILED (Codex P1).** The reused determinism core surfaces a replay divergence — a
+history/code mismatch, e.g. a cross-backend import whose recorded command stream
+does not match what the registered handler re-produces on replay — as
+`WorkflowOutcome::Failed { non_deterministic_details: Some(_) }`, distinct from the
+workflow's own logic returning `Err`. Harvest's **core replay-safety invariant**
+(issue #603 / Phase 3.45) is that an engine-detected non-determinism must **never**
+terminally seal a workflow: it is a *recoverable* condition a rollback, a
+re-import, or a corrected build can still drive to a faithful terminal. The
+prototype now honours that invariant with a **scoped analogue** of the engine's
+non-terminal ND-block gate: `drive_one_cycle` branches on
+`non_deterministic_details` and, on a divergence, opens **no** persist transaction
+at all — it appends **no** `WorkflowFailed`, persists **none** of the divergent
+cycle's pending bookkeeping (so a re-import is not poisoned), leaves the execution
+exactly as it was (non-terminal), and surfaces the distinct, recoverable
+`SpikeError::NonDeterministic` (never `Stuck`, never a durable seal). This is
+**detect-and-hold**, deliberately *not* the productized engine's full non-terminal
+ND-block machinery (capped-exponential backoff + `nd_blocked_*` columns so a
+rolled-back build resumes automatically) — the throwaway prototype captures only
+the essential *non-sealing / recoverable* property. It is directly load-bearing for
+the spike's cross-backend-import claim: a mismatched imported history is held for
+re-import rather than sealed unrecoverably. Regressed by
+`scenario_nondeterministic_import_is_recoverable_not_sealed` (§5.2), which fails on
+the pre-fix code that appended a `WorkflowFailed` and flipped the row to FAILED.
+
 ### 5.2 What it proved (live test run)
 
 `cargo test -p autumn-harvest --no-default-features --features
-sqlite-spike,testing --test integration sqlite_spike` → **18 passed; 0 failed**
+sqlite-spike,testing --test integration sqlite_spike` → **19 passed; 0 failed**
 (no Docker — SQLite is embedded via `rusqlite`'s `bundled` feature):
 
 | Test | Proves |
@@ -511,6 +557,7 @@ sqlite-spike,testing --test integration sqlite_spike` → **18 passed; 0 failed*
 | `scenario_unregistered_activity_requeues_and_drains_after_registration` | **(Codex P2 regression, round 6)** A workflow schedules an activity whose handler is NOT registered. The claim commits the task `RUNNING` in its own transaction; the handler lookup then fails. The task is requeued to `PENDING` (attempt unchanged) and the `UnregisteredActivity` error surfaced, so registering the handler and re-running drains the same task to `Completed`. Fails on the pre-fix code, where the claimed task was stranded `RUNNING` (later claims select only `PENDING`) so the re-run could never drain it and wedged at `SpikeError::Stuck`. This is the recoverable-application-condition half of `drain_ready`'s requeue-on-any-post-claim-error invariant (§5.1). |
 | `scenario_import_timed_out_activity_is_terminal_not_re_materialized` | **(Codex P2 regression, round 7)** An imported PG-shaped history in which a scheduled activity **timed out** (`Scheduled → Started → ActivityTimedOut`) is recognized as **terminal**: the importer materializes **no** stale `spike_tasks` row, so when the workflow swallows the replayed timeout and suspends on a timer (reaching the `drain_ready` pass), no stale task is claimed + run and **no** duplicate `ActivityCompleted` terminal is appended for the id. Fails on the pre-fix code where `history_has_activity_terminal` recognized only `ActivityCompleted`/`ActivityFailed` (missing `ActivityTimedOut`), so the timed-out activity read as *open*, a stale task was materialized, and driving corrupted the log with a second terminal. Closes the activity-terminal-variant completeness gap comprehensively (also recognizes the external-completion terminals). |
 | `scenario_import_sealed_unrepresentable_terminal_is_rejected` | **(Codex P2 regression, round 7)** A **sealed** imported history whose tail terminal is a variant the COMPLETED/FAILED-only prototype cannot model (`WorkflowCancelled`, and separately `WorkflowExecutionTimedOut`) is **rejected** outright with `SpikeError::Unsupported` before any DB write — nothing is imported — and a representable sealed import (`WorkflowCompleted`) still succeeds on the same runtime afterward (no torn/poisoned state left behind). Fails on the pre-fix code where the sealed-terminal scan recognized only `WorkflowCompleted`/`WorkflowFailed`, so an unrepresentable seal fell through to the in-flight branch and was seeded `RUNNING` — a later re-drive would then replay the sealed history and append a second terminal. Closes the workflow-terminal-variant completeness gap (never silently mis-materialized), consistent with the driven path already rejecting a `ContinueAsNew` command. |
+| `scenario_nondeterministic_import_is_recoverable_not_sealed` | **(Codex P1 regression, round 8)** An imported history whose recorded `ActivityScheduled` names a **different** activity than the registered `single_activity` handler produces on replay (it schedules `work`; the history has `other_activity`) diverges in `match_activity` → `WorkflowOutcome::Failed { non_deterministic_details: Some(_) }`. The runtime **detects-and-holds**: `run_until_blocked` surfaces the distinct, recoverable `SpikeError::NonDeterministic` (not a seal, not `Stuck`), appends **no** `WorkflowFailed`, persists **no** divergent-cycle bookkeeping (history is byte-for-byte the imported two events), never runs the activity body, and a **re-drive re-detects** the divergence (proving the execution was left non-terminal / recoverable). Fails on the pre-fix code that unconditionally appended a `WorkflowFailed` and flipped the row to FAILED — sealing an engine-detected non-determinism unrecoverably and violating harvest's #603 replay-safety invariant (§5.1). |
 
 ### 5.3 Honest fidelity caveat — retry recording (verified against the PG engine)
 
