@@ -191,7 +191,21 @@ pub fn drain_ready(
         // for the common case (`None`, or a deadline still in the future). The retry
         // path (below, in `finalize_within_tx`) catches the more common case: a body
         // that keeps failing/backing off past the deadline.
-        if schedule_to_close_exceeded(now, task.schedule_to_close_at) {
+        //
+        // Read a FRESH clock for THIS pre-run check (Codex #1069 P2, `worker.rs:194`)
+        // — NOT the stale cycle-start `now`, which is captured ONCE at the top of the
+        // pass. When several ready activities are drained in one pass, an EARLIER
+        // body drained in this same pass may consume real wall-clock time before this
+        // (later) task is claimed, so this task's ABSOLUTE deadline can elapse WHILE
+        // it waited its turn. Comparing against the stale `now` would pass this check
+        // and RUN the body anyway — the finalize-time recheck (below) only catches it
+        // AFTER the side effect already happened, starting an attempt past the
+        // declared wall-clock cap. Reading current time here seals an already
+        // over-deadline queued task terminal via the SAME timeout path BEFORE its
+        // body runs. In `_as_of` simulation `failure_now() == now`, so this is
+        // byte-identical to the old behavior there.
+        let claim_now = failure_now();
+        if schedule_to_close_exceeded(claim_now, task.schedule_to_close_at) {
             finalize_activity_timeout(conn, exec_id, &task, TimeoutType::ScheduleToClose)?;
             produced = true;
             if settle_after_first_terminal {
@@ -943,6 +957,27 @@ mod tests {
         spec
     }
 
+    /// A two-valued clock seam for the finalize-time-recheck drain tests: returns
+    /// `before` on the FIRST read and `after` on every read thereafter. Now that the
+    /// PRE-RUN `schedule_to_close` check also reads the clock (Codex #1069 P2,
+    /// `worker.rs:194`), a single constant value past the deadline would seal the
+    /// activity BEFORE its body runs — which is the NEW pre-run test's subject, not
+    /// these. These backstop tests model "the deadline elapses WHILE the body runs":
+    /// the first read (the pre-run check) must see `before` (< the deadline, so the
+    /// body runs) and the second read (the post-body finalize recheck) must see
+    /// `after` (>= the deadline, so the finalize recheck seals it). So the clock
+    /// advances ACROSS the body, exactly as a real wall clock does.
+    fn advancing_finalize_clock(before: i64, after: i64) -> impl Fn() -> i64 + Send + Sync {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        move || {
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                before
+            } else {
+                after
+            }
+        }
+    }
+
     /// Requeue `run_at` (epoch-ms) of the single task after one retryable failure,
     /// finalized with a distinct cycle-start `now` and failure-time `failure_now`
     /// and the given retry `policy`. Asserts the failure was a (non-terminal) retry.
@@ -1636,7 +1671,7 @@ mod tests {
         // Cycle-start now = 0 (< deadline 1000 → pre-body check passes, body runs);
         // post-body finalize clock = 1500 (>= deadline → finalize recheck seals the
         // timeout).
-        let failure_now = || 1_500_i64;
+        let failure_now = advancing_finalize_clock(0, 1_500);
         let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
@@ -1742,7 +1777,7 @@ mod tests {
         // Cycle-start now = 0 (< deadline 1000 → pre-body check passes, body runs);
         // post-body finalize clock = 1500 (>= deadline → generalized finalize recheck
         // seals the timeout even though the body returned Err).
-        let failure_now = || 1_500_i64;
+        let failure_now = advancing_finalize_clock(0, 1_500);
         let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
@@ -1824,7 +1859,7 @@ mod tests {
         // zero-delay run_at = now = 0 would NOT be caught by the retry-path check);
         // post-body finalize clock = 1500 (>= deadline → the generalized finalize recheck
         // seals the timeout).
-        let failure_now = || 1_500_i64;
+        let failure_now = advancing_finalize_clock(0, 1_500);
         let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
         assert!(produced);
 

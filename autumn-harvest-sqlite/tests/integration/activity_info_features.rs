@@ -261,6 +261,151 @@ async fn a_successful_body_finalized_past_the_total_deadline_records_timed_out_n
     );
 }
 
+// ── PRE-RUN check reads a FRESH clock (Codex #1069 P2, `worker.rs:194`) ─────────────
+//
+// `drain_ready` captures the cycle-start `now` ONCE and drains every ready activity in
+// one pass. The pre-run `schedule_to_close` check must NOT compare a LATER task's
+// absolute deadline against that stale `now`: an EARLIER body drained in the same pass
+// can consume real wall-clock time, so a task queued behind it can cross its total
+// deadline WHILE it waited its turn. Comparing against the stale `now` runs the body
+// anyway — the finalize-time recheck only seals the timeout AFTER the side effect
+// already happened, starting an attempt past the declared cap. Reading current time at
+// the pre-run check seals an already over-deadline queued task via the SAME timeout
+// path BEFORE its body runs.
+//
+// Driven deterministically (no sleeping) via a shared injectable clock: BOTH activities
+// are fanned out in ONE suspension batch → both are drained in ONE pass, in seq (input)
+// order. `earlier_body` (seq 0) advances the shared clock 5s past `queued_side_effect`'s
+// 1s deadline, then completes; `queued_side_effect` (seq 1, drained after) has an
+// observable side-effect counter.
+
+#[activity]
+async fn earlier_body(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[activity(schedule_to_close = "1s")]
+async fn queued_side_effect(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[workflow]
+async fn drained_together_wf(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    // Fan out BOTH activities in one suspension batch → they become ready together and
+    // are drained in ONE `drain_ready` pass, `earlier_body` first (lower seq).
+    match ctx
+        .execute_activity_fan_out_raw(vec![
+            ("earlier_body".to_string(), json!(n), "default".to_string()),
+            (
+                "queued_side_effect".to_string(),
+                json!(n),
+                "default".to_string(),
+            ),
+        ])
+        .await
+    {
+        Ok(_) => Ok("both_completed".to_string()),
+        // `queued_side_effect` times out → the fail-fast fan-out surfaces the failure;
+        // map it so the run reaches a clean terminal state regardless of how the timeout
+        // is surfaced (the assertions below are on history, not the returned string).
+        Err(_) => Ok("queued_timed_out".to_string()),
+    }
+}
+
+// RED pre-fix: the pre-run check used the STALE cycle-start `now` (< the deadline the
+// earlier body pushed us past), so `queued_side_effect`'s body RAN (counter == 1) and
+// was timed out only at finalize — AFTER its side effect. GREEN post-fix: the pre-run
+// check reads the fresh clock (past the deadline), so the body NEVER runs (counter == 0)
+// while the SAME terminal `ActivityTimedOut { ScheduleToClose }` is still recorded.
+#[tokio::test]
+async fn a_queued_activity_whose_deadline_elapsed_while_an_earlier_body_ran_is_timed_out_before_running()
+ {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&drained_together_wf_info());
+
+    // A shared, injectable clock (epoch-millis). The runtime driver and `earlier_body`
+    // read/advance it, so the deadline elapses WHILE the earlier body runs — no sleeping.
+    let t0: i64 = 5_000_000_000;
+    let clock = Arc::new(AtomicI64::new(t0));
+    let clock_for_rt = Arc::clone(&clock);
+    rt.set_clock(move || {
+        DateTime::from_timestamp_millis(clock_for_rt.load(Ordering::SeqCst)).unwrap()
+    });
+
+    // `earlier_body` (seq 0, drained FIRST) advances the shared clock to t0+5s — well
+    // past `queued_side_effect`'s absolute deadline (scheduled_at t0 + 1s = t0+1000) —
+    // then completes. No schedule_to_close of its own, so it never times out.
+    let clock_for_body = Arc::clone(&clock);
+    rt.register_activity(&earlier_body_info(), move |input| {
+        clock_for_body.store(t0 + 5_000, Ordering::SeqCst);
+        Ok(input)
+    });
+
+    // `queued_side_effect` (seq 1, drained AFTER) increments an OBSERVABLE counter so
+    // "did its body run?" is falsifiable. Its 1s total deadline has ALREADY elapsed by
+    // the time it is claimed (the earlier body pushed the clock to t0+5s).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body_calls = Arc::clone(&calls);
+    rt.register_activity(&queued_side_effect_info(), move |input| {
+        body_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(input)
+    });
+
+    let exec = rt.start_workflow("drained_together_wf", json!(7)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "queued_timed_out"),
+        "the run must terminate observing the queued activity's schedule-to-close \
+         timeout, got {state:?}"
+    );
+
+    // GREEN: the queued body was sealed BEFORE it ran.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the queued activity's body must NOT run — its absolute deadline had already \
+         elapsed (an earlier body drained in the same pass advanced the clock past it) \
+         when it was claimed. RED pre-fix: the stale cycle `now` let the body run \
+         (counter == 1), timed out only at finalize AFTER the side effect."
+    );
+
+    // The SAME terminal `ActivityTimedOut { ScheduleToClose }` is still recorded via the
+    // existing timeout path — the body just never ran.
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: TimeoutType::ScheduleToClose,
+                ..
+            }
+        )),
+        "the over-deadline queued activity must seal ActivityTimedOut {{ ScheduleToClose }} \
+         via the existing timeout path:\n{history:?}"
+    );
+    // The earlier body completed normally (control: a fresh-clock pre-run check does not
+    // falsely time out an on-time earlier body).
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+        "the earlier body must complete normally:\n{history:?}"
+    );
+
+    // The timed-out history replays byte-identically on the core engine.
+    let report = WorkflowReplayer::new()
+        .register_fn("drained_together_wf", drained_together_wf_info().handler)
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a pre-run ScheduleToClose history must replay cleanly on the core:\n{report}"
+    );
+}
+
 // ── REJECTED at registration (setup-time panic, naming the feature) ────────────────
 
 #[activity(heartbeat_timeout = "10s")]
