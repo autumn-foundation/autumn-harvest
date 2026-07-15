@@ -163,8 +163,11 @@ pub fn export_profile_mermaid_gantt(profile: &DagProfile) -> Result<String, std:
     writeln!(out, "    dateFormat  X")?;
     writeln!(out, "    axisFormat  %S")?;
 
-    let mut starts = std::collections::HashMap::new();
-    let mut output_lines = Vec::new();
+    let len = profile.timeline.len();
+    // Pre-allocating `output_lines` and `starts` map to `len / 2` (every task has a start and end)
+    // avoids iterative heap reallocations when exporting large charts.
+    let mut starts = std::collections::HashMap::with_capacity(len / 2);
+    let mut output_lines = Vec::with_capacity(len / 2);
 
     for event in &profile.timeline {
         match &event.kind {
