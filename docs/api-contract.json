@@ -2376,13 +2376,13 @@
       "path": "/dead-letters/aggregate",
       "category": "dlq",
       "read_only": true,
-      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, and/or a derived failure_signature, returning per-group counts and representative sample IDs merged across shards.",
+      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, a derived failure_signature, a derived dlq_reason class, and/or a derived error_class, returning per-group counts and representative sample IDs merged across shards.",
       "params": [
         {
           "name": "group_by",
           "in": "query",
           "required": true,
-          "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, or failure_signature. Repeats build a hierarchical key."
+          "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, failure_signature, dlq_reason, or error_class. Repeats build a hierarchical key."
         },
         {
           "name": "time_bucket",
@@ -2495,6 +2495,21 @@
             "description": "RFC 3339 timestamp \u2014 only replay entries failed before this time."
           },
           {
+            "name": "error_class",
+            "required": false,
+            "description": "Filter by derived error class (compute-on-read, exact match; e.g. CircuitOpen, PoisonPill)."
+          },
+          {
+            "name": "dlq_reason",
+            "required": false,
+            "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
+          },
+          {
+            "name": "failure_signature",
+            "required": false,
+            "description": "Filter by derived failure signature (compute-on-read, exact match)."
+          },
+          {
             "name": "limit",
             "required": false,
             "description": "Maximum number of entries to replay."
@@ -2559,6 +2574,21 @@
             "name": "failed_before",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only discard entries failed before this time."
+          },
+          {
+            "name": "error_class",
+            "required": false,
+            "description": "Filter by derived error class (compute-on-read, exact match; e.g. CircuitOpen, PoisonPill)."
+          },
+          {
+            "name": "dlq_reason",
+            "required": false,
+            "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
+          },
+          {
+            "name": "failure_signature",
+            "required": false,
+            "description": "Filter by derived failure signature (compute-on-read, exact match)."
           },
           {
             "name": "limit",

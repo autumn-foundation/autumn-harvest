@@ -2710,7 +2710,9 @@ fn dlq_summary_drilldown_href(
             DlqGroupDimension::ActivityName
             | DlqGroupDimension::QueueName
             | DlqGroupDimension::TimeBucket
-            | DlqGroupDimension::FailureSignature => {
+            | DlqGroupDimension::FailureSignature
+            | DlqGroupDimension::DlqReason
+            | DlqGroupDimension::ErrorClass => {
                 partial = true;
             }
         }

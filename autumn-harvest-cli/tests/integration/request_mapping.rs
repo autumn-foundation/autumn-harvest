@@ -1148,27 +1148,16 @@ fn dlq_bulk_discard_with_cause_filters_maps_to_body() {
 
 #[test]
 fn dlq_summary_alias_maps_like_aggregate() {
-    let summary = Cli::try_parse_from([
-        "harvest",
-        "dlq",
-        "summary",
-        "--group-by",
-        "dlq_reason",
-    ])
-    .expect("dlq summary should parse")
-    .api_request()
-    .expect("summary request should build");
+    let summary = Cli::try_parse_from(["harvest", "dlq", "summary", "--group-by", "dlq_reason"])
+        .expect("dlq summary should parse")
+        .api_request()
+        .expect("summary request should build");
 
-    let aggregate = Cli::try_parse_from([
-        "harvest",
-        "dlq",
-        "aggregate",
-        "--group-by",
-        "dlq_reason",
-    ])
-    .expect("dlq aggregate should parse")
-    .api_request()
-    .expect("aggregate request should build");
+    let aggregate =
+        Cli::try_parse_from(["harvest", "dlq", "aggregate", "--group-by", "dlq_reason"])
+            .expect("dlq aggregate should parse")
+            .api_request()
+            .expect("aggregate request should build");
 
     assert_eq!(summary.method, ApiMethod::Get);
     assert_eq!(summary.method, aggregate.method);

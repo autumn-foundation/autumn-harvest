@@ -70,6 +70,8 @@ linux        autumn-harvest-plugin  build_ramp_integration           -          
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
+linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
+linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  fail_now_integration             -                          -
 linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -

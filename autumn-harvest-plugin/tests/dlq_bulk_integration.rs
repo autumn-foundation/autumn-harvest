@@ -156,6 +156,24 @@ async fn post_json(
     (status, json)
 }
 
+async fn get_json_bulk(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, Value) {
+    let uri = uri.into();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("GET request failed");
+    let status = response.status();
+    let json = read_json_response(response).await;
+    (status, json)
+}
+
 async fn insert_dlq_row(database_url: &str, activity_name: &str, task_type: &str) -> uuid::Uuid {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -452,4 +470,278 @@ async fn bulk_replay_after_drain_returns_zero_matched() {
     assert_eq!(second_body["acted_on"], 0);
     let ids = second_body["ids"].as_array().expect("ids must be an array");
     assert!(ids.is_empty(), "no ids expected when nothing matched");
+}
+
+// ---------------------------------------------------------------------------
+// Cause-dimension bulk filters (issue #613)
+// ---------------------------------------------------------------------------
+
+fn poison_pill_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::PoisonPill {
+        crash_strikes: 3,
+        last_worker_id: Some("worker-7".to_string()),
+    }
+    .to_string()
+}
+
+/// Insert a dead-letter row carrying an arbitrary `error` string.
+async fn insert_dlq_row_with_error(
+    database_url: &str,
+    activity_name: &str,
+    error: &str,
+) -> uuid::Uuid {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for dead-letter insert");
+    autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: None,
+            activity_name: Some(activity_name.to_string()),
+            input: json!({ "test": true }),
+            error: error.to_string(),
+            attempts: 3,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed")
+}
+
+async fn count_dlq_rows_by_activity(database_url: &str, activity_name: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for dead-letter count");
+    harvest_dead_letters::table
+        .filter(harvest_dead_letters::activity_name.eq(activity_name))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count dead letters by activity")
+}
+
+async fn post_form(app: &HarvestApiApp, uri: &str, body: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("POST form request failed");
+    let status = response.status();
+    let json = read_json_response(response).await;
+    (status, json)
+}
+
+/// The AC5 round-trip money test: the bulk dry-run `matched` count for a cause
+/// cohort equals the same cohort's count from the aggregate facet, proving both
+/// surfaces share the classifier (lossless by construction).
+#[tokio::test]
+async fn bulk_cause_dry_run_count_equals_aggregate_facet() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    for _ in 0..4 {
+        insert_dlq_row_with_error(&database_url, "pp", &poison_pill_error()).await;
+    }
+    for _ in 0..3 {
+        insert_dlq_row_with_error(&database_url, "plain", "connection refused").await;
+    }
+
+    // Aggregate facet count for poison_pill.
+    let (agg_status, agg_body) =
+        get_json_bulk(&app, "/dead-letters/aggregate?group_by=dlq_reason").await;
+    assert_eq!(agg_status, StatusCode::OK, "agg body: {agg_body}");
+    let facet = agg_body["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .find(|g| g["key"]["dlq_reason"] == "poison_pill")
+        .expect("poison_pill facet")["count"]
+        .as_i64()
+        .expect("count");
+    assert_eq!(facet, 4);
+
+    // Bulk discard dry-run for the same cohort must report the same matched.
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "poison_pill", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["matched"], facet, "discard matched must equal facet");
+    assert_eq!(body["dry_run"], true);
+
+    // Same for replay dry-run.
+    let (rstatus, rbody) = post_json(
+        &app,
+        "/dead-letters/replay",
+        json!({ "dlq_reason": "poison_pill", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(rstatus, StatusCode::OK, "body: {rbody}");
+    assert_eq!(rbody["matched"], facet, "replay matched must equal facet");
+}
+
+#[tokio::test]
+async fn bulk_discard_error_class_deletes_only_matching() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    for _ in 0..4 {
+        insert_dlq_row_with_error(&database_url, "pp", &poison_pill_error()).await;
+    }
+    for _ in 0..3 {
+        insert_dlq_row_with_error(&database_url, "plain", "connection refused").await;
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "error_class": "PoisonPill" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["matched"], 4);
+    assert_eq!(body["acted_on"], 4);
+
+    assert_eq!(
+        count_dlq_rows_by_activity(&database_url, "pp").await,
+        0,
+        "all PoisonPill rows discarded"
+    );
+    assert_eq!(
+        count_dlq_rows_by_activity(&database_url, "plain").await,
+        3,
+        "non-matching rows must survive"
+    );
+}
+
+#[tokio::test]
+async fn bulk_cause_post_filter_precedes_limit() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    // Interleave poison_pill and plain rows so a limit applied BEFORE the cause
+    // post-filter would clip the wrong rows.
+    for _ in 0..5 {
+        insert_dlq_row_with_error(&database_url, "pp", &poison_pill_error()).await;
+        insert_dlq_row_with_error(&database_url, "plain", "connection refused").await;
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "poison_pill", "limit": 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["matched"], 5,
+        "matched counts all matching (pre-limit)"
+    );
+    assert_eq!(body["acted_on"], 3, "limit caps acted-on to 3");
+
+    // Exactly 3 poison_pill rows discarded; every plain row untouched — proving
+    // the cause post-filter ran before the limit clip.
+    assert_eq!(
+        count_dlq_rows_by_activity(&database_url, "pp").await,
+        2,
+        "3 of 5 poison_pill rows discarded"
+    );
+    assert_eq!(
+        count_dlq_rows_by_activity(&database_url, "plain").await,
+        5,
+        "no plain rows may be discarded"
+    );
+}
+
+#[tokio::test]
+async fn bulk_empty_cause_filter_json_is_rejected_400() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    let (status, _body) =
+        post_json(&app, "/dead-letters/discard", json!({ "dlq_reason": "" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty cause must 400");
+
+    let (wstatus, _wbody) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "   " }),
+    )
+    .await;
+    assert_eq!(
+        wstatus,
+        StatusCode::BAD_REQUEST,
+        "whitespace-only cause must 400"
+    );
+}
+
+#[tokio::test]
+async fn bulk_empty_cause_filter_form_is_rejected_400() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    // An empty cause value in a form must be REJECTED, never silently dropped
+    // (which would leave workflow_name=x as the only filter and widen scope).
+    let (status, _body) =
+        post_form(&app, "/dead-letters/discard", "dlq_reason=&workflow_name=x").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty form cause must 400");
+}
+
+#[tokio::test]
+async fn bulk_cause_only_filter_is_not_rejected_as_empty() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    // A cause-only filter is substantive: it must not trip the empty-filter 400.
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "poison_pill", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cause-only filter must be accepted: {body}"
+    );
+}
+
+#[tokio::test]
+async fn bulk_cause_across_shards_honors_global_limit() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let app = build_sharded_dlq_app(&shard0_url, &shard1_url);
+
+    for _ in 0..4 {
+        insert_dlq_row_with_error(&shard0_url, "pp", &poison_pill_error()).await;
+        insert_dlq_row_with_error(&shard1_url, "pp", &poison_pill_error()).await;
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/dead-letters/discard",
+        json!({ "dlq_reason": "poison_pill", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["matched"], 8, "matched sums the cohort across shards");
+    assert_eq!(
+        body["acted_on"], 5,
+        "global limit caps acted-on across shards"
+    );
+
+    let remaining = count_dlq_rows(&shard0_url).await + count_dlq_rows(&shard1_url).await;
+    assert_eq!(remaining, 3, "8 matched - 5 acted = 3 remain");
 }

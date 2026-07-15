@@ -2615,13 +2615,17 @@ mod tests {
             vec![DlqGroupDimension::DlqReason, DlqGroupDimension::ErrorClass]
         );
 
-        let err = DlqAggregateParams::from_query_pairs(
-            &pairs(&[("group_by", "bogus_dim")]),
-            Utc::now(),
-        )
-        .expect_err("unknown dim must still error");
-        assert!(err.contains("dlq_reason"), "message should list new dims: {err}");
-        assert!(err.contains("error_class"), "message should list new dims: {err}");
+        let err =
+            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "bogus_dim")]), Utc::now())
+                .expect_err("unknown dim must still error");
+        assert!(
+            err.contains("dlq_reason"),
+            "message should list new dims: {err}"
+        );
+        assert!(
+            err.contains("error_class"),
+            "message should list new dims: {err}"
+        );
     }
 
     #[test]
