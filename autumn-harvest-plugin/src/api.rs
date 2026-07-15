@@ -22802,9 +22802,9 @@ impl BulkDlqApiBody {
 /// trimming, rejected with `400` rather than silently downgraded to "no
 /// filter" (which would replay/discard a far larger cohort than intended).
 fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, AutumnError> {
-    match value {
-        None => Ok(None),
-        Some(raw) => {
+    value.map_or_else(
+        || Ok(None),
+        |raw| {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 Err(AutumnError::bad_request_msg(
@@ -22813,8 +22813,8 @@ fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, Autum
             } else {
                 Ok(Some(trimmed.to_string()))
             }
-        }
-    }
+        },
+    )
 }
 
 /// Parsed `POST /dlq/redrive` request (issue #510): the core filter plus the

@@ -1580,11 +1580,11 @@ enum DeadLetterCommand {
         /// Exclusive upper bound on `failed_at` (RFC 3339).
         #[arg(long)]
         failed_before: Option<String>,
-        /// Filter by derived error class (exact, PascalCase; e.g. `CircuitOpen`,
+        /// Filter by derived error class (exact, `PascalCase`; e.g. `CircuitOpen`,
         /// `PoisonPill`, `HandlerPanic`). Matching is exact-equality, not case-folded.
         #[arg(long)]
         error_class: Option<String>,
-        /// Filter by derived DLQ reason class (exact, snake_case; e.g.
+        /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
         /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,
@@ -1660,11 +1660,11 @@ enum DeadLetterCommand {
         /// Exclusive upper bound on `failed_at` (RFC 3339).
         #[arg(long)]
         failed_before: Option<String>,
-        /// Filter by derived error class (exact, PascalCase; e.g. `CircuitOpen`,
+        /// Filter by derived error class (exact, `PascalCase`; e.g. `CircuitOpen`,
         /// `PoisonPill`, `HandlerPanic`). Matching is exact-equality, not case-folded.
         #[arg(long)]
         error_class: Option<String>,
-        /// Filter by derived DLQ reason class (exact, snake_case; e.g.
+        /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
         /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
         #[arg(long)]
         dlq_reason: Option<String>,

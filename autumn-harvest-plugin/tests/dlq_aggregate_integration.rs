@@ -550,8 +550,8 @@ fn callback_exhausted_error() -> String {
 
 /// Seed a 10-row cause fixture with three distinct engine-authored quarantine
 /// reasons plus a plain retry-exhaustion cohort:
-///   poison_pill = 4, workflow_task_timeout = 2,
-///   callback_delivery_exhausted = 1, retry_exhaustion (plain) = 3.
+///   `poison_pill` = 4, `workflow_task_timeout` = 2,
+///   `callback_delivery_exhausted` = 1, `retry_exhaustion` (plain) = 3.
 async fn seed_cause_fixture(database_url: &str, shard: i32) {
     let exec = insert_execution(database_url, shard, "cause_wf").await;
     insert_dlq_rows(database_url, exec, "a", &poison_pill_error(), 4).await;
