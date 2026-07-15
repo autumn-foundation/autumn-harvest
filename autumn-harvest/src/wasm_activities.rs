@@ -300,7 +300,8 @@ impl WasmModuleStore {
         config.wasm_extended_const(false);
         config.wasm_memory64(false); // 32-bit addressing keeps the memory bound meaningful
         config.wasm_exceptions(false); // requires GC (disabled above)
-        config.wasm_legacy_exceptions(false);
+        // (`wasm_legacy_exceptions` is a deprecated internal spec-testsuite knob,
+        // not a guest-reachable proposal — deliberately not toggled.)
         // Deliberately KEPT enabled: required by the ABI or rustc-emitted guests
         // and bounded by fuel/memory/table limits, so not host-resource-escape
         // vectors — `reference_types` (funcref tables + `ref.null func`),

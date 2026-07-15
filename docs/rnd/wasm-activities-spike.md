@@ -248,7 +248,7 @@ meet the spike's bar, recommended for GA.
   `wasm_shared_everything_threads`, `wasm_component_model`, `wasm_relaxed_simd`,
   `wasm_tail_call`, `wasm_wide_arithmetic`, `wasm_stack_switching`,
   `wasm_custom_page_sizes`, `wasm_extended_const`, `wasm_memory64`,
-  `wasm_exceptions`, `wasm_legacy_exceptions`. Kept enabled because the ABI or
+  `wasm_exceptions`. Kept enabled because the ABI or
   rustc-emitted guests require them and each is already bounded by fuel/memory/table
   limits (not a host-resource-escape vector): `reference_types` (funcref tables +
   `ref.null func`), `bulk_memory` (`memory.copy`/`fill`, and a `reference_types`
