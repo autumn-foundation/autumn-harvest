@@ -157,6 +157,42 @@ fn slow_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) 
     })
 }
 
+/// Local activity that sleeps ~2s then echoes — long enough that a 1s
+/// builder-default STC kills it while the 60s worker cap alone would not.
+fn slower_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(input)
+    })
+}
+
+/// Workflow: run the ~2s local activity with NO call-site STC override.
+fn wf_slower_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("slower_local", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Workflow: schedule one regular activity WITH a call-site START_TO_CLOSE
+/// override (5s), no retry override. Used to prove the call-site STC wins over
+/// the builder-default STC on the regular dispatch path.
+fn wf_one_activity_stc_override(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw_with_opts(
+            "echo",
+            input,
+            &queue,
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
 /// Workflow: schedule the reserved session-acquire internal activity via the
 /// raw path (mirroring how `create_session` dispatches it). Used to prove the
 /// builder-level floor does NOT leak onto engine-internal session machinery.
@@ -908,24 +944,85 @@ async fn local_activity_honours_builder_default_retry() {
 }
 
 // ---------------------------------------------------------------------------
-// AC7 — a local activity's builder-default STC is clamped by the worker max.
+// AC7 (discriminating) — a local activity's builder-default STC BELOW the
+// worker cap is enforced at its EXACT value.
 //
-// NOTE (RED-phase limitation, flagged to the coordinator): asserting the
-// builder-default STC end-to-end is awkward. The local path's per-attempt
-// timeout is `run.start_to_close_secs.map_or(max, from_secs).min(max)`, so a
-// no-call-site-STC local activity ALREADY falls back to `max` today —
-// meaning a builder default LARGER than `max` (300s vs 60s) yields the same
-// clamped value (60s) with or without the feature. This integration test can
-// therefore only assert the weaker AC "the builder default does not grant the
-// full 300s": a 500ms-sleeping local activity under a small `max` (200ms) times
-// out (FAILED) rather than completing. The precedence itself is pinned by the
-// pure `resolve_effective_start_to_close_precedence` unit test in policy.rs.
+// This is the discriminating rework of the original clamp test: builder-default
+// STC = 1s (well below the 60s worker cap), local activity sleeps ~2s. The
+// local path's per-attempt timeout is
+// `run.start_to_close_secs.map_or(max, from_secs).min(max)` — WITH the feature
+// `start_to_close_secs = Some(1)` (the builder default, `.as_secs()`), so the
+// timeout is `min(1s, 60s) = 1s` and the 2s activity FAILS. WITHOUT the feature
+// `start_to_close_secs = None`, so the timeout is the 60s cap and the 2s
+// activity would COMPLETE. The outcome therefore depends on the feature's exact
+// value, not merely the cap. (Local path is seconds-granularity, so 1s is the
+// smallest meaningful builder STC.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_activity_builder_default_stc_clamped_by_max() {
+async fn local_activity_builder_default_stc_below_cap_is_enforced() {
     let (url, _container) = setup_db().await;
-    let queue = "q620-local-stc";
+    let queue = "q620-local-stc-enforced";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_slower_local",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // Builder default STC = 1s, worker cap = 60s. No retry (so exactly one
+    // attempt), no activity-level STC, no call-site STC — the builder default
+    // is the sole source. The ~2s activity must be killed by the 1s builder STC.
+    let registry = build_registry(
+        vec![wf_info("wf_slower_local", wf_slower_local)],
+        vec![act_info("slower_local", slower_local, true, None, None)],
+        None,
+        Some(Duration::from_secs(1)),
+    );
+    let worker = build_worker(
+        "w620-local-stc-enforced",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let execution = run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        execution.state, "FAILED",
+        "the builder-default 1s STC (below the 60s cap) must kill the ~2s local \
+         activity — without the feature the 60s cap alone would let it complete"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::LocalActivityFailed { .. })),
+        "the STC-killed local activity must record a LocalActivityFailed (timeout)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC7 (clamp-proof) — a builder-default STC LARGER than the worker cap is still
+// clamped by the cap. Cheap companion to the discriminating test above: it
+// pins that the builder default can never GRANT more than the worker cap.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_builder_default_stc_larger_than_cap_is_clamped() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-local-stc-clamp";
     let mut conn = connect(&url).await;
     let exec_id = seed_workflow(
         &mut conn,
@@ -935,9 +1032,8 @@ async fn local_activity_builder_default_stc_clamped_by_max() {
     )
     .await;
 
-    // Builder default STC = 300s, worker max_local_activity_start_to_close =
-    // 200ms. A 500ms-sleeping local activity must NOT be granted the full 300s;
-    // it is clamped and times out → FAILED.
+    // Builder default STC = 300s, worker cap = 200ms. A 500ms-sleeping local
+    // activity must NOT be granted the full 300s; it is clamped → times out.
     let registry = build_registry(
         vec![wf_info("wf_slow_local", wf_slow_local)],
         vec![act_info("slow_local", slow_local, true, None, None)],
@@ -945,7 +1041,7 @@ async fn local_activity_builder_default_stc_clamped_by_max() {
         Some(Duration::from_secs(300)),
     );
     let worker = build_worker(
-        "w620-local-stc",
+        "w620-local-stc-clamp",
         queue,
         Arc::clone(&registry),
         Duration::from_millis(200),
@@ -965,7 +1061,7 @@ async fn local_activity_builder_default_stc_clamped_by_max() {
     assert_eq!(
         execution.state, "FAILED",
         "a 500ms local activity under a 200ms clamp must time out — the \
-         builder-default 300s STC must not grant the full window"
+         builder-default 300s STC must never grant more than the worker cap"
     );
     let history = load_history(&url, exec_id).await;
     assert!(
@@ -1177,5 +1273,297 @@ async fn local_activity_mid_retry_without_recorded_budget_uses_current_default()
         3,
         "with NO frozen budget (pre-#620 event), recovery re-derives the current \
          builder default (fixed(3)) — 1 pre-crash failure + 2 more = 3 total"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 3 (P1) — the builder-default start_to_close reaches a REGULAR activity's
+// enqueued task.start_to_close (the positive STC path — the retry equivalent is
+// already covered by no_retry_activity_under_builder_default_gets_max_attempts_n).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regular_activity_under_builder_default_gets_start_to_close() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-stc-positive";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // Builder default STC = 30s; activity declares no STC; no call override.
+    let registry = build_registry(
+        vec![wf_info("wf_one_activity", wf_one_activity)],
+        vec![act_info("echo", echo_activity, false, None, None)],
+        None,
+        Some(Duration::from_secs(30)),
+    );
+    let worker = build_worker(
+        "w620-stc-positive",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let task = run_until_activity_enqueued(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "echo",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        task.start_to_close,
+        Some(chrono::Duration::seconds(30)),
+        "the builder-default start_to_close (30s) must reach the enqueued \
+         regular activity task's start_to_close column"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 6 (P2) — STC precedence on the regular path: a call-site START_TO_CLOSE
+// override wins over the builder-default STC (the STC mirror of AC5 for retry).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_site_stc_override_wins_over_builder_default_stc() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-stc-call-wins";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity_stc_override",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // Call-site STC override = 5s; builder default STC = 30s; activity none.
+    let registry = build_registry(
+        vec![wf_info(
+            "wf_one_activity_stc_override",
+            wf_one_activity_stc_override,
+        )],
+        vec![act_info("echo", echo_activity, false, None, None)],
+        None,
+        Some(Duration::from_secs(30)),
+    );
+    let worker = build_worker(
+        "w620-stc-call",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let task = run_until_activity_enqueued(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "echo",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        task.start_to_close,
+        Some(chrono::Duration::seconds(5)),
+        "the call-site start_to_close override (5s) must win over the \
+         builder-default STC (30s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 6 (P2) — STC precedence on the regular path: an activity-declared
+// #[activity(start_to_close = …)] default wins over the builder-default STC.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_activity_stc_wins_over_builder_default_stc() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-stc-declared-wins";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // Activity declares its own STC = 7s; builder default STC = 30s.
+    let registry = build_registry(
+        vec![wf_info("wf_one_activity", wf_one_activity)],
+        vec![act_info(
+            "echo",
+            echo_activity,
+            false,
+            None,
+            Some(Duration::from_secs(7)),
+        )],
+        None,
+        Some(Duration::from_secs(30)),
+    );
+    let worker = build_worker(
+        "w620-stc-declared",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let task = run_until_activity_enqueued(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "echo",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        task.start_to_close,
+        Some(chrono::Duration::seconds(7)),
+        "the activity's own declared start_to_close (7s) must win over the \
+         builder-default STC (30s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 7 (P3) — the FULL builder-default retry policy (not just max_attempts)
+// round-trips into the enqueued task.retry_policy JSON: an EXPONENTIAL default
+// with a distinct initial_interval + backoff must be observable after decode.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builder_default_exponential_retry_policy_round_trips_into_task() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-retry-roundtrip";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_one_activity",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // A distinctive exponential policy: 4 attempts, 2500ms initial, ×2 backoff.
+    let builder_policy = RetryPolicy::exponential(4, Duration::from_millis(2500));
+    assert!(
+        (builder_policy.backoff_coefficient - 2.0).abs() < f64::EPSILON,
+        "sanity: exponential backoff coefficient is 2.0"
+    );
+
+    let registry = build_registry(
+        vec![wf_info("wf_one_activity", wf_one_activity)],
+        vec![act_info("echo", echo_activity, false, None, None)],
+        Some(builder_policy),
+        None,
+    );
+    let worker = build_worker(
+        "w620-roundtrip",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let task = run_until_activity_enqueued(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "echo",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        task.max_attempts, 4,
+        "the exponential builder default max_attempts (4) must reach the task"
+    );
+    let policy_json = task
+        .retry_policy
+        .expect("the enqueued task must carry the resolved retry policy JSON");
+    let decoded: RetryPolicy = serde_json::from_value(policy_json)
+        .expect("task.retry_policy must decode into RetryPolicy");
+    assert_eq!(
+        decoded.max_attempts, 4,
+        "decoded max_attempts must round-trip"
+    );
+    assert_eq!(
+        decoded.initial_interval,
+        Duration::from_millis(2500),
+        "decoded initial_interval must round-trip (guards against dropping the \
+         backoff curve while keeping max_attempts)"
+    );
+    assert!(
+        (decoded.backoff_coefficient - 2.0).abs() < f64::EPSILON,
+        "decoded backoff_coefficient (2.0 = exponential) must round-trip"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Item 8 (P3) — with builder defaults UNSET, a failing LOCAL activity records
+// exactly ONE LocalActivityFailed (the local fallback is 1 attempt, vs 3 for a
+// regular activity). Guards the local no-op path byte-for-byte.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_no_defaults_records_single_failure() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-local-noop";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_failing_local",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // No builder default, no activity default, no call-site override → the
+    // local fallback of a single attempt governs.
+    let registry = build_registry(
+        vec![wf_info("wf_failing_local", wf_failing_local)],
+        vec![act_info("failing_local", failing_local, true, None, None)],
+        None,
+        None,
+    );
+    let worker = build_worker(
+        "w620-local-noop",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        count_local_failed(&history),
+        1,
+        "with no defaults a failing local activity runs exactly once — a single \
+         LocalActivityFailed (the local fallback of 1 attempt), byte-for-byte"
     );
 }

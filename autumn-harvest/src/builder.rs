@@ -3315,6 +3315,82 @@ mod tests {
         assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
     }
 
+    // Issue #620: the two `into_worker_parts*` hunks copy the builder-level
+    // activity defaults out of `WorkerConfig` and into the `HandlerRegistry`.
+    // Every other #620 test injects them via `HandlerRegistry::
+    // with_activity_defaults` directly, bypassing those hunks — so this test
+    // drives the REAL public entry point (`WorkerConfig::with_default_*` ->
+    // `.worker(..)` -> `.build()` -> `.into_worker_parts()`) and asserts the
+    // registry carries the configured floor. Without the wiring hunks the
+    // registry would report `None` and this test would fail.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        7,
+                        Duration::from_millis(25),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(42)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(7),
+            "the builder-level default retry policy must be wired into the registry"
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(42)),
+            "the builder-level default start_to_close must be wired into the registry"
+        );
+    }
+
+    // Issue #620: the `into_worker_parts_with_extra_state` hunk is a distinct
+    // code path (used by the plugin's extra-state runner); assert it wires the
+    // same floor. An empty extra-state map is the minimal input.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_extra_state_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        6,
+                        Duration::from_millis(15),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(17)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(6),
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(17)),
+        );
+    }
+
     #[test]
     fn harvest_builder_telemetry_override_is_propagated() {
         use crate::telemetry::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
