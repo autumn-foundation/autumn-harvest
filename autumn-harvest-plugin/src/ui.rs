@@ -900,14 +900,21 @@ async fn dag_retry_commit_ui(
             url_encode(&format!("Retry failed: {}", failure.human_message())),
         ),
     };
-    // From `/dags/{dag}/runs/{run}/retry`, `../../../{dag}` reaches `/dags/{dag}`.
-    let redirect_url = format!(
-        "../../../{}?run={}&flash={}",
-        url_encode(&dag_name),
-        target_run,
-        flash
-    );
+    let redirect_url = dag_detail_relative_url(&dag_name, &target_run, Some(&flash));
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
+}
+
+/// Build a relative URL back to the DAG detail page from a retry route
+/// (`/dags/{dag}/runs/{run}/retry`): `../../../{dag}?run={run}` (+ an optional
+/// pre-encoded flash). Single-sources the relative depth so the confirm
+/// back-link and the commit redirect can never drift.
+fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> String {
+    let mut url = format!("../../../{}?run={}", url_encode(dag_name), run);
+    if let Some(flash) = flash {
+        url.push_str("&flash=");
+        url.push_str(flash);
+    }
+    url
 }
 
 /// Render the retry confirm page from a dry-run outcome: on success, the
@@ -959,7 +966,7 @@ fn render_dag_retry_confirm(
         Err(failure) => html! {
             div class="banner Warning" { (failure.human_message()) }
             p {
-                a class="back" href=(format!("../../../{}?run={}", url_encode(dag_name), run_exec_id)) {
+                a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
                     "← Back to run"
                 }
             }
@@ -9225,6 +9232,18 @@ mod tests {
         assert!(
             flash.contains("new-run-abc-123"),
             "success flash must name the new run id: {flash}"
+        );
+    }
+
+    #[test]
+    fn dag_detail_relative_url_builds_back_link_and_flash() {
+        assert_eq!(
+            dag_detail_relative_url("graph_linear", "run-1", None),
+            "../../../graph_linear?run=run-1"
+        );
+        assert_eq!(
+            dag_detail_relative_url("graph_linear", "run-2", Some("done")),
+            "../../../graph_linear?run=run-2&flash=done"
         );
     }
 }
