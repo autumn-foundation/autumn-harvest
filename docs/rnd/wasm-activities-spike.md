@@ -517,6 +517,21 @@ real SDK (the issue scopes SDK ergonomics beyond one demo language as follow-up)
   into the interceptor terminal closure (lazy resolution — resolve only when the
   chain actually invokes the handler) is a **GA follow-up**, deferred from the
   spike as a moderate seam restructure outside the activities-only demo scope.
+- **Cold-compile cache stampede on a publish/hot-swap burst.** The compile-once
+  module cache is probed before compiling, so several concurrent activity tasks
+  hitting the *same* newly-published/hot-swapped hash can each pass the cache probe
+  and run `Module::new` for the identical bytes before the first compile populates
+  the cache — redundant compiles that pressure the blocking pool/CPU. This is
+  correct steady-state (the cache serves every subsequent hit) and the window is
+  **transient**: it exists only immediately after a publish/hot-swap, until the
+  first compile lands. Each redundant compile is bounded by the 32 MiB module-size
+  cap and the worker's activity-concurrency semaphore, and publishing is
+  operator-only in this spike (not an unbounded/attacker-driven vector). The GA
+  mitigation is a per-hash singleflight/reservation OR — preferred —
+  **precompile-at-publish/seed** (store the serialized compiled artifact next to
+  the bytes so dispatch only deserializes), which removes cold compile from the
+  dispatch path entirely and subsumes this, consistent with the compile-path notes
+  in §3/§7. Deferred to the GA follow-up, not the spike.
 - **Memory-growth failure classification is a string match** on the wasmtime error
   Debug form (§8) — guarded by a test, but revisit on a wasmtime upgrade.
 - **CI executes the DB test suite via the `linux` integration manifest row**
