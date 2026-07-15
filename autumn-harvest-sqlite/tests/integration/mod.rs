@@ -16,6 +16,7 @@ mod durability;
 mod freeze_activity_defaults;
 mod payload_caps;
 mod race_activities;
+mod race_fairness;
 mod reopen_consistency;
 mod retry_policy_and_failure_fidelity;
 mod reuse_policy;

@@ -756,7 +756,32 @@ pub fn finalize_within_tx(
                     queue::finish_task(conn, &task.task_id)?;
                     return Ok(true);
                 }
-                queue::requeue_task(conn, &task.task_id, attempt_num, run_at)?;
+                // Requeue, choosing the ready-queue ordering by whether the retry
+                // is IMMEDIATE or a real backoff (issue #1068, hardening item 3):
+                //
+                // - IMMEDIATE (`run_at <= now`, a zero-delay/no-policy retry): the
+                //   task would be re-claimable in THIS same drain pass. Move it to
+                //   the BACK of the ready queue (fresh highest `seq`) so
+                //   `claim_next_ready_task` (`ORDER BY seq`) YIELDS to every ready
+                //   SIBLING before returning to the just-failed branch. Without
+                //   this, a low-`seq` `ctx.race()` branch that fails-and-retries
+                //   with zero delay re-selects itself every retry, monopolizes the
+                //   drain, and can settle the race by exhausting/terminal-ing before
+                //   a faster sibling ever runs — biasing the winner toward the
+                //   lowest index and violating "first branch to finish wins". The
+                //   inner loop stays bounded: each branch has finite `max_attempts`,
+                //   so round-robin total iterations = sum of branches' attempts.
+                //   Outside a race there are no siblings, so the bump is harmless
+                //   (the task is re-claimed immediately anyway).
+                // - BACKOFF (`run_at > now`, a positive delay): the task already
+                //   yields naturally — its future `run_at` keeps it out of this
+                //   pass's `run_at <= now` claim window — so keep its `seq`
+                //   unchanged and leave the existing behavior byte-for-byte intact.
+                if run_at <= now {
+                    queue::requeue_task_to_back(conn, &task.task_id, attempt_num, run_at)?;
+                } else {
+                    queue::requeue_task(conn, &task.task_id, attempt_num, run_at)?;
+                }
                 Ok(false)
             } else {
                 // Terminal (attempts exhausted OR non-retryable): the failure is

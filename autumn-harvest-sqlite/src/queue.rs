@@ -407,7 +407,13 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
     Ok(exists)
 }
 
-/// Requeue a task for another attempt at `run_at`, recording the consumed attempt.
+/// Requeue a task for another attempt at `run_at`, recording the consumed
+/// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
+/// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
+/// (its future `run_at` keeps it out of `claim_next_ready_task`'s `run_at <= now`
+/// window this pass), so keeping its low `seq` is correct and leaves existing
+/// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
+/// [`requeue_task_to_back`] instead.
 pub fn requeue_task(
     conn: &Connection,
     task_id: &str,
@@ -417,6 +423,38 @@ pub fn requeue_task(
     conn.execute(
         "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3 WHERE task_id = ?1",
         params![task_id, i64::from(attempt), run_at],
+    )?;
+    Ok(())
+}
+
+/// Requeue a task for another attempt at `run_at`, moving it to the **BACK** of
+/// the ready queue by assigning it a fresh, highest `seq` (issue #1068, hardening
+/// item 3).
+///
+/// This is the fairness variant of [`requeue_task`], for an IMMEDIATE (zero-delay)
+/// retry — one whose `run_at <= now`, so the just-failed task would otherwise be
+/// re-claimable in the SAME drain pass. Because [`claim_next_ready_task`] selects
+/// the oldest ready task (`ORDER BY seq LIMIT 1`), keeping the failed task's
+/// ORIGINAL (lower) `seq` would let it re-select itself before any ready SIBLING
+/// gets a turn — a low-index `ctx.race()` branch that fails-and-retries with zero
+/// delay could then monopolize the drain and settle the race before a faster
+/// sibling ever runs. Assigning a fresh `MAX(seq) + 1` (the same monotonic
+/// allocator [`enqueue_activity`] uses via [`next_task_seq`]) sorts the requeued
+/// task AFTER every currently-queued task, so the claim loop yields to every other
+/// ready sibling before returning to it — round-robin fairness. Outside a race a
+/// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
+/// simply re-claimed immediately anyway.
+pub fn requeue_task_to_back(
+    conn: &Connection,
+    task_id: &str,
+    attempt: u32,
+    run_at: i64,
+) -> SqliteResult<()> {
+    let seq = next_task_seq(conn)?;
+    conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4 \
+         WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, seq],
     )?;
     Ok(())
 }
