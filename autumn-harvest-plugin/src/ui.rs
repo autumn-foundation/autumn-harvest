@@ -8831,4 +8831,238 @@ mod tests {
             "root with no task rows should remain Unknown"
         );
     }
+
+    // ── Issue #957 — DAG run graph rendering (consumes dag_graph::build_run_graph) ──
+
+    use crate::dag_graph::{DagNodeKind, DagNodeStatus, DagRunNode};
+
+    const ALL_DAG_NODE_STATUSES: [DagNodeStatus; 8] = [
+        DagNodeStatus::Succeeded,
+        DagNodeStatus::Failed,
+        DagNodeStatus::TimedOut,
+        DagNodeStatus::Cancelled,
+        DagNodeStatus::Running,
+        DagNodeStatus::Pending,
+        DagNodeStatus::Skipped,
+        DagNodeStatus::Waiting,
+    ];
+
+    fn dag_run_node(name: &str, status: DagNodeStatus, depends_on: Vec<String>) -> DagRunNode {
+        DagRunNode {
+            node_name: name.to_string(),
+            kind: DagNodeKind::Activity,
+            status,
+            depends_on,
+            started_at: None,
+            finished_at: None,
+            attempts: 0,
+            error_type: None,
+            error: None,
+        }
+    }
+
+    // P1
+    #[test]
+    fn dag_node_status_fill_covers_all_eight_variants() {
+        let fills: Vec<&str> = ALL_DAG_NODE_STATUSES
+            .iter()
+            .map(|s| dag_node_status_fill(*s))
+            .collect();
+        for fill in &fills {
+            assert!(
+                fill.starts_with('#') && fill.len() >= 4,
+                "fill must be a non-empty hex colour: {fill:?}"
+            );
+        }
+        let unique: std::collections::HashSet<&&str> = fills.iter().collect();
+        assert_eq!(unique.len(), 8, "each status must have a distinct fill: {fills:?}");
+    }
+
+    // P2
+    #[test]
+    fn dag_node_status_icon_distinguishes_without_color() {
+        let icons: Vec<&str> = ALL_DAG_NODE_STATUSES
+            .iter()
+            .map(|s| dag_node_status_icon(*s))
+            .collect();
+        for icon in &icons {
+            assert!(!icon.is_empty(), "icon must be non-empty");
+        }
+        let unique: std::collections::HashSet<&&str> = icons.iter().collect();
+        assert_eq!(unique.len(), 8, "each status must have a distinct glyph: {icons:?}");
+    }
+
+    // P3
+    #[test]
+    fn dag_node_status_label_all_variants() {
+        assert_eq!(dag_node_status_label(DagNodeStatus::TimedOut), "Timed out");
+        assert_eq!(dag_node_status_label(DagNodeStatus::Waiting), "Waiting");
+        assert_eq!(dag_node_status_label(DagNodeStatus::Pending), "Pending");
+        assert_eq!(dag_node_status_label(DagNodeStatus::Skipped), "Skipped");
+        let labels: Vec<&str> = ALL_DAG_NODE_STATUSES
+            .iter()
+            .map(|s| dag_node_status_label(*s))
+            .collect();
+        for label in &labels {
+            assert!(!label.is_empty(), "label must be non-empty");
+        }
+        let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(unique.len(), 8, "each status must have a distinct label: {labels:?}");
+    }
+
+    // P4
+    #[test]
+    fn node_retry_offered_matrix() {
+        // Terminal-failed run + attempted-not-succeeded node → offer retry.
+        assert!(node_retry_offered("FAILED", DagNodeStatus::Failed));
+        assert!(node_retry_offered("FAILED", DagNodeStatus::TimedOut));
+        assert!(node_retry_offered("FAILED", DagNodeStatus::Cancelled));
+        assert!(node_retry_offered("CANCELLED", DagNodeStatus::Failed));
+        assert!(node_retry_offered("TIMED_OUT", DagNodeStatus::Failed));
+        // Run not terminal-eligible → never offer.
+        assert!(!node_retry_offered("COMPLETED", DagNodeStatus::Failed));
+        assert!(!node_retry_offered("RUNNING", DagNodeStatus::Failed));
+        // Node not a retry candidate → never offer.
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Succeeded));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Pending));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Skipped));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Waiting));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Running));
+    }
+
+    // P5
+    #[test]
+    fn build_graph_layout_columns_by_level() {
+        // 3-level linear chain → 3 monotonically increasing x-columns.
+        let layout = build_graph_layout(&[vec![0], vec![1], vec![2]], 3);
+        assert_eq!(layout.pos.len(), 3);
+        assert!(layout.pos[0].0 < layout.pos[1].0);
+        assert!(layout.pos[1].0 < layout.pos[2].0);
+
+        // Fan-out level → same column x, distinct rows y.
+        let layout2 = build_graph_layout(&[vec![0], vec![1, 2], vec![3]], 4);
+        assert!(
+            (layout2.pos[1].0 - layout2.pos[2].0).abs() < f64::EPSILON,
+            "same-level nodes share a column x"
+        );
+        assert!(
+            (layout2.pos[1].1 - layout2.pos[2].1).abs() > f64::EPSILON,
+            "same-level nodes occupy distinct rows"
+        );
+        assert!(layout2.width > 0.0 && layout2.height > 0.0);
+    }
+
+    // P6
+    #[test]
+    fn build_graph_layout_is_deterministic() {
+        let a = build_graph_layout(&[vec![0], vec![1, 2], vec![3]], 4);
+        let b = build_graph_layout(&[vec![0], vec![1, 2], vec![3]], 4);
+        assert_eq!(a.pos, b.pos);
+        assert!((a.width - b.width).abs() < f64::EPSILON);
+        assert!((a.height - b.height).abs() < f64::EPSILON);
+    }
+
+    // P7
+    #[test]
+    fn render_dag_run_graph_svg_contains_nodes_edges_fills() {
+        let nodes = vec![
+            dag_run_node("step_a", DagNodeStatus::Succeeded, vec![]),
+            dag_run_node("step_b", DagNodeStatus::Failed, vec!["step_a".to_string()]),
+        ];
+        let levels = vec![vec![0], vec![1]];
+        let upstreams = vec![vec![], vec![0]];
+        let svg = render_dag_run_graph_svg(&nodes, &levels, &upstreams, None, uuid::Uuid::nil())
+            .into_string();
+
+        assert!(svg.contains("<svg"), "must be an inline svg");
+        assert!(svg.contains("step_a"));
+        assert!(svg.contains("step_b"));
+        assert!(svg.contains(dag_node_status_fill(DagNodeStatus::Succeeded)));
+        assert!(svg.contains(dag_node_status_fill(DagNodeStatus::Failed)));
+        assert!(svg.contains("<line"), "edges rendered as <line>");
+        assert!(svg.contains("<a "), "each node is a click-through link");
+        assert!(svg.contains("?run="), "node links carry the run id");
+        assert!(svg.contains("node=0"));
+        assert!(svg.contains("node=1"));
+    }
+
+    // P8
+    #[test]
+    fn render_dag_run_graph_svg_escapes_node_names() {
+        let nodes = vec![dag_run_node(
+            "<b>evil</b>",
+            DagNodeStatus::Failed,
+            vec![],
+        )];
+        let svg = render_dag_run_graph_svg(&nodes, &[vec![0]], &[vec![]], None, uuid::Uuid::nil())
+            .into_string();
+        assert!(
+            !svg.contains("<b>evil</b>"),
+            "a markup-char node name must be escaped, not injected: {svg}"
+        );
+        assert!(svg.contains("&lt;b&gt;evil"), "escaped form present");
+    }
+
+    // P9
+    #[test]
+    fn render_dag_node_panel_failed_shows_error_and_retry_link() {
+        let mut node = dag_run_node("step_b", DagNodeStatus::Failed, vec!["step_a".to_string()]);
+        node.attempts = 2;
+        node.error_type = Some("S3Error".to_string());
+        node.error = Some("transient S3 500".to_string());
+        let panel =
+            render_dag_node_panel(&node, 1, "FAILED", "graph_linear_dag", uuid::Uuid::nil())
+                .into_string();
+
+        assert!(panel.contains("S3Error"));
+        assert!(panel.contains("transient S3 500"));
+        assert!(panel.contains("/retry"), "retry link present: {panel}");
+        assert!(
+            panel.contains("from_node=step_b"),
+            "retry link names the source node: {panel}"
+        );
+    }
+
+    // P10
+    #[test]
+    fn render_dag_node_panel_no_retry_when_not_offered() {
+        // Succeeded node on a FAILED run → no retry.
+        let ok_node = dag_run_node("step_a", DagNodeStatus::Succeeded, vec![]);
+        let ok_panel =
+            render_dag_node_panel(&ok_node, 0, "FAILED", "d", uuid::Uuid::nil()).into_string();
+        assert!(!ok_panel.contains("/retry"));
+
+        // Failed node on a RUNNING run → no retry.
+        let live_node = dag_run_node("step_a", DagNodeStatus::Failed, vec![]);
+        let live_panel =
+            render_dag_node_panel(&live_node, 0, "RUNNING", "d", uuid::Uuid::nil()).into_string();
+        assert!(!live_panel.contains("/retry"));
+    }
+
+    // P11
+    #[test]
+    fn render_dag_node_panel_pending_vs_skipped_distinct() {
+        let pending = dag_run_node("n", DagNodeStatus::Pending, vec![]);
+        let skipped = dag_run_node("n", DagNodeStatus::Skipped, vec![]);
+        let pending_panel =
+            render_dag_node_panel(&pending, 0, "RUNNING", "d", uuid::Uuid::nil()).into_string();
+        let skipped_panel =
+            render_dag_node_panel(&skipped, 0, "COMPLETED", "d", uuid::Uuid::nil()).into_string();
+        assert!(pending_panel.contains(dag_node_status_label(DagNodeStatus::Pending)));
+        assert!(skipped_panel.contains(dag_node_status_label(DagNodeStatus::Skipped)));
+        assert_ne!(
+            dag_node_status_label(DagNodeStatus::Pending),
+            dag_node_status_label(DagNodeStatus::Skipped)
+        );
+    }
+
+    // P12
+    #[test]
+    fn dag_retry_success_flash_names_new_run() {
+        let flash = dag_retry_success_flash("new-run-abc-123");
+        assert!(
+            flash.contains("new-run-abc-123"),
+            "success flash must name the new run id: {flash}"
+        );
+    }
 }

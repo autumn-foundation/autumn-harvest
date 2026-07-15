@@ -5,9 +5,12 @@ use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::context::{DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowHistoryPolicy};
+use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::NewHarvestEvent;
-use autumn_harvest::scheduler::SchedulerMonitor;
+use autumn_harvest::prelude::{ActivityContext, activities, activity, dag, dags, workflows};
+use autumn_harvest::scheduler::{RegisteredDag, SchedulerMonitor, compile_dag_catalog};
+use autumn_harvest::store;
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_task_queue, harvest_workflow_executions,
 };
@@ -3473,5 +3476,501 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
         0,
         "a render whose only envelopes are hidden fields must not write a \
          payload.decode_read audit row"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #957 — Vantage DAG run graph view
+//
+// These exercise the enhanced `GET /dags/{dag_name}` page (server-rendered inline
+// SVG built from `dag_graph::build_run_graph`, the same in-process call the #690
+// API handler makes) plus the 3-click retry flow (node → dry-run confirm →
+// admin-gated commit) that delegates to the shipped #366 retry endpoint via the
+// extracted `retry_dag_run_inner`. Docker-backed (testcontainers); compile-checked
+// in sandboxes without Docker, run on Linux CI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[activity(queue = "default")]
+async fn dag957_step_a(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+#[activity(queue = "default")]
+async fn dag957_step_b(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+#[activity(queue = "default")]
+async fn dag957_step_c(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+#[activity(queue = "default")]
+async fn dag957_step_d(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
+/// Linear: dag957_step_a -> dag957_step_b -> dag957_step_c
+#[dag(default_queue = "default")]
+fn dag957_linear(dag: &mut DagBuilder) {
+    let a = dag.activity(dag957_step_a);
+    let b = dag.activity(dag957_step_b).upstream(&a);
+    let _c = dag.activity(dag957_step_c).upstream(&b);
+}
+
+/// Fan-out: a -> {b, c} -> d
+#[dag(default_queue = "default")]
+fn dag957_fanout(dag: &mut DagBuilder) {
+    let a = dag.activity(dag957_step_a);
+    let b = dag.activity(dag957_step_b).upstream(&a);
+    let c = dag.activity(dag957_step_c).upstream(&a);
+    let _d = dag.activity(dag957_step_d).upstream(&b).upstream(&c);
+}
+
+fn dag957_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        workflows![dag957_linear, dag957_fanout],
+        activities![dag957_step_a, dag957_step_b, dag957_step_c, dag957_step_d],
+    ))
+}
+
+/// A hand-built classic (non-unified) `RegisteredDag`; `compile_dag_catalog`
+/// rejects classic DAGs, so a hand-built definition is the only way to register
+/// one for the degraded-state test.
+fn dag957_classic(name: &str) -> RegisteredDag {
+    let mut builder = DagBuilder::new();
+    let _a = builder.activity(dag957_step_a);
+    let definition = builder.build().expect("classic dag builds");
+    RegisteredDag {
+        name: name.to_string(),
+        module: "test".to_string(),
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default".to_string()),
+        is_unified: false,
+        definition,
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::default(),
+        buffer_all_max: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    }
+}
+
+/// A large (>200-task) unified DAG built by hand so the ≥200-node scrollable
+/// fallback can be exercised without declaring 200 activity fns.
+fn dag957_large(name: &str) -> RegisteredDag {
+    let mut builder = DagBuilder::new();
+    for _ in 0..220 {
+        let _ = builder.activity(dag957_step_a);
+    }
+    let definition = builder.build().expect("large dag builds");
+    RegisteredDag {
+        name: name.to_string(),
+        module: "test".to_string(),
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default".to_string()),
+        is_unified: true,
+        definition,
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::default(),
+        buffer_all_max: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    }
+}
+
+fn build_dag957_ui_app(
+    database_url: &str,
+    admin: bool,
+    extra: Vec<(String, RegisteredDag)>,
+) -> axum::Router {
+    let pool = build_test_pool(database_url);
+    let mut catalog =
+        compile_dag_catalog(dags![dag957_linear, dag957_fanout]).expect("dag catalog compiles");
+    for (name, dag) in extra {
+        catalog.insert(name, dag);
+    }
+    let api_state = HarvestApiState::new();
+    if admin {
+        api_state.set_admin_auth_boundary(true);
+    }
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    api_state.install(HarvestApiRuntime::new(
+        dag957_registry(),
+        Arc::new(catalog),
+        Arc::new(Vec::new()),
+        Some("dag957-ui-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    harvest_ui_router(api_state).with_state(test_app_state_without_database())
+}
+
+fn dag957_sched(name: &str, id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityScheduled {
+        activity_id: id,
+        name: name.to_string(),
+        input: json!({ "dag_task": name }),
+        queue: "default".to_string(),
+    }
+}
+fn dag957_started(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityStarted {
+        activity_id: id,
+        worker_id: autumn_harvest::types::WorkerId::new("worker-1"),
+    }
+}
+fn dag957_completed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityCompleted {
+        activity_id: id,
+        output: Value::Null,
+    }
+}
+fn dag957_failed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityFailed {
+        activity_id: id,
+        error: "transient S3 500\nstack trace line".to_string(),
+        attempt: 1,
+        error_type: "S3Error".to_string(),
+        non_retryable: false,
+        details: None,
+    }
+}
+
+async fn dag957_seed_run(
+    database_url: &str,
+    dag_name: &'static str,
+    workflow_id: &str,
+    events: Vec<autumn_harvest::WorkflowEvent>,
+    state: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for dag957 seed");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: dag_name,
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+        },
+        None,
+    )
+    .await
+    .expect("seed workflow");
+
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
+        .await
+        .expect("append seed events");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq(state))
+        .execute(&mut conn)
+        .await
+        .expect("set state");
+    exec_id
+}
+
+async fn dag957_audit_rows(database_url: &str, operation: &str, source: &str) -> i64 {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for audit count");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(operation.to_string()))
+        .filter(harvest_audit_log::source.eq(source.to_string()))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count audit rows")
+}
+
+// I-A
+#[tokio::test]
+async fn ui_dag_run_graph_renders_mixed_status_run() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    // a succeeded, b failed, c pending. Run FAILED.
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-mixed", events, "FAILED").await;
+
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_linear?run={exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(html.contains("<svg"), "inline svg present: {html}");
+    assert!(html.contains("dag957_step_a"));
+    assert!(html.contains("dag957_step_b"));
+    assert!(html.contains("dag957_step_c"));
+    // Status fills for the three distinct statuses present in the run.
+    assert!(html.contains("#166534"), "succeeded fill present"); // Succeeded
+    assert!(html.contains("#991b1b"), "failed fill present"); // Failed
+}
+
+// I-B
+#[tokio::test]
+async fn ui_dag_run_graph_node_panel_shows_failure_detail() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-panel", events, "FAILED").await;
+
+    // node index 1 == dag957_step_b (failed).
+    let (status, html) =
+        fetch_html(&app, &format!("/dags/dag957_linear?run={exec_id}&node=1")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(html.contains("S3Error"), "error_type shown: {html}");
+    assert!(html.contains("transient S3 500"), "first-line error shown");
+    assert!(html.contains("/retry"), "retry link offered for the failed node");
+    assert!(html.contains("from_node=dag957_step_b"));
+}
+
+// I-C
+#[tokio::test]
+async fn ui_dag_retry_confirm_lists_widened_nodes() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-confirm", events, "FAILED").await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    // Retrying from b widens to b + its downstream closure (c).
+    assert!(html.contains("dag957_step_b"), "widened list names the source node");
+    assert!(html.contains("dag957_step_c"), "widened list names the downstream node");
+    assert!(html.contains("reason"), "reason field present");
+    assert!(
+        html.to_lowercase().contains("confirm"),
+        "a confirm control is present: {html}"
+    );
+}
+
+// I-D
+#[tokio::test]
+async fn ui_dag_retry_commit_starts_new_run_and_audits() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-commit", events, "FAILED").await;
+
+    let (status, headers, _body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_b&reason=retry+via+vantage",
+    )
+    .await;
+    assert!(status.is_redirection(), "commit redirects; got {status}");
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(location.contains("flash="), "redirect carries a flash: {location}");
+
+    // Audit row written under OP_DAG_RETRY with source=ui.
+    let count = dag957_audit_rows(
+        &url,
+        autumn_harvest::audit::OP_DAG_RETRY,
+        autumn_harvest::audit::SOURCE_UI,
+    )
+    .await;
+    assert!(count >= 1, "a dag.retry audit row from the UI must exist");
+}
+
+// I-E
+#[tokio::test]
+async fn ui_dag_retry_error_renders_human_message() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    // A COMPLETED run cannot be retried (409, "DAG run succeeded ...").
+    let ia = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        autumn_harvest::WorkflowEvent::WorkflowCompleted { output: Value::Null },
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-done", events, "COMPLETED").await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("succeeded"),
+        "the 409 conflict renders as a human message: {html}"
+    );
+    assert!(
+        !html.contains("\"message\""),
+        "no raw JSON body is shown to the operator: {html}"
+    );
+}
+
+// I-F
+#[tokio::test]
+async fn ui_dag_run_graph_classic_dag_degraded() {
+    let (url, _c) = setup_test_database_url().await;
+    let classic = dag957_classic("dag957_classic");
+    let app = build_dag957_ui_app(&url, true, vec![("dag957_classic".to_string(), classic)]);
+
+    let (status, html) = fetch_html(&app, "/dags/dag957_classic").await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("No topology available for classic DAG runs"),
+        "classic DAGs render the degraded message: {html}"
+    );
+}
+
+// I-G
+#[tokio::test]
+async fn ui_dag_retry_requires_admin() {
+    let (url, _c) = setup_test_database_url().await;
+    // No admin boundary → the retry route layer rejects before any handler runs.
+    let app = build_dag957_ui_app(&url, false, vec![]);
+    let bogus = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let (status, _headers, _body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{bogus}/retry"),
+        "from_node=dag957_step_b&reason=x",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// I-H
+#[tokio::test]
+async fn ui_dag_run_graph_large_dag_scrollable() {
+    let (url, _c) = setup_test_database_url().await;
+    let large = dag957_large("dag957_large");
+    let app = build_dag957_ui_app(&url, true, vec![("dag957_large".to_string(), large)]);
+
+    let exec_id = dag957_seed_run(&url, "dag957_large", "graph-large", vec![], "RUNNING").await;
+
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_large?run={exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("dag-graph-scroll"),
+        "a large DAG uses the scrollable container, not a disabled render: {html}"
+    );
+    assert!(html.contains("Large DAG"), "a large-DAG note is shown");
+}
+
+// I-I
+#[tokio::test]
+async fn ui_dag_run_graph_unknown_run_falls_back() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let ia = autumn_harvest::ActivityExecId::new();
+    let valid = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-fallback",
+        vec![dag957_sched("dag957_step_a", ia), dag957_started(ia), dag957_completed(ia)],
+        "RUNNING",
+    )
+    .await;
+
+    // An unknown (shard-0) run id → graceful fallback to the first valid run,
+    // never a 500.
+    let bogus = ExecutionId::new_for_shard(ShardId::new(0));
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_linear?run={bogus}")).await;
+    assert_eq!(status, StatusCode::OK, "unknown run must not 500: {html}");
+    // The page still renders (the run list at minimum); the valid run is present.
+    assert!(
+        html.contains(&valid.to_string()) || html.contains("dag957_step_a"),
+        "falls back to a renderable view: {html}"
     );
 }

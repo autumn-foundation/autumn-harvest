@@ -30903,6 +30903,35 @@ mod tests {
             .collect()
     }
 
+    // P13 (issue #957): the extracted DagRetryFailure carries enough to render a
+    // human-readable UI flash for every failure the retry inner produces.
+    #[test]
+    fn dag_retry_failure_human_message_maps_all_variants() {
+        use crate::dag_retry::DagRetryResolveError;
+        use autumn_harvest::reset::WorkflowResetError;
+
+        let variants = vec![
+            DagRetryFailure::BadRequest("`reason` and `operator_id` are required".to_string()),
+            DagRetryFailure::NotFound("DAG 'x' is not registered".to_string()),
+            DagRetryFailure::StateConflict("DAG run succeeded".to_string()),
+            DagRetryFailure::Resolve(DagRetryResolveError::EmptyFromNodes),
+            DagRetryFailure::Resolve(DagRetryResolveError::UnknownNodes {
+                unknown: vec!["nope".to_string()],
+                declared: vec!["step_a".to_string()],
+            }),
+            DagRetryFailure::Reset(WorkflowResetError::ContinueAsNew),
+            DagRetryFailure::AuditFailed("audit insert failed: boom".to_string()),
+            DagRetryFailure::Other(AutumnError::bad_request_msg("malformed execution id")),
+        ];
+        for variant in &variants {
+            let message = variant.human_message();
+            assert!(
+                !message.trim().is_empty(),
+                "human_message must be non-empty for {variant:?}"
+            );
+        }
+    }
+
     /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
     /// different queue does NOT match it — letting us prove `check()` blocks a
     /// non-matching start only via fail-closed, never because the gate matched.
