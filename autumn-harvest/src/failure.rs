@@ -89,6 +89,66 @@ pub const ERROR_TYPE_OPERATOR_FORCE_FAILED: &str = "OperatorForceFailed";
 /// author cannot use it to manufacture extra retries.
 pub const ERROR_TYPE_HANDLER_PANIC: &str = "HandlerPanic";
 
+/// Stable error-type name for a WASM activity denied a host capability
+/// (issue #965).
+///
+/// Synthesised when a sandboxed WebAssembly guest imports a host function it
+/// was not granted (e.g. clock, randomness, an env key outside its allowlist,
+/// or filesystem/network — which are not grantable in this spike, so any
+/// import naming them is unsatisfied). Instantiation fails deterministically,
+/// so the outcome is **non-retryable**: a denied capability cannot succeed on a
+/// later attempt without a policy change.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_SANDBOX_DENIED: &str = "SandboxDenied";
+
+/// Stable error-type name for a WASM activity that exhausted a resource budget
+/// (issue #965).
+///
+/// Synthesised when a guest exceeds its CPU fuel, memory ceiling, or wall-clock
+/// deadline. **Retryable**: a larger budget or a less-loaded worker may let the
+/// same input succeed, so the engine honours the activity's retry policy.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_RESOURCE_EXHAUSTED: &str = "ResourceExhausted";
+
+/// Stable error-type name for a WASM guest trap or ABI violation (issue #965).
+///
+/// Synthesised for a guest-side trap (`unreachable`, out-of-bounds access
+/// inside the guest, a bad export signature) or a host-observed ABI violation
+/// (an out-of-range output pointer/length, non-JSON output, a missing `run`
+/// export). **Retryable** — it mirrors the legacy `Err(String)` classification,
+/// so a transient guest fault is retried under the activity's policy.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_TRAP: &str = "WasmTrap";
+
+/// Stable error-type name for a resolvable-but-absent WASM module (issue #965).
+///
+/// Synthesised by the storage layer when no active module row exists for the
+/// requested activity. **Non-retryable**: without a published module the
+/// activity can never run, so retrying in place is pointless — the fix is to
+/// publish (or re-activate) a module version.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_MODULE_UNAVAILABLE: &str = "WasmModuleUnavailable";
+
+/// Stable error-type name for a corrupt or uncompilable WASM module
+/// (issue #965).
+///
+/// Synthesised when a resolved module's bytes fail their content-integrity
+/// check (claimed hash mismatch) or fail to compile. **Non-retryable**: the
+/// stored bytes are bad, so every attempt against the same module version
+/// fails identically — the fix is to republish a valid module.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_MODULE_INVALID: &str = "WasmModuleInvalid";
+
+/// Stable error-type name for a transient failure resolving a WASM module
+/// (issue #965).
+///
+/// Synthesised when the module lookup itself fails for a transient reason (a
+/// database error during resolution). **Retryable**: the module may well be
+/// present and valid; the resolution just failed transiently, so the engine
+/// honours the activity's retry policy.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED: &str = "WasmModuleLookupFailed";
+
 /// Typed failure carrier for activity handlers.
 ///
 /// ## Backward compatibility
@@ -208,6 +268,81 @@ impl ActivityFailure {
             },
         );
         Self::non_retryable(ERROR_TYPE_OPERATOR_FORCE_FAILED, message).with_details(details)
+    }
+
+    /// Construct the non-retryable failure used when a sandboxed WASM guest is
+    /// denied a host capability (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_SANDBOX_DENIED`] and the failure
+    /// is non-retryable: a denied capability cannot be granted by a retry, so
+    /// the in-flight attempt terminates immediately and the workflow's own
+    /// failure/compensation path takes over.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn sandbox_denied(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_SANDBOX_DENIED, detail)
+    }
+
+    /// Construct the retryable failure used when a sandboxed WASM guest exceeds
+    /// its resource budget — CPU fuel, memory, or wall-clock deadline
+    /// (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_RESOURCE_EXHAUSTED`] and the
+    /// failure is retryable: a larger budget or a less-loaded worker may let the
+    /// same input succeed, so the engine honours the activity's retry policy.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn resource_exhausted(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_RESOURCE_EXHAUSTED, detail)
+    }
+
+    /// Construct the retryable failure used for a WASM guest trap or ABI
+    /// violation (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_TRAP`] and the failure is
+    /// retryable, mirroring the legacy `Err(String)` classification: a guest
+    /// trap, a bad-ABI response, or non-JSON output is retried under the
+    /// activity's policy.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_trap(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_WASM_TRAP, detail)
+    }
+
+    /// Construct the non-retryable failure used when no active WASM module row
+    /// exists for the requested activity (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_MODULE_UNAVAILABLE`] and the
+    /// failure is non-retryable: without a published module the activity can
+    /// never run.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_unavailable(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_MODULE_UNAVAILABLE, detail)
+    }
+
+    /// Construct the non-retryable failure used when a WASM module's bytes fail
+    /// their content-integrity check or fail to compile (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_MODULE_INVALID`] and the
+    /// failure is non-retryable: the stored bytes are bad, so every attempt
+    /// against the same module version fails identically.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_invalid(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_MODULE_INVALID, detail)
+    }
+
+    /// Construct the retryable failure used when resolving a WASM module fails
+    /// for a transient reason, such as a database error (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED`] and
+    /// the failure is retryable: the module may be present and valid; only the
+    /// resolution failed transiently.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_lookup_failed(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED, detail)
     }
 }
 
@@ -1026,5 +1161,143 @@ mod tests {
         );
         assert_eq!(decoded.message, "boom");
         assert_eq!(decoded.non_retryable, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // WASM activity failure constructors (issue #965)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn sandbox_denied_is_non_retryable_with_stable_error_type() {
+        let f = ActivityFailure::sandbox_denied("import env::fs_read not granted");
+        assert_eq!(f.error_type, ERROR_TYPE_SANDBOX_DENIED);
+        assert_eq!(f.error_type, "SandboxDenied");
+        assert!(
+            f.non_retryable,
+            "a denied capability cannot succeed on retry"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn resource_exhausted_is_retryable_with_stable_error_type() {
+        let f = ActivityFailure::resource_exhausted("cpu fuel exhausted");
+        assert_eq!(f.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED);
+        assert_eq!(f.error_type, "ResourceExhausted");
+        assert!(!f.non_retryable, "a larger budget may let a retry succeed");
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_trap_is_retryable_with_stable_error_type() {
+        let f = ActivityFailure::wasm_trap("guest hit unreachable");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_TRAP);
+        assert_eq!(f.error_type, "WasmTrap");
+        assert!(
+            !f.non_retryable,
+            "wasm trap mirrors the legacy Err(String) path"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_unavailable_is_non_retryable() {
+        let f = ActivityFailure::wasm_module_unavailable("no active module for activity");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_MODULE_UNAVAILABLE);
+        assert_eq!(f.error_type, "WasmModuleUnavailable");
+        assert!(f.non_retryable);
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_invalid_is_non_retryable() {
+        let f = ActivityFailure::wasm_module_invalid("bytes fail integrity check");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_MODULE_INVALID);
+        assert_eq!(f.error_type, "WasmModuleInvalid");
+        assert!(f.non_retryable);
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_lookup_failed_is_retryable() {
+        let f = ActivityFailure::wasm_module_lookup_failed("transient db error");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED);
+        assert_eq!(f.error_type, "WasmModuleLookupFailed");
+        assert!(
+            !f.non_retryable,
+            "a transient lookup error may resolve on retry"
+        );
+    }
+
+    /// Every WASM failure constructor must round-trip through the shared
+    /// `harvest_activity_failure_v1` wire envelope so a recorded `ActivityFailed`
+    /// event reproduces the same classification on replay.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_failures_round_trip_through_wire_format() {
+        let cases: Vec<(ActivityFailure, &str, bool)> = vec![
+            (
+                ActivityFailure::sandbox_denied("denied"),
+                ERROR_TYPE_SANDBOX_DENIED,
+                true,
+            ),
+            (
+                ActivityFailure::resource_exhausted("fuel"),
+                ERROR_TYPE_RESOURCE_EXHAUSTED,
+                false,
+            ),
+            (
+                ActivityFailure::wasm_trap("trap"),
+                ERROR_TYPE_WASM_TRAP,
+                false,
+            ),
+            (
+                ActivityFailure::wasm_module_unavailable("none"),
+                ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
+                true,
+            ),
+            (
+                ActivityFailure::wasm_module_invalid("bad"),
+                ERROR_TYPE_WASM_MODULE_INVALID,
+                true,
+            ),
+            (
+                ActivityFailure::wasm_module_lookup_failed("transient"),
+                ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+                false,
+            ),
+        ];
+        for (failure, want_type, want_non_retryable) in cases {
+            let payload = failure.into_error_payload();
+            assert!(
+                payload.contains("harvest_activity_failure_v1"),
+                "{want_type} must use the typed wire envelope"
+            );
+            let (error_type, non_retryable, _) = parse_error_payload(&payload);
+            assert_eq!(error_type, want_type);
+            assert_eq!(non_retryable, want_non_retryable, "{want_type}");
+        }
+    }
+
+    /// A WASM failure's `non_retryable` flag is intrinsic to the constructor and
+    /// is honoured regardless of any retry policy the activity carries.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_non_retryable_failures_ignore_policy() {
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 10,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 2.0,
+            max_interval: std::time::Duration::from_secs(60),
+            non_retryable_errors: vec![],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let payload = ActivityFailure::sandbox_denied("denied").into_error_payload();
+        let (_, non_retryable) = classify_activity_error(&payload, Some(&policy));
+        assert!(
+            non_retryable,
+            "sandbox_denied is non-retryable regardless of policy"
+        );
     }
 }

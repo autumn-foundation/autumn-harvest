@@ -248,6 +248,8 @@ pub mod store;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod timeout;
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_activities;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod worker;
@@ -444,6 +446,12 @@ pub use version_usage::{
 pub use webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookHandlerFn, WebhookTarget, WebhookTriggerInfo,
     validate_webhook_triggers,
+};
+
+#[cfg(feature = "wasm-activities")]
+pub use wasm_activities::{
+    DEFAULT_FUEL, DEFAULT_MAX_WALL_CLOCK, DEFAULT_MEMORY_BYTES, EPOCH_TICK_INTERVAL,
+    WasmCapabilities, WasmLimits, WasmModuleStore, deadline_ticks, invoke_wasm_activity,
 };
 
 #[cfg(feature = "db")]
