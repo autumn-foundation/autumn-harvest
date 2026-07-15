@@ -347,8 +347,7 @@ fn link_host_functions(
             .func_wrap("env", "now_millis", || -> i64 {
                 let millis = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_millis());
                 i64::try_from(millis).unwrap_or(i64::MAX)
             })
             .map_err(|e| map_link_err("env::now_millis", &e))?;

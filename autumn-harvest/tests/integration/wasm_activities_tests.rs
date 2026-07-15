@@ -1314,11 +1314,13 @@ fn dispatch_overhead_wasm_echo_vs_native() {
     // Native baseline: a trivial echo closure returning the same JSON.
     let native = |v: &serde_json::Value| -> serde_json::Value { v.clone() };
 
-    let pct = |sorted: &[Duration], p: f64| -> Duration {
+    // Nearest-rank percentile via integer math (no float casts): for a sorted
+    // slice of length L, idx = round(p * (L-1) / 100).
+    let pct = |sorted: &[Duration], p: usize| -> Duration {
         if sorted.is_empty() {
             return Duration::ZERO;
         }
-        let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+        let idx = (p * (sorted.len() - 1) + 50) / 100;
         sorted[idx.min(sorted.len() - 1)]
     };
 
@@ -1344,10 +1346,10 @@ fn dispatch_overhead_wasm_echo_vs_native() {
     wasm_samples.sort_unstable();
     native_samples.sort_unstable();
 
-    let w50 = pct(&wasm_samples, 50.0);
-    let w99 = pct(&wasm_samples, 99.0);
-    let n50 = pct(&native_samples, 50.0);
-    let n99 = pct(&native_samples, 99.0);
+    let w50 = pct(&wasm_samples, 50);
+    let w99 = pct(&wasm_samples, 99);
+    let n50 = pct(&native_samples, 50);
+    let n99 = pct(&native_samples, 99);
     let d50 = w50.saturating_sub(n50);
     let d99 = w99.saturating_sub(n99);
 
