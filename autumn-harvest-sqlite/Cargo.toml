@@ -35,5 +35,14 @@ rusqlite = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
+# Single consolidated integration-test binary. Cargo compiles each top-level
+# `tests/*.rs` as its own binary; routing every per-area file through one
+# `[[test]]` target (with the files as `mod`s in `tests/integration/mod.rs`)
+# collapses ~17 binaries into 1, cutting CI compile time and disk. Mirrors the
+# core `autumn-harvest` crate's `integration` target.
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
 [lints]
 workspace = true
