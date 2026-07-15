@@ -235,6 +235,27 @@
 //!   terminal drain), so the run completes cleanly and no orphaned timer is left
 //!   behind.
 //!
+//! **Known limitation — a plain `wait_for_signal(name)` composed with a
+//! `wait_for_signal_timeout(name, ...)` on the SAME signal name concurrently** (e.g.
+//! `tokio::join!(ctx.wait_for_signal("go"), ctx.wait_for_signal_timeout("go", ...))`)
+//! is subject to a pre-existing limitation of the *core* determinism engine, NOT
+//! this backend: the sibling timeout wait's deadline (`__signal_timeout:{seq}:go`)
+//! is a legitimate durable timer, so a signal arriving after that deadline records
+//! `TimerFired` before `SignalReceived(go)`; the core `HistoryMatcher::match_signal`
+//! path (the plain wait) does not skip an interleaved `TimerFired`, so replay cannot
+//! consume the delivered signal and the run stays parked. This is NOT a backend
+//! ingest/correlation gap — even exact per-wait timer correlation cannot fix it,
+//! because the deadline `TimerFired` is in history regardless of ingest order, and
+//! `match_signal` still stops at it (verified on the core `WorkflowReplayer`:
+//! `[…, TimerFired(__signal_timeout:0:go), SignalReceived(go)]` for a plain-wait
+//! handler → `NonDeterminismDetected`). Tracked as the same core-matcher class as
+//! #1071 (the interleaved-`TimerFired` intolerance also behind the declined
+//! activity-vs-timer reorder). The **supported** path for a signal-with-deadline is
+//! `wait_for_signal_timeout` / `receive_signal_timeout` used ALONE (which arms
+//! exactly the `__signal_timeout` deadline this backend reorders, and is covered by
+//! the late-signal-vs-deadline tests) — do not also add a plain `wait_for_signal`
+//! on the same name in the same race.
+//!
 //! Signal ingress is validated at the boundary:
 //! [`SqliteRuntime::send_signal`](crate::SqliteRuntime::send_signal) rejects a signal
 //! aimed at an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal

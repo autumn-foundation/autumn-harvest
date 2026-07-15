@@ -16,6 +16,12 @@
 // The terminal-failure workflow fixtures return immediately (no `.await`).
 #![allow(clippy::unused_async)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC;
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{ActivityExecId, WorkerId};
@@ -448,4 +454,193 @@ async fn untyped_workflow_failure_is_unchanged() {
     );
     assert_eq!(*details, None);
     assert_eq!(*non_retryable, None);
+}
+
+// ── Codex #1069 P2 (`worker.rs:119`): caught activity panics carry the typed ─────
+//    `HandlerPanic` envelope, not a plain string ──────────────────────────────────
+//
+// A registered activity that `panic!()`s is contained (issue #782 analog) and
+// routed through the crate's NORMAL retryable-failure path. Pre-fix the panic was
+// converted to a PLAIN string `"activity panicked: …"`, so it was the one
+// activity-failure that skipped the typed-envelope treatment the ordinary
+// `Err(String)` path now gets: the terminal `ActivityFailed` recorded
+// `error_type = "Error"` (RED here in `(a)`), and a retry policy marking
+// `HandlerPanic` non-retryable never matched, retrying the panic to exhaustion
+// (RED here in `(b)`). The fix encodes the caught panic as the typed
+// `harvest_activity_failure_v1` envelope carrying `error_type = "HandlerPanic"`,
+// byte-equivalent to the Postgres worker's caught-panic path.
+
+// A workflow that CATCHES the activity failure and completes, so the run — and the
+// replay of its history on the core engine — reaches a clean terminal
+// `WorkflowCompleted` (`ReplaySucceeded`).
+#[workflow]
+async fn catches_activity_panic(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    match ctx
+        .execute_activity_raw("panicky", json!(0), "default")
+        .await
+    {
+        Ok(_) => Ok("unexpected_ok".to_string()),
+        Err(e) => Ok(format!("caught: {e}")),
+    }
+}
+
+// RED pre-fix: the terminal `ActivityFailed` recorded `error_type = "Error"` and
+// the raw `"activity panicked: …"` string, losing the `HandlerPanic` class the
+// Postgres worker records and breaking cross-backend byte-identity.
+#[tokio::test]
+async fn caught_activity_panic_records_handler_panic_error_type_and_replays() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&catches_activity_panic_info());
+    // `max_attempts = 1` → terminal on the first strike; the panic is the exhausting
+    // (terminal) failure whose recorded `error_type` is under test.
+    rt.register_activity(
+        "panicky",
+        ActivitySpec::new(
+            1,
+            |_input: serde_json::Value| -> Result<serde_json::Value, String> {
+                panic!("activity boom")
+            },
+        ),
+    );
+    let exec = rt
+        .start_workflow("catches_activity_panic", json!(0))
+        .unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "the workflow catches the activity failure and completes, got {state:?}"
+    );
+
+    // The terminal `ActivityFailed` carries the DECODED typed `HandlerPanic` class
+    // (not `"Error"`), the raw panic message is preserved, and there is no raw
+    // envelope leaking into the human message.
+    let history = rt.load_history(exec).unwrap();
+    let mut failed = history.iter().filter_map(|e| match e {
+        WorkflowEvent::ActivityFailed {
+            error,
+            error_type,
+            non_retryable,
+            attempt,
+            ..
+        } => Some((error.clone(), error_type.clone(), *non_retryable, *attempt)),
+        _ => None,
+    });
+    let (error, error_type, non_retryable, attempt) =
+        failed.next().expect("one terminal ActivityFailed");
+    assert!(failed.next().is_none(), "exactly one ActivityFailed");
+    assert_eq!(
+        error_type, ERROR_TYPE_HANDLER_PANIC,
+        "a caught panic records error_type = HandlerPanic (RED pre-fix: \"Error\")"
+    );
+    assert_ne!(error_type, "Error");
+    assert!(
+        error.contains("activity boom"),
+        "the raw panic message is preserved in the failure: {error:?}"
+    );
+    assert!(
+        !error.contains("harvest_activity_failure_v1"),
+        "the human message must not leak the raw wire envelope: {error:?}"
+    );
+    assert!(!non_retryable, "a caught panic is a retryable class");
+    assert_eq!(
+        attempt, 1,
+        "terminal on the first strike (max_attempts = 1)"
+    );
+
+    // AC5: the history replays cleanly (no non-determinism drift) — the catching
+    // workflow re-runs to a clean terminal `WorkflowCompleted` (`ReplaySucceeded`).
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "catches_activity_panic",
+            catches_activity_panic_info().handler,
+        )
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a caught-panic history must replay to ReplaySucceeded on the core engine:\n{report}"
+    );
+}
+
+// A retry policy that marks the engine-reserved `HandlerPanic` class non-retryable.
+fn handler_panic_non_retryable_policy() -> RetryPolicy {
+    RetryPolicy {
+        non_retryable_errors: vec![ERROR_TYPE_HANDLER_PANIC.to_string()],
+        ..RetryPolicy::exponential(3, Duration::from_millis(1))
+    }
+}
+
+// The per-call retry policy is carried on the typed `execute_activity(&info, ...)`
+// command (`retry_policy_override`) and persisted on the task row, so the worker's
+// failure classifier can see it.
+#[activity(retry = handler_panic_non_retryable_policy())]
+async fn panicky_typed(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    Ok(n)
+}
+
+#[workflow]
+async fn calls_panicky_typed(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    let out: i64 = ctx
+        .execute_activity(&panicky_typed_info(), n)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+// RED pre-fix: a caught panic was a plain string with no typed `error_type`, so the
+// policy's `non_retryable_errors = ["HandlerPanic"]` never matched (it compares
+// against `error_type` OR the raw string). The panic was therefore retried to
+// `max_attempts` (3 body runs) and the terminal event recorded `error_type =
+// "Error"`. GREEN: the typed envelope carries `error_type = "HandlerPanic"`, the
+// policy matches, and the task fails terminally after ONE attempt.
+#[tokio::test]
+async fn caught_activity_panic_honors_handler_panic_non_retryable_policy() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body_calls = calls.clone();
+
+    rt.register_workflow(&calls_panicky_typed_info());
+    // The registered spec allows 3 attempts; only the policy's non-retryable
+    // classification stops the retries — so pre-fix (no typed error_type) this body
+    // ran 3 times.
+    rt.register_activity(
+        "panicky_typed",
+        ActivitySpec::new(3, move |_input: serde_json::Value| {
+            body_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("activity boom");
+        }),
+    );
+
+    let exec = rt.start_workflow("calls_panicky_typed", json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Failed(_)),
+        "the non-retryable panic fails the run terminally, got {state:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a HandlerPanic marked non-retryable must run the body exactly ONCE \
+         (RED pre-fix: retried to max_attempts = 3)"
+    );
+
+    let history = rt.load_history(exec).unwrap();
+    let (error_type, attempt) = history
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                attempt,
+                ..
+            } => Some((error_type.clone(), *attempt)),
+            _ => None,
+        })
+        .expect("one terminal ActivityFailed");
+    assert_eq!(
+        error_type, ERROR_TYPE_HANDLER_PANIC,
+        "the terminal event records the HandlerPanic class (RED pre-fix: \"Error\")"
+    );
+    assert_eq!(attempt, 1, "terminal after the first attempt (not retried)");
 }

@@ -113,9 +113,26 @@ pub fn drain_ready(
             (spec.body)(task.input.clone())
         }))
         .unwrap_or_else(|payload| {
-            Err(format!(
-                "activity panicked: {}",
-                autumn_harvest::error::panic_message(payload)
+            // Encode the caught panic as the TYPED `harvest_activity_failure_v1`
+            // envelope carrying `error_type = "HandlerPanic"` (issue #782; Codex
+            // #1069 P2, `worker.rs:119`) — NOT a plain string. This is the one
+            // activity-failure path that would otherwise skip the typed-envelope
+            // treatment the ordinary `Err(String)` path already gets, because the
+            // finalize path derives BOTH the retry classification
+            // (`parse_typed_payload` → `RetryPolicy::is_non_retryable`) AND the
+            // terminal `ActivityFailed` metadata (`parse_error_payload_full`) from
+            // this string. Emitting the typed HandlerPanic envelope makes a retry
+            // policy that marks `HandlerPanic` non-retryable actually match (the
+            // panicking task fails terminally after ONE attempt instead of being
+            // retried to `max_attempts`), and records a terminal
+            // `ActivityFailed { error_type: "HandlerPanic", .. }` byte-equivalent
+            // to the Postgres worker's caught-panic path
+            // (`handler_panic_activity_envelope`). Retryable like the core — a
+            // caught panic follows the activity's retry policy exactly as
+            // `Err(String)` does. The carried message is the raw panic message (no
+            // synthetic prefix), matching the core envelope.
+            Err(handler_panic_activity_envelope(
+                autumn_harvest::error::panic_message(payload),
             ))
         });
         let elapsed = started.elapsed();
@@ -171,6 +188,25 @@ pub fn drain_ready(
     }
 
     Ok(produced)
+}
+
+/// Encode a contained **activity** handler-panic message as the typed
+/// `harvest_activity_failure_v1` envelope carrying the engine-reserved
+/// [`ERROR_TYPE_HANDLER_PANIC`](autumn_harvest::failure) class (issue #782).
+///
+/// Mirrors the Postgres worker's private `handler_panic_activity_envelope`
+/// verbatim, built from the same `pub` `autumn_harvest::failure` building blocks
+/// ([`ActivityFailure::retryable`](autumn_harvest::failure::ActivityFailure::retryable)
+/// and
+/// [`IntoActivityErrorString::into_error_payload`](autumn_harvest::failure::IntoActivityErrorString)),
+/// so a caught panic on this backend produces a byte-identical failure payload.
+/// The failure is **retryable**: a caught panic follows the activity's retry
+/// policy (honoring a `HandlerPanic`-non-retryable classification) exactly as an
+/// ordinary `Err(String)` does.
+fn handler_panic_activity_envelope(message: String) -> String {
+    use autumn_harvest::failure::{ERROR_TYPE_HANDLER_PANIC, IntoActivityErrorString as _};
+    autumn_harvest::failure::ActivityFailure::retryable(ERROR_TYPE_HANDLER_PANIC, message)
+        .into_error_payload()
 }
 
 /// True iff `timer_id` is the deadline timer of a `wait_for_signal_timeout` /
@@ -526,8 +562,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        finalize_within_tx, fire_timer, fire_timer_within_tx, ingest_awaited_signal,
-        is_signal_timeout_deadline_timer, start_to_close_exceeded,
+        finalize_within_tx, fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
+        ingest_awaited_signal, is_signal_timeout_deadline_timer, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::{schema, store};
@@ -949,5 +985,43 @@ mod tests {
             "a zero-delay policy retry is immediate: requeue at cycle-start now so it \
              re-claims this drain pass, never at failure_now"
         );
+    }
+
+    // Codex #1069 P2 (`worker.rs:119`): a caught activity panic is encoded as the
+    // TYPED `harvest_activity_failure_v1` envelope carrying `error_type =
+    // "HandlerPanic"` — NOT a plain string. This is what makes the finalize path
+    // (`parse_typed_payload` → retry classification, `parse_error_payload_full` →
+    // terminal event metadata) treat a panic like the Postgres worker does: a retry
+    // policy that marks `HandlerPanic` non-retryable actually matches, and the
+    // terminal `ActivityFailed` records `error_type = "HandlerPanic"` byte-equivalent
+    // to the core. Mirrors the core worker's
+    // `handler_panic_activity_envelope_is_retryable_handler_panic`.
+    #[test]
+    fn handler_panic_activity_envelope_encodes_retryable_handler_panic() {
+        let payload = handler_panic_activity_envelope("activity boom".to_string());
+        // Not a plain string — the retry classifier must see a typed envelope so the
+        // `error_type` is available to `RetryPolicy::is_non_retryable`.
+        assert!(
+            !payload.starts_with("activity boom"),
+            "must be a versioned envelope, not the bare panic message"
+        );
+        let typed = autumn_harvest::failure::parse_typed_payload(&payload)
+            .expect("a caught panic encodes a TYPED envelope, not a plain string");
+        assert_eq!(
+            typed.error_type,
+            autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC,
+        );
+        assert!(
+            !typed.non_retryable,
+            "a caught panic is retryable (follows the activity's retry policy)"
+        );
+        // The terminal decode path records HandlerPanic metadata + the human message.
+        let full = autumn_harvest::failure::parse_error_payload_full(&payload);
+        assert_eq!(
+            full.error_type,
+            autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC,
+        );
+        assert_eq!(full.message, "activity boom", "raw panic message preserved");
+        assert!(!full.non_retryable);
     }
 }
