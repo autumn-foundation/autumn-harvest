@@ -1283,7 +1283,11 @@ pub fn compute_jitter_offset(
 /// Returns `None` when nothing is set anywhere, preserving today's implicit
 /// fallback (the enqueue path's own `max_attempts` default). Opt-in: an unset
 /// builder default is a pure no-op via `.or(None)`.
+///
+/// The sole non-test consumer is the `db`-gated worker dispatch path; unused
+/// under `--no-default-features` (the pure precedence is still test-covered).
 #[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn resolve_effective_retry(
     call: Option<RetryPolicy>,
     activity: Option<RetryPolicy>,
@@ -1297,7 +1301,11 @@ pub(crate) fn resolve_effective_retry(
 /// Same precedence as [`resolve_effective_retry`]: call-site override →
 /// activity default → builder default. `None` when unset (no timeout enforced),
 /// preserving today's behaviour.
+///
+/// The sole non-test consumer is the `db`-gated worker dispatch path; unused
+/// under `--no-default-features` (the pure precedence is still test-covered).
 #[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn resolve_effective_start_to_close(
     call: Option<Duration>,
     activity: Option<Duration>,
@@ -1329,25 +1337,21 @@ mod tests {
 
         // All three present → call-site wins.
         assert_eq!(
-            resolve_effective_retry(
-                Some(call.clone()),
-                Some(activity.clone()),
-                Some(builder.clone()),
-            )
-            .map(|p| p.max_attempts),
+            resolve_effective_retry(Some(call), Some(activity.clone()), Some(builder.clone()))
+                .map(|p| p.max_attempts),
             Some(5),
         );
 
         // No call-site → activity default wins over builder default.
         assert_eq!(
-            resolve_effective_retry(None, Some(activity.clone()), Some(builder.clone()))
+            resolve_effective_retry(None, Some(activity), Some(builder.clone()))
                 .map(|p| p.max_attempts),
             Some(2),
         );
 
         // No call-site, no activity default → builder default applies.
         assert_eq!(
-            resolve_effective_retry(None, None, Some(builder.clone())).map(|p| p.max_attempts),
+            resolve_effective_retry(None, None, Some(builder)).map(|p| p.max_attempts),
             Some(9),
         );
 

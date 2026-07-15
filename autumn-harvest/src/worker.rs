@@ -903,6 +903,14 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "activity_interceptor_count",
                 &self.activity_interceptors.len(),
+            )
+            .field(
+                "default_activity_retry_policy",
+                &self.default_activity_retry_policy,
+            )
+            .field(
+                "default_activity_start_to_close",
+                &self.default_activity_start_to_close,
             );
         #[cfg(feature = "wasm-activities")]
         d.field("wasm_activity_count", &self.wasm_activities.len())
@@ -15912,6 +15920,8 @@ mod tests {
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,

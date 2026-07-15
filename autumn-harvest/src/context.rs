@@ -1801,7 +1801,7 @@ pub struct WorkflowContext {
     default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
     /// Builder-level default activity `start_to_close` (issue #620). Used by the
     /// LOCAL activity path (still clamped by the worker's local-STC cap). `None`.
-    default_activity_start_to_close: Option<Duration>,
+    default_activity_start_to_close: Option<std::time::Duration>,
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
@@ -2504,7 +2504,7 @@ impl WorkflowContext {
     pub fn with_activity_defaults(
         mut self,
         retry: Option<crate::policy::RetryPolicy>,
-        start_to_close: Option<Duration>,
+        start_to_close: Option<std::time::Duration>,
     ) -> Self {
         self.default_activity_retry_policy = retry;
         self.default_activity_start_to_close = start_to_close;

@@ -1,5 +1,5 @@
 #![cfg(feature = "db")]
-//! Builder-level default activity retry + start_to_close floor — issue #620.
+//! Builder-level default activity retry + `start_to_close` floor — issue #620.
 //!
 //! RED PHASE (TDD): these tests reference the not-yet-existing
 //! `HandlerRegistry::with_activity_defaults(retry, start_to_close)` builder, so
