@@ -3992,3 +3992,440 @@ async fn ui_dag_run_graph_unknown_run_falls_back() {
         "falls back to a renderable view: {html}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #960 — Vantage execution timeline / Gantt view
+//
+// These exercise the standalone `GET /workflows/{id}/timeline` page (server-
+// rendered inline SVG built from `autumn_harvest::derive_timeline`, the same
+// in-process call the #739 API handler makes) plus the pause/ND-block bands
+// sourced from the execution row and the "Timeline" tab link on the detail
+// page. Docker-backed (testcontainers); compile-checked in sandboxes without
+// Docker, run on Linux CI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Set an event row's wall-clock timestamp so the derived timeline has
+/// meaningful, spread-out durations (events default to NOW() on insert).
+async fn tl960_set_event_ts(
+    database_url: &str,
+    exec_id: ExecutionId,
+    event_id: i32,
+    ts: chrono::DateTime<chrono::Utc>,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for event-ts update");
+    let sql = format!(
+        "UPDATE harvest_events SET timestamp = '{}' WHERE workflow_exec_id = '{}' AND event_id = {}",
+        ts.to_rfc3339(),
+        exec_id.as_uuid(),
+        event_id,
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("update event timestamp");
+}
+
+/// Seed a plain workflow run with the given events (appended after the
+/// `WorkflowStarted` at event 1), spread across wall-clock time starting at
+/// `base`, then apply the state/column overrides. Returns the exec id and the
+/// number of appended events.
+#[allow(clippy::too_many_arguments)]
+async fn tl960_seed_run(
+    database_url: &str,
+    workflow_id: &str,
+    events: Vec<autumn_harvest::WorkflowEvent>,
+    base: chrono::DateTime<chrono::Utc>,
+    step_ms: i64,
+    state: &str,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    pause_reason: Option<&str>,
+    pause_actor: Option<&str>,
+    nd_blocked_at: Option<chrono::DateTime<chrono::Utc>>,
+    nd_block_reason: Option<&str>,
+    current_details: Option<&str>,
+) -> ExecutionId {
+    let exec_id = insert_workflow_on_url(database_url, ShardId::new(0), "echo_workflow", workflow_id).await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for tl960 seed");
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    let start_event_id = history.next_event_id;
+    let count = i32::try_from(events.len()).unwrap();
+    store::append_events(&mut conn, exec_id, &events, start_event_id)
+        .await
+        .expect("append tl960 events");
+
+    // Anchor the WorkflowStarted (event 1) to `base` and spread the rest.
+    tl960_set_event_ts(database_url, exec_id, 1, base).await;
+    for offset in 0..count {
+        let ts = base + chrono::Duration::milliseconds((offset as i64 + 1) * step_ms);
+        tl960_set_event_ts(database_url, exec_id, start_event_id + offset, ts).await;
+    }
+
+    // Apply the row overrides (state, completion, pause/ND-block, current_details).
+    let mut sets: Vec<String> = vec![format!("state = '{state}'")];
+    sets.push(format!("started_at = '{}'", base.to_rfc3339()));
+    if let Some(c) = completed_at {
+        sets.push(format!("completed_at = '{}'", c.to_rfc3339()));
+    }
+    if let Some(p) = paused_at {
+        sets.push(format!("paused_at = '{}'", p.to_rfc3339()));
+    }
+    if let Some(r) = pause_reason {
+        sets.push(format!("pause_reason = '{r}'"));
+    }
+    if let Some(a) = pause_actor {
+        sets.push(format!("pause_actor = '{a}'"));
+    }
+    if let Some(nd) = nd_blocked_at {
+        sets.push(format!("nd_blocked_at = '{}'", nd.to_rfc3339()));
+    }
+    if let Some(r) = nd_block_reason {
+        sets.push(format!("nd_block_reason = '{r}'"));
+    }
+    if let Some(cd) = current_details {
+        sets.push(format!("current_details = '{cd}'"));
+    }
+    let sql = format!(
+        "UPDATE harvest_workflow_executions SET {} WHERE id = '{}'",
+        sets.join(", "),
+        exec_id.as_uuid(),
+    );
+    conn.batch_execute(&sql).await.expect("apply tl960 row overrides");
+    exec_id
+}
+
+fn tl960_act_sched(name: &str, id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityScheduled {
+        activity_id: id,
+        name: name.to_string(),
+        input: json!({}),
+        queue: "default".to_string(),
+    }
+}
+fn tl960_act_started(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityStarted {
+        activity_id: id,
+        worker_id: autumn_harvest::types::WorkerId::new("tl-worker"),
+    }
+}
+const fn tl960_act_completed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityCompleted {
+        activity_id: id,
+        output: Value::Null,
+    }
+}
+fn tl960_act_failed(id: autumn_harvest::ActivityExecId, attempt: u32) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityFailed {
+        activity_id: id,
+        error: "transient failure".to_string(),
+        attempt,
+        error_type: "Transient".to_string(),
+        non_retryable: false,
+        details: None,
+    }
+}
+fn tl960_timer_started(id: &str) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::TimerStarted {
+        timer_id: autumn_harvest::types::TimerId::new(id),
+        duration_secs: 60,
+    }
+}
+fn tl960_timer_fired(id: &str) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::TimerFired {
+        timer_id: autumn_harvest::types::TimerId::new(id),
+    }
+}
+fn tl960_child_started(child: ExecutionId, name: &str) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ChildWorkflowStarted {
+        child_id: child,
+        workflow_name: name.to_string(),
+        input: json!({}),
+    }
+}
+const fn tl960_child_completed(child: ExecutionId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ChildWorkflowCompleted {
+        child_id: child,
+        output: Value::Null,
+    }
+}
+
+// J-A
+#[tokio::test]
+async fn ui_timeline_renders_activity_timer_pause_ndblock() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
+    // so `derive_timeline` reports attempt = 2 → a "×2" badge. Plus a durable timer.
+    let a = autumn_harvest::ActivityExecId::new();
+    let t_id = "wait_gate";
+    let events = vec![
+        tl960_act_sched("charge_card", a),
+        tl960_act_started(a),
+        tl960_act_failed(a, 1),
+        tl960_act_started(a),
+        tl960_act_failed(a, 2),
+        tl960_act_started(a),
+        tl960_act_completed(a),
+        tl960_timer_started(t_id),
+        tl960_timer_fired(t_id),
+    ];
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-a",
+        events,
+        base,
+        1000,
+        "RUNNING",
+        None,
+        Some(base + chrono::Duration::seconds(4)),
+        Some("incident-4821"),
+        Some("oncall@corp"),
+        Some(base + chrono::Duration::seconds(6)),
+        Some("expected ActivityScheduled got TimerStarted"),
+        None,
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK, "timeline renders: {html}");
+    assert!(html.contains("<svg"), "inline svg present");
+    assert!(html.contains("charge_card"), "activity span present");
+    assert!(html.contains("×2"), "retry attempt badge visible: {html}");
+    assert!(html.contains("wait_gate"), "timer span present");
+    assert!(html.contains("Timer"), "timer lane label present");
+    // Pause band + reason/actor.
+    assert!(html.contains("gantt-pause-band"), "pause band present");
+    assert!(html.contains("incident-4821"), "pause reason labelled");
+    assert!(html.contains("oncall@corp"), "pause actor labelled");
+    // ND marker + runbook link.
+    assert!(html.contains("gantt-nd-marker"), "ND marker present");
+    assert!(html.contains("nondeterminism-block"), "runbook link present");
+}
+
+// J-B
+#[tokio::test]
+async fn ui_timeline_split_only_when_present() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // An activity WITH ActivityStarted → wait/exec split. A child workflow → no split.
+    let a = autumn_harvest::ActivityExecId::new();
+    let child = ExecutionId::new_for_shard(ShardId::new(0));
+    let events = vec![
+        tl960_act_sched("split_activity", a),
+        tl960_act_started(a),
+        tl960_act_completed(a),
+        tl960_child_started(child, "sub_flow"),
+        tl960_child_completed(child),
+    ];
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-b",
+        events,
+        base,
+        1000,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(6)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Started activity → wait + exec segments.
+    assert!(html.contains("gantt-seg-wait"), "wait segment present: {html}");
+    assert!(html.contains("gantt-seg-exec"), "exec segment present");
+    // Child → single undivided span.
+    assert!(html.contains("gantt-seg-whole"), "child renders one whole span");
+    assert!(html.contains("sub_flow") || html.contains("ChildWorkflow") || html.contains("Child workflow"));
+}
+
+// J-C
+#[tokio::test]
+async fn ui_timeline_slowest_highlight_and_rollup() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // A quick activity then a much slower one (the slowest step).
+    let a1 = autumn_harvest::ActivityExecId::new();
+    let a2 = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        tl960_act_sched("quick", a1),
+        tl960_act_completed(a1),
+        tl960_act_sched("slow_bottleneck", a2),
+        tl960_act_completed(a2),
+    ];
+    // event offsets (step_ms=1000): sched(quick)@1s, complete(quick)@2s,
+    // sched(slow)@3s, complete(slow)@4s → but that makes both 1s. Use explicit
+    // widening below by pushing the slow completion far out via a large step.
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-c",
+        events,
+        base,
+        3000,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(20)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    // Push the slow activity's completion far out so it dominates.
+    tl960_set_event_ts(&database_url, exec_id, 5, base + chrono::Duration::seconds(20)).await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Rollup header present.
+    assert!(html.contains("Total") || html.contains("wall-clock") || html.contains("Wall-clock"), "rollup header: {html}");
+    assert!(html.contains("slow_bottleneck"), "slowest step named");
+    // Slowest span anchor + highlight.
+    assert!(html.contains("id=\"slowest\""), "slowest anchor present");
+    assert!(html.contains("gantt-span-slowest"), "slowest highlight present");
+}
+
+// J-D
+#[tokio::test]
+async fn ui_timeline_inflight_open_span_and_current_details() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // A running execution with a scheduled-but-not-completed activity.
+    let a = autumn_harvest::ActivityExecId::new();
+    let events = vec![tl960_act_sched("in_flight_activity", a), tl960_act_started(a)];
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-d",
+        events,
+        base,
+        1000,
+        "RUNNING",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("step 2/3: awaiting downstream"),
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("gantt-span-open"), "in-flight open span present: {html}");
+    assert!(html.contains("step 2/3: awaiting downstream"), "current_details shown in header");
+}
+
+// J-E
+#[tokio::test]
+async fn ui_timeline_unknown_execution_404() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    // A random exec id has no execution row (mirrors a classic DAG run, which is
+    // not on the execution path) → 404.
+    let bogus = ExecutionId::new_for_shard(ShardId::new(0));
+    let (status, _html) = fetch_html(&app, &format!("/workflows/{bogus}/timeline")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown execution → 404");
+}
+
+// J-F
+#[tokio::test]
+async fn ui_detail_page_has_timeline_link() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T14:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let a = autumn_harvest::ActivityExecId::new();
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-f",
+        vec![tl960_act_sched("a", a), tl960_act_completed(a)],
+        base,
+        1000,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(3)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("/timeline") && html.to_lowercase().contains("timeline"),
+        "detail page links to the timeline view: {html}"
+    );
+}
+
+// J-G (perf)
+#[tokio::test]
+async fn ui_timeline_200_steps_under_1s() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T15:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // 200 activities (400 events: sched + complete each).
+    let mut events = Vec::with_capacity(400);
+    for _ in 0..200 {
+        let id = autumn_harvest::ActivityExecId::new();
+        events.push(tl960_act_sched("step", id));
+        events.push(tl960_act_completed(id));
+    }
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-g",
+        events,
+        base,
+        100,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(60)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let start = std::time::Instant::now();
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("<svg"), "renders the gantt");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "200-step timeline renders server-side in < 1s (took {elapsed:?})"
+    );
+}

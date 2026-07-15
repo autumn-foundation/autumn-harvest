@@ -9246,4 +9246,463 @@ mod tests {
             "../../../graph_linear?run=run-2&flash=done"
         );
     }
+
+    // ── Issue #960 — execution timeline / Gantt view ───────────────────────
+    //
+    // Pure render/geometry unit tests (run without Docker). The Gantt consumes
+    // the shipped `autumn_harvest::derive_timeline` output plus the execution
+    // row's pause/ND-block columns — it never forks history-derivation.
+
+    use autumn_harvest::{
+        SlowestStep, StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep,
+    };
+
+    const ALL_STEP_OUTCOMES: [StepOutcome; 6] = [
+        StepOutcome::Completed,
+        StepOutcome::Failed,
+        StepOutcome::TimedOut,
+        StepOutcome::Cancelled,
+        StepOutcome::Fired,
+        StepOutcome::Pending,
+    ];
+
+    const ALL_STEP_KINDS: [StepKind; 6] = [
+        StepKind::Activity,
+        StepKind::LocalActivity,
+        StepKind::Timer,
+        StepKind::ChildWorkflow,
+        StepKind::SignalWait,
+        StepKind::SideEffect,
+    ];
+
+    fn tl_base() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tl_step(
+        kind: StepKind,
+        name: Option<&str>,
+        sched_off_ms: i64,
+        end_off_ms: Option<i64>,
+        wait_ms: Option<i64>,
+        exec_ms: Option<i64>,
+        outcome: StepOutcome,
+        attempt: Option<i32>,
+    ) -> TimelineStep {
+        let base = tl_base();
+        let scheduled_at = base + chrono::Duration::milliseconds(sched_off_ms);
+        let ended_at = end_off_ms.map(|o| base + chrono::Duration::milliseconds(o));
+        let total_ms = end_off_ms.map_or(0, |e| (e - sched_off_ms).max(0));
+        TimelineStep {
+            step_kind: kind,
+            name: name.map(ToString::to_string),
+            scheduled_at,
+            ended_at,
+            total_ms,
+            wait_ms,
+            exec_ms,
+            outcome,
+            attempt,
+        }
+    }
+
+    fn tl_rollup(slowest: Option<SlowestStep>) -> TimelineRollup {
+        TimelineRollup {
+            total_wall_clock_ms: 12_000,
+            busy_ms: 8_000,
+            wait_ms: 3_000,
+            slowest_step: slowest,
+            step_count_by_kind: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn tl_timeline(steps: Vec<TimelineStep>, slowest: Option<SlowestStep>) -> Timeline {
+        Timeline {
+            exec_id: "exec-1".to_string(),
+            workflow_id: "wf-1".to_string(),
+            workflow_name: "order_flow".to_string(),
+            state: "RUNNING".to_string(),
+            steps,
+            rollup: tl_rollup(slowest),
+        }
+    }
+
+    // Q1
+    #[test]
+    fn step_outcome_fill_and_label_all_variants() {
+        let fills: Vec<&str> = ALL_STEP_OUTCOMES.iter().map(|o| step_outcome_fill(*o)).collect();
+        for fill in &fills {
+            assert!(
+                fill.starts_with('#') && fill.len() >= 4,
+                "outcome fill must be non-empty hex: {fill:?}"
+            );
+        }
+        let unique: std::collections::HashSet<&&str> = fills.iter().collect();
+        assert_eq!(unique.len(), 6, "each outcome has a distinct fill: {fills:?}");
+
+        let labels: Vec<&str> = ALL_STEP_OUTCOMES
+            .iter()
+            .map(|o| step_outcome_label(*o))
+            .collect();
+        let unique_labels: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(unique_labels.len(), 6, "distinct labels: {labels:?}");
+        assert!(labels.iter().all(|l| !l.is_empty()));
+    }
+
+    // Q2
+    #[test]
+    fn timeline_lanes_fixed_order_and_labels() {
+        // Fixed lane order, matching the AC's step_kind list.
+        assert_eq!(
+            TIMELINE_LANES,
+            [
+                StepKind::Activity,
+                StepKind::LocalActivity,
+                StepKind::ChildWorkflow,
+                StepKind::Timer,
+                StepKind::SignalWait,
+                StepKind::SideEffect,
+            ]
+        );
+        let labels: Vec<&str> = ALL_STEP_KINDS
+            .iter()
+            .map(|k| step_kind_lane_label(*k))
+            .collect();
+        let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(unique.len(), 6, "distinct lane labels: {labels:?}");
+        assert!(labels.iter().all(|l| !l.is_empty()));
+    }
+
+    // Q3
+    #[test]
+    fn x_scale_maps_endpoints() {
+        assert!((x_scale(0, 1000, 800.0) - 0.0).abs() < f64::EPSILON);
+        assert!((x_scale(1000, 1000, 800.0) - 800.0).abs() < f64::EPSILON);
+        assert!((x_scale(500, 1000, 800.0) - 400.0).abs() < f64::EPSILON);
+    }
+
+    // Q4
+    #[test]
+    fn x_scale_zero_duration_guard() {
+        // span_ms == 0 must not divide by zero / NaN / panic.
+        let a = x_scale(0, 0, 800.0);
+        let b = x_scale(5, 0, 800.0);
+        assert!(a.is_finite() && b.is_finite(), "no NaN/inf on zero span");
+        // Clamped inside the axis regardless.
+        assert!((0.0..=800.0).contains(&x_scale(9_000, 1_000, 800.0)));
+        assert!((0.0..=800.0).contains(&x_scale(-9_000, 1_000, 800.0)));
+    }
+
+    // Q5a
+    #[test]
+    fn span_segments_split_when_both_present() {
+        let step = tl_step(
+            StepKind::Activity,
+            Some("charge"),
+            0,
+            Some(1000),
+            Some(300),
+            Some(700),
+            StepOutcome::Completed,
+            Some(1),
+        );
+        let segs = span_segments(&step);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], (SegKind::Wait, 300));
+        assert_eq!(segs[1], (SegKind::Exec, 700));
+        assert_eq!(segs.iter().map(|(_, ms)| *ms).sum::<i64>(), 1000);
+    }
+
+    // Q5b
+    #[test]
+    fn span_segments_single_when_absent() {
+        // No split recorded → one undivided Whole segment (never fabricated).
+        let child = tl_step(
+            StepKind::ChildWorkflow,
+            Some("sub"),
+            0,
+            Some(500),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        );
+        assert_eq!(span_segments(&child), vec![(SegKind::Whole, 500)]);
+
+        // Only one of wait/exec present → still a single Whole span.
+        let half = tl_step(
+            StepKind::Activity,
+            Some("a"),
+            0,
+            Some(400),
+            Some(100),
+            None,
+            StepOutcome::Completed,
+            Some(1),
+        );
+        assert_eq!(span_segments(&half), vec![(SegKind::Whole, 400)]);
+    }
+
+    // Q6
+    #[test]
+    fn format_ms_units() {
+        assert!(format_ms(0).contains("ms"));
+        assert!(format_ms(500).contains("ms"));
+        assert!(format_ms(1500).contains('s') && !format_ms(1500).contains("ms"));
+        let long = format_ms(90_000);
+        assert!(long.contains('m') && long.contains('s'), "minutes: {long}");
+    }
+
+    // Q7
+    #[test]
+    fn render_timeline_gantt_lanes_and_spans() {
+        let steps = vec![
+            tl_step(StepKind::Activity, Some("charge"), 0, Some(1000), Some(300), Some(700), StepOutcome::Completed, Some(1)),
+            tl_step(StepKind::Timer, Some("wait_24h"), 1000, Some(2000), None, None, StepOutcome::Fired, None),
+            tl_step(StepKind::ChildWorkflow, Some("fulfill"), 2000, Some(3000), None, None, StepOutcome::Completed, None),
+            tl_step(StepKind::SignalWait, Some("approve"), 3000, Some(4000), None, None, StepOutcome::Completed, None),
+        ];
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(4000));
+        exec.state = "COMPLETED".to_string();
+        let timeline = tl_timeline(steps, None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+
+        assert!(html.contains("<svg"), "inline svg present");
+        // A lane label per present kind.
+        assert!(html.contains(step_kind_lane_label(StepKind::Activity)));
+        assert!(html.contains(step_kind_lane_label(StepKind::Timer)));
+        assert!(html.contains(step_kind_lane_label(StepKind::ChildWorkflow)));
+        assert!(html.contains(step_kind_lane_label(StepKind::SignalWait)));
+        // A span per step (by name).
+        assert!(html.contains("charge"));
+        assert!(html.contains("wait_24h"));
+        assert!(html.contains("fulfill"));
+        assert!(html.contains("approve"));
+        // Outcome fills present.
+        assert!(html.contains(step_outcome_fill(StepOutcome::Completed)));
+        assert!(html.contains(step_outcome_fill(StepOutcome::Fired)));
+    }
+
+    // Q8
+    #[test]
+    fn render_timeline_gantt_split_only_when_present() {
+        let split = tl_step(StepKind::Activity, Some("charge"), 0, Some(1000), Some(300), Some(700), StepOutcome::Completed, Some(1));
+        let whole = tl_step(StepKind::ChildWorkflow, Some("sub"), 1000, Some(1500), None, None, StepOutcome::Completed, None);
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1500));
+        let timeline = tl_timeline(vec![split, whole], None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        // Split activity → both wait and exec segment classes.
+        assert!(html.contains("gantt-seg-wait"), "wait segment rendered: {html}");
+        assert!(html.contains("gantt-seg-exec"), "exec segment rendered");
+        // Un-split child → the undivided whole class.
+        assert!(html.contains("gantt-seg-whole"), "whole span rendered");
+    }
+
+    // Q9
+    #[test]
+    fn render_timeline_gantt_open_span_to_now() {
+        // In-flight step: ended_at = None, outcome Pending → open-ended span.
+        let pending = tl_step(StepKind::Activity, Some("running"), 0, None, None, None, StepOutcome::Pending, Some(1));
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = None;
+        exec.state = "RUNNING".to_string();
+        let timeline = tl_timeline(vec![pending], None);
+        let now = tl_base() + chrono::Duration::milliseconds(5000);
+        let html = render_timeline_gantt(&timeline, &exec, now).into_string();
+        assert!(html.contains("gantt-span-open"), "open span styled: {html}");
+    }
+
+    // Q10
+    #[test]
+    fn render_timeline_gantt_attempt_badge() {
+        let retried = tl_step(StepKind::Activity, Some("flaky"), 0, Some(1000), Some(100), Some(900), StepOutcome::Completed, Some(3));
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        let timeline = tl_timeline(vec![retried], None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert!(html.contains("×3"), "attempt badge visible: {html}");
+    }
+
+    // Q11a
+    #[test]
+    fn pause_band_present_when_paused() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.paused_at = Some(tl_base() + chrono::Duration::milliseconds(2000));
+        exec.pause_reason = Some("incident-4821".to_string());
+        exec.pause_actor = Some("oncall@corp".to_string());
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        let band = pause_band_markup(&exec, &axis).expect("band present when paused");
+        let html = band.into_string();
+        assert!(html.contains("gantt-pause-band"), "band rect class: {html}");
+        assert!(html.contains("incident-4821"), "reason labelled");
+        assert!(html.contains("oncall@corp"), "actor labelled");
+    }
+
+    // Q11b
+    #[test]
+    fn pause_band_absent_when_not_paused() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.paused_at = None;
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        assert!(pause_band_markup(&exec, &axis).is_none());
+    }
+
+    // Q12a
+    #[test]
+    fn nd_marker_present_when_blocked() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.nd_blocked_at = Some(tl_base() + chrono::Duration::milliseconds(3000));
+        exec.nd_block_reason = Some("expected ActivityScheduled got TimerStarted".to_string());
+        exec.nd_block_count = 4;
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        let marker = nd_marker_markup(&exec, &axis).expect("marker present when nd-blocked");
+        let html = marker.into_string();
+        assert!(html.contains("gantt-nd-marker"), "marker class: {html}");
+        assert!(html.contains("expected ActivityScheduled"), "reason shown");
+        assert!(
+            html.contains("nondeterminism-block"),
+            "runbook link present: {html}"
+        );
+    }
+
+    // Q12b
+    #[test]
+    fn nd_marker_absent_when_not_blocked() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.nd_blocked_at = None;
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        assert!(nd_marker_markup(&exec, &axis).is_none());
+    }
+
+    // Q13
+    #[test]
+    fn render_timeline_rollup_totals_and_slowest() {
+        let rollup = TimelineRollup {
+            total_wall_clock_ms: 42_000,
+            busy_ms: 30_000,
+            wait_ms: 9_000,
+            slowest_step: Some(SlowestStep {
+                name: Some("bottleneck_activity".to_string()),
+                step_kind: StepKind::Activity,
+                total_ms: 25_000,
+            }),
+            step_count_by_kind: std::collections::BTreeMap::new(),
+        };
+        let html = render_timeline_rollup(&rollup).into_string();
+        assert!(html.contains(&format_ms(42_000)), "total wall-clock shown");
+        assert!(html.contains(&format_ms(30_000)), "busy total shown");
+        assert!(html.contains(&format_ms(9_000)), "wait total shown");
+        assert!(html.contains("bottleneck_activity"), "slowest name shown");
+        assert!(html.contains(&format_ms(25_000)), "slowest duration shown");
+    }
+
+    // Q14
+    #[test]
+    fn slowest_step_highlighted_with_id() {
+        let steps = vec![
+            tl_step(StepKind::Activity, Some("quick"), 0, Some(100), Some(10), Some(90), StepOutcome::Completed, Some(1)),
+            tl_step(StepKind::Activity, Some("slow_one"), 100, Some(9100), Some(50), Some(9050), StepOutcome::Completed, Some(1)),
+        ];
+        // slowest_step_index picks the max total_ms step (index 1).
+        let timeline = tl_timeline(
+            steps,
+            Some(SlowestStep {
+                name: Some("slow_one".to_string()),
+                step_kind: StepKind::Activity,
+                total_ms: 9000,
+            }),
+        );
+        assert_eq!(slowest_step_index(&timeline), Some(1));
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(9100));
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert!(html.contains("id=\"slowest\""), "slowest anchor id present: {html}");
+        assert!(html.contains("gantt-span-slowest"), "slowest highlight class present");
+    }
+
+    // Q15
+    #[test]
+    fn render_timeline_gantt_escapes_names() {
+        let step = tl_step(StepKind::Activity, Some("<b>evil</b>"), 0, Some(100), None, None, StepOutcome::Completed, None);
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(100));
+        let timeline = tl_timeline(vec![step], None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert!(
+            !html.contains("<b>evil</b>"),
+            "a markup-char step name must be escaped: {html}"
+        );
+        assert!(html.contains("&lt;b&gt;evil"), "escaped form present");
+    }
+
+    // Q16
+    #[test]
+    fn timeline_step_cap_truncates_and_notes() {
+        let n = MAX_RENDER_STEPS + 25;
+        let steps: Vec<TimelineStep> = (0..n)
+            .map(|i| {
+                let off = i64::try_from(i).unwrap() * 10;
+                tl_step(
+                    StepKind::Activity,
+                    Some("s"),
+                    off,
+                    Some(off + 5),
+                    None,
+                    None,
+                    StepOutcome::Completed,
+                    Some(1),
+                )
+            })
+            .collect();
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10));
+        let timeline = tl_timeline(steps, None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        // A "showing N of M" note when capped.
+        assert!(
+            html.contains(&MAX_RENDER_STEPS.to_string()) && html.contains(&n.to_string()),
+            "truncation note names both the cap and the full count: {}",
+            &html[..html.len().min(400)]
+        );
+    }
 }
