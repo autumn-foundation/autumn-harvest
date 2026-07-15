@@ -631,9 +631,18 @@ impl SqliteRuntime {
                     name,
                     input,
                     queue,
+                    retry_policy_override,
                     ..
                 } => {
                     if !store::history_has_activity_scheduled(history, &activity_id.to_string()) {
+                        // Honor the workflow's declared/per-call retry policy (issue
+                        // #1069 P2): the typed `execute_activity`/`_with_opts` path
+                        // resolves the activity's `RetryPolicy` and carries it here.
+                        // Persist its `max_attempts` on the task row so the worker
+                        // uses it instead of the registered `ActivitySpec` default.
+                        // `None` (the raw `execute_activity_raw` path) leaves the
+                        // task row's `max_attempts` NULL, preserving the fallback.
+                        let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
                         persist_scheduled_activity(
                             &tx,
                             exec,
@@ -642,6 +651,7 @@ impl SqliteRuntime {
                             input,
                             queue,
                             now,
+                            max_attempts,
                         )?;
                         produced = true;
                     }
@@ -830,6 +840,12 @@ impl SqliteRuntime {
 /// task-queue row on the same connection/transaction. Callers pass a
 /// `rusqlite::Transaction` (via `&tx`) so a crash cannot land the event without
 /// the row.
+///
+/// `max_attempts` carries the scheduling command's `retry_policy_override`
+/// (issue #1069 P2): `Some(n)` persists the workflow's declared/per-call retry cap
+/// onto the task row; `None` leaves it NULL so the worker falls back to the
+/// registered [`ActivitySpec`] default.
+#[allow(clippy::too_many_arguments)]
 pub fn persist_scheduled_activity(
     conn: &Connection,
     exec: ExecutionId,
@@ -838,6 +854,7 @@ pub fn persist_scheduled_activity(
     input: &Value,
     queue_name: &str,
     run_at: i64,
+    max_attempts: Option<u32>,
 ) -> SqliteResult<()> {
     store::append_event(
         conn,
@@ -849,7 +866,16 @@ pub fn persist_scheduled_activity(
             queue: queue_name.to_string(),
         },
     )?;
-    queue::enqueue_activity(conn, exec, activity_id, name, input, queue_name, run_at)?;
+    queue::enqueue_activity(
+        conn,
+        exec,
+        activity_id,
+        name,
+        input,
+        queue_name,
+        run_at,
+        max_attempts,
+    )?;
     Ok(())
 }
 
@@ -1079,6 +1105,7 @@ mod tests {
                 &serde_json::json!({}),
                 "default",
                 0,
+                None,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -1105,6 +1132,7 @@ mod tests {
                 &serde_json::json!({}),
                 "default",
                 0,
+                None,
             )
             .unwrap();
             tx.commit().unwrap();

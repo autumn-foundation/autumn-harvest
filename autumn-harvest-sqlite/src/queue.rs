@@ -47,11 +47,34 @@ pub struct ClaimedTask {
     pub input: Value,
     /// Attempts already consumed (0 before the first run).
     pub attempt: u32,
+    /// Per-call retry cap carried from the scheduling command's
+    /// `retry_policy_override` (issue #1069 P2). `Some` when the workflow used the
+    /// typed `execute_activity`/`execute_activity_with_opts` path (which resolves
+    /// the activity's declared/per-call `RetryPolicy`); `None` for the raw
+    /// `execute_activity_raw` path, in which case the worker falls back to the
+    /// registered [`ActivitySpec`](crate::runtime::ActivitySpec)'s default.
+    pub max_attempts: Option<u32>,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
     let max: Option<i64> =
         conn.query_row("SELECT MAX(seq) FROM harvest_tasks", [], |row| row.get(0))?;
+    Ok(max.map_or(0, |m| m + 1))
+}
+
+/// The next monotonic timer arm sequence (the deterministic same-`fire_at`
+/// tie-breaker, issue #1069 P2). Computed as `MAX(arm_seq) + 1` over ALL timer
+/// rows so it is globally monotonic within the database — two timers armed in the
+/// same [`apply_commands`](crate::runtime) transaction (e.g.
+/// `tokio::join!(ctx.timer("a", 1), ctx.timer("b", 1))`) get consecutive values in
+/// command order, because the first `enqueue_timer` commits its row before the
+/// second reads `MAX`. Robust to `VACUUM` (unlike an implicit `rowid`, which
+/// `VACUUM` may renumber).
+fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
+    let max: Option<i64> =
+        conn.query_row("SELECT MAX(arm_seq) FROM harvest_timers", [], |row| {
+            row.get(0)
+        })?;
     Ok(max.map_or(0, |m| m + 1))
 }
 
@@ -69,6 +92,12 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 }
 
 /// Enqueue a fresh activity task in the `PENDING` state.
+///
+/// `max_attempts` is the per-call retry cap from the scheduling command's
+/// `retry_policy_override` (issue #1069 P2): `Some(n)` honors the workflow's
+/// declared/per-call [`RetryPolicy`](autumn_harvest::policy::RetryPolicy), `None`
+/// leaves the worker to fall back to the registered `ActivitySpec` default.
+#[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
     exec_id: ExecutionId,
@@ -77,12 +106,14 @@ pub fn enqueue_activity(
     input: &Value,
     queue: &str,
     run_at: i64,
+    max_attempts: Option<u32>,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
         "INSERT INTO harvest_tasks \
-         (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8)",
+         (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
+          max_attempts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9)",
         params![
             uuid::Uuid::new_v4().to_string(),
             exec_id.to_string(),
@@ -92,6 +123,7 @@ pub fn enqueue_activity(
             queue,
             run_at,
             seq,
+            max_attempts.map(i64::from),
         ],
     )?;
     Ok(())
@@ -108,7 +140,7 @@ pub fn claim_next_ready_task(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
-            "SELECT task_id, activity_id, name, input_json, attempt \
+            "SELECT task_id, activity_id, name, input_json, attempt, max_attempts \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -119,12 +151,13 @@ pub fn claim_next_ready_task(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((task_id, act_s, name, input_s, attempt)) = row else {
+    let Some((task_id, act_s, name, input_s, attempt, max_attempts)) = row else {
         tx.commit()?;
         return Ok(None);
     };
@@ -150,6 +183,7 @@ pub fn claim_next_ready_task(
         name,
         input,
         attempt: u32::try_from(attempt).unwrap_or(0),
+        max_attempts: max_attempts.and_then(|m| u32::try_from(m).ok()),
     }))
 }
 
@@ -244,19 +278,28 @@ pub fn enqueue_timer(
     // (`fired = 1`) row from a previous arm that is safe to supersede with the
     // fresh unfired arm. `OR IGNORE` would instead silently keep the spent row and
     // wedge the re-arm at `Stuck`.
+    // Assign a fresh monotonic `arm_seq` so this arm sorts AFTER every timer armed
+    // earlier (issue #1069 P2). A re-arm of the same id (the poll-loop idiom) is an
+    // `INSERT OR REPLACE`, which deletes the spent row and inserts fresh — so it
+    // correctly gets a NEW, higher `arm_seq`, sorting after any concurrently-armed
+    // sibling as its re-arm implies.
+    let arm_seq = next_timer_arm_seq(conn)?;
     conn.execute(
-        "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired) \
-         VALUES (?1, ?2, ?3, 0)",
-        params![timer_id, exec_id.to_string(), fire_at],
+        "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![timer_id, exec_id.to_string(), fire_at, arm_seq],
     )?;
     Ok(())
 }
 
 /// Return the ids of all unfired timers for `exec_id` whose deadline has passed.
 pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Vec<String>> {
+    // `ORDER BY fire_at, arm_seq`: the secondary `arm_seq` key makes the fire order
+    // of equal-deadline timers deterministic and equal to their `TimerStarted`
+    // append order, which the core matcher requires (issue #1069 P2).
     let mut stmt = conn.prepare_cached(
         "SELECT timer_id FROM harvest_timers \
-         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at",
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at, arm_seq",
     )?;
     let rows = stmt.query_map(params![exec_id.to_string(), now], |row| {
         row.get::<_, String>(0)
@@ -289,7 +332,8 @@ pub fn due_timers_before_signal(
 ) -> SqliteResult<Vec<String>> {
     let mut stmt = conn.prepare_cached(
         "SELECT timer_id FROM harvest_timers \
-         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 AND fire_at <= ?3 ORDER BY fire_at",
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 AND fire_at <= ?3 \
+         ORDER BY fire_at, arm_seq",
     )?;
     let rows = stmt.query_map(params![exec_id.to_string(), now, received_at], |row| {
         row.get::<_, String>(0)
@@ -348,4 +392,90 @@ pub fn delete_pending_timer(
         params![exec_id.to_string(), timer_id],
     )?;
     Ok(n > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, params};
+
+    use autumn_harvest::ExecutionId;
+
+    use super::{due_timers, due_timers_before_signal, enqueue_timer};
+    use crate::schema;
+
+    fn open() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+        conn
+    }
+
+    // FINDING 1 (Codex #1069 P2): the deterministic `arm_seq` tie-break makes the
+    // fire order of equal-`fire_at` timers well-defined and equal to arm order.
+    // (SQLite's `ORDER BY fire_at`-only tie order is *unspecified* — it may happen
+    // to coincide with arm order or not — so the hard-falsifiable proof that this
+    // order is load-bearing lives in the end-to-end reversed-history control in
+    // `tests/timer_arm_order.rs`; here we pin the guarantee.) Rows are inserted so
+    // arm order (a, z) is the reverse of insertion (rowid) order (z, a).
+    #[test]
+    fn due_timers_break_equal_deadlines_by_arm_seq() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        conn.execute(
+            "INSERT INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+             VALUES ('z', ?1, 100, 0, 1)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+             VALUES ('a', ?1, 100, 0, 0)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            due_timers(&conn, exec, 200).unwrap(),
+            vec!["a".to_string(), "z".to_string()],
+            "equal-deadline timers must fire in arm_seq order"
+        );
+        // The signal-interleave query carries the same tie-break.
+        assert_eq!(
+            due_timers_before_signal(&conn, exec, 200, 200).unwrap(),
+            vec!["a".to_string(), "z".to_string()],
+            "due_timers_before_signal must apply the same arm_seq tie-break"
+        );
+    }
+
+    // `enqueue_timer` assigns a strictly increasing `arm_seq` in call order, so two
+    // timers armed in one batch (the `join!` case) fire in `TimerStarted`-append
+    // order — and a re-arm of the same id (INSERT OR REPLACE) gets a fresh, higher
+    // `arm_seq` rather than keeping the spent row's value.
+    #[test]
+    fn enqueue_timer_assigns_monotonic_arm_seq_including_on_rearm() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        enqueue_timer(&conn, exec, "a", 100).unwrap();
+        enqueue_timer(&conn, exec, "b", 100).unwrap();
+        let seq = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT arm_seq FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2",
+                params![exec.to_string(), id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(seq("a") < seq("b"), "a armed before b sorts first");
+        // Both share fire_at=100, so due order follows arm order.
+        assert_eq!(
+            due_timers(&conn, exec, 200).unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+
+        // Re-arm "a" (the poll-loop idiom) — it must get a fresh arm_seq ABOVE b's.
+        enqueue_timer(&conn, exec, "a", 100).unwrap();
+        assert!(
+            seq("a") > seq("b"),
+            "a re-armed after b must get a fresh higher arm_seq, not keep its stale one"
+        );
+    }
 }

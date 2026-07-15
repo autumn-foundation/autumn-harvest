@@ -18,7 +18,14 @@
 //!   `WorkflowReplayer` (and, in principle, a Postgres hub).
 //! - `harvest_tasks` — the activity task queue (the `FOR UPDATE SKIP LOCKED`
 //!   analog; single writer — see [`queue`](crate::queue)).
-//! - `harvest_timers` — durable timers with an absolute epoch `fire_at`.
+//! - `harvest_timers` — durable timers with an absolute epoch `fire_at` and a
+//!   monotonic `arm_seq`. `arm_seq` is the deterministic tie-breaker when several
+//!   timers share the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
+//!   ctx.timer("b", 1))`): due timers fire in `(fire_at, arm_seq)` order, so the
+//!   `TimerFired` events land in the same order as the `TimerStarted` events. The
+//!   core `HistoryMatcher::match_timer` scans for its own `TimerFired` but STOPS at
+//!   an unconsumed sibling `TimerFired`, so a reversed fire order would wedge replay
+//!   (issue #1069 P2).
 //! - `harvest_signals` — staged inbound signals awaiting a matching
 //!   `wait_for_signal`. Each row records the absolute epoch-second the signal
 //!   arrived (`received_at`), which the wake-event ingest interleaves against a
@@ -51,16 +58,19 @@ CREATE TABLE IF NOT EXISTS harvest_events (
 );
 
 CREATE TABLE IF NOT EXISTS harvest_tasks (
-    task_id     TEXT PRIMARY KEY,
-    exec_id     TEXT NOT NULL,
-    activity_id TEXT NOT NULL,            -- the scheduled ActivityExecId
-    name        TEXT NOT NULL,
-    input_json  TEXT NOT NULL,
-    queue       TEXT NOT NULL,
-    state       TEXT NOT NULL,            -- PENDING | RUNNING | DONE
-    attempt     INTEGER NOT NULL,         -- attempts consumed so far
-    run_at      INTEGER NOT NULL,         -- earliest epoch-second this may run
-    seq         INTEGER NOT NULL          -- FIFO ordering within the queue
+    task_id      TEXT PRIMARY KEY,
+    exec_id      TEXT NOT NULL,
+    activity_id  TEXT NOT NULL,            -- the scheduled ActivityExecId
+    name         TEXT NOT NULL,
+    input_json   TEXT NOT NULL,
+    queue        TEXT NOT NULL,
+    state        TEXT NOT NULL,            -- PENDING | RUNNING | DONE
+    attempt      INTEGER NOT NULL,         -- attempts consumed so far
+    run_at       INTEGER NOT NULL,         -- earliest epoch-second this may run
+    seq          INTEGER NOT NULL,         -- FIFO ordering within the queue
+    max_attempts INTEGER                   -- per-call retry cap from the command's
+                                           -- retry_policy_override (issue #1069 P2);
+                                           -- NULL = use the registered ActivitySpec default
 );
 
 CREATE TABLE IF NOT EXISTS harvest_timers (
@@ -68,6 +78,12 @@ CREATE TABLE IF NOT EXISTS harvest_timers (
     exec_id  TEXT NOT NULL,
     fire_at  INTEGER NOT NULL,            -- absolute epoch-second
     fired    INTEGER NOT NULL DEFAULT 0,
+    arm_seq  INTEGER NOT NULL DEFAULT 0,  -- monotonic arm order (issue #1069 P2);
+                                          -- the deterministic tie-breaker for equal
+                                          -- fire_at deadlines, so multiple timers armed
+                                          -- in one batch (a join! of two timers) FIRE in
+                                          -- TimerStarted-append order, which the core
+                                          -- matcher requires to replay
     PRIMARY KEY (exec_id, timer_id)
 );
 

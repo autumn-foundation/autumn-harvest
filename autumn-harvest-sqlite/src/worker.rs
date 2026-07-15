@@ -99,7 +99,13 @@ pub fn drain_ready(
             ))
         });
 
-        if finalize_activity_result(conn, exec_id, &task, spec.max_attempts, now, result)? {
+        // Honor the workflow's declared/per-call retry policy when the scheduling
+        // command carried one (issue #1069 P2): the task row's persisted
+        // `max_attempts` (from `retry_policy_override`) wins over the registered
+        // `ActivitySpec` default; a raw-path task (`None`) falls back to the spec.
+        // Clamp to `>= 1` to mirror `ActivitySpec::new` (a body always runs once).
+        let max_attempts = task.max_attempts.unwrap_or(spec.max_attempts).max(1);
+        if finalize_activity_result(conn, exec_id, &task, max_attempts, now, result)? {
             produced = true;
         }
     }
@@ -286,8 +292,17 @@ mod tests {
 
     fn seed_running_task(conn: &Connection, exec: ExecutionId, name: &str) -> ClaimedTask {
         let act = ActivityExecId::new();
-        queue::enqueue_activity(conn, exec, act, name, &serde_json::json!({}), "default", 0)
-            .unwrap();
+        queue::enqueue_activity(
+            conn,
+            exec,
+            act,
+            name,
+            &serde_json::json!({}),
+            "default",
+            0,
+            None,
+        )
+        .unwrap();
         conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
             .unwrap();
         let task_id: String = conn
@@ -299,6 +314,7 @@ mod tests {
             name: name.to_string(),
             input: serde_json::json!({}),
             attempt: 0,
+            max_attempts: None,
         }
     }
 

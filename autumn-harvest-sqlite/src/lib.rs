@@ -41,6 +41,17 @@
 //!   passed fire. There is no virtual clock to persist or reset, so timers are
 //!   naturally monotonic across restarts. The public drivers use [`chrono::Utc::now`];
 //!   the `*_as_of` variants inject an as-of time for deterministic, sleep-free tests.
+//!   Timers that share the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),
+//!   ctx.timer("b", 1))`) fire in `(fire_at, arm_seq)` order, so their `TimerFired`
+//!   events land in `TimerStarted`-append order — the core matcher requires it to
+//!   replay (issue #1069 P2).
+//! - **Declared/per-call retry policies are honored.** The typed
+//!   `ctx.execute_activity(&info, ...)` / `execute_activity_with_opts` path carries
+//!   the activity's resolved [`RetryPolicy`](autumn_harvest::policy::RetryPolicy) in
+//!   the scheduling command's `retry_policy_override`; the backend persists its
+//!   `max_attempts` on the task row and the worker uses it in preference to the
+//!   registered [`ActivitySpec`] cap (the raw `execute_activity_raw` path carries no
+//!   override and still falls back to the registered default) (issue #1069 P2).
 //!
 //! # Crash-model bound (accepted non-goal)
 //!
