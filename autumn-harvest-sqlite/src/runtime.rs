@@ -4,11 +4,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use autumn_harvest::context::empty_shared_state;
-use autumn_harvest::executor::run_workflow_with_state;
+use autumn_harvest::builder::{
+    DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+    DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+};
+use autumn_harvest::context::{DEFAULT_CURRENT_DETAILS_CAP_BYTES, empty_shared_state};
+use autumn_harvest::executor::run_workflow_with_state_history_policy_and_caps;
 use autumn_harvest::{
-    ActivityExecId, ExecutionId, TimerId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
-    WorkflowInfo, WorkflowOutcome,
+    ActivityExecId, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand, WorkflowEvent,
+    WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -80,6 +84,16 @@ pub enum ExecutionOutcome {
 /// supported scenarios converge in a handful of cycles).
 const MAX_ITERATIONS: usize = 10_000;
 
+/// Bounded consecutive-panic budget for a `#[workflow]` handler that panics
+/// (issue #782 analog). A contained workflow-handler panic re-drives the
+/// UNCHANGED history up to this many times before the run is sealed terminally
+/// `FAILED` — buying time for a hotfix/rollback rather than permanently closing a
+/// transiently-panicking or fixable run on the first strike. With `3`, strikes 1
+/// and 2 are non-terminal (surfaced as [`SqliteError::WorkflowPanicked`]) and
+/// strike 3 seals the run. Mirrors the Postgres worker's default
+/// `workflow_panic_max_attempts`.
+const WORKFLOW_PANIC_MAX_ATTEMPTS: u32 = 3;
+
 /// A single-writer, single-server, embedded workflow runtime backed by one `SQLite`
 /// database.
 ///
@@ -92,6 +106,12 @@ pub struct SqliteRuntime {
     conn: Connection,
     workflows: HashMap<String, WorkflowHandlerFn>,
     activities: HashMap<String, ActivitySpec>,
+    /// Consecutive contained-workflow-panic strike counter, keyed by execution
+    /// (issue #782 analog). In-process (reset on restart, like the Postgres
+    /// worker's strike map); incremented on each panicked decision cycle and
+    /// cleared on any non-panic outcome, so only *consecutive* panics count
+    /// against [`WORKFLOW_PANIC_MAX_ATTEMPTS`].
+    workflow_panic_strikes: HashMap<ExecutionId, u32>,
 }
 
 impl SqliteRuntime {
@@ -150,6 +170,7 @@ impl SqliteRuntime {
             conn,
             workflows: HashMap::new(),
             activities: HashMap::new(),
+            workflow_panic_strikes: HashMap::new(),
         })
     }
 
@@ -208,7 +229,37 @@ impl SqliteRuntime {
         name: &str,
         payload: Value,
     ) -> SqliteResult<()> {
-        store::stage_signal(&self.conn, exec, name, &payload)
+        self.send_signal_as_of(exec, name, payload, Utc::now())
+    }
+
+    /// Like [`send_signal`](Self::send_signal) but with an injected arrival time
+    /// (`received_at`), so tests can deterministically place a signal before or
+    /// after a `wait_for_signal_timeout` deadline without sleeping.
+    ///
+    /// A deterministic-simulation seam paired with the `*_as_of` drivers: the
+    /// staged `received_at` is compared against a deadline timer's `fire_at` by the
+    /// wake-event ingest (issue #476), so — exactly like the driver caveat on
+    /// [`run_until_blocked_as_of`](Self::run_until_blocked_as_of) — do **not** mix a
+    /// wall-clock `send_signal` with `*_as_of` drivers (or vice versa) for the
+    /// *same* execution: the two clocks are incomparable, so a signal's arrival
+    /// could order surprisingly against the deadline. (A pending signal only ever
+    /// interleaves with a deadline timer that is already **due** at drive time, so
+    /// a plain `wait_for_signal` and any wait driven *before* its deadline are
+    /// unaffected by the clock choice.)
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error if the signal row cannot be written.
+    #[doc(hidden)]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn send_signal_as_of(
+        &mut self,
+        exec: ExecutionId,
+        name: &str,
+        payload: Value,
+        received_at: DateTime<Utc>,
+    ) -> SqliteResult<()> {
+        store::stage_signal(&self.conn, exec, name, &payload, received_at.timestamp())
     }
 
     /// The full ordered event history — the canonical, replayable log.
@@ -389,8 +440,8 @@ impl SqliteRuntime {
             .get(&workflow_name)
             .ok_or_else(|| SqliteError::UnknownWorkflow(workflow_name.clone()))?;
 
-        // The reused, backend-neutral determinism core. Use the value-returning
-        // entry point (`run_workflow_with_state`) rather than `run_workflow`: on a
+        // The reused, backend-neutral determinism core. Use the caps-carrying,
+        // value-returning entry point rather than `run_workflow`: on a
         // Completed/Failed cycle it hands back the drained `pending` commands
         // (`RecordSideEffect`/`RecordMarker` emitted at the live frontier in the
         // SAME cycle the workflow returns) so we can persist them BEFORE the
@@ -398,15 +449,63 @@ impl SqliteRuntime {
         // side effect emitted after the last suspension (e.g. `ctx.new_uuid()`
         // right before `Ok(..)`) and producing a history that fails the core
         // `WorkflowReplayer` with `SideEffectDrift`.
-        let (outcome, pending, _span) = run_workflow_with_state(
+        //
+        // FIX C (cross-backend fidelity, Codex #1069): thread the real
+        // `workflow_name` into the context via the dedicated `workflow_name`
+        // parameter (the one that populates `ctx.info().workflow_type`, issue #698 —
+        // `span_meta.workflow_name` feeds only the OTel span, which this backend has
+        // no worker for). The lighter `run_workflow_with_state` hard-codes it to
+        // `""`, so a workflow that records/branches on the replay-safe
+        // `ctx.info().workflow_type` would persist `""` here while the Postgres
+        // worker injects the real handler name — a divergence on the very
+        // byte-identity guarantee this crate makes. All other arguments reproduce
+        // `run_workflow_with_state`'s own defaults exactly (unchanged behavior);
+        // `span_meta` stays `None` (OTel-only) and there is no queue notion here.
+        let (outcome, pending, _span) = run_workflow_with_state_history_policy_and_caps(
             exec,
             history.clone(),
             handler,
             input,
             empty_shared_state(),
-            None,
+            WorkflowHistoryPolicy::default(),
+            None,           // span_meta — OTel span only; this backend has no OTel worker.
+            &[],            // declarative query handlers (none on this backend)
+            &[],            // declarative update handlers (none on this backend)
+            &workflow_name, // FIX C: the load-bearing name → ctx.info().workflow_type
+            DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            std::collections::HashMap::new(), // context headers (none)
+            None,                             // payload offload threshold (none)
+            std::sync::Arc::new(NoOpMetrics),
         )
         .await;
+
+        // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
+        // terminal side effect and beside the non-determinism gate below. A
+        // `#[workflow]` body that `panic!()`s (rather than returning `Err`) is
+        // caught by the core at the dispatch boundary and surfaced as
+        // `Failed { handler_panic: true }` (with an EMPTY `pending` — the panicked
+        // cycle's commands are untrustworthy and already dropped by the executor).
+        // Do NOT seal it `FAILED` on the first strike like an author `Err`: under
+        // the bounded panic budget the divergent cycle is discarded (no event
+        // appended, no bookkeeping persisted, state stays `RUNNING`) and the
+        // divergence is surfaced so a hotfix/rollback can re-drive the UNCHANGED
+        // history to completion. Only at/over budget is the run sealed with the
+        // typed `HandlerPanic` error. Every OTHER (non-panic) outcome clears the
+        // consecutive-panic strike so a later transient panic starts fresh — this
+        // must run before the `match` so the ND/author-Err/completed/suspended arms
+        // all reset it (mirrors the Postgres worker's clear-on-every-non-panic-path).
+        if let WorkflowOutcome::Failed {
+            handler_panic: true,
+            error,
+            ..
+        } = &outcome
+        {
+            return self.contain_workflow_panic(exec, error);
+        }
+        self.workflow_panic_strikes.remove(&exec);
 
         match outcome {
             WorkflowOutcome::Completed { output, .. } => {
@@ -559,15 +658,14 @@ impl SqliteRuntime {
                     }
                 }
                 WorkflowCommand::WaitForSignal { signal_name, .. } => {
-                    if let Some(payload) = store::take_pending_signal(&tx, exec, signal_name)? {
-                        store::append_event(
-                            &tx,
-                            exec,
-                            &WorkflowEvent::SignalReceived {
-                                signal_name: signal_name.clone(),
-                                payload,
-                            },
-                        )?;
+                    // Consume the awaited signal (if staged), interleaving a due
+                    // deadline timer chronologically against its arrival time
+                    // (issue #476): a signal that arrived AFTER an expired
+                    // `wait_for_signal_timeout` deadline records the `TimerFired`
+                    // FIRST, so the timeout — not the late signal — wins the race.
+                    // A plain `wait_for_signal` (no deadline timer) and an on-time
+                    // signal are unchanged. See [`worker::ingest_awaited_signal`].
+                    if worker::ingest_awaited_signal(&tx, exec, signal_name, now)? {
                         produced = true;
                     }
                 }
@@ -665,6 +763,45 @@ impl SqliteRuntime {
             return Ok(RunState::WaitingTimer);
         }
         Err(SqliteError::Stuck(exec))
+    }
+
+    /// Apply the bounded panic budget to a contained workflow-handler panic
+    /// (issue #782 analog).
+    ///
+    /// Increments the execution's consecutive-panic strike:
+    /// - **Under budget** (strikes below [`WORKFLOW_PANIC_MAX_ATTEMPTS`]): discard
+    ///   the panicked cycle — append NO terminal event, persist NONE of its
+    ///   (already-empty) pending commands, leave the execution `RUNNING` — and
+    ///   return [`SqliteError::WorkflowPanicked`], which propagates out of the
+    ///   drive loop (mirroring the non-determinism gate) so the caller can
+    ///   fix/roll back the build and re-drive the unchanged history.
+    /// - **At/over budget**: clear the strike and seal a CLEAN terminal
+    ///   `WorkflowFailed` carrying the typed `HandlerPanic` error.
+    fn contain_workflow_panic(&mut self, exec: ExecutionId, error: &str) -> SqliteResult<RunState> {
+        let strikes = {
+            let count = self.workflow_panic_strikes.entry(exec).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        if strikes >= WORKFLOW_PANIC_MAX_ATTEMPTS {
+            // Budget exhausted: fail terminally with the typed HandlerPanic error.
+            self.workflow_panic_strikes.remove(&exec);
+            let tx = self.conn.transaction()?;
+            store::append_event(
+                &tx,
+                exec,
+                &WorkflowEvent::workflow_failed(error.to_string()),
+            )?;
+            store::set_failed(&tx, exec, error)?;
+            tx.commit()?;
+            Ok(RunState::Failed(error.to_string()))
+        } else {
+            // Under budget: non-terminal, resumable. No event, no state change.
+            Err(SqliteError::WorkflowPanicked {
+                execution_id: exec,
+                details: error.to_string(),
+            })
+        }
     }
 }
 

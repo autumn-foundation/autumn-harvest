@@ -19,7 +19,13 @@
 //! - `harvest_tasks` — the activity task queue (the `FOR UPDATE SKIP LOCKED`
 //!   analog; single writer — see [`queue`](crate::queue)).
 //! - `harvest_timers` — durable timers with an absolute epoch `fire_at`.
-//! - `harvest_signals` — staged inbound signals awaiting a matching `wait_for_signal`.
+//! - `harvest_signals` — staged inbound signals awaiting a matching
+//!   `wait_for_signal`. Each row records the absolute epoch-second the signal
+//!   arrived (`received_at`), which the wake-event ingest interleaves against a
+//!   deadline timer's `fire_at` so a signal delivered *after* an expired
+//!   `wait_for_signal_timeout` deadline cannot retroactively win the race
+//!   (issue #476; mirrors the Postgres `merge_wake_events` `received_at` vs
+//!   `fires_at` ordering).
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
@@ -70,7 +76,8 @@ CREATE TABLE IF NOT EXISTS harvest_signals (
     exec_id      TEXT NOT NULL,
     name         TEXT NOT NULL,
     payload_json TEXT NOT NULL,
-    delivered    INTEGER NOT NULL DEFAULT 0
+    delivered    INTEGER NOT NULL DEFAULT 0,
+    received_at  INTEGER NOT NULL DEFAULT 0   -- absolute epoch-second the signal arrived
 );
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (

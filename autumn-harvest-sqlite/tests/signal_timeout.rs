@@ -185,6 +185,142 @@ async fn wait_for_signal_timeout_deadline_wins_returns_none() {
     );
 }
 
+// ── Arrival-time ordering: a LATE signal must NOT beat an expired deadline ─────
+//
+// Codex #1069 P1 (runtime.rs:562). When a workflow is parked in
+// `wait_for_signal_timeout`, the decision cycle used to consume any staged signal
+// BEFORE the due `TimerFired` was appended, so a signal delivered AFTER the
+// deadline (while the runtime was idle) recorded `SignalReceived` first and
+// wrongly won the race as an approval. The fix interleaves the signal against the
+// due deadline timer by ARRIVAL time (mirroring the core `merge_wake_events`): a
+// deadline that expired at or before the signal arrived fires FIRST, so the
+// timeout wins and the (still-recorded) signal stays observable to a later plain
+// wait.
+
+fn event_pos(history: &[WorkflowEvent], pred: impl Fn(&WorkflowEvent) -> bool) -> Option<usize> {
+    history.iter().position(pred)
+}
+
+#[tokio::test]
+async fn late_signal_does_not_beat_expired_timeout() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&approval_gate_info());
+    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
+
+    // Block on the signal; the deadline is armed at t0 + 3600.
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "approval"),
+        "got {state:?}"
+    );
+
+    // Deliver the signal AFTER the deadline (received_at = t0 + 3601 > t0 + 3600),
+    // as if it arrived while the idle runtime had already blown past the deadline.
+    rt.send_signal_as_of(
+        exec,
+        "approval",
+        json!("late"),
+        t0 + chrono::Duration::seconds(3601),
+    )
+    .unwrap();
+
+    // Drive past the deadline. The deadline expired at or before the signal
+    // arrived, so the TIMEOUT wins — NOT the late signal.
+    let state = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3602))
+        .await
+        .unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "auto_rejected"),
+        "a signal that arrived after the deadline must NOT win — the timeout wins, got {state:?}"
+    );
+
+    // History records the fire BEFORE the late signal, and the signal is still
+    // recorded (observable to a later plain wait — never silently dropped).
+    let history = rt.load_history(exec).unwrap();
+    let timer_pos = event_pos(&history, |e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        .expect("the expired deadline must fire");
+    let signal_pos = event_pos(&history, |e| {
+        matches!(e, WorkflowEvent::SignalReceived { .. })
+    })
+    .expect("the late signal must still be recorded");
+    assert!(
+        timer_pos < signal_pos,
+        "TimerFired must precede the late SignalReceived (arrival-time ordering):\n{history:?}"
+    );
+
+    // The winning-timeout history replays byte-identically on the core engine.
+    let report = WorkflowReplayer::new()
+        .register_fn("approval_gate", approval_gate_info().handler)
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a late-signal-vs-expired-timeout history must replay on the core:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn on_time_signal_still_wins() {
+    // The OTHER branch: a signal that arrived BEFORE the deadline still wins, even
+    // when the run is only driven PAST the deadline (the fix orders by arrival
+    // time, not by consumption/drive order).
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&approval_gate_info());
+    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
+
+    let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingSignal(ref s) if s == "approval"),
+        "got {state:?}"
+    );
+
+    // Signal arrives BEFORE the deadline (received_at = t0 + 10 < t0 + 3600) …
+    rt.send_signal_as_of(
+        exec,
+        "approval",
+        json!("alice"),
+        t0 + chrono::Duration::seconds(10),
+    )
+    .unwrap();
+
+    // … but the run is only driven PAST the deadline. The on-time signal must
+    // still win the approval.
+    let state = rt
+        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3700))
+        .await
+        .unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "approved:alice"),
+        "an on-time signal must win even when driven past the deadline, got {state:?}"
+    );
+
+    // The signal is ordered ahead of the (later-fired) deadline timer in history.
+    let history = rt.load_history(exec).unwrap();
+    let signal_pos = event_pos(&history, |e| {
+        matches!(e, WorkflowEvent::SignalReceived { .. })
+    })
+    .expect("the winning signal must be recorded");
+    if let Some(timer_pos) = event_pos(&history, |e| matches!(e, WorkflowEvent::TimerFired { .. }))
+    {
+        assert!(
+            signal_pos < timer_pos,
+            "the on-time SignalReceived must precede any TimerFired:\n{history:?}"
+        );
+    }
+
+    let report = WorkflowReplayer::new()
+        .register_fn("approval_gate", approval_gate_info().handler)
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the on-time-signal-win history must replay on the core:\n{report}"
+    );
+}
+
 // ── Typed sibling `receive_signal_timeout` completes on signal-win too ─────────
 
 #[derive(serde::Deserialize, serde::Serialize)]

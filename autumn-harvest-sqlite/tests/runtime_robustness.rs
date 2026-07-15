@@ -25,7 +25,7 @@
 #![allow(clippy::unused_async)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
@@ -467,4 +467,132 @@ async fn mixed_timer_activity_batch_completes_and_replays() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a mixed timer+activity history must replay on the core engine:\n{report}"
     );
+}
+
+// ── FIX 5 (Codex #1069 P1): a WORKFLOW-handler panic is bounded-retried, not ───
+//    sealed FAILED on the first strike (issue #782 analog, runtime.rs:460).
+//
+// A `#[workflow]` body that `panic!()`s (distinct from an activity-body panic,
+// FIX 3) used to fall through the terminal `Failed` arm and seal the run `FAILED`
+// on the FIRST strike — permanently closing a transiently-panicking or
+// hotfix-able run. The fix contains it: under a bounded budget the panicked cycle
+// is discarded (no event, execution stays `RUNNING`) and surfaced as
+// `SqliteError::WorkflowPanicked`; only after the budget is exhausted is the run
+// sealed with the typed `HandlerPanic` error.
+
+#[workflow]
+async fn always_panics_wf(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    panic!("workflow boom");
+}
+
+#[tokio::test]
+async fn workflow_handler_panic_is_not_sealed_on_first_strike() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&always_panics_wf_info());
+    let exec = rt.start_workflow("always_panics_wf", json!(0)).unwrap();
+
+    // Drive repeatedly. Every strike UNDER the budget is contained non-terminally
+    // (WorkflowPanicked + execution stays RUNNING, no terminal event); the
+    // budget-exhausting strike seals FAILED. Bounded well above the default (3).
+    let mut sealed_at: Option<usize> = None;
+    for i in 0..10 {
+        match rt.run_until_blocked(exec).await {
+            Err(SqliteError::WorkflowPanicked { .. }) => {
+                assert!(
+                    matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Running),
+                    "strike {i}: the execution must stay RUNNING under the panic budget"
+                );
+                assert!(
+                    rt.load_history(exec)
+                        .unwrap()
+                        .iter()
+                        .all(|e| !matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+                    "strike {i}: NO terminal WorkflowFailed may be appended before the budget \
+                     is exhausted"
+                );
+            }
+            Ok(RunState::Failed(_)) => {
+                sealed_at = Some(i);
+                break;
+            }
+            other => panic!("strike {i}: unexpected drive result: {other:?}"),
+        }
+    }
+
+    let sealed_at = sealed_at.expect("the panic budget must eventually seal the run terminally");
+    assert!(
+        sealed_at >= 1,
+        "the run must NOT be sealed on the FIRST strike (issue #782); sealed at strike {sealed_at}"
+    );
+    assert!(
+        matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Failed(_)),
+        "the run is terminally FAILED once the budget is exhausted"
+    );
+    assert!(
+        rt.load_history(exec)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "the budget-exhausting strike records the terminal WorkflowFailed"
+    );
+}
+
+// The hotfix flag: the workflow panics until flipped, then completes. Only this
+// test touches it, so there is no cross-test contention.
+static HOTFIX_APPLIED: AtomicBool = AtomicBool::new(false);
+
+#[workflow]
+async fn panicky_then_fixed(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    if HOTFIX_APPLIED.load(Ordering::SeqCst) {
+        Ok(42)
+    } else {
+        panic!("workflow boom (pre-hotfix)");
+    }
+}
+
+#[tokio::test]
+async fn workflow_handler_panic_then_hotfix_resumes() {
+    HOTFIX_APPLIED.store(false, Ordering::SeqCst);
+
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&panicky_then_fixed_info());
+    let exec = rt.start_workflow("panicky_then_fixed", json!(0)).unwrap();
+
+    // First drive panics → contained non-terminally, still RUNNING/resumable.
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::WorkflowPanicked { .. }),
+        "a workflow-handler panic under budget must surface WorkflowPanicked, got {err}"
+    );
+    assert!(
+        matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Running),
+        "the execution must stay RUNNING/resumable after a contained panic"
+    );
+
+    // "Hotfix"/rollback: the corrected build no longer panics.
+    HOTFIX_APPLIED.store(true, Ordering::SeqCst);
+
+    // Re-drive: resumes from the UNCHANGED history and completes.
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(42)),
+        "the hotfixed workflow resumes and completes, got {state:?}"
+    );
+
+    // No pending commands from the panicked cycle were persisted: the history is
+    // exactly [WorkflowStarted, WorkflowCompleted] — no stray WorkflowFailed /
+    // marker / side-effect from the discarded panicked cycle.
+    let history = rt.load_history(exec).unwrap();
+    assert_eq!(
+        history.len(),
+        2,
+        "the panicked cycle must append nothing — clean [WorkflowStarted, WorkflowCompleted]:\n{history:?}"
+    );
+    assert!(matches!(history[0], WorkflowEvent::WorkflowStarted { .. }));
+    assert!(matches!(
+        history[1],
+        WorkflowEvent::WorkflowCompleted { .. }
+    ));
 }

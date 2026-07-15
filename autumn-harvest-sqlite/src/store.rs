@@ -268,45 +268,83 @@ pub fn load_attempts(
 
 // ── Inbound signals ──────────────────────────────────────────────────────────
 
+/// Stage an inbound signal, recording the absolute epoch-second it arrived
+/// (`received_at`).
+///
+/// `received_at` is compared against a `wait_for_signal_timeout` deadline timer's
+/// `fire_at` by the wake-event ingest ([`crate::worker::ingest_awaited_signal`]),
+/// so it must be on the **same clock** as the deadline: the public
+/// [`send_signal`](crate::SqliteRuntime::send_signal) uses the wall clock (as the
+/// wall-clock drivers do), and the `*_as_of` seam injects a test epoch (as the
+/// `*_as_of` drivers do). Mirrors the Postgres engine's `harvest_signals.received_at`.
 pub fn stage_signal(
     conn: &Connection,
     exec_id: ExecutionId,
     name: &str,
     payload: &Value,
+    received_at: i64,
 ) -> SqliteResult<()> {
     conn.execute(
-        "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered) VALUES (?1, ?2, ?3, 0)",
-        params![exec_id.to_string(), name, serde_json::to_string(payload)?],
+        "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, received_at) \
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![
+            exec_id.to_string(),
+            name,
+            serde_json::to_string(payload)?,
+            received_at
+        ],
     )?;
     Ok(())
 }
 
-/// Pop the oldest undelivered signal matching `name`, marking it delivered.
-pub fn take_pending_signal(
+/// A staged signal awaiting delivery: its row id, arrival time, and payload.
+pub struct PendingSignal {
+    /// `harvest_signals.signal_seq` — pass to [`mark_signal_delivered`].
+    pub seq: i64,
+    /// Absolute epoch-second the signal arrived (`received_at`).
+    pub received_at: i64,
+    /// Deserialized payload.
+    pub payload: Value,
+}
+
+/// Peek (without consuming) the oldest undelivered signal matching `name`.
+///
+/// Deserializes the payload eagerly so a corrupt row surfaces as an error
+/// **before** the caller mutates anything (fires a due timer / appends the
+/// `SignalReceived` / marks it delivered), leaving the whole cycle transaction to
+/// roll back with the signal still `delivered = 0` rather than silently dropped —
+/// the same corrupt-payload safety the old `take_pending_signal` had, split so the
+/// wake-event ingest can interleave a due deadline timer between the peek and the
+/// append (issue #476).
+pub fn peek_pending_signal(
     conn: &Connection,
     exec_id: ExecutionId,
     name: &str,
-) -> SqliteResult<Option<Value>> {
-    let row: Option<(i64, String)> = conn
+) -> SqliteResult<Option<PendingSignal>> {
+    let row: Option<(i64, i64, String)> = conn
         .query_row(
-            "SELECT signal_seq, payload_json FROM harvest_signals \
+            "SELECT signal_seq, received_at, payload_json FROM harvest_signals \
              WHERE exec_id = ?1 AND name = ?2 AND delivered = 0 ORDER BY signal_seq LIMIT 1",
             params![exec_id.to_string(), name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
     match row {
-        Some((seq, payload)) => {
-            // Deserialize BEFORE marking delivered: a `?`-return on a corrupt
-            // payload must leave the signal `delivered = 0` so it is not lost —
-            // a mark-then-deserialize ordering would silently drop it.
-            let val = serde_json::from_str(&payload)?;
-            conn.execute(
-                "UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1",
-                params![seq],
-            )?;
-            Ok(Some(val))
-        }
+        Some((seq, received_at, payload)) => Ok(Some(PendingSignal {
+            seq,
+            received_at,
+            payload: serde_json::from_str(&payload)?,
+        })),
         None => Ok(None),
     }
+}
+
+/// Mark a peeked signal delivered (consumed). Call only after the matching
+/// `SignalReceived` has been appended in the same transaction.
+pub fn mark_signal_delivered(conn: &Connection, seq: i64) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1",
+        params![seq],
+    )?;
+    Ok(())
 }

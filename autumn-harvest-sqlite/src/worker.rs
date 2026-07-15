@@ -113,6 +113,50 @@ pub fn drain_ready(
     Ok(produced)
 }
 
+/// Ingest one awaited signal chronologically against the execution's due timers
+/// (issue #476), mirroring the Postgres `merge_wake_events`.
+///
+/// Consumes the oldest undelivered signal named `signal_name` (if any) and
+/// appends its `SignalReceived` — but a due deadline timer whose `fire_at` is at
+/// or before the signal's `received_at` is fired (`TimerFired`) **first**, so a
+/// signal delivered *after* an expired `wait_for_signal_timeout` deadline can
+/// never retroactively win the signal-or-deadline race. A due timer whose
+/// deadline is *after* the signal arrived is left for the ordinary
+/// [`drain_ready`] pass to fire *after* the signal, so an on-time signal still
+/// wins even when the run is only driven past the deadline. Runs entirely inside
+/// the caller's cycle transaction (`conn` is a `&tx`).
+///
+/// Returns `true` iff any event was appended (a signal was consumed and/or a due
+/// deadline timer fired).
+pub fn ingest_awaited_signal(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    now: i64,
+) -> SqliteResult<bool> {
+    // Peek (and eagerly deserialize) BEFORE mutating: a corrupt payload rolls the
+    // whole cycle transaction back with the signal still undelivered (no timer
+    // fired, nothing marked) rather than silently dropped.
+    let Some(signal) = store::peek_pending_signal(conn, exec_id, signal_name)? else {
+        return Ok(false);
+    };
+    // Fire every due timer whose deadline is at or before the signal's arrival —
+    // recorded BEFORE the SignalReceived so the deadline wins over a late signal.
+    for timer_id in queue::due_timers_before_signal(conn, exec_id, now, signal.received_at)? {
+        fire_timer_within_tx(conn, exec_id, &timer_id)?;
+    }
+    store::append_event(
+        conn,
+        exec_id,
+        &WorkflowEvent::SignalReceived {
+            signal_name: signal_name.to_string(),
+            payload: signal.payload,
+        },
+    )?;
+    store::mark_signal_delivered(conn, signal.seq)?;
+    Ok(true)
+}
+
 /// Finalize one activity attempt in a **single transaction** (AC7): the audit
 /// record, the terminal event append (on success or retry-exhaustion), and the
 /// task-row transition (`DONE` or requeue) commit together or not at all.

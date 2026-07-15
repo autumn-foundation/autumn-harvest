@@ -101,10 +101,16 @@
 //! - the signal-or-deadline waits `ctx.wait_for_signal_timeout` /
 //!   `ctx.receive_signal_timeout` (issue #476), which race the signal against a
 //!   durable deadline timer — the signal wins if it arrives first, else the timer
-//!   fires and the wait resolves to `None`. When the **signal** wins, the core
-//!   emits a `CancelRaceLosers` bookkeeping command to durably delete the losing
-//!   deadline timer; this backend handles it (deleting the `harvest_timers` row in
-//!   the same cycle transaction — whether it rides a suspending batch or the
+//!   fires and the wait resolves to `None`. The winner is decided by **arrival
+//!   time**, not consumption order: the wake ingest interleaves a staged signal's
+//!   `received_at` against the deadline timer's `fire_at` (mirroring the Postgres
+//!   `merge_wake_events`), so a signal delivered *after* an expired deadline
+//!   records its `TimerFired` FIRST and the timeout wins (the late signal stays
+//!   recorded, observable to a later plain wait), while an on-time signal wins even
+//!   when the run is only driven past the deadline. When the **signal** wins, the
+//!   core emits a `CancelRaceLosers` bookkeeping command to durably delete the
+//!   losing deadline timer; this backend handles it (deleting the `harvest_timers`
+//!   row in the same cycle transaction — whether it rides a suspending batch or the
 //!   terminal drain), so the run completes cleanly and no orphaned timer is left
 //!   behind.
 //!
@@ -124,7 +130,22 @@
 //!
 //! # Robustness — healthy-run-killer containment (Codex #1069 / round 8)
 //!
-//! Four failure modes that would otherwise WEDGE a healthy run are contained:
+//! Failure modes that would otherwise WEDGE (or wrongly seal) a healthy run are
+//! contained:
+//!
+//! - **A workflow-handler panic is bounded-retried, not sealed on the first
+//!   strike.** A `#[workflow]` body that `panic!()`s (distinct from an activity
+//!   body panic, above) is caught by the core at the dispatch boundary and
+//!   surfaced as a contained panic. Rather than sealing the run `FAILED` on the
+//!   first strike — permanently closing a transiently-panicking or hotfix-able run
+//!   — the backend discards the panicked decision cycle (appends nothing, persists
+//!   no bookkeeping command, state stays `RUNNING`) and surfaces
+//!   [`SqliteError::WorkflowPanicked`] under a bounded consecutive-panic budget, so
+//!   a fixed/rolled-back build can re-drive the UNCHANGED history to completion.
+//!   Only after the budget is exhausted is the run sealed `FAILED` with the typed
+//!   `HandlerPanic` error (as a normal [`RunState::Failed`]). A genuine author
+//!   `Err(...)` still fails terminally on the first strike, unchanged. Mirrors the
+//!   Postgres worker's issue #782 panic gate.
 //!
 //! - **Engine replay non-determinism is NON-TERMINAL.** If a workflow's code
 //!   drifts from its recorded history (a bad deploy), the determinism core

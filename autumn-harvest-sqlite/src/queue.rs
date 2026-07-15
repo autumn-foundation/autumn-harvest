@@ -268,6 +268,39 @@ pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteRe
     Ok(out)
 }
 
+/// Return the ids of all unfired timers for `exec_id` that are **both** due
+/// (`fire_at <= now`) **and** whose deadline is at or before `received_at`,
+/// oldest deadline first.
+///
+/// The "fire this timer BEFORE that signal" half of the wake-event ordering
+/// (issue #476). A `wait_for_signal_timeout` deadline that expired at or before a
+/// signal arrived (`fire_at <= received_at`) must be recorded as `TimerFired`
+/// ahead of the `SignalReceived`, so a late signal cannot retroactively flip the
+/// race to the approval branch. Ties (`fire_at == received_at`) go to the timer,
+/// mirroring the Postgres `merge_wake_events` rule (signal-first iff
+/// `received_at < fires_at`). A due timer whose deadline is *after* the signal
+/// arrived is deliberately excluded here — it is fired *after* the signal by the
+/// ordinary [`drain_ready`](crate::worker::drain_ready) pass.
+pub fn due_timers_before_signal(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    now: i64,
+    received_at: i64,
+) -> SqliteResult<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT timer_id FROM harvest_timers \
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 AND fire_at <= ?3 ORDER BY fire_at",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string(), now, received_at], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// True if `exec_id` has any armed (unfired) durable timer — the ground-truth
 /// signal a no-progress cycle is genuinely waiting on a not-yet-due timer.
 pub fn has_unfired_timer(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {

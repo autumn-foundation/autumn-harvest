@@ -62,6 +62,30 @@ pub enum SqliteError {
         details: String,
     },
 
+    /// A `#[workflow]` handler **panicked** (rather than returning `Err`) and the
+    /// engine caught it at the dispatch boundary (issue #782). Like a replay
+    /// non-determinism divergence, this is **non-terminal and resumable**: the
+    /// panicked decision cycle is **discarded** (no event appended, no bookkeeping
+    /// command persisted), the execution stays `RUNNING`, and the divergence is
+    /// surfaced so the drive loop stops instead of spinning. Under the panic budget
+    /// a fixed/rolled-back build can re-drive the **unchanged** history to
+    /// completion; only after the budget is exhausted is the run sealed `FAILED`
+    /// with the typed `HandlerPanic` error (returned as a normal
+    /// [`RunState::Failed`](crate::RunState::Failed), not this error).
+    ///
+    /// A genuine author `Err(...)` carries no panic flag and still fails terminally
+    /// on the first strike, unchanged.
+    #[error(
+        "execution {execution_id} handler panicked \
+         (contained non-terminally; resumable under the panic budget): {details}"
+    )]
+    WorkflowPanicked {
+        /// The panicking execution (still `RUNNING`, resumable).
+        execution_id: ExecutionId,
+        /// The engine's typed `HandlerPanic` error payload / message.
+        details: String,
+    },
+
     /// A driven execution made no durable progress and could not be classified
     /// as waiting on a timer or a signal — surfaced honestly instead of looping.
     /// The most common cause is a task stranded `RUNNING` by a crash that the

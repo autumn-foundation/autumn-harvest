@@ -9,6 +9,11 @@
 //! two replay identically because `HistoryMatcher::scan_activity_terminal` skips
 //! `ActivityStarted` (exercised by the PG-shaped-history test below).
 
+// The `#[workflow]` macro references the workflow's input parameter, so a
+// deliberately-unused param reads as a "used underscore binding" through the
+// expansion.
+#![allow(clippy::used_underscore_binding)]
+
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{ActivityExecId, WorkerId};
@@ -219,4 +224,70 @@ async fn deterministic_side_effect_persists_and_replays_byte_identically() {
         "a history with a frozen side effect must replay byte-identically:\n{report}"
     );
     assert_eq!(recorded_id.len(), 36, "the recorded UUID is a real v7 UUID");
+}
+
+// ── FIX C (Codex #1069): the real workflow_name reaches ctx.info() ─────────────
+//
+// A workflow that reads the documented replay-safe `ctx.info().workflow_type`
+// (issue #698) must observe the REAL registered handler name on this backend,
+// exactly as the Postgres worker (which injects it) does. The lighter core entry
+// point hard-codes an EMPTY workflow_name; driving through the caps-carrying entry
+// point with the real name populates `ctx.info().workflow_type`. This is a
+// cross-backend byte-identity concern: the value is recorded into an activity
+// input, so a divergent (empty) name would poison the shared-history guarantee.
+
+#[workflow]
+async fn records_workflow_type(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    // Read the run's own type and route it through an activity input (so the
+    // value is recorded in history and must replay byte-identically).
+    let wf_type = ctx.info().workflow_type;
+    let echoed = ctx
+        .execute_activity_raw("echo_str", json!(wf_type), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(echoed.as_str().unwrap_or_default().to_string())
+}
+
+#[tokio::test]
+async fn workflow_type_reaches_ctx_info_and_replays_on_core() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&records_workflow_type_info());
+    rt.register_activity(
+        "echo_str",
+        ActivitySpec::new(1, |input: serde_json::Value| Ok(input)),
+    );
+    let exec = rt
+        .start_workflow("records_workflow_type", json!(0))
+        .unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    // The workflow observed its REAL registered type, NOT "" (FIX C; RED pre-fix).
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == "records_workflow_type"),
+        "ctx.info().workflow_type must be the real registered name, not empty, got {state:?}"
+    );
+
+    // The activity input recorded the real name into history.
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { input, .. }
+                if input.as_str() == Some("records_workflow_type")
+        )),
+        "the recorded activity input must carry the real workflow type:\n{history:?}"
+    );
+
+    // Cross-backend guarantee: the history replays byte-identically on the core.
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "records_workflow_type",
+            records_workflow_type_info().handler,
+        )
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a history recording ctx.info().workflow_type must replay on the core:\n{report}"
+    );
 }
