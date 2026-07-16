@@ -2211,6 +2211,16 @@ pub(crate) struct StartWorkflowRequest {
     /// Mutually exclusive with a throttle / debounce / batch policy.
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Internal workflow-start provenance override (issue #740). Set by
+    /// [`Self::from_webhook`] so a webhook-delegated start records `webhook`
+    /// provenance instead of the default `api`. `#[serde(skip)]` so it is
+    /// never part of the public JSON request body.
+    #[serde(default, skip)]
+    start_source_override: Option<autumn_harvest::StartSource>,
+    /// Internal provenance correlation ref override (issue #740), paired with
+    /// [`Self::start_source_override`]. Never part of the public JSON body.
+    #[serde(default, skip)]
+    start_source_ref_override: Option<String>,
 }
 
 impl StartWorkflowRequest {
@@ -2241,6 +2251,8 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            start_source_override: None,
+            start_source_ref_override: None,
         }
     }
 
@@ -2280,6 +2292,9 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            // Webhook-delegated starts record `webhook` provenance (#740/#344).
+            start_source_override: Some(autumn_harvest::StartSource::Webhook),
+            start_source_ref_override: None,
         }
     }
 }
@@ -2318,6 +2333,12 @@ pub(crate) struct SignalWithStartRequest {
     /// GitHub `X-GitHub-Delivery`, etc.).
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Internal workflow-start provenance override (issue #740). Set by
+    /// [`Self::from_webhook`] so a webhook-delegated `SignalsWithStart` fresh
+    /// run records `webhook` instead of the default `signal_with_start`.
+    /// `#[serde(skip)]` so it is never part of the public JSON body.
+    #[serde(default, skip)]
+    start_source_override: Option<autumn_harvest::StartSource>,
 }
 
 impl SignalWithStartRequest {
@@ -2349,6 +2370,9 @@ impl SignalWithStartRequest {
             execution_timeout_secs: None,
             id_reuse_policy: None,
             idempotency_key,
+            // Webhook-delegated signal-with-start records `webhook` provenance
+            // on a fresh run (#740/#344).
+            start_source_override: Some(autumn_harvest::StartSource::Webhook),
         }
     }
 }
@@ -2918,6 +2942,10 @@ pub(crate) struct WorkflowFilters {
     /// When true, return only executions currently under an active legal hold
     /// (issue #747).
     pub(crate) legal_hold: bool,
+    /// Only return executions with the given `start_source` provenance (issue #740).
+    /// A validated bounded `snake_case` string (a known `StartSource` variant or
+    /// the literal `"unknown"`, which matches NULL / pre-upgrade rows via `IS NULL`).
+    pub(crate) start_source: Option<String>,
     /// Only return executions with at least this many recorded events (issue #493).
     pub(crate) min_history_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
@@ -7838,6 +7866,26 @@ pub(crate) fn parse_workflow_filters(
             "legal_hold" => {
                 filters.legal_hold = value.trim().eq_ignore_ascii_case("true");
             }
+            "start_source" => {
+                // Issue #740: bounded provenance filter. Accept any known
+                // `StartSource` variant or the literal "unknown" (matches
+                // NULL / pre-upgrade rows). A blank/whitespace-only value is
+                // treated as absent (no filter), matching the state/workflow_name/
+                // owner siblings. A non-empty *invalid* value is rejected with a
+                // 400 (never a silent empty match, never a 500). `from_str` maps
+                // unrecognized input to `Unknown`, so a non-"unknown" value
+                // that parses to `Unknown` is an invalid source string.
+                let trimmed = value.trim().to_ascii_lowercase();
+                if !trimmed.is_empty() {
+                    let parsed = autumn_harvest::StartSource::from_str(&trimmed);
+                    if parsed == autumn_harvest::StartSource::Unknown && trimmed != "unknown" {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid start_source '{trimmed}'; expected a known source or 'unknown'"
+                        )));
+                    }
+                    filters.start_source = Some(trimmed);
+                }
+            }
             "min_history_events" => {
                 let parsed = value.trim().parse::<u64>().map_err(|_| {
                     AutumnError::bad_request_msg(format!(
@@ -10694,6 +10742,15 @@ pub(crate) async fn start_workflow(
         }
     };
 
+    // Workflow-start provenance (issue #740): default `api` for the plain HTTP
+    // start route; a webhook-delegated start (`from_webhook`) overrides it to
+    // `webhook`. Applied uniformly to the direct start and every deferred
+    // (debounce/throttle/batch) admission carrier below.
+    let effective_start_source = request
+        .start_source_override
+        .unwrap_or(autumn_harvest::StartSource::Api);
+    let effective_start_source_ref = request.start_source_ref_override.clone();
+
     if matches!(
         request.reuse_policy.as_deref(),
         Some("terminate_if_running")
@@ -11614,6 +11671,11 @@ pub(crate) async fn start_workflow(
                     schedule_id: None,
                     scheduled_for: None,
                     origin: None,
+                    // Capture the effective start provenance so the eventual
+                    // debounced fire records it (issue #740).
+                    start_source: Some(effective_start_source.as_str().to_string()),
+                    start_source_ref: effective_start_source_ref.clone(),
+                    started_by: None,
                 },
             };
 
@@ -11921,6 +11983,11 @@ pub(crate) async fn start_workflow(
                 schedule_id: None,
                 scheduled_for: None,
                 origin: None,
+                // Capture the effective start provenance so the eventual
+                // batched fire records it (issue #740).
+                start_source: Some(effective_start_source.as_str().to_string()),
+                start_source_ref: effective_start_source_ref.clone(),
+                started_by: None,
             },
         };
 
@@ -12286,6 +12353,11 @@ pub(crate) async fn start_workflow(
             schedule_id: None,
             scheduled_for: None,
             origin: None,
+            // Capture the effective start provenance so the eventual throttled
+            // fire records it (issue #740).
+            start_source: Some(effective_start_source.as_str().to_string()),
+            start_source_ref: effective_start_source_ref.clone(),
+            started_by: None,
         };
 
         match autumn_harvest::throttle::reserve_or_defer(
@@ -12435,6 +12507,9 @@ pub(crate) async fn start_workflow(
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                 origin: None,
                 completion_callbacks,
+                start_source: effective_start_source,
+                start_source_ref: effective_start_source_ref.as_deref(),
+                started_by: None,
             },
             key,
             window_secs,
@@ -12654,6 +12729,9 @@ pub(crate) async fn start_workflow(
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         origin: None,
         completion_callbacks,
+        start_source: effective_start_source,
+        start_source_ref: effective_start_source_ref.as_deref(),
+        started_by: None,
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
         Some(runtime.registry.telemetry().metrics.as_ref());
@@ -13556,6 +13634,11 @@ async fn batch_start_workflows(
                     schedule_id: None,
                     scheduled_for: None,
                     origin: None,
+                    // Batch-start API item (issue #740): provenance is `batch`,
+                    // attributed to the operator that issued the batch.
+                    start_source: Some(autumn_harvest::StartSource::Batch.as_str().to_string()),
+                    start_source_ref: None,
+                    started_by: Some(actor.clone()),
                 };
                 match autumn_harvest::throttle::reserve_or_defer(
                     &mut conn,
@@ -13653,6 +13736,12 @@ async fn batch_start_workflows(
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                     origin: None,
                     completion_callbacks: None,
+                    // Batch-start API immediate path (issue #740): provenance is
+                    // `batch`, attributed to the operator that issued the batch.
+                    // Mirrors the throttle-carrier branch above.
+                    start_source: autumn_harvest::StartSource::Batch,
+                    start_source_ref: None,
+                    started_by: Some(actor.as_str()),
                 },
                 false,
                 item_reject_fresh,
@@ -14672,6 +14761,7 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_retry_policy: sws_workflow_retry_policy,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             workflow_info: runtime.registry.workflows.get(&workflow_name),
+            start_source_override: request.start_source_override,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
@@ -17935,6 +18025,10 @@ pub(crate) async fn trigger_dag_run_inner(
         dag.owner.as_deref(),
         dag.runbook_url.as_deref(),
         dag.severity.as_deref(),
+        // Manual DAG trigger is attributed to the schedule (issue #740),
+        // mirroring trigger_schedule_now; carry the operator actor.
+        autumn_harvest::StartSource::Schedule,
+        Some(actor.as_str()),
     )
     .await;
 
@@ -20858,6 +20952,11 @@ async fn trigger_schedule_now(
             schedule_id: Some(schedule_id),
             scheduled_for: None,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER.to_string()),
+            // Manual trigger-now (issue #740): provenance is `schedule`,
+            // referencing the schedule id, attributed to the operator.
+            start_source: Some(autumn_harvest::StartSource::Schedule.as_str().to_string()),
+            start_source_ref: Some(schedule_id.to_string()),
+            started_by: Some(actor.clone()),
         };
         match autumn_harvest::throttle::reserve_or_defer(
             &mut exec_conn,
@@ -20967,6 +21066,10 @@ async fn trigger_schedule_now(
         }
     }
 
+    // issue #740: manual trigger-now provenance is `schedule`, referencing the
+    // schedule id and attributed to the operator (mirrors the throttle-carrier
+    // branch above). Bound in the enclosing scope so the ref outlives the params.
+    let manual_schedule_id_str = schedule_id.to_string();
     let result = start_or_load_workflow_execution_with_metrics(
         &mut exec_conn,
         StartWorkflowParams {
@@ -21019,6 +21122,9 @@ async fn trigger_schedule_now(
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Schedule,
+            start_source_ref: Some(manual_schedule_id_str.as_str()),
+            started_by: Some(actor.as_str()),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         None,
@@ -22250,6 +22356,13 @@ async fn schedule_backfill(
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL.to_string()),
+                        // Schedule backfill (issue #740): provenance is
+                        // `backfill`, referencing the schedule id, operator.
+                        start_source: Some(
+                            autumn_harvest::StartSource::Backfill.as_str().to_string(),
+                        ),
+                        start_source_ref: Some(schedule_id.to_string()),
+                        started_by: Some(actor.clone()),
                     };
                     match autumn_harvest::throttle::reserve_or_defer(
                         &mut conn,
@@ -22335,6 +22448,10 @@ async fn schedule_backfill(
                     }
                 }
 
+                // Provenance for a non-throttled workflow backfill (issue #740):
+                // `backfill`, referencing the schedule id and the operator actor —
+                // matching the throttled branch above.
+                let schedule_id_str = schedule_id.to_string();
                 let result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -22391,6 +22508,9 @@ async fn schedule_backfill(
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                         completion_callbacks: None,
+                        start_source: autumn_harvest::StartSource::Backfill,
+                        start_source_ref: Some(&schedule_id_str),
+                        started_by: Some(actor.as_str()),
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
@@ -22642,6 +22762,9 @@ async fn schedule_backfill(
                     }
                 }
 
+                // Provenance for a non-throttled DAG backfill (issue #740):
+                // `backfill`, referencing the schedule id and the operator actor.
+                let schedule_id_str = schedule_id.to_string();
                 let start_result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -22685,6 +22808,9 @@ async fn schedule_backfill(
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                         completion_callbacks: None,
+                        start_source: autumn_harvest::StartSource::Backfill,
+                        start_source_ref: Some(&schedule_id_str),
+                        started_by: Some(actor.as_str()),
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
@@ -25692,6 +25818,22 @@ pub(crate) async fn load_workflows(
                     .or(harvest_workflow_executions::legal_hold_until.gt(now)),
             );
     }
+    if let Some(src) = &filters.start_source {
+        // Issue #740: provenance filter. "unknown" matches NULL / pre-upgrade
+        // rows *or* a literal "unknown" (a workflow-level retry of a pre-upgrade
+        // NULL predecessor round-trips through from_str→Unknown→as_str()="unknown"
+        // and could store the literal string); any other value is an exact column
+        // match. Plain column predicate, cross-shard safe.
+        if src == "unknown" {
+            query = query.filter(
+                harvest_workflow_executions::start_source
+                    .is_null()
+                    .or(harvest_workflow_executions::start_source.eq("unknown")),
+            );
+        } else {
+            query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
+        }
+    }
     if let Some(min_events) = filters.min_history_events {
         // Correlated subquery: filter to executions with at least `min_events`
         // recorded events. No schema migration is required — the count is
@@ -26061,6 +26203,21 @@ pub(crate) async fn load_stalled_workflows(
                     .is_null()
                     .or(harvest_workflow_executions::legal_hold_until.gt(now)),
             );
+    }
+    // Honor the start_source provenance filter (issue #740) on the stalled path
+    // too, for the same bypass reason as sla_breached/nd_blocked/legal_hold above.
+    // "unknown" matches NULL / pre-upgrade rows or a literal "unknown" (a retry of
+    // a NULL predecessor could store the literal string); see load_workflows.
+    if let Some(src) = &filters.start_source {
+        if src == "unknown" {
+            query = query.filter(
+                harvest_workflow_executions::start_source
+                    .is_null()
+                    .or(harvest_workflow_executions::start_source.eq("unknown")),
+            );
+        } else {
+            query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
+        }
     }
     // Honor the time-range and exec-id-prefix filters (issue #498) on the
     // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
@@ -32877,6 +33034,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_workflow_filters_parses_start_source() {
+        // Absent → None (issue #740).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(absent.start_source.is_none());
+
+        // A known variant (case-insensitive, trimmed) is accepted verbatim.
+        let known = parse_workflow_filters(&pairs(&[("start_source", " Schedule ")]))
+            .expect("start_source=schedule parses");
+        assert_eq!(known.start_source.as_deref(), Some("schedule"));
+
+        // The literal "unknown" is accepted (matches NULL / pre-upgrade rows).
+        let unknown = parse_workflow_filters(&pairs(&[("start_source", "unknown")]))
+            .expect("start_source=unknown parses");
+        assert_eq!(unknown.start_source.as_deref(), Some("unknown"));
+
+        // A blank / whitespace-only value is treated as absent (no filter),
+        // matching the state/workflow_name/owner siblings — never a 400.
+        let blank = parse_workflow_filters(&pairs(&[("start_source", "   ")]))
+            .expect("blank start_source parses as absent");
+        assert!(blank.start_source.is_none());
+        let empty = parse_workflow_filters(&pairs(&[("start_source", "")]))
+            .expect("empty start_source parses as absent");
+        assert!(empty.start_source.is_none());
+
+        // An unrecognized value is a 400, never a silent empty filter.
+        let err = parse_workflow_filters(&pairs(&[("start_source", "bogus")]))
+            .expect_err("start_source=bogus must be rejected");
+        assert!(
+            format!("{err:?}").contains("invalid start_source"),
+            "error should name the invalid start_source: {err:?}"
+        );
+    }
+
+    #[test]
     fn parse_workflow_children_filters_accepts_statuses_limit_and_depth() {
         let filters = parse_workflow_children_filters(&pairs(&[
             ("status", "Failed,Running"),
@@ -33254,6 +33445,9 @@ mod tests {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
             None,
@@ -33335,6 +33529,9 @@ mod tests {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
             None,
@@ -33453,6 +33650,9 @@ mod tests {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
             None,
@@ -35375,6 +35575,9 @@ mod tests {
             legal_hold_until: None,
             legal_hold_reason: None,
             legal_hold_actor: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         }
     }
 

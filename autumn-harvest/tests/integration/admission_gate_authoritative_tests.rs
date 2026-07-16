@@ -262,6 +262,9 @@ async fn start_source_completed_on(
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -2684,6 +2687,9 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )
@@ -2909,6 +2915,9 @@ async fn run_stale_sealed_delivered_case(
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )
@@ -3170,6 +3179,9 @@ async fn start_webhook_delivery(conn: &mut AsyncPgConnection, workflow_id: &str)
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -3214,6 +3226,9 @@ fn webhook_replacement_params(workflow_id: &'static str) -> StartWorkflowParams<
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     }
 }
 
@@ -3420,6 +3435,9 @@ fn ag_target_params(
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     }
 }
 
@@ -3775,6 +3793,7 @@ fn signal_with_start_fresh_params(workflow_id: &'static str) -> SignalWithStartP
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         workflow_info: None,
+        start_source_override: None,
     }
 }
 

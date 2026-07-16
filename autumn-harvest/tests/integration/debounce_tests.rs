@@ -716,6 +716,9 @@ async fn no_debounce_policy_uses_normal_start_path() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )

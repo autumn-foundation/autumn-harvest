@@ -256,6 +256,15 @@ pub async fn admit_batched_start(
                             .and_then(crate::types::Priority::from_i32)
                             .unwrap_or_default();
 
+                        // Restore the provenance captured at admission (#740),
+                        // defaulting to `Batch` for a pre-#740 row.
+                        let batch_start_source = opts.start_source.as_deref().map_or(
+                            crate::types::StartSource::Batch,
+                            crate::types::StartSource::from_str,
+                        );
+                        let batch_start_source_ref = opts.start_source_ref.clone();
+                        let batch_started_by = opts.started_by.clone();
+
                         let params = crate::execution::StartWorkflowParams {
                             workflow_name: &row.workflow_name,
                             workflow_id: &row.workflow_id,
@@ -296,6 +305,9 @@ pub async fn admit_batched_start(
                             max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
                             origin: None,
                             completion_callbacks: opts.completion_callbacks.clone(),
+                            start_source: batch_start_source,
+                            start_source_ref: batch_start_source_ref.as_deref(),
+                            started_by: batch_started_by.as_deref(),
                         };
 
                         let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -545,6 +557,14 @@ async fn fire_claimed_batch_row(
     let queue_name = row.queue_name.clone();
     let batch_key = row.batch_key.clone();
     let row_id = row.id;
+    // Restore the provenance captured at admission (#740), defaulting to `Batch`
+    // for a pre-#740 row.
+    let batch_start_source = opts.start_source.as_deref().map_or(
+        crate::types::StartSource::Batch,
+        crate::types::StartSource::from_str,
+    );
+    let batch_start_source_ref = opts.start_source_ref.clone();
+    let batch_started_by = opts.started_by.clone();
 
     let params = crate::execution::StartWorkflowParams {
         workflow_name: &workflow_name,
@@ -581,6 +601,9 @@ async fn fire_claimed_batch_row(
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
         completion_callbacks: opts.completion_callbacks,
+        start_source: batch_start_source,
+        start_source_ref: batch_start_source_ref.as_deref(),
+        started_by: batch_started_by.as_deref(),
     };
 
     let start_res = crate::execution::start_or_load_workflow_execution_collect(

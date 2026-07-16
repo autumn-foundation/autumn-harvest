@@ -173,6 +173,9 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )

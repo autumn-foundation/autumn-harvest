@@ -164,7 +164,11 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     "\n",
     // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql")
+    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
+    "\n",
+    // issue #740: start_source/start_source_ref/started_by provenance columns on
+    // harvest_workflow_executions.
+    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -253,7 +257,12 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
+    // issue #740: WorkflowExecution::as_select() (modern start path's read-back)
+    // references the three start_source_* provenance columns.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source_ref TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS started_by TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -650,6 +659,9 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -704,6 +716,9 @@ pub(crate) async fn insert_workflow_execution_with_id(
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -770,6 +785,9 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -1691,6 +1709,9 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -1888,6 +1909,9 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -5008,6 +5032,9 @@ async fn insert_named_workflow_execution(
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -5496,6 +5523,156 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
     );
 }
 
+/// Issue #740 (AC3): a continue-as-new successor records its OWN `continue_as_new`
+/// source referencing the predecessor — it is NEVER misattributed as a fresh
+/// `api` start, and never inherits the predecessor's source. Driven through the
+/// real worker loop (the only way to exercise `persist_workflow_continue_as_new`,
+/// which is engine-internal). The predecessor is deliberately stamped with a
+/// DISTINCT source (`schedule`) so the assertion falsifies any inheritance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_continue_as_new_records_own_start_source_referencing_predecessor() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
+    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
+    // (and the child workflow's) up front. A no-op against a fresh CI container.
+    for stmt in [
+        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
+        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
+        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .expect("pre-test scrub");
+    }
+
+    let original_exec_id = insert_workflow_execution(&mut conn).await;
+    // Give the predecessor a DISTINCT source so "successor never inherits" is
+    // genuinely falsifiable (not merely NULL-vs-continue_as_new).
+    diesel::update(harvest_workflow_executions::table.find(original_exec_id.as_uuid()))
+        .set(harvest_workflow_executions::start_source.eq(Some("schedule")))
+        .execute(&mut conn)
+        .await
+        .expect("stamp predecessor source");
+
+    let initial_input = serde_json::json!({"phase": "init"});
+    enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: continue_as_new_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-can-source", 2, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Wait for the predecessor to be sealed, then resolve the successor id from
+    // the WorkflowContinuedAsNew event.
+    let _sealed =
+        wait_for_execution_state(&database_url, original_exec_id, "CONTINUED_AS_NEW").await;
+    let original_history = load_history_from_url(&database_url, original_exec_id).await;
+    let new_exec_id = original_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("original history should contain a WorkflowContinuedAsNew event");
+
+    let successor = wait_for_execution_state(&database_url, new_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        successor.start_source.as_deref(),
+        Some("continue_as_new"),
+        "the successor records its OWN `continue_as_new` source, never the \
+         predecessor's `schedule` source and never a fresh `api` start"
+    );
+    assert_eq!(
+        successor.start_source_ref.as_deref(),
+        Some(original_exec_id.to_string().as_str()),
+        "the continue-as-new successor references the predecessor execution id"
+    );
+}
+
+/// Issue #740 (AC3): a spawned child workflow records the `child` source
+/// referencing its parent execution. Driven through the real worker loop (the
+/// child-spawn insert path, `insert_awaited_child_execution`, is engine-internal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_child_workflow_records_child_start_source_referencing_parent() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
+    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
+    // (and the child workflow's) up front. A no-op against a fresh CI container.
+    for stmt in [
+        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
+        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
+        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
+    ] {
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .expect("pre-test scrub");
+    }
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"value": "from-parent"});
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, workflow_input).await;
+
+    let worker = build_runtime_worker("worker-e2e-child-source", 2, 1, child_round_trip_registry());
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(child_execs.len(), 1, "exactly one child execution");
+    assert_eq!(
+        child_execs[0].start_source.as_deref(),
+        Some("child"),
+        "a spawned child records the `child` source"
+    );
+    assert_eq!(
+        child_execs[0].start_source_ref.as_deref(),
+        Some(parent_exec_id.to_string().as_str()),
+        "the child references its parent execution id"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() {
@@ -5668,6 +5845,9 @@ mod reuse_policy_helpers {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         }
     }
 
@@ -6976,6 +7156,9 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -7148,6 +7331,9 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -8682,6 +8868,9 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

@@ -506,6 +506,9 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -807,6 +810,9 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )

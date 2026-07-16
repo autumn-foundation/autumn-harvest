@@ -104,6 +104,9 @@ async fn insert_execution(
             retry_of_exec_id: None,
             origin: None,
             completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         })
         .execute(conn)
         .await

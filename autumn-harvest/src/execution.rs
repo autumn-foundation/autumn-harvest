@@ -24,7 +24,7 @@ use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_signals, harvest_workflow_executions};
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
-use crate::types::{ExecutionId, ParentClosePolicy, Priority, WorkflowIdReusePolicy};
+use crate::types::{ExecutionId, ParentClosePolicy, Priority, StartSource, WorkflowIdReusePolicy};
 
 /// Parameters for starting a workflow execution.
 ///
@@ -142,6 +142,16 @@ pub struct StartWorkflowParams<'a> {
     /// per-execution targets; the effective target set at the terminal
     /// transition is still the union with any builder-wide defaults.
     pub completion_callbacks: Option<serde_json::Value>,
+    /// Workflow-start provenance classifier (issue #740): how this execution
+    /// was started (API call, schedule tick, child spawn, ...). Persisted as
+    /// metadata only — never read on replay. Distinct from `origin` (#534).
+    pub start_source: StartSource,
+    /// Optional correlation reference for the start source (issue #740), e.g.
+    /// the triggering execution id or schedule id. `None` when absent.
+    pub start_source_ref: Option<&'a str>,
+    /// Optional human/operator attribution for the start (issue #740). `None`
+    /// when absent.
+    pub started_by: Option<&'a str>,
 }
 
 /// Origin marker for a normal scheduler-tick fire (issue #534).
@@ -561,6 +571,9 @@ pub async fn start_or_load_workflow_execution_collect(
         retry_of_exec_id: request.retry_of_exec_id,
         origin: request.origin,
         completion_callbacks: request.completion_callbacks.clone(),
+        start_source: Some(request.start_source.as_str()),
+        start_source_ref: request.start_source_ref,
+        started_by: request.started_by,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -3228,6 +3241,11 @@ pub struct SignalWithStartParams<'a> {
     /// stub — that intentionally never validates, matching every other
     /// schema-validation call site being HTTP-JSON-boundary-only).
     pub workflow_info: Option<&'a WorkflowInfo>,
+    /// Workflow-start provenance override for a fresh start (issue #740).
+    /// `None` records the default [`StartSource::SignalWithStart`]; a webhook
+    /// `SignalsWithStart` delegation sets `Some(StartSource::Webhook)` so the
+    /// fresh run records `webhook` provenance.
+    pub start_source_override: Option<StartSource>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -3508,6 +3526,14 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                         origin: None,
                         completion_callbacks: None,
+                        start_source: request
+                            .start_source_override
+                            .unwrap_or(crate::types::StartSource::SignalWithStart),
+                        start_source_ref: request
+                            .idempotency_key
+                            .as_deref()
+                            .or(Some(request.workflow_id)),
+                        started_by: None,
                     };
 
                 // For a debounced workflow, route the start through the no-spawn collect
@@ -4081,6 +4107,12 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                         origin: None,
                         completion_callbacks: None,
+                        start_source: crate::types::StartSource::UpdateWithStart,
+                        start_source_ref: request
+                            .idempotency_key
+                            .as_deref()
+                            .or(Some(request.workflow_id)),
+                        started_by: None,
                     };
 
                 // Debounced workflow: route through the no-spawn collect path with

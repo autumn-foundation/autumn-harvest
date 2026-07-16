@@ -116,6 +116,72 @@ struct CountRow {
     count: i64,
 }
 
+/// Env-aware test-DB handle for the #740 provenance test.
+///
+/// Honours `HARVEST_TEST_DATABASE_URL` (a **blank** Postgres that the test
+/// migrates itself via `autumn_web::migrate::run_pending`, exactly as it does
+/// against a fresh testcontainer) so it can run against a local instance when
+/// Docker/testcontainers is unavailable; otherwise falls back to the shared
+/// testcontainers `TestDb`. Mirrors the `setup_*_or_env` fallback pattern used
+/// by the core `integration_e2e` suite and `start_source_integration.rs`.
+///
+/// Exposes the same `url()` / `pool()` / `execute_sql()` surface the test
+/// relied on from `TestDb`, so only the DB-acquisition line of the test
+/// changes.
+enum WebhookTestDb {
+    Container(&'static TestDb),
+    Env {
+        url: String,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    },
+}
+
+impl WebhookTestDb {
+    async fn get() -> Self {
+        if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(&url);
+            let pool = diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+                .max_size(5)
+                .build()
+                .expect("failed to build local-PG pool");
+            Self::Env { url, pool }
+        } else {
+            Self::Container(TestDb::shared().await)
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            Self::Container(db) => db.url(),
+            Self::Env { url, .. } => url,
+        }
+    }
+
+    fn pool(
+        &self,
+    ) -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+        match self {
+            Self::Container(db) => db.pool(),
+            Self::Env { pool, .. } => pool.clone(),
+        }
+    }
+
+    async fn execute_sql(&self, sql: &str) {
+        match self {
+            Self::Container(db) => db.execute_sql(sql).await,
+            Self::Env { pool, .. } => {
+                let mut conn = pool.get().await.expect("pool conn");
+                diesel::sql_query(sql)
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
+            }
+        }
+    }
+}
+
 /// AC (issue #344): "a synthetic vendor sends two identical webhook
 /// deliveries; exactly one workflow execution is created; both responses
 /// return the same `workflow_exec_id`."
@@ -205,6 +271,76 @@ async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec
     assert!(
         audit_count >= 1,
         "expected at least one webhook.trigger audit row"
+    );
+}
+
+/// AC3 (issue #740): a start delegated from the inbound webhook receiver records
+/// `start_source = "webhook"`, distinguishing it from an ordinary `api` start.
+///
+/// Uses a multi-thread runtime: `TestApp::plugin(HarvestPlugin)` runs the
+/// plugin startup hook on a spawned thread via `Handle::block_on` while the
+/// test thread blocks on its join, which deadlocks a current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn webhook_start_records_webhook_source() {
+    #[derive(diesel::QueryableByName)]
+    struct SourceRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        start_source: Option<String>,
+    }
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let db = WebhookTestDb::get().await;
+    unsafe {
+        std::env::set_var("AUTUMN_DATABASE__URL", db.url());
+    }
+    autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
+        .expect("failed to run framework migrations");
+    autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
+        .expect("failed to run Harvest migrations");
+    db.execute_sql("TRUNCATE TABLE harvest_workflow_executions CASCADE")
+        .await;
+
+    let client = TestApp::new()
+        .config(webhook_config())
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![order_flow, subscription_flow])
+                .webhooks(webhooks![map_order, map_subscription])
+                .worker(WorkerConfig::default())
+                .api("/api/harvest"),
+        )
+        .with_db(db.pool())
+        .build();
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "id": "dlv-src-1",
+        "order_id": "o-src"
+    }))
+    .unwrap();
+    let sig = sign(&body);
+
+    let resp = client
+        .post("/hooks/orders")
+        .header("X-Webhook-Signature", &sig)
+        .header("X-Webhook-Delivery", "dlv-src-1")
+        .body(body)
+        .send()
+        .await;
+    resp.assert_status(202);
+
+    let mut conn = db.pool().get().await.expect("pool conn");
+    let row: SourceRow = diesel::sql_query(
+        "SELECT start_source FROM harvest_workflow_executions WHERE workflow_name = 'order_flow' LIMIT 1",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("created execution row");
+    assert_eq!(
+        row.start_source.as_deref(),
+        Some("webhook"),
+        "a webhook-delegated start must record start_source='webhook'"
     );
 }
 

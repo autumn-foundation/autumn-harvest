@@ -310,6 +310,9 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )
@@ -399,6 +402,9 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )

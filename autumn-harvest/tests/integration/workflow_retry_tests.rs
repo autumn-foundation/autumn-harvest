@@ -23,9 +23,11 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::{METRIC_WORKFLOW_RETRIES, MetricsRecorder, TelemetryConfig};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ExecutionId, Priority, ShardId, StartWorkflowParams, WorkflowContext,
+    ExecutionId, Priority, ShardId, StartSource, StartWorkflowParams, WorkflowContext,
     cancel_workflow_execution, start_or_load_workflow_execution,
 };
+
+use crate::integration_e2e::setup_test_database_url_or_env;
 
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -365,12 +367,91 @@ async fn start_workflow(
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
     .await
     .expect("workflow start should succeed")
     .exec_id
+}
+
+/// Like [`start_workflow`] but stamps an explicit start-source provenance triple
+/// (issue #740) so the workflow-level retry inheritance path is falsifiable.
+#[allow(clippy::too_many_arguments)]
+async fn start_workflow_with_source(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    workflow_id: &str,
+    retry_policy: Option<RetryPolicy>,
+    start_source: StartSource,
+    start_source_ref: Option<&str>,
+    started_by: Option<&str>,
+) -> ExecutionId {
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
+            input: serde_json::Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: retry_policy,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source,
+            start_source_ref,
+            started_by,
+        },
+        None,
+    )
+    .await
+    .expect("workflow start should succeed")
+    .exec_id
+}
+
+/// Read the `(start_source, start_source_ref, started_by)` provenance triple of
+/// an execution row (issue #740).
+async fn get_provenance(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> (Option<String>, Option<String>, Option<String>) {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .select((
+            harvest_workflow_executions::start_source,
+            harvest_workflow_executions::start_source_ref,
+            harvest_workflow_executions::started_by,
+        ))
+        .first(conn)
+        .await
+        .expect("load execution provenance")
 }
 
 async fn get_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
@@ -630,6 +711,93 @@ async fn workflow_retries_on_transient_failure_and_succeeds() {
         1,
         "the original execution is the only one with the original workflow_id"
     );
+}
+
+/// Issue #740: a workflow-level retry (#523) is the same logical run trying
+/// again, so the retry execution must INHERIT the predecessor's start-source
+/// provenance triple (`schedule` here, with a ref + operator) rather than being
+/// re-attributed as a fresh `api` start. Driven end-to-end through the real
+/// worker loop — the inheritance happens inside `persist_workflow_failure`,
+/// which is engine-internal. Uses the env-aware DB helper so it runs against a
+/// local `HARVEST_TEST_DATABASE_URL` or a fresh testcontainer.
+#[tokio::test]
+async fn workflow_retry_inherits_predecessor_start_source() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        non_retryable_errors: vec![],
+        jitter: JitterPolicy::None,
+    };
+
+    let counter = Arc::new(CallCounter::default());
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    // Start the ORIGINAL run stamped with a DISTINCT `schedule` source so the
+    // assertion falsifies both a fresh `api` re-attribution and a dropped ref.
+    let workflow_id = format!("retry-inherit-{}", uuid::Uuid::new_v4());
+    let exec_id = start_workflow_with_source(
+        &mut conn,
+        "retry_source_inherit_wf",
+        &workflow_id,
+        Some(policy.clone()),
+        StartSource::Schedule,
+        Some("sched-inherit-xyz"),
+        Some("operator@example.com"),
+    )
+    .await;
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "retry_source_inherit_wf",
+            fail_once_then_succeed_handler,
+            Some(policy),
+        )],
+        make_shared_state(counter),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&pool)).await;
+    });
+
+    // Wait for the retry execution (attempt 2) to COMPLETE.
+    let mut check = connect(&url).await;
+    let retry_exec = wait_for_retry_state(&mut check, exec_id, &["COMPLETED"]).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(get_attempt(&mut check, retry_exec).await, 2);
+
+    // The retry run must inherit the predecessor's full provenance triple.
+    let (source, source_ref, started_by) = get_provenance(&mut check, retry_exec).await;
+    assert_eq!(
+        source.as_deref(),
+        Some("schedule"),
+        "a workflow-level retry must inherit the predecessor's start_source \
+         ('schedule'), never re-attribute as a fresh 'api' start"
+    );
+    assert_eq!(
+        source_ref.as_deref(),
+        Some("sched-inherit-xyz"),
+        "the retry must inherit the predecessor's start_source_ref"
+    );
+    assert_eq!(
+        started_by.as_deref(),
+        Some("operator@example.com"),
+        "the retry must inherit the predecessor's started_by"
+    );
+
+    // Sanity: the original run keeps its own (identical) provenance.
+    let (orig_source, _, _) = get_provenance(&mut check, exec_id).await;
+    assert_eq!(orig_source.as_deref(), Some("schedule"));
 }
 
 /// AC #2: `max_attempts` exhausted — final run FAILED, schedule counter incremented exactly once.

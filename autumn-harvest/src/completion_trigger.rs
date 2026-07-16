@@ -1056,6 +1056,8 @@ impl DeferredTriggerStart {
                 .as_ref()
                 .map(|m| m.as_ref() as &(dyn crate::telemetry::MetricsRecorder + Send + Sync));
 
+            // Provenance ref is the triggering (source) execution id (#740).
+            let source_exec_id_str = self.source_exec_id.to_string();
             let params = crate::execution::StartWorkflowParams {
                 workflow_name: &self.target_workflow_name,
                 workflow_id: &self.target_workflow_id,
@@ -1089,6 +1091,9 @@ impl DeferredTriggerStart {
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 origin: None,
                 completion_callbacks: None,
+                start_source: crate::types::StartSource::CompletionTrigger,
+                start_source_ref: Some(source_exec_id_str.as_str()),
+                started_by: None,
             };
 
             if let Err(e) = relay_gate_checked_start(
@@ -1160,6 +1165,10 @@ pub fn evaluate_triggers_for_execution<'a>(
             .load::<CompletionTriggerDb>(conn)
             .await
             .map_err(crate::error::database_error)?;
+
+        // Provenance ref for every completion-triggered target start is the
+        // triggering (source) execution id (#740).
+        let source_exec_id_str = exec_id.to_string();
 
         for trigger_db in triggers {
             let terminal_states: Vec<TerminalState> = serde_json::from_value(trigger_db.terminal_states)
@@ -1557,6 +1566,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                         // Completion-trigger start is not a schedule fire (issue #534).
                         origin: None,
                         completion_callbacks: None,
+                        start_source: crate::types::StartSource::CompletionTrigger,
+                        start_source_ref: Some(source_exec_id_str.as_str()),
+                        started_by: None,
                     },
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
@@ -1748,6 +1760,8 @@ pub async fn enforce_completion_triggers_outbox(
             .ok()
             .and_then(|g| *g);
 
+        // Provenance ref is the triggering (source) execution id (#740).
+        let source_exec_id_str = task.source_exec_id.to_string();
         let params = crate::execution::StartWorkflowParams {
             workflow_name: &task.target_workflow_name,
             workflow_id: &task.target_workflow_id,
@@ -1787,6 +1801,9 @@ pub async fn enforce_completion_triggers_outbox(
             // (issue #605); a completion-trigger target has no per-execution
             // callback option of its own.
             completion_callbacks: None,
+            start_source: crate::types::StartSource::CompletionTrigger,
+            start_source_ref: Some(source_exec_id_str.as_str()),
+            started_by: None,
         };
 
         // Existence-aware relay-time start/block via `gate_checked_start_or_load`

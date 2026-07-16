@@ -692,6 +692,9 @@ mod db_tests {
                 retry_of_exec_id: None,
                 origin: None,
                 completion_callbacks: None,
+                start_source: None,
+                start_source_ref: None,
+                started_by: None,
             })
             .execute(conn)
             .await
@@ -955,6 +958,9 @@ mod db_tests {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         }
     }
 

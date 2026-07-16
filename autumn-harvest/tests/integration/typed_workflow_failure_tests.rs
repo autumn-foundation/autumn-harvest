@@ -258,6 +258,9 @@ mod db_handle_surface {
                 completion_callbacks: None,
                 continued_from_exec_id: None,
                 first_exec_id: None,
+                start_source: None,
+                start_source_ref: None,
+                started_by: None,
             })
             .execute(conn)
             .await

@@ -701,6 +701,12 @@ pub async fn trigger_unified_dag(
     owner: Option<&str>,
     runbook_url: Option<&str>,
     severity: Option<&str>,
+    // Workflow-start provenance for this DAG run (issue #740). The caller
+    // decides: a manual HTTP/UI trigger passes `Schedule`, a scheduler tick
+    // `Schedule`, a backfill `Backfill`. `started_by` carries the operator
+    // actor when the trigger is human-initiated.
+    start_source: crate::types::StartSource,
+    started_by: Option<&str>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     let mut db = pool
         .get()
@@ -765,6 +771,10 @@ pub async fn trigger_unified_dag(
         .unwrap_or_else(|| default_queue.to_string());
     let input = run_conf.unwrap_or(Value::Null);
 
+    // Provenance ref is the triggering schedule id when this DAG is
+    // schedule-associated (issue #740).
+    let schedule_ref = schedule.as_ref().map(|s| s.id.to_string());
+
     start_or_load_workflow_execution(
         &mut db,
         StartWorkflowParams {
@@ -807,6 +817,9 @@ pub async fn trigger_unified_dag(
                 .as_ref()
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
+            start_source,
+            start_source_ref: schedule_ref.as_deref(),
+            started_by,
         },
         None,
     )
@@ -3324,6 +3337,11 @@ async fn tick_one_workflow_schedule(
                     schedule_id: Some(schedule.id),
                     scheduled_for: Some(*original_slot),
                     origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
+                    // Scheduled-tick throttle admission (issue #740): provenance
+                    // is `schedule`, referencing the triggering schedule id.
+                    start_source: Some(crate::types::StartSource::Schedule.as_str().to_string()),
+                    start_source_ref: Some(schedule.id.to_string()),
+                    started_by: None,
                 };
                 match crate::throttle::reserve_or_defer(
                     conn,
@@ -3362,6 +3380,8 @@ async fn tick_one_workflow_schedule(
             }
         }
 
+        // Provenance ref for a scheduled fire is the triggering schedule id (#740).
+        let schedule_id_str = schedule.id.to_string();
         let start_result = crate::execution::start_or_load_workflow_execution(
             conn,
             StartWorkflowParams {
@@ -3410,6 +3430,9 @@ async fn tick_one_workflow_schedule(
                 // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                 origin: Some(crate::execution::ORIGIN_SCHEDULED),
                 completion_callbacks: None,
+                start_source: crate::types::StartSource::Schedule,
+                start_source_ref: Some(schedule_id_str.as_str()),
+                started_by: None,
             },
             None,
         )
@@ -4885,6 +4908,13 @@ async fn drain_buffered_schedule_runs(
                         schedule_id: Some(schedule.id),
                         scheduled_for: Some(scheduled_for),
                         origin: Some(crate::execution::ORIGIN_SCHEDULED.to_string()),
+                        // Buffered scheduled fire throttle admission (issue #740):
+                        // provenance is `schedule`, referencing the schedule id.
+                        start_source: Some(
+                            crate::types::StartSource::Schedule.as_str().to_string(),
+                        ),
+                        start_source_ref: Some(schedule.id.to_string()),
+                        started_by: None,
                     };
                     match crate::throttle::reserve_or_defer(
                         conn,
@@ -4921,6 +4951,8 @@ async fn drain_buffered_schedule_runs(
                 }
             }
 
+            // Provenance ref for a buffered scheduled fire is the schedule id (#740).
+            let schedule_id_str = schedule.id.to_string();
             let start_result = crate::execution::start_or_load_workflow_execution(
                 conn,
                 crate::execution::StartWorkflowParams {
@@ -4961,6 +4993,9 @@ async fn drain_buffered_schedule_runs(
                     // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
                     completion_callbacks: None,
+                    start_source: crate::types::StartSource::Schedule,
+                    start_source_ref: Some(schedule_id_str.as_str()),
+                    started_by: None,
                 },
                 None,
             )

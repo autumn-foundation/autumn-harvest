@@ -206,3 +206,43 @@ The response projects the execution's `harvest_events` into ordered `steps` (act
 **Known limitation — unbounded history load.** The timeline loads the execution's *entire* event history with no `LIMIT` (a hard cap is deliberately avoided — silent truncation would make the rollup wrong). History size is bounded by workflow continue-as-new discipline (the ≤500-event target); a run that accumulates a very large history makes this read proportionally expensive.
 
 A step whose `outcome` is `pending` (with a `null` `ended_at`) is still open; its `total_ms` is measured to "now", so a growing pending step on repeated calls is the currently-stuck point.
+
+## What created this run? (start_source provenance)
+
+Every workflow execution durably records a bounded `start_source` classifier (issue #740) naming the mechanism that started it, plus optional `start_source_ref` (a correlating id — schedule id, triggering execution id, idempotency key) and `started_by` (an operator/actor). Use these to answer "where did this run come from?" during a spawn storm without grepping logs.
+
+**Bounded source set:** `api`, `schedule`, `backfill`, `signal_with_start`, `update_with_start`, `completion_trigger`, `webhook`, `child`, `batch`, `continue_as_new`, `reset`, `outbox`. A row started before the upgrade (or with no classifier) reports `unknown`.
+
+### An unexpected run appeared — find what started it
+
+Read the provenance fields off the single execution:
+
+```text
+GET /api/harvest/workflows/{exec_id}
+```
+
+or from the CLI:
+
+```bash
+harvest workflow get <exec_id>
+```
+
+The response's execution object carries `start_source` (always present; `unknown` for pre-upgrade rows), and — when set — `start_source_ref` and `started_by`. Example: a run showing `"start_source": "completion_trigger"` with `"start_source_ref": "<triggering exec id>"` was spawned by that upstream workflow finishing, not by a client call — follow the ref to the culprit.
+
+### The fleet is flooded — isolate the runaway mechanism
+
+Group/filter the list by `start_source` to find which start path is the source of the flood:
+
+```text
+GET /api/harvest/workflows?start_source=webhook
+GET /api/harvest/workflows?start_source=completion_trigger&state=RUNNING
+```
+
+or from the CLI:
+
+```bash
+harvest workflow list --start-source webhook
+harvest workflow list --start-source completion_trigger --state RUNNING
+```
+
+`start_source` accepts exactly one value from the bounded set above (or `unknown`); any other value returns `400` (never a silent empty match). Once you know the mechanism, go turn it off at the source — pause the offending schedule, disable the completion trigger, or throttle the webhook — rather than cancelling runs one at a time.

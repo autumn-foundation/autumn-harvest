@@ -1172,6 +1172,9 @@ async fn start_harvest_runtime(
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                         origin: None,
                         completion_callbacks: None,
+                        start_source: autumn_harvest::StartSource::Api,
+                        start_source_ref: None,
+                        started_by: None,
                     };
 
                     // The metrics recorder (`Arc<dyn MetricsRecorder>`) coerced to the
