@@ -664,12 +664,11 @@ async fn interface_omits_schema_fields_for_schema_less_workflow() {
 // ── AC4: boundary validation ───────────────────────────────────────────────
 
 fn assert_field_violation(body: &Value, error_contains: &str, expected_pointer: &str) {
-    assert_eq!(
+    assert!(
         body["error"]
             .as_str()
             .unwrap_or_default()
             .contains(error_contains),
-        true,
         "error should mention `{error_contains}`, got: {body}"
     );
     let violations = body["violations"].as_array().expect("violations array");

@@ -13885,12 +13885,9 @@ pub(crate) async fn signal_workflow(
     // when the header is absent (an empty param there is treated as omitted).
     // No key at all reproduces today's at-least-once behavior exactly.
     let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
-        let key = match raw.to_str() {
-            Ok(k) => k,
-            Err(_) => {
-                return AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
-                    .into_response();
-            }
+        let Ok(key) = raw.to_str() else {
+            return AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
+                .into_response();
         };
         if key.is_empty() {
             return AutumnError::bad_request_msg("Idempotency-Key header is empty").into_response();
