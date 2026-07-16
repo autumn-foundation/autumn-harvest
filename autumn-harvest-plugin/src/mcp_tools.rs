@@ -1377,6 +1377,9 @@ mod tests {
             handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
             validator: None,
             mcp,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         }
     }
 
@@ -1683,6 +1686,9 @@ mod tests {
             handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
         let second_mcp = UpdateHandlerInfo {
             name: "approve",
@@ -1694,6 +1700,9 @@ mod tests {
             handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
             validator: None,
             mcp: true,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
         let descriptors =
             collect_descriptors(&[wf("order_flow", true)], &[first_non_mcp, second_mcp], &[]);
@@ -1721,6 +1730,9 @@ mod tests {
             handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
             validator: None,
             mcp: true,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
         let second_mcp = UpdateHandlerInfo {
             name: "approve",
@@ -1732,6 +1744,9 @@ mod tests {
             handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
             validator: None,
             mcp: true,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
         let descriptors =
             collect_descriptors(&[wf("order_flow", true)], &[first_mcp, second_mcp], &[]);

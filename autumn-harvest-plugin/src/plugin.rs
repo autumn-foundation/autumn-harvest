@@ -2000,6 +2000,9 @@ mod tests {
                 handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
                 validator: None,
                 mcp: true,
+                description: None,
+                arg_schema: None,
+                response_schema: None,
             }
         }
         fn fake_query() -> autumn_harvest::QueryHandlerInfo {
@@ -2010,6 +2013,9 @@ mod tests {
                 input_type_hint: "()",
                 output_type_hint: "u64",
                 handler: |_ctx, _args| Ok(serde_json::Value::Null),
+                description: None,
+                arg_schema: None,
+                response_schema: None,
             }
         }
 
