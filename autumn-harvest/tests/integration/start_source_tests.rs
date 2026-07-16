@@ -19,16 +19,28 @@
 //! testcontainers Postgres is booted with the full migration bundle.
 //!
 //! Paths driven here (pure core): `api` (start_or_load), `signal_with_start`,
-//! `update_with_start`, and the three deferred carriers — `debounce`, `throttle`,
+//! `update_with_start`, the three deferred carriers — `debounce`, `throttle`,
 //! `batch` — whose captured provenance must be RESTORED at fire time (never a
-//! hardcoded carrier-specific default). Also `reset` (own-source) and
-//! `continue_as_new` (own-source, never inherited) driven directly. The
-//! worker-loop-only paths (`child`, `schedule`, `backfill`, `completion_trigger`,
-//! workflow-level retry INHERIT) are covered in the plugin/e2e suites; see the
-//! comments at those tests.
+//! hardcoded carrier-specific default), `reset` (own-source, driven via
+//! `reset_workflow_execution`), `schedule` (driven via `tick_once`), and
+//! `completion_trigger` (driven via `evaluate_triggers_for_execution`).
+//!
+//! Two worker-loop-only paths (`continue_as_new`, `child`) are directly
+//! asserted in the sibling `integration_e2e` module — they require its
+//! module-local worker-loop harness (`build_runtime_worker`, `spawn_test_worker`,
+//! the `continue_as_new_workflow` / child-round-trip handlers) that cannot be
+//! reproduced here without disproportionate scaffolding. `backfill` is only
+//! reachable through the plugin's `POST /admin/schedules/{id}/backfill` HTTP
+//! handler and is directly asserted in the plugin's `api_scheduler_integration`
+//! suite. See AC3 mapping in the PR / worker report for the full path→test table.
 
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
+use autumn_harvest::completion_trigger::{
+    CompletionTrigger, TerminalState, evaluate_triggers_for_execution, sync_completion_triggers,
+};
 use autumn_harvest::debounce::{AdmitDebounceParams, DebounceStartOptions, admit_debounced_start};
 use autumn_harvest::event_batch::{AdmitBatchParams, admit_batched_start};
 use autumn_harvest::execution::{
@@ -36,12 +48,18 @@ use autumn_harvest::execution::{
     signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
 };
+use autumn_harvest::info::{WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest::models::WorkflowExecution;
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::reset::{WorkflowResetRequest, reset_workflow_execution};
 use autumn_harvest::schema::harvest_workflow_executions;
-use autumn_harvest::shard::ShardedDbPool;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
 use autumn_harvest::throttle::{AdmitThrottleParams, ThrottleAdmission, reserve_or_defer};
 use autumn_harvest::types::{ExecutionId, ShardId, StartSource, UpdateId, WorkflowIdReusePolicy};
-use autumn_harvest::worker::DbPool;
+use autumn_harvest::worker::{DbPool, HandlerRegistry};
+use autumn_harvest::{
+    DagCatalog, SchedulerMonitor, WorkflowContext, register_workflow_schedules, tick_once,
+};
 
 use autumn_harvest::telemetry::NoOpMetrics;
 use diesel::prelude::*;
@@ -531,20 +549,262 @@ async fn batch_fire_defaults_to_batch_source() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// continue_as_new — own source, NEVER inherited from the predecessor (AC3 crux)
+// reset — own source, referencing the source execution (AC3)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// The worker's `persist_workflow_continue_as_new` is exercised end-to-end in the
-// e2e worker suite; here we assert the DIRECT insert contract: a successor row
-// created via the continue-as-new path records `continue_as_new`, referencing
-// the predecessor, regardless of the predecessor's own source. Driving the full
-// worker loop for this is covered by `integration_e2e`; this pure-core check
-// guards the column contract the successor insert must satisfy.
+// A reset fork is an operator intervention: `insert_fork_execution` must record
+// its OWN `reset` source and reference the source execution id — it must never
+// inherit the source run's provenance. Driven end-to-end through the public
+// `reset_workflow_execution` entrypoint: start a RUNNING run (which appends a
+// `WorkflowStarted` event at id 0), then fork at that boundary and inspect the
+// successor row.
+
+#[tokio::test]
+async fn reset_records_reset_source_referencing_source_execution() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    // A RUNNING source run whose OWN source is `api` — the fork must NOT inherit it.
+    let source_exec_id = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params(
+            "reset_wf",
+            "reset-wf-1",
+            source_exec_id,
+            StartSource::Api,
+            None,
+        ),
+        None,
+    )
+    .await
+    .expect("start source run");
+
+    // Fork at the WorkflowStarted boundary (event id 0).
+    let result = reset_workflow_execution(
+        &mut conn,
+        source_exec_id,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "provenance test".to_string(),
+            operator_id: "op-1".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
+            allow_terminal_source: false,
+        },
+        None,
+    )
+    .await
+    .expect("reset");
+
+    let fork = load_row(&mut conn, result.new_exec_id).await;
+    assert_eq!(
+        fork.start_source.as_deref(),
+        Some("reset"),
+        "a reset fork records its OWN `reset` source, never the source run's `api`"
+    );
+    assert_eq!(
+        fork.start_source_ref.as_deref(),
+        Some(source_exec_id.to_string().as_str()),
+        "the reset fork references the source execution id"
+    );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// reset — own source
+// schedule — scheduler tick, referencing the schedule id (AC3)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// `reset_workflow_execution` requires a terminal source execution with a full
-// event history to fork from; that setup is exercised in the reset integration
-// suite. The fork insert's `reset` own-source contract is asserted there.
+// A scheduler tick that fires a due slot inserts the run row synchronously (via
+// `start_or_load_workflow_execution`), so no worker needs to drain it: the row
+// exists with `start_source = schedule` and `start_source_ref = <schedule id>`
+// the instant `tick_once` returns.
+
+/// A trivial workflow handler — the scheduler tick only *inserts* the run row;
+/// the body is never executed here (no worker is run).
+fn noop_schedule_handler<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+> {
+    Box::pin(async move { Ok(json!(null)) })
+}
+
+fn schedule_registry(wf_name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: wf_name,
+            module: "start_source_tests",
+            handler,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ))
+}
+
+#[tokio::test]
+async fn schedule_tick_records_schedule_source_referencing_schedule_id() {
+    use autumn_harvest::schema::harvest_schedules;
+
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("conn");
+    scrub(&mut conn).await;
+    // Clear any residual schedule rows so we resolve the id unambiguously.
+    let _ = diesel::sql_query("DELETE FROM harvest_schedules")
+        .execute(&mut conn)
+        .await;
+
+    let wf_name = "sched_wf";
+    let registry = schedule_registry(wf_name, noop_schedule_handler);
+    let dags = Arc::new(DagCatalog::default());
+
+    // Register a 60s interval schedule, then force its next fire into the past.
+    let sched = WorkflowSchedule::new(wf_name, Schedule::Interval(Duration::from_secs(60)));
+    register_workflow_schedules(&mut conn, &[sched])
+        .await
+        .expect("register schedule");
+    diesel::update(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(wf_name)))
+        .set(harvest_schedules::next_run_at.eq(chrono::Utc::now() - chrono::Duration::seconds(300)))
+        .execute(&mut conn)
+        .await
+        .expect("arm slot");
+
+    // Resolve the schedule id for the ref assertion.
+    let schedule_id: uuid::Uuid = harvest_schedules::table
+        .filter(harvest_schedules::workflow_name.eq(wf_name))
+        .select(harvest_schedules::id)
+        .first(&mut conn)
+        .await
+        .expect("schedule id");
+
+    // A tick inserts the run row synchronously — no worker needed.
+    tick_once(
+        pool.clone(),
+        registry,
+        dags,
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick");
+
+    let rows: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("load rows");
+    assert_eq!(rows.len(), 1, "the tick should fire exactly one run");
+    assert_eq!(
+        rows[0].start_source.as_deref(),
+        Some("schedule"),
+        "a scheduler-tick start records the `schedule` source"
+    );
+    assert_eq!(
+        rows[0].start_source_ref.as_deref(),
+        Some(schedule_id.to_string().as_str()),
+        "the schedule-fired run references the schedule id"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// completion_trigger — inline target start, referencing the triggering run (AC3)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `evaluate_triggers_for_execution` fires a registered completion trigger,
+// starting the target run inline on the same shard with `start_source =
+// completion_trigger` and `start_source_ref = <triggering source exec id>`.
+
+#[tokio::test]
+async fn completion_trigger_records_completion_trigger_source_referencing_source() {
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let _ = diesel::sql_query("DELETE FROM harvest_completion_triggers")
+        .execute(&mut conn)
+        .await;
+
+    // The inline start path resolves the target shard via the global router.
+    install_global_router(ShardRouter::single());
+
+    // A terminal source run whose completion fires the trigger.
+    let source_exec_id = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params(
+            "ct_source",
+            "ct-source-1",
+            source_exec_id,
+            StartSource::Api,
+            None,
+        ),
+        None,
+    )
+    .await
+    .expect("start source run");
+
+    // Register a static trigger: ct_source COMPLETED → start ct_target.
+    sync_completion_triggers(
+        &mut conn,
+        &[CompletionTrigger::new("ct_source", "ct_target")],
+    )
+    .await
+    .expect("register trigger");
+
+    let deferred =
+        evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Completed, None)
+            .await
+            .expect("evaluate triggers");
+    assert!(
+        deferred.is_empty(),
+        "a same-shard trigger starts inline, not deferred: {deferred:?}"
+    );
+
+    let rows: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("ct_target"))
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("load target rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the trigger should start exactly one target run"
+    );
+    assert_eq!(
+        rows[0].start_source.as_deref(),
+        Some("completion_trigger"),
+        "a completion-trigger target start records the `completion_trigger` source"
+    );
+    assert_eq!(
+        rows[0].start_source_ref.as_deref(),
+        Some(source_exec_id.to_string().as_str()),
+        "the target run references the triggering (source) execution id"
+    );
+}

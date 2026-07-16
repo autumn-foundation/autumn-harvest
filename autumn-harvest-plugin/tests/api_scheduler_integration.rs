@@ -5141,6 +5141,85 @@ async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
     );
 }
 
+/// Issue #740 (AC3): a schedule backfill records the `backfill` source
+/// referencing the schedule id. Backfill is only reachable through this
+/// plugin HTTP handler (`POST /admin/schedules/{id}/backfill`), so this is the
+/// single direct assertion of the backfill provenance path. Driven with a
+/// non-throttled workflow schedule (the common backfill branch) whose runs are
+/// dispatched immediately, then inspected on the created execution rows.
+#[tokio::test]
+async fn backfill_records_backfill_source_referencing_schedule_id() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_provenance_wf";
+
+    // Isolate this workflow/schedule name on a possibly-shared DB.
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect for isolation scrub");
+        diesel::delete(
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(name)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("clear prior executions");
+        diesel::delete(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
+            .execute(&mut conn)
+            .await
+            .expect("clear prior schedule");
+    }
+
+    // Unlimited budget → every planned slot dispatches immediately.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    // A 1-hour hourly window → 2 candidate slots (10:00, 11:00), both dispatch.
+    let from = chrono::DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-06-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "backfill body: {body}");
+    assert!(
+        body["dispatched"].as_u64().unwrap() >= 1,
+        "at least one backfilled slot should dispatch, body: {body}"
+    );
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect for row read");
+    let rows: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(name))
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("load backfilled runs");
+    assert!(
+        !rows.is_empty(),
+        "a non-dry-run backfill should create execution rows"
+    );
+    for row in &rows {
+        assert_eq!(
+            row.start_source.as_deref(),
+            Some("backfill"),
+            "a backfilled run records the `backfill` source, not `api`"
+        );
+        assert_eq!(
+            row.start_source_ref.as_deref(),
+            Some(schedule.id.to_string().as_str()),
+            "a backfilled run references the schedule id"
+        );
+    }
+}
+
 /// Deterministic reserve-then-RELEASE proof (issue #688): every slot reserves a
 /// `max_runs` budget slot, enters the throttle block, hits the oversized-input
 /// guard, and releases the reservation. No slot ever dispatches, and the

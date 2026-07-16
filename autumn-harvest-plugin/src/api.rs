@@ -21761,6 +21761,10 @@ async fn schedule_backfill(
                     }
                 }
 
+                // Provenance for a non-throttled workflow backfill (issue #740):
+                // `backfill`, referencing the schedule id and the operator actor —
+                // matching the throttled branch above.
+                let schedule_id_str = schedule_id.to_string();
                 let result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -21817,9 +21821,9 @@ async fn schedule_backfill(
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                         completion_callbacks: None,
-                        start_source: autumn_harvest::StartSource::Api,
-                        start_source_ref: None,
-                        started_by: None,
+                        start_source: autumn_harvest::StartSource::Backfill,
+                        start_source_ref: Some(&schedule_id_str),
+                        started_by: Some(actor.as_str()),
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
@@ -22071,6 +22075,9 @@ async fn schedule_backfill(
                     }
                 }
 
+                // Provenance for a non-throttled DAG backfill (issue #740):
+                // `backfill`, referencing the schedule id and the operator actor.
+                let schedule_id_str = schedule_id.to_string();
                 let start_result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
@@ -22114,9 +22121,9 @@ async fn schedule_backfill(
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                         completion_callbacks: None,
-                        start_source: autumn_harvest::StartSource::Api,
-                        start_source_ref: None,
-                        started_by: None,
+                        start_source: autumn_harvest::StartSource::Backfill,
+                        start_source_ref: Some(&schedule_id_str),
+                        started_by: Some(actor.as_str()),
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
