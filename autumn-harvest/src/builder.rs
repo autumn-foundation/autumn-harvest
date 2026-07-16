@@ -3304,6 +3304,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn harvest_builder_passes_history_policy_to_worker_registry() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .history_continue_as_new_threshold(9)
             .history_event_hard_cap(11)
@@ -3327,6 +3335,14 @@ mod tests {
     #[test]
     fn harvest_builder_wires_activity_defaults_into_worker_registry() {
         use crate::policy::RetryPolicy;
+
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let built = HarvestBuilder::new()
             .worker(
@@ -3363,6 +3379,15 @@ mod tests {
     #[test]
     fn harvest_builder_extra_state_wires_activity_defaults_into_worker_registry() {
         use crate::policy::RetryPolicy;
+
+        // `into_worker_parts_with_extra_state` unconditionally writes the
+        // process-global start-idempotency sweep window; serialize against the
+        // sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let built = HarvestBuilder::new()
             .worker(
@@ -3424,6 +3449,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn built_harvest_into_worker_parts_preserves_shared_state() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .workflows(vec![fake_workflow_info()])
             .activities(vec![ActivityInfo {
