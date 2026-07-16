@@ -213,6 +213,12 @@ async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn webhook_start_records_webhook_source() {
+    #[derive(diesel::QueryableByName)]
+    struct SourceRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        start_source: Option<String>,
+    }
+
     let _ = tracing_subscriber::fmt::try_init();
 
     let db = TestDb::shared().await;
@@ -255,11 +261,6 @@ async fn webhook_start_records_webhook_source() {
     resp.assert_status(202);
 
     let mut conn = db.pool().get().await.expect("pool conn");
-    #[derive(diesel::QueryableByName)]
-    struct SourceRow {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        start_source: Option<String>,
-    }
     let row: SourceRow = diesel::sql_query(
         "SELECT start_source FROM harvest_workflow_executions WHERE workflow_name = 'order_flow' LIMIT 1",
     )
