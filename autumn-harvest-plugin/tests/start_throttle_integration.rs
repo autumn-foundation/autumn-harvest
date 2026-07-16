@@ -1359,10 +1359,15 @@ async fn batch_bypass_uses_start_will_create_predicate_not_bare_existence() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "batch request: {body:?}");
-    assert_ne!(
+    assert_eq!(
         body["results"][0]["status"],
         json!("rejected"),
-        "an AllowDuplicate attach to a COMPLETED prior must bypass the gate, not be rejected: {body:?}"
+        "an AllowDuplicate attach to a COMPLETED prior must be rejected as an idempotent re-attach without gate admission: {body:?}"
+    );
+    assert_eq!(
+        body["results"][0]["error"],
+        json!("workflow_id 'batch-predicate-job' already has an existing execution"),
+        "the rejection must be the idempotent-attach rejection, not the gate rejection"
     );
     assert_eq!(
         execution_count(&mut conn, "plain_job").await,
