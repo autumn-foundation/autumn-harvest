@@ -14845,43 +14845,73 @@ async fn update_with_start_workflow(
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
 
-    // Run the registered update handler's validator (if any) before admitting.
+    // Resolve the registered update handler once and reuse it for both the
+    // #610 schema-400 check and the #684 validator-422 check, mirroring the
+    // plain `admit_update` route so the two entry points stay consistent.
     if let Some(update_info) = runtime
         .registry
         .update_handlers
         .iter()
         .find(|h| h.workflow == workflow_name && h.name == request.update_name)
-        && let Some(validator) = update_info.validator
-        && let Err(reason) = (validator)(&update_args)
     {
+        // issue #610: structural schema validation of the update argument
+        // against the handler's published `arg_schema` (if any). Runs *before*
+        // the semantic validator below so a malformed payload is rejected at
+        // the edge with a field-level 400 rather than reaching the validator
+        // (422) or becoming durable history. A handler with no published schema
+        // validates Ok (today's behavior, unchanged). Closes the bypass where
+        // `update-with-start` durably admitted an unvalidated payload while the
+        // plain `admit_update` route already gated it.
+        if let Err(violations) = update_info.validate_arg(&update_args) {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("update payload validation failed"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return schema_validation_response("update payload validation failed", violations);
+        }
+
         // Issue #684: a durable pre-admission validator rejection.
-        runtime
-            .registry
-            .telemetry()
-            .metrics
-            .record_update_rejected(&workflow_name, &request.update_name);
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_UPDATE_WITH_START,
-            target_type: TARGET_WORKFLOW,
-            target_id: None,
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: request.idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some("update validator rejected"),
-            shard_id: Some(shard.as_i32()),
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "update rejected by validator",
-                "reason": reason,
-            })),
-        )
-            .into_response();
+        if let Some(validator) = update_info.validator
+            && let Err(reason) = (validator)(&update_args)
+        {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_update_rejected(&workflow_name, &request.update_name);
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("update validator rejected"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "update rejected by validator",
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let params = UpdateWithStartParams {
@@ -28670,46 +28700,45 @@ pub(crate) async fn admit_update(
     // different workflows may register update handlers with the same name.
     let execution_for_validation = load_execution(&mut conn, exec_id).await;
 
-    // issue #610: structural schema validation of the update argument against
-    // the handler's published `arg_schema` (if any). Runs *before* the semantic
-    // validator below so a malformed payload is rejected at the edge with a
-    // field-level 400 rather than reaching the validator (422) or becoming
-    // durable history. A handler with no published schema validates Ok (today's
-    // behavior, unchanged). Scoped by (workflow_name, update_name).
+    // Resolve the registered update handler once and reuse it for both the
+    // #610 schema-400 check and the #684 validator-422 check. Scoped by
+    // (workflow_name, update_name), not update_name alone, since two different
+    // workflows may register update handlers with the same name.
     if let Ok(execution) = &execution_for_validation
         && let Some(update_info) = runtime
             .registry
             .update_handlers
             .iter()
             .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
-        && let Err(violations) = update_info.validate_arg(&request.input)
     {
-        return schema_validation_response("update payload validation failed", violations);
-    }
+        // issue #610: structural schema validation of the update argument
+        // against the handler's published `arg_schema` (if any). Runs *before*
+        // the semantic validator below so a malformed payload is rejected at
+        // the edge with a field-level 400 rather than reaching the validator
+        // (422) or becoming durable history. A handler with no published schema
+        // validates Ok (today's behavior, unchanged).
+        if let Err(violations) = update_info.validate_arg(&request.input) {
+            return schema_validation_response("update payload validation failed", violations);
+        }
 
-    if let Ok(execution) = &execution_for_validation
-        && let Some(update_info) = runtime
-            .registry
-            .update_handlers
-            .iter()
-            .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
-        && let Some(validator) = update_info.validator
-        && let Err(reason) = (validator)(&request.input)
-    {
         // Issue #684: a durable pre-admission validator rejection.
-        runtime
-            .registry
-            .telemetry()
-            .metrics
-            .record_update_rejected(&execution.workflow_name, &update_name);
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "update rejected by validator",
-                "reason": reason,
-            })),
-        )
-            .into_response();
+        if let Some(validator) = update_info.validator
+            && let Err(reason) = (validator)(&request.input)
+        {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_update_rejected(&execution.workflow_name, &update_name);
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "update rejected by validator",
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let update_id = UpdateId::new();
