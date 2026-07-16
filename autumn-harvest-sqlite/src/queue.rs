@@ -35,7 +35,7 @@
 
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{ActivityExecId, ExecutionId};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -85,23 +85,34 @@ pub struct ClaimedTask {
     /// Unlike [`Self::run_at`-mutating retries], it always denotes when the activity
     /// was first scheduled, so a wait for LATE registration cannot extend the budget.
     pub scheduled_at: i64,
-    /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond.
-    /// **Resolved at CLAIM time**, not read from the DB and not carried on the
-    /// `ScheduleActivity` command (issue #378, Codex #1069 P2 `runtime.rs:944`):
-    /// [`claim_next_ready_task`] leaves it `None`, and
-    /// [`drain_ready`](crate::worker::drain_ready) fills it from the now-guaranteed
-    /// registered `ActivitySpec`'s `default_schedule_to_close` anchored to
-    /// [`Self::scheduled_at`] — exactly as the Postgres worker resolves `ActivityInfo`
-    /// from its `HandlerRegistry` at claim. Resolving at claim (not schedule) time is
-    /// what preserves the deadline for a LATE-registered activity (whose spec was
-    /// absent at schedule time). `Some(at)` = the whole activity (all attempts +
-    /// back-off sleeps combined) must finish before `at`; `None` = no total deadline
-    /// (the activity has no declared `schedule_to_close`, or was raw-registered).
-    /// Enforced by the worker: a task drained at/after `at`, or a retry whose next
-    /// attempt would land at/after `at`, records a terminal
-    /// `ActivityTimedOut { ScheduleToClose }` instead of running/retrying —
-    /// byte-equivalent to the Postgres `schedule_to_close_deadline_exceeded` path.
+    /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond,
+    /// **read from the frozen `schedule_to_close_at` column** (issue #1068). For a
+    /// FROZEN task (`defaults_frozen == true`) this is the immutable value resolved
+    /// once at schedule/claim time; for an UNFROZEN task it is whatever is currently
+    /// on the row (`None` until the worker resolves it from the registered spec,
+    /// anchored to [`Self::scheduled_at`], and freezes it — mirroring the Postgres
+    /// worker resolving `ActivityInfo` from its `HandlerRegistry`). `Some(at)` = the
+    /// whole activity (all attempts + back-off sleeps combined) must finish before
+    /// `at`; `None` = no total deadline (the activity has no declared
+    /// `schedule_to_close`, or was raw-registered). Enforced by the worker: a task
+    /// drained at/after `at`, or a retry whose next attempt would land at/after `at`,
+    /// records a terminal `ActivityTimedOut { ScheduleToClose }` instead of
+    /// running/retrying — byte-equivalent to the Postgres
+    /// `schedule_to_close_deadline_exceeded` path.
     pub schedule_to_close_at: Option<i64>,
+    /// Whether this task's four resolved-default scalars (`retry_policy`,
+    /// `max_attempts`, `start_to_close_ms`, `schedule_to_close_at`) are FROZEN on the
+    /// row (issue #1068). `true` = they were resolved once (at schedule time when the
+    /// activity was already registered, or at first claim for a late-registered one)
+    /// and persisted — the worker reads them VERBATIM and never re-consults the
+    /// mutable registry for them, so an in-flight activity's retry/deadline contract
+    /// is immutable across a crash/reopen or a re-registration under a changed spec.
+    /// `false` = not yet resolved (the activity was scheduled before its
+    /// body/`ActivityInfo` was registered): the worker resolves the four fields from
+    /// the now-present spec, persists them via [`freeze_task_defaults`], and sets this
+    /// to `true`. The activity BODY is always resolved from the registry regardless —
+    /// only the policy/deadline scalars are frozen.
+    pub defaults_frozen: bool,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -156,14 +167,16 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 /// persists it so the worker honors backoff timing + non-retryable classification;
 /// `None` for the raw path (immediate requeue, no policy list).
 ///
-/// The activity's total (cross-retry) `schedule_to_close` deadline is deliberately
-/// **not** a parameter here (issue #378, Codex #1069 P2 `runtime.rs:944`): it is not
-/// carried on the `ScheduleActivity` command, and resolving it here (at schedule
-/// time) from the backend registry would silently DROP it for an activity scheduled
-/// before its body/`ActivityInfo` was registered. Instead the initial `run_at` is
-/// also recorded as the stable `scheduled_at` anchor, and
-/// [`drain_ready`](crate::worker::drain_ready) resolves the deadline from the
-/// registered spec at CLAIM time (when the body is guaranteed present).
+/// `schedule_to_close_at` is the FROZEN absolute (epoch-millisecond) total
+/// (cross-retry) deadline (issue #1068): `Some(at)` when the activity is registered
+/// at schedule time and declares a `schedule_to_close` (`scheduled_at +
+/// default_schedule_to_close`), `None` otherwise. `defaults_frozen` records whether
+/// the four resolved-default scalars are frozen on this row (`true` when the caller
+/// resolved them from the registered spec at schedule time; `false` when the
+/// activity was scheduled before it was registered, so the worker resolves and
+/// freezes them at first claim). The initial `run_at` is also recorded as the stable
+/// `scheduled_at` anchor so the frozen deadline is always measured from when the
+/// activity was first scheduled, never mutated by a retry requeue.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
@@ -176,13 +189,16 @@ pub fn enqueue_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+    defaults_frozen: bool,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
         "INSERT INTO harvest_tasks \
          (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
-          max_attempts, retry_policy_json, start_to_close_ms, scheduled_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7)",
+          max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, \
+          schedule_to_close_at, defaults_frozen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7, ?12, ?13)",
         params![
             uuid::Uuid::new_v4().to_string(),
             exec_id.to_string(),
@@ -195,24 +211,85 @@ pub fn enqueue_activity(
             max_attempts.map(i64::from),
             retry_policy_json,
             start_to_close_ms,
+            schedule_to_close_at,
+            i64::from(defaults_frozen),
         ],
     )?;
     Ok(())
 }
 
-/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id`,
-/// flipping it to `RUNNING` inside a `BEGIN IMMEDIATE` transaction. See the
-/// module docs for why this replaces `SKIP LOCKED`.
-pub fn claim_next_ready_task(
+/// Freeze the four resolved-default scalars onto a task row and set
+/// `defaults_frozen = 1` (issue #1068).
+///
+/// Called by [`drain_ready`](crate::worker::drain_ready) at CLAIM time for a task
+/// that was scheduled before its activity was registered (`defaults_frozen == 0`):
+/// once the body/`ActivityInfo` is present, the worker resolves `retry_policy_json`,
+/// `max_attempts`, `start_to_close_ms`, and the absolute `schedule_to_close_at` from
+/// the registered spec, persists them here, and reads them verbatim thereafter — so
+/// a later claim (crash/reopen, or a re-registration under a changed spec) sees the
+/// SAME values rather than re-resolving against a mutated registry. A single
+/// `UPDATE` scoped to `task_id`, run **inside the caller's open claim transaction**
+/// (issue #1068; Codex #1080 P2) — `conn` here is the still-open `BEGIN IMMEDIATE`
+/// claim transaction (a `&Transaction` deref-coerces to `&Connection`), NOT a fresh
+/// autocommit connection, so this freeze and the claim's `RUNNING` flip commit
+/// atomically (or roll back together if either fails). A `None` argument is written
+/// as SQL `NULL` (= "resolved to no value"), which the frozen claim path reads back
+/// as `None`.
+pub fn freeze_task_defaults(
+    conn: &Connection,
+    task_id: &str,
+    retry_policy_json: Option<&str>,
+    max_attempts: Option<u32>,
+    start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET retry_policy_json = ?2, max_attempts = ?3, \
+         start_to_close_ms = ?4, schedule_to_close_at = ?5, defaults_frozen = 1 \
+         WHERE task_id = ?1",
+        params![
+            task_id,
+            retry_policy_json,
+            max_attempts.map(i64::from),
+            start_to_close_ms,
+            schedule_to_close_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id`, flipping
+/// it to `RUNNING` inside a `BEGIN IMMEDIATE` transaction — and return the STILL-OPEN
+/// transaction so the caller can freeze the task's resolved defaults in the SAME
+/// transaction before committing (issue #1068; Codex #1080 P2). See the module docs
+/// for why this replaces `SKIP LOCKED`.
+///
+/// The returned transaction is NOT committed. The caller (`worker::drain_ready`)
+/// resolves the activity's registered spec and, for an UNFROZEN (late-registered)
+/// task, calls [`freeze_task_defaults`] through the same transaction, then commits —
+/// so the `RUNNING` flip and the default-freeze commit ATOMICALLY. This closes the
+/// gap where the old (self-committing) claim left a committed `RUNNING`+unfrozen row:
+/// a crash between the claim commit and a SEPARATE freeze commit could then be
+/// reclaimed `PENDING` (still unfrozen) and re-frozen against a CHANGED registry,
+/// silently altering an "already-claimed" late-registered task's frozen contract. If
+/// the caller instead DROPS the transaction (an unregistered activity, or a crash
+/// before commit), the whole claim rolls back and the row stays `PENDING` — no
+/// orphaned `RUNNING` row, and nothing for a reopen to mis-handle.
+///
+/// The `Transaction` is held only across the caller's spec lookup + freeze (a hash
+/// lookup + a pure resolution + one `UPDATE`) — never across the activity BODY, which
+/// runs after the caller commits — so the write lock is held for microseconds.
+pub fn claim_next_ready_task_tx(
     conn: &mut Connection,
     exec_id: ExecutionId,
     now: i64,
-) -> SqliteResult<Option<ClaimedTask>> {
+) -> SqliteResult<Option<(Transaction<'_>, ClaimedTask)>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
-             retry_policy_json, start_to_close_ms, scheduled_at \
+             retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
+             defaults_frozen \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -227,6 +304,8 @@ pub fn claim_next_ready_task(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
                     row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )
@@ -242,8 +321,11 @@ pub fn claim_next_ready_task(
         retry_policy_json,
         start_to_close_ms,
         scheduled_at,
+        schedule_to_close_at,
+        defaults_frozen,
     )) = row
     else {
+        // No ready task — commit the empty read tx to release the lock cleanly.
         tx.commit()?;
         return Ok(None);
     };
@@ -261,13 +343,14 @@ pub fn claim_next_ready_task(
         .map(serde_json::from_str::<RetryPolicy>)
         .transpose()?;
 
+    // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
+    // (for a late-registered task) in this SAME transaction, then commits both.
     tx.execute(
         "UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1",
         params![task_id],
     )?;
-    tx.commit()?;
 
-    Ok(Some(ClaimedTask {
+    let task = ClaimedTask {
         task_id,
         activity_id,
         name,
@@ -277,33 +360,14 @@ pub fn claim_next_ready_task(
         retry_policy,
         start_to_close_ms,
         scheduled_at,
-        // Resolved at CLAIM time by `drain_ready` from the now-guaranteed registered
-        // spec anchored to `scheduled_at` (issue #378, Codex #1069 P2 `runtime.rs:944`)
-        // — NOT stored on the row and NOT known here, so `None` until the worker fills
-        // it. Resolving at claim (vs schedule) time preserves the deadline for a
-        // LATE-registered activity whose spec was absent at schedule time.
-        schedule_to_close_at: None,
-    }))
-}
-
-/// Release a just-claimed (`RUNNING`) task back to `PENDING` **without** consuming
-/// an attempt or advancing `run_at` — the body never ran.
-///
-/// The claim-release primitive for the unregistered-activity path (Codex #1069
-/// P2). [`claim_next_ready_task`] commits a task to `RUNNING` *before* the caller
-/// resolves the handler; if the activity name has no registered body, leaving the
-/// row `RUNNING` would strand it (invisible to a later drain, which only re-claims
-/// `PENDING` rows) until a full DB close+reopen ran [`reclaim_orphaned_running`].
-/// Releasing it here lets a later drain re-claim it once the body is registered,
-/// with no reopen. Scoped to one task and guarded on `state = 'RUNNING'` so it is a
-/// no-op against an already-finalized row; mirrors the shape of
-/// [`reclaim_orphaned_running`].
-pub fn release_claim(conn: &Connection, task_id: &str) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING' WHERE task_id = ?1 AND state = 'RUNNING'",
-        params![task_id],
-    )?;
-    Ok(())
+        // Read straight from the row (issue #1068). For a frozen task this is the
+        // immutable resolved deadline; for an unfrozen task it is whatever is on the
+        // row (`None` until the worker resolves and freezes it from the now-present
+        // registered spec, anchored to `scheduled_at`).
+        schedule_to_close_at,
+        defaults_frozen: defaults_frozen != 0,
+    };
+    Ok(Some((tx, task)))
 }
 
 /// Mark a task terminally done (success or exhausted retries).
@@ -333,7 +397,7 @@ pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<Strin
 /// workflow suspended and neither a command nor a drain made progress this cycle),
 /// any `PENDING` activity task is necessarily one BACKING OFF with a future
 /// `run_at`: a `PENDING` task whose `run_at <= now` would already have been claimed
-/// and run by [`claim_next_ready_task`] in this cycle's `drain_ready` pass. A
+/// and run by [`claim_next_ready_task_tx`] in this cycle's `drain_ready` pass. A
 /// delayed retry (`run_at = now + backoff`, issue #1069 P2, Codex `runtime.rs:985`)
 /// is therefore a genuine time-based block — the driver returns
 /// [`RunState::WaitingTimer`](crate::RunState) (a no-progress state) so a poll
@@ -348,7 +412,13 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
     Ok(exists)
 }
 
-/// Requeue a task for another attempt at `run_at`, recording the consumed attempt.
+/// Requeue a task for another attempt at `run_at`, recording the consumed
+/// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
+/// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
+/// (its future `run_at` keeps it out of `claim_next_ready_task_tx`'s `run_at <= now`
+/// window this pass), so keeping its low `seq` is correct and leaves existing
+/// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
+/// [`requeue_task_to_back`] instead.
 pub fn requeue_task(
     conn: &Connection,
     task_id: &str,
@@ -362,6 +432,38 @@ pub fn requeue_task(
     Ok(())
 }
 
+/// Requeue a task for another attempt at `run_at`, moving it to the **BACK** of
+/// the ready queue by assigning it a fresh, highest `seq` (issue #1068, hardening
+/// item 3).
+///
+/// This is the fairness variant of [`requeue_task`], for an IMMEDIATE (zero-delay)
+/// retry — one whose `run_at <= now`, so the just-failed task would otherwise be
+/// re-claimable in the SAME drain pass. Because [`claim_next_ready_task_tx`] selects
+/// the oldest ready task (`ORDER BY seq LIMIT 1`), keeping the failed task's
+/// ORIGINAL (lower) `seq` would let it re-select itself before any ready SIBLING
+/// gets a turn — a low-index `ctx.race()` branch that fails-and-retries with zero
+/// delay could then monopolize the drain and settle the race before a faster
+/// sibling ever runs. Assigning a fresh `MAX(seq) + 1` (the same monotonic
+/// allocator [`enqueue_activity`] uses via [`next_task_seq`]) sorts the requeued
+/// task AFTER every currently-queued task, so the claim loop yields to every other
+/// ready sibling before returning to it — round-robin fairness. Outside a race a
+/// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
+/// simply re-claimed immediately anyway.
+pub fn requeue_task_to_back(
+    conn: &Connection,
+    task_id: &str,
+    attempt: u32,
+    run_at: i64,
+) -> SqliteResult<()> {
+    let seq = next_task_seq(conn)?;
+    conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4 \
+         WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, seq],
+    )?;
+    Ok(())
+}
+
 /// Cancel a still-open (`PENDING`/`RUNNING`) activity task by its `activity_id`,
 /// flipping it to `CANCELLED`. Returns `true` iff a row was actually cancelled.
 ///
@@ -371,7 +473,7 @@ pub fn requeue_task(
 /// genuinely completed first (a real completion raced the cancellation) is
 /// already `DONE`, matches nothing, and returns `false` — so its real terminal
 /// event is never shadowed by a synthetic one. A `CANCELLED` row is terminal for
-/// this queue: [`claim_next_ready_task`] only selects `state = 'PENDING'`, so a
+/// this queue: [`claim_next_ready_task_tx`] only selects `state = 'PENDING'`, so a
 /// cancelled loser is never re-run.
 pub fn cancel_activity_task(conn: &Connection, activity_id: ActivityExecId) -> SqliteResult<bool> {
     let n = conn.execute(
@@ -512,6 +614,38 @@ pub fn delete_pending_timer(
         params![exec_id.to_string(), timer_id],
     )?;
     Ok(n > 0)
+}
+
+/// Delete every PENDING task row for an execution (issue #1068) — used by the
+/// reuse-policy `TerminateIfRunning` case when it seals a still-RUNNING prior, so
+/// no orphan task can be claimed against a run that will never be driven again.
+/// Returns the number of rows deleted. DONE/RUNNING rows are left untouched: in
+/// the single-writer runtime no drive is in flight during a start call (a crashed
+/// mid-claim RUNNING row is reset to PENDING by the orphan reclaim on open), so
+/// PENDING is exactly the set of claimable orphans.
+pub fn delete_pending_tasks_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'",
+        params![exec_id.to_string()],
+    )?)
+}
+
+/// Delete every unfired timer row for an execution (issue #1068) — companion to
+/// [`delete_pending_tasks_for_execution`] for the `TerminateIfRunning` seal, so a
+/// durable timer armed by the sealed prior cannot fire against a run that will
+/// never be driven again. Returns the number of rows deleted. Fired timer rows are
+/// left untouched (they are inert audit history).
+pub fn delete_unfired_timers_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
+        params![exec_id.to_string()],
+    )?)
 }
 
 #[cfg(test)]

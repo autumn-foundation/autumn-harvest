@@ -75,6 +75,26 @@ pub enum SqliteError {
         cap_bytes: u64,
     },
 
+    /// A start carrying the [`RejectDuplicate`](autumn_harvest::WorkflowIdReusePolicy::RejectDuplicate)
+    /// reuse policy collided with an existing, non-sealed execution for the same
+    /// `(workflow_name, workflow_id)` key (issue #1068). Mirrors the Postgres core
+    /// start path's [`HarvestError::AlreadyExists`](autumn_harvest::HarvestError::AlreadyExists):
+    /// the second request is refused rather than attaching a signal / silently
+    /// returning the prior, so the caller can decide what to do. A prior in a
+    /// SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to the reuse
+    /// check and never triggers this — matching core's uniqueness-index-excludes-
+    /// terminal nuance.
+    #[error(
+        "workflow execution already exists for this (workflow_name, workflow_id) key: \
+         {existing_exec_id} (state: {existing_state})"
+    )]
+    AlreadyExists {
+        /// The existing (non-sealed) execution the start collided with.
+        existing_exec_id: ExecutionId,
+        /// Its current state — `RUNNING`, `COMPLETED`, or `FAILED`.
+        existing_state: String,
+    },
+
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
