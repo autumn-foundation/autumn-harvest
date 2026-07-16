@@ -129,13 +129,19 @@ async fn run_app(
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if event::poll(timeout).unwrap_or(false)
-            && let Event::Key(key) = event::read().unwrap()
-            && (key.code == KeyCode::Char('q')
-                || (key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')))
-        {
-            return Ok(());
+        if event::poll(timeout).unwrap_or(false) {
+            let evt = event::read().map_err(|e| CliError::ReadJson {
+                label: "read terminal event",
+                path: "terminal".to_string(),
+                source: e,
+            })?;
+            if let Event::Key(key) = evt
+                && (key.code == KeyCode::Char('q')
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')))
+            {
+                return Ok(());
+            }
         }
     }
 }
