@@ -92,6 +92,7 @@ fn build_client() -> TestClient {
         &descriptors,
         &HarvestApiState::new(),
         None,
+        false,
     );
     TestApp::new().routes(routes).mount_mcp("/mcp").build()
 }
@@ -281,7 +282,7 @@ async fn tool_routes_coexist_with_the_nested_management_router() {
     let descriptors = collect_descriptors(&workflows, &[], &[]);
     record_schemas(&descriptors);
     let api_state = HarvestApiState::new();
-    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None);
+    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None, false);
 
     let client = TestApp::new()
         .routes(routes)
@@ -385,6 +386,7 @@ fn build_dag_client() -> TestClient {
         &descriptors,
         &HarvestApiState::new(),
         None,
+        false,
     );
     TestApp::new().routes(routes).mount_mcp("/mcp").build()
 }
@@ -431,4 +433,208 @@ async fn dag_start_tool_call_dispatches_through_the_dag_trigger_pipeline() {
         text.contains("harvest runtime is not started"),
         "pre-startup DAG start calls must fail closed on harvest's runtime check, got: {text}"
     );
+}
+
+// ── Read-only operator role × MCP tool routes (issue #776, F1) ────────────────
+//
+// The generated MCP tool routes are registered app-level (outside the nested
+// management router that carries the `enforce_read_only_class` layer), so
+// without a per-route gate a read-only principal could START / SIGNAL / UPDATE
+// / DAG-start a workflow through a tool. `build_mcp_tool_routes(role_auth=true)`
+// installs `enforce_read_only_mcp_mutation` on every mutating tool. These
+// tests drive each generated tool route directly (a read-only `Session`
+// injected into request extensions, exactly as the embedder auth middleware
+// would populate it) and assert the class boundary. A `403` is produced ONLY
+// by the gate (the handlers themselves return 400/404/503 when the runtime is
+// absent, never 403), so `status == 403` ⟺ the gate fired.
+
+use autumn_harvest_plugin::mcp_tools::tool_route_specs;
+use autumn_web::AppState;
+use autumn_web::reexports::axum::Router;
+use autumn_web::reexports::axum::body::{Body, to_bytes};
+use autumn_web::reexports::http::{Method, Request, StatusCode};
+use autumn_web::session::Session;
+use std::collections::{HashMap, HashSet};
+use tower::ServiceExt;
+
+const MCP_PREFIX: &str = "/api/harvest/mcp";
+
+fn readonly_session() -> Session {
+    let mut d = HashMap::new();
+    d.insert("role".to_string(), "harvest_readonly".to_string());
+    Session::new_for_test("ro".to_string(), d)
+}
+
+fn admin_session() -> Session {
+    let mut d = HashMap::new();
+    d.insert("role".to_string(), "admin".to_string());
+    Session::new_for_test("admin".to_string(), d)
+}
+
+/// Replace every `{param}` segment with a non-empty placeholder so the concrete
+/// path routes to its own template. `bogus` is not a valid execution id, so
+/// handle-taking read handlers fail fast (400) with no DB access.
+fn concrete(path: &str) -> String {
+    path.split('/')
+        .map(|s| {
+            if s.starts_with('{') && s.ends_with('}') {
+                "bogus"
+            } else {
+                s
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The full descriptor set exercised: a plain mcp workflow with an mcp update,
+/// plus (under `unified-dag-execution`) an mcp DAG.
+fn all_descriptors() -> Vec<autumn_harvest_plugin::mcp_tools::McpWorkflowDescriptor> {
+    let mut workflows =
+        vec![__autumn_workflow_info_order_flow().with_input_schema_fn(order_input_schema)];
+    let updates = vec![__autumn_update_handler_info_approve()];
+    #[cfg(feature = "unified-dag-execution")]
+    let dags = vec![__autumn_dag_info_daily_etl_dag()];
+    #[cfg(not(feature = "unified-dag-execution"))]
+    let dags: Vec<DagInfo> = vec![];
+    #[cfg(feature = "unified-dag-execution")]
+    workflows.push(__autumn_workflow_info_daily_etl_dag());
+    collect_descriptors(&workflows, &updates, &dags)
+}
+
+/// Set of route paths whose tool is a mutation ([`ToolKind::is_mutation`]).
+fn mutation_paths(
+    descriptors: &[autumn_harvest_plugin::mcp_tools::McpWorkflowDescriptor],
+) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for d in descriptors {
+        for spec in tool_route_specs(MCP_PREFIX, d) {
+            if spec.kind.is_mutation() {
+                set.insert(spec.path.clone());
+            }
+        }
+    }
+    set
+}
+
+/// `(Method, concrete_path)` for one generated tool route.
+type RouteMeta = Vec<(Method, String)>;
+
+/// Build a raw axum router from the generated tool routes (exactly what
+/// `AppBuilder::routes(routes)` does inside `Plugin::build`, minus the app
+/// scaffolding), so a `Session` can be injected per request. Returns the app
+/// plus the mutating and read `(Method, concrete_path)` sets.
+fn build_router(role_auth_enabled: bool) -> (Router, RouteMeta, RouteMeta) {
+    let descriptors = all_descriptors();
+    record_schemas(&descriptors);
+    let muts = mutation_paths(&descriptors);
+    let tool_routes = build_mcp_tool_routes(
+        MCP_PREFIX,
+        &descriptors,
+        &HarvestApiState::new(),
+        None,
+        role_auth_enabled,
+    );
+
+    let mut app: Router<AppState> = Router::new();
+    let mut mutating = Vec::new();
+    let mut reading = Vec::new();
+    for route in tool_routes {
+        let entry = (route.method.clone(), concrete(route.path));
+        if muts.contains(route.path) {
+            mutating.push(entry);
+        } else {
+            reading.push(entry);
+        }
+        app = app.route(route.path, route.handler);
+    }
+    (app.with_state(AppState::for_test()), mutating, reading)
+}
+
+async fn drive(
+    app: &Router,
+    method: &Method,
+    uri: &str,
+    session: Option<Session>,
+) -> (StatusCode, String) {
+    let mut req = Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    if let Some(s) = session {
+        req.extensions_mut().insert(s);
+    }
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn readonly_principal_is_denied_mutating_mcp_tools_but_reaches_reads() {
+    let (app, mutating, reading) = build_router(true);
+    assert!(
+        !mutating.is_empty() && !reading.is_empty(),
+        "sanity: both mutating and read MCP tools present"
+    );
+
+    // A read-only principal → 403 on every mutating tool (start/signal/update/
+    // dag-start), with the distinguishable denial body.
+    for (method, path) in &mutating {
+        let (status, body) = drive(&app, method, path, Some(readonly_session())).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-only principal must be 403'd on mutating MCP tool {method} {path}"
+        );
+        assert!(
+            body.contains("read-only principal: mutation not permitted"),
+            "gate 403 must carry the distinguishable marker, got: {body}"
+        );
+    }
+
+    // A read-only principal → NOT 403 on read tools (status/watch): the gate is
+    // only installed on mutations, so the handler runs (and fails fast on the
+    // bogus handle without a DB).
+    for (method, path) in &reading {
+        let (status, _) = drive(&app, method, path, Some(readonly_session())).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-only principal must reach read MCP tool {method} {path}"
+        );
+    }
+
+    // Admin and unmarked principals are never gated (reach every tool).
+    for (method, path) in mutating.iter().chain(reading.iter()) {
+        let (admin, _) = drive(&app, method, path, Some(admin_session())).await;
+        assert_ne!(
+            admin,
+            StatusCode::FORBIDDEN,
+            "admin principal must reach MCP tool {method} {path}"
+        );
+        let (anon, _) = drive(&app, method, path, None).await;
+        assert_ne!(
+            anon,
+            StatusCode::FORBIDDEN,
+            "unmarked principal must reach MCP tool {method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn role_auth_off_leaves_mcp_tools_ungated() {
+    // AC6: without `api_with_role_auth`, no gate is installed — even a read-only
+    // principal reaches every MCP tool (the routes are byte-for-byte the pre-
+    // #776 shape).
+    let (app, mutating, reading) = build_router(false);
+    for (method, path) in mutating.iter().chain(reading.iter()) {
+        let (status, _) = drive(&app, method, path, Some(readonly_session())).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "role-auth OFF: read-only principal must reach MCP tool {method} {path}"
+        );
+    }
 }

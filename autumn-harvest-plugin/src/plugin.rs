@@ -99,6 +99,11 @@ pub(crate) type McpToolMiddlewareFn = std::sync::Arc<
 ///     .await;
 /// # }
 /// ```
+// Each bool is an independent, orthogonal opt-in mirrored onto HarvestApiState
+// (mcp tools, read-path decode, read-only role, metrics scrape); they are not a
+// state machine that a bitfield/enum would model better. The count crosses the
+// clippy threshold only under the `metrics` feature.
+#[allow(clippy::struct_excessive_bools)]
 pub struct HarvestPlugin {
     builder: HarvestBuilder,
     api_path: Option<String>,
@@ -116,6 +121,10 @@ pub struct HarvestPlugin {
     /// Deployment-level opt-in for operator read-path payload decoding
     /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
     decode_payloads_on_read: bool,
+    /// Opt-in for the read-only operator role (issue #776). Set true by
+    /// [`Self::api_with_role_auth`]; installs the class-aware enforcement
+    /// layer. Default off — the router is byte-for-byte unchanged.
+    role_auth_enabled: bool,
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
     status_thresholds: crate::status_summary::StatusThresholds,
@@ -147,6 +156,7 @@ impl HarvestPlugin {
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
             decode_payloads_on_read: false,
+            role_auth_enabled: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
@@ -261,6 +271,64 @@ impl HarvestPlugin {
             method_router.layer(mcp_middleware.clone())
         }));
         self.api_middleware = Some(Box::new(move |router| router.layer(middleware)));
+        self
+    }
+
+    /// Mount the Harvest management API under `path`, protected by the given
+    /// tower middleware layer, **with the read-only operator role enabled**
+    /// (issue #776).
+    ///
+    /// This behaves exactly like [`Self::api_with_auth`] — `middleware` is the
+    /// embedder's authentication layer, applied to the whole management router
+    /// (and to every generated MCP tool route) — and additionally installs a
+    /// class-aware enforcement layer that gives a **least-privilege read-only
+    /// tier** in one call.
+    ///
+    /// # The read-only principal contract
+    ///
+    /// The restriction applies **only** to a principal the embedder's
+    /// `middleware` explicitly marks read-only on the autumn-web `Session`:
+    /// either `role` set to one of `harvest_readonly` / `harvest_operator` /
+    /// `operator` / `readonly` / `read_only`, or a truthy
+    /// `is_harvest_readonly` / `is_harvest_operator` session value. Such a
+    /// principal may reach every [`RouteClass::ReadOnly`](autumn_harvest::audit::RouteClass)
+    /// route (100% of the read surface) but receives **403 Forbidden** on every
+    /// mutating route. A principal carrying an admin marker (`role` ∈
+    /// {`admin`,`harvest_admin`} or a truthy `is_harvest_admin`/`is_admin`), or
+    /// a principal your middleware lets through with no marker at all, keeps
+    /// full access — exactly as under [`Self::api_with_auth`] today.
+    ///
+    /// Enforcement is driven by
+    /// [`autumn_harvest::audit::CLASSIFIED_ROUTES`] as the single source of
+    /// truth and **fails closed**: a route with no classification entry is
+    /// treated as a mutation and denied to read-only principals.
+    ///
+    /// Read-only principals get admin-level **reads** (payload decode, the SSE
+    /// event stream) by design — this slice restricts *verbs* (read vs mutate),
+    /// not *fields* or *rows*. The nested `/ui` sub-router is not classified, so
+    /// read-only principals receive 403 on `/ui` (a documented follow-up).
+    #[must_use]
+    pub fn api_with_role_auth<M>(mut self, path: impl Into<String>, middleware: M) -> Self
+    where
+        M: tower::Layer<autumn_web::reexports::axum::routing::Route>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        M::Service: tower::Service<autumn_web::reexports::axum::extract::Request>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Response:
+            autumn_web::reexports::axum::response::IntoResponse + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Error:
+            Into<std::convert::Infallible> + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Future:
+            Send + 'static,
+    {
+        self = self.api_with_auth(path, middleware);
+        self.role_auth_enabled = true;
         self
     }
 
@@ -433,6 +501,7 @@ impl Plugin for HarvestPlugin {
             mcp_tools_enabled,
             mcp_tools_prefix,
             decode_payloads_on_read,
+            role_auth_enabled,
             status_thresholds,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
@@ -534,6 +603,11 @@ impl Plugin for HarvestPlugin {
                 &descriptors,
                 &api_state,
                 mcp_tool_middleware.as_ref(),
+                // Issue #776 (F1): gate mutating MCP tools for read-only
+                // principals. These routes are app-level (outside the
+                // `enforce_read_only_class` layer on the nested management
+                // router), so the read-only class boundary is applied here too.
+                role_auth_enabled,
             ))
         } else {
             None
@@ -609,6 +683,20 @@ impl Plugin for HarvestPlugin {
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());
             let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
+            // Issue #776: install the class-aware read-only enforcement layer
+            // BEFORE the embedder's auth middleware wraps the router, so the
+            // request order is: embedder auth mw (sets Session) → this layer
+            // (reads Session + method + nest-stripped path) → per-route
+            // require_admin → handler. Applied to the combined router so it
+            // also covers the nested /ui sub-router (which, being unclassified,
+            // fails closed → 403 for read-only principals). Only installed
+            // under api_with_role_auth; the default and api_with_auth paths are
+            // byte-for-byte unchanged (AC6).
+            if role_auth_enabled {
+                router = router.layer(autumn_web::reexports::axum::middleware::from_fn(
+                    crate::api::enforce_read_only_class,
+                ));
+            }
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
