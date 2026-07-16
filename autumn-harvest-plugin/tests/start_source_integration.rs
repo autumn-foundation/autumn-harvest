@@ -194,3 +194,255 @@ async fn http_start_records_api_source() {
         "an HTTP start must record start_source='api'"
     );
 }
+
+/// GET a management-API path and return `(status, parsed_json_body)`.
+async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-harvest-admin", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("GET request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let jsonv = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, jsonv)
+}
+
+/// Directly insert a workflow-execution row with a chosen `start_source`
+/// (`None` = a NULL / pre-upgrade column). Returns the new `id` (UUID text).
+/// This exercises the *read* filter over the `start_source` column regardless
+/// of which start path wrote it — the correctness of each write path is
+/// covered by the `*_records_*_source` tests elsewhere.
+async fn seed_execution(
+    pool: &DbPool,
+    workflow_name: &str,
+    workflow_id: &str,
+    start_source: Option<&str>,
+    start_source_ref: Option<&str>,
+    started_by: Option<&str>,
+) -> String {
+    use diesel::sql_types::Nullable;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut conn = pool.get().await.expect("pool conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, start_source, start_source_ref, started_by) \
+         VALUES ($1::uuid, $2, $3, 0, '{}'::jsonb, $4, $5, $6)",
+    )
+    .bind::<Text, _>(&id)
+    .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Nullable<Text>, _>(start_source)
+    .bind::<Nullable<Text>, _>(start_source_ref)
+    .bind::<Nullable<Text>, _>(started_by)
+    .execute(&mut conn)
+    .await
+    .expect("seed execution");
+    id
+}
+
+/// Extract the `start_source` string of each row from a bare-array list
+/// response (the non-paginated happy path returns a JSON array whose elements
+/// flatten `WorkflowExecution`).
+fn list_sources(body: &Value) -> Vec<String> {
+    body.as_array()
+        .expect("list response should be a bare array")
+        .iter()
+        .map(|row| {
+            row["start_source"]
+                .as_str()
+                .expect("each row surfaces start_source")
+                .to_string()
+        })
+        .collect()
+}
+
+/// AC5 (issue #740): `GET /workflows?start_source=` narrows the list to the
+/// matching provenance; `start_source=unknown` matches NULL / pre-upgrade
+/// rows; omitting the param returns every row (behavior preserved).
+#[tokio::test]
+async fn list_filter_by_start_source_narrows_results() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![]);
+
+    // Unique workflow_name isolates this test's rows from any concurrent test.
+    let wf = format!("ssfilter_{}", uuid::Uuid::new_v4().simple());
+    seed_execution(
+        &pool,
+        &wf,
+        &format!("{wf}-s1"),
+        Some("schedule"),
+        None,
+        None,
+    )
+    .await;
+    seed_execution(
+        &pool,
+        &wf,
+        &format!("{wf}-s2"),
+        Some("schedule"),
+        None,
+        None,
+    )
+    .await;
+    seed_execution(&pool, &wf, &format!("{wf}-a1"), Some("api"), None, None).await;
+    // A NULL / pre-upgrade row → matched only by start_source=unknown.
+    seed_execution(&pool, &wf, &format!("{wf}-u1"), None, None, None).await;
+
+    // start_source=schedule → only the two schedule rows.
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows?workflow_name={wf}&start_source=schedule"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list should 200: {body}");
+    let sources = list_sources(&body);
+    assert_eq!(
+        sources.len(),
+        2,
+        "expected 2 schedule rows, got {sources:?}"
+    );
+    assert!(
+        sources.iter().all(|s| s == "schedule"),
+        "every returned row must be schedule-sourced, got {sources:?}"
+    );
+
+    // start_source=unknown → only the NULL-source row (surfaced as "unknown").
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows?workflow_name={wf}&start_source=unknown"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sources = list_sources(&body);
+    assert_eq!(
+        sources,
+        vec!["unknown".to_string()],
+        "only the NULL row matches unknown"
+    );
+
+    // start_source=api → only the one api row.
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows?workflow_name={wf}&start_source=api"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sources = list_sources(&body);
+    assert_eq!(
+        sources,
+        vec!["api".to_string()],
+        "only the api row matches api"
+    );
+
+    // No start_source param → all four rows (behavior preserved).
+    let (status, body) = get_json(&app, &format!("/workflows?workflow_name={wf}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        list_sources(&body).len(),
+        4,
+        "omitting the filter returns all rows"
+    );
+}
+
+/// AC5 (issue #740): an unrecognized `start_source` value is a 400 JSON error,
+/// never a 500 and never a silent empty 200.
+#[tokio::test]
+async fn list_filter_rejects_invalid_start_source_with_400() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![]);
+
+    let (status, body) = get_json(&app, "/workflows?start_source=bogus").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an invalid start_source must be a 400, got {status}: {body}"
+    );
+    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "must never 500");
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "must never silently return an empty 200"
+    );
+}
+
+/// AC4 (issue #740): a describe response surfaces `start_source = "unknown"` for
+/// a NULL / pre-upgrade row and omits `start_source_ref`/`started_by` when NULL;
+/// a row with a concrete source + ref + actor surfaces all three.
+#[tokio::test]
+async fn describe_surfaces_start_source_and_omits_absent_fields() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![]);
+
+    let wf = format!("ssdesc_{}", uuid::Uuid::new_v4().simple());
+
+    // NULL-source (pre-upgrade) row → "unknown", ref/started_by keys ABSENT.
+    let null_id = seed_execution(&pool, &wf, &format!("{wf}-null"), None, None, None).await;
+    let (status, body) = get_json(&app, &format!("/workflows/{null_id}")).await;
+    assert_eq!(status, StatusCode::OK, "describe should 200: {body}");
+    let exec = &body["execution"];
+    assert_eq!(
+        exec["start_source"].as_str(),
+        Some("unknown"),
+        "a NULL start_source row must serialize as 'unknown'"
+    );
+    assert!(
+        exec.get("start_source_ref").is_none(),
+        "start_source_ref must be absent when NULL, got {:?}",
+        exec.get("start_source_ref")
+    );
+    assert!(
+        exec.get("started_by").is_none(),
+        "started_by must be absent when NULL, got {:?}",
+        exec.get("started_by")
+    );
+
+    // Concrete-source row with ref + actor → all three surface.
+    let concrete_id = seed_execution(
+        &pool,
+        &wf,
+        &format!("{wf}-sched"),
+        Some("schedule"),
+        Some("sched-123"),
+        Some("operator@example.com"),
+    )
+    .await;
+    let (status, body) = get_json(&app, &format!("/workflows/{concrete_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let exec = &body["execution"];
+    assert_eq!(exec["start_source"].as_str(), Some("schedule"));
+    assert_eq!(exec["start_source_ref"].as_str(), Some("sched-123"));
+    assert_eq!(exec["started_by"].as_str(), Some("operator@example.com"));
+
+    // The list row for the same concrete execution surfaces the fields too.
+    let (status, list) = get_json(
+        &app,
+        &format!("/workflows?workflow_name={wf}&start_source=schedule"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = list.as_array().expect("bare array");
+    let row = rows
+        .iter()
+        .find(|r| r["id"].as_str() == Some(concrete_id.as_str()))
+        .expect("concrete row present in list");
+    assert_eq!(row["start_source"].as_str(), Some("schedule"));
+    assert_eq!(row["start_source_ref"].as_str(), Some("sched-123"));
+    assert_eq!(row["started_by"].as_str(), Some("operator@example.com"));
+}
