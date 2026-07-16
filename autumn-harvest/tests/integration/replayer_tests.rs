@@ -7959,6 +7959,80 @@ async fn interleaved_sibling_signal_after_deadline_timer_fired_replays_succeeded
     );
 }
 
+/// Two CONCURRENT, DIFFERENTLY-named signal waits in one mixed batch: a plain
+/// `wait_for_signal("a")` (polled FIRST) joined with a
+/// `receive_signal_timeout::<Value>("b", 5s)` whose deadline fires BEFORE "a"
+/// arrives. `receive_signal_timeout` pre-increments `signal_timeout_seq`, so the
+/// race arms `__signal_timeout:1:b`; the recorded history is
+/// `[WorkflowStarted, TimerStarted(__signal_timeout:1:b),
+/// TimerFired(__signal_timeout:1:b), SignalReceived(a)]` (b times out, then a
+/// arrives). This is the Codex P1 composition on PR #1084.
+fn interleaved_two_signal_foreign_deadline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // "a" (plain wait) is polled FIRST, so `match_signal("a")` runs before
+        // the sibling race's `match_signal_or_timer("b")` during replay.
+        let (a_res, b_res) = tokio::join!(
+            ctx.wait_for_signal("a"),
+            ctx.receive_signal_timeout::<Value>("b", std::time::Duration::from_secs(5)),
+        );
+        a_res.map_err(|e| e.to_string())?;
+        let b: Option<Value> = b_res.map_err(|e| e.to_string())?;
+        // Original run: "a" arrived, "b"'s deadline fired first => None.
+        Ok(serde_json::json!({ "b_timed_out": b.is_none() }))
+    })
+}
+
+fn interleaved_two_signal_foreign_deadline_history() -> Vec<WorkflowEvent> {
+    // seq pre-increments (context.rs `wait_for_signal_timeout_with_timer_id`),
+    // so the first race id is `__signal_timeout:1:b`.
+    let timer_id = TimerId::new("__signal_timeout:1:b");
+    vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+        WorkflowEvent::SignalReceived {
+            signal_name: "a".into(),
+            payload: serde_json::json!({ "ok": true }),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn interleaved_two_signal_race_foreign_deadline_timer_replays_succeeded() {
+    // Codex P1 (PR #1084 review of issue #1071): `match_signal("a")`'s
+    // reserved-`__signal_timeout` cross-without-rewind arm keyed only on the
+    // reserved PREFIX, so it crossed a FOREIGN signal's deadline timer
+    // (`__signal_timeout:1:b`) without rewinding — advancing the cursor past the
+    // sibling race's `TimerStarted`/`TimerFired`, so the "b" branch's
+    // `match_signal_or_timer` could no longer positionally re-anchor its own
+    // `TimerStarted` and strict replay diverged (`NonDeterminismDetected`,
+    // `EarlyCompletion`). The guard is now narrowed to the SAME signal name, so a
+    // foreign deadline timer falls through to the generic `TimerStarted` rewind
+    // arm and the sibling race re-matches.
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "interleaved_two_signal_foreign_deadline",
+            interleaved_two_signal_foreign_deadline_workflow,
+        )
+        .replay_from_events(interleaved_two_signal_foreign_deadline_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "Codex P1 (#1071/#1084): two concurrent differently-named signal waits \
+         where a foreign signal's deadline timer fired before the awaited signal \
+         arrived must replay — match_signal must only cross THIS signal's own \
+         reserved deadline timer without rewind, leaving a foreign one for its \
+         sibling race:\n{report}"
+    );
+}
+
 #[tokio::test]
 async fn interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded() {
     let report = WorkflowReplayer::new()

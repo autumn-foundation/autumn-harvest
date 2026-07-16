@@ -294,8 +294,8 @@ pub use context::{
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
-    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
-    DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
+    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagInputBinding,
+    DagMapTaskRef, DagMergeSource, DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
 };
 #[cfg(feature = "testing")]
 pub use dag_export::export_profile_mermaid_gantt;
@@ -352,8 +352,9 @@ pub use history_export::{
     HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
 };
 pub use info::{
-    ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
-    UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
+    ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
+    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
+    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,

@@ -257,6 +257,29 @@ pub enum RouteClass {
     Mutating,
 }
 
+/// Pure access-control decision for the read-only operator role (issue #776).
+///
+/// Returns `true` when a read-only principal must be **denied (403)** the
+/// route it is calling. A read-only principal may reach [`RouteClass::ReadOnly`]
+/// and [`RouteClass::PublicSafe`] routes but never a [`RouteClass::Mutating`]
+/// one.
+///
+/// **Fail closed by construction.** The enforcement layer resolves an
+/// unclassified path to [`RouteClass::Mutating`] before calling this function,
+/// so a route a contributor forgot to classify is denied to read-only
+/// principals — never accidentally exposed.
+///
+/// This is deliberately a pure, `const` function keyed only on
+/// `RouteClass` (the source-of-truth verb classification) so the security
+/// decision is pinned by a truth-table unit test with no session or router
+/// harness. Principal classification (read-only vs admin vs anonymous) is a
+/// separate concern resolved by the enforcement layer and passed in as
+/// `is_readonly_principal`.
+#[must_use]
+pub const fn deny_readonly_mutation(is_readonly_principal: bool, class: RouteClass) -> bool {
+    is_readonly_principal && !matches!(class, RouteClass::ReadOnly | RouteClass::PublicSafe)
+}
+
 /// Security classification for every route registered in `harvest_api_router`.
 ///
 /// Each entry is `(route_template, RouteClass)`. The exhaustiveness guard test
@@ -507,6 +530,84 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
         RouteClass::Mutating,
     ),
+    // ── Read-only operator role (issue #776) — routes that were mounted in
+    // harvest_api_router but had drifted without a classification entry. Under
+    // #776 fail-closed enforcement an unclassified route is treated as
+    // Mutating; these are classified explicitly per verified handler behavior
+    // so the read-only tier reaches every genuine read (AC1) and never a
+    // mutation (AC2). Every "Mutating" handler below was verified to write
+    // state; every "ReadOnly" handler was verified not to.
+    //
+    // ReadOnly — discovery / reads (no state mutation):
+    ("GET /batches/pending", RouteClass::ReadOnly),
+    ("GET /workflows/registered", RouteClass::ReadOnly),
+    (
+        "GET /workflows/registered/{name}/schema",
+        RouteClass::ReadOnly,
+    ),
+    // Enumerates a workflow type's query/update handlers (read). Router-only:
+    // not in management_api_routes() before #776.
+    (
+        "GET /workflows/types/{workflow_name}/handlers",
+        RouteClass::ReadOnly,
+    ),
+    // Missing-workflow_id guard: always returns 400 (no read, no write). Both
+    // verbs share one handler; classified ReadOnly so a read-only principal
+    // receives the intended 400 rather than a 403. Router-only before #776.
+    ("GET /workflows/by-id/{workflow_name}", RouteClass::ReadOnly),
+    (
+        "POST /workflows/by-id/{workflow_name}",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /dead-letters/aggregate", RouteClass::ReadOnly),
+    // Circuit-breaker snapshots (read); force-open/close are the mutations below.
+    ("GET /admin/circuits", RouteClass::ReadOnly),
+    ("GET /admin/circuits/{activity_name}", RouteClass::ReadOnly),
+    ("GET /admin/queues/scaling", RouteClass::ReadOnly),
+    ("GET /admin/metrics", RouteClass::ReadOnly),
+    ("GET /admin/completion-triggers", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}/runs", RouteClass::ReadOnly),
+    ("GET /admin/schedules/decisions", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}/decisions", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}/preview", RouteClass::ReadOnly),
+    // Preview a candidate schedule: POST carries the candidate in the body but
+    // only validates + projects fire times; no state is written.
+    ("POST /admin/schedules/preview", RouteClass::ReadOnly),
+    ("GET /calendars", RouteClass::ReadOnly),
+    ("GET /calendars/{name}", RouteClass::ReadOnly),
+    ("GET /workers/{worker_id}/pinned", RouteClass::ReadOnly),
+    (
+        "GET /admin/queues/{queue_name}/eligibility",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /admin/tasks/{id}/eligibility", RouteClass::ReadOnly),
+    // Mutating — these write state. A read-only principal is denied (403).
+    // Update-with-start admits an update and may start a fresh run.
+    (
+        "POST /workflows/{workflow_name}/update-with-start",
+        RouteClass::Mutating,
+    ),
+    // DAG retry-from-failed-node (reset internals).
+    (
+        "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+        RouteClass::Mutating,
+    ),
+    // Operator force-open / force-close of a circuit breaker.
+    (
+        "POST /admin/circuits/{activity_name}/force-open",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /admin/circuits/{activity_name}/force-close",
+        RouteClass::Mutating,
+    ),
+    // Calendar + completion-trigger CRUD. No dedicated audit op constant yet
+    // (audit wiring is out of scope for #776); disposition is EXCLUDED_ROUTES.
+    ("POST /admin/completion-triggers", RouteClass::Mutating),
+    ("POST /calendars", RouteClass::Mutating),
+    ("PUT /calendars/{name}", RouteClass::Mutating),
+    ("DELETE /calendars/{name}", RouteClass::Mutating),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -577,6 +678,15 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Operator read-path payload decoding (issue #608). Read audit — no
     // ALL_MUTATION_ROUTES entry; see the doc comment on OP_PAYLOAD_DECODE_READ.
     OP_PAYLOAD_DECODE_READ,
+    // Read-only operator role (issue #776): these four constants pre-existed
+    // but had never been wired into a route manifest entry. Their handlers
+    // already write audit rows under these ops; classifying the routes (below)
+    // requires an ALL_MUTATION_ROUTES entry, which in turn requires the op be
+    // registered here.
+    OP_WORKFLOW_UPDATE_WITH_START,
+    OP_DAG_RETRY,
+    OP_CIRCUIT_FORCE_OPEN,
+    OP_CIRCUIT_FORCE_CLOSE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -654,6 +764,39 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
     // POST query is read-only (typed args, no state mutation).
     "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+    // ── Read-only operator role (issue #776) ──────────────────────────────────
+    // ReadOnly routes (no audit trail — reads):
+    "GET /batches/pending",
+    "GET /workflows/registered",
+    "GET /workflows/registered/{name}/schema",
+    "GET /workflows/types/{workflow_name}/handlers",
+    "GET /workflows/by-id/{workflow_name}",
+    "POST /workflows/by-id/{workflow_name}",
+    "GET /dead-letters/aggregate",
+    "GET /admin/circuits",
+    "GET /admin/circuits/{activity_name}",
+    "GET /admin/queues/scaling",
+    "GET /admin/metrics",
+    "GET /admin/completion-triggers",
+    "GET /admin/schedules/{id}",
+    "GET /admin/schedules/{id}/runs",
+    "GET /admin/schedules/decisions",
+    "GET /admin/schedules/{id}/decisions",
+    "GET /admin/schedules/{id}/preview",
+    "POST /admin/schedules/preview",
+    "GET /calendars",
+    "GET /calendars/{name}",
+    "GET /workers/{worker_id}/pinned",
+    "GET /admin/queues/{queue_name}/eligibility",
+    "GET /admin/tasks/{id}/eligibility",
+    // Mutating routes with no dedicated audit op constant (calendar +
+    // completion-trigger CRUD). Audit wiring for these is out of scope for
+    // #776; their audit disposition is "explicitly excluded" so the
+    // mutating_routes_are_audited_or_explicitly_excluded guard passes.
+    "POST /admin/completion-triggers",
+    "POST /calendars",
+    "PUT /calendars/{name}",
+    "DELETE /calendars/{name}",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -886,6 +1029,54 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
         Some(OP_WORKFLOW_RESUME),
     ),
+    // ── Read-only operator role (issue #776) — classification manifest ────────
+    // ReadOnly routes (None = not audited):
+    ("GET /batches/pending", None),
+    ("GET /workflows/registered", None),
+    ("GET /workflows/registered/{name}/schema", None),
+    ("GET /workflows/types/{workflow_name}/handlers", None),
+    ("GET /workflows/by-id/{workflow_name}", None),
+    ("POST /workflows/by-id/{workflow_name}", None),
+    ("GET /dead-letters/aggregate", None),
+    ("GET /admin/circuits", None),
+    ("GET /admin/circuits/{activity_name}", None),
+    ("GET /admin/queues/scaling", None),
+    ("GET /admin/metrics", None),
+    ("GET /admin/completion-triggers", None),
+    ("GET /admin/schedules/{id}", None),
+    ("GET /admin/schedules/{id}/runs", None),
+    ("GET /admin/schedules/decisions", None),
+    ("GET /admin/schedules/{id}/decisions", None),
+    ("GET /admin/schedules/{id}/preview", None),
+    ("POST /admin/schedules/preview", None),
+    ("GET /calendars", None),
+    ("GET /calendars/{name}", None),
+    ("GET /workers/{worker_id}/pinned", None),
+    ("GET /admin/queues/{queue_name}/eligibility", None),
+    ("GET /admin/tasks/{id}/eligibility", None),
+    // Mutating routes — the four with pre-existing op constants audit under
+    // them (their handlers already write the audit row); the calendar +
+    // completion-trigger CRUD have no op and are excluded (None).
+    (
+        "POST /workflows/{workflow_name}/update-with-start",
+        Some(OP_WORKFLOW_UPDATE_WITH_START),
+    ),
+    (
+        "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(OP_DAG_RETRY),
+    ),
+    (
+        "POST /admin/circuits/{activity_name}/force-open",
+        Some(OP_CIRCUIT_FORCE_OPEN),
+    ),
+    (
+        "POST /admin/circuits/{activity_name}/force-close",
+        Some(OP_CIRCUIT_FORCE_CLOSE),
+    ),
+    ("POST /admin/completion-triggers", None),
+    ("POST /calendars", None),
+    ("PUT /calendars/{name}", None),
+    ("DELETE /calendars/{name}", None),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────
@@ -1451,6 +1642,125 @@ mod tests {
                      explicitly declare its audit disposition"
                 );
             }
+        }
+    }
+
+    // ── Read-only operator role (issue #776) ──────────────────────────────────
+
+    #[test]
+    fn deny_readonly_mutation_truth_table() {
+        // A read-only principal is denied every Mutating route, allowed every
+        // ReadOnly/PublicSafe route. A non-read-only principal is never denied
+        // by this decision (the enforcement layer leaves them to the existing
+        // admin gates).
+        assert!(
+            deny_readonly_mutation(true, RouteClass::Mutating),
+            "read-only principal must be denied a Mutating route (403)"
+        );
+        assert!(
+            !deny_readonly_mutation(true, RouteClass::ReadOnly),
+            "read-only principal must reach a ReadOnly route"
+        );
+        assert!(
+            !deny_readonly_mutation(true, RouteClass::PublicSafe),
+            "read-only principal must reach a PublicSafe route"
+        );
+        // A non-read-only (admin/anon) principal is never denied by THIS fn —
+        // their access is decided by the existing admin gates, not this layer.
+        assert!(!deny_readonly_mutation(false, RouteClass::Mutating));
+        assert!(!deny_readonly_mutation(false, RouteClass::ReadOnly));
+        assert!(!deny_readonly_mutation(false, RouteClass::PublicSafe));
+    }
+
+    #[test]
+    fn newly_classified_mutations_are_mutating_and_covered() {
+        // Privilege-escalation guard (issue #776): every route added to the
+        // classification table as a mutation in this slice MUST be
+        // RouteClass::Mutating — a wrong Mutating→ReadOnly entry would let a
+        // read-only principal force-open a circuit / create a calendar / retry
+        // a DAG / start-via-update. Dedicated pin (like the legal-hold pin):
+        // the general exhaustiveness guards only cross-check the two lists
+        // against each other, so this catches a class regression on these
+        // specific routes.
+        let audited: std::collections::HashSet<&str> = ALL_MUTATION_ROUTES
+            .iter()
+            .filter_map(|(r, op)| op.map(|_| *r))
+            .collect();
+        let excluded: std::collections::HashSet<&str> = EXCLUDED_ROUTES.iter().copied().collect();
+        for route in [
+            "POST /workflows/{workflow_name}/update-with-start",
+            "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+            "POST /admin/circuits/{activity_name}/force-open",
+            "POST /admin/circuits/{activity_name}/force-close",
+            "POST /admin/completion-triggers",
+            "POST /calendars",
+            "PUT /calendars/{name}",
+            "DELETE /calendars/{name}",
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating (issue #776) — \
+                 a read-only principal must never reach it"
+            );
+            assert!(
+                audited.contains(route) || excluded.contains(route),
+                "{route} must declare its audit disposition (Some(op) or EXCLUDED_ROUTES)"
+            );
+        }
+        // The four circuit/dag/update ops reuse pre-existing constants that had
+        // never been wired into a route manifest entry; confirm the wiring.
+        for op in [
+            OP_WORKFLOW_UPDATE_WITH_START,
+            OP_DAG_RETRY,
+            OP_CIRCUIT_FORCE_OPEN,
+            OP_CIRCUIT_FORCE_CLOSE,
+        ] {
+            assert!(
+                AUDITED_OPERATIONS.contains(&op),
+                "operation '{op}' must be in AUDITED_OPERATIONS (issue #776 wiring)"
+            );
+        }
+    }
+
+    #[test]
+    fn newly_classified_reads_are_read_only() {
+        // The read grant surface for the read-only tier: each must be
+        // RouteClass::ReadOnly so a read-only principal reaches it (AC1). A
+        // wrong ReadOnly→Mutating here would only over-restrict (403 a read),
+        // not escalate, but it breaks the "100% of ReadOnly reachable" bar.
+        for route in [
+            "GET /batches/pending",
+            "GET /workflows/registered",
+            "GET /workflows/registered/{name}/schema",
+            "GET /workflows/types/{workflow_name}/handlers",
+            "GET /workflows/by-id/{workflow_name}",
+            "POST /workflows/by-id/{workflow_name}",
+            "GET /dead-letters/aggregate",
+            "GET /admin/circuits",
+            "GET /admin/circuits/{activity_name}",
+            "GET /admin/queues/scaling",
+            "GET /admin/metrics",
+            "GET /admin/completion-triggers",
+            "GET /admin/schedules/{id}",
+            "GET /admin/schedules/{id}/runs",
+            "GET /admin/schedules/decisions",
+            "GET /admin/schedules/{id}/decisions",
+            "GET /admin/schedules/{id}/preview",
+            "POST /admin/schedules/preview",
+            "GET /calendars",
+            "GET /calendars/{name}",
+            "GET /workers/{worker_id}/pinned",
+            "GET /admin/queues/{queue_name}/eligibility",
+            "GET /admin/tasks/{id}/eligibility",
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+                "{route} must be classified RouteClass::ReadOnly (issue #776)"
+            );
         }
     }
 }

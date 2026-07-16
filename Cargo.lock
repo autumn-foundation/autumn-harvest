@@ -331,6 +331,7 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "futures",
+ "matchit",
  "maud",
  "reqwest",
  "scoped-futures",
