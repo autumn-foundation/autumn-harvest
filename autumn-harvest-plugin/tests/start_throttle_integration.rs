@@ -1359,10 +1359,15 @@ async fn batch_bypass_uses_start_will_create_predicate_not_bare_existence() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "batch request: {body:?}");
-    assert_ne!(
+    assert_eq!(
         body["results"][0]["status"],
         json!("rejected"),
-        "an AllowDuplicate attach to a COMPLETED prior must bypass the gate, not be rejected: {body:?}"
+        "the attach is reported as rejected by batch_start: {body:?}"
+    );
+    let error_str = body["results"][0]["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("already has an existing execution"),
+        "an AllowDuplicate attach to a COMPLETED prior must bypass the gate (yielding AlreadyExists), not be blocked by the gate: {body:?}"
     );
     assert_eq!(
         execution_count(&mut conn, "plain_job").await,
