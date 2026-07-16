@@ -5605,9 +5605,29 @@ fn render_timeline_gantt(
     }
     let total_steps = order.len();
     let truncated = total_steps > MAX_RENDER_STEPS;
-    let render_order = &order[..total_steps.min(MAX_RENDER_STEPS)];
-
     let slowest = slowest_step_index(timeline);
+
+    // Render the first `MAX_RENDER_STEPS` lane-grouped rows. Lane grouping orders
+    // rows by lane, not by duration, so the slowest step can fall outside the
+    // prefix (#960). The rollup and the execution-detail Timeline link both
+    // advertise `#slowest`, so the row carrying `id="slowest"` must always be
+    // rendered — otherwise the anchor dangles. When truncating, append the
+    // slowest step's lane-grouped entry as one extra row if it is not already in
+    // the rendered set. (`slowest`, when present, always names a real entry in
+    // `order`: every `StepKind` is a `TIMELINE_LANES` lane, so `order` holds one
+    // entry per step.)
+    let mut render_order: Vec<(StepKind, usize, bool)> =
+        order.iter().take(MAX_RENDER_STEPS).copied().collect();
+    let slowest_appended = if truncated
+        && let Some(slow_idx) = slowest
+        && !render_order.iter().any(|(_, idx, _)| *idx == slow_idx)
+        && let Some(entry) = order.iter().find(|(_, idx, _)| *idx == slow_idx)
+    {
+        render_order.push(*entry);
+        true
+    } else {
+        false
+    };
     #[allow(clippy::cast_precision_loss)]
     let height = TL_ROW_H.mul_add(render_order.len() as f64, TL_HEADER_H) + TL_PAD;
     let svg_width = TL_GUTTER + TL_AXIS_W + TL_PAD;
@@ -5655,7 +5675,9 @@ fn render_timeline_gantt(
         @if truncated {
             div class="banner Warning" {
                 "Showing first " (MAX_RENDER_STEPS) " of " (total_steps)
-                " steps. The rollup above covers all steps."
+                " steps"
+                @if slowest_appended { " (plus the slowest)" }
+                ". The rollup above covers all steps."
             }
         }
 
@@ -10622,6 +10644,127 @@ mod tests {
             html.contains(&MAX_RENDER_STEPS.to_string()) && html.contains(&n.to_string()),
             "truncation note names both the cap and the full count: {}",
             &html[..html.len().min(400)]
+        );
+    }
+
+    // Q17 (#960): when the step list is capped, the slowest step must stay in the
+    // rendered set even though lane grouping can push it past the prefix — the
+    // rollup and the execution-detail Timeline link both advertise `#slowest`, so
+    // the `id="slowest"` element must always resolve.
+    #[test]
+    fn timeline_cap_keeps_slowest_step_rendered() {
+        // MAX_RENDER_STEPS + 1 short Activity steps fill the whole first-lane
+        // prefix, then a single slow SideEffect step (last lane) is lane-grouped
+        // *after* every Activity — beyond the rendered prefix.
+        let mut steps: Vec<TimelineStep> = (0..=MAX_RENDER_STEPS)
+            .map(|i| {
+                let off = i64::try_from(i).unwrap() * 10;
+                tl_step(
+                    StepKind::Activity,
+                    Some("act"),
+                    off,
+                    Some(off + 5),
+                    None,
+                    None,
+                    StepOutcome::Completed,
+                    Some(1),
+                )
+            })
+            .collect();
+        // The slowest step: distinctly named, largest total_ms, last (SideEffect)
+        // lane. Its index in `steps` is > MAX_RENDER_STEPS, and lane grouping
+        // places it after all Activities, so it falls outside the prefix.
+        steps.push(tl_step(
+            StepKind::SideEffect,
+            Some("SLOWEST_STEP"),
+            0,
+            Some(999_999),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        ));
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(999_999));
+        exec.state = "COMPLETED".to_string();
+        let timeline = tl_timeline(steps, None);
+        // Sanity: the slowest step is genuinely the SideEffect, and it is past the
+        // rendered prefix (so the pre-fix code would have dropped its anchor).
+        assert_eq!(slowest_step_index(&timeline), Some(MAX_RENDER_STEPS + 1));
+
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+
+        // Exactly one `#slowest` anchor is emitted — never zero (dangling link),
+        // never more than one.
+        assert_eq!(
+            html.matches("id=\"slowest\"").count(),
+            1,
+            "exactly one id=\"slowest\" element: {}",
+            &html[..html.len().min(400)]
+        );
+        // The anchored `<g id="slowest">…</g>` belongs to the actual slowest step:
+        // its distinctly-named title is inside the anchored group (and would be
+        // absent entirely without the fix, being past the prefix).
+        let anchor = html.find("id=\"slowest\"").expect("anchor present");
+        let group_end = html[anchor..].find("</g>").expect("anchored group closes");
+        let anchored_group = &html[anchor..anchor + group_end];
+        assert!(
+            anchored_group.contains("SLOWEST_STEP"),
+            "the #slowest anchor wraps the slowest step's span: {anchored_group}"
+        );
+        // The truncation note is accurate about the extra row.
+        assert!(
+            html.contains("(plus the slowest)"),
+            "truncation note flags the appended slowest step: {}",
+            &html[..html.len().min(600)]
+        );
+    }
+
+    // Q18 (#960): under the cap the slowest step is rendered in place, so the
+    // `#slowest` anchor resolves without any special-casing.
+    #[test]
+    fn timeline_slowest_anchor_present_under_cap() {
+        let steps = vec![
+            tl_step(
+                StepKind::Activity,
+                Some("quick"),
+                0,
+                Some(10),
+                None,
+                None,
+                StepOutcome::Completed,
+                Some(1),
+            ),
+            tl_step(
+                StepKind::ChildWorkflow,
+                Some("BIGGEST"),
+                10,
+                Some(5_000),
+                None,
+                None,
+                StepOutcome::Completed,
+                None,
+            ),
+        ];
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(5_000));
+        exec.state = "COMPLETED".to_string();
+        let timeline = tl_timeline(steps, None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert_eq!(
+            html.matches("id=\"slowest\"").count(),
+            1,
+            "exactly one id=\"slowest\" element under the cap"
+        );
+        // No "(plus the slowest)" note — the slowest is in place, not appended.
+        assert!(!html.contains("(plus the slowest)"));
+        let anchor = html.find("id=\"slowest\"").expect("anchor present");
+        let group_end = html[anchor..].find("</g>").expect("group closes");
+        assert!(
+            html[anchor..anchor + group_end].contains("BIGGEST"),
+            "the #slowest anchor wraps the actual slowest (child) step"
         );
     }
 }
