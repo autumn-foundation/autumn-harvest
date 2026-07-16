@@ -24,6 +24,8 @@ struct UpdateAttrs {
     /// Opt-in MCP tool exposure for this update (issue #597). Parsed from
     /// `#[update(workflow = "…", mcp)]` or `mcp = true`.
     mcp: bool,
+    /// Optional human-readable description for interface discovery (issue #610).
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
@@ -31,6 +33,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
         workflow: None,
         validator: None,
         mcp: false,
+        description: None,
     };
 
     syn::meta::parser(|meta| {
@@ -45,9 +48,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
         } else if meta.path.is_ident("mcp") {
             result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `workflow = \"name\"`, `validator = path::to::fn`, or `mcp`",
+                "unsupported attribute: expected `workflow = \"name\"`, `validator = path::to::fn`, `mcp`, or `description = \"…\"`",
             ))
         }
     })
@@ -106,6 +113,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_update_handler_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
+
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
@@ -576,7 +589,18 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 handler: __dispatch,
                 validator: #validator_expr,
                 mcp: #mcp_expr,
+                description: #description_expr,
+                arg_schema: ::std::option::Option::None,
+                response_schema: ::std::option::Option::None,
             }
+        }
+
+        /// Returns the [`::autumn_harvest::UpdateHandlerInfo`] for this update.
+        ///
+        /// Chain schema builders at registration, e.g.
+        /// `.updates(vec![#public_info_name().with_schemas::<Arg, Resp>()])`.
+        pub fn #public_info_name() -> ::autumn_harvest::UpdateHandlerInfo {
+            #companion_name()
         }
 
         #impl_block

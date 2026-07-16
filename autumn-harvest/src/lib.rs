@@ -295,8 +295,9 @@ pub use history_export::{
     HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
 };
 pub use info::{
-    ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
-    UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
+    ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
+    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
+    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use payload_codec::{
     CodecError, IdentityCodec, LossyDecodeOutcome, PayloadCodec, PayloadCodecs,

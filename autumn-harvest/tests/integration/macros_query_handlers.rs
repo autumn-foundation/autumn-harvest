@@ -701,3 +701,108 @@ fn update_mcp_composes_with_validator() {
     assert!(!info.mcp);
     assert!(info.has_validator);
 }
+
+// ── issue #610: interface schema — description attr, signal companion, aliases ─
+
+#[query(workflow = "my_workflow", description = "read the current status")]
+fn described_query(_ctx: &WorkflowContext) -> Result<u64, String> {
+    Ok(1)
+}
+
+#[update(workflow = "my_workflow", description = "approve the order")]
+async fn described_update(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bool, String> {
+    Ok(req.approved)
+}
+
+#[signal(workflow = "my_workflow", description = "cancel the order")]
+async fn cancel_order(_ctx: &WorkflowContext, _req: ApproveRequest) -> Result<(), String> {
+    Ok(())
+}
+
+#[signal(workflow = "my_workflow")]
+async fn pause_order(_ctx: &WorkflowContext, _amount: u32) -> Result<(), String> {
+    Ok(())
+}
+
+#[test]
+fn query_description_attr_threads_through() {
+    let info = __autumn_query_handler_info_described_query();
+    assert_eq!(info.description, Some("read the current status"));
+    assert!(info.arg_schema.is_none());
+    assert!(info.response_schema.is_none());
+}
+
+#[test]
+fn update_description_attr_threads_through() {
+    let info = __autumn_update_handler_info_described_update();
+    assert_eq!(info.description, Some("approve the order"));
+    assert!(info.arg_schema.is_none());
+}
+
+#[test]
+fn query_public_info_alias_exists() {
+    // Chaining a schema builder at registration must compile & work.
+    fn arg() -> serde_json::Value {
+        serde_json::json!({"type": "null"})
+    }
+    let info = described_query_info();
+    assert_eq!(info.name, "described_query");
+    let info = described_query_info().with_arg_schema_fn(arg);
+    assert!(info.arg_schema.is_some());
+}
+
+#[test]
+fn update_public_info_alias_exists() {
+    let info = described_update_info();
+    assert_eq!(info.name, "described_update");
+}
+
+#[test]
+fn signal_companion_returns_signal_handler_info() {
+    let info = __autumn_signal_handler_info_cancel_order();
+    assert_eq!(info.name, "cancel_order");
+    assert_eq!(info.workflow, "my_workflow");
+    assert_eq!(info.description, Some("cancel the order"));
+    assert!(
+        info.arg_type_hint.contains("ApproveRequest"),
+        "arg_type_hint was {:?}",
+        info.arg_type_hint
+    );
+    assert!(info.arg_schema.is_none());
+}
+
+#[test]
+fn signal_public_info_alias_exists() {
+    let info: SignalHandlerInfo = cancel_order_info();
+    assert_eq!(info.name, "cancel_order");
+}
+
+#[test]
+fn signal_without_description_defaults_none() {
+    let info = pause_order_info();
+    assert_eq!(info.name, "pause_order");
+    assert!(info.description.is_none());
+    assert!(
+        info.arg_type_hint.contains("u32"),
+        "arg_type_hint was {:?}",
+        info.arg_type_hint
+    );
+}
+
+#[test]
+fn signals_macro_collects_correct_count_and_names() {
+    let ss: Vec<SignalHandlerInfo> = signals![cancel_order, pause_order];
+    assert_eq!(ss.len(), 2);
+    assert_eq!(ss[0].name, "cancel_order");
+    assert_eq!(ss[1].name, "pause_order");
+}
+
+#[test]
+fn builder_signals_method_stores_handlers() {
+    use autumn_harvest::builder::HarvestBuilder;
+
+    let built = HarvestBuilder::new()
+        .signals(signals![cancel_order, pause_order])
+        .build();
+    assert_eq!(built.signal_handlers().len(), 2);
+}

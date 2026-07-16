@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::batch_start::BatchStartConfig;
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
-use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+use crate::info::{
+    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
@@ -68,6 +70,8 @@ pub struct HarvestBuilder {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers collected via `updates![…]`.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata collected via `signals![…]` (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -141,6 +145,7 @@ impl Default for HarvestBuilder {
             auto_registered_dag_workflows: Vec::new(),
             query_handlers: Vec::new(),
             update_handlers: Vec::new(),
+            signal_handlers: Vec::new(),
             worker_config: WorkerConfig::default(),
             state: std::collections::HashMap::new(),
             telemetry: None,
@@ -183,6 +188,7 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -228,6 +234,8 @@ pub struct BuiltHarvest {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers indexed by workflow name for fast lookup.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
@@ -289,6 +297,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
@@ -696,6 +705,22 @@ impl BuiltHarvest {
         &self.update_handlers
     }
 
+    /// Declarative signal handler metadata collected via `.signals(signals![…])`
+    /// (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
+    /// Returns all signal handler infos for the named workflow (issue #610).
+    #[must_use]
+    pub fn signal_handlers_for(&self, workflow_name: &str) -> Vec<&SignalHandlerInfo> {
+        self.signal_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
+    }
+
     /// Returns all query handler infos for the named workflow.
     #[must_use]
     pub fn query_handlers_for(&self, workflow_name: &str) -> Vec<&QueryHandlerInfo> {
@@ -774,7 +799,11 @@ impl BuiltHarvest {
                 Arc::new(self.state),
                 self.telemetry,
             )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
+            .with_handler_infos(
+                self.query_handlers,
+                self.update_handlers,
+                self.signal_handlers,
+            )
             .with_history_policy(self.history_policy)
             .with_payload_caps(
                 self.max_activity_input_bytes,
@@ -816,7 +845,11 @@ impl BuiltHarvest {
                 Arc::new(self.state),
                 self.telemetry,
             )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
+            .with_handler_infos(
+                self.query_handlers,
+                self.update_handlers,
+                self.signal_handlers,
+            )
             .with_history_policy(self.history_policy)
             .with_payload_caps(
                 self.max_activity_input_bytes,
@@ -927,6 +960,14 @@ impl HarvestBuilder {
         &self.query_handlers
     }
 
+    /// Registered declarative signal handler metadata, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::signal_handlers`] (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
     /// Register activity definitions (output of `activities![]` macro).
     ///
     /// The runtime maps activity tasks to these definitions for execution.
@@ -990,6 +1031,22 @@ impl HarvestBuilder {
     #[must_use]
     pub fn updates(mut self, handlers: Vec<UpdateHandlerInfo>) -> Self {
         self.update_handlers.extend(handlers);
+        self
+    }
+
+    /// Register declarative signal handler metadata (output of `signals![…]`
+    /// macro) for self-service interface discovery (issue #610).
+    ///
+    /// Each [`SignalHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute and carries an optional payload schema and
+    /// description. This metadata is published by the management API; it does not
+    /// register a runtime handler (push handlers register inside the workflow body
+    /// via [`WorkflowContext::register_signal_handler`](crate::context::WorkflowContext)).
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn signals(mut self, handlers: Vec<SignalHandlerInfo>) -> Self {
+        self.signal_handlers.extend(handlers);
         self
     }
 
@@ -1503,6 +1560,7 @@ impl HarvestBuilder {
             workflow_schedules: self.workflow_schedules,
             query_handlers: self.query_handlers,
             update_handlers: self.update_handlers,
+            signal_handlers: self.signal_handlers,
             worker_config,
             state: self.state,
             telemetry: telemetry_arc,
