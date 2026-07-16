@@ -391,6 +391,7 @@ async fn seed_workflow(
 /// `recorded_resolved` is the #620 disambiguation marker (Codex P2): `true`
 /// models a #620+ event whose frozen values are authoritative (even `None`);
 /// `false` models a pre-#620 legacy event that falls back to live re-derivation.
+#[allow(clippy::too_many_arguments)]
 async fn seed_local_activity_in_progress(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,

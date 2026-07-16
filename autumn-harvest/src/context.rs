@@ -4566,9 +4566,9 @@ impl WorkflowContext {
         // Public seconds-granularity escape hatch (DAG/raw local dispatch). The
         // whole-second value is exact; the subsecond-capable resolution (builder
         // default and the typed `_with_opts` per-call/activity override) happens
-        // in `execute_local_activity_raw_resolved`, which preserves millisecond
-        // precision so a subsecond floor never truncates to `0` (issue #620,
-        // Codex P2).
+        // in `execute_local_activity_raw_resolved`, which carries the full
+        // `Duration` so a subsecond OR sub-millisecond floor never truncates to
+        // `0` (issue #620, Codex P2).
         self.execute_local_activity_raw_resolved(
             name,
             input,
