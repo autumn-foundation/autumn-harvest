@@ -517,15 +517,18 @@ fn mutation_paths(
     set
 }
 
+/// `(Method, concrete_path)` for one generated tool route.
+type RouteMeta = Vec<(Method, String)>;
+
 /// Build a raw axum router from the generated tool routes (exactly what
 /// `AppBuilder::routes(routes)` does inside `Plugin::build`, minus the app
 /// scaffolding), so a `Session` can be injected per request. Returns the app
-/// plus `(Method, concrete_path, is_mutation)` for every route.
-fn build_router(role_auth_enabled: bool) -> (Router, Vec<(Method, String)>, Vec<(Method, String)>) {
+/// plus the mutating and read `(Method, concrete_path)` sets.
+fn build_router(role_auth_enabled: bool) -> (Router, RouteMeta, RouteMeta) {
     let descriptors = all_descriptors();
     record_schemas(&descriptors);
     let muts = mutation_paths(&descriptors);
-    let routes = build_mcp_tool_routes(
+    let tool_routes = build_mcp_tool_routes(
         MCP_PREFIX,
         &descriptors,
         &HarvestApiState::new(),
@@ -533,19 +536,19 @@ fn build_router(role_auth_enabled: bool) -> (Router, Vec<(Method, String)>, Vec<
         role_auth_enabled,
     );
 
-    let mut router: Router<AppState> = Router::new();
+    let mut app: Router<AppState> = Router::new();
     let mut mutating = Vec::new();
     let mut reading = Vec::new();
-    for route in routes {
+    for route in tool_routes {
         let entry = (route.method.clone(), concrete(route.path));
         if muts.contains(route.path) {
             mutating.push(entry);
         } else {
             reading.push(entry);
         }
-        router = router.route(route.path, route.handler);
+        app = app.route(route.path, route.handler);
     }
-    (router.with_state(AppState::for_test()), mutating, reading)
+    (app.with_state(AppState::for_test()), mutating, reading)
 }
 
 async fn drive(
