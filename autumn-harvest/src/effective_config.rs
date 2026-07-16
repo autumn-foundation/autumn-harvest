@@ -118,6 +118,12 @@ pub struct WorkerConfigView {
     pub shard_assignments: Vec<i32>,
     /// Hard cap on local-activity `start_to_close`, milliseconds.
     pub max_local_activity_start_to_close_ms: u64,
+    /// Builder-level default activity retry `max_attempts` (issue #620);
+    /// `null` when no builder-default retry floor is configured.
+    pub default_activity_retry_max_attempts: Option<u32>,
+    /// Builder-level default activity `start_to_close`, milliseconds (issue #620);
+    /// `null` when no builder-default timeout floor is configured.
+    pub default_activity_start_to_close_ms: Option<u64>,
     /// Worker liveness heartbeat interval, milliseconds.
     pub worker_heartbeat_interval_ms: u64,
     /// Immutable build identifier (may be empty; not a secret).
@@ -246,6 +252,8 @@ impl WorkerConfigView {
             cancellation_grace_period,
             shard_assignments,
             max_local_activity_start_to_close,
+            default_activity_retry_policy,
+            default_activity_start_to_close,
             worker_heartbeat_interval,
             build_id,
             deployment_name,
@@ -280,6 +288,10 @@ impl WorkerConfigView {
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),
             shard_assignments: shard_assignments.iter().map(|s| s.as_i32()).collect(),
             max_local_activity_start_to_close_ms: dur_ms(*max_local_activity_start_to_close),
+            default_activity_retry_max_attempts: default_activity_retry_policy
+                .as_ref()
+                .map(|p| p.max_attempts),
+            default_activity_start_to_close_ms: default_activity_start_to_close.map(dur_ms),
             worker_heartbeat_interval_ms: dur_ms(*worker_heartbeat_interval),
             build_id: build_id.clone(),
             deployment_name: deployment_name.clone(),

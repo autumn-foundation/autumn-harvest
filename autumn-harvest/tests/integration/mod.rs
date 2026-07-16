@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod activity_default_floor_tests;
 mod activity_failure_tests;
 mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;

@@ -1331,6 +1331,8 @@ pub async fn run_workflow_with_state_and_history_policy(
         std::collections::HashMap::new(),
         None,
         metrics,
+        None,
+        None,
     )
     .await
 }
@@ -1356,6 +1358,8 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     context_headers: std::collections::HashMap<String, String>,
     payload_offload_threshold: Option<u64>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    default_activity_start_to_close: Option<std::time::Duration>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -1384,7 +1388,14 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     .with_current_details_cap(max_current_details_bytes)
     .with_payload_offload_threshold(payload_offload_threshold)
     .with_context_headers(context_headers)
-    .with_metrics(metrics);
+    .with_metrics(metrics)
+    // Issue #620: thread the builder-level default activity retry/timeout floor
+    // so LOCAL activities (resolved in `execute_local_activity_with_opts`) fall
+    // back to it when no call-site or activity-level default is set.
+    .with_activity_defaults(
+        default_activity_retry_policy,
+        default_activity_start_to_close,
+    );
 
     // Auto-register declarative handlers before any workflow code runs.
     // This satisfies the AC: "authors do not call ctx.register_*_handler in
