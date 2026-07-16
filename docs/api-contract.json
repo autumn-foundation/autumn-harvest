@@ -3305,6 +3305,33 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/workflows/registered/{name}/interface",
+      "category": "discovery",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Enumerate a registered workflow type's published interaction surface: its signal, query, and update handlers, each with an optional argument/response JSON Schema and description. Returns a WorkflowInterfaceRecord { signals, queries, updates }; each array is sorted by handler name (deterministic across calls), and handlers without a published schema omit the arg_schema/response_schema/description fields. Signals always omit response_schema. Returns 404 when the name is unknown (issue #610).",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Workflow type not registered."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/workflows/batch_start",
       "category": "batch",

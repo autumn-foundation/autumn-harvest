@@ -34,7 +34,9 @@ pub use crate::handle::{
 pub use crate::handle_typed::{
     TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
 };
-pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+pub use crate::info::{
+    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+};
 pub use crate::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
@@ -63,6 +65,6 @@ pub use crate::webhook_trigger::{
 
 // Re-export macros from autumn-harvest-macros.
 pub use autumn_harvest_macros::{
-    activities, activity, dag, dags, queries, query, signal, update, updates, webhook, webhooks,
-    workflow, workflows,
+    activities, activity, dag, dags, queries, query, signal, signals, update, updates, webhook,
+    webhooks, workflow, workflows,
 };
