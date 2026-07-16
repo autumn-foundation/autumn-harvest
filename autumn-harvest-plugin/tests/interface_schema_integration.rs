@@ -7,14 +7,17 @@
 //!         type's published signal/query/update handlers, each with an optional
 //!         `arg_schema`/`response_schema`/`description`, sorted by name and
 //!         deterministic across calls. Unknown names → 404. A workflow with no
-//!         published schemas omits the schema fields.
+//!         published schemas omits the schema fields, and a workflow with *no
+//!         handlers at all* returns three empty arrays.
 //!   AC4 — a signal or update payload is validated against its handler's
-//!         published `arg_schema` *before* durable enqueue at the three HTTP
-//!         boundaries (`.../signal/{name}`, `.../signal-with-start`,
-//!         `.../update/{name}`), returning `400` with
+//!         published `arg_schema` *before* durable enqueue at every HTTP
+//!         boundary (`.../signal/{name}`, `.../signal-with-start`,
+//!         `.../update/{name}`, `.../update-with-start`), returning `400` with
 //!         `{ "error": "...", "violations": [{ "message", "field_path" }] }`
 //!         (RFC 6901 pointer). A handler with no published schema is not
-//!         validated (today's behaviour).
+//!         validated (today's behaviour). When a handler carries BOTH an
+//!         `arg_schema` and a semantic validator, the structural schema gate
+//!         (400) runs *before* the validator (422).
 //!
 //! Runs against a real Postgres: uses `HARVEST_TEST_DATABASE_URL` (creating a
 //! fresh per-test database via `psql`) when set, otherwise a testcontainers
@@ -150,6 +153,32 @@ fn plain_info() -> WorkflowInfo {
     }
 }
 
+/// A workflow with ZERO query/update/signal handlers — its `/interface`
+/// document must have all three arrays empty (FIX 4 / AC3).
+fn empty_info() -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name: "empty_wf",
+        module: "tests",
+        handler: iface_workflow,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
 fn query_handlers() -> Vec<QueryHandlerInfo> {
     vec![
         // Deliberately declared second so the /interface sort is observable.
@@ -178,6 +207,17 @@ fn query_handlers() -> Vec<QueryHandlerInfo> {
     ]
 }
 
+/// Semantic validator for `set_priority_gated`: rejects `priority > 10`. A
+/// well-typed payload (integer `priority`) that violates this business rule
+/// must reach the validator (422), *after* the #610 schema gate (400) has
+/// already accepted its shape.
+fn reject_priority_over_ten(args: &Value) -> Result<(), String> {
+    match args.get("priority").and_then(Value::as_i64) {
+        Some(p) if p > 10 => Err(format!("priority {p} exceeds the maximum of 10")),
+        _ => Ok(()),
+    }
+}
+
 fn update_handlers() -> Vec<UpdateHandlerInfo> {
     vec![
         UpdateHandlerInfo {
@@ -191,6 +231,22 @@ fn update_handlers() -> Vec<UpdateHandlerInfo> {
             validator: None,
             mcp: false,
             description: Some("Set the run priority."),
+            arg_schema: Some(priority_arg_schema),
+            response_schema: Some(priority_response_schema),
+        },
+        // Carries BOTH a published arg_schema AND a semantic validator, so the
+        // schema-400-before-validator-422 ordering is observable (FIX 2 / AC4).
+        UpdateHandlerInfo {
+            name: "set_priority_gated",
+            workflow: "iface_wf",
+            module: "tests",
+            input_type_hint: "SetPriority",
+            output_type_hint: "Ack",
+            has_validator: true,
+            handler: |_ctx, _args| Box::pin(async move { Ok(json!({ "ok": true })) }),
+            validator: Some(reject_priority_over_ten),
+            mcp: false,
+            description: Some("Set the run priority (bounded to 10)."),
             arg_schema: Some(priority_arg_schema),
             response_schema: Some(priority_response_schema),
         },
@@ -323,7 +379,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let registry = HandlerRegistry::new(vec![iface_info(), plain_info()], vec![])
+    let registry = HandlerRegistry::new(vec![iface_info(), plain_info(), empty_info()], vec![])
         .with_handler_infos(query_handlers(), update_handlers(), signal_handlers());
     api_state.install(HarvestApiRuntime::new(
         Arc::new(registry),
@@ -486,8 +542,12 @@ async fn interface_lists_sorted_handlers_with_schemas() {
     assert!(body["queries"][1].get("arg_schema").is_none());
     assert!(body["queries"][1].get("response_schema").is_none());
 
-    // Updates: one entry `set_priority` with both schemas + description.
-    assert_eq!(names(&body["updates"]), vec!["set_priority"]);
+    // Updates: sorted by name → set_priority, set_priority_gated (the latter
+    // carries both an arg_schema and a semantic validator; see FIX 2 tests).
+    assert_eq!(
+        names(&body["updates"]),
+        vec!["set_priority", "set_priority_gated"]
+    );
     assert_eq!(body["updates"][0]["arg_schema"], priority_arg_schema());
     assert_eq!(
         body["updates"][0]["response_schema"],
@@ -496,6 +556,12 @@ async fn interface_lists_sorted_handlers_with_schemas() {
     assert_eq!(
         body["updates"][0]["description"],
         json!("Set the run priority.")
+    );
+    // The gated update publishes the same argument schema and its own description.
+    assert_eq!(body["updates"][1]["arg_schema"], priority_arg_schema());
+    assert_eq!(
+        body["updates"][1]["description"],
+        json!("Set the run priority (bounded to 10).")
     );
 }
 
@@ -702,4 +768,185 @@ async fn schema_less_workflow_signal_and_update_are_not_validated() {
         "no-schema update must not 400: {upd_body}"
     );
     assert_eq!(upd_status, StatusCode::ACCEPTED, "body: {upd_body}");
+}
+
+// ── FIX 2 / AC4: schema-400 precedes semantic-validator-422 ────────────────
+
+#[tokio::test]
+async fn update_schema_gate_400_precedes_validator_when_shape_is_wrong() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_running_execution(&pool, "iface_wf").await;
+
+    // Wrong TYPE for `priority` (string, not integer). The #610 schema gate
+    // must reject with a field-level 400 *before* the semantic validator runs,
+    // so the response is the structural-violation body, not the validator body.
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/update/set_priority_gated?wait=admitted"),
+        json!({ "input": { "priority": "high" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_field_violation(&body, "update payload validation failed", "/priority");
+    // It must NOT be the validator body.
+    assert!(
+        body.get("reason").is_none(),
+        "schema failure must not surface the validator `reason`: {body}"
+    );
+}
+
+#[tokio::test]
+async fn update_validator_422_runs_after_schema_gate_accepts_shape() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_running_execution(&pool, "iface_wf").await;
+
+    // Well-typed integer `priority` (passes the schema gate) but violates the
+    // business rule (> 10): the pre-existing validator path must still fire and
+    // return the 422 validator body, unbroken by the new #610 schema gate.
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/update/set_priority_gated?wait=admitted"),
+        json!({ "input": { "priority": 99 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(
+        body["error"], "update rejected by validator",
+        "body: {body}"
+    );
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exceeds the maximum"),
+        "validator reason should be surfaced: {body}"
+    );
+    // It must NOT be the structural-violation body.
+    assert!(
+        body.get("violations").is_none(),
+        "validator rejection must not carry schema `violations`: {body}"
+    );
+}
+
+#[tokio::test]
+async fn update_gated_accepts_a_valid_within_bounds_payload() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_running_execution(&pool, "iface_wf").await;
+
+    // Well-typed AND within the validator bound → neither gate fires.
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/update/set_priority_gated?wait=admitted"),
+        json!({ "input": { "priority": 5 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+}
+
+// ── FIX 3 / AC4: update-with-start boundary validation ─────────────────────
+
+#[tokio::test]
+async fn update_with_start_rejects_malformed_payload_with_400() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Validation runs before the durable start+admit, so no seeded run is needed.
+    // `set_priority` requires an integer `priority`; send a string.
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": "uws-iface-malformed",
+            "update_name": "set_priority",
+            "update_args": { "priority": "high" },
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_field_violation(&body, "update payload validation failed", "/priority");
+}
+
+#[tokio::test]
+async fn update_with_start_accepts_valid_payload() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": "uws-iface-valid",
+            "update_name": "set_priority",
+            "update_args": { "priority": 3 },
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "valid update-with-start payload must not 400: {body}"
+    );
+}
+
+// ── FIX 4 / AC3: fully-empty interface + signal-with-start happy path ───────
+
+#[tokio::test]
+async fn interface_is_all_empty_for_workflow_with_no_handlers() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = get(&app, "/workflows/registered/empty_wf/interface").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["signals"].as_array().unwrap().is_empty(),
+        "signals must be empty: {body}"
+    );
+    assert!(
+        body["queries"].as_array().unwrap().is_empty(),
+        "queries must be empty: {body}"
+    );
+    assert!(
+        body["updates"].as_array().unwrap().is_empty(),
+        "updates must be empty: {body}"
+    );
+}
+
+#[tokio::test]
+async fn signal_with_start_accepts_valid_payload() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // A schema-valid `approve` payload must pass the #610 gate and proceed to
+    // the durable start-or-attach (mirrors signal_route_accepts_valid_payload).
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": "sws-iface-valid",
+            "signal_name": "approve",
+            "signal_payload": { "reason": "looks good" }
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "valid signal-with-start payload must not 400: {body}"
+    );
+    assert!(
+        status.is_success(),
+        "valid signal-with-start should proceed (2xx), got {status}: {body}"
+    );
 }
