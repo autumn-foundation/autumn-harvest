@@ -207,6 +207,8 @@ footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-t
 .dag-legend,.timeline-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
 .dag-legend span,.timeline-legend span{display:inline-flex;align-items:center;gap:4px}
 .dag-legend .swatch,.timeline-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
+.dag-run-current{color:#64748b;font-size:11px;margin-left:6px}
+.dag-run-detail{color:#94a3b8;font-size:11px;margin-left:8px}
 .gantt-scroll{overflow:auto;max-width:100%;max-height:75vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
 .gantt-lane-label{fill:#cbd5e1;font:11px system-ui,-apple-system,sans-serif}
 .gantt-lane-group{fill:#93c5fd;font:600 11px system-ui,-apple-system,sans-serif}
@@ -5783,19 +5785,42 @@ fn render_dag_detail(
                     th { "Duration" }
                 }
             }
-            tbody {
-                @for run in runs {
-                    tr {
-                        td { a href={ "../workflows/" (run.id) } { code { (run.id) } } }
-                        td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
-                        td { (format_timestamp(Some(run.started_at))) }
-                        td { (format_run_duration(run.started_at, run.completed_at)) }
-                    }
-                }
-            }
+            (render_dag_run_rows(runs, selected_run))
         }
     };
     layout_dag_detail(&format!("DAG {dag_name} · Vantage"), &body, "../", refresh)
+}
+
+/// Render the `<tbody>` of the DAG run list (issue #957).
+///
+/// Each run's **primary** affordance re-renders THIS page's node graph for that
+/// run via a same-page `?run=` query (the same selector the graph honors, and the
+/// same bare-relative form the SVG node links use). Without this, older runs' graphs
+/// were only reachable by hand-constructing the query URL. The currently-shown run
+/// is marked "(current)" instead of linked, so it is clear which run the graph
+/// reflects. A secondary "detail" link still opens each run's workflow-detail page.
+fn render_dag_run_rows(runs: &[WorkflowExecution], selected_run: Option<uuid::Uuid>) -> Markup {
+    html! {
+        tbody {
+            @for run in runs {
+                @let is_current = selected_run == Some(run.id);
+                tr {
+                    td {
+                        @if is_current {
+                            code { (run.id) }
+                            span class="dag-run-current" { "(current)" }
+                        } @else {
+                            a href={ "?run=" (url_encode(&run.id.to_string())) } { code { (run.id) } }
+                        }
+                        a class="dag-run-detail" href={ "../workflows/" (run.id) } { "detail" }
+                    }
+                    td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
+                    td { (format_timestamp(Some(run.started_at))) }
+                    td { (format_run_duration(run.started_at, run.completed_at)) }
+                }
+            }
+        }
+    }
 }
 
 /// Render the graph SVG + legend + optional large-DAG note + selected-node
@@ -8905,6 +8930,44 @@ mod tests {
         let html = layout_dag_detail("D", &body, "", Some(30)).into_string();
         assert!(html.contains("http-equiv=\"refresh\""));
         assert!(html.contains("content=\"30\""));
+    }
+
+    // Issue #957 (Codex review): every non-current run in the list must link to
+    // its own graph via `?run=`, and the currently-shown run must be marked
+    // "current" rather than linked — so an operator can inspect an older run's
+    // graph from the page instead of hand-building the query URL.
+    #[test]
+    fn render_dag_run_rows_links_each_run_to_its_graph_and_marks_current() {
+        let mut run_a = stub_execution();
+        run_a.id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let mut run_b = stub_execution();
+        run_b.id = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let runs = vec![run_a.clone(), run_b.clone()];
+
+        // run_a is the selected/current run.
+        let html = render_dag_run_rows(&runs, Some(run_a.id)).into_string();
+
+        // The non-current run (run_b) is reachable as a graph via `?run=<id>`,
+        // with the id url-encoded.
+        let expected_href = format!("?run={}", url_encode(&run_b.id.to_string()));
+        assert!(
+            html.contains(&format!("href=\"{expected_href}\"")),
+            "non-current run must link to its graph via ?run=; html={html}"
+        );
+
+        // The current run is marked, not linked to a graph.
+        assert!(
+            html.contains("(current)"),
+            "current run must be marked; html={html}"
+        );
+        assert!(
+            !html.contains(&format!("?run={}", url_encode(&run_a.id.to_string()))),
+            "current run must NOT carry a ?run= graph link; html={html}"
+        );
+
+        // The secondary workflow-detail link is preserved for every run.
+        assert!(html.contains(&format!("../workflows/{}", run_a.id)));
+        assert!(html.contains(&format!("../workflows/{}", run_b.id)));
     }
 
     #[test]
