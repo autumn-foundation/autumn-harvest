@@ -99,6 +99,11 @@ pub(crate) type McpToolMiddlewareFn = std::sync::Arc<
 ///     .await;
 /// # }
 /// ```
+// Each bool is an independent, orthogonal opt-in mirrored onto HarvestApiState
+// (mcp tools, read-path decode, read-only role, metrics scrape); they are not a
+// state machine that a bitfield/enum would model better. The count crosses the
+// clippy threshold only under the `metrics` feature.
+#[allow(clippy::struct_excessive_bools)]
 pub struct HarvestPlugin {
     builder: HarvestBuilder,
     api_path: Option<String>,
