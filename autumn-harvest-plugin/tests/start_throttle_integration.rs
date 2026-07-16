@@ -1406,7 +1406,7 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
     // Guard the result count before indexing so a wrong shape yields a clear
     // message instead of an index-out-of-bounds panic.
     assert_eq!(
-        body["results"].as_array().map_or(0, |a| a.len()),
+        body["results"].as_array().map_or(0, Vec::len),
         2,
         "expected exactly 2 results in the batch response: {body:?}"
     );
