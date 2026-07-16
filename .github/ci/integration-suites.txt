@@ -74,6 +74,7 @@ linux        autumn-harvest-plugin  dag_run_graph_integration        -          
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  fail_now_integration             -                          -
 linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -
+linux        autumn-harvest-plugin  interface_schema_integration     -                          -
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
