@@ -11118,7 +11118,6 @@ mod tests {
     #[test]
     fn register_signal_handler_typed_deserialization_failure_does_not_panic() {
         #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
         struct CancelRequest {
             reason: String,
         }
@@ -11134,7 +11133,8 @@ mod tests {
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
         // Must not panic even though the payload cannot deserialize into CancelRequest.
-        ctx.register_signal_handler("cancel", |_req: CancelRequest| {
+        ctx.register_signal_handler("cancel", |req: CancelRequest| {
+            let _ = req.reason;
             panic!("handler must never run on a deserialization failure");
         });
     }
