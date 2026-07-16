@@ -208,6 +208,71 @@ async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec
     );
 }
 
+/// AC3 (issue #740): a start delegated from the inbound webhook receiver records
+/// `start_source = "webhook"`, distinguishing it from an ordinary `api` start.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn webhook_start_records_webhook_source() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let db = TestDb::shared().await;
+    unsafe {
+        std::env::set_var("AUTUMN_DATABASE__URL", db.url());
+    }
+    autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
+        .expect("failed to run framework migrations");
+    autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
+        .expect("failed to run Harvest migrations");
+    db.execute_sql("TRUNCATE TABLE harvest_workflow_executions CASCADE")
+        .await;
+
+    let client = TestApp::new()
+        .config(webhook_config())
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![order_flow, subscription_flow])
+                .webhooks(webhooks![map_order, map_subscription])
+                .worker(WorkerConfig::default())
+                .api("/api/harvest"),
+        )
+        .with_db(db.pool())
+        .build();
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "id": "dlv-src-1",
+        "order_id": "o-src"
+    }))
+    .unwrap();
+    let sig = sign(&body);
+
+    let resp = client
+        .post("/hooks/orders")
+        .header("X-Webhook-Signature", &sig)
+        .header("X-Webhook-Delivery", "dlv-src-1")
+        .body(body)
+        .send()
+        .await;
+    resp.assert_status(202);
+
+    let mut conn = db.pool().get().await.expect("pool conn");
+    #[derive(diesel::QueryableByName)]
+    struct SourceRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        start_source: Option<String>,
+    }
+    let row: SourceRow = diesel::sql_query(
+        "SELECT start_source FROM harvest_workflow_executions WHERE workflow_name = 'order_flow' LIMIT 1",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("created execution row");
+    assert_eq!(
+        row.start_source.as_deref(),
+        Some("webhook"),
+        "a webhook-delegated start must record start_source='webhook'"
+    );
+}
+
 /// The `signals` target variant dedupes on the verified delivery ID: two
 /// identical deliveries admit exactly one `SignalReceived` event, not two.
 #[tokio::test]

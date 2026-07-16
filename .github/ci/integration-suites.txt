@@ -61,6 +61,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
 linux        autumn-harvest         integration                      -                          scheduler_overdue_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
+linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    nd_block
@@ -83,6 +84,7 @@ linux        autumn-harvest-plugin  read_path_decode_integration     -          
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  start_idempotency_integration    -                          -
+linux        autumn-harvest-plugin  start_source_integration         -                          -
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
