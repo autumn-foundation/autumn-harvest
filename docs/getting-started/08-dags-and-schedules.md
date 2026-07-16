@@ -327,6 +327,118 @@ nodes as runnable for the purpose of structure validation — it does not
 evaluate condition closures. Use `WorkflowTestEnv` or a real run to verify
 routing behaviour.
 
+## Passing data between nodes (node input binding)
+
+By default, every DAG node's activity is fed the DAG's *trigger input*
+(wrapped in a `{ "conf": …, "dag_task": "<name>" }` envelope) — **not** the
+output of the upstream node it depends on. So a classic
+`extract → transform → load` pipeline, where each stage consumes the prior
+stage's output, previously forced you to either flatten the whole pipeline
+into one mega-activity or hand-thread outputs through shared state. Neither
+is the graph you wanted to draw.
+
+**Node input binding** (issue #702) closes that gap: bind a node's activity
+input directly to one or more upstream node outputs, with one builder call
+per data edge and zero hand-written output-threading.
+
+```rust
+#[activity(start_to_close = "30s")]
+async fn extract_rows(_ctx: &ActivityContext) -> HarvestResult<Value> {
+    Ok(serde_json::json!([{ "id": 1 }, { "id": 2 }]))
+}
+
+#[activity(start_to_close = "30s")]
+async fn transform_rows(_ctx: &ActivityContext, rows: Value) -> HarvestResult<Value> {
+    // `rows` IS the extract output, verbatim — no envelope to unpack.
+    Ok(serde_json::json!({ "record_count": rows.as_array().map_or(0, Vec::len) }))
+}
+
+#[activity(start_to_close = "30s")]
+async fn load_summary(_ctx: &ActivityContext, summary: Value) -> HarvestResult<Value> {
+    // `summary` IS the transform output, verbatim.
+    Ok(Value::Null)
+}
+
+#[dag]
+pub fn etl_pipeline(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_rows);
+    let transform = dag.activity(transform_rows).input_from(&extract);
+    let _load = dag.activity(load_summary).input_from(&transform);
+}
+```
+
+### The three binding methods
+
+| Method | The bound node's activity receives … |
+|---|---|
+| `.input_from(&up)` | `up`'s recorded output, **verbatim** — no `conf`/`dag_task` wrapper. |
+| `.input_from_all(&[&a, &b])` | a JSON object merging both outputs, keyed by each upstream's **activity name**. |
+| `.input_from_aliased(&[("k", &a)])` | a JSON object merging the outputs, keyed by the **given alias**. |
+
+`.input_from_all` keys by activity name, so two upstreams sharing an activity
+name is a `DagBuildError::DuplicateInputBindingKey` at build time — use
+`.input_from_aliased` to disambiguate. A repeated alias is likewise a
+`DuplicateInputBindingKey`, and declaring both an `.input_from(…)` binding
+and a mapped upstream (`.map_activity(…).over(…)`) on the same node is a
+`DagBuildError::ConflictingInputBinding`. All three are caught when the DAG
+is compiled, never at run time.
+
+```rust
+// Fan-in: merge two upstream outputs into one keyed object.
+let users = dag.activity(fetch_users);
+let orders = dag.activity(fetch_orders);
+let _report = dag
+    .activity(join_report)
+    .input_from_aliased(&[("users", &users), ("orders", &orders)]);
+// join_report receives { "users": <fetch_users out>, "orders": <fetch_orders out> }
+```
+
+### Binding implies the dependency edge
+
+A binding **is** a data edge, so it adds the upstream dependency
+automatically — you do not also need `.upstream(&up)` (an extra one is
+harmless). The bound node therefore runs *after* its bound upstream(s), and
+only after their outputs are recorded.
+
+### Skipped or failed upstreams yield null
+
+If a bound upstream was skipped (by a trigger rule or a `.condition`) or
+failed, its contribution to the binding is a deterministic `Value::Null` —
+never a missing key. By default a node whose upstream was skipped is itself
+skipped; to make a bound node run *anyway* and branch on the null, give it a
+permissive trigger rule:
+
+```rust
+let maybe = dag.activity(maybe_step).upstream(&root).condition(|_| false); // skipped
+let _final = dag
+    .activity(finalize)
+    .input_from(&maybe)               // maybe was skipped → input is null
+    .trigger_rule(TriggerRule::AllDone);
+```
+
+### Determinism rule
+
+A bound node's input is a **pure function of already-recorded upstream
+outputs**. Those outputs are frozen in `harvest_events` before the bound
+node is dispatched, so replay reconstructs byte-identical inputs on every
+worker and every pass. Do not derive a node's input from process state, the
+system clock, or random values — bind to an upstream output instead (and if
+you need a captured wall-clock or random value, produce it with
+[`ctx.side_effect`](07-reliability-knobs.md) in an upstream activity and read
+it back through that activity's output). **No new `WorkflowEvent` variant
+and no migration:** binding is computed in the workflow body from recorded
+`ActivityCompleted` outputs, and an unbound DAG is byte-identical to today.
+
+### Composition
+
+Input binding composes with the rest of the DAG surface. It slots in
+alongside a `.condition(…)` branch (evaluate the branch predicate over
+upstream outputs, then bind the chosen node's input), and a bound node's
+own output can feed a downstream [mapped fan-out](#dynamic-task-mapping-fan-out)
+(`.map_activity(…).over(&bound_node)`) exactly as any other node's output
+does. A worked end-to-end example — a three-stage ETL plus a fan-in merge —
+lives in `autumn-harvest/examples/dag_data_flow.rs`.
+
 ## Signal / approval gates
 
 A **gate node** pauses a DAG run until a named signal arrives, then makes the
