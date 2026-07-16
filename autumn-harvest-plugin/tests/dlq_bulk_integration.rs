@@ -889,3 +889,42 @@ async fn bulk_min_attempts_filter_narrows() {
         "the attempts=1 row must survive"
     );
 }
+
+/// A non-positive `min_attempts` matches EVERY DLQ row (`attempts >= 0` is
+/// universally true, attempt counts being 1-based), so on the DESTRUCTIVE bulk
+/// path it must be rejected with `400` at the request boundary rather than
+/// slipping past the empty-filter safety guard (AC8, issue #613). Covers both
+/// the reported negative case and `0`; asserts nothing is acted on.
+#[tokio::test]
+async fn bulk_negative_min_attempts_is_rejected_400() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+
+    insert_dlq_row_full(&database_url, "flaky", "default", 1, "connection refused").await;
+    insert_dlq_row_full(&database_url, "flaky", "default", 3, "connection refused").await;
+
+    // Negative: the reported all-rows-match bypass.
+    let (neg_status, neg_body) =
+        post_json(&app, "/dead-letters/discard", json!({ "min_attempts": -1 })).await;
+    assert_eq!(
+        neg_status,
+        StatusCode::BAD_REQUEST,
+        "negative min_attempts must 400, body: {neg_body}"
+    );
+
+    // Zero: `attempts >= 0` also matches every row.
+    let (zero_status, zero_body) =
+        post_json(&app, "/dead-letters/discard", json!({ "min_attempts": 0 })).await;
+    assert_eq!(
+        zero_status,
+        StatusCode::BAD_REQUEST,
+        "zero min_attempts must 400, body: {zero_body}"
+    );
+
+    // Neither malformed request touched the DLQ.
+    assert_eq!(
+        count_dlq_rows(&database_url).await,
+        2,
+        "a rejected bulk request must act on no rows"
+    );
+}

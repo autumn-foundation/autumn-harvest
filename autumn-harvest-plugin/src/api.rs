@@ -22796,7 +22796,10 @@ impl BulkDlqApiBody {
                 // dimensions (whose empty value would dangerously skip the
                 // filter and widen the cohort).
                 queue_name: self.queue_name,
-                min_attempts: self.min_attempts,
+                min_attempts: self
+                    .min_attempts
+                    .map(validate_bulk_min_attempts)
+                    .transpose()?,
                 failed_after: self.failed_after,
                 failed_before: self.failed_before,
                 error_class: normalize_cause_filter(self.error_class)?,
@@ -22830,6 +22833,26 @@ fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, Autum
             }
         },
     )
+}
+
+/// Validate a bulk-DLQ `min_attempts` filter (issue #613). The aggregate read
+/// parser (`DlqAggregateParams::from_query_pairs`) only rejects negatives
+/// (accepting `>= 0`), but the bulk replay/discard paths are DESTRUCTIVE so we
+/// are stricter: attempt counts are 1-based, so a `min_attempts` of `0` or a
+/// negative value produces the predicate `attempts >= 0` (or lower) which
+/// matches EVERY DLQ row. That is not a genuine narrowing criterion, so it must
+/// not satisfy the substantive-filter safety guard (AC8) — otherwise a
+/// malformed request slips past `BulkDlqFilter::is_empty()` and acts on the
+/// whole DLQ. Reject at the request boundary (mirroring `normalize_cause_filter`)
+/// rather than touching the SQL predicate; require `>= 1`.
+fn validate_bulk_min_attempts(value: i32) -> Result<i32, AutumnError> {
+    if value < 1 {
+        Err(AutumnError::bad_request_msg(format!(
+            "invalid min_attempts '{value}'; expected a positive integer (>= 1)"
+        )))
+    } else {
+        Ok(value)
+    }
 }
 
 /// Parsed `POST /dlq/redrive` request (issue #510): the core filter plus the
@@ -22945,7 +22968,10 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
             "workflow_name" => selector.filter.workflow_name = Some(value.to_string()),
             "queue_name" => selector.filter.queue_name = Some(value.to_string()),
             "min_attempts" => {
-                selector.filter.min_attempts = Some(parse_i32_field(value, "min_attempts")?);
+                selector.filter.min_attempts = Some(validate_bulk_min_attempts(parse_i32_field(
+                    value,
+                    "min_attempts",
+                )?)?);
             }
             "task_kind" | "task_type" => {
                 selector.task_type = Some(parse_dlq_task_type_filter(value)?);
@@ -31005,6 +31031,18 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
+    /// `0` and negatives — which match every 1-based-attempt row — are rejected
+    /// so a malformed request can't slip past the empty-filter safety guard.
+    #[test]
+    fn validate_bulk_min_attempts_rejects_non_positive() {
+        assert_eq!(validate_bulk_min_attempts(1).unwrap(), 1);
+        assert_eq!(validate_bulk_min_attempts(3).unwrap(), 3);
+        assert!(validate_bulk_min_attempts(0).is_err());
+        assert!(validate_bulk_min_attempts(-1).is_err());
+        assert!(validate_bulk_min_attempts(i32::MIN).is_err());
     }
 
     /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
