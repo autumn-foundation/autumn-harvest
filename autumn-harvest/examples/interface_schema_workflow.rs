@@ -77,14 +77,24 @@ pub async fn order_workflow(_ctx: &WorkflowContext, _input: ()) -> Result<(), St
 /// function body itself is never invoked (signals have no handler fn — they are
 /// dispatched via `register_signal_handler`), so it is intentionally unused here.
 #[allow(dead_code)]
-#[signal(workflow = "order_workflow", description = "Cancel the in-flight order")]
+#[signal(
+    workflow = "order_workflow",
+    description = "Cancel the in-flight order"
+)]
 fn cancel_order(_ctx: &WorkflowContext, _req: CancelRequest) {}
 
 /// Query: read the order's current progress.
-#[query(workflow = "order_workflow", description = "Read the order's current progress")]
+#[query(
+    workflow = "order_workflow",
+    description = "Read the order's current progress"
+)]
 fn order_status(_ctx: &WorkflowContext, req: StatusRequest) -> Result<StatusResponse, String> {
     Ok(StatusResponse {
-        state: if req.verbose { "RUNNING (verbose)".into() } else { "RUNNING".into() },
+        state: if req.verbose {
+            "RUNNING (verbose)".into()
+        } else {
+            "RUNNING".into()
+        },
         processed: 0,
     })
 }
@@ -163,14 +173,23 @@ mod tests {
         // Signal: arg_schema + description, never a response_schema.
         let sig = &record.signals[0];
         assert_eq!(sig.name, "cancel_order");
-        assert_eq!(sig.description.as_deref(), Some("Cancel the in-flight order"));
+        assert_eq!(
+            sig.description.as_deref(),
+            Some("Cancel the in-flight order")
+        );
         assert!(sig.arg_schema.is_some(), "signal must carry an arg_schema");
-        assert!(sig.response_schema.is_none(), "signals have no response_schema");
+        assert!(
+            sig.response_schema.is_none(),
+            "signals have no response_schema"
+        );
 
         // Query: arg + response schema + description.
         let q = &record.queries[0];
         assert_eq!(q.name, "order_status");
-        assert_eq!(q.description.as_deref(), Some("Read the order's current progress"));
+        assert_eq!(
+            q.description.as_deref(),
+            Some("Read the order's current progress")
+        );
         assert!(q.arg_schema.is_some());
         assert!(q.response_schema.is_some());
 
