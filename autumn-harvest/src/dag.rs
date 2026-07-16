@@ -123,6 +123,34 @@ pub enum DagDispatchDecision {
     SkipByCondition,
 }
 
+/// How a DAG node's activity input is bound to upstream node outputs
+/// (issue #702).
+///
+/// When a node has an `input_from` binding, its activity receives the raw
+/// upstream output(s) directly instead of the trigger-input + `dag_task`
+/// wrapper the unbound path uses. Set via [`DagTaskRef::input_from`],
+/// [`DagTaskRef::input_from_all`], or [`DagTaskRef::input_from_aliased`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DagInputBinding {
+    /// Single upstream: the node's input is that upstream's recorded output,
+    /// verbatim.
+    Single(usize),
+    /// Multiple upstreams merged into a JSON object, one key per source.
+    Merged(Vec<DagMergeSource>),
+}
+
+/// A single keyed source in a [`DagInputBinding::Merged`] binding (issue #702).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DagMergeSource {
+    /// The JSON object key this source's output is inserted under — either an
+    /// explicit alias (from [`DagTaskRef::input_from_aliased`]) or the
+    /// upstream's activity name (from [`DagTaskRef::input_from_all`]).
+    pub key: String,
+    /// The global task index of the upstream node whose output supplies the
+    /// value.
+    pub upstream_index: usize,
+}
+
 #[derive(Clone)]
 struct PendingDagTask {
     activity_name: String,
@@ -135,6 +163,7 @@ struct PendingDagTask {
     map_failure_policy: MapFailurePolicy,
     condition: Option<DagCondition>,
     signal: Option<DagSignalGate>,
+    input_from: Option<DagInputBinding>,
 }
 
 impl fmt::Debug for PendingDagTask {
@@ -150,6 +179,7 @@ impl fmt::Debug for PendingDagTask {
             .field("map_failure_policy", &self.map_failure_policy)
             .field("condition", &self.condition)
             .field("signal", &self.signal)
+            .field("input_from", &self.input_from)
             .finish()
     }
 }
@@ -183,6 +213,12 @@ pub struct DagTask {
     /// level so its `WaitForSignal` suspension is never batched with a level's
     /// activity `ScheduleActivity` dispatches.
     pub signal: Option<DagSignalGate>,
+    /// Optional input binding (issue #702). When `Some`, this node's activity
+    /// input is drawn directly from upstream node output(s) — the raw output
+    /// for [`DagInputBinding::Single`], or a keyed JSON object for
+    /// [`DagInputBinding::Merged`] — instead of the trigger-input + `dag_task`
+    /// wrapper the unbound path uses.
+    pub input_from: Option<DagInputBinding>,
 }
 
 impl DagTask {
@@ -232,6 +268,7 @@ impl From<PendingDagTask> for DagTask {
             map_failure_policy: task.map_failure_policy,
             condition: task.condition,
             signal: task.signal,
+            input_from: task.input_from,
         }
     }
 }
@@ -263,12 +300,46 @@ impl DagDefinition {
 pub enum DagBuildError {
     /// The DAG contains a cyclic dependency, which prevents execution.
     CycleDetected,
+    /// A node declares both an `input_from` binding and a `map_upstream`
+    /// (issue #702) — these are contradictory input sources.
+    ConflictingInputBinding {
+        /// The activity name of the offending node.
+        task: String,
+    },
+    /// A [`DagInputBinding::Merged`] binding contains the same key twice
+    /// (issue #702) — either two upstreams sharing an activity name via
+    /// `input_from_all`, or a repeated alias via `input_from_aliased`.
+    DuplicateInputBindingKey {
+        /// The activity name of the offending node.
+        task: String,
+        /// The duplicated merge key.
+        key: String,
+    },
+    /// A binding references an `upstream_index` that is not one of the node's
+    /// upstreams (issue #702) — unreachable via the public API (bindings
+    /// auto-add the edge), validated defensively.
+    InputBindingNotAnUpstream {
+        /// The activity name of the offending node.
+        task: String,
+    },
 }
 
 impl fmt::Display for DagBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CycleDetected => f.write_str("dag contains a dependency cycle"),
+            Self::ConflictingInputBinding { task } => write!(
+                f,
+                "dag task '{task}' declares both an input binding and a mapped upstream (input_from and map_activity are mutually exclusive)"
+            ),
+            Self::DuplicateInputBindingKey { task, key } => write!(
+                f,
+                "dag task '{task}' has a duplicate input-binding key '{key}' (merge keys must be unique)"
+            ),
+            Self::InputBindingNotAnUpstream { task } => write!(
+                f,
+                "dag task '{task}' has an input binding referencing a node that is not an upstream"
+            ),
         }
     }
 }
@@ -374,6 +445,107 @@ impl DagTaskRef {
         F: Fn(&[Value]) -> bool + Send + Sync + 'static,
     {
         self.mutate(|task| task.condition = Some(DagCondition::new(predicate)))
+    }
+
+    /// Bind this task's activity input to `upstream`'s output, verbatim
+    /// (issue #702).
+    ///
+    /// The dependency edge is added automatically (an explicit `.upstream()`
+    /// is not required). The bound activity receives the raw upstream output
+    /// instead of the trigger-input + `dag_task` wrapper the unbound path uses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `upstream` were created by different
+    /// [`DagBuilder`] instances.
+    #[must_use]
+    pub fn input_from(self, upstream: &Self) -> Self {
+        assert!(
+            Rc::ptr_eq(&self.tasks, &upstream.tasks),
+            "cannot connect tasks from different DagBuilder instances"
+        );
+        let up_index = upstream.index;
+        self.mutate(|task| {
+            if !task.upstreams.contains(&up_index) {
+                task.upstreams.push(up_index);
+            }
+            task.input_from = Some(DagInputBinding::Single(up_index));
+        })
+    }
+
+    /// Bind this task's activity input to a JSON object merging every
+    /// `upstream`'s output, keyed by each upstream's activity name (issue #702).
+    ///
+    /// Dependency edges are added automatically. Keys are the upstreams'
+    /// activity names in the given order; two upstreams sharing an activity
+    /// name is a [`DagBuildError::DuplicateInputBindingKey`] at build time (use
+    /// [`input_from_aliased`](Self::input_from_aliased) to disambiguate).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and any `upstream` were created by different
+    /// [`DagBuilder`] instances.
+    #[must_use]
+    pub fn input_from_all(self, upstreams: &[&Self]) -> Self {
+        for up in upstreams {
+            assert!(
+                Rc::ptr_eq(&self.tasks, &up.tasks),
+                "cannot connect tasks from different DagBuilder instances"
+            );
+        }
+        let sources: Vec<DagMergeSource> = {
+            let tasks = self.tasks.borrow();
+            upstreams
+                .iter()
+                .map(|up| DagMergeSource {
+                    key: tasks[up.index].activity_name.clone(),
+                    upstream_index: up.index,
+                })
+                .collect()
+        };
+        self.mutate(move |task| {
+            for up in upstreams {
+                if !task.upstreams.contains(&up.index) {
+                    task.upstreams.push(up.index);
+                }
+            }
+            task.input_from = Some(DagInputBinding::Merged(sources));
+        })
+    }
+
+    /// Bind this task's activity input to a JSON object merging every
+    /// upstream's output, keyed by an explicit alias (issue #702).
+    ///
+    /// Dependency edges are added automatically. A duplicate alias is a
+    /// [`DagBuildError::DuplicateInputBindingKey`] at build time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and any bound upstream were created by different
+    /// [`DagBuilder`] instances.
+    #[must_use]
+    pub fn input_from_aliased(self, bindings: &[(&str, &Self)]) -> Self {
+        for (_, up) in bindings {
+            assert!(
+                Rc::ptr_eq(&self.tasks, &up.tasks),
+                "cannot connect tasks from different DagBuilder instances"
+            );
+        }
+        let sources: Vec<DagMergeSource> = bindings
+            .iter()
+            .map(|(key, up)| DagMergeSource {
+                key: (*key).to_owned(),
+                upstream_index: up.index,
+            })
+            .collect();
+        self.mutate(move |task| {
+            for (_, up) in bindings {
+                if !task.upstreams.contains(&up.index) {
+                    task.upstreams.push(up.index);
+                }
+            }
+            task.input_from = Some(DagInputBinding::Merged(sources));
+        })
     }
 
     fn mutate(self, update: impl FnOnce(&mut PendingDagTask)) -> Self {
@@ -499,6 +671,7 @@ impl DagBuilder {
             map_failure_policy: MapFailurePolicy::FailFast,
             condition: None,
             signal: None,
+            input_from: None,
         });
 
         DagTaskRef {
@@ -527,6 +700,7 @@ impl DagBuilder {
             map_failure_policy: MapFailurePolicy::FailFast,
             condition: None,
             signal: None,
+            input_from: None,
         });
 
         DagMapTaskRef {
@@ -621,6 +795,7 @@ impl DagBuilder {
             map_failure_policy: MapFailurePolicy::FailFast,
             condition: None,
             signal: Some(gate),
+            input_from: None,
         });
 
         DagTaskRef {
@@ -637,6 +812,45 @@ impl DagBuilder {
     /// cycle.
     pub fn build(&self) -> Result<DagDefinition, DagBuildError> {
         let tasks = self.tasks.borrow().clone();
+
+        // Input-binding validation (issue #702).
+        for task in &tasks {
+            let Some(binding) = &task.input_from else {
+                continue;
+            };
+            // A binding and a mapped upstream are contradictory input sources.
+            if task.map_upstream.is_some() {
+                return Err(DagBuildError::ConflictingInputBinding {
+                    task: task.activity_name.clone(),
+                });
+            }
+            let indices: Vec<usize> = match binding {
+                DagInputBinding::Single(i) => vec![*i],
+                DagInputBinding::Merged(sources) => {
+                    let mut seen = std::collections::HashSet::new();
+                    for source in sources {
+                        if !seen.insert(source.key.as_str()) {
+                            return Err(DagBuildError::DuplicateInputBindingKey {
+                                task: task.activity_name.clone(),
+                                key: source.key.clone(),
+                            });
+                        }
+                    }
+                    sources.iter().map(|s| s.upstream_index).collect()
+                }
+            };
+            // Defensive: every bound source must be a declared upstream. The
+            // public builder methods auto-add the edge, so this is unreachable
+            // via the API, but validate anyway.
+            for idx in indices {
+                if !task.upstreams.contains(&idx) {
+                    return Err(DagBuildError::InputBindingNotAnUpstream {
+                        task: task.activity_name.clone(),
+                    });
+                }
+            }
+        }
+
         let mut indegree = vec![0_usize; tasks.len()];
         let mut outgoing = vec![Vec::<usize>::new(); tasks.len()];
 
@@ -707,6 +921,22 @@ impl DagBuilder {
             tasks: tasks.into_iter().map(Into::into).collect(),
             execution_levels,
         })
+    }
+}
+
+/// Resolve a bound node's activity input from upstream outputs (issue #702):
+/// the raw output for a [`DagInputBinding::Single`], or a keyed JSON object for
+/// a [`DagInputBinding::Merged`]. No `dag_task` injection, no `conf` wrapping.
+fn bind_activity_input(binding: &DagInputBinding, outputs: &[Value]) -> Value {
+    match binding {
+        DagInputBinding::Single(idx) => outputs[*idx].clone(),
+        DagInputBinding::Merged(sources) => {
+            let mut obj = serde_json::Map::new();
+            for source in sources {
+                obj.insert(source.key.clone(), outputs[source.upstream_index].clone());
+            }
+            Value::Object(obj)
+        }
     }
 }
 
@@ -941,30 +1171,39 @@ pub async fn run_unified_dag(
                     Ok::<_, String>((task_idx, status, final_val))
                 }));
             } else {
-                let mapped_up = upstreams
-                    .iter()
-                    .copied()
-                    .find(|&i| tasks[i].map_upstream.is_some());
-                let activity_input = mapped_up.map_or_else(
-                    || match input.clone() {
-                        Value::Object(mut object) => {
-                            object.insert(
-                                "dag_task".to_owned(),
-                                Value::String(activity_name.clone()),
-                            );
-                            Value::Object(object)
-                        }
-                        conf => {
-                            let mut object = serde_json::Map::new();
-                            object.insert("conf".to_owned(), conf);
-                            object.insert(
-                                "dag_task".to_owned(),
-                                Value::String(activity_name.clone()),
-                            );
-                            Value::Object(object)
-                        }
+                // Highest priority (issue #702): an explicit input binding
+                // draws the activity input directly from upstream output(s) —
+                // the RAW output, with NO `dag_task` injection and NO `conf`
+                // wrapping. The unbound `||` branch below stays byte-identical.
+                let activity_input = tasks[task_idx].input_from.as_ref().map_or_else(
+                    || {
+                        let mapped_up = upstreams
+                            .iter()
+                            .copied()
+                            .find(|&i| tasks[i].map_upstream.is_some());
+                        mapped_up.map_or_else(
+                            || match input.clone() {
+                                Value::Object(mut object) => {
+                                    object.insert(
+                                        "dag_task".to_owned(),
+                                        Value::String(activity_name.clone()),
+                                    );
+                                    Value::Object(object)
+                                }
+                                conf => {
+                                    let mut object = serde_json::Map::new();
+                                    object.insert("conf".to_owned(), conf);
+                                    object.insert(
+                                        "dag_task".to_owned(),
+                                        Value::String(activity_name.clone()),
+                                    );
+                                    Value::Object(object)
+                                }
+                            },
+                            |mapped_up_idx| outputs[mapped_up_idx].clone(),
+                        )
                     },
-                    |mapped_up_idx| outputs[mapped_up_idx].clone(),
+                    |binding| bind_activity_input(binding, &outputs),
                 );
 
                 activity_futs.push(Box::pin(async move {
@@ -1403,6 +1642,138 @@ mod tests {
         assert_eq!(
             dag.tasks()[1].dispatch_decision(&statuses, &outputs),
             DagDispatchDecision::SkipByCondition,
+        );
+    }
+
+    // ── Issue #702 — DAG node input binding ────────────────────────────────
+
+    #[test]
+    fn input_from_stores_single_binding_and_adds_edge() {
+        let mut builder = DagBuilder::new();
+        let extract = builder.activity(dummy_activity); // idx 0
+        let extract_idx = extract.index();
+        // transform declares NO explicit `.upstream()` — the edge must be
+        // auto-added by `input_from`.
+        let transform = builder.activity(dummy_activity2); // idx 1
+        let _ = transform.input_from(&extract);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+        assert_eq!(
+            tasks[1].input_from,
+            Some(DagInputBinding::Single(extract_idx)),
+            "single binding must be stored"
+        );
+        assert!(
+            tasks[1].upstreams.contains(&extract_idx),
+            "input_from must auto-add the dependency edge"
+        );
+    }
+
+    #[test]
+    fn input_from_all_merges_keyed_by_activity_name() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity); // 0 "dummy_activity"
+        let b = builder.activity(dummy_activity2); // 1 "dummy_activity2"
+        let c = builder.activity(dummy_activity3); // 2
+        let _ = c.input_from_all(&[&a, &b]);
+
+        let dag = builder.build().unwrap();
+        let t = &dag.tasks()[2];
+        assert_eq!(
+            t.input_from,
+            Some(DagInputBinding::Merged(vec![
+                DagMergeSource {
+                    key: "dummy_activity".to_owned(),
+                    upstream_index: 0,
+                },
+                DagMergeSource {
+                    key: "dummy_activity2".to_owned(),
+                    upstream_index: 1,
+                },
+            ])),
+            "input_from_all must key by upstream activity name in argument order"
+        );
+        assert!(t.upstreams.contains(&0) && t.upstreams.contains(&1));
+    }
+
+    #[test]
+    fn input_from_aliased_merges_keyed_by_alias() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity); // 0
+        let b = builder.activity(dummy_activity2); // 1
+        let c = builder.activity(dummy_activity3); // 2
+        let _ = c.input_from_aliased(&[("rows", &a), ("meta", &b)]);
+
+        let dag = builder.build().unwrap();
+        let t = &dag.tasks()[2];
+        assert_eq!(
+            t.input_from,
+            Some(DagInputBinding::Merged(vec![
+                DagMergeSource {
+                    key: "rows".to_owned(),
+                    upstream_index: 0,
+                },
+                DagMergeSource {
+                    key: "meta".to_owned(),
+                    upstream_index: 1,
+                },
+            ])),
+            "input_from_aliased must key by the given alias"
+        );
+        assert!(t.upstreams.contains(&0) && t.upstreams.contains(&1));
+    }
+
+    #[test]
+    fn input_from_all_duplicate_activity_name_is_build_error() {
+        let mut builder = DagBuilder::new();
+        // Two nodes using the SAME activity fn → same activity_name.
+        let a = builder.activity(dummy_activity); // 0 "dummy_activity"
+        let b = builder.activity(dummy_activity); // 1 "dummy_activity"
+        let c = builder.activity(dummy_activity3); // 2
+        let _ = c.input_from_all(&[&a, &b]);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::DuplicateInputBindingKey { ref key, .. } if key == "dummy_activity"
+            ),
+            "duplicate activity-name merge key must be a build error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_aliased_duplicate_alias_is_build_error() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity); // 0
+        let b = builder.activity(dummy_activity2); // 1
+        let c = builder.activity(dummy_activity3); // 2
+        let _ = c.input_from_aliased(&[("k", &a), ("k", &b)]);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::DuplicateInputBindingKey { ref key, .. } if key == "k"
+            ),
+            "duplicate alias must be a build error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_on_mapped_node_is_conflict_error() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity); // 0
+        let other = builder.activity(dummy_activity3); // 1
+        // `.over()` sets map_upstream; `.input_from()` then sets input_from.
+        let mapped = builder.map_activity(dummy_activity2).over(&a); // 2
+        let _ = mapped.input_from(&other);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, DagBuildError::ConflictingInputBinding { .. }),
+            "input_from on a mapped node must conflict, got {err:?}"
         );
     }
 }

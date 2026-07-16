@@ -1427,6 +1427,7 @@ mod tests {
             map_failure_policy: autumn_harvest::MapFailurePolicy::FailFast,
             condition: None,
             signal: None,
+            input_from: None,
         }
     }
 
