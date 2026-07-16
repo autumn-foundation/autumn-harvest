@@ -113,6 +113,26 @@ pub enum ToolKind {
     Watch,
 }
 
+impl ToolKind {
+    /// Whether this tool mutates workflow state. `Start`/`DagStart` (start a
+    /// run, with `terminate_if_running` destructive-start semantics),
+    /// `Signal`, and `Update` are mutations; `Status`/`Watch` are reads.
+    ///
+    /// Used by the read-only operator role (issue #776, F1) to gate the
+    /// generated MCP tool routes — which are registered app-level, outside the
+    /// nested management router the `enforce_read_only_class` layer wraps — so
+    /// a read-only principal cannot start/signal/update a workflow through an
+    /// MCP tool (via the tool's direct HTTP path OR the `/mcp` JSON-RPC
+    /// envelope, which re-dispatches through the same route).
+    #[must_use]
+    pub const fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::Start | Self::DagStart | Self::Signal | Self::Update
+        )
+    }
+}
+
 /// Transport-agnostic description of one generated tool route. Consumed by
 /// the route layer and asserted directly in unit tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -776,17 +796,30 @@ fn leak(s: String) -> &'static str {
 /// handlers delegate to the same primitives the management API uses, reading
 /// runtime state from the given [`HarvestApiState`] (fail-closed 503 before
 /// `on_startup` installs the runtime).
+///
+/// When `role_auth_enabled` (issue #776, F1), every mutating tool route
+/// ([`ToolKind::is_mutation`]) additionally gets the
+/// [`crate::api::enforce_read_only_mcp_mutation`] gate so a read-only principal
+/// receives `403` on it — closing the write bypass that would otherwise exist
+/// because these routes are registered app-level, outside the
+/// `enforce_read_only_class` layer on the nested management router.
 #[must_use]
 pub fn build_mcp_tool_routes(
     prefix: &str,
     descriptors: &[McpWorkflowDescriptor],
     api_state: &crate::api::HarvestApiState,
     tool_middleware: Option<&crate::plugin::McpToolMiddlewareFn>,
+    role_auth_enabled: bool,
 ) -> Vec<autumn_web::Route> {
     let mut routes = Vec::new();
     for descriptor in descriptors {
         for spec in tool_route_specs(prefix, descriptor) {
-            routes.push(build_tool_route(&spec, api_state.clone(), tool_middleware));
+            routes.push(build_tool_route(
+                &spec,
+                api_state.clone(),
+                tool_middleware,
+                role_auth_enabled,
+            ));
         }
     }
     routes
@@ -796,6 +829,7 @@ fn build_tool_route(
     spec: &ToolRouteSpec,
     api_state: crate::api::HarvestApiState,
     tool_middleware: Option<&crate::plugin::McpToolMiddlewareFn>,
+    role_auth_enabled: bool,
 ) -> autumn_web::Route {
     use axum::routing::MethodRouter;
 
@@ -850,6 +884,23 @@ fn build_tool_route(
             let api_state = api_state.clone();
             async move { watch_tool(api_state, workflow, &handle).await }
         }),
+    };
+    // Issue #776 (F1): under the read-only operator role, a mutating tool must
+    // 403 a read-only principal. These routes are app-level (outside the
+    // `enforce_read_only_class` layer on the nested management router), so they
+    // carry their own class gate. Applied FIRST (inner) so the auth middleware
+    // below wraps it (outer) and populates the `Session` extension *before*
+    // this gate reads it — exactly the layer order the management router uses
+    // (`enforce_read_only_class` inner, embedder auth outer). One gate on the
+    // route closes both invocation paths: the direct HTTP path AND the `/mcp`
+    // JSON-RPC `tools/call` envelope, which re-dispatches through this same
+    // route with the caller's forwarded credential.
+    let handler = if role_auth_enabled && spec.kind.is_mutation() {
+        handler.layer(axum::middleware::from_fn(
+            crate::api::enforce_read_only_mcp_mutation,
+        ))
+    } else {
+        handler
     };
     // Issue #597 hardening: these routes are registered via
     // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
@@ -1422,6 +1473,20 @@ mod tests {
             "properties": { "order_id": {"type": "string"}, "amount": {"type": "integer"} },
             "required": ["order_id"]
         })
+    }
+
+    #[test]
+    fn tool_kind_is_mutation_classifies_the_read_only_boundary() {
+        // Issue #776 (F1): the read-only role gates a tool by this predicate.
+        // Mutations (start/dag-start/signal/update) must be true; reads
+        // (status/watch) false, or a read-only principal would be wrongly
+        // denied a read tool / wrongly allowed a write tool.
+        assert!(ToolKind::Start.is_mutation());
+        assert!(ToolKind::DagStart.is_mutation());
+        assert!(ToolKind::Signal.is_mutation());
+        assert!(ToolKind::Update.is_mutation());
+        assert!(!ToolKind::Status.is_mutation());
+        assert!(!ToolKind::Watch.is_mutation());
     }
 
     #[test]
@@ -2129,6 +2194,7 @@ mod tests {
             &descriptors,
             &crate::api::HarvestApiState::new(),
             Some(&tool_middleware),
+            false,
         );
 
         let client = autumn_web::test::TestApp::new().routes(routes).build();
@@ -2160,6 +2226,7 @@ mod tests {
             &descriptors,
             &crate::api::HarvestApiState::new(),
             None,
+            false,
         );
 
         let client = autumn_web::test::TestApp::new().routes(routes).build();

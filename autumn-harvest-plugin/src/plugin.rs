@@ -596,6 +596,11 @@ impl Plugin for HarvestPlugin {
                 &descriptors,
                 &api_state,
                 mcp_tool_middleware.as_ref(),
+                // Issue #776 (F1): gate mutating MCP tools for read-only
+                // principals. These routes are app-level (outside the
+                // `enforce_read_only_class` layer on the nested management
+                // router), so the read-only class boundary is applied here too.
+                role_auth_enabled,
             ))
         } else {
             None
@@ -611,8 +616,6 @@ impl Plugin for HarvestPlugin {
         // gate. Must run before `builder` is moved into the runtime slot.
         api_state.set_payload_codecs(builder.payload_codecs().clone());
         api_state.set_decode_payloads_on_read(decode_payloads_on_read);
-        // Issue #776: mirror the read-only-role opt-in into the API state.
-        api_state.set_role_auth_enabled(role_auth_enabled);
         // Issue #679: mirror the rolled-up status thresholds into the API state.
         api_state.set_status_thresholds(status_thresholds);
 

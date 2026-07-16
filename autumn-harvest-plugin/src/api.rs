@@ -413,11 +413,6 @@ pub struct HarvestApiState {
     /// Default **off**: responses are byte-for-byte identical to a build
     /// without the feature.
     decode_payloads_on_read: Arc<Mutex<bool>>,
-    /// Whether the read-only operator role (issue #776) is enabled. Set true
-    /// by [`crate::HarvestPlugin::api_with_role_auth`]; the class-aware
-    /// enforcement layer is installed only when this is true. Default **off**:
-    /// the router and its layers are byte-for-byte identical to today.
-    role_auth_enabled: Arc<Mutex<bool>>,
     /// Retention window for request-scoped start idempotency keys (issue #808),
     /// mirrored from `BuiltHarvest::start_idempotency_window` at startup so the
     /// HTTP start route dedups a repeated `idempotency_key` within this window.
@@ -469,7 +464,6 @@ impl Default for HarvestApiState {
                 autumn_harvest::payload_codec::PayloadCodecs::default(),
             )),
             decode_payloads_on_read: Arc::new(Mutex::new(false)),
-            role_auth_enabled: Arc::new(Mutex::new(false)),
             start_idempotency_window: Arc::new(Mutex::new(
                 autumn_harvest::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
             )),
@@ -657,36 +651,6 @@ impl HarvestApiState {
             .decode_payloads_on_read
             .lock()
             .expect("harvest api state lock poisoned") = enabled;
-    }
-
-    /// Enable or disable the read-only operator role (issue #776).
-    ///
-    /// Default **off**: with the flag off, the class-aware enforcement layer is
-    /// never installed and the router behaves byte-for-byte as today. Mirrored
-    /// from the plugin builder at startup by
-    /// [`crate::HarvestPlugin::api_with_role_auth`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn set_role_auth_enabled(&self, enabled: bool) {
-        *self
-            .role_auth_enabled
-            .lock()
-            .expect("harvest api state lock poisoned") = enabled;
-    }
-
-    /// Whether the read-only operator role (issue #776) is enabled.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    #[must_use]
-    pub fn role_auth_enabled(&self) -> bool {
-        *self
-            .role_auth_enabled
-            .lock()
-            .expect("harvest api state lock poisoned")
     }
 
     /// Override the thresholds for the rolled-up `GET /admin/status` verdict
@@ -4525,8 +4489,20 @@ const READONLY_ROLE_VALUES: &[&str] = &[
 /// Session flag keys whose truthy value marks a principal as read-only.
 const READONLY_FLAG_KEYS: &[&str] = &["is_harvest_readonly", "is_harvest_operator"];
 
+/// Normalize a Session claim VALUE for case-insensitive marker matching
+/// (issue #776, F2): an embedder that authenticates a read-only user but sets
+/// `role = "ReadOnly"` / `"READONLY"` must still be recognized as read-only —
+/// a case mismatch that fell through to "unmarked → full access" would be a
+/// fail-OPEN security defect (a principal the embedder intended to restrict
+/// silently gets admin). Trims surrounding whitespace and lowercases. Marker
+/// key names are matched as-is (mirroring [`has_harvest_admin_access`], which
+/// does not normalize keys either).
+fn normalize_claim(v: &str) -> String {
+    v.trim().to_ascii_lowercase()
+}
+
 fn is_truthy(v: &str) -> bool {
-    v == "true" || v == "1"
+    matches!(normalize_claim(v).as_str(), "true" | "1" | "yes" | "on")
 }
 
 /// Whether the request's autumn-web `Session` carries an explicit read-only
@@ -4551,9 +4527,12 @@ pub(crate) async fn has_harvest_readonly_access(session: Option<Session>) -> boo
     let Some(session) = session else {
         return false;
     };
+    // Fetch the `role` claim once (F8: was fetched twice) and normalize its
+    // value case-insensitively (F2) before matching the lowercase marker sets.
+    let role = session.get("role").await.map(|v| normalize_claim(&v));
     // Admin marker present ⇒ never read-only-restricted (admin wins).
-    if let Some(role) = session.get("role").await
-        && ADMIN_ROLE_VALUES.contains(&role.as_str())
+    if let Some(role) = role.as_deref()
+        && ADMIN_ROLE_VALUES.contains(&role)
     {
         return false;
     }
@@ -4563,8 +4542,8 @@ pub(crate) async fn has_harvest_readonly_access(session: Option<Session>) -> boo
         }
     }
     // Read-only marker?
-    if let Some(role) = session.get("role").await
-        && READONLY_ROLE_VALUES.contains(&role.as_str())
+    if let Some(role) = role.as_deref()
+        && READONLY_ROLE_VALUES.contains(&role)
     {
         return true;
     }
@@ -4632,9 +4611,21 @@ fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Route
             };
             let normalized = normalize_route_template(path);
             let router = by_method.entry(method).or_default();
-            router
-                .insert(normalized, *class)
-                .unwrap_or_else(|e| panic!("failed to register '{template}' in matcher: {e}"));
+            if let Err(e) = router.insert(normalized, *class) {
+                // Fail closed, never panic (F4): a future post-normalization
+                // collision must not crash the first read-only request and
+                // poison the `OnceLock`. A skipped route stays unclassified →
+                // `classify_route` → `Mutating` → denied to read-only
+                // principals (over-restriction, never exposure). The
+                // build-time `route_class_matchers_build_without_conflict`
+                // test (debug_assert active) still fails CI on any conflict.
+                tracing::error!(
+                    template = %template,
+                    error = %e,
+                    "harvest: CLASSIFIED_ROUTES matcher insert failed; route will fail closed (deny read-only)"
+                );
+                debug_assert!(false, "matcher insert conflict for '{template}': {e}");
+            }
         }
         by_method
     })
@@ -4644,8 +4635,19 @@ fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Route
 /// given method. **Fail closed:** an unknown method OR an unmatched path
 /// resolves to [`RouteClass::Mutating`], so a read-only principal is denied a
 /// route no one classified.
+///
+/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
+/// handler, so a `HEAD` probe of a readable resource must inherit that route's
+/// read class rather than fail closed to `Mutating` and 403 a read-only
+/// dashboard's existence/size probe.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
-    let Some(router) = route_class_matchers().get(method) else {
+    let get = axum::http::Method::GET;
+    let lookup_method = if *method == axum::http::Method::HEAD {
+        &get
+    } else {
+        method
+    };
+    let Some(router) = route_class_matchers().get(lookup_method) else {
         return RouteClass::Mutating;
     };
     match router.at(path) {
@@ -4690,7 +4692,13 @@ pub async fn enforce_read_only_class(
     next: Next,
 ) -> axum::response::Response {
     let session = request.extensions().get::<Session>().cloned();
-    if has_harvest_readonly_access(session).await {
+    // OPTIONS is a preflight/metadata verb, never a mutation. A credential-less
+    // CORS preflight carries no Session and already passes (below); this also
+    // lets a rare cookie-bearing same-origin OPTIONS from a read-only principal
+    // through instead of fail-closing it to 403 (F3).
+    if *request.method() != axum::http::Method::OPTIONS
+        && has_harvest_readonly_access(session).await
+    {
         let class = classify_route(request.method(), request.uri().path());
         if deny_readonly_mutation(true, class) {
             // AC7 observability: a denied attempt is always logged so operators
@@ -4705,6 +4713,39 @@ pub async fn enforce_read_only_class(
             );
             return read_only_forbidden_response();
         }
+    }
+    next.run(request).await
+}
+
+/// The class gate for a **known-mutating** generated MCP tool route (issue
+/// #776, F1).
+///
+/// The generated MCP tool routes are registered app-level (via
+/// `AppBuilder::routes`), outside the nested management router that
+/// [`enforce_read_only_class`] wraps, so they would otherwise be a fully
+/// unguarded write surface reachable by a read-only principal. Unlike that
+/// layer (which resolves the class from `CLASSIFIED_ROUTES` by path), the
+/// caller ([`crate::mcp_tools::build_tool_route`]) already knows this route is
+/// a mutation ([`crate::mcp_tools::ToolKind::is_mutation`]), so this hard-denies
+/// a read-only principal with `403` — no path lookup needed. Installed **only**
+/// on mutating tools and **only** when `api_with_role_auth` is used; read tools
+/// (`status`/`watch`) never carry it.
+///
+/// This single gate closes both invocation paths: the tool's direct HTTP path
+/// AND the `/mcp` JSON-RPC `tools/call` envelope (autumn-web re-dispatches the
+/// envelope through this same route with the caller's forwarded credential).
+pub async fn enforce_read_only_mcp_mutation(
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let session = request.extensions().get::<Session>().cloned();
+    if has_harvest_readonly_access(session).await {
+        tracing::warn!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            "harvest: read-only principal denied MCP mutation tool (403)"
+        );
+        return read_only_forbidden_response();
     }
     next.run(request).await
 }
@@ -34302,6 +34343,48 @@ mod tests {
         assert!(!has_harvest_readonly_access(Some(session_with(&[("user_id", "u1")]))).await);
     }
 
+    #[tokio::test]
+    async fn readonly_access_normalizes_marker_case_and_truthy_spellings() {
+        // F2: a case-mismatched read-only marker must still be recognized —
+        // failing to would fail OPEN (an embedder intending restriction
+        // silently grants admin). Mixed-case / padded role values.
+        for role in [
+            "ReadOnly",
+            "READONLY",
+            "Read_Only",
+            "  harvest_readonly  ",
+            "Harvest_Operator",
+            "OPERATOR",
+        ] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[("role", role)]))).await,
+                "case/whitespace-variant role={role:?} must be recognized as read-only"
+            );
+        }
+        // Broader truthy spellings, case-insensitive.
+        for truthy in ["TRUE", "True", "yes", "YES", "On", "1", " true "] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[("is_harvest_readonly", truthy)])))
+                    .await,
+                "is_harvest_readonly={truthy:?} must be truthy"
+            );
+        }
+        // A mis-cased ADMIN marker must still win over a read-only marker
+        // (admin ⊇ read-only), so admin case-mismatch never restricts.
+        assert!(
+            !has_harvest_readonly_access(Some(session_with(&[
+                ("role", "harvest_readonly"),
+                ("is_harvest_admin", "TRUE"),
+            ])))
+            .await,
+            "mis-cased admin flag must still win over a concurrent read-only marker"
+        );
+        assert!(
+            !has_harvest_readonly_access(Some(session_with(&[("role", "Harvest_Admin")]))).await,
+            "mis-cased admin role must not be treated as read-only"
+        );
+    }
+
     #[test]
     fn classify_route_matches_class_and_precedence() {
         use axum::http::Method;
@@ -34376,6 +34459,37 @@ mod tests {
     }
 
     #[test]
+    fn classify_route_head_inherits_get_class() {
+        use axum::http::Method;
+        // F3: HEAD is served by axum via the GET handler, so it must inherit
+        // the GET route's read class rather than fail closed to Mutating — a
+        // read-only principal must be able to HEAD-probe readable resources.
+        assert_eq!(
+            classify_route(&Method::HEAD, "/health"),
+            RouteClass::PublicSafe
+        );
+        assert_eq!(
+            classify_route(&Method::HEAD, "/workflows/exec-uuid"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::HEAD, "/admin/schedules/abc-123"),
+            RouteClass::ReadOnly,
+            "HEAD must map to the GET class even where DELETE/PATCH are Mutating"
+        );
+        // A HEAD of a path with no GET route still fails closed.
+        assert_eq!(
+            classify_route(&Method::HEAD, "/totally/unknown/route"),
+            RouteClass::Mutating
+        );
+        // deny_readonly_mutation must permit HEAD of a read route.
+        assert!(!deny_readonly_mutation(
+            true,
+            classify_route(&Method::HEAD, "/workflows/exec-uuid")
+        ));
+    }
+
+    #[test]
     fn classify_route_fails_closed_on_unknown() {
         use axum::http::Method;
         // Unmatched path ⇒ Mutating (fail closed).
@@ -34426,19 +34540,6 @@ mod tests {
             ),
             "/workflows/by-id/{p0}/{p1}/query/{p2}"
         );
-    }
-
-    #[test]
-    fn api_state_role_auth_defaults_off() {
-        let state = HarvestApiState::new();
-        assert!(
-            !state.role_auth_enabled(),
-            "role_auth_enabled must default to false (issue #776 AC6)"
-        );
-        state.set_role_auth_enabled(true);
-        assert!(state.role_auth_enabled());
-        state.set_role_auth_enabled(false);
-        assert!(!state.role_auth_enabled());
     }
 
     #[test]
