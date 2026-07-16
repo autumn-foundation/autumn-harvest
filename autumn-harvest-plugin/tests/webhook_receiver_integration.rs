@@ -116,6 +116,72 @@ struct CountRow {
     count: i64,
 }
 
+/// Env-aware test-DB handle for the #740 provenance test.
+///
+/// Honours `HARVEST_TEST_DATABASE_URL` (a **blank** Postgres that the test
+/// migrates itself via `autumn_web::migrate::run_pending`, exactly as it does
+/// against a fresh testcontainer) so it can run against a local instance when
+/// Docker/testcontainers is unavailable; otherwise falls back to the shared
+/// testcontainers `TestDb`. Mirrors the `setup_*_or_env` fallback pattern used
+/// by the core `integration_e2e` suite and `start_source_integration.rs`.
+///
+/// Exposes the same `url()` / `pool()` / `execute_sql()` surface the test
+/// relied on from `TestDb`, so only the DB-acquisition line of the test
+/// changes.
+enum WebhookTestDb {
+    Container(&'static TestDb),
+    Env {
+        url: String,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    },
+}
+
+impl WebhookTestDb {
+    async fn get() -> Self {
+        if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(&url);
+            let pool = diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+                .max_size(5)
+                .build()
+                .expect("failed to build local-PG pool");
+            Self::Env { url, pool }
+        } else {
+            Self::Container(TestDb::shared().await)
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            Self::Container(db) => db.url(),
+            Self::Env { url, .. } => url,
+        }
+    }
+
+    fn pool(
+        &self,
+    ) -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+        match self {
+            Self::Container(db) => db.pool(),
+            Self::Env { pool, .. } => pool.clone(),
+        }
+    }
+
+    async fn execute_sql(&self, sql: &str) {
+        match self {
+            Self::Container(db) => db.execute_sql(sql).await,
+            Self::Env { pool, .. } => {
+                let mut conn = pool.get().await.expect("pool conn");
+                diesel::sql_query(sql)
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
+            }
+        }
+    }
+}
+
 /// AC (issue #344): "a synthetic vendor sends two identical webhook
 /// deliveries; exactly one workflow execution is created; both responses
 /// return the same `workflow_exec_id`."
@@ -210,7 +276,11 @@ async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec
 
 /// AC3 (issue #740): a start delegated from the inbound webhook receiver records
 /// `start_source = "webhook"`, distinguishing it from an ordinary `api` start.
-#[tokio::test]
+///
+/// Uses a multi-thread runtime: `TestApp::plugin(HarvestPlugin)` runs the
+/// plugin startup hook on a spawned thread via `Handle::block_on` while the
+/// test thread blocks on its join, which deadlocks a current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn webhook_start_records_webhook_source() {
     #[derive(diesel::QueryableByName)]
@@ -221,7 +291,7 @@ async fn webhook_start_records_webhook_source() {
 
     let _ = tracing_subscriber::fmt::try_init();
 
-    let db = TestDb::shared().await;
+    let db = WebhookTestDb::get().await;
     unsafe {
         std::env::set_var("AUTUMN_DATABASE__URL", db.url());
     }
