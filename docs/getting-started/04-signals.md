@@ -290,6 +290,13 @@ contract without reading source, and malformed payloads are rejected at the HTTP
 boundary before they are ever enqueued. This extends the #373 workflow
 input/output schema story to the interaction surface.
 
+> **Terminology — argument, not input.** `with_arg_schema_fn` / `validate_arg`
+> (and `with_response_schema_fn`) describe a *handler's* argument and response —
+> the payload of one signal/query/update *call*. That is distinct from a
+> *workflow's* input/output (#373's `with_input_schema_fn` / `validate_input`),
+> which describes the value passed to `start`. A workflow has one input schema
+> and many per-handler argument schemas.
+
 Attach a description and a JSON Schema to each handler at registration. With the
 `schema` feature the schema is auto-derived from a `schemars::JsonSchema` type
 (or supply it by hand with `with_arg_schema_fn`/`with_description`):
@@ -355,9 +362,10 @@ A `404` is returned when the workflow type is not registered.
 ### Boundary validation
 
 When a signal or update handler has a published `arg_schema`, the payload is
-validated **before** it is durably enqueued at all three interaction entry
-points — the signal-send route, `POST /workflows/{name}/signal-with-start`, and
-the update route. A malformed payload is rejected with a field-level `400`:
+validated **before** it is durably enqueued at every interaction entry point —
+the signal-send route, `POST /workflows/{name}/signal-with-start`, the update
+route, and `POST /workflows/{name}/update-with-start`. A malformed payload is
+rejected with a field-level `400`:
 
 ```bash
 # `cancel` requires a string `reason` — send an empty object:
@@ -372,7 +380,13 @@ curl -X POST '/api/harvest/workflows/<exec-id>/signal/cancel_order' \
 
 `field_path` is a JSON Pointer (RFC 6901), matching the #373 workflow-input
 validation response shape. A handler with **no** published `arg_schema` is never
-validated — its route behaves exactly as before. See
+validated — its route behaves exactly as before.
+
+> **Rendering note.** A violation's `message` and `field_path` can reflect keys
+> from the caller-supplied payload object, so a UI that renders them must
+> HTML-escape both before display (they are untrusted input, not fixed strings).
+
+See
 `examples/interface_schema_workflow.rs` (run with `--features schema`) for a
 complete worked example, and the [queries](../management-api.md) and updates
 chapters for the request/response envelopes.

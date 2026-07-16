@@ -27,3 +27,9 @@ argument/response JSON Schema and a description:
 no replay impact** — validation runs at the HTTP boundary before enqueue, and
 discovery is a read-only projection of the registry. Example
 `autumn-harvest/examples/interface_schema_workflow.rs` (`--features schema`).
+
+**Source-visible change:** each `#[query]`/`#[update]`/`#[signal]`-annotated
+function now also emits a public `{fn}_info()` symbol (consistent with the
+existing `#[workflow]`/`#[activity]` convention). A downstream crate that
+already defines a hand-written `foo_info()` beside `#[query] fn foo` would need
+to rename one of them.
