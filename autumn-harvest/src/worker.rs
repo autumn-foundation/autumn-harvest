@@ -414,6 +414,10 @@ pub struct HandlerRegistry {
     pub query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers (issue #346), indexed by `(workflow, name)`.
     pub update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata (issue #610), indexed by
+    /// `(workflow, name)`. Published for interface discovery; runtime push
+    /// handlers register inside the workflow body.
+    pub signal_handlers: Vec<crate::info::SignalHandlerInfo>,
     /// Shared typed state visible to workflow and activity handlers.
     state: SharedState,
     /// Telemetry bundle (trace-context propagator + metrics recorder) applied
@@ -589,6 +593,7 @@ impl HandlerRegistry {
             activities,
             query_handlers: Vec::new(),
             update_handlers: Vec::new(),
+            signal_handlers: Vec::new(),
             state,
             telemetry,
             history_policy: WorkflowHistoryPolicy::default(),
@@ -612,15 +617,18 @@ impl HandlerRegistry {
         }
     }
 
-    /// Set declarative query and update handlers (issue #346).
+    /// Set declarative query, update, and signal handler metadata
+    /// (issues #346, #610).
     #[must_use]
     pub fn with_handler_infos(
         mut self,
         query_handlers: Vec<QueryHandlerInfo>,
         update_handlers: Vec<UpdateHandlerInfo>,
+        signal_handlers: Vec<crate::info::SignalHandlerInfo>,
     ) -> Self {
         self.query_handlers = query_handlers;
         self.update_handlers = update_handlers;
+        self.signal_handlers = signal_handlers;
         self
     }
 
@@ -848,6 +856,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("activities", &self.activities.keys())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("history_policy", &self.history_policy)

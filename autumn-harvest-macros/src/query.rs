@@ -15,10 +15,14 @@ use syn::{ItemFn, LitStr, parse::Parser as _};
 
 struct QueryAttrs {
     workflow: Option<String>,
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<QueryAttrs> {
-    let mut result = QueryAttrs { workflow: None };
+    let mut result = QueryAttrs {
+        workflow: None,
+        description: None,
+    };
 
     if attr.is_empty() {
         return Ok(result);
@@ -29,8 +33,14 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<QueryAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.workflow = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected `workflow = \"workflow_name\"`"))
+            Err(meta.error(
+                "unsupported attribute: expected `workflow = \"workflow_name\"` or `description = \"…\"`",
+            ))
         }
     })
     .parse2(attr)?;
@@ -88,6 +98,12 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_query_handler_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
+
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
@@ -227,7 +243,18 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 input_type_hint: #input_type_hint,
                 output_type_hint: #output_type_hint,
                 handler: __dispatch,
+                description: #description_expr,
+                arg_schema: ::std::option::Option::None,
+                response_schema: ::std::option::Option::None,
             }
+        }
+
+        /// Returns the [`::autumn_harvest::QueryHandlerInfo`] for this query.
+        ///
+        /// Chain schema builders at registration, e.g.
+        /// `.queries(vec![#public_info_name().with_schemas::<Arg, Resp>()])`.
+        pub fn #public_info_name() -> ::autumn_harvest::QueryHandlerInfo {
+            #companion_name()
         }
 
         #impl_block

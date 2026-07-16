@@ -11791,6 +11791,9 @@ mod tests {
             handler: probe_handler,
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
 
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -11839,6 +11842,9 @@ mod tests {
             handler: deadline_at_handler,
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
 
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -11888,6 +11894,9 @@ mod tests {
             handler: parent_probe_handler,
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
 
         let parent_id = ExecutionId::new();
