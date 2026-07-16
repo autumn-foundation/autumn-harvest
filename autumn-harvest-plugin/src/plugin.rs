@@ -190,6 +190,13 @@ impl HarvestPlugin {
         self
     }
 
+    /// Register declarative signal handlers produced by `autumn_harvest::signals!`.
+    #[must_use]
+    pub fn signals(mut self, signals: Vec<autumn_harvest::SignalHandlerInfo>) -> Self {
+        self.builder = self.builder.signals(signals);
+        self
+    }
+
     /// Register typed shared state visible to workflow and activity handlers.
     #[must_use]
     pub fn state<T: Any + Send + Sync>(mut self, value: T) -> Self {
@@ -2028,6 +2035,44 @@ mod tests {
         assert!(plugin.builder.update_handlers()[0].mcp);
         assert_eq!(plugin.builder.query_handlers().len(), 1);
         assert_eq!(plugin.builder.query_handlers()[0].name, "progress");
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_signals_to_builder_and_registry() {
+        // Issue #610 gap-fill: `#[signal(..)]` handlers registered through the
+        // plugin's fluent surface must reach both the builder AND the runtime
+        // `HandlerRegistry` that the `GET /interface` route and the pre-enqueue
+        // payload-validation gates read from. Without the `.signals()`
+        // forwarding method this test fails to compile (the method does not
+        // exist), and even if it did, a registry-level assertion catches a
+        // forwarding method that drops the handler on the floor.
+        fn fake_signal() -> autumn_harvest::SignalHandlerInfo {
+            autumn_harvest::SignalHandlerInfo {
+                name: "cancel",
+                workflow: "echo",
+                module: "tests",
+                arg_type_hint: "CancelRequest",
+                description: None,
+                arg_schema: None,
+            }
+        }
+
+        let plugin = HarvestPlugin::new()
+            .workflows(vec![fake_workflow_info()])
+            .signals(vec![fake_signal()]);
+
+        // Builder level: the forwarding method appended the handler.
+        assert_eq!(plugin.builder.signal_handlers().len(), 1);
+        assert_eq!(plugin.builder.signal_handlers()[0].name, "cancel");
+        assert_eq!(plugin.builder.signal_handlers()[0].workflow, "echo");
+
+        // Runtime registry level: the same handler survives through
+        // `build()` into the `HandlerRegistry` that the `GET /interface` route
+        // (`runtime.registry.signal_handlers`) and the boundary gates consult.
+        let (registry, _dags, _schedules, _worker) = plugin.builder.build().into_worker_parts();
+        assert_eq!(registry.signal_handlers.len(), 1);
+        assert_eq!(registry.signal_handlers[0].name, "cancel");
+        assert_eq!(registry.signal_handlers[0].workflow, "echo");
     }
 
     #[test]
