@@ -535,8 +535,9 @@ pub(crate) struct LocalActivityResolution {
     pub(crate) resolved: bool,
     /// The frozen fully-resolved retry policy, or `None`.
     pub(crate) retry_policy: Option<crate::policy::RetryPolicy>,
-    /// The frozen fully-resolved `start_to_close` in milliseconds, or `None`.
-    pub(crate) start_to_close_millis: Option<u64>,
+    /// The frozen fully-resolved `start_to_close` in nanoseconds (full
+    /// `Duration` precision), or `None`.
+    pub(crate) start_to_close_nanos: Option<u64>,
 }
 
 /// Walks through recorded workflow events during replay, matching
@@ -5024,7 +5025,7 @@ impl HistoryMatcher {
     /// three additive fields in one pass.
     ///
     /// `resolved` is the disambiguation marker: `true` for a #620+ event whose
-    /// frozen `retry_policy`/`start_to_close_millis` are authoritative on
+    /// frozen `retry_policy`/`start_to_close_nanos` are authoritative on
     /// recovery even when `None` ("explicitly resolved to no floor"); `false`
     /// for a pre-#620 legacy event (all three fields absent → the marker
     /// deserializes to `false`), which the crash-recovery path in
@@ -5044,12 +5045,12 @@ impl HistoryMatcher {
                     activity_id: recorded_id,
                     resolved,
                     retry_policy,
-                    start_to_close_millis,
+                    start_to_close_nanos,
                     ..
                 } if *recorded_id == activity_id => Some(LocalActivityResolution {
                     resolved: *resolved,
                     retry_policy: retry_policy.clone(),
-                    start_to_close_millis: *start_to_close_millis,
+                    start_to_close_nanos: *start_to_close_nanos,
                 }),
                 _ => None,
             })
@@ -8646,7 +8647,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -8674,7 +8675,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8714,7 +8715,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8752,7 +8753,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8810,7 +8811,7 @@ mod tests {
             input: Value::Null,
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         }];
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
@@ -8835,7 +8836,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8878,7 +8879,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: local_id,
@@ -9033,7 +9034,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,

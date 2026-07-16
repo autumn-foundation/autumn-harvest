@@ -325,7 +325,7 @@ pub enum WorkflowEvent {
         input: serde_json::Value,
         /// Disambiguation marker distinguishing a #620+ event whose defaults were
         /// fully resolved at first schedule from a genuine pre-#620 legacy event
-        /// (issue #620, Codex P2). BOTH `retry_policy` and `start_to_close_millis`
+        /// (issue #620, Codex P2). BOTH `retry_policy` and `start_to_close_nanos`
         /// below serialize as absent when they resolved to "no floor", so an
         /// absent value alone cannot tell a resolved-to-nothing #620+ event apart
         /// from a legacy event — the former MUST stay frozen (implicit 1-attempt /
@@ -352,11 +352,15 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The fully-resolved `start_to_close` this local activity was scheduled
-        /// with, in **milliseconds** (call-site → activity default → builder
-        /// default; issue #620, Codex P2). Millis (not seconds) to preserve
-        /// subsecond precision — the local per-attempt timeout is
-        /// `Duration::from_millis(this).min(cap)`, so a seconds field would
-        /// truncate a subsecond floor to `0` and instantly time out every attempt.
+        /// with, in **nanoseconds** (call-site → activity default → builder
+        /// default; issue #620, Codex P2). Nanoseconds — the FULL `Duration`
+        /// precision — so no floor is ever truncated: the local per-attempt
+        /// timeout is `Duration::from_nanos(this).min(cap)`. Truncating at any
+        /// coarser unit is the same footgun one order down (a seconds field
+        /// zeroes a subsecond floor; a millis field zeroes a sub-millisecond
+        /// floor like `Duration::from_micros(500)`), so the full `Duration` is
+        /// carried end-to-end (`u64` nanos ≈ 584 years — never saturates for a
+        /// realistic timeout).
         ///
         /// Additive/optional, same freeze semantics as `retry_policy`: on a #620+
         /// event (`resolved == true`) a recorded value — `Some` OR `None` — is
@@ -364,7 +368,7 @@ pub enum WorkflowEvent {
         /// floor", frozen); a legacy event (`resolved == false`) falls back to
         /// live re-derivation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        start_to_close_millis: Option<u64>,
+        start_to_close_nanos: Option<u64>,
     },
     /// A local activity finished executing successfully.
     LocalActivityCompleted {
@@ -1185,7 +1189,9 @@ mod tests {
                 4,
                 std::time::Duration::from_millis(10),
             )),
-            start_to_close_millis: Some(500),
+            // A sub-millisecond value (500µs = 500_000 ns): a millis field would
+            // have zeroed it — the full-nanos field round-trips it exactly.
+            start_to_close_nanos: Some(500_000),
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
@@ -1193,7 +1199,7 @@ mod tests {
             WorkflowEvent::LocalActivityScheduled {
                 resolved,
                 retry_policy,
-                start_to_close_millis,
+                start_to_close_nanos,
                 ..
             } => {
                 assert!(resolved, "resolution marker must round-trip as true");
@@ -1203,9 +1209,9 @@ mod tests {
                     "frozen retry policy must round-trip"
                 );
                 assert_eq!(
-                    start_to_close_millis,
-                    Some(500),
-                    "frozen STC millis must round-trip"
+                    start_to_close_nanos,
+                    Some(500_000),
+                    "frozen sub-millisecond STC nanos must round-trip exactly"
                 );
             }
             other => panic!("expected LocalActivityScheduled, got {other:?}"),
@@ -1225,12 +1231,12 @@ mod tests {
             WorkflowEvent::LocalActivityScheduled {
                 resolved,
                 retry_policy,
-                start_to_close_millis,
+                start_to_close_nanos,
                 ..
             } => {
                 assert!(!resolved, "a legacy event must deserialize as unresolved");
                 assert!(retry_policy.is_none());
-                assert!(start_to_close_millis.is_none());
+                assert!(start_to_close_nanos.is_none());
             }
             other => panic!("expected LocalActivityScheduled, got {other:?}"),
         }
@@ -1398,7 +1404,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 resolved: false,
                 retry_policy: None,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: ActivityExecId::new(),

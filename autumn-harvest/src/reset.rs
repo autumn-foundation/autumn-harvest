@@ -1841,7 +1841,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -1878,7 +1878,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,

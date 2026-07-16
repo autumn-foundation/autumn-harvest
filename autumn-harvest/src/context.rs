@@ -354,13 +354,14 @@ pub enum WorkflowCommand {
         name: String,
         /// JSON input for the handler.
         input: Value,
-        /// Optional start-to-close timeout in **milliseconds** (issue #620,
-        /// Codex P2). `None` defers to the worker's
-        /// `max_local_activity_start_to_close` cap. Millis (not seconds) so a
-        /// subsecond builder default / per-call override never truncates to `0`
-        /// and instantly times out — the worker builds the per-attempt timeout as
-        /// `Duration::from_millis(this).min(cap)`.
-        start_to_close_millis: Option<u64>,
+        /// Optional per-attempt start-to-close timeout as a full
+        /// [`std::time::Duration`] (issue #620, Codex P2). `None` defers to the
+        /// worker's `max_local_activity_start_to_close` cap. A `Duration` (not
+        /// secs/millis) so NO floor — subsecond or sub-millisecond — is ever
+        /// truncated: the worker builds the per-attempt timeout as
+        /// `start_to_close.min(cap)` and feeds it straight to
+        /// `tokio::time::timeout`.
+        start_to_close: Option<std::time::Duration>,
         /// Optional retry policy. `None` = no retries (fail immediately).
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The worker sends the final result (success or exhausted retries) here.
@@ -647,13 +648,13 @@ impl std::fmt::Debug for WorkflowCommand {
             Self::RunLocalActivity {
                 activity_id,
                 name,
-                start_to_close_millis,
+                start_to_close,
                 ..
             } => f
                 .debug_struct("RunLocalActivity")
                 .field("activity_id", activity_id)
                 .field("name", name)
-                .field("start_to_close_millis", start_to_close_millis)
+                .field("start_to_close", start_to_close)
                 .finish_non_exhaustive(),
             Self::UpsertSearchAttributes { patch } => f
                 .debug_struct("UpsertSearchAttributes")
@@ -4612,14 +4613,11 @@ impl WorkflowContext {
         // regular/remote path resolves the same floor worker-side via the
         // shared `policy::resolve_effective_*` helpers.
         let retry_policy = retry_policy.or_else(|| self.default_activity_retry_policy.clone());
+        // Carry the FULL resolved `Duration` (issue #620, Codex P2) — no
+        // truncation at seconds OR milliseconds, so a subsecond floor
+        // (`from_millis(500)`) and a sub-millisecond floor (`from_micros(500)`)
+        // are both preserved end-to-end to the worker's `tokio::time::timeout`.
         let start_to_close = start_to_close.or(self.default_activity_start_to_close);
-        // Millis, not seconds — a subsecond floor (builder default OR per-call
-        // override) MUST NOT truncate to `0`, which would make the worker run
-        // `Duration::from_millis(0)` and instantly time out every attempt
-        // (issue #620, Codex P2). Clamp a pathologically large duration to
-        // `u64::MAX` millis rather than overflow.
-        let start_to_close_millis = start_to_close
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_local_activity_strict(name, &input))
         } else {
@@ -4715,12 +4713,19 @@ impl WorkflowContext {
                     let matcher = self.matcher.lock().expect("matcher lock poisoned");
                     matcher.recorded_local_activity_resolution(activity_id)
                 };
-                let (effective_retry, effective_stc_millis) = if recorded.resolved {
+                let (effective_retry, effective_stc) = if recorded.resolved {
                     // #620+ event: frozen values (Some OR None) are authoritative.
-                    (recorded.retry_policy, recorded.start_to_close_millis)
+                    // The frozen `start_to_close` is stored as nanos → restore the
+                    // exact `Duration` with no precision loss.
+                    (
+                        recorded.retry_policy,
+                        recorded
+                            .start_to_close_nanos
+                            .map(std::time::Duration::from_nanos),
+                    )
                 } else {
                     // Legacy (pre-#620) event: re-derive from the live defaults.
-                    (retry_policy, start_to_close_millis)
+                    (retry_policy, start_to_close)
                 };
 
                 // If the recorded failure count already covers all retry
@@ -4744,7 +4749,7 @@ impl WorkflowContext {
                     activity_id,
                     name: name.to_string(),
                     input,
-                    start_to_close_millis: effective_stc_millis,
+                    start_to_close: effective_stc,
                     retry_policy: effective_retry,
                     result_tx: tx,
                     already_scheduled: true,
@@ -4796,7 +4801,7 @@ impl WorkflowContext {
                     activity_id,
                     name: name.to_string(),
                     input,
-                    start_to_close_millis,
+                    start_to_close,
                     retry_policy,
                     result_tx: tx,
                     already_scheduled: false,
@@ -15864,7 +15869,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -15897,7 +15902,7 @@ mod tests {
                 input: Value::Null,
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -17788,7 +17793,7 @@ mod tests {
                 input: serde_json::json!("data"),
                 retry_policy: None,
                 resolved: false,
-                start_to_close_millis: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id,

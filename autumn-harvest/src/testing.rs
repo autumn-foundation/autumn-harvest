@@ -3748,7 +3748,7 @@ impl WorkflowTestEnv {
                 name,
                 input: act_input,
                 retry_policy,
-                start_to_close_millis,
+                start_to_close,
                 ..
             } => {
                 let call_num = Self::next_call_count(call_counts, &name);
@@ -3761,10 +3761,11 @@ impl WorkflowTestEnv {
                     // #620+ schedule, so record the resolution marker plus the
                     // resolved retry/STC the command carried, so harness-based
                     // replay fixtures observe the same frozen budget/timeout the
-                    // worker writes.
+                    // worker writes. STC frozen as full-precision nanos.
                     resolved: true,
                     retry_policy,
-                    start_to_close_millis,
+                    start_to_close_nanos: start_to_close
+                        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
                 });
                 Self::push_local_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)

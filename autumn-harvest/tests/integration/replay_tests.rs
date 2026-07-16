@@ -413,7 +413,7 @@ async fn local_activity_completes_from_full_history() {
             input: Value::Null,
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: local_id,
@@ -496,7 +496,7 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             input: Value::Null,
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id1,
@@ -508,7 +508,7 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             input: out1.clone(),
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id2,
@@ -549,7 +549,7 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             input: Value::Null,
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         },
         WorkflowEvent::LocalActivityFailed {
             activity_id: id1,
@@ -571,7 +571,7 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             input: final_out.clone(),
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id2,
@@ -609,7 +609,7 @@ async fn local_activity_exhausted_retries_fails_the_workflow() {
             input: Value::Null,
             retry_policy: None,
             resolved: false,
-            start_to_close_millis: None,
+            start_to_close_nanos: None,
         },
         WorkflowEvent::LocalActivityFailed {
             activity_id: id,

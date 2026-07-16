@@ -176,9 +176,9 @@ fn wf_slower_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_
 }
 
 /// Local activity that sleeps ~50ms then echoes — well under a 500ms subsecond
-/// builder-default STC, so it MUST complete. Without the millis fix (issue #620,
-/// Codex P2) the 500ms builder default truncates to `Duration::from_secs(0)` and
-/// even this 50ms activity is instantly timed out.
+/// builder-default STC, so it MUST complete. Without the full-`Duration` fix
+/// (issue #620, Codex P2) the 500ms builder default truncates to
+/// `Duration::from_secs(0)` and even this 50ms activity is instantly timed out.
 fn fast_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -382,7 +382,7 @@ async fn seed_workflow(
 
 /// Seed a RUNNING execution whose local activity is MID-RETRY: its history
 /// already carries `LocalActivityScheduled` (frozen with `recorded_resolved` /
-/// `recorded_retry` / `recorded_stc_millis`) and one
+/// `recorded_retry` / `recorded_stc_nanos`) and one
 /// `LocalActivityFailed(attempt=1)`, and a workflow task is enqueued so a
 /// worker resumes it. This reproduces the crash-recovery window for AC8: the
 /// original retry budget/timeout is frozen in history and must survive a later
@@ -399,7 +399,7 @@ async fn seed_local_activity_in_progress(
     queue: &str,
     recorded_resolved: bool,
     recorded_retry: Option<RetryPolicy>,
-    recorded_stc_millis: Option<u64>,
+    recorded_stc_nanos: Option<u64>,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
     let row = NewWorkflowExecution {
@@ -457,7 +457,7 @@ async fn seed_local_activity_in_progress(
                 input: input.clone(),
                 resolved: recorded_resolved,
                 retry_policy: recorded_retry,
-                start_to_close_millis: recorded_stc_millis,
+                start_to_close_nanos: recorded_stc_nanos,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -648,6 +648,22 @@ fn count_local_failed(history: &[WorkflowEvent]) -> usize {
         .iter()
         .filter(|e| matches!(e, WorkflowEvent::LocalActivityFailed { .. }))
         .count()
+}
+
+/// The `start_to_close_nanos` the worker FROZE onto the recorded
+/// `LocalActivityScheduled` — i.e. the fully-resolved effective per-attempt
+/// timeout, in nanoseconds (issue #620, Codex P2). This is the pre-clamp
+/// resolved `Duration` value, so asserting it proves the resolution carried the
+/// configured `Duration` with no truncation at any unit — deterministically,
+/// with no wall-clock timing dependence.
+fn local_scheduled_stc_nanos(history: &[WorkflowEvent]) -> Option<u64> {
+    history.iter().find_map(|e| match e {
+        WorkflowEvent::LocalActivityScheduled {
+            start_to_close_nanos,
+            ..
+        } => Some(*start_to_close_nanos),
+        _ => None,
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -980,13 +996,13 @@ async fn local_activity_honours_builder_default_retry() {
 // This is the discriminating rework of the original clamp test: builder-default
 // STC = 1s (well below the 60s worker cap), local activity sleeps ~2s. The
 // local path's per-attempt timeout is
-// `run.start_to_close_secs.map_or(max, from_secs).min(max)` — WITH the feature
-// `start_to_close_secs = Some(1)` (the builder default, `.as_secs()`), so the
-// timeout is `min(1s, 60s) = 1s` and the 2s activity FAILS. WITHOUT the feature
-// `start_to_close_secs = None`, so the timeout is the 60s cap and the 2s
-// activity would COMPLETE. The outcome therefore depends on the feature's exact
-// value, not merely the cap. (Local path is seconds-granularity, so 1s is the
-// smallest meaningful builder STC.)
+// `run.start_to_close.unwrap_or(max).min(max)` — WITH the feature the resolved
+// `Duration` is `Some(1s)`, so the timeout is `min(1s, 60s) = 1s` and the 2s
+// activity FAILS. WITHOUT the feature it is `None`, so the timeout is the 60s
+// cap and the 2s activity would COMPLETE. The outcome therefore depends on the
+// feature's exact value, not merely the cap. (The local path carries the full
+// `Duration`, so subsecond builder STCs are meaningful — see the
+// `local_activity_subsecond_*` tests below.)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1388,6 +1404,114 @@ async fn local_activity_resolved_to_no_floor_ignores_a_later_added_default() {
          A count of 3 would mean the marker was ignored and the added default \
          wrongly re-derived (the AC8-violating bug)."
     );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 (Codex P2, value proof) — the EFFECTIVE resolved local start_to_close
+// must EQUAL the configured Duration with NO loss at any unit. The command and
+// the frozen `LocalActivityScheduled.start_to_close_nanos` carry the full
+// Duration (nanoseconds), so:
+//   * a `from_millis(1500)` builder default resolves to EXACTLY 1.5s
+//     (1_500_000_000 ns) — not 1s (a seconds field would truncate it);
+//   * a `from_micros(500)` sub-millisecond value is preserved as 500_000 ns —
+//     NON-ZERO (a millis field would zero it → instant timeout).
+// This asserts the resolved Duration VALUE from recorded history — deterministic,
+// no wall-clock timing race — and subsumes the "subsecond not zeroed" outcome
+// assertion below (which additionally proves the worker HONORS the value
+// end-to-end at a robust 10x margin).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_resolved_stc_equals_configured_duration_no_truncation() {
+    let (url, _container) = setup_db().await;
+    let pool = build_pool(&url);
+
+    // Scenario 1: from_millis(1500) → exactly 1.5s frozen, and (1.5s > 50ms
+    // activity, 60s cap) the run COMPLETES.
+    {
+        let queue = "q620-stc-value-1500ms";
+        let mut conn = connect(&url).await;
+        let exec_id = seed_workflow(
+            &mut conn,
+            "wf_fast_local",
+            serde_json::json!({"v": 1}),
+            queue,
+        )
+        .await;
+        let registry = build_registry(
+            vec![wf_info("wf_fast_local", wf_fast_local)],
+            vec![act_info("fast_local", fast_local, true, None, None)],
+            None,
+            Some(Duration::from_millis(1500)),
+        );
+        let worker = build_worker(
+            "w620-stc-value-1500ms",
+            queue,
+            Arc::clone(&registry),
+            Duration::from_secs(60),
+        );
+        run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "COMPLETED",
+            Duration::from_secs(20),
+        )
+        .await;
+        let history = load_history(&url, exec_id).await;
+        assert_eq!(
+            local_scheduled_stc_nanos(&history),
+            Some(1_500_000_000),
+            "a from_millis(1500) builder default must freeze EXACTLY 1.5s \
+             (1_500_000_000 ns) — a seconds field would have truncated it to 1s"
+        );
+    }
+
+    // Scenario 2: from_micros(500) → 500_000 ns frozen (NON-ZERO), proving
+    // sub-millisecond precision survives. The 500µs per-attempt timeout kills
+    // the 50ms activity (→ FAILED), but the FROZEN value is recorded at schedule
+    // time regardless, so the value assertion is outcome-independent.
+    {
+        let queue = "q620-stc-value-500us";
+        let mut conn = connect(&url).await;
+        let exec_id = seed_workflow(
+            &mut conn,
+            "wf_fast_local",
+            serde_json::json!({"v": 2}),
+            queue,
+        )
+        .await;
+        let registry = build_registry(
+            vec![wf_info("wf_fast_local", wf_fast_local)],
+            vec![act_info("fast_local", fast_local, true, None, None)],
+            None,
+            Some(Duration::from_micros(500)),
+        );
+        let worker = build_worker(
+            "w620-stc-value-500us",
+            queue,
+            Arc::clone(&registry),
+            Duration::from_secs(60),
+        );
+        run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "FAILED",
+            Duration::from_secs(20),
+        )
+        .await;
+        let history = load_history(&url, exec_id).await;
+        assert_eq!(
+            local_scheduled_stc_nanos(&history),
+            Some(500_000),
+            "a from_micros(500) sub-millisecond builder default must freeze \
+             500_000 ns (NON-ZERO) — a millis field would have zeroed it, \
+             instantly timing out every attempt"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1198,7 +1198,7 @@ mod tests {
                     input: serde_json::Value::Null,
                     retry_policy: None,
                     resolved: false,
-                    start_to_close_millis: None,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
@@ -1250,7 +1250,7 @@ mod tests {
                     input: serde_json::Value::Null,
                     retry_policy: None,
                     resolved: false,
-                    start_to_close_millis: None,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
@@ -1392,7 +1392,7 @@ mod tests {
                     input: serde_json::Value::Null,
                     retry_policy: None,
                     resolved: false,
-                    start_to_close_millis: None,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
@@ -1427,7 +1427,7 @@ mod tests {
                     input: serde_json::Value::Null,
                     retry_policy: None,
                     resolved: false,
-                    start_to_close_millis: None,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
