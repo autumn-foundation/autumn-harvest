@@ -3692,22 +3692,33 @@ async fn signal_workflow_by_id(
         Json(payload),
     )
     .await;
-    match result {
-        Ok((status, Json(ack))) => {
-            let body = serde_json::json!({
-                "execution_id": exec_id.to_string(),
-                "ok": ack.ok,
-                "signal_delivered": ack.signal_delivered,
-            });
-            let mut resp = (status, Json(body)).into_response();
-            insert_exec_id_header(&mut resp, exec_id);
-            resp
-        }
-        Err(error) => {
-            let mut resp = error.into_response();
-            insert_exec_id_header(&mut resp, exec_id);
-            resp
-        }
+    // `signal_workflow` returns an opaque `Response` (issue #610 changed its
+    // signature so it can emit the field-level schema-validation 400 body). On
+    // the 202 success path re-wrap the `{ok, signal_delivered}` ack body with
+    // `execution_id`; on any error/validation response forward it verbatim.
+    // Either way stamp the resolved execution id header.
+    let (parts, body) = result.into_parts();
+    if parts.status == axum::http::StatusCode::ACCEPTED {
+        let ack = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let out = serde_json::json!({
+            "execution_id": exec_id.to_string(),
+            "ok": ack.get("ok").cloned().unwrap_or(Value::Bool(true)),
+            "signal_delivered": ack
+                .get("signal_delivered")
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+        });
+        let mut resp = (parts.status, Json(out)).into_response();
+        insert_exec_id_header(&mut resp, exec_id);
+        resp
+    } else {
+        let mut resp = axum::response::Response::from_parts(parts, body);
+        insert_exec_id_header(&mut resp, exec_id);
+        resp
     }
 }
 
@@ -3943,6 +3954,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/registered/{name}/schema",
             get(get_registered_workflow_schema),
+        )
+        // issue #610: static /workflows/registered/{name}/interface — enumerate a
+        // workflow type's published signal/query/update interaction schemas.
+        // Registered alongside the other /workflows/registered/* routes, before
+        // any /workflows/{param} route so axum does not capture "registered".
+        .route(
+            "/workflows/registered/{name}/interface",
+            get(get_registered_workflow_interface),
         )
         // issue #544: static /workflows/count must be registered before any
         // /workflows/{param} routes so axum does not capture "count" as a path param.
@@ -4644,6 +4663,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/summaries"),
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
+        ("GET", "/workflows/registered/{name}/interface"),
         ("GET", "/workflows/{id}"),
         ("GET", "/workflows/{id}/history"),
         ("GET", "/workflows/{id}/result"),
@@ -7144,6 +7164,95 @@ async fn get_registered_workflow_schema(
             .into_response()
         },
     )
+}
+
+/// `GET /workflows/registered/{name}/interface` — enumerate a registered
+/// workflow type's published interaction surface: its signal, query, and update
+/// handlers, each with an optional argument/response JSON Schema and description
+/// (issue #610).
+///
+/// Returns `200` with a [`WorkflowInterfaceRecord`] whose `signals`/`queries`/
+/// `updates` arrays are each sorted by handler name (so the response is
+/// deterministic across calls), or `404` when the workflow name is not
+/// registered. Handlers without a published schema simply omit the
+/// `arg_schema`/`response_schema`/`description` fields.
+///
+/// [`WorkflowInterfaceRecord`]: autumn_harvest::WorkflowInterfaceRecord
+async fn get_registered_workflow_interface(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    use autumn_harvest::InterfaceHandlerRecord;
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    if !runtime.registry.workflows.contains_key(&name) {
+        return AutumnError::not_found_msg(format!("workflow '{name}' is not registered"))
+            .into_response();
+    }
+
+    let mut signals: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_signal)
+        .collect();
+    signals.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut queries: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .query_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_query)
+        .collect();
+    queries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut updates: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .update_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_update)
+        .collect();
+    updates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Json(autumn_harvest::WorkflowInterfaceRecord {
+        signals,
+        queries,
+        updates,
+    })
+    .into_response()
+}
+
+/// Build a `400 Bad Request` response for an interaction payload that failed
+/// its published `arg_schema` (issue #610).
+///
+/// Mirrors the `POST /workflows/{name}/start` input-validation response shape
+/// (issue #373): `{ "error": "...", "violations": [{ "message", "field_path" }] }`
+/// where each `field_path` is a JSON Pointer (RFC 6901). Used by the signal,
+/// signal-with-start, and update HTTP entry points to reject a structurally
+/// invalid payload *before* it is durably enqueued.
+fn schema_validation_response(
+    error: &'static str,
+    violations: Vec<autumn_harvest::info::SchemaViolation>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    #[derive(serde::Serialize)]
+    struct Body {
+        error: &'static str,
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    }
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(Body { error, violations }),
+    )
+        .into_response()
 }
 
 /// Coerce a raw predicate token to a typed JSON scalar (issue #506).
@@ -13964,6 +14073,21 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // issue #610: structural schema validation of the signal payload against
+    // the signal handler's published `arg_schema` (if any). Runs before any
+    // durable start/attach so a malformed signal is rejected at the edge with a
+    // field-level 400. A signal with no published schema validates Ok (today's
+    // behavior, unchanged). Scoped by (workflow_name, signal_name).
+    if let Some(handler) = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .find(|h| h.workflow == workflow_name && h.name == request.signal_name)
+        && let Err(violations) = handler.validate_arg(&signal_payload)
+    {
+        return schema_validation_response("signal payload validation failed", violations);
+    }
+
     // Debounce admission is owned by POST /workflows/{name}/start; an atomic
     // start+signal cannot be deferred through the trailing-edge gate. Rather than
     // rejecting up front (which would block legitimate *attach* calls to a live
@@ -16505,7 +16629,9 @@ pub(crate) async fn signal_workflow(
     Query(query): Query<SignalQuery>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<(axum::http::StatusCode, Json<SignalAck>), AutumnError> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
 
@@ -16516,13 +16642,15 @@ pub(crate) async fn signal_workflow(
     // when the header is absent (an empty param there is treated as omitted).
     // No key at all reproduces today's at-least-once behavior exactly.
     let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
-        let key = raw.to_str().map_err(|_| {
-            AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
-        })?;
+        let key = match raw.to_str() {
+            Ok(k) => k,
+            Err(_) => {
+                return AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
+                    .into_response();
+            }
+        };
         if key.is_empty() {
-            return Err(AutumnError::bad_request_msg(
-                "Idempotency-Key header is empty",
-            ));
+            return AutumnError::bad_request_msg("Idempotency-Key header is empty").into_response();
         }
         Some(key.to_string())
     } else {
@@ -16550,34 +16678,58 @@ pub(crate) async fn signal_workflow(
                 };
                 let _ = audit::insert_audit(&mut conn, &ar).await;
             }
-            return Err(e);
+            return e.into_response();
         }
     };
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
     let exec_id_str = exec_id.to_string();
 
-    if let Err(e) = load_execution(&mut conn, exec_id).await {
-        let err_str = e.to_string();
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_SIGNAL,
-            target_type: TARGET_WORKFLOW,
-            target_id: Some(exec_id_str.as_str()),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some(err_str.as_str()),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return Err(map_error(e));
-    }
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return map_error(e).into_response();
+        }
+    };
 
+    // issue #610: structural schema validation of the signal payload against
+    // the signal handler's published `arg_schema` (if any). Resolved by
+    // (execution.workflow_name, signal_name) and run before enqueue so a
+    // malformed payload is rejected at the edge with a field-level 400. A
+    // signal with no published schema validates Ok (today's behavior).
+    //
     // Issue #252: enforce signal payload cap before inserting the signal row.
     if let Ok(runtime) = api_state.runtime() {
-        check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)?;
+        if let Some(handler) = runtime
+            .registry
+            .signal_handlers
+            .iter()
+            .find(|h| h.workflow == execution.workflow_name && h.name == signal_name)
+            && let Err(violations) = handler.validate_arg(&payload)
+        {
+            return schema_validation_response("signal payload validation failed", violations);
+        }
+        if let Err(e) = check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)
+        {
+            return e.into_response();
+        }
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
@@ -16608,7 +16760,7 @@ pub(crate) async fn signal_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            return Err(map_error(e));
+            return map_error(e).into_response();
         }
     };
     let ar = NewAuditRecord {
@@ -16624,16 +16776,17 @@ pub(crate) async fn signal_workflow(
         shard_id: None,
         source: &source,
     };
-    audit::insert_audit(&mut conn, &ar)
-        .await
-        .map_err(map_error)?;
-    Ok((
+    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+        return map_error(e).into_response();
+    }
+    (
         axum::http::StatusCode::ACCEPTED,
         Json(SignalAck {
             ok: true,
             signal_delivered,
         }),
-    ))
+    )
+        .into_response()
 }
 
 /// Hydrate a workflow context by replaying its history into the workflow
@@ -28518,6 +28671,24 @@ pub(crate) async fn admit_update(
     // Scoped by (workflow_name, update_name), not update_name alone, since two
     // different workflows may register update handlers with the same name.
     let execution_for_validation = load_execution(&mut conn, exec_id).await;
+
+    // issue #610: structural schema validation of the update argument against
+    // the handler's published `arg_schema` (if any). Runs *before* the semantic
+    // validator below so a malformed payload is rejected at the edge with a
+    // field-level 400 rather than reaching the validator (422) or becoming
+    // durable history. A handler with no published schema validates Ok (today's
+    // behavior, unchanged). Scoped by (workflow_name, update_name).
+    if let Ok(execution) = &execution_for_validation
+        && let Some(update_info) = runtime
+            .registry
+            .update_handlers
+            .iter()
+            .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
+        && let Err(violations) = update_info.validate_arg(&request.input)
+    {
+        return schema_validation_response("update payload validation failed", violations);
+    }
+
     if let Ok(execution) = &execution_for_validation
         && let Some(update_info) = runtime
             .registry
