@@ -208,8 +208,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:batch_operations_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:build_routing_ui_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:dlq_aggregate_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:dlq_bulk_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:dlq_redrive_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:erase_payloads_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:event_batch_integration", ALLOWLIST_DEBT_REASON),

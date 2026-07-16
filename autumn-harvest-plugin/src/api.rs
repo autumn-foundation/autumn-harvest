@@ -5005,8 +5005,13 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
+                "error_class",
+                "dlq_reason",
+                "failure_signature",
                 "limit",
                 "dry_run",
             ]),
@@ -5017,8 +5022,13 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
+                "error_class",
+                "dlq_reason",
+                "failure_signature",
                 "limit",
                 "dry_run",
             ]),
@@ -22745,12 +22755,22 @@ struct BulkDlqApiBody {
     activity_name: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
+    #[serde(default)]
+    queue_name: Option<String>,
+    #[serde(default)]
+    min_attempts: Option<i32>,
     #[serde(default, alias = "task_kind")]
     task_type: Option<String>,
     #[serde(default)]
     failed_after: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    error_class: Option<String>,
+    #[serde(default)]
+    dlq_reason: Option<String>,
+    #[serde(default)]
+    failure_signature: Option<String>,
     #[serde(default)]
     shard_id: Option<i32>,
     #[serde(default)]
@@ -22770,8 +22790,21 @@ impl BulkDlqApiBody {
             filter: dlq::BulkDlqFilter {
                 activity_name: self.activity_name,
                 workflow_name: self.workflow_name,
+                // `queue_name` is a plain positive-equality filter — treat empty
+                // exactly like `activity_name`/`workflow_name` (a harmless
+                // matches-nothing predicate), not like the strict-reject cause
+                // dimensions (whose empty value would dangerously skip the
+                // filter and widen the cohort).
+                queue_name: self.queue_name,
+                min_attempts: self
+                    .min_attempts
+                    .map(validate_bulk_min_attempts)
+                    .transpose()?,
                 failed_after: self.failed_after,
                 failed_before: self.failed_before,
+                error_class: normalize_cause_filter(self.error_class)?,
+                dlq_reason: normalize_cause_filter(self.dlq_reason)?,
+                failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
             },
@@ -22779,6 +22812,46 @@ impl BulkDlqApiBody {
             task_type,
             shard_id: self.shard_id,
         })
+    }
+}
+
+/// Normalize a compute-on-read cause filter value (issue #613): an absent
+/// value stays absent; a present value is trimmed and, if empty after
+/// trimming, rejected with `400` rather than silently downgraded to "no
+/// filter" (which would replay/discard a far larger cohort than intended).
+fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, AutumnError> {
+    value.map_or_else(
+        || Ok(None),
+        |raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(AutumnError::bad_request_msg(
+                    "cause filter (error_class/dlq_reason/failure_signature) must not be empty",
+                ))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        },
+    )
+}
+
+/// Validate a bulk-DLQ `min_attempts` filter (issue #613). The aggregate read
+/// parser (`DlqAggregateParams::from_query_pairs`) only rejects negatives
+/// (accepting `>= 0`), but the bulk replay/discard paths are DESTRUCTIVE so we
+/// are stricter: attempt counts are 1-based, so a `min_attempts` of `0` or a
+/// negative value produces the predicate `attempts >= 0` (or lower) which
+/// matches EVERY DLQ row. That is not a genuine narrowing criterion, so it must
+/// not satisfy the substantive-filter safety guard (AC8) — otherwise a
+/// malformed request slips past `BulkDlqFilter::is_empty()` and acts on the
+/// whole DLQ. Reject at the request boundary (mirroring `normalize_cause_filter`)
+/// rather than touching the SQL predicate; require `>= 1`.
+fn validate_bulk_min_attempts(value: i32) -> Result<i32, AutumnError> {
+    if value < 1 {
+        Err(AutumnError::bad_request_msg(format!(
+            "invalid min_attempts '{value}'; expected a positive integer (>= 1)"
+        )))
+    } else {
+        Ok(value)
     }
 }
 
@@ -22871,6 +22944,19 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
     for (key, value) in parse_urlencoded_form(raw)? {
         let field = key.trim();
         let value = value.trim();
+        // Cause filters (issue #613) must be rejected — not silently skipped —
+        // when empty, so an accidental empty form value can't widen the cohort
+        // (the generic empty-value skip below would otherwise drop them).
+        if matches!(field, "error_class" | "dlq_reason" | "failure_signature") {
+            let normalized = normalize_cause_filter(Some(value.to_string()))?;
+            match field {
+                "error_class" => selector.filter.error_class = normalized,
+                "dlq_reason" => selector.filter.dlq_reason = normalized,
+                "failure_signature" => selector.filter.failure_signature = normalized,
+                _ => unreachable!(),
+            }
+            continue;
+        }
         if value.is_empty() {
             continue;
         }
@@ -22880,6 +22966,13 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
             }
             "activity_name" => selector.filter.activity_name = Some(value.to_string()),
             "workflow_name" => selector.filter.workflow_name = Some(value.to_string()),
+            "queue_name" => selector.filter.queue_name = Some(value.to_string()),
+            "min_attempts" => {
+                selector.filter.min_attempts = Some(validate_bulk_min_attempts(parse_i32_field(
+                    value,
+                    "min_attempts",
+                )?)?);
+            }
             "task_kind" | "task_type" => {
                 selector.task_type = Some(parse_dlq_task_type_filter(value)?);
             }
@@ -23007,7 +23100,7 @@ fn dlq_bulk_empty_filter_response(request: &ParsedBulkDlqRequest) -> axum::respo
 
     const MESSAGE: &str = "bulk filter must specify at least one criterion: dead_letter_id, \
                            activity_name, workflow_name, task_type, failed_after, failed_before, \
-                           or shard_id";
+                           error_class, dlq_reason, failure_signature, or shard_id";
 
     if request.wants_redirect {
         return dlq_form_redirect(request.return_to.as_deref(), MESSAGE);
@@ -23615,6 +23708,20 @@ async fn count_api_bulk_filter_matches(
 ) -> HarvestResult<i64> {
     let mut query = harvest_dead_letters::table.into_boxed();
     query = apply_api_bulk_filters(query, selector);
+    // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
+    // `error` strings and count the ones passing the cause post-filter.
+    if selector.filter.has_cause_filter() {
+        let errors: Vec<String> = query
+            .select(harvest_dead_letters::error)
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        let matched = errors
+            .iter()
+            .filter(|e| selector.filter.cause_matches(e))
+            .count();
+        return Ok(i64::try_from(matched).unwrap_or(i64::MAX));
+    }
     query.count().get_result(conn).await.map_err(database_error)
 }
 
@@ -23622,16 +23729,33 @@ async fn query_dead_letters_for_api_bulk(
     conn: &mut AsyncPgConnection,
     selector: &DlqBulkSelector,
 ) -> HarvestResult<Vec<DeadLetter>> {
+    // Cause dimensions (issue #613) are compute-on-read, so the SQL row limit
+    // cannot precede the post-filter (it would clip pre-filter rows). Drop the
+    // SQL limit, order oldest-first, then post-filter and `take` the limit — so
+    // the cause post-filter precedes the limit.
+    let cause = selector.filter.has_cause_filter();
     let mut query = harvest_dead_letters::table
         .into_boxed()
-        .order(harvest_dead_letters::failed_at.asc())
-        .limit(selector.filter.effective_limit());
+        .order(harvest_dead_letters::failed_at.asc());
+    if !cause {
+        query = query.limit(selector.filter.effective_limit());
+    }
     query = apply_api_bulk_filters(query, selector);
-    query
+    let rows = query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
-        .map_err(database_error)
+        .map_err(database_error)?;
+    if cause {
+        let limit = usize::try_from(selector.filter.effective_limit()).unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .filter(|r| selector.filter.cause_matches(&r.error))
+            .take(limit)
+            .collect())
+    } else {
+        Ok(rows)
+    }
 }
 
 fn apply_api_bulk_filters<'a>(
@@ -23650,6 +23774,12 @@ fn apply_api_bulk_filters<'a>(
                 .bind::<diesel::sql_types::Text, _>(task_type.clone())
                 .sql(")"),
         );
+    }
+    if let Some(ref queue) = selector.filter.queue_name {
+        query = query.filter(harvest_dead_letters::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = selector.filter.min_attempts {
+        query = query.filter(harvest_dead_letters::attempts.ge(min));
     }
     if let Some(after) = selector.filter.failed_after {
         query = query.filter(harvest_dead_letters::failed_at.ge(after));
@@ -30901,6 +31031,18 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
+    /// `0` and negatives — which match every 1-based-attempt row — are rejected
+    /// so a malformed request can't slip past the empty-filter safety guard.
+    #[test]
+    fn validate_bulk_min_attempts_rejects_non_positive() {
+        assert_eq!(validate_bulk_min_attempts(1).unwrap(), 1);
+        assert_eq!(validate_bulk_min_attempts(3).unwrap(), 3);
+        assert!(validate_bulk_min_attempts(0).is_err());
+        assert!(validate_bulk_min_attempts(-1).is_err());
+        assert!(validate_bulk_min_attempts(i32::MIN).is_err());
     }
 
     /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
