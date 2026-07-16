@@ -63,19 +63,21 @@ HarvestPlugin::new()
 For a support/on-call/status-dashboard principal that should **read but not
 mutate**, mount with `api_with_role_auth` instead of `api_with_auth` — a single
 call that adds a class-aware enforcement layer giving `403 Forbidden` on every
-mutating route to any principal your middleware marks read-only, while leaving
-100% of the read surface reachable. See **[the read-only operator role
-guide](./operator-role.md)** for the Session claim contract, the fail-closed
-guarantee, and the `/ui` limitation.
+mutating management route (and every mutating [MCP tool](./mcp-tools.md), when
+`mcp_tools()` is enabled) to any principal your middleware marks read-only,
+while leaving 100% of the read surface reachable. See **[the read-only operator
+role guide](./operator-role.md)** for the Session claim contract, the
+fail-closed guarantee, the MCP-tool coverage, and the `/ui` limitation.
 
 ### Production (host-app authentication)
 
 Mount the API with the host application's authentication middleware. The
 `api_with_auth` method applies any Tower middleware layer to the **entire**
-router — all 48 management API routes, the embedded Vantage UI (`/ui/*`), and
+router — every management API route, the embedded Vantage UI (`/ui/*`), and
 all CLI-compatible endpoints are wrapped together because `harvest_ui_router` is
 nested into the same Axum router before the middleware layer is added (see
-`HarvestPlugin::build` in the plugin source).
+`HarvestPlugin::build` in the plugin source). The same layer is also applied to
+every generated MCP tool route.
 
 Pass any Tower `Layer`-compatible middleware. Two common shapes are shown below.
 

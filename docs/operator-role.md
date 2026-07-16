@@ -71,14 +71,21 @@ if caller.is_support_engineer() {
 - **Reaches 100% of `RouteClass::ReadOnly` routes** — list/describe/history/
   export/query/preview/stack/timeline/eligibility/schedule-read/etc. This
   includes read routes that are otherwise admin-gated, and the SSE event stream.
-- **Receives `403 Forbidden` on every `RouteClass::Mutating` route** —
-  terminate, cancel, reset, pause/resume, signal, update, batch start/cancel/
+- **Receives `403 Forbidden` on every `RouteClass::Mutating` management route**
+  — terminate, cancel, reset, pause/resume, signal, update, batch start/cancel/
   signal/reset, DLQ replay/discard/redrive, circuit force-open/close, schedule
   create/update/pause/resume/backfill/trigger/delete, retention run-now,
   rate-limit setters, PII erasure, legal hold, build-routing policy/ramp
   changes, task reprioritize, worker drain, calendar/completion-trigger CRUD,
   external-activity completion, and any route not yet classified (see
   *fail-closed* below).
+- **Receives `403 Forbidden` on every mutating MCP tool** — when
+  [`mcp_tools()`](./mcp-tools.md) is enabled, the generated `start_{wf}`,
+  `signal_{wf}`, `{wf}_update_{name}`, and `start_{dag}` tools are covered by
+  the same read-only class gate (the `{wf}_status` / `{wf}_watch` **read** tools
+  stay reachable). The gate applies to both the tool's own HTTP path and the
+  `/mcp` JSON-RPC `tools/call` envelope (autumn-web re-dispatches the envelope
+  through the same route). See *MCP tool routes* below.
 
 The `403` is distinct from the anonymous `401` the admin gate returns, so an
 authenticated-but-insufficient read-only principal is distinguishable from an
@@ -129,12 +136,35 @@ principal.
 
 ---
 
+## MCP tool routes
+
+The generated [MCP tool routes](./mcp-tools.md) are registered app-level (via
+`AppBuilder::routes`), **outside** the nested management router that carries the
+`enforce_read_only_class` layer. Under `api_with_role_auth` they therefore carry
+their **own** class gate (`enforce_read_only_mcp_mutation`), installed on every
+**mutating** tool (`start_{wf}` / `signal_{wf}` / `{wf}_update_{name}` /
+`start_{dag}`) and driven by `ToolKind::is_mutation()`. A read-only principal is
+`403`'d on those and reaches the **read** tools (`{wf}_status` / `{wf}_watch`)
+unchanged. Because autumn-web re-dispatches the `/mcp` JSON-RPC `tools/call`
+envelope through the same route with the caller's forwarded credential, this one
+gate closes both the direct-HTTP and the envelope invocation paths. When
+`api_with_role_auth` is not used, the gate is not installed and the MCP routes
+are byte-for-byte their pre-#776 shape.
+
 ## Known limitation: the Vantage UI (`/ui`)
 
 The nested `/ui` sub-router's paths are not part of `CLASSIFIED_ROUTES`, so under
 fail-closed enforcement a read-only principal receives `403` on `/ui`. Admins
 reach `/ui` unchanged. Classifying the UI routes so read-only principals can view
 (but not act through) the dashboard is a documented follow-up.
+
+## Known limitation: read-capability breadth
+
+This slice restricts **verbs**, not **fields** or **rows** (see above): a
+read-only principal, mounted behind your auth boundary, gets admin-level
+**reads** — including payload decoding ([#608](./operations/read-path-decode.md))
+and the SSE event stream. Field-level redaction and per-tenant row scoping are
+out of scope for this role.
 
 ---
 
