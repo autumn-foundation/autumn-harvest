@@ -301,6 +301,9 @@ mod db_tests {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params, None)
             .await
@@ -373,6 +376,9 @@ mod db_tests {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params, None)
             .await

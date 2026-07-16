@@ -699,6 +699,9 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -924,6 +927,9 @@ async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, stat
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )

@@ -807,6 +807,9 @@ pub async fn trigger_unified_dag(
                 .as_ref()
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
+            start_source: crate::types::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -3410,6 +3413,9 @@ async fn tick_one_workflow_schedule(
                 // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                 origin: Some(crate::execution::ORIGIN_SCHEDULED),
                 completion_callbacks: None,
+                start_source: crate::types::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             },
             None,
         )
@@ -4961,6 +4967,9 @@ async fn drain_buffered_schedule_runs(
                     // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
                     completion_callbacks: None,
+                    start_source: crate::types::StartSource::Api,
+                    start_source_ref: None,
+                    started_by: None,
                 },
                 None,
             )

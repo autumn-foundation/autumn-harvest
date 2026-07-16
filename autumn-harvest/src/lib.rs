@@ -438,8 +438,8 @@ pub use timeline::{
 pub use trace_export::export_chrome_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
-    ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, TimerId, UpdateId, WorkerId,
-    WorkflowId, WorkflowIdReusePolicy,
+    ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, StartSource, TimerId,
+    UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

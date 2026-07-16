@@ -1011,6 +1011,9 @@ async fn fire_claimed_throttle_row(
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: opts.origin.as_deref(),
         completion_callbacks: opts.completion_callbacks,
+        start_source: crate::types::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,

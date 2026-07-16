@@ -253,7 +253,12 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_until TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_actor TEXT NULL;\n",
+    // issue #740: WorkflowExecution::as_select() (modern start path's read-back)
+    // references the three start_source_* provenance columns.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source_ref TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS started_by TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -650,6 +655,9 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -704,6 +712,9 @@ pub(crate) async fn insert_workflow_execution_with_id(
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -770,6 +781,9 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -1691,6 +1705,9 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -1888,6 +1905,9 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     let started = start_or_load_workflow_execution(&mut conn, request, None)
         .await
@@ -5008,6 +5028,9 @@ async fn insert_named_workflow_execution(
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -5668,6 +5691,9 @@ mod reuse_policy_helpers {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         }
     }
 
@@ -6976,6 +7002,9 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -7148,6 +7177,9 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -8682,6 +8714,9 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

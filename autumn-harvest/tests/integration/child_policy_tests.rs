@@ -144,6 +144,9 @@ async fn start_workflow(
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )
@@ -361,6 +364,9 @@ async fn insert_detached_child_execution(
             retry_of_exec_id: None,
             origin: None,
             completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         })
         .execute(conn)
         .await
@@ -961,6 +967,9 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             retry_of_exec_id: None,
             origin: None,
             completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         })
         .execute(&mut conn)
         .await

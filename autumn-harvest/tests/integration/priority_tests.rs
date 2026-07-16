@@ -258,6 +258,9 @@ fn start_workflow_params_has_priority_field() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -304,6 +307,9 @@ fn start_workflow_params_default_priority_is_normal() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);

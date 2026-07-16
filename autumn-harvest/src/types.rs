@@ -755,6 +755,118 @@ pub enum WorkflowIdReusePolicy {
 }
 
 // ---------------------------------------------------------------------------
+// StartSource
+// ---------------------------------------------------------------------------
+
+/// A bounded classifier for *how* a workflow execution was started (issue #740).
+///
+/// Recorded durably on every execution across all start paths so operators can
+/// answer "where did this run come from?" — an API call, a schedule tick, a
+/// child spawn, a completion trigger, and so on. This is distinct from the
+/// `origin` column (issue #534), which classifies scheduled dispatch sub-kinds;
+/// the two coexist.
+///
+/// The variant set is intentionally bounded (low-cardinality) so it is safe as
+/// a filter dimension and, if ever surfaced, a metric label. An unrecognized
+/// stored string deserializes to [`StartSource::Unknown`] rather than erroring,
+/// so a value written by a newer build never breaks an older reader.
+///
+/// A start-source column is *never* read during replay, so recording it has no
+/// effect on determinism.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::StartSource;
+///
+/// // Unknown is the default (a NULL / pre-upgrade column).
+/// assert_eq!(StartSource::default(), StartSource::Unknown);
+/// assert_eq!(StartSource::Api.as_str(), "api");
+/// // Unrecognized strings never error — they map to Unknown.
+/// assert_eq!(StartSource::from_str("not-a-real-source"), StartSource::Unknown);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartSource {
+    /// Started via the plain HTTP start route or an equivalent direct API call.
+    Api,
+    /// Fired by a schedule tick.
+    Schedule,
+    /// Started by a schedule backfill run.
+    Backfill,
+    /// Started atomically alongside a signal (`signal_with_start`).
+    SignalWithStart,
+    /// Started atomically alongside an update (`update_with_start`).
+    UpdateWithStart,
+    /// Started by a completion trigger reacting to another workflow's terminal.
+    CompletionTrigger,
+    /// Started by an inbound webhook delivery.
+    Webhook,
+    /// Spawned as a child workflow (awaited or detached).
+    Child,
+    /// Started via the batch-start API.
+    Batch,
+    /// A continue-as-new successor run.
+    ContinueAsNew,
+    /// A reset-fork run.
+    Reset,
+    /// Started by the cross-shard outbox dispatcher.
+    Outbox,
+    /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
+    /// stored value). This is the default.
+    #[default]
+    Unknown,
+}
+
+impl StartSource {
+    /// The stable, snake_case wire string for this source.
+    ///
+    /// Matches the `#[serde(rename_all = "snake_case")]` representation and is
+    /// what is written to the `start_source` column.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Schedule => "schedule",
+            Self::Backfill => "backfill",
+            Self::SignalWithStart => "signal_with_start",
+            Self::UpdateWithStart => "update_with_start",
+            Self::CompletionTrigger => "completion_trigger",
+            Self::Webhook => "webhook",
+            Self::Child => "child",
+            Self::Batch => "batch",
+            Self::ContinueAsNew => "continue_as_new",
+            Self::Reset => "reset",
+            Self::Outbox => "outbox",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored/source string into a [`StartSource`].
+    ///
+    /// Unrecognized input maps to [`StartSource::Unknown`] and never errors, so
+    /// a value written by a newer build is tolerated by an older reader.
+    #[must_use]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "api" => Self::Api,
+            "schedule" => Self::Schedule,
+            "backfill" => Self::Backfill,
+            "signal_with_start" => Self::SignalWithStart,
+            "update_with_start" => Self::UpdateWithStart,
+            "completion_trigger" => Self::CompletionTrigger,
+            "webhook" => Self::Webhook,
+            "child" => Self::Child,
+            "batch" => Self::Batch,
+            "continue_as_new" => Self::ContinueAsNew,
+            "reset" => Self::Reset,
+            "outbox" => Self::Outbox,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IdempotencyKey
 // ---------------------------------------------------------------------------
 
@@ -1349,6 +1461,63 @@ mod tests {
 
             let deserialized: Priority = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, priority);
+        }
+    }
+
+    #[test]
+    fn start_source_as_str_from_str_round_trip() {
+        let all = [
+            StartSource::Api,
+            StartSource::Schedule,
+            StartSource::Backfill,
+            StartSource::SignalWithStart,
+            StartSource::UpdateWithStart,
+            StartSource::CompletionTrigger,
+            StartSource::Webhook,
+            StartSource::Child,
+            StartSource::Batch,
+            StartSource::ContinueAsNew,
+            StartSource::Reset,
+            StartSource::Outbox,
+            StartSource::Unknown,
+        ];
+        for src in all {
+            assert_eq!(
+                StartSource::from_str(src.as_str()),
+                src,
+                "round-trip failed for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_source_from_str_unrecognized_maps_to_unknown() {
+        assert_eq!(StartSource::from_str("garbage"), StartSource::Unknown);
+        assert_eq!(StartSource::from_str(""), StartSource::Unknown);
+        assert_eq!(StartSource::from_str("API"), StartSource::Unknown);
+        assert_eq!(StartSource::from_str("unknown"), StartSource::Unknown);
+    }
+
+    #[test]
+    fn start_source_default_is_unknown() {
+        assert_eq!(StartSource::default(), StartSource::Unknown);
+    }
+
+    #[test]
+    fn start_source_serde_matches_as_str() {
+        // serde snake_case rename must agree with as_str() for every variant.
+        let cases = [
+            StartSource::Api,
+            StartSource::SignalWithStart,
+            StartSource::CompletionTrigger,
+            StartSource::ContinueAsNew,
+            StartSource::Unknown,
+        ];
+        for src in cases {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(json, format!("\"{}\"", src.as_str()));
+            let de: StartSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, src);
         }
     }
 }

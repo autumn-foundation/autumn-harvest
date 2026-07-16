@@ -289,6 +289,9 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             max_workflow_attempts_ceiling: None,
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         None,
     )

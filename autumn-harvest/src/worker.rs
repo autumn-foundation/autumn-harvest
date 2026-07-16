@@ -3767,6 +3767,9 @@ async fn persist_workflow_failure(
                         // predecessor's completion-callback targets (#605)
                         // rather than silently dropping them.
                         completion_callbacks: exec_ref.completion_callbacks.clone(),
+                        start_source: crate::types::StartSource::Api,
+                        start_source_ref: None,
+                        started_by: None,
                     };
 
                     match crate::execution::start_or_load_workflow_execution_collect(
@@ -5378,6 +5381,9 @@ async fn persist_all_started_child_workflows(
                         // targets, resolved at their own terminal transition
                         // (issue #605) — no per-execution override here.
                         completion_callbacks: None,
+                        start_source: Some("api"),
+                        start_source_ref: None,
+                        started_by: None,
                     };
                     let child_started_event = WorkflowEvent::WorkflowStarted {
                         input: child.input.clone(),
@@ -5545,6 +5551,9 @@ async fn insert_awaited_child_execution(
         // Children get only builder-wide default callback targets, resolved at
         // their own terminal transition (issue #605) — no per-execution override.
         completion_callbacks: None,
+        start_source: Some("api"),
+        start_source_ref: None,
+        started_by: None,
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
         input: child.input.clone(),
@@ -6607,6 +6616,9 @@ async fn create_detached_child_executions(
             // Detached children get only builder-wide default callback
             // targets (issue #605) — no per-execution override here.
             completion_callbacks: None,
+            start_source: Some("api"),
+            start_source_ref: None,
+            started_by: None,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -9391,6 +9403,9 @@ async fn persist_workflow_continue_as_new(
         // itself a successor, else the predecessor's own id.
         continued_from_exec_id: Some(exec_id.as_uuid()),
         first_exec_id: Some(execution.first_exec_id.unwrap_or(execution.id)),
+        start_source: Some("api"),
+        start_source_ref: None,
+        started_by: None,
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);

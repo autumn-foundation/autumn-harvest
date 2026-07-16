@@ -988,6 +988,9 @@ async fn seed_workflow(
         completion_callbacks: None,
         continued_from_exec_id: None,
         first_exec_id: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

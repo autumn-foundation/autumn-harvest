@@ -115,6 +115,17 @@ diesel::table! {
         legal_hold_reason -> Nullable<Text>,
         /// Principal that placed the legal hold (issue #747, audit trail).
         legal_hold_actor -> Nullable<Text>,
+        /// Workflow-start provenance classifier (issue #740): a bounded
+        /// snake_case source string (`api` / `schedule` / `child` / ...). NULL
+        /// for pre-upgrade rows, reported as "unknown". Distinct from `origin`
+        /// (issue #534); never read on replay.
+        start_source -> Nullable<Text>,
+        /// Optional correlation reference for the start source (issue #740),
+        /// e.g. the triggering execution id or schedule id. NULL when absent.
+        start_source_ref -> Nullable<Text>,
+        /// Optional human/operator attribution for the start (issue #740).
+        /// NULL when absent.
+        started_by -> Nullable<Text>,
     }
 }
 

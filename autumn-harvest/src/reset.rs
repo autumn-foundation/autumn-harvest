@@ -1286,6 +1286,9 @@ async fn insert_fork_execution(
         // fork continues the same logical run, so its terminal notification
         // targets should too.
         completion_callbacks: source.completion_callbacks.clone(),
+        start_source: Some("api"),
+        start_source_ref: None,
+        started_by: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1553,6 +1556,9 @@ mod tests {
             legal_hold_until: None,
             legal_hold_reason: None,
             legal_hold_actor: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         }
     }
 

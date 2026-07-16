@@ -6457,6 +6457,9 @@ async fn execute_schedule_trigger_ui(
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
         None,
@@ -8261,6 +8264,9 @@ mod tests {
             legal_hold_until: None,
             legal_hold_reason: None,
             legal_hold_actor: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         }
     }
 

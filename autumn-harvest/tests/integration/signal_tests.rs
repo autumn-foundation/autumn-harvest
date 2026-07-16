@@ -84,6 +84,9 @@ async fn test_send_and_load_signals() {
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -148,6 +151,9 @@ async fn test_mark_signals_consumed() {
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -224,6 +230,9 @@ async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) ->
         retry_of_exec_id: None,
         origin: None,
         completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

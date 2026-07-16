@@ -1042,6 +1042,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                         origin: None,
                         completion_callbacks: ::std::option::Option::None,
+                        start_source: ::autumn_harvest::types::StartSource::Api,
+                        start_source_ref: ::std::option::Option::None,
+                        started_by: ::std::option::Option::None,
                     };
 
                     let started = client.start_or_load(conn, params).await?;

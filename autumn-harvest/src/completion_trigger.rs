@@ -1089,6 +1089,9 @@ impl DeferredTriggerStart {
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 origin: None,
                 completion_callbacks: None,
+                start_source: crate::types::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
             };
 
             if let Err(e) = relay_gate_checked_start(
@@ -1557,6 +1560,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                         // Completion-trigger start is not a schedule fire (issue #534).
                         origin: None,
                         completion_callbacks: None,
+                        start_source: crate::types::StartSource::Api,
+                        start_source_ref: None,
+                        started_by: None,
                     },
                     // The inline same-shard completion-trigger start keeps its own
                     // unlocked pre-check gate above (it also performs the fires-row
@@ -1787,6 +1793,9 @@ pub async fn enforce_completion_triggers_outbox(
             // (issue #605); a completion-trigger target has no per-execution
             // callback option of its own.
             completion_callbacks: None,
+            start_source: crate::types::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         };
 
         // Existence-aware relay-time start/block via `gate_checked_start_or_load`

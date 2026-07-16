@@ -777,6 +777,9 @@ async fn fire_claimed_debounce_row(
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
         completion_callbacks: opts.completion_callbacks,
+        start_source: crate::types::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

@@ -296,6 +296,9 @@ pub async fn admit_batched_start(
                             max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
                             origin: None,
                             completion_callbacks: opts.completion_callbacks.clone(),
+                            start_source: crate::types::StartSource::Api,
+                            start_source_ref: None,
+                            started_by: None,
                         };
 
                         let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -581,6 +584,9 @@ async fn fire_claimed_batch_row(
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
         completion_callbacks: opts.completion_callbacks,
+        start_source: crate::types::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
 
     let start_res = crate::execution::start_or_load_workflow_execution_collect(

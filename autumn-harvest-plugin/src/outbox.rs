@@ -367,6 +367,9 @@ pub(crate) async fn dispatch_workflow_start_request(
             // Outbox delivery is not a schedule fire (issue #534).
             origin: None,
             completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
         registry_ext.as_ref().map(|r| {
             r.telemetry().metrics.as_ref()

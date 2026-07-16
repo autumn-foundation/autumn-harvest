@@ -507,6 +507,9 @@ fn mk_start_params(
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     }
 }
 
@@ -646,6 +649,9 @@ async fn test_same_shard_not_found_retry() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
@@ -694,6 +700,9 @@ async fn test_same_shard_not_found_retry() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
@@ -842,6 +851,9 @@ async fn test_cross_shard_outbox_delivery() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
@@ -883,6 +895,9 @@ async fn test_cross_shard_outbox_delivery() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
@@ -1003,6 +1018,9 @@ async fn test_grace_window_expiration() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
@@ -1162,6 +1180,9 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params, None)
         .await
@@ -1210,6 +1231,9 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         max_workflow_attempts_ceiling: None,
         origin: None,
         completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params, None)
         .await
