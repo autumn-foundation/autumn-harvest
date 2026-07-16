@@ -3481,30 +3481,41 @@ impl HistoryMatcher {
                     // Update events are transparent to signal scanning.
                     scan_cursor += 1;
                 }
-                // A signal-or-deadline race's OWN deadline timer (issue #476's
-                // reserved `__signal_timeout:{seq}:{name}` convention) is
-                // transparent to a plain signal wait: it belongs to a concurrent
-                // `receive_signal_timeout` race, not to this wait, so it is
-                // neither a user command to rewind for nor a park-forever stray.
-                // Cross it WITHOUT setting `first_interleaved_command` (its paired
-                // `TimerFired` crosses via the arm below), so the awaited signal
-                // recorded after the spent deadline is found and the reserved
-                // events end up behind the cursor on the win — never flagging
-                // early completion (issue #1071 manifestation #3). A genuine user
-                // `ctx.timer` sibling falls through to the arm below and keeps its
-                // rewind so its own `match_timer_strict` still finds it.
+                // A reserved deadline timer (issue #476's
+                // `__signal_timeout:{seq}:{name}` convention) for THIS awaited
+                // signal — a spent deadline from this wait's own signal-or-deadline
+                // composition, recorded earlier in the batch, where the plain
+                // signal ultimately won AFTER the deadline event. Cross it WITHOUT
+                // setting `first_interleaved_command` (its paired `TimerFired`
+                // crosses via the arm below), so the awaited signal recorded after
+                // the spent deadline is found and the reserved events end up behind
+                // the cursor on the win — never flagging early completion (issue
+                // #1071 manifestation #3).
                 //
-                // NOTE (issue #1071): this arm is scoped to the documented +
-                // tested case where the race's deadline has ALREADY fired (the
-                // signal wins after the deadline event was recorded). It assumes
-                // the reserved deadline is spent, not that a same-name race is
-                // still open at this cursor and racing THIS plain wait for the
-                // same signal — that composition (a plain `wait_for_signal("go")`
-                // interleaved with a still-open `receive_signal_timeout("go", …)`
-                // for the same name in the same batch) is an unsupported/exotic
-                // shape, not something this arm is designed to disambiguate.
+                // The guard is scoped to THIS signal's OWN name. A reserved
+                // deadline for a DIFFERENT signal name (e.g. matching
+                // `wait_for_signal("a")` while a concurrent
+                // `receive_signal_timeout("b", …)` armed `__signal_timeout:N:b`)
+                // belongs to that sibling race's own `match_signal_or_timer("b")`,
+                // which positionally re-anchors on its `TimerStarted`. Crossing a
+                // FOREIGN reserved timer WITHOUT rewind here would advance the
+                // cursor past the sibling's reserved events, so its later poll can
+                // no longer find its own `TimerStarted` → false EarlyCompletion / a
+                // re-armed spent timer (Codex P1 on PR #1084). So a foreign-name
+                // reserved timer instead falls through to the generic
+                // `TimerStarted` rewind arm below (as does a genuine user
+                // `ctx.timer` sibling), which sets `first_interleaved_command` so
+                // the sibling race / `match_timer_strict` re-matches after the win.
+                //
+                // NOTE (issue #1071): this arm assumes the SAME-name reserved
+                // deadline is SPENT (the signal won after the deadline event was
+                // recorded). It does not disambiguate a same-name race that is
+                // still OPEN at this cursor and racing THIS plain wait for the same
+                // signal (a plain `wait_for_signal("go")` interleaved with a
+                // still-open `receive_signal_timeout("go", …)` for the same name in
+                // the same batch) — that composition is an unsupported/exotic shape.
                 WorkflowEvent::TimerStarted { timer_id, .. }
-                    if Self::signal_timeout_race_name(timer_id.as_str()).is_some() =>
+                    if Self::signal_timeout_race_name(timer_id.as_str()) == Some(signal_name) =>
                 {
                     scan_cursor += 1;
                 }
