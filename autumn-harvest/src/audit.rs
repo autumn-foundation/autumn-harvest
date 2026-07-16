@@ -545,8 +545,6 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/registered/{name}/schema",
         RouteClass::ReadOnly,
     ),
-    // issue #610/#1092: enumerates a workflow type's published signal/query/
-    // update interaction schemas (read; no state mutation).
     (
         "GET /workflows/registered/{name}/interface",
         RouteClass::ReadOnly,
