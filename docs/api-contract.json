@@ -119,6 +119,12 @@
           "in": "query",
           "required": false,
           "description": "When 'true', return only executions currently under an active legal hold (issue #747): legal_hold_set_at IS NOT NULL AND (legal_hold_until IS NULL OR legal_hold_until > now)."
+        },
+        {
+          "name": "start_source",
+          "in": "query",
+          "required": false,
+          "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
         }
       ],
       "request_body": null,

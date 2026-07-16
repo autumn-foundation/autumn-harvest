@@ -290,6 +290,20 @@ fn workflow_list_supports_repeated_and_comma_states() {
 }
 
 #[test]
+fn workflow_list_start_source_filter_maps_to_query_string() {
+    // Issue #740: `--start-source` forwards a single bounded provenance value
+    // verbatim to the `start_source` query param. The CLI does not validate it
+    // (the server 400s an unknown value), matching how `--state` passes through.
+    let list = Cli::try_parse_from(["harvest", "workflow", "list", "--start-source", "schedule"])
+        .expect("start-source list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/workflows?start_source=schedule");
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_summaries_maps_to_get_request() {
     let cli = Cli::try_parse_from(["harvest", "workflow", "summaries"])
         .expect("summaries args should parse");

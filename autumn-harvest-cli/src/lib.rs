@@ -823,6 +823,13 @@ enum WorkflowCommand {
         /// stalled-workflow results. Only meaningful with --no-progress-minutes.
         #[arg(long)]
         include_sleeping: bool,
+        /// Filter by workflow-start provenance (issue #740): one of api,
+        /// schedule, backfill, `signal_with_start`, `update_with_start`,
+        /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
+        /// reset, outbox, or unknown (matches pre-upgrade/NULL rows). The
+        /// server rejects any other value with a 400.
+        #[arg(long = "start-source")]
+        start_source: Option<String>,
     },
     /// List tiered/summary-retention execution summaries (issue #752).
     ///
@@ -4277,6 +4284,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             owner,
             no_progress_minutes,
             include_sleeping,
+            start_source,
         } => Ok(ApiRequest::get(build_workflow_list_path(
             *limit,
             state,
@@ -4286,6 +4294,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             owner.as_deref(),
             *no_progress_minutes,
             *include_sleeping,
+            start_source.as_deref(),
         )?)),
         WorkflowCommand::Summaries {
             workflow_name,
@@ -5831,6 +5840,7 @@ fn build_workflow_list_path(
     owner: Option<&str>,
     no_progress_minutes: Option<i64>,
     include_sleeping: bool,
+    start_source: Option<&str>,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(value) = limit {
@@ -5864,6 +5874,12 @@ fn build_workflow_list_path(
     }
     if include_sleeping {
         params.push(("include_sleeping", "true".to_string()));
+    }
+    // Issue #740: bounded provenance filter. The server owns validation (a value
+    // outside the known `StartSource` set / "unknown" returns a 400), so the CLI
+    // is a thin passthrough — matching how `--state` forwards verbatim.
+    if let Some(source) = start_source {
+        params.push(("start_source", source.to_string()));
     }
 
     if params.is_empty() {
