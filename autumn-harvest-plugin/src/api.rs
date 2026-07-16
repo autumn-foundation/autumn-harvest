@@ -16736,6 +16736,72 @@ pub(crate) async fn signal_workflow(
         }
     };
 
+    // Issues #521 / #610: committed keyed-replay short-circuit. A keyed retry
+    // whose `(exec_id, idempotency_key)` row already landed must return the
+    // documented dedup no-op (202, `signal_delivered: false`) *before* the #610
+    // schema gate or the #252 payload cap runs below -- those may have been
+    // published or tightened since the original delivery, and rejecting an
+    // already-accepted signal with a 400 would regress #521's exactly-once
+    // contract (including the "retry after the run went terminal" case). A known
+    // duplicate needs neither the runtime nor validation, so this also works
+    // during the startup window before `install(runtime)`. The authoritative
+    // dedup stays in `send_signal_idempotent`'s insert-time `ON CONFLICT`; this
+    // read-only probe is a fast path for already-committed rows, so a concurrent
+    // first-delivery race (neither request sees a row yet) still falls through
+    // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
+    // so fresh + unkeyed deliveries are still fully validated before enqueue.
+    if let Some(key) = idempotency_key.as_deref() {
+        match signal::signal_idempotency_key_exists(&mut conn, exec_id, key).await {
+            Ok(true) => {
+                // Same success audit + response the normal on-conflict path
+                // writes when `send_signal_idempotent` returns `Ok(false)`.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: None,
+                    source: &source,
+                };
+                if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                    return map_error(e).into_response();
+                }
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(SignalAck {
+                        ok: true,
+                        signal_delivered: false,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return map_error(e).into_response();
+            }
+        }
+    }
+
     // Fail closed if the runtime isn't installed yet, rather than silently
     // skipping the schema/cap checks below. `install_storage_pool` runs before
     // `install(runtime)` during plugin startup (with a genuine `.await` -- the

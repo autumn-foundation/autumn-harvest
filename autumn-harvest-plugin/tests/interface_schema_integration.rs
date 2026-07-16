@@ -673,6 +673,153 @@ async fn signal_route_accepts_valid_payload() {
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
 }
 
+/// Seed a raw `harvest_signals` row directly, simulating a signal that landed
+/// *before* the `approve` handler's `arg_schema` was published or tightened.
+/// The payload is inserted verbatim (no schema gate), so it may be
+/// schema-invalid by the current rules.
+async fn seed_signal_row(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    payload: Value,
+    idempotency_key: &str,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    diesel::sql_query(
+        "INSERT INTO harvest_signals \
+         (workflow_exec_id, signal_name, payload, idempotency_key) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(signal_name)
+    .bind::<diesel::sql_types::Jsonb, _>(payload)
+    .bind::<diesel::sql_types::Text, _>(idempotency_key)
+    .execute(&mut conn)
+    .await
+    .expect("seed signal row");
+}
+
+/// Count `harvest_signals` rows for a given `(exec_id, idempotency_key)`.
+async fn count_signal_rows(pool: &DbPool, exec_id: ExecutionId, idempotency_key: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = pool.get().await.expect("pooled conn");
+    let row: Cnt = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_signals \
+         WHERE workflow_exec_id = $1 AND idempotency_key = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(idempotency_key)
+    .get_result(&mut conn)
+    .await
+    .expect("count signal rows");
+    row.n
+}
+
+/// Regression for the Codex P2 (issue #610): the #610 schema gate (and the
+/// #252 cap) must NOT reject a *committed keyed replay* of a signal that was
+/// accepted before the schema was published/tightened. A same-key retry
+/// carrying a now-schema-invalid payload must return `202 signal_delivered:
+/// false` and enqueue no second row — preserving #521's exactly-once contract.
+/// A *fresh* keyed malformed delivery is still validated (400), and a fresh
+/// valid keyed delivery still succeeds (`signal_delivered: true`).
+#[tokio::test]
+async fn signal_route_committed_keyed_replay_short_circuits_before_schema_gate() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_running_execution(&pool, "iface_wf").await;
+
+    // A signal accepted *before* the `approve` schema existed: seed it directly
+    // with a payload that is invalid under the now-published schema (`reason`
+    // is required + must be a string).
+    let committed_key = "k-committed";
+    seed_signal_row(
+        &pool,
+        exec_id,
+        "approve",
+        json!({ "reason": 123 }),
+        committed_key,
+    )
+    .await;
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "precondition: exactly one committed row"
+    );
+
+    // Same-key retry with a now-schema-invalid payload → dedup no-op, NOT 400.
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/signal/approve?idempotency_key={committed_key}"),
+        json!({}), // invalid under `approve` schema (missing `reason`)
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "committed keyed replay must dedup to 202, not be rejected by the schema gate: {body}"
+    );
+    assert_eq!(
+        body["signal_delivered"],
+        json!(false),
+        "committed keyed replay must report signal_delivered: false: {body}"
+    );
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "committed keyed replay must NOT enqueue a second row"
+    );
+
+    // A *fresh* keyed malformed delivery (key never seen) is still validated
+    // at the edge → 400, and enqueues nothing.
+    let fresh_bad_key = "k-fresh-bad";
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/signal/approve?idempotency_key={fresh_bad_key}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "fresh keyed malformed signal must still be validated before enqueue: {body}"
+    );
+    assert_field_violation(&body, "signal payload validation failed", "/reason");
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, fresh_bad_key).await,
+        0,
+        "a rejected fresh keyed signal must enqueue nothing"
+    );
+
+    // A *fresh* valid keyed delivery still succeeds and enqueues a row.
+    let fresh_good_key = "k-fresh-good";
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/signal/approve?idempotency_key={fresh_good_key}"),
+        json!({ "reason": "looks good" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "fresh valid keyed signal: {body}"
+    );
+    assert_eq!(
+        body["signal_delivered"],
+        json!(true),
+        "fresh valid keyed signal must report signal_delivered: true: {body}"
+    );
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, fresh_good_key).await,
+        1,
+        "fresh valid keyed signal must enqueue exactly one row"
+    );
+}
+
 #[tokio::test]
 async fn signal_with_start_rejects_malformed_payload_with_400() {
     let (url, _guard) = setup_database().await;

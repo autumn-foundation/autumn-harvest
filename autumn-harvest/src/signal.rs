@@ -152,6 +152,52 @@ pub async fn send_signal_idempotent(
     .await
 }
 
+/// Read-only probe: does a queued signal row already exist for
+/// `(workflow_exec_id, idempotency_key)`?
+///
+/// Used by the standalone signal route's committed-replay dedup short-circuit
+/// (issues #521 / #610): a keyed retry whose row already landed must return the
+/// documented `signal_delivered: false` no-op *before* any payload-schema
+/// (#610) or payload-cap (#252) validation that may have been published or
+/// tightened since the original delivery — otherwise a retry of an
+/// already-accepted signal could be rejected `400` instead of the documented
+/// `202`, regressing the exactly-once contract (including the "retry after the
+/// run went terminal" case). Side-effect free (no insert, no wake).
+///
+/// The authoritative dedup remains [`send_signal_idempotent`]'s insert-time
+/// `ON CONFLICT`; this is only a fast path for already-committed rows, so a
+/// concurrent first-delivery race (neither request sees a row yet) still falls
+/// through to validation + the `ON CONFLICT` insert. An empty key is excluded
+/// from the partial unique index (never dedupes), so it reports `false` and the
+/// caller falls through to the normal path — mirroring
+/// [`send_signal_idempotent`]'s empty-key normalization.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the query fails.
+#[cfg(feature = "db")]
+pub async fn signal_idempotency_key_exists(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    idempotency_key: &str,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_signals::dsl;
+
+    if idempotency_key.is_empty() {
+        return Ok(false);
+    }
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_signals
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::idempotency_key.eq(idempotency_key)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 /// Load all unconsumed queued signals for an execution, ordered by receive time.
 ///
 /// # Errors
