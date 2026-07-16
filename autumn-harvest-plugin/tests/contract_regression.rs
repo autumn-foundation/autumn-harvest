@@ -866,3 +866,122 @@ fn contract_routes_have_params_array() {
         );
     }
 }
+
+// ── Read-only operator role (issue #776) ──────────────────────────────────────
+
+/// AC4 coverage sweep: EVERY route registered in `management_api_routes()` (the
+/// authoritative mounted-route inventory) must resolve to a `RouteClass` entry
+/// in `autumn_harvest::audit::CLASSIFIED_ROUTES`. The read-only enforcement
+/// layer keys on that table; a mounted route with no class entry would be
+/// treated as a mutation (fail closed) — this test makes that classification
+/// gap a hard failure so the read-only tier's grant surface stays complete.
+///
+/// `audit.rs`'s own exhaustiveness guards only cross-check `CLASSIFIED_ROUTES`
+/// against `ALL_MUTATION_ROUTES`, never against the live router — which is
+/// exactly how routes drifted unclassified before #776.
+#[test]
+fn every_management_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+    use std::collections::HashSet;
+
+    let classified: HashSet<&str> = CLASSIFIED_ROUTES.iter().map(|(r, _)| *r).collect();
+    let mut unclassified: Vec<String> = Vec::new();
+    for (method, path) in management_api_routes() {
+        let key = format!("{method} {path}");
+        if !classified.contains(key.as_str()) {
+            unclassified.push(key);
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "management_api_routes() entries with no CLASSIFIED_ROUTES entry \
+         (read-only enforcement source of truth, issue #776 AC4):\n{unclassified:#?}"
+    );
+}
+
+/// Pin the specific mutation routes this diff classifies as `RouteClass::Mutating`
+/// (privilege-escalation guard, issue #776). A wrong `Mutating`→`ReadOnly` entry
+/// here would let a read-only principal force-open a circuit / create a calendar
+/// / retry a DAG / start-via-update. Mirrors the `business_id_routes_are_classified`
+/// per-route pinning style: the general guards only cross-check the two lists.
+#[test]
+fn readonly_role_new_mutations_are_classified_mutating() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    for route in [
+        "POST /workflows/{workflow_name}/update-with-start",
+        "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+        "POST /admin/circuits/{activity_name}/force-open",
+        "POST /admin/circuits/{activity_name}/force-close",
+        "POST /admin/completion-triggers",
+        "POST /calendars",
+        "PUT /calendars/{name}",
+        "DELETE /calendars/{name}",
+    ] {
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+            "{route} must be classified RouteClass::Mutating (issue #776) — a \
+             read-only principal must never reach it"
+        );
+    }
+}
+
+/// Pin the read routes newly classified for the read-only tier. Each must be
+/// `RouteClass::ReadOnly` so a read-only principal reaches it (AC1), and the
+/// three router-only routes (`/handlers`, the two by-id missing-id stubs) must
+/// be registered in `management_api_routes()` and the contract so the sweep
+/// above and `management_routes_match_contract` cover them.
+#[test]
+fn readonly_role_new_reads_are_classified_read_only() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    for route in [
+        "GET /batches/pending",
+        "GET /workflows/registered",
+        "GET /workflows/registered/{name}/schema",
+        "GET /workflows/types/{workflow_name}/handlers",
+        "GET /workflows/by-id/{workflow_name}",
+        "POST /workflows/by-id/{workflow_name}",
+        "GET /dead-letters/aggregate",
+        "GET /admin/circuits",
+        "GET /admin/circuits/{activity_name}",
+        "GET /admin/queues/scaling",
+        "GET /admin/metrics",
+        "GET /admin/completion-triggers",
+        "GET /admin/schedules/{id}",
+        "GET /admin/schedules/{id}/runs",
+        "GET /admin/schedules/decisions",
+        "GET /admin/schedules/{id}/decisions",
+        "GET /admin/schedules/{id}/preview",
+        "POST /admin/schedules/preview",
+        "GET /calendars",
+        "GET /calendars/{name}",
+        "GET /workers/{worker_id}/pinned",
+        "GET /admin/queues/{queue_name}/eligibility",
+        "GET /admin/tasks/{id}/eligibility",
+    ] {
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly (issue #776 AC1)"
+        );
+    }
+
+    // The three router-only routes must be registered so the AC4 sweep and the
+    // management_routes_match_contract test cover them.
+    for (method, path) in [
+        ("GET", "/workflows/types/{workflow_name}/handlers"),
+        ("GET", "/workflows/by-id/{workflow_name}"),
+        ("POST", "/workflows/by-id/{workflow_name}"),
+    ] {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| *m == method && *p == path),
+            "{method} {path} must be registered in management_api_routes() (issue #776)"
+        );
+    }
+}

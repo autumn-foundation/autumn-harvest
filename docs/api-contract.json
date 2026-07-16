@@ -6317,6 +6317,88 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/types/{workflow_name}/handlers",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Enumerate the query and update handlers registered for a workflow type (read-only). Returns a WorkflowTypeHandlers object listing each handler's name and type hints. Classified read-only (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Missing-workflow_id guard for the business-id route family: always returns 400 (the business-id form requires /workflows/by-id/{workflow_name}/{workflow_id}). No read, no write; classified read-only (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id is required."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id is required."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "idempotency": "Safe",
+      "description": "Missing-workflow_id guard for the business-id route family (POST variant): always returns 400. Shares the GET handler; never reads or writes state. Classified read-only despite the POST verb (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id is required."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id is required."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/workflows/by-id/{workflow_name}/{workflow_id}",
       "category": "workflow",
       "read_only": true,

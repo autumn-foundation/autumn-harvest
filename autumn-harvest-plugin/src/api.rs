@@ -1,7 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,22 +33,22 @@ use serde_json::Value;
 use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
-    self, AuditFilters, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID, HEADER_SOURCE,
-    OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE,
-    OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET,
-    OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
-    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
-    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW,
-    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
-    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
-    TARGET_WORKER, TARGET_WORKFLOW,
+    self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
+    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR,
+    OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN,
+    OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY,
+    OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE,
+    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
+    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -413,6 +413,11 @@ pub struct HarvestApiState {
     /// Default **off**: responses are byte-for-byte identical to a build
     /// without the feature.
     decode_payloads_on_read: Arc<Mutex<bool>>,
+    /// Whether the read-only operator role (issue #776) is enabled. Set true
+    /// by [`crate::HarvestPlugin::api_with_role_auth`]; the class-aware
+    /// enforcement layer is installed only when this is true. Default **off**:
+    /// the router and its layers are byte-for-byte identical to today.
+    role_auth_enabled: Arc<Mutex<bool>>,
     /// Retention window for request-scoped start idempotency keys (issue #808),
     /// mirrored from `BuiltHarvest::start_idempotency_window` at startup so the
     /// HTTP start route dedups a repeated `idempotency_key` within this window.
@@ -464,6 +469,7 @@ impl Default for HarvestApiState {
                 autumn_harvest::payload_codec::PayloadCodecs::default(),
             )),
             decode_payloads_on_read: Arc::new(Mutex::new(false)),
+            role_auth_enabled: Arc::new(Mutex::new(false)),
             start_idempotency_window: Arc::new(Mutex::new(
                 autumn_harvest::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
             )),
@@ -651,6 +657,36 @@ impl HarvestApiState {
             .decode_payloads_on_read
             .lock()
             .expect("harvest api state lock poisoned") = enabled;
+    }
+
+    /// Enable or disable the read-only operator role (issue #776).
+    ///
+    /// Default **off**: with the flag off, the class-aware enforcement layer is
+    /// never installed and the router behaves byte-for-byte as today. Mirrored
+    /// from the plugin builder at startup by
+    /// [`crate::HarvestPlugin::api_with_role_auth`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_role_auth_enabled(&self, enabled: bool) {
+        *self
+            .role_auth_enabled
+            .lock()
+            .expect("harvest api state lock poisoned") = enabled;
+    }
+
+    /// Whether the read-only operator role (issue #776) is enabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn role_auth_enabled(&self) -> bool {
+        *self
+            .role_auth_enabled
+            .lock()
+            .expect("harvest api state lock poisoned")
     }
 
     /// Override the thresholds for the rolled-up `GET /admin/status` verdict
@@ -4445,6 +4481,234 @@ pub(crate) async fn has_harvest_admin_access(
     }
 }
 
+// ── Read-only operator role (issue #776) ──────────────────────────────────────
+//
+// A least-privilege tier: a principal the embedder explicitly marks read-only
+// may reach every `RouteClass::ReadOnly` / `PublicSafe` route but is denied
+// (403) every `RouteClass::Mutating` route. Enforcement is a single, opt-in,
+// class-aware tower layer ([`enforce_read_only_class`]) installed only under
+// [`crate::HarvestPlugin::api_with_role_auth`]. It is driven entirely by
+// [`autumn_harvest::audit::CLASSIFIED_ROUTES`] — the single source of truth —
+// and fails closed: any path with no class entry resolves to `Mutating`.
+//
+// # This layer is the sole write boundary for read-only principals
+//
+// Correctness depends on two things:
+//   1. `CLASSIFIED_ROUTES` completeness — but fail-closed backstops any gap
+//      (an unclassified route denies read-only principals, never exposes them).
+//   2. The per-method matcher's static-beats-param precedence — provided by
+//      `matchit` (the crate axum uses), NOT a hand-rolled scan. Getting this
+//      wrong (e.g. `/workflows/batch_start` matching `/workflows/{id}`) would
+//      be a privilege-escalation bug.
+//
+// `MatchedPath` is deliberately NOT used: it is unreliable when read from a
+// layer on a nested router (axum #1441), which is exactly the position this
+// layer occupies. Instead the layer keys on `request.method()` +
+// `request.uri().path()`, which axum has already stripped of the `/api/harvest`
+// mount prefix by the time the request reaches this nested router — so the path
+// is concrete and mount-relative, exactly the form `CLASSIFIED_ROUTES` uses.
+
+/// Session-claim marker keys that mark a principal as an **admin**. Any of
+/// these present (role value or truthy flag) means the principal is NOT
+/// read-only-restricted (admin ⊇ read-only for reads, and full access for
+/// mutations). Mirrors [`has_harvest_admin_access`]'s non-dev branch.
+const ADMIN_ROLE_VALUES: &[&str] = &["admin", "harvest_admin"];
+const ADMIN_FLAG_KEYS: &[&str] = &["is_harvest_admin", "is_admin"];
+/// Session `role` values that mark a principal as read-only.
+const READONLY_ROLE_VALUES: &[&str] = &[
+    "harvest_readonly",
+    "harvest_operator",
+    "operator",
+    "readonly",
+    "read_only",
+];
+/// Session flag keys whose truthy value marks a principal as read-only.
+const READONLY_FLAG_KEYS: &[&str] = &["is_harvest_readonly", "is_harvest_operator"];
+
+fn is_truthy(v: &str) -> bool {
+    v == "true" || v == "1"
+}
+
+/// Whether the request's autumn-web `Session` carries an explicit read-only
+/// marker AND does not carry an explicit admin marker (issue #776).
+///
+/// Contract for embedders: a principal is subject to the read-only restriction
+/// **only** when the embedder's auth middleware explicitly marks the Session
+/// read-only. Semantics:
+///
+/// - **No session** → `false` (full access — a principal the auth boundary let
+///   through with no markers keeps today's boundary semantics; the read-only
+///   restriction is opt-in per-principal).
+/// - **Explicit admin marker present** (`role` ∈ {`admin`,`harvest_admin`} or
+///   `is_harvest_admin`/`is_admin` truthy) → `false`. Admin wins: an admin is
+///   never verb-restricted, even if also tagged read-only.
+/// - **Explicit read-only marker present** (`role` ∈ {`harvest_readonly`,
+///   `harvest_operator`, `operator`, `readonly`, `read_only`} or
+///   `is_harvest_readonly`/`is_harvest_operator` truthy) → `true`.
+/// - **Otherwise** → `false` (full access — preserves existing boundary
+///   semantics for an unmarked principal).
+pub(crate) async fn has_harvest_readonly_access(session: Option<Session>) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    // Admin marker present ⇒ never read-only-restricted (admin wins).
+    if let Some(role) = session.get("role").await
+        && ADMIN_ROLE_VALUES.contains(&role.as_str())
+    {
+        return false;
+    }
+    for key in ADMIN_FLAG_KEYS {
+        if session.get(key).await.is_some_and(|v| is_truthy(&v)) {
+            return false;
+        }
+    }
+    // Read-only marker?
+    if let Some(role) = session.get("role").await
+        && READONLY_ROLE_VALUES.contains(&role.as_str())
+    {
+        return true;
+    }
+    for key in READONLY_FLAG_KEYS {
+        if session.get(key).await.is_some_and(|v| is_truthy(&v)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rewrite a `CLASSIFIED_ROUTES` template's path parameters to positional,
+/// distinct placeholders (`{p0}`, `{p1}`, …) so a single `matchit::Router`
+/// accepts the full set without a param-name conflict.
+///
+/// `matchit` requires the same param NAME at a shared tree position across
+/// routes (e.g. `POST /workflows/{workflow_name}/start` and
+/// `POST /workflows/{id}/cancel` both have a param at segment 2) and distinct
+/// names WITHIN one route (e.g. `.../by-id/{workflow_name}/{workflow_id}/...`).
+/// Renaming positionally satisfies both. Param names are irrelevant to class
+/// lookup — only structure + static segments (which decide static-beats-param
+/// precedence) matter.
+fn normalize_route_template(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut idx = 0u32;
+    for seg in path.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        out.push('/');
+        if seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("{p");
+            out.push_str(&idx.to_string());
+            out.push('}');
+            idx += 1;
+        } else {
+            out.push_str(seg);
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Per-method radix-tree matchers over `CLASSIFIED_ROUTES`, built once.
+///
+/// Keyed per HTTP method because the same path can carry a different class per
+/// method (e.g. `GET /admin/schedules/{id}` is `ReadOnly`, `DELETE` is
+/// `Mutating`).
+fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Router<RouteClass>> {
+    static MATCHERS: std::sync::OnceLock<HashMap<axum::http::Method, matchit::Router<RouteClass>>> =
+        std::sync::OnceLock::new();
+    MATCHERS.get_or_init(|| {
+        let mut by_method: HashMap<axum::http::Method, matchit::Router<RouteClass>> =
+            HashMap::new();
+        for (template, class) in CLASSIFIED_ROUTES {
+            let Some((method, path)) = template.split_once(' ') else {
+                debug_assert!(false, "malformed CLASSIFIED_ROUTES template: {template}");
+                continue;
+            };
+            let Ok(method) = method.parse::<axum::http::Method>() else {
+                debug_assert!(false, "unknown method in CLASSIFIED_ROUTES: {template}");
+                continue;
+            };
+            let normalized = normalize_route_template(path);
+            let router = by_method.entry(method).or_default();
+            router
+                .insert(normalized, *class)
+                .unwrap_or_else(|e| panic!("failed to register '{template}' in matcher: {e}"));
+        }
+        by_method
+    })
+}
+
+/// Resolve the `RouteClass` of a concrete (nest-stripped) request path for the
+/// given method. **Fail closed:** an unknown method OR an unmatched path
+/// resolves to [`RouteClass::Mutating`], so a read-only principal is denied a
+/// route no one classified.
+pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
+    let Some(router) = route_class_matchers().get(method) else {
+        return RouteClass::Mutating;
+    };
+    match router.at(path) {
+        Ok(m) => *m.value,
+        Err(_) => RouteClass::Mutating,
+    }
+}
+
+/// A `403 Forbidden` for a read-only principal that attempted a mutation
+/// (issue #776, AC2 — distinct from the anonymous `401` the admin gate emits).
+///
+/// Built directly rather than via an `AutumnError` constructor so it does not
+/// depend on an autumn-web `forbidden` helper.
+fn read_only_forbidden_response() -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "read-only principal: mutation not permitted"
+        })),
+    )
+        .into_response()
+}
+
+/// The opt-in, class-aware enforcement layer (issue #776).
+///
+/// Installed on `harvest_api_router` **only** under
+/// [`crate::HarvestPlugin::api_with_role_auth`]; the default and `api_with_auth`
+/// paths never see it, so their behavior is byte-for-byte unchanged (AC6).
+///
+/// Request order under the role-auth mount: embedder auth middleware (sets the
+/// `Session` extension) → **this layer** (reads Session + method + path) →
+/// per-route `require_admin` (a no-op under the auth boundary) → handler. This
+/// layer therefore stops a read-only principal at the route boundary, before
+/// any handler's in-handler admin write-gate runs — which is why enabling the
+/// admin auth boundary (so read-only principals reach admin-gated `ReadOnly`
+/// routes and the SSE stream, AC1) is safe: the only extra capability the
+/// boundary grants a read-only principal is READS, and every state-writing
+/// handler sits on a `Mutating` (or unclassified→fail-closed→`Mutating`) route
+/// this layer already denies.
+pub async fn enforce_read_only_class(
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let session = request.extensions().get::<Session>().cloned();
+    if has_harvest_readonly_access(session).await {
+        let class = classify_route(request.method(), request.uri().path());
+        if deny_readonly_mutation(true, class) {
+            // AC7 observability: a denied attempt is always logged so operators
+            // can detect a misconfigured or probing client. A best-effort DB
+            // audit row is deliberately NOT written here — this layer runs
+            // before a pooled connection is acquired, and forcing a write on
+            // every probe would be a DoS vector.
+            tracing::warn!(
+                method = %request.method(),
+                path = %request.uri().path(),
+                "harvest: read-only principal denied mutation (403)"
+            );
+            return read_only_forbidden_response();
+        }
+    }
+    next.run(request).await
+}
+
 // ── Read-path payload decoding (issue #608) ───────────────────────────────────
 
 /// The pure decode-eligibility predicate (issue #608, AC1 + AC6): the
@@ -4682,7 +4946,14 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/query/{query_name}"),
         ("POST", "/workflows/{id}/update/{update_name}"),
         ("GET", "/workflows/{id}/update/{update_id}/result"),
+        // Workflow-type handler enumeration (read). Router-only until it was
+        // added here for the read-only-role classification sweep (issue #776).
+        ("GET", "/workflows/types/{workflow_name}/handlers"),
         // ── business-id ("latest run") variants (issue #805) ──────────────────
+        // Missing-workflow_id guard: always 400 (GET+POST share one handler).
+        // Router-only until listed here for the #776 classification sweep.
+        ("GET", "/workflows/by-id/{workflow_name}"),
+        ("POST", "/workflows/by-id/{workflow_name}"),
         ("GET", "/workflows/by-id/{workflow_name}/{workflow_id}"),
         (
             "GET",
@@ -33969,6 +34240,205 @@ mod tests {
         assert!(state.decode_payloads_on_read());
         state.set_decode_payloads_on_read(false);
         assert!(!state.decode_payloads_on_read());
+    }
+
+    // ── Read-only operator role (issue #776) ─────────────────────────────────
+
+    fn session_with(pairs: &[(&str, &str)]) -> Session {
+        let mut data = std::collections::HashMap::new();
+        for (k, v) in pairs {
+            data.insert((*k).to_string(), (*v).to_string());
+        }
+        Session::new_for_test("harvest-test-session".to_string(), data)
+    }
+
+    #[tokio::test]
+    async fn readonly_access_recognizes_readonly_markers_and_rejects_admin() {
+        // No session ⇒ full access (not readonly-restricted).
+        assert!(!has_harvest_readonly_access(None).await);
+
+        // Every read-only role value + flag marker ⇒ readonly.
+        for role in [
+            "harvest_readonly",
+            "harvest_operator",
+            "operator",
+            "readonly",
+            "read_only",
+        ] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[("role", role)]))).await,
+                "role={role} must be recognized as read-only"
+            );
+        }
+        for flag in ["is_harvest_readonly", "is_harvest_operator"] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[(flag, "true")]))).await,
+                "flag {flag}=true must be recognized as read-only"
+            );
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[(flag, "1")]))).await,
+                "flag {flag}=1 must be recognized as read-only"
+            );
+        }
+
+        // Admin marker present ⇒ NOT readonly-restricted (admin wins),
+        // even if a read-only marker is also present.
+        for admin in [("role", "admin"), ("role", "harvest_admin")] {
+            assert!(!has_harvest_readonly_access(Some(session_with(&[admin]))).await);
+        }
+        for flag in ["is_harvest_admin", "is_admin"] {
+            assert!(!has_harvest_readonly_access(Some(session_with(&[(flag, "true")]))).await);
+        }
+        assert!(
+            !has_harvest_readonly_access(Some(session_with(&[
+                ("role", "harvest_readonly"),
+                ("is_harvest_admin", "true"),
+            ])))
+            .await,
+            "admin marker must win over a concurrent read-only marker"
+        );
+
+        // No relevant marker ⇒ full access (not readonly-restricted).
+        assert!(!has_harvest_readonly_access(Some(session_with(&[("user_id", "u1")]))).await);
+    }
+
+    #[test]
+    fn classify_route_matches_class_and_precedence() {
+        use axum::http::Method;
+
+        // Static-beats-param precedence: /workflows/count is ReadOnly and must
+        // NOT be captured by the /workflows/{id} ReadOnly matcher (both read,
+        // but the precedence is the load-bearing property that a mutation like
+        // /workflows/batch_start is never mistaken for /workflows/{id}).
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/batch_start"),
+            RouteClass::Mutating,
+            "static POST /workflows/batch_start must not match a param route"
+        );
+        // Per-method divergence on the same path.
+        assert_eq!(
+            classify_route(&Method::GET, "/admin/schedules/abc-123"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::DELETE, "/admin/schedules/abc-123"),
+            RouteClass::Mutating
+        );
+        assert_eq!(
+            classify_route(&Method::PATCH, "/admin/schedules/abc-123"),
+            RouteClass::Mutating
+        );
+        // Concrete param path resolves to the templated route's class.
+        assert_eq!(
+            classify_route(&Method::GET, "/workflows/exec-uuid"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/exec-uuid/cancel"),
+            RouteClass::Mutating
+        );
+        // ReadOnly POST-for-body routes: keyed on class, never the verb.
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/exec-uuid/query/progress"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/admin/build-routing/retire"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/admin/schedules/preview"),
+            RouteClass::ReadOnly
+        );
+        // PublicSafe.
+        assert_eq!(
+            classify_route(&Method::GET, "/health"),
+            RouteClass::PublicSafe
+        );
+        // Newly-classified #776 mutations.
+        assert_eq!(
+            classify_route(&Method::POST, "/admin/circuits/act/force-open"),
+            RouteClass::Mutating
+        );
+        assert_eq!(
+            classify_route(&Method::DELETE, "/calendars/business"),
+            RouteClass::Mutating
+        );
+        // by-id 4-segment mutation vs 2-segment stub (ReadOnly).
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/by-id/wf/wid/cancel"),
+            RouteClass::Mutating
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/by-id/wf"),
+            RouteClass::ReadOnly
+        );
+    }
+
+    #[test]
+    fn classify_route_fails_closed_on_unknown() {
+        use axum::http::Method;
+        // Unmatched path ⇒ Mutating (fail closed).
+        assert_eq!(
+            classify_route(&Method::GET, "/totally/unknown/route"),
+            RouteClass::Mutating
+        );
+        // Unknown method for an existing path ⇒ Mutating (fail closed).
+        assert_eq!(
+            classify_route(&Method::PUT, "/workflows/exec-uuid"),
+            RouteClass::Mutating
+        );
+        // The /ui sub-router is unclassified ⇒ Mutating (fail closed).
+        assert_eq!(
+            classify_route(&Method::GET, "/ui/workflows"),
+            RouteClass::Mutating
+        );
+    }
+
+    #[test]
+    fn route_class_matchers_build_without_conflict() {
+        // Building the matchers panics on any matchit insert conflict; simply
+        // resolving them proves the whole CLASSIFIED_ROUTES set registers
+        // (positional param normalization avoids name-conflict panics) and
+        // parses cleanly (every template splits into a known method).
+        let matchers = route_class_matchers();
+        assert!(!matchers.is_empty());
+        assert!(matchers.contains_key(&axum::http::Method::GET));
+        assert!(matchers.contains_key(&axum::http::Method::POST));
+        assert!(matchers.contains_key(&axum::http::Method::DELETE));
+    }
+
+    #[test]
+    fn normalize_route_template_rewrites_params_positionally() {
+        assert_eq!(normalize_route_template("/health"), "/health");
+        assert_eq!(
+            normalize_route_template("/workflows/{id}"),
+            "/workflows/{p0}"
+        );
+        assert_eq!(
+            normalize_route_template("/workflows/{workflow_name}/start"),
+            "/workflows/{p0}/start"
+        );
+        // Distinct positional names within one route (matchit forbids dup names).
+        assert_eq!(
+            normalize_route_template(
+                "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}"
+            ),
+            "/workflows/by-id/{p0}/{p1}/query/{p2}"
+        );
+    }
+
+    #[test]
+    fn api_state_role_auth_defaults_off() {
+        let state = HarvestApiState::new();
+        assert!(
+            !state.role_auth_enabled(),
+            "role_auth_enabled must default to false (issue #776 AC6)"
+        );
+        state.set_role_auth_enabled(true);
+        assert!(state.role_auth_enabled());
+        state.set_role_auth_enabled(false);
+        assert!(!state.role_auth_enabled());
     }
 
     #[test]

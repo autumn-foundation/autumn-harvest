@@ -849,3 +849,263 @@ async fn eris_require_auth_blocks_trigger_schedule() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ── Read-only operator role (issue #776) ──────────────────────────────────────
+//
+// Headline success-metric test (AC1/AC2, no DB): a synthetic router mounts a
+// trivial 200-OK handler at EVERY autumn_harvest::audit::CLASSIFIED_ROUTES
+// (method, path), wraps it in the read-only class-enforcement layer, and drives
+// it with a read-only Session. Every Mutating route → 403; every
+// ReadOnly/PublicSafe route → 200 (reaches the trivial handler). The success
+// metric — "0 of N mutation routes reachable, N of N read routes reachable" —
+// is asserted explicitly. Using URI-path matching (not MatchedPath) makes a
+// top-level synthetic router faithful to nested production.
+
+use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+use autumn_harvest_plugin::api::enforce_read_only_class;
+use autumn_web::reexports::axum::Router;
+use autumn_web::reexports::axum::middleware::from_fn;
+use autumn_web::reexports::axum::routing::{MethodFilter, MethodRouter};
+
+fn method_filter(m: &Method) -> MethodFilter {
+    match *m {
+        Method::GET => MethodFilter::GET,
+        Method::POST => MethodFilter::POST,
+        Method::PUT => MethodFilter::PUT,
+        Method::PATCH => MethodFilter::PATCH,
+        Method::DELETE => MethodFilter::DELETE,
+        _ => panic!("unexpected method in CLASSIFIED_ROUTES: {m}"),
+    }
+}
+
+/// Substitute each `{param}` segment with a non-static placeholder so the
+/// concrete request path uniquely matches its own template (never a sibling
+/// static route).
+fn concrete_request_path(template: &str) -> String {
+    let mut out = String::new();
+    let mut k = 0u32;
+    for seg in template.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        out.push('/');
+        if seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("zzztestparam");
+            out.push_str(&k.to_string());
+            k += 1;
+        } else {
+            out.push_str(seg);
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Build the synthetic router: every `CLASSIFIED_ROUTES` (method, path) → 200,
+/// wrapped in the read-only enforcement layer. Routes sharing a path are merged
+/// into one `MethodRouter` (registering the same (method, path) twice would
+/// panic; `CLASSIFIED_ROUTES` is dup-free).
+fn synthetic_enforced_router() -> Router {
+    let mut by_path: HashMap<&str, MethodRouter> = HashMap::new();
+    for (template, _class) in CLASSIFIED_ROUTES {
+        let (method_str, path) = template.split_once(' ').expect("well-formed template");
+        let method: Method = method_str.parse().expect("known method");
+        let filter = method_filter(&method);
+        let entry = by_path.entry(path).or_default();
+        let mr = std::mem::take(entry);
+        *entry = mr.on(filter, || async { StatusCode::OK });
+    }
+    let mut router: Router = Router::new();
+    for (path, mr) in by_path {
+        router = router.route(path, mr);
+    }
+    router.layer(from_fn(enforce_read_only_class))
+}
+
+fn session_role(role: &str) -> Session {
+    let mut data = HashMap::new();
+    data.insert("role".to_string(), role.to_string());
+    Session::new_for_test("harvest-role-test".to_string(), data)
+}
+
+async fn status_for(
+    app: &Router,
+    method: &Method,
+    concrete_path: &str,
+    session: Option<Session>,
+) -> StatusCode {
+    let mut req = Request::builder()
+        .method(method.clone())
+        .uri(concrete_path)
+        .body(Body::empty())
+        .unwrap();
+    if let Some(session) = session {
+        req.extensions_mut().insert(session);
+    }
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn eris_readonly_principal_reaches_all_reads_and_no_mutations() {
+    let app = synthetic_enforced_router();
+
+    let mut mutations_total = 0usize;
+    let mut mutations_reachable_by_readonly = 0usize;
+    let mut reads_total = 0usize;
+    let mut reads_reachable_by_readonly = 0usize;
+
+    for (template, class) in CLASSIFIED_ROUTES {
+        let (method_str, path) = template.split_once(' ').unwrap();
+        let method: Method = method_str.parse().unwrap();
+        let concrete = concrete_request_path(path);
+
+        // Read-only principal.
+        let ro_status = status_for(
+            &app,
+            &method,
+            &concrete,
+            Some(session_role("harvest_readonly")),
+        )
+        .await;
+
+        match class {
+            RouteClass::Mutating => {
+                mutations_total += 1;
+                assert_eq!(
+                    ro_status,
+                    StatusCode::FORBIDDEN,
+                    "read-only principal must be denied 403 on Mutating route {template}"
+                );
+                if ro_status != StatusCode::FORBIDDEN {
+                    mutations_reachable_by_readonly += 1;
+                }
+            }
+            RouteClass::ReadOnly | RouteClass::PublicSafe => {
+                reads_total += 1;
+                assert_eq!(
+                    ro_status,
+                    StatusCode::OK,
+                    "read-only principal must reach (200) ReadOnly/PublicSafe route {template}"
+                );
+                if ro_status == StatusCode::OK {
+                    reads_reachable_by_readonly += 1;
+                }
+            }
+        }
+
+        // Admin principal: never denied by the class layer, reaches everything.
+        let admin_status = status_for(&app, &method, &concrete, Some(session_role("admin"))).await;
+        assert_eq!(
+            admin_status,
+            StatusCode::OK,
+            "admin principal must reach (200) every route {template}"
+        );
+    }
+
+    // The 100% / 0% split — the issue's explicit success metric.
+    assert_eq!(
+        mutations_reachable_by_readonly, 0,
+        "0 of {mutations_total} mutation routes must be reachable by a read-only principal"
+    );
+    assert_eq!(
+        reads_reachable_by_readonly, reads_total,
+        "all {reads_total} read routes must be reachable by a read-only principal"
+    );
+    assert!(
+        mutations_total > 0 && reads_total > 0,
+        "sanity: both sets non-empty"
+    );
+}
+
+#[tokio::test]
+async fn eris_readonly_post_for_body_read_routes_are_reachable() {
+    // The two ReadOnly routes that use POST (query, retire) and the POST
+    // preview must be reachable (200) by a read-only principal — enforcement is
+    // keyed on the class table, never the HTTP verb.
+    let app = synthetic_enforced_router();
+    for concrete in [
+        "/workflows/zzztestparam0/query/zzztestparam1",
+        "/admin/build-routing/retire",
+        "/admin/schedules/preview",
+        "/workflows/by-id/zzztestparam0",
+    ] {
+        let status = status_for(
+            &app,
+            &Method::POST,
+            concrete,
+            Some(session_role("harvest_readonly")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "read-only principal must reach ReadOnly POST route {concrete}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn eris_unmarked_and_admin_principals_are_not_verb_restricted() {
+    // AC6-adjacent: a principal with no read-only marker (or an admin) is never
+    // denied by the class layer, even on Mutating routes — the read-only
+    // restriction is opt-in per-principal.
+    let app = synthetic_enforced_router();
+    let mutating = "/workflows/zzztestparam0/cancel";
+
+    // No session at all → not read-only-restricted → reaches the handler.
+    let anon = status_for(&app, &Method::POST, mutating, None).await;
+    assert_eq!(
+        anon,
+        StatusCode::OK,
+        "unauthenticated/unmarked reaches handler"
+    );
+
+    // Session with an unrelated marker → not read-only-restricted.
+    let unmarked = status_for(
+        &app,
+        &Method::POST,
+        mutating,
+        Some({
+            let mut d = HashMap::new();
+            d.insert("user_id".to_string(), "u1".to_string());
+            Session::new_for_test("s".to_string(), d)
+        }),
+    )
+    .await;
+    assert_eq!(
+        unmarked,
+        StatusCode::OK,
+        "unmarked principal reaches handler"
+    );
+
+    // Admin marker → not read-only-restricted.
+    let admin = status_for(&app, &Method::POST, mutating, Some(session_role("admin"))).await;
+    assert_eq!(admin, StatusCode::OK, "admin reaches handler");
+}
+
+#[tokio::test]
+async fn eris_readonly_denial_body_is_distinguishable() {
+    // AC7 observability: a denied mutation is a 403 with a distinguishable body
+    // marker (in addition to the mandatory tracing::warn! the layer emits), so
+    // a probing/misconfigured client is diagnosable.
+    let app = synthetic_enforced_router();
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/workflows/zzztestparam0/cancel")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(session_role("harvest_readonly"));
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body.contains("read-only principal: mutation not permitted"),
+        "403 body must carry the distinguishable read-only-denial marker, got: {body}"
+    );
+}
