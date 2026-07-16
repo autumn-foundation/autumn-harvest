@@ -58,6 +58,16 @@ HarvestPlugin::new()
     .api("/api/harvest")
 ```
 
+### Read-only operator tier (least-privilege triage)
+
+For a support/on-call/status-dashboard principal that should **read but not
+mutate**, mount with `api_with_role_auth` instead of `api_with_auth` — a single
+call that adds a class-aware enforcement layer giving `403 Forbidden` on every
+mutating route to any principal your middleware marks read-only, while leaving
+100% of the read surface reachable. See **[the read-only operator role
+guide](./operator-role.md)** for the Session claim contract, the fail-closed
+guarantee, and the `/ui` limitation.
+
 ### Production (host-app authentication)
 
 Mount the API with the host application's authentication middleware. The
