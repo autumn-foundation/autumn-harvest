@@ -926,7 +926,10 @@ async fn dag_retry_confirm_ui(
 /// POST the retry commit: run the fork through `retry_dag_run_inner`
 /// (`dry_run = false`), which writes the `OP_DAG_RETRY` audit row with
 /// `source = ui`. Redirects back to the DAG page with a success flash naming
-/// the new run, or a human-readable failure flash. Admin-gated at the router.
+/// the new run. If the fork committed but the audit row failed to write
+/// (a partial success), redirects to the *new* run with a warning flash rather
+/// than misreporting it as a failure. A genuine failure (400/404/409) redirects
+/// to the source run with a "Retry failed" flash. Admin-gated at the router.
 async fn dag_retry_commit_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -952,17 +955,8 @@ async fn dag_retry_commit_ui(
         Some(SOURCE_UI),
     )
     .await;
-    let (target_run, flash) = match outcome {
-        Ok(plan) => {
-            let new_run = plan.new_run_exec_id.unwrap_or_else(|| run_exec_id.clone());
-            let flash = url_encode(&dag_retry_success_flash(&new_run));
-            (new_run, flash)
-        }
-        Err(failure) => (
-            run_exec_id.clone(),
-            url_encode(&format!("Retry failed: {}", failure.human_message())),
-        ),
-    };
+    let (target_run, flash_text) = dag_retry_commit_redirect(outcome, &run_exec_id);
+    let flash = url_encode(&flash_text);
     let redirect_url = dag_detail_relative_url(&dag_name, &target_run, Some(&flash));
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
@@ -5191,6 +5185,47 @@ fn render_dag_node_panel(
 /// Success-flash text naming the new (forked) run id (issue #957).
 fn dag_retry_success_flash(new_run: &str) -> String {
     format!("Retry started — new run {new_run}")
+}
+
+/// Warning-flash text for the audit-write-after-fork case (issue #957, Codex
+/// review): the fork **committed** (a new run exists) but the `dag.retry` audit
+/// row could not be written. This is a partial success — the operator must be
+/// able to find the run that actually started, so we name it and flag the
+/// missing audit record distinctly from the hard "Retry failed" message used
+/// for real failures (400/404/409).
+fn dag_retry_audit_warning_flash(new_run: &str) -> String {
+    format!("Retry started — new run {new_run} — but the audit record could not be written")
+}
+
+/// Pure decision for the retry-commit redirect: which run to open next and what
+/// flash text to show, given the shared `retry_dag_run_inner` outcome and the
+/// source run id. A successful fork opens the new run with the success flash; an
+/// [`DagRetryFailure::AuditFailed`] is a **partial success** (the fork committed)
+/// so it opens the *new* run with a warning flash rather than hiding it behind a
+/// failure message; every other failure opens the source run with the hard
+/// "Retry failed" message. Returns unencoded flash text — the caller percent-
+/// encodes it once.
+fn dag_retry_commit_redirect(
+    outcome: Result<DagRetryResponse, DagRetryFailure>,
+    source_run: &str,
+) -> (String, String) {
+    match outcome {
+        Ok(plan) => {
+            let new_run = plan
+                .new_run_exec_id
+                .unwrap_or_else(|| source_run.to_string());
+            let flash = dag_retry_success_flash(&new_run);
+            (new_run, flash)
+        }
+        Err(DagRetryFailure::AuditFailed { new_exec_id, .. }) => {
+            let flash = dag_retry_audit_warning_flash(&new_exec_id);
+            (new_exec_id, flash)
+        }
+        Err(failure) => (
+            source_run.to_string(),
+            format!("Retry failed: {}", failure.human_message()),
+        ),
+    }
 }
 
 /// Default, editable retry reason pre-filled into the confirm-page textarea.
@@ -10015,6 +10050,80 @@ mod tests {
         assert!(
             flash.contains("new-run-abc-123"),
             "success flash must name the new run id: {flash}"
+        );
+    }
+
+    // Codex review (issue #957): a successful fork opens the NEW run.
+    #[test]
+    fn dag_retry_commit_redirect_opens_new_run_on_success() {
+        let plan = DagRetryResponse {
+            dry_run: false,
+            dag_name: "graph_linear".to_string(),
+            source_run_exec_id: "source-run".to_string(),
+            reset_to_event_id: 3,
+            nodes_to_re_execute: vec!["step_b".to_string()],
+            nodes_carried_over: vec!["step_a".to_string()],
+            new_run_exec_id: Some("forked-run-xyz".to_string()),
+            events_carried_over: Some(2),
+        };
+        let (target, flash) = dag_retry_commit_redirect(Ok(plan), "source-run");
+        assert_eq!(target, "forked-run-xyz", "success must open the new run");
+        assert!(
+            flash.contains("forked-run-xyz"),
+            "success flash must name the new run: {flash}"
+        );
+        assert!(
+            !flash.contains("Retry failed"),
+            "success must not use the failure message: {flash}"
+        );
+    }
+
+    // Codex review (issue #957): AuditFailed is a PARTIAL SUCCESS — the fork
+    // committed, so redirect to the NEW run with a distinct warning, never the
+    // hard "Retry failed" pointing back at the source (which would hide the run
+    // that actually started).
+    #[test]
+    fn dag_retry_commit_redirect_surfaces_new_run_on_audit_failure() {
+        let failure = DagRetryFailure::AuditFailed {
+            message: "audit insert failed: boom".to_string(),
+            new_exec_id: "forked-run-xyz".to_string(),
+        };
+        let (target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
+        assert_eq!(
+            target, "forked-run-xyz",
+            "audit failure must still open the NEW forked run, not the source"
+        );
+        assert_ne!(
+            target, "source-run",
+            "audit failure must not redirect back to the source run"
+        );
+        assert!(
+            flash.contains("forked-run-xyz"),
+            "warning flash must name the new run so the operator can find it: {flash}"
+        );
+        assert!(
+            !flash.contains("Retry failed"),
+            "audit failure is a partial success and must NOT use the hard failure message: {flash}"
+        );
+        assert!(
+            flash.contains("audit record"),
+            "warning flash must call out the missing audit record: {flash}"
+        );
+    }
+
+    // Codex review (issue #957): a genuine failure (400/404/409) redirects back
+    // to the SOURCE run with the hard "Retry failed" message.
+    #[test]
+    fn dag_retry_commit_redirect_opens_source_run_on_real_failure() {
+        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
+        let (target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
+        assert_eq!(
+            target, "source-run",
+            "a real failure must redirect back to the source run"
+        );
+        assert!(
+            flash.contains("Retry failed"),
+            "a real failure must use the hard failure message: {flash}"
         );
     }
 

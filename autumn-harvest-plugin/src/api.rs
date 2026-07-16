@@ -16285,8 +16285,15 @@ pub(crate) enum DagRetryFailure {
     Resolve(crate::dag_retry::DagRetryResolveError),
     /// The reset primitive rejected the fork (rich `409`/`400`).
     Reset(WorkflowResetError),
-    /// The fork committed but the audit insert failed (`503`).
-    AuditFailed(String),
+    /// The fork **committed** (a new run exists) but the audit insert failed
+    /// (`503`). This is a partial success: `new_exec_id` names the run that
+    /// actually started so operator surfaces (the Vantage UI) can point at it
+    /// instead of misreporting the retry as a hard failure. The HTTP wire
+    /// contract is unchanged — only `message` is surfaced there.
+    AuditFailed {
+        message: String,
+        new_exec_id: String,
+    },
     /// A pass-through `AutumnError` (runtime not started, malformed id, DB conn,
     /// load failure) — already mapped to its HTTP form by the inner fn.
     Other(AutumnError),
@@ -16298,10 +16305,8 @@ impl DagRetryFailure {
     pub(crate) fn human_message(&self) -> String {
         use crate::dag_retry::DagRetryResolveError as R;
         match self {
-            Self::BadRequest(m)
-            | Self::NotFound(m)
-            | Self::StateConflict(m)
-            | Self::AuditFailed(m) => m.clone(),
+            Self::BadRequest(m) | Self::NotFound(m) | Self::StateConflict(m) => m.clone(),
+            Self::AuditFailed { message, .. } => message.clone(),
             Self::Resolve(e) => match e {
                 R::EmptyFromNodes => {
                     "from_nodes must be a non-empty array of declared DAG node names".to_string()
@@ -16354,7 +16359,7 @@ impl DagRetryFailure {
                 .into_response(),
             Self::Resolve(e) => dag_retry_resolve_error_response(e),
             Self::Reset(e) => dag_retry_reset_error_response(e),
-            Self::AuditFailed(message) => {
+            Self::AuditFailed { message, .. } => {
                 AutumnError::service_unavailable_msg(message).into_response()
             }
             Self::Other(e) => e.into_response(),
@@ -16563,9 +16568,10 @@ pub(crate) async fn retry_dag_run_inner(
             };
             if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
                 tracing::error!(error = %audit_err, new_exec_id = %new_exec_id_str, "audit insert failed for dag.retry");
-                return Err(DagRetryFailure::AuditFailed(format!(
-                    "audit insert failed: {audit_err}"
-                )));
+                return Err(DagRetryFailure::AuditFailed {
+                    message: format!("audit insert failed: {audit_err}"),
+                    new_exec_id: new_exec_id_str,
+                });
             }
             Ok(DagRetryResponse {
                 dry_run: false,
@@ -31021,7 +31027,10 @@ mod tests {
                 declared: vec!["step_a".to_string()],
             }),
             DagRetryFailure::Reset(WorkflowResetError::ContinueAsNew),
-            DagRetryFailure::AuditFailed("audit insert failed: boom".to_string()),
+            DagRetryFailure::AuditFailed {
+                message: "audit insert failed: boom".to_string(),
+                new_exec_id: "new-run-abc".to_string(),
+            },
             DagRetryFailure::Other(AutumnError::bad_request_msg("malformed execution id")),
         ];
         for variant in &variants {
