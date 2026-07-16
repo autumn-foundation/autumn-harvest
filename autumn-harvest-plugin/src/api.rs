@@ -5749,8 +5749,8 @@ async fn get_registered_workflow_interface(
     Extension(api_state): Extension<HarvestApiState>,
     Path(name): Path<String>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     use autumn_harvest::InterfaceHandlerRecord;
+    use axum::response::IntoResponse as _;
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
@@ -13969,7 +13969,8 @@ pub(crate) async fn signal_workflow(
         {
             return schema_validation_response("signal payload validation failed", violations);
         }
-        if let Err(e) = check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)
+        if let Err(e) =
+            check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)
         {
             return e.into_response();
         }

@@ -31,9 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::info::{
-    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
-};
+use autumn_harvest::info::{QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
@@ -369,7 +367,9 @@ static DB_SEQ: AtomicU64 = AtomicU64::new(0);
 /// - unset → start a fresh testcontainers Postgres 16 (the CI path).
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        let (server, _base_db) = base_url.rsplit_once('/').expect("db url has a database segment");
+        let (server, _base_db) = base_url
+            .rsplit_once('/')
+            .expect("db url has a database segment");
         let seq = DB_SEQ.fetch_add(1, Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -579,7 +579,10 @@ async fn interface_lists_sorted_handlers_with_schemas() {
 
     // Signals: one entry `approve`, with an arg_schema + description, no response_schema.
     assert_eq!(names(&body["signals"]), vec!["approve"]);
-    assert_eq!(body["signals"][0]["description"], json!("Approve the pending request."));
+    assert_eq!(
+        body["signals"][0]["description"],
+        json!("Approve the pending request.")
+    );
     assert_eq!(body["signals"][0]["arg_schema"], approve_arg_schema());
     assert!(
         body["signals"][0].get("response_schema").is_none(),
@@ -589,17 +592,29 @@ async fn interface_lists_sorted_handlers_with_schemas() {
     // Queries: sorted by name → progress, status.
     assert_eq!(names(&body["queries"]), vec!["progress", "status"]);
     assert_eq!(body["queries"][0]["arg_schema"], progress_arg_schema());
-    assert_eq!(body["queries"][0]["response_schema"], progress_response_schema());
+    assert_eq!(
+        body["queries"][0]["response_schema"],
+        progress_response_schema()
+    );
     // `status` has a description but no schemas → schema fields omitted.
-    assert_eq!(body["queries"][1]["description"], json!("Current coarse status."));
+    assert_eq!(
+        body["queries"][1]["description"],
+        json!("Current coarse status.")
+    );
     assert!(body["queries"][1].get("arg_schema").is_none());
     assert!(body["queries"][1].get("response_schema").is_none());
 
     // Updates: one entry `set_priority` with both schemas + description.
     assert_eq!(names(&body["updates"]), vec!["set_priority"]);
     assert_eq!(body["updates"][0]["arg_schema"], priority_arg_schema());
-    assert_eq!(body["updates"][0]["response_schema"], priority_response_schema());
-    assert_eq!(body["updates"][0]["description"], json!("Set the run priority."));
+    assert_eq!(
+        body["updates"][0]["response_schema"],
+        priority_response_schema()
+    );
+    assert_eq!(
+        body["updates"][0]["description"],
+        json!("Set the run priority.")
+    );
 }
 
 #[tokio::test]
@@ -612,7 +627,10 @@ async fn interface_is_deterministic_across_calls() {
     let (s2, b2) = get_raw(&app, "/workflows/registered/iface_wf/interface").await;
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(s2, StatusCode::OK);
-    assert_eq!(b1, b2, "interface response must be byte-identical across calls");
+    assert_eq!(
+        b1, b2,
+        "interface response must be byte-identical across calls"
+    );
 }
 
 #[tokio::test]
@@ -647,12 +665,18 @@ async fn interface_omits_schema_fields_for_schema_less_workflow() {
 
 fn assert_field_violation(body: &Value, error_contains: &str, expected_pointer: &str) {
     assert_eq!(
-        body["error"].as_str().unwrap_or_default().contains(error_contains),
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(error_contains),
         true,
         "error should mention `{error_contains}`, got: {body}"
     );
     let violations = body["violations"].as_array().expect("violations array");
-    assert!(!violations.is_empty(), "expected at least one violation: {body}");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one violation: {body}"
+    );
     assert!(
         violations
             .iter()
@@ -671,8 +695,12 @@ async fn signal_route_rejects_malformed_payload_with_400() {
     let exec_id = seed_running_execution(&pool, "iface_wf").await;
 
     // `approve` requires a string `reason`; send an empty object.
-    let (status, body) =
-        post_json(&app, &format!("/workflows/{exec_id}/signal/approve"), json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/signal/approve"),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_field_violation(&body, "signal payload validation failed", "/reason");
 }
@@ -690,7 +718,11 @@ async fn signal_route_accepts_valid_payload() {
         json!({ "reason": "looks good" }),
     )
     .await;
-    assert_ne!(status, StatusCode::BAD_REQUEST, "valid payload must not 400: {body}");
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "valid payload must not 400: {body}"
+    );
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
 }
 
@@ -746,7 +778,11 @@ async fn update_route_accepts_valid_payload() {
         json!({ "input": { "priority": 3 } }),
     )
     .await;
-    assert_ne!(status, StatusCode::BAD_REQUEST, "valid payload must not 400: {body}");
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "valid payload must not 400: {body}"
+    );
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
 }
 
@@ -765,7 +801,11 @@ async fn schema_less_workflow_signal_and_update_are_not_validated() {
         json!({ "anything": 1 }),
     )
     .await;
-    assert_ne!(sig_status, StatusCode::BAD_REQUEST, "no-schema signal must not 400: {sig_body}");
+    assert_ne!(
+        sig_status,
+        StatusCode::BAD_REQUEST,
+        "no-schema signal must not 400: {sig_body}"
+    );
     assert_eq!(sig_status, StatusCode::ACCEPTED, "body: {sig_body}");
 
     // Likewise an update with no published schema.
@@ -775,6 +815,10 @@ async fn schema_less_workflow_signal_and_update_are_not_validated() {
         json!({ "input": { "anything": "goes" } }),
     )
     .await;
-    assert_ne!(upd_status, StatusCode::BAD_REQUEST, "no-schema update must not 400: {upd_body}");
+    assert_ne!(
+        upd_status,
+        StatusCode::BAD_REQUEST,
+        "no-schema update must not 400: {upd_body}"
+    );
     assert_eq!(upd_status, StatusCode::ACCEPTED, "body: {upd_body}");
 }
