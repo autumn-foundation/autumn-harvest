@@ -414,6 +414,10 @@ pub struct HandlerRegistry {
     pub query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers (issue #346), indexed by `(workflow, name)`.
     pub update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata (issue #610), indexed by
+    /// `(workflow, name)`. Published for interface discovery; runtime push
+    /// handlers register inside the workflow body.
+    pub signal_handlers: Vec<crate::info::SignalHandlerInfo>,
     /// Shared typed state visible to workflow and activity handlers.
     state: SharedState,
     /// Telemetry bundle (trace-context propagator + metrics recorder) applied
@@ -465,6 +469,13 @@ pub struct HandlerRegistry {
     /// manual publish step.
     #[cfg(feature = "wasm-activities")]
     wasm_module_registrations: Vec<(String, Vec<u8>)>,
+    /// Builder-level default activity retry policy (issue #620). `None` = no
+    /// floor configured; the schedule-time resolution is a pure no-op preserving
+    /// today's behaviour byte-for-byte.
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` (issue #620). `None` = no
+    /// floor configured.
+    default_activity_start_to_close: Option<Duration>,
 }
 
 impl HandlerRegistry {
@@ -589,6 +600,7 @@ impl HandlerRegistry {
             activities,
             query_handlers: Vec::new(),
             update_handlers: Vec::new(),
+            signal_handlers: Vec::new(),
             state,
             telemetry,
             history_policy: WorkflowHistoryPolicy::default(),
@@ -609,18 +621,23 @@ impl HandlerRegistry {
             wasm_store: None,
             #[cfg(feature = "wasm-activities")]
             wasm_module_registrations: Vec::new(),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
         }
     }
 
-    /// Set declarative query and update handlers (issue #346).
+    /// Set declarative query, update, and signal handler metadata
+    /// (issues #346, #610).
     #[must_use]
     pub fn with_handler_infos(
         mut self,
         query_handlers: Vec<QueryHandlerInfo>,
         update_handlers: Vec<UpdateHandlerInfo>,
+        signal_handlers: Vec<crate::info::SignalHandlerInfo>,
     ) -> Self {
         self.query_handlers = query_handlers;
         self.update_handlers = update_handlers;
+        self.signal_handlers = signal_handlers;
         self
     }
 
@@ -766,6 +783,35 @@ impl HandlerRegistry {
         &self.wasm_module_registrations
     }
 
+    /// Install the builder-level default activity retry/timeout floor (issue #620).
+    ///
+    /// Both are `None` by default — an unset floor is a pure no-op preserving
+    /// today's behaviour byte-for-byte. Resolved at schedule time as the
+    /// lowest-priority fallback: a call-site override or an activity's own
+    /// `#[activity(retry = …/start_to_close = …)]` default both win.
+    #[must_use]
+    pub fn with_activity_defaults(
+        mut self,
+        retry: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<Duration>,
+    ) -> Self {
+        self.default_activity_retry_policy = retry;
+        self.default_activity_start_to_close = start_to_close;
+        self
+    }
+
+    /// Borrow the builder-level default activity retry policy (issue #620).
+    #[must_use]
+    pub fn default_activity_retry_policy(&self) -> Option<crate::policy::RetryPolicy> {
+        self.default_activity_retry_policy.clone()
+    }
+
+    /// The builder-level default activity `start_to_close` (issue #620).
+    #[must_use]
+    pub const fn default_activity_start_to_close(&self) -> Option<Duration> {
+        self.default_activity_start_to_close
+    }
+
     /// Clone the shared state reference for runtime contexts.
     #[must_use]
     pub fn shared_state(&self) -> SharedState {
@@ -848,6 +894,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("activities", &self.activities.keys())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("history_policy", &self.history_policy)
@@ -865,6 +912,14 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "activity_interceptor_count",
                 &self.activity_interceptors.len(),
+            )
+            .field(
+                "default_activity_retry_policy",
+                &self.default_activity_retry_policy,
+            )
+            .field(
+                "default_activity_start_to_close",
+                &self.default_activity_start_to_close,
             );
         #[cfg(feature = "wasm-activities")]
         d.field("wasm_activity_count", &self.wasm_activities.len())
@@ -1573,7 +1628,10 @@ struct LocalActivityRun {
     activity_id: crate::types::ActivityExecId,
     name: String,
     input: serde_json::Value,
-    start_to_close_secs: Option<u64>,
+    /// Resolved per-attempt `start_to_close` as a full [`Duration`] (issue #620,
+    /// Codex P2 — full precision, not secs/millis, so no floor is ever truncated
+    /// to `0`). `None` defers to the worker cap.
+    start_to_close: Option<Duration>,
     retry_policy: Option<crate::policy::RetryPolicy>,
     /// `true` when `LocalActivityScheduled` is already in the durable history —
     /// the worker crashed after appending it but before recording a terminal event.
@@ -1667,7 +1725,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
                 activity_id,
                 name,
                 input,
-                start_to_close_secs,
+                start_to_close,
                 retry_policy,
                 result_tx,
                 already_scheduled,
@@ -1679,7 +1737,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
                     activity_id,
                     name,
                     input,
-                    start_to_close_secs,
+                    start_to_close,
                     retry_policy,
                     already_scheduled,
                     failed_attempts,
@@ -2202,9 +2260,14 @@ async fn run_local_activity_inline(
     }
     let history_event_hard_cap = registry.history_policy().event_hard_cap();
 
+    // Per-attempt timeout at FULL `Duration` precision (issue #620, Codex P2). A
+    // subsecond OR sub-millisecond floor must NOT truncate to
+    // `Duration::from_secs(0)`/`from_millis(0)` and instantly time out — the
+    // command carries the exact `Duration`, honored directly, then clamped by the
+    // worker cap (`Duration` implements `Ord`).
     let per_attempt_timeout = run
-        .start_to_close_secs
-        .map_or(max_start_to_close, Duration::from_secs)
+        .start_to_close
+        .unwrap_or(max_start_to_close)
         .min(max_start_to_close);
 
     let max_attempts = run.retry_policy.as_ref().map_or(1, |p| p.max_attempts);
@@ -2217,6 +2280,23 @@ async fn run_local_activity_inline(
             activity_id: run.activity_id,
             name: run.name.clone(),
             input: run.input.clone(),
+            // Issue #620 (AC8; Codex P2): the resolution marker. Every #620+
+            // schedule writes `true` at this first-schedule anchor so the
+            // crash-recovery path treats the frozen retry/STC below as
+            // authoritative (even when `None`), distinct from a pre-#620 legacy
+            // event (marker absent → `false` → re-derive live).
+            resolved: true,
+            // Freeze the fully-resolved retry policy AND start_to_close (already
+            // call → activity → builder resolved in
+            // `execute_local_activity_raw_resolved`) so a crash-recovery replay
+            // keeps this ORIGINAL budget/timeout even if the builder-level
+            // default changed in the crash window. `None` = "explicitly resolved
+            // to no floor" — still frozen, since the marker is `true`. Stored as
+            // full-precision nanos so recovery restores the exact `Duration`.
+            retry_policy: run.retry_policy.clone(),
+            start_to_close_nanos: run
+                .start_to_close
+                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
         });
     }
     prefix_events.extend(post_schedule_events);
@@ -4513,10 +4593,26 @@ async fn persist_scheduled_activities(
             params.required_capabilities = Some(serde_json::to_value(&reqs)?);
         }
 
-        let effective_retry = scheduled
-            .retry_policy_override
-            .clone()
-            .or_else(|| activity.default_retry_policy.clone());
+        // Issue #620: call-site override → activity default → builder default.
+        //
+        // Reserved worker-session internal activities (issue #606,
+        // `__harvest_session_acquire` / `__harvest_session_release`) are
+        // engine-internal machinery bounded by schedule_to_start /
+        // SessionOptions::acquisition_timeout, NOT by a user retry/timeout
+        // floor. They must NOT inherit the builder-level default — fall back to
+        // the pre-feature resolution (call-site override → activity default) for
+        // them so an operator's floor never governs session acquire/release.
+        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
+        let builder_retry_default = if is_reserved {
+            None
+        } else {
+            registry.default_activity_retry_policy()
+        };
+        let effective_retry = crate::policy::resolve_effective_retry(
+            scheduled.retry_policy_override.clone(),
+            activity.default_retry_policy.clone(),
+            builder_retry_default,
+        );
         if let Some(retry_policy) = effective_retry {
             params.max_attempts = i32::try_from(retry_policy.max_attempts).map_err(|_| {
                 HarvestError::Config(format!(
@@ -4531,9 +4627,19 @@ async fn persist_scheduled_activities(
             params.heartbeat_timeout =
                 Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
         }
-        let effective_stc = scheduled
-            .start_to_close_override
-            .or(activity.default_start_to_close);
+        // Issue #620: call-site override → activity default → builder default.
+        // Reserved session-internal activities skip the builder floor (see the
+        // retry resolution above for the rationale).
+        let builder_stc_default = if is_reserved {
+            None
+        } else {
+            registry.default_activity_start_to_close()
+        };
+        let effective_stc = crate::policy::resolve_effective_start_to_close(
+            scheduled.start_to_close_override,
+            activity.default_start_to_close,
+            builder_stc_default,
+        );
         if let Some(timeout) = effective_stc {
             params.start_to_close =
                 Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
@@ -10406,6 +10512,10 @@ async fn process_workflow_task(
                     .payload_offloader()
                     .map(crate::payload_store::PayloadOffloader::threshold),
                 telemetry.metrics.clone(),
+                // Issue #620: builder-level default activity retry/timeout floor,
+                // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
+                registry.default_activity_retry_policy(),
+                registry.default_activity_start_to_close(),
             )
             .await;
 
@@ -15865,6 +15975,8 @@ mod tests {
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -17200,7 +17312,7 @@ mod tests {
                 activity_id: crate::types::ActivityExecId::new(),
                 name: "format_data".to_string(),
                 input: serde_json::Value::Null,
-                start_to_close_secs: None,
+                start_to_close: None,
                 retry_policy: None,
                 result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
                 already_scheduled: false,
@@ -17249,7 +17361,7 @@ mod tests {
                 activity_id: crate::types::ActivityExecId::new(),
                 name: "format_data".to_string(),
                 input: serde_json::Value::Null,
-                start_to_close_secs: None,
+                start_to_close: None,
                 retry_policy: None,
                 result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
                 already_scheduled: false,

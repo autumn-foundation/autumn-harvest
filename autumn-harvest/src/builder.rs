@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::batch_start::BatchStartConfig;
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
-use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+use crate::info::{
+    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
@@ -68,6 +70,8 @@ pub struct HarvestBuilder {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers collected via `updates![…]`.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata collected via `signals![…]` (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -161,6 +165,7 @@ impl Default for HarvestBuilder {
             auto_registered_dag_workflows: Vec::new(),
             query_handlers: Vec::new(),
             update_handlers: Vec::new(),
+            signal_handlers: Vec::new(),
             worker_config: WorkerConfig::default(),
             state: std::collections::HashMap::new(),
             telemetry: None,
@@ -211,6 +216,7 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -256,6 +262,8 @@ pub struct BuiltHarvest {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers indexed by workflow name for fast lookup.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
@@ -334,6 +342,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
@@ -807,6 +816,22 @@ impl BuiltHarvest {
         &self.update_handlers
     }
 
+    /// Declarative signal handler metadata collected via `.signals(signals![…])`
+    /// (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
+    /// Returns all signal handler infos for the named workflow (issue #610).
+    #[must_use]
+    pub fn signal_handlers_for(&self, workflow_name: &str) -> Vec<&SignalHandlerInfo> {
+        self.signal_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
+    }
+
     /// Returns all query handler infos for the named workflow.
     #[must_use]
     pub fn query_handlers_for(&self, workflow_name: &str) -> Vec<&QueryHandlerInfo> {
@@ -898,7 +923,11 @@ impl BuiltHarvest {
             Arc::new(self.state),
             self.telemetry,
         )
-        .with_handler_infos(self.query_handlers, self.update_handlers)
+        .with_handler_infos(
+            self.query_handlers,
+            self.update_handlers,
+            self.signal_handlers,
+        )
         .with_history_policy(self.history_policy)
         .with_payload_caps(
             self.max_activity_input_bytes,
@@ -909,7 +938,11 @@ impl BuiltHarvest {
         .with_current_details_cap(self.max_current_details_bytes)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_payload_offloader(self.payload_offloader.clone())
-        .with_activity_interceptors(self.activity_interceptors.clone());
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -955,7 +988,11 @@ impl BuiltHarvest {
             Arc::new(self.state),
             self.telemetry,
         )
-        .with_handler_infos(self.query_handlers, self.update_handlers)
+        .with_handler_infos(
+            self.query_handlers,
+            self.update_handlers,
+            self.signal_handlers,
+        )
         .with_history_policy(self.history_policy)
         .with_payload_caps(
             self.max_activity_input_bytes,
@@ -966,7 +1003,11 @@ impl BuiltHarvest {
         .with_current_details_cap(self.max_current_details_bytes)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
         .with_payload_offloader(self.payload_offloader.clone())
-        .with_activity_interceptors(self.activity_interceptors.clone());
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1077,6 +1118,14 @@ impl HarvestBuilder {
         &self.query_handlers
     }
 
+    /// Registered declarative signal handler metadata, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::signal_handlers`] (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
     /// Register activity definitions (output of `activities![]` macro).
     ///
     /// The runtime maps activity tasks to these definitions for execution.
@@ -1140,6 +1189,22 @@ impl HarvestBuilder {
     #[must_use]
     pub fn updates(mut self, handlers: Vec<UpdateHandlerInfo>) -> Self {
         self.update_handlers.extend(handlers);
+        self
+    }
+
+    /// Register declarative signal handler metadata (output of `signals![…]`
+    /// macro) for self-service interface discovery (issue #610).
+    ///
+    /// Each [`SignalHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute and carries an optional payload schema and
+    /// description. This metadata is published by the management API; it does not
+    /// register a runtime handler (push handlers register inside the workflow body
+    /// via [`WorkflowContext::register_signal_handler`](crate::context::WorkflowContext)).
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn signals(mut self, handlers: Vec<SignalHandlerInfo>) -> Self {
+        self.signal_handlers.extend(handlers);
         self
     }
 
@@ -1780,6 +1845,7 @@ impl HarvestBuilder {
             workflow_schedules: self.workflow_schedules,
             query_handlers: self.query_handlers,
             update_handlers: self.update_handlers,
+            signal_handlers: self.signal_handlers,
             worker_config,
             state: self.state,
             telemetry: telemetry_arc,
@@ -2402,6 +2468,23 @@ pub struct WorkerConfig {
     /// Any local activity registered with `start_to_close > cap` is rejected
     /// at builder `try_build()` time.
     pub max_local_activity_start_to_close: Duration,
+    /// Builder-level default activity retry policy (issue #620).
+    ///
+    /// Applied at schedule time as the lowest-priority fallback in the
+    /// precedence chain: call-site override → activity `#[activity(retry = …)]`
+    /// default → this builder default → implicit fallback. `None` (the default)
+    /// is opt-in — an unset floor leaves today's behaviour byte-for-byte
+    /// unchanged. Set via [`WorkerConfig::with_default_activity_retry_policy`].
+    pub default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
+    /// call-site override → activity default → this builder default → no
+    /// timeout. `None` (the default) is opt-in. For *local* activities the
+    /// resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
+    /// [`WorkerConfig::with_default_activity_start_to_close`].
+    pub default_activity_start_to_close: Option<Duration>,
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
@@ -2559,6 +2642,8 @@ impl Default for WorkerConfig {
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -2959,6 +3044,32 @@ impl WorkerConfig {
         self.max_concurrent_sessions = n;
         self
     }
+
+    /// Set the builder-level default activity retry policy (issue #620).
+    ///
+    /// Resolved at schedule time as the lowest-priority fallback: a call-site
+    /// override or an activity's own `#[activity(retry = …)]` default both win
+    /// over this floor. Unset (the default) leaves today's behaviour
+    /// byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_default_activity_retry_policy(
+        mut self,
+        policy: crate::policy::RetryPolicy,
+    ) -> Self {
+        self.default_activity_retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
+    /// For *local* activities the resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`].
+    #[must_use]
+    pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
+        self.default_activity_start_to_close = Some(timeout);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -3251,6 +3362,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn harvest_builder_passes_history_policy_to_worker_registry() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .history_continue_as_new_threshold(9)
             .history_event_hard_cap(11)
@@ -3260,6 +3379,99 @@ mod tests {
 
         assert_eq!(registry.history_policy().continue_as_new_threshold(), 9);
         assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
+    }
+
+    // Issue #620: the two `into_worker_parts*` hunks copy the builder-level
+    // activity defaults out of `WorkerConfig` and into the `HandlerRegistry`.
+    // Every other #620 test injects them via `HandlerRegistry::
+    // with_activity_defaults` directly, bypassing those hunks — so this test
+    // drives the REAL public entry point (`WorkerConfig::with_default_*` ->
+    // `.worker(..)` -> `.build()` -> `.into_worker_parts()`) and asserts the
+    // registry carries the configured floor. Without the wiring hunks the
+    // registry would report `None` and this test would fail.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        7,
+                        Duration::from_millis(25),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(42)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(7),
+            "the builder-level default retry policy must be wired into the registry"
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(42)),
+            "the builder-level default start_to_close must be wired into the registry"
+        );
+    }
+
+    // Issue #620: the `into_worker_parts_with_extra_state` hunk is a distinct
+    // code path (used by the plugin's extra-state runner); assert it wires the
+    // same floor. An empty extra-state map is the minimal input.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_extra_state_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        // `into_worker_parts_with_extra_state` unconditionally writes the
+        // process-global start-idempotency sweep window; serialize against the
+        // sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        6,
+                        Duration::from_millis(15),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(17)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(6),
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(17)),
+        );
     }
 
     #[test]
@@ -3295,6 +3507,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn built_harvest_into_worker_parts_preserves_shared_state() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .workflows(vec![fake_workflow_info()])
             .activities(vec![ActivityInfo {
@@ -3721,6 +3941,45 @@ mod tests {
             }])
             .try_build();
         assert!(result.is_ok());
+    }
+
+    // ── Builder-level activity default floor (issue #620) ─────────────────
+    //
+    // RED PHASE: the `default_activity_retry_policy` / `default_activity_start_to_close`
+    // fields and their `with_*` builder methods do not exist yet — this test
+    // fails to COMPILE against the missing `WorkerConfig` symbols until the
+    // green phase adds them. Both default to `None` so an unset config is
+    // byte-for-byte identical to today (opt-in, AC1/AC6).
+
+    #[test]
+    fn worker_config_activity_defaults_default_to_none() {
+        use crate::policy::RetryPolicy;
+
+        let config = WorkerConfig::default();
+        assert!(
+            config.default_activity_retry_policy.is_none(),
+            "default activity retry policy must be unset by default (opt-in)"
+        );
+        assert!(
+            config.default_activity_start_to_close.is_none(),
+            "default activity start_to_close must be unset by default (opt-in)"
+        );
+
+        // The two builder methods set the floors and are chainable.
+        let configured = WorkerConfig::default()
+            .with_default_activity_retry_policy(RetryPolicy::fixed(4, Duration::from_millis(50)))
+            .with_default_activity_start_to_close(Duration::from_secs(300));
+        assert_eq!(
+            configured
+                .default_activity_retry_policy
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(4),
+        );
+        assert_eq!(
+            configured.default_activity_start_to_close,
+            Some(Duration::from_secs(300)),
+        );
     }
 
     // ── Local activity cap tests ──────────────────────────────────────────

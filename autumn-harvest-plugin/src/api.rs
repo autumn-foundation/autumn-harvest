@@ -3692,22 +3692,33 @@ async fn signal_workflow_by_id(
         Json(payload),
     )
     .await;
-    match result {
-        Ok((status, Json(ack))) => {
-            let body = serde_json::json!({
-                "execution_id": exec_id.to_string(),
-                "ok": ack.ok,
-                "signal_delivered": ack.signal_delivered,
-            });
-            let mut resp = (status, Json(body)).into_response();
-            insert_exec_id_header(&mut resp, exec_id);
-            resp
-        }
-        Err(error) => {
-            let mut resp = error.into_response();
-            insert_exec_id_header(&mut resp, exec_id);
-            resp
-        }
+    // `signal_workflow` returns an opaque `Response` (issue #610 changed its
+    // signature so it can emit the field-level schema-validation 400 body). On
+    // the 202 success path re-wrap the `{ok, signal_delivered}` ack body with
+    // `execution_id`; on any error/validation response forward it verbatim.
+    // Either way stamp the resolved execution id header.
+    let (parts, body) = result.into_parts();
+    if parts.status == axum::http::StatusCode::ACCEPTED {
+        let ack = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let out = serde_json::json!({
+            "execution_id": exec_id.to_string(),
+            "ok": ack.get("ok").cloned().unwrap_or(Value::Bool(true)),
+            "signal_delivered": ack
+                .get("signal_delivered")
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+        });
+        let mut resp = (parts.status, Json(out)).into_response();
+        insert_exec_id_header(&mut resp, exec_id);
+        resp
+    } else {
+        let mut resp = axum::response::Response::from_parts(parts, body);
+        insert_exec_id_header(&mut resp, exec_id);
+        resp
     }
 }
 
@@ -3943,6 +3954,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/registered/{name}/schema",
             get(get_registered_workflow_schema),
+        )
+        // issue #610: static /workflows/registered/{name}/interface — enumerate a
+        // workflow type's published signal/query/update interaction schemas.
+        // Registered alongside the other /workflows/registered/* routes, before
+        // any /workflows/{param} route so axum does not capture "registered".
+        .route(
+            "/workflows/registered/{name}/interface",
+            get(get_registered_workflow_interface),
         )
         // issue #544: static /workflows/count must be registered before any
         // /workflows/{param} routes so axum does not capture "count" as a path param.
@@ -4644,6 +4663,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/summaries"),
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
+        ("GET", "/workflows/registered/{name}/interface"),
         ("GET", "/workflows/{id}"),
         ("GET", "/workflows/{id}/history"),
         ("GET", "/workflows/{id}/result"),
@@ -5005,8 +5025,13 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
+                "error_class",
+                "dlq_reason",
+                "failure_signature",
                 "limit",
                 "dry_run",
             ]),
@@ -5017,8 +5042,13 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
+                "error_class",
+                "dlq_reason",
+                "failure_signature",
                 "limit",
                 "dry_run",
             ]),
@@ -7144,6 +7174,95 @@ async fn get_registered_workflow_schema(
             .into_response()
         },
     )
+}
+
+/// `GET /workflows/registered/{name}/interface` — enumerate a registered
+/// workflow type's published interaction surface: its signal, query, and update
+/// handlers, each with an optional argument/response JSON Schema and description
+/// (issue #610).
+///
+/// Returns `200` with a [`WorkflowInterfaceRecord`] whose `signals`/`queries`/
+/// `updates` arrays are each sorted by handler name (so the response is
+/// deterministic across calls), or `404` when the workflow name is not
+/// registered. Handlers without a published schema simply omit the
+/// `arg_schema`/`response_schema`/`description` fields.
+///
+/// [`WorkflowInterfaceRecord`]: autumn_harvest::WorkflowInterfaceRecord
+async fn get_registered_workflow_interface(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::InterfaceHandlerRecord;
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    if !runtime.registry.workflows.contains_key(&name) {
+        return AutumnError::not_found_msg(format!("workflow '{name}' is not registered"))
+            .into_response();
+    }
+
+    let mut signals: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_signal)
+        .collect();
+    signals.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut queries: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .query_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_query)
+        .collect();
+    queries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut updates: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .update_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_update)
+        .collect();
+    updates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Json(autumn_harvest::WorkflowInterfaceRecord {
+        signals,
+        queries,
+        updates,
+    })
+    .into_response()
+}
+
+/// Build a `400 Bad Request` response for an interaction payload that failed
+/// its published `arg_schema` (issue #610).
+///
+/// Mirrors the `POST /workflows/{name}/start` input-validation response shape
+/// (issue #373): `{ "error": "...", "violations": [{ "message", "field_path" }] }`
+/// where each `field_path` is a JSON Pointer (RFC 6901). Used by the signal,
+/// signal-with-start, and update HTTP entry points to reject a structurally
+/// invalid payload *before* it is durably enqueued.
+fn schema_validation_response(
+    error: &'static str,
+    violations: Vec<autumn_harvest::info::SchemaViolation>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    #[derive(serde::Serialize)]
+    struct Body {
+        error: &'static str,
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    }
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(Body { error, violations }),
+    )
+        .into_response()
 }
 
 /// Coerce a raw predicate token to a typed JSON scalar (issue #506).
@@ -13964,6 +14083,21 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // issue #610: structural schema validation of the signal payload against
+    // the signal handler's published `arg_schema` (if any). Runs before any
+    // durable start/attach so a malformed signal is rejected at the edge with a
+    // field-level 400. A signal with no published schema validates Ok (today's
+    // behavior, unchanged). Scoped by (workflow_name, signal_name).
+    if let Some(handler) = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .find(|h| h.workflow == workflow_name && h.name == request.signal_name)
+        && let Err(violations) = handler.validate_arg(&signal_payload)
+    {
+        return schema_validation_response("signal payload validation failed", violations);
+    }
+
     // Debounce admission is owned by POST /workflows/{name}/start; an atomic
     // start+signal cannot be deferred through the trailing-edge gate. Rather than
     // rejecting up front (which would block legitimate *attach* calls to a live
@@ -14721,43 +14855,73 @@ async fn update_with_start_workflow(
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
 
-    // Run the registered update handler's validator (if any) before admitting.
+    // Resolve the registered update handler once and reuse it for both the
+    // #610 schema-400 check and the #684 validator-422 check, mirroring the
+    // plain `admit_update` route so the two entry points stay consistent.
     if let Some(update_info) = runtime
         .registry
         .update_handlers
         .iter()
         .find(|h| h.workflow == workflow_name && h.name == request.update_name)
-        && let Some(validator) = update_info.validator
-        && let Err(reason) = (validator)(&update_args)
     {
+        // issue #610: structural schema validation of the update argument
+        // against the handler's published `arg_schema` (if any). Runs *before*
+        // the semantic validator below so a malformed payload is rejected at
+        // the edge with a field-level 400 rather than reaching the validator
+        // (422) or becoming durable history. A handler with no published schema
+        // validates Ok (today's behavior, unchanged). Closes the bypass where
+        // `update-with-start` durably admitted an unvalidated payload while the
+        // plain `admit_update` route already gated it.
+        if let Err(violations) = update_info.validate_arg(&update_args) {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("update payload validation failed"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return schema_validation_response("update payload validation failed", violations);
+        }
+
         // Issue #684: a durable pre-admission validator rejection.
-        runtime
-            .registry
-            .telemetry()
-            .metrics
-            .record_update_rejected(&workflow_name, &request.update_name);
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_UPDATE_WITH_START,
-            target_type: TARGET_WORKFLOW,
-            target_id: None,
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: request.idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some("update validator rejected"),
-            shard_id: Some(shard.as_i32()),
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "update rejected by validator",
-                "reason": reason,
-            })),
-        )
-            .into_response();
+        if let Some(validator) = update_info.validator
+            && let Err(reason) = (validator)(&update_args)
+        {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_update_rejected(&workflow_name, &request.update_name);
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("update validator rejected"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "update rejected by validator",
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let params = UpdateWithStartParams {
@@ -16505,7 +16669,9 @@ pub(crate) async fn signal_workflow(
     Query(query): Query<SignalQuery>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<(axum::http::StatusCode, Json<SignalAck>), AutumnError> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
 
@@ -16516,13 +16682,12 @@ pub(crate) async fn signal_workflow(
     // when the header is absent (an empty param there is treated as omitted).
     // No key at all reproduces today's at-least-once behavior exactly.
     let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
-        let key = raw.to_str().map_err(|_| {
-            AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
-        })?;
+        let Ok(key) = raw.to_str() else {
+            return AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
+                .into_response();
+        };
         if key.is_empty() {
-            return Err(AutumnError::bad_request_msg(
-                "Idempotency-Key header is empty",
-            ));
+            return AutumnError::bad_request_msg("Idempotency-Key header is empty").into_response();
         }
         Some(key.to_string())
     } else {
@@ -16550,34 +16715,135 @@ pub(crate) async fn signal_workflow(
                 };
                 let _ = audit::insert_audit(&mut conn, &ar).await;
             }
-            return Err(e);
+            return e.into_response();
         }
     };
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
     let exec_id_str = exec_id.to_string();
 
-    if let Err(e) = load_execution(&mut conn, exec_id).await {
-        let err_str = e.to_string();
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_SIGNAL,
-            target_type: TARGET_WORKFLOW,
-            target_id: Some(exec_id_str.as_str()),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some(err_str.as_str()),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return Err(map_error(e));
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // Issues #521 / #610: committed keyed-replay short-circuit. A keyed retry
+    // whose `(exec_id, idempotency_key)` row already landed must return the
+    // documented dedup no-op (202, `signal_delivered: false`) *before* the #610
+    // schema gate or the #252 payload cap runs below -- those may have been
+    // published or tightened since the original delivery, and rejecting an
+    // already-accepted signal with a 400 would regress #521's exactly-once
+    // contract (including the "retry after the run went terminal" case). A known
+    // duplicate needs neither the runtime nor validation, so this also works
+    // during the startup window before `install(runtime)`. The authoritative
+    // dedup stays in `send_signal_idempotent`'s insert-time `ON CONFLICT`; this
+    // read-only probe is a fast path for already-committed rows, so a concurrent
+    // first-delivery race (neither request sees a row yet) still falls through
+    // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
+    // so fresh + unkeyed deliveries are still fully validated before enqueue.
+    if let Some(key) = idempotency_key.as_deref() {
+        match signal::signal_idempotency_key_exists(&mut conn, exec_id, key).await {
+            Ok(true) => {
+                // Same success audit + response the normal on-conflict path
+                // writes when `send_signal_idempotent` returns `Ok(false)`.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: None,
+                    source: &source,
+                };
+                if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                    return map_error(e).into_response();
+                }
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(SignalAck {
+                        ok: true,
+                        signal_delivered: false,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return map_error(e).into_response();
+            }
+        }
     }
 
+    // Fail closed if the runtime isn't installed yet, rather than silently
+    // skipping the schema/cap checks below. `install_storage_pool` runs before
+    // `install(runtime)` during plugin startup (with a genuine `.await` -- the
+    // boot-time admission-gate load -- in between), so a request can reach this
+    // handler with a working storage pool while `runtime()` still errors.
+    // Without this check, that narrow startup window would let a payload slip
+    // through unvalidated (#610 schema gate) and uncapped (#252) into a durable
+    // signal row instead of being rejected at the edge. Mirrors `admit_update`
+    // and `update_with_start_workflow`'s identical hard requirement.
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // issue #610: structural schema validation of the signal payload against
+    // the signal handler's published `arg_schema` (if any). Resolved by
+    // (execution.workflow_name, signal_name) and run before enqueue so a
+    // malformed payload is rejected at the edge with a field-level 400. A
+    // signal with no published schema validates Ok (today's behavior).
+    //
     // Issue #252: enforce signal payload cap before inserting the signal row.
-    if let Ok(runtime) = api_state.runtime() {
-        check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)?;
+    if let Some(handler) = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .find(|h| h.workflow == execution.workflow_name && h.name == signal_name)
+        && let Err(violations) = handler.validate_arg(&payload)
+    {
+        return schema_validation_response("signal payload validation failed", violations);
+    }
+    if let Err(e) = check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes) {
+        return e.into_response();
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
@@ -16608,7 +16874,7 @@ pub(crate) async fn signal_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            return Err(map_error(e));
+            return map_error(e).into_response();
         }
     };
     let ar = NewAuditRecord {
@@ -16624,16 +16890,17 @@ pub(crate) async fn signal_workflow(
         shard_id: None,
         source: &source,
     };
-    audit::insert_audit(&mut conn, &ar)
-        .await
-        .map_err(map_error)?;
-    Ok((
+    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+        return map_error(e).into_response();
+    }
+    (
         axum::http::StatusCode::ACCEPTED,
         Json(SignalAck {
             ok: true,
             signal_delivered,
         }),
-    ))
+    )
+        .into_response()
 }
 
 /// Hydrate a workflow context by replaying its history into the workflow
@@ -22745,12 +23012,22 @@ struct BulkDlqApiBody {
     activity_name: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
+    #[serde(default)]
+    queue_name: Option<String>,
+    #[serde(default)]
+    min_attempts: Option<i32>,
     #[serde(default, alias = "task_kind")]
     task_type: Option<String>,
     #[serde(default)]
     failed_after: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    error_class: Option<String>,
+    #[serde(default)]
+    dlq_reason: Option<String>,
+    #[serde(default)]
+    failure_signature: Option<String>,
     #[serde(default)]
     shard_id: Option<i32>,
     #[serde(default)]
@@ -22770,8 +23047,21 @@ impl BulkDlqApiBody {
             filter: dlq::BulkDlqFilter {
                 activity_name: self.activity_name,
                 workflow_name: self.workflow_name,
+                // `queue_name` is a plain positive-equality filter — treat empty
+                // exactly like `activity_name`/`workflow_name` (a harmless
+                // matches-nothing predicate), not like the strict-reject cause
+                // dimensions (whose empty value would dangerously skip the
+                // filter and widen the cohort).
+                queue_name: self.queue_name,
+                min_attempts: self
+                    .min_attempts
+                    .map(validate_bulk_min_attempts)
+                    .transpose()?,
                 failed_after: self.failed_after,
                 failed_before: self.failed_before,
+                error_class: normalize_cause_filter(self.error_class)?,
+                dlq_reason: normalize_cause_filter(self.dlq_reason)?,
+                failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
             },
@@ -22779,6 +23069,46 @@ impl BulkDlqApiBody {
             task_type,
             shard_id: self.shard_id,
         })
+    }
+}
+
+/// Normalize a compute-on-read cause filter value (issue #613): an absent
+/// value stays absent; a present value is trimmed and, if empty after
+/// trimming, rejected with `400` rather than silently downgraded to "no
+/// filter" (which would replay/discard a far larger cohort than intended).
+fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, AutumnError> {
+    value.map_or_else(
+        || Ok(None),
+        |raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(AutumnError::bad_request_msg(
+                    "cause filter (error_class/dlq_reason/failure_signature) must not be empty",
+                ))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        },
+    )
+}
+
+/// Validate a bulk-DLQ `min_attempts` filter (issue #613). The aggregate read
+/// parser (`DlqAggregateParams::from_query_pairs`) only rejects negatives
+/// (accepting `>= 0`), but the bulk replay/discard paths are DESTRUCTIVE so we
+/// are stricter: attempt counts are 1-based, so a `min_attempts` of `0` or a
+/// negative value produces the predicate `attempts >= 0` (or lower) which
+/// matches EVERY DLQ row. That is not a genuine narrowing criterion, so it must
+/// not satisfy the substantive-filter safety guard (AC8) — otherwise a
+/// malformed request slips past `BulkDlqFilter::is_empty()` and acts on the
+/// whole DLQ. Reject at the request boundary (mirroring `normalize_cause_filter`)
+/// rather than touching the SQL predicate; require `>= 1`.
+fn validate_bulk_min_attempts(value: i32) -> Result<i32, AutumnError> {
+    if value < 1 {
+        Err(AutumnError::bad_request_msg(format!(
+            "invalid min_attempts '{value}'; expected a positive integer (>= 1)"
+        )))
+    } else {
+        Ok(value)
     }
 }
 
@@ -22871,6 +23201,19 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
     for (key, value) in parse_urlencoded_form(raw)? {
         let field = key.trim();
         let value = value.trim();
+        // Cause filters (issue #613) must be rejected — not silently skipped —
+        // when empty, so an accidental empty form value can't widen the cohort
+        // (the generic empty-value skip below would otherwise drop them).
+        if matches!(field, "error_class" | "dlq_reason" | "failure_signature") {
+            let normalized = normalize_cause_filter(Some(value.to_string()))?;
+            match field {
+                "error_class" => selector.filter.error_class = normalized,
+                "dlq_reason" => selector.filter.dlq_reason = normalized,
+                "failure_signature" => selector.filter.failure_signature = normalized,
+                _ => unreachable!(),
+            }
+            continue;
+        }
         if value.is_empty() {
             continue;
         }
@@ -22880,6 +23223,13 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
             }
             "activity_name" => selector.filter.activity_name = Some(value.to_string()),
             "workflow_name" => selector.filter.workflow_name = Some(value.to_string()),
+            "queue_name" => selector.filter.queue_name = Some(value.to_string()),
+            "min_attempts" => {
+                selector.filter.min_attempts = Some(validate_bulk_min_attempts(parse_i32_field(
+                    value,
+                    "min_attempts",
+                )?)?);
+            }
             "task_kind" | "task_type" => {
                 selector.task_type = Some(parse_dlq_task_type_filter(value)?);
             }
@@ -23007,7 +23357,7 @@ fn dlq_bulk_empty_filter_response(request: &ParsedBulkDlqRequest) -> axum::respo
 
     const MESSAGE: &str = "bulk filter must specify at least one criterion: dead_letter_id, \
                            activity_name, workflow_name, task_type, failed_after, failed_before, \
-                           or shard_id";
+                           error_class, dlq_reason, failure_signature, or shard_id";
 
     if request.wants_redirect {
         return dlq_form_redirect(request.return_to.as_deref(), MESSAGE);
@@ -23615,6 +23965,20 @@ async fn count_api_bulk_filter_matches(
 ) -> HarvestResult<i64> {
     let mut query = harvest_dead_letters::table.into_boxed();
     query = apply_api_bulk_filters(query, selector);
+    // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
+    // `error` strings and count the ones passing the cause post-filter.
+    if selector.filter.has_cause_filter() {
+        let errors: Vec<String> = query
+            .select(harvest_dead_letters::error)
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        let matched = errors
+            .iter()
+            .filter(|e| selector.filter.cause_matches(e))
+            .count();
+        return Ok(i64::try_from(matched).unwrap_or(i64::MAX));
+    }
     query.count().get_result(conn).await.map_err(database_error)
 }
 
@@ -23622,16 +23986,33 @@ async fn query_dead_letters_for_api_bulk(
     conn: &mut AsyncPgConnection,
     selector: &DlqBulkSelector,
 ) -> HarvestResult<Vec<DeadLetter>> {
+    // Cause dimensions (issue #613) are compute-on-read, so the SQL row limit
+    // cannot precede the post-filter (it would clip pre-filter rows). Drop the
+    // SQL limit, order oldest-first, then post-filter and `take` the limit — so
+    // the cause post-filter precedes the limit.
+    let cause = selector.filter.has_cause_filter();
     let mut query = harvest_dead_letters::table
         .into_boxed()
-        .order(harvest_dead_letters::failed_at.asc())
-        .limit(selector.filter.effective_limit());
+        .order(harvest_dead_letters::failed_at.asc());
+    if !cause {
+        query = query.limit(selector.filter.effective_limit());
+    }
     query = apply_api_bulk_filters(query, selector);
-    query
+    let rows = query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
-        .map_err(database_error)
+        .map_err(database_error)?;
+    if cause {
+        let limit = usize::try_from(selector.filter.effective_limit()).unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .filter(|r| selector.filter.cause_matches(&r.error))
+            .take(limit)
+            .collect())
+    } else {
+        Ok(rows)
+    }
 }
 
 fn apply_api_bulk_filters<'a>(
@@ -23650,6 +24031,12 @@ fn apply_api_bulk_filters<'a>(
                 .bind::<diesel::sql_types::Text, _>(task_type.clone())
                 .sql(")"),
         );
+    }
+    if let Some(ref queue) = selector.filter.queue_name {
+        query = query.filter(harvest_dead_letters::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = selector.filter.min_attempts {
+        query = query.filter(harvest_dead_letters::attempts.ge(min));
     }
     if let Some(after) = selector.filter.failed_after {
         query = query.filter(harvest_dead_letters::failed_at.ge(after));
@@ -28518,29 +28905,46 @@ pub(crate) async fn admit_update(
     // Scoped by (workflow_name, update_name), not update_name alone, since two
     // different workflows may register update handlers with the same name.
     let execution_for_validation = load_execution(&mut conn, exec_id).await;
+
+    // Resolve the registered update handler once and reuse it for both the
+    // #610 schema-400 check and the #684 validator-422 check. Scoped by
+    // (workflow_name, update_name), not update_name alone, since two different
+    // workflows may register update handlers with the same name.
     if let Ok(execution) = &execution_for_validation
         && let Some(update_info) = runtime
             .registry
             .update_handlers
             .iter()
             .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
-        && let Some(validator) = update_info.validator
-        && let Err(reason) = (validator)(&request.input)
     {
+        // issue #610: structural schema validation of the update argument
+        // against the handler's published `arg_schema` (if any). Runs *before*
+        // the semantic validator below so a malformed payload is rejected at
+        // the edge with a field-level 400 rather than reaching the validator
+        // (422) or becoming durable history. A handler with no published schema
+        // validates Ok (today's behavior, unchanged).
+        if let Err(violations) = update_info.validate_arg(&request.input) {
+            return schema_validation_response("update payload validation failed", violations);
+        }
+
         // Issue #684: a durable pre-admission validator rejection.
-        runtime
-            .registry
-            .telemetry()
-            .metrics
-            .record_update_rejected(&execution.workflow_name, &update_name);
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "update rejected by validator",
-                "reason": reason,
-            })),
-        )
-            .into_response();
+        if let Some(validator) = update_info.validator
+            && let Err(reason) = (validator)(&request.input)
+        {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_update_rejected(&execution.workflow_name, &update_name);
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "update rejected by validator",
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let update_id = UpdateId::new();
@@ -30903,6 +31307,18 @@ mod tests {
             .collect()
     }
 
+    /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
+    /// `0` and negatives — which match every 1-based-attempt row — are rejected
+    /// so a malformed request can't slip past the empty-filter safety guard.
+    #[test]
+    fn validate_bulk_min_attempts_rejects_non_positive() {
+        assert_eq!(validate_bulk_min_attempts(1).unwrap(), 1);
+        assert_eq!(validate_bulk_min_attempts(3).unwrap(), 3);
+        assert!(validate_bulk_min_attempts(0).is_err());
+        assert!(validate_bulk_min_attempts(-1).is_err());
+        assert!(validate_bulk_min_attempts(i32::MIN).is_err());
+    }
+
     /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
     /// different queue does NOT match it — letting us prove `check()` blocks a
     /// non-matching start only via fail-closed, never because the gate matched.
@@ -32522,6 +32938,130 @@ mod tests {
                 autumn_harvest::event::WorkflowEvent::UpdateAdmitted { .. }
             )),
             "the update must not have been durably admitted while the runtime was unavailable"
+        );
+    }
+
+    /// Codex P1 regression test (issue #610, PR #1092): the plain signal-send
+    /// route (`POST /workflows/{id}/signal/{name}`) gates its #610 payload
+    /// schema validation and #252 payload cap on `api_state.runtime()`. During
+    /// the plugin-startup window (storage pool installed, `install(runtime)`
+    /// not yet complete) `runtime()` errors -- so an `if let Ok(runtime)` guard
+    /// would skip both checks and let `send_signal_idempotent` durably enqueue
+    /// an unvalidated/uncapped payload. Reproduce that exact state and assert
+    /// `signal_workflow` fails closed instead, mirroring `admit_update` above.
+    #[tokio::test]
+    async fn signal_workflow_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to signal_workflow test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "signal_no_runtime",
+                workflow_id: "signal-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup window.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = signal_workflow(
+            Extension(state),
+            Path((exec_id.to_string(), "some_signal".to_string())),
+            Query(SignalQuery::default()),
+            axum::http::HeaderMap::new(),
+            Json(serde_json::json!({ "payload": true })),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "signal_workflow must fail closed when the runtime isn't installed yet, not silently \
+             enqueue an unvalidated payload"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // And the signal must NOT have been durably enqueued -- no
+        // `harvest_signals` row should exist for this execution. (This is the
+        // load-bearing "did not fall through to send_signal_idempotent" check:
+        // without the fail-closed guard the handler would insert a signal row
+        // here and return 202 instead of the 400 asserted above.)
+        let rows: Vec<CountRow> = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM harvest_signals WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .load(&mut conn)
+        .await
+        .expect("signal count query should run");
+        // `rows.as_slice()` avoids the diesel `RunQueryDsl::first`
+        // method-resolution ambiguity a bare `rows.first()` triggers on a `Vec`
+        // of query rows.
+        let signal_count = match rows.as_slice() {
+            [first, ..] => first.n,
+            [] => 0,
+        };
+        assert_eq!(
+            signal_count, 0,
+            "the signal must not have been durably enqueued while the runtime was unavailable"
         );
     }
 

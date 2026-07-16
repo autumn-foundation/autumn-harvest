@@ -1196,6 +1196,9 @@ mod tests {
                     activity_id: a1,
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
+                    retry_policy: None,
+                    resolved: false,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
@@ -1245,6 +1248,9 @@ mod tests {
                     activity_id: a1,
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
+                    retry_policy: None,
+                    resolved: false,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
@@ -1384,6 +1390,9 @@ mod tests {
                     activity_id: a1,
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
+                    retry_policy: None,
+                    resolved: false,
+                    start_to_close_nanos: None,
                 },
             ),
             row(
@@ -1416,6 +1425,9 @@ mod tests {
                     activity_id: a1,
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
+                    retry_policy: None,
+                    resolved: false,
+                    start_to_close_nanos: None,
                 },
             ),
             row(

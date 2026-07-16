@@ -45,6 +45,7 @@ allos        autumn-harvest-plugin  contract_regression              -          
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
+linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          child_timeout_tests
@@ -71,9 +72,12 @@ linux        autumn-harvest-plugin  build_ramp_integration           -          
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
+linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
+linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  fail_now_integration             -                          -
 linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -
+linux        autumn-harvest-plugin  interface_schema_integration     -                          -
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -

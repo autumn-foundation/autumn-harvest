@@ -1131,6 +1131,12 @@ impl SqliteRuntime {
             std::collections::HashMap::new(), // context headers (none)
             None,                             // payload offload threshold (none)
             std::sync::Arc::new(NoOpMetrics),
+            // Issue #620: builder-level default activity retry/timeout floor. This
+            // lightweight SQLite driver has no `HarvestBuilder` behind it, so there
+            // is no fleet-wide default to thread — `None`/`None` preserve today's
+            // "no floor" behavior (call-site/activity-level defaults still apply).
+            None,
+            None,
         )
         .await;
 

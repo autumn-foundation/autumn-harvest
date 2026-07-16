@@ -517,3 +517,127 @@ async fn aggregate_merges_counts_across_shards() {
     assert_eq!(counts.get("reporting"), Some(&14));
     assert_eq!(sum_group_counts(groups), 100);
 }
+
+// ---------------------------------------------------------------------------
+// Cause-dimension aggregation (issue #613)
+// ---------------------------------------------------------------------------
+
+fn poison_pill_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::PoisonPill {
+        crash_strikes: 3,
+        last_worker_id: Some("worker-7".to_string()),
+    }
+    .to_string()
+}
+
+fn task_timeout_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::WorkflowTaskTimeout {
+        task_timeout_strikes: 3,
+        timeout_secs: 30,
+    }
+    .to_string()
+}
+
+fn callback_exhausted_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::CallbackDeliveryExhausted {
+        delivery_id: uuid::Uuid::new_v4(),
+        attempts: 10,
+        last_status: Some(503),
+        target: "https://hooks.example.com/x".to_string(),
+    }
+    .to_string()
+}
+
+/// Seed a 10-row cause fixture with three distinct engine-authored quarantine
+/// reasons plus a plain retry-exhaustion cohort:
+///   `poison_pill` = 4, `workflow_task_timeout` = 2,
+///   `callback_delivery_exhausted` = 1, `retry_exhaustion` (plain) = 3.
+async fn seed_cause_fixture(database_url: &str, shard: i32) {
+    let exec = insert_execution(database_url, shard, "cause_wf").await;
+    insert_dlq_rows(database_url, exec, "a", &poison_pill_error(), 4).await;
+    insert_dlq_rows(database_url, exec, "a", &task_timeout_error(), 2).await;
+    insert_dlq_rows(database_url, exec, "a", &callback_exhausted_error(), 1).await;
+    insert_dlq_rows(database_url, exec, "a", "connection refused", 3).await;
+}
+
+#[tokio::test]
+async fn aggregate_group_by_dlq_reason_orders_by_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+    seed_cause_fixture(&database_url, 0).await;
+
+    let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=dlq_reason").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let groups = body["groups"].as_array().expect("groups array");
+    let counts = counts_by(groups, "dlq_reason");
+    assert_eq!(counts.get("poison_pill"), Some(&4), "counts: {counts:?}");
+    assert_eq!(
+        counts.get("workflow_task_timeout"),
+        Some(&2),
+        "counts: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("callback_delivery_exhausted"),
+        Some(&1),
+        "counts: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("retry_exhaustion"),
+        Some(&3),
+        "counts: {counts:?}"
+    );
+    assert_eq!(sum_group_counts(groups), 10, "reconcile to filtered_total");
+    assert_eq!(body["filtered_total"], 10);
+    // Descending-count ordering: the largest group comes first.
+    assert_eq!(groups[0]["key"]["dlq_reason"], "poison_pill");
+}
+
+#[tokio::test]
+async fn aggregate_group_by_error_class() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+    seed_cause_fixture(&database_url, 0).await;
+
+    let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=error_class").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let groups = body["groups"].as_array().expect("groups array");
+    let counts = counts_by(groups, "error_class");
+    assert_eq!(counts.get("PoisonPill"), Some(&4), "counts: {counts:?}");
+    assert_eq!(
+        counts.get("WorkflowTaskTimeout"),
+        Some(&2),
+        "counts: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("CallbackDeliveryExhausted"),
+        Some(&1),
+        "counts: {counts:?}"
+    );
+    // Plain "connection refused" -> normalized leading token "connection".
+    assert_eq!(counts.get("connection"), Some(&3), "counts: {counts:?}");
+    assert_eq!(sum_group_counts(groups), 10);
+}
+
+#[tokio::test]
+async fn aggregate_group_by_dlq_reason_merges_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let app = build_sharded_dlq_app(&shard0_url, &shard1_url);
+
+    seed_cause_fixture(&shard0_url, 0).await;
+    seed_cause_fixture(&shard1_url, 1).await;
+
+    let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=dlq_reason").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], 20, "total sums across shards");
+    assert_eq!(body["filtered_total"], 20);
+
+    let groups = body["groups"].as_array().expect("groups array");
+    let counts = counts_by(groups, "dlq_reason");
+    assert_eq!(counts.get("poison_pill"), Some(&8));
+    assert_eq!(counts.get("workflow_task_timeout"), Some(&4));
+    assert_eq!(counts.get("callback_delivery_exhausted"), Some(&2));
+    assert_eq!(counts.get("retry_exhaustion"), Some(&6));
+    assert_eq!(sum_group_counts(groups), 20);
+}
