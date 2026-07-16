@@ -741,7 +741,7 @@ pub fn validate_against_schema(
     input: &serde_json::Value,
 ) -> Result<(), Vec<SchemaViolation>> {
     let mut violations: Vec<SchemaViolation> = Vec::new();
-    validate_node(schema, schema, input, "", &mut violations);
+    validate_node(schema, schema, input, "", &mut violations, 0);
     if violations.is_empty() {
         Ok(())
     } else {
@@ -749,9 +749,22 @@ pub fn validate_against_schema(
     }
 }
 
+/// Maximum recursion depth for [`validate_node`].
+///
+/// Guards against a stack overflow on a pathological developer schema (e.g. a
+/// self-referential `allOf`/`$ref` cycle whose per-call `$ref` cycle guard is
+/// defeated by recursing through a fresh `validate_node` frame each level) or
+/// on extremely deeply nested input. Generous enough that no realistic
+/// schema + input ever reaches it, but bounded so an attacker-influenced signal
+/// or update payload cannot crash the handler task. At the cap the walker
+/// records one violation and stops recursing (fail closed — never a silent
+/// accept, never a panic).
+const MAX_VALIDATION_DEPTH: usize = 128;
+
 /// Recursive schema walker — validates `value` against `schema` at path `ptr`.
 ///
 /// `root` is the top-level schema document, used to resolve `$ref` pointers.
+/// `depth` is the current recursion depth, bounded by [`MAX_VALIDATION_DEPTH`].
 #[allow(clippy::too_many_lines)]
 fn validate_node(
     root: &serde_json::Value,
@@ -759,7 +772,24 @@ fn validate_node(
     value: &serde_json::Value,
     ptr: &str,
     out: &mut Vec<SchemaViolation>,
+    depth: usize,
 ) {
+    // Bounded recursion guard (issue #610 hardening): stop before overflowing
+    // the stack on a cyclic schema or pathologically deep input. Fail closed.
+    if depth >= MAX_VALIDATION_DEPTH {
+        out.push(SchemaViolation {
+            message:
+                "validation aborted: schema or input nesting exceeds the maximum supported depth"
+                    .to_string(),
+            field_path: if ptr.is_empty() {
+                None
+            } else {
+                Some(ptr.to_string())
+            },
+        });
+        return;
+    }
+
     // Resolve $ref (local JSON Pointer only, e.g. "#/definitions/Foo").
     let mut schema = schema;
     let mut visited = std::collections::HashSet::new();
@@ -842,7 +872,7 @@ fn validate_node(
                 // Escape property name per RFC 6901: ~ → ~0, / → ~1.
                 let escaped_name = prop_name.replace('~', "~0").replace('/', "~1");
                 let child_ptr = format!("{ptr}/{escaped_name}");
-                validate_node(root, prop_schema, prop_value, &child_ptr, out);
+                validate_node(root, prop_schema, prop_value, &child_ptr, out, depth + 1);
             }
         }
     }
@@ -861,7 +891,7 @@ fn validate_node(
     if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
         for (i, elem) in arr.iter().enumerate() {
             let child_ptr = format!("{ptr}/{i}");
-            validate_node(root, items_schema, elem, &child_ptr, out);
+            validate_node(root, items_schema, elem, &child_ptr, out, depth + 1);
         }
     }
 
@@ -940,7 +970,7 @@ fn validate_node(
                 if !known_keys.contains(key.as_str()) {
                     let escaped = key.replace('~', "~0").replace('/', "~1");
                     let child_ptr = format!("{ptr}/{escaped}");
-                    validate_node(root, add_props, val, &child_ptr, out);
+                    validate_node(root, add_props, val, &child_ptr, out, depth + 1);
                 }
             }
         }
@@ -950,7 +980,7 @@ fn validate_node(
     if let Some(all_of) = schema_obj.get("allOf").and_then(|v| v.as_array()) {
         for sub_schema in all_of {
             let mut sub_violations = Vec::new();
-            validate_node(root, sub_schema, value, ptr, &mut sub_violations);
+            validate_node(root, sub_schema, value, ptr, &mut sub_violations, depth + 1);
             out.extend(sub_violations);
         }
     }
@@ -959,7 +989,7 @@ fn validate_node(
     if let Some(any_of) = schema_obj.get("anyOf").and_then(|v| v.as_array()) {
         let satisfied = any_of.iter().any(|sub_schema| {
             let mut sub_violations = Vec::new();
-            validate_node(root, sub_schema, value, ptr, &mut sub_violations);
+            validate_node(root, sub_schema, value, ptr, &mut sub_violations, depth + 1);
             sub_violations.is_empty()
         });
         if !satisfied {
@@ -976,7 +1006,7 @@ fn validate_node(
             .iter()
             .filter(|sub_schema| {
                 let mut sub_violations = Vec::new();
-                validate_node(root, sub_schema, value, ptr, &mut sub_violations);
+                validate_node(root, sub_schema, value, ptr, &mut sub_violations, depth + 1);
                 sub_violations.is_empty()
             })
             .count();
@@ -2487,6 +2517,29 @@ mod tests {
         assert_eq!(json["signals"].as_array().unwrap().len(), 1);
         assert_eq!(json["queries"].as_array().unwrap().len(), 1);
         assert_eq!(json["updates"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_against_schema_bounds_recursion_on_cyclic_ref() {
+        // A self-referential `allOf`/`$ref` cycle defeats the per-call `$ref`
+        // cycle guard (each level recurses through a fresh `validate_node`
+        // frame), so without the depth bound this overflows the stack. It must
+        // instead terminate with the depth-cap violation — never panic, never
+        // silently accept (issue #610 hardening).
+        let schema = serde_json::json!({
+            "allOf": [{ "$ref": "#/$defs/A" }],
+            "$defs": { "A": { "allOf": [{ "$ref": "#/$defs/A" }] } }
+        });
+        let input = serde_json::json!({ "any": "small input" });
+
+        let result = validate_against_schema(&schema, &input);
+        let violations = result.expect_err("cyclic schema must abort with a violation");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.message.contains("exceeds the maximum supported depth")),
+            "expected a depth-cap violation, got: {violations:?}"
+        );
     }
 }
 
