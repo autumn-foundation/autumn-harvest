@@ -743,26 +743,31 @@ pub async fn bulk_discard_dead_letters(
     let mut acted_on = 0usize;
     let mut skipped = 0usize;
     let mut acted_ids: Vec<String> = Vec::with_capacity(rows.len());
-    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::new();
 
-    for row in &rows {
-        match diesel::delete(dsl::harvest_dead_letters.find(row.id))
-            .execute(conn)
+    if !rows.is_empty() {
+        let row_ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        match diesel::delete(dsl::harvest_dead_letters.filter(dsl::id.eq_any(&row_ids)))
+            .returning(dsl::id)
+            .load::<uuid::Uuid>(conn)
             .await
             .map_err(crate::error::database_error)
         {
-            Ok(0) => {
-                skipped += 1;
-            }
-            Ok(_) => {
-                acted_on += 1;
-                acted_ids.push(row.id.to_string());
+            Ok(deleted_ids) => {
+                acted_on = deleted_ids.len();
+                skipped = rows.len().saturating_sub(acted_on);
+                acted_ids = deleted_ids.into_iter().map(|id| id.to_string()).collect();
             }
             Err(e) => {
-                failures.push(BulkDlqFailure {
-                    id: row.id.to_string(),
-                    reason: e.to_string(),
-                });
+                let e_str = e.to_string();
+                failures = rows
+                    .iter()
+                    .map(|r| BulkDlqFailure {
+                        id: r.id.to_string(),
+                        reason: e_str.clone(),
+                    })
+                    .collect();
+                skipped = rows.len();
             }
         }
     }
