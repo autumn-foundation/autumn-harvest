@@ -1085,11 +1085,169 @@ async fn eris_unmarked_and_admin_principals_are_not_verb_restricted() {
     assert_eq!(admin, StatusCode::OK, "admin reaches handler");
 }
 
+// H2 (issue #776): the headline synthetic test proves the class layer's verb
+// decision, but not the *production wiring* the whole feature rests on — the
+// enforce layer sitting INSIDE the `/api/harvest` nest (so it sees the
+// mount-stripped path), and the `admin_auth_boundary=true` reconciliation that
+// lets a read-only principal reach the ~15 `require_admin`-carrying ReadOnly
+// routes (and the SSE stream's in-handler admin check). This test reproduces
+// that wiring against the REAL `harvest_api_router` and drives full
+// `/api/harvest/...` paths through the nest.
+
+use autumn_web::reexports::axum::middleware::Next;
+
+/// Reproduce the `api_with_role_auth` production mount: the real
+/// `harvest_api_router` with `admin_auth_boundary=true`, the class layer
+/// installed (when `with_enforce`), an embedder auth middleware that tags the
+/// Session `role`, and the whole thing nested under `/api/harvest`.
+fn role_auth_nested_app(role: &'static str, with_enforce: bool) -> Router {
+    let api_state = HarvestApiState::new();
+    // `api_with_role_auth` → `api_with_auth` sets `admin_auth_boundary=true`,
+    // making per-route `require_admin` (and the SSE in-handler admin check) a
+    // no-op for the read-only principal — the AC1 reconciliation.
+    api_state.set_admin_auth_boundary(true);
+    let mut router = harvest_api_router(api_state);
+    if with_enforce {
+        router = router.layer(from_fn(enforce_read_only_class));
+    }
+    // Embedder auth middleware: authenticate + tag the Session. Applied LAST so
+    // it is the outermost layer (runs first) and populates the Session
+    // extension before the enforce layer reads it — the exact production order.
+    router = router.layer(from_fn(
+        move |mut req: Request<Body>, next: Next| async move {
+            let mut d = HashMap::new();
+            d.insert("role".to_string(), role.to_string());
+            req.extensions_mut()
+                .insert(Session::new_for_test("nested-test".to_string(), d));
+            next.run(req).await
+        },
+    ));
+    Router::new()
+        .nest("/api/harvest", router)
+        .with_state(AppState::for_test())
+}
+
+async fn drive_nested(app: &Router, method: Method, uri: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = autumn_web::reexports::axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn eris_readonly_role_auth_reaches_admin_reads_and_403s_mutations_through_the_nest() {
+    let ro = role_auth_nested_app("harvest_readonly", true);
+
+    // A read-only principal REACHES an admin-gated ReadOnly route through the
+    // nest (require_admin is a no-op under the boundary): NOT 401 (auth passed),
+    // NOT 403 (class layer allowed the read). A 5xx/400 from the handler
+    // (no runtime installed) proves the request reached it.
+    for path in ["/api/harvest/admin/config", "/api/harvest/admin/status"] {
+        let (status, _) = drive_nested(&ro, Method::GET, path).await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path}: read-only must pass require_admin under the boundary (got 401)"
+        );
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{path}: read-only must reach an admin-gated ReadOnly route (got 403)"
+        );
+    }
+
+    // The SSE event stream (ReadOnly, admin-gated + an in-handler admin check)
+    // is reachable by a read-only principal. A valid uuid gets past the id
+    // parse to the in-handler admin gate, which passes under the boundary; the
+    // stream then fails closed on the missing runtime. Timeout-guarded so a
+    // (theoretical) DB connect can't hang the test — a timeout still proves the
+    // request passed auth (a 401/403 returns immediately).
+    let sse = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        drive_nested(
+            &ro,
+            Method::GET,
+            "/api/harvest/executions/00000000-0000-0000-0000-000000000001/events/stream",
+        ),
+    )
+    .await;
+    if let Ok((status, _)) = sse {
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "SSE: read-only must pass the in-handler admin gate (got 401)"
+        );
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "SSE: read-only must reach the SSE handler (got 403)"
+        );
+    }
+
+    // A read-only principal is 403'd on a real Mutating route THROUGH THE NEST —
+    // proving the layer sees the mount-stripped path and produces the
+    // distinguishable read-only-denial body.
+    let (mstatus, mbody) =
+        drive_nested(&ro, Method::POST, "/api/harvest/workflows/exec-1/cancel").await;
+    assert_eq!(
+        mstatus,
+        StatusCode::FORBIDDEN,
+        "read-only must be 403'd on POST cancel through the /api/harvest nest"
+    );
+    assert!(
+        mbody.contains("read-only principal: mutation not permitted"),
+        "nest 403 must carry the read-only-denial marker, got: {mbody}"
+    );
+
+    // An admin principal reaches the same Mutating route (not 403).
+    let admin = role_auth_nested_app("admin", true);
+    let (astatus, _) =
+        drive_nested(&admin, Method::POST, "/api/harvest/workflows/exec-1/cancel").await;
+    assert_ne!(
+        astatus,
+        StatusCode::FORBIDDEN,
+        "admin must reach the Mutating route through the nest"
+    );
+}
+
+#[tokio::test]
+async fn eris_role_auth_off_leaves_the_router_unchanged_through_the_nest() {
+    // AC6: with NO enforce layer (the `api_with_auth`/`api()` shape), a
+    // read-only principal reaches the Mutating handler — byte-for-byte the
+    // pre-#776 behavior. `admin_auth_boundary=true` makes require_admin a
+    // no-op, so the request reaches the handler (which fails closed on the
+    // missing runtime), and is NEVER the read-only-denial 403.
+    let off = role_auth_nested_app("harvest_readonly", false);
+    let (status, body) =
+        drive_nested(&off, Method::POST, "/api/harvest/workflows/exec-1/cancel").await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "without the enforce layer, a read-only principal is not 403'd (got {status})"
+    );
+    assert!(
+        !body.contains("read-only principal: mutation not permitted"),
+        "the read-only-denial marker must never appear when the layer is off"
+    );
+}
+
 #[tokio::test]
 async fn eris_readonly_denial_body_is_distinguishable() {
     // AC7 observability: a denied mutation is a 403 with a distinguishable body
-    // marker (in addition to the mandatory tracing::warn! the layer emits), so
-    // a probing/misconfigured client is diagnosable.
+    // marker, so a probing/misconfigured client is diagnosable. The layer also
+    // emits `tracing::warn!(method, path, "...denied mutation (403)")` on every
+    // denial (verified in `enforce_read_only_class`); that warn is deliberately
+    // NOT asserted here — capturing it in this parallel test binary is
+    // unreliable (`tracing` caches callsite interest globally, and sibling
+    // tests hit the same callsite with no subscriber active, poisoning it), so
+    // this stable body marker is the pinned distinguishability signal.
     let app = synthetic_enforced_router();
     let mut req = Request::builder()
         .method(Method::POST)
@@ -1107,5 +1265,68 @@ async fn eris_readonly_denial_body_is_distinguishable() {
     assert!(
         body.contains("read-only principal: mutation not permitted"),
         "403 body must carry the distinguishable read-only-denial marker, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn eris_readonly_denied_on_unclassified_ui_path_through_the_layer() {
+    // L4 + the documented /ui limitation: /ui is unclassified, so under
+    // fail-closed enforcement a read-only principal is 403'd on it while an
+    // admin reaches it. Drives the actual `enforce_read_only_class` LAYER
+    // (not just the `classify_route` unit fn) over an /ui route.
+    use autumn_web::reexports::axum::routing::get as axum_get;
+    let router: Router = Router::new()
+        .route("/ui/workflows", axum_get(|| async { StatusCode::OK }))
+        .layer(from_fn(enforce_read_only_class));
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/ui/workflows")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(session_role("harvest_readonly"));
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "read-only principal must be 403'd on unclassified /ui (fail closed)"
+    );
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("read-only principal: mutation not permitted")
+    );
+
+    let admin = status_for(
+        &router,
+        &Method::GET,
+        "/ui/workflows",
+        Some(session_role("admin")),
+    )
+    .await;
+    assert_eq!(admin, StatusCode::OK, "admin must reach /ui unchanged");
+}
+
+#[tokio::test]
+async fn eris_readonly_options_preflight_is_not_denied() {
+    // F3: OPTIONS is a preflight/metadata verb, never a mutation. A read-only
+    // principal's OPTIONS request (even to a Mutating route's path) must NOT be
+    // 403'd by the layer. (The synthetic router has no OPTIONS handler, so it
+    // routes to 405 — the point is that the layer let it THROUGH rather than
+    // fail-closing it to 403.)
+    let app = synthetic_enforced_router();
+    let status = status_for(
+        &app,
+        &Method::OPTIONS,
+        "/workflows/zzztestparam0/cancel",
+        Some(session_role("harvest_readonly")),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "OPTIONS must pass the read-only layer (got 403)"
     );
 }
