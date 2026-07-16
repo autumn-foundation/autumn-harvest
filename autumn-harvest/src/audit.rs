@@ -545,6 +545,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/registered/{name}/schema",
         RouteClass::ReadOnly,
     ),
+    (
+        "GET /workflows/registered/{name}/interface",
+        RouteClass::ReadOnly,
+    ),
     // Enumerates a workflow type's query/update handlers (read). Router-only:
     // not in management_api_routes() before #776.
     (
@@ -769,6 +773,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /batches/pending",
     "GET /workflows/registered",
     "GET /workflows/registered/{name}/schema",
+    "GET /workflows/registered/{name}/interface",
     "GET /workflows/types/{workflow_name}/handlers",
     "GET /workflows/by-id/{workflow_name}",
     "POST /workflows/by-id/{workflow_name}",
@@ -1034,6 +1039,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /batches/pending", None),
     ("GET /workflows/registered", None),
     ("GET /workflows/registered/{name}/schema", None),
+    ("GET /workflows/registered/{name}/interface", None),
     ("GET /workflows/types/{workflow_name}/handlers", None),
     ("GET /workflows/by-id/{workflow_name}", None),
     ("POST /workflows/by-id/{workflow_name}", None),
@@ -1734,6 +1740,7 @@ mod tests {
             "GET /batches/pending",
             "GET /workflows/registered",
             "GET /workflows/registered/{name}/schema",
+            "GET /workflows/registered/{name}/interface",
             "GET /workflows/types/{workflow_name}/handlers",
             "GET /workflows/by-id/{workflow_name}",
             "POST /workflows/by-id/{workflow_name}",
