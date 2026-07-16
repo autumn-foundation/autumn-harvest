@@ -2376,13 +2376,13 @@
       "path": "/dead-letters/aggregate",
       "category": "dlq",
       "read_only": true,
-      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, and/or a derived failure_signature, returning per-group counts and representative sample IDs merged across shards.",
+      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, a derived failure_signature, a derived dlq_reason class, and/or a derived error_class, returning per-group counts and representative sample IDs merged across shards.",
       "params": [
         {
           "name": "group_by",
           "in": "query",
           "required": true,
-          "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, or failure_signature. Repeats build a hierarchical key."
+          "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, failure_signature, dlq_reason, or error_class. Repeats build a hierarchical key."
         },
         {
           "name": "time_bucket",
@@ -2485,6 +2485,16 @@
             "description": "Filter by workflow name."
           },
           {
+            "name": "queue_name",
+            "required": false,
+            "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
+          },
+          {
+            "name": "min_attempts",
+            "required": false,
+            "description": "Only replay entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
             "name": "failed_after",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only replay entries failed after this time."
@@ -2493,6 +2503,21 @@
             "name": "failed_before",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only replay entries failed before this time."
+          },
+          {
+            "name": "error_class",
+            "required": false,
+            "description": "Filter by derived error class (compute-on-read, exact match; e.g. CircuitOpen, PoisonPill)."
+          },
+          {
+            "name": "dlq_reason",
+            "required": false,
+            "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
+          },
+          {
+            "name": "failure_signature",
+            "required": false,
+            "description": "Filter by derived failure signature (compute-on-read, exact match)."
           },
           {
             "name": "limit",
@@ -2551,6 +2576,16 @@
             "description": "Filter by workflow name."
           },
           {
+            "name": "queue_name",
+            "required": false,
+            "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
+          },
+          {
+            "name": "min_attempts",
+            "required": false,
+            "description": "Only discard entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
             "name": "failed_after",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only discard entries failed after this time."
@@ -2559,6 +2594,21 @@
             "name": "failed_before",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only discard entries failed before this time."
+          },
+          {
+            "name": "error_class",
+            "required": false,
+            "description": "Filter by derived error class (compute-on-read, exact match; e.g. CircuitOpen, PoisonPill)."
+          },
+          {
+            "name": "dlq_reason",
+            "required": false,
+            "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
+          },
+          {
+            "name": "failure_signature",
+            "required": false,
+            "description": "Filter by derived failure signature (compute-on-read, exact match)."
           },
           {
             "name": "limit",
@@ -3234,6 +3284,33 @@
       "read_only": true,
       "idempotency": "Safe",
       "description": "Fetch the RegisteredWorkflowRecord for a single registered workflow type by name. Returns 404 when the name is unknown (issue #373).",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Workflow type not registered."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/registered/{name}/interface",
+      "category": "discovery",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Enumerate a registered workflow type's published interaction surface: its signal, query, and update handlers, each with an optional argument/response JSON Schema and description. Returns a WorkflowInterfaceRecord { signals, queries, updates }; each array is sorted by handler name (deterministic across calls), and handlers without a published schema omit the arg_schema/response_schema/description fields. Signals always omit response_schema. Returns 404 when the name is unknown (issue #610).",
       "params": [
         {
           "name": "name",
@@ -5949,8 +6026,9 @@
       "method": "POST",
       "path": "/admin/build-routing/retire",
       "category": "build_routing",
-      "read_only": false,
-      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe.",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe. Reachability-only: reads build reachability and writes no state (RouteClass::ReadOnly); POST is used solely to carry a JSON request body.",
       "idempotency": "Idempotent: repeated calls reflect current reachability state and do not mutate data.",
       "params": [],
       "request_body": {
@@ -6312,6 +6390,88 @@
         {
           "status": 503,
           "description": "Database or shard unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/types/{workflow_name}/handlers",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Enumerate the query and update handlers registered for a workflow type (read-only). Returns a WorkflowTypeHandlers object listing each handler's name and type hints. Classified read-only (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Missing-workflow_id guard for the business-id route family: always returns 400 (the business-id form requires /workflows/by-id/{workflow_name}/{workflow_id}). No read, no write; classified read-only (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id is required."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id is required."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "idempotency": "Safe",
+      "description": "Missing-workflow_id guard for the business-id route family (POST variant): always returns 400. Shares the GET handler; never reads or writes state. Classified read-only despite the POST verb (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id is required."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id is required."
         }
       ]
     },

@@ -1,7 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,22 +33,22 @@ use serde_json::Value;
 use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
-    self, AuditFilters, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID, HEADER_SOURCE,
-    OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE,
-    OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET,
-    OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
-    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
-    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_RETENTION_RUN_NOW,
-    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
-    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
-    TARGET_WORKER, TARGET_WORKFLOW,
+    self, AuditFilters, CLASSIFIED_ROUTES, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID,
+    HEADER_SOURCE, OP_ACTIVITY_FAIL_NOW, OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR,
+    OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN,
+    OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY,
+    OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE,
+    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
+    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -3697,22 +3697,33 @@ async fn signal_workflow_by_id(
         Json(payload),
     )
     .await;
-    match result {
-        Ok((status, Json(ack))) => {
-            let body = serde_json::json!({
-                "execution_id": exec_id.to_string(),
-                "ok": ack.ok,
-                "signal_delivered": ack.signal_delivered,
-            });
-            let mut resp = (status, Json(body)).into_response();
-            insert_exec_id_header(&mut resp, exec_id);
-            resp
-        }
-        Err(error) => {
-            let mut resp = error.into_response();
-            insert_exec_id_header(&mut resp, exec_id);
-            resp
-        }
+    // `signal_workflow` returns an opaque `Response` (issue #610 changed its
+    // signature so it can emit the field-level schema-validation 400 body). On
+    // the 202 success path re-wrap the `{ok, signal_delivered}` ack body with
+    // `execution_id`; on any error/validation response forward it verbatim.
+    // Either way stamp the resolved execution id header.
+    let (parts, body) = result.into_parts();
+    if parts.status == axum::http::StatusCode::ACCEPTED {
+        let ack = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let out = serde_json::json!({
+            "execution_id": exec_id.to_string(),
+            "ok": ack.get("ok").cloned().unwrap_or(Value::Bool(true)),
+            "signal_delivered": ack
+                .get("signal_delivered")
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+        });
+        let mut resp = (parts.status, Json(out)).into_response();
+        insert_exec_id_header(&mut resp, exec_id);
+        resp
+    } else {
+        let mut resp = axum::response::Response::from_parts(parts, body);
+        insert_exec_id_header(&mut resp, exec_id);
+        resp
     }
 }
 
@@ -3948,6 +3959,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/registered/{name}/schema",
             get(get_registered_workflow_schema),
+        )
+        // issue #610: static /workflows/registered/{name}/interface — enumerate a
+        // workflow type's published signal/query/update interaction schemas.
+        // Registered alongside the other /workflows/registered/* routes, before
+        // any /workflows/{param} route so axum does not capture "registered".
+        .route(
+            "/workflows/registered/{name}/interface",
+            get(get_registered_workflow_interface),
         )
         // issue #544: static /workflows/count must be registered before any
         // /workflows/{param} routes so axum does not capture "count" as a path param.
@@ -4450,6 +4469,311 @@ pub(crate) async fn has_harvest_admin_access(
     }
 }
 
+// ── Read-only operator role (issue #776) ──────────────────────────────────────
+//
+// A least-privilege tier: a principal the embedder explicitly marks read-only
+// may reach every `RouteClass::ReadOnly` / `PublicSafe` route but is denied
+// (403) every `RouteClass::Mutating` route. Enforcement is a single, opt-in,
+// class-aware tower layer ([`enforce_read_only_class`]) installed only under
+// [`crate::HarvestPlugin::api_with_role_auth`]. It is driven entirely by
+// [`autumn_harvest::audit::CLASSIFIED_ROUTES`] — the single source of truth —
+// and fails closed: any path with no class entry resolves to `Mutating`.
+//
+// # This layer is the sole write boundary for read-only principals
+//
+// Correctness depends on two things:
+//   1. `CLASSIFIED_ROUTES` completeness — but fail-closed backstops any gap
+//      (an unclassified route denies read-only principals, never exposes them).
+//   2. The per-method matcher's static-beats-param precedence — provided by
+//      `matchit` (the crate axum uses), NOT a hand-rolled scan. Getting this
+//      wrong (e.g. `/workflows/batch_start` matching `/workflows/{id}`) would
+//      be a privilege-escalation bug.
+//
+// `MatchedPath` is deliberately NOT used: it is unreliable when read from a
+// layer on a nested router (axum #1441), which is exactly the position this
+// layer occupies. Instead the layer keys on `request.method()` +
+// `request.uri().path()`, which axum has already stripped of the `/api/harvest`
+// mount prefix by the time the request reaches this nested router — so the path
+// is concrete and mount-relative, exactly the form `CLASSIFIED_ROUTES` uses.
+
+/// Session-claim marker keys that mark a principal as an **admin**. Any of
+/// these present (role value or truthy flag) means the principal is NOT
+/// read-only-restricted (admin ⊇ read-only for reads, and full access for
+/// mutations). Mirrors [`has_harvest_admin_access`]'s non-dev branch.
+const ADMIN_ROLE_VALUES: &[&str] = &["admin", "harvest_admin"];
+const ADMIN_FLAG_KEYS: &[&str] = &["is_harvest_admin", "is_admin"];
+/// Session `role` values that mark a principal as read-only.
+const READONLY_ROLE_VALUES: &[&str] = &[
+    "harvest_readonly",
+    "harvest_operator",
+    "operator",
+    "readonly",
+    "read_only",
+];
+/// Session flag keys whose truthy value marks a principal as read-only.
+const READONLY_FLAG_KEYS: &[&str] = &["is_harvest_readonly", "is_harvest_operator"];
+
+/// Normalize a Session claim VALUE for case-insensitive marker matching
+/// (issue #776, F2): an embedder that authenticates a read-only user but sets
+/// `role = "ReadOnly"` / `"READONLY"` must still be recognized as read-only —
+/// a case mismatch that fell through to "unmarked → full access" would be a
+/// fail-OPEN security defect (a principal the embedder intended to restrict
+/// silently gets admin). Trims surrounding whitespace and lowercases. Marker
+/// key names are matched as-is (mirroring [`has_harvest_admin_access`], which
+/// does not normalize keys either).
+fn normalize_claim(v: &str) -> String {
+    v.trim().to_ascii_lowercase()
+}
+
+fn is_truthy(v: &str) -> bool {
+    matches!(normalize_claim(v).as_str(), "true" | "1" | "yes" | "on")
+}
+
+/// Whether the request's autumn-web `Session` carries an explicit read-only
+/// marker AND does not carry an explicit admin marker (issue #776).
+///
+/// Contract for embedders: a principal is subject to the read-only restriction
+/// **only** when the embedder's auth middleware explicitly marks the Session
+/// read-only. Semantics:
+///
+/// - **No session** → `false` (full access — a principal the auth boundary let
+///   through with no markers keeps today's boundary semantics; the read-only
+///   restriction is opt-in per-principal).
+/// - **Explicit admin marker present** (`role` ∈ {`admin`,`harvest_admin`} or
+///   `is_harvest_admin`/`is_admin` truthy) → `false`. Admin wins: an admin is
+///   never verb-restricted, even if also tagged read-only.
+/// - **Explicit read-only marker present** (`role` ∈ {`harvest_readonly`,
+///   `harvest_operator`, `operator`, `readonly`, `read_only`} or
+///   `is_harvest_readonly`/`is_harvest_operator` truthy) → `true`.
+/// - **Otherwise** → `false` (full access — preserves existing boundary
+///   semantics for an unmarked principal).
+pub(crate) async fn has_harvest_readonly_access(session: Option<Session>) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    // Fetch the `role` claim once (F8: was fetched twice) and normalize its
+    // value case-insensitively (F2) before matching the lowercase marker sets.
+    let role = session.get("role").await.map(|v| normalize_claim(&v));
+    // Admin marker present ⇒ never read-only-restricted (admin wins).
+    if let Some(role) = role.as_deref()
+        && ADMIN_ROLE_VALUES.contains(&role)
+    {
+        return false;
+    }
+    for key in ADMIN_FLAG_KEYS {
+        if session.get(key).await.is_some_and(|v| is_truthy(&v)) {
+            return false;
+        }
+    }
+    // Read-only marker?
+    if let Some(role) = role.as_deref()
+        && READONLY_ROLE_VALUES.contains(&role)
+    {
+        return true;
+    }
+    for key in READONLY_FLAG_KEYS {
+        if session.get(key).await.is_some_and(|v| is_truthy(&v)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rewrite a `CLASSIFIED_ROUTES` template's path parameters to positional,
+/// distinct placeholders (`{p0}`, `{p1}`, …) so a single `matchit::Router`
+/// accepts the full set without a param-name conflict.
+///
+/// `matchit` requires the same param NAME at a shared tree position across
+/// routes (e.g. `POST /workflows/{workflow_name}/start` and
+/// `POST /workflows/{id}/cancel` both have a param at segment 2) and distinct
+/// names WITHIN one route (e.g. `.../by-id/{workflow_name}/{workflow_id}/...`).
+/// Renaming positionally satisfies both. Param names are irrelevant to class
+/// lookup — only structure + static segments (which decide static-beats-param
+/// precedence) matter.
+fn normalize_route_template(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut idx = 0u32;
+    for seg in path.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        out.push('/');
+        if seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("{p");
+            out.push_str(&idx.to_string());
+            out.push('}');
+            idx += 1;
+        } else {
+            out.push_str(seg);
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Per-method radix-tree matchers over `CLASSIFIED_ROUTES`, built once.
+///
+/// Keyed per HTTP method because the same path can carry a different class per
+/// method (e.g. `GET /admin/schedules/{id}` is `ReadOnly`, `DELETE` is
+/// `Mutating`).
+fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Router<RouteClass>> {
+    static MATCHERS: std::sync::OnceLock<HashMap<axum::http::Method, matchit::Router<RouteClass>>> =
+        std::sync::OnceLock::new();
+    MATCHERS.get_or_init(|| {
+        let mut by_method: HashMap<axum::http::Method, matchit::Router<RouteClass>> =
+            HashMap::new();
+        for (template, class) in CLASSIFIED_ROUTES {
+            let Some((method, path)) = template.split_once(' ') else {
+                debug_assert!(false, "malformed CLASSIFIED_ROUTES template: {template}");
+                continue;
+            };
+            let Ok(method) = method.parse::<axum::http::Method>() else {
+                debug_assert!(false, "unknown method in CLASSIFIED_ROUTES: {template}");
+                continue;
+            };
+            let normalized = normalize_route_template(path);
+            let router = by_method.entry(method).or_default();
+            if let Err(e) = router.insert(normalized, *class) {
+                // Fail closed, never panic (F4): a future post-normalization
+                // collision must not crash the first read-only request and
+                // poison the `OnceLock`. A skipped route stays unclassified →
+                // `classify_route` → `Mutating` → denied to read-only
+                // principals (over-restriction, never exposure). The
+                // build-time `route_class_matchers_build_without_conflict`
+                // test (debug_assert active) still fails CI on any conflict.
+                tracing::error!(
+                    template = %template,
+                    error = %e,
+                    "harvest: CLASSIFIED_ROUTES matcher insert failed; route will fail closed (deny read-only)"
+                );
+                debug_assert!(false, "matcher insert conflict for '{template}': {e}");
+            }
+        }
+        by_method
+    })
+}
+
+/// Resolve the `RouteClass` of a concrete (nest-stripped) request path for the
+/// given method. **Fail closed:** an unknown method OR an unmatched path
+/// resolves to [`RouteClass::Mutating`], so a read-only principal is denied a
+/// route no one classified.
+///
+/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
+/// handler, so a `HEAD` probe of a readable resource must inherit that route's
+/// read class rather than fail closed to `Mutating` and 403 a read-only
+/// dashboard's existence/size probe.
+pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
+    let get = axum::http::Method::GET;
+    let lookup_method = if *method == axum::http::Method::HEAD {
+        &get
+    } else {
+        method
+    };
+    let Some(router) = route_class_matchers().get(lookup_method) else {
+        return RouteClass::Mutating;
+    };
+    match router.at(path) {
+        Ok(m) => *m.value,
+        Err(_) => RouteClass::Mutating,
+    }
+}
+
+/// A `403 Forbidden` for a read-only principal that attempted a mutation
+/// (issue #776, AC2 — distinct from the anonymous `401` the admin gate emits).
+///
+/// Built directly rather than via an `AutumnError` constructor so it does not
+/// depend on an autumn-web `forbidden` helper.
+fn read_only_forbidden_response() -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "read-only principal: mutation not permitted"
+        })),
+    )
+        .into_response()
+}
+
+/// The opt-in, class-aware enforcement layer (issue #776).
+///
+/// Installed on `harvest_api_router` **only** under
+/// [`crate::HarvestPlugin::api_with_role_auth`]; the default and `api_with_auth`
+/// paths never see it, so their behavior is byte-for-byte unchanged (AC6).
+///
+/// Request order under the role-auth mount: embedder auth middleware (sets the
+/// `Session` extension) → **this layer** (reads Session + method + path) →
+/// per-route `require_admin` (a no-op under the auth boundary) → handler. This
+/// layer therefore stops a read-only principal at the route boundary, before
+/// any handler's in-handler admin write-gate runs — which is why enabling the
+/// admin auth boundary (so read-only principals reach admin-gated `ReadOnly`
+/// routes and the SSE stream, AC1) is safe: the only extra capability the
+/// boundary grants a read-only principal is READS, and every state-writing
+/// handler sits on a `Mutating` (or unclassified→fail-closed→`Mutating`) route
+/// this layer already denies.
+pub async fn enforce_read_only_class(
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let session = request.extensions().get::<Session>().cloned();
+    // OPTIONS is a preflight/metadata verb, never a mutation. A credential-less
+    // CORS preflight carries no Session and already passes (below); this also
+    // lets a rare cookie-bearing same-origin OPTIONS from a read-only principal
+    // through instead of fail-closing it to 403 (F3).
+    if *request.method() != axum::http::Method::OPTIONS
+        && has_harvest_readonly_access(session).await
+    {
+        let class = classify_route(request.method(), request.uri().path());
+        if deny_readonly_mutation(true, class) {
+            // AC7 observability: a denied attempt is always logged so operators
+            // can detect a misconfigured or probing client. A best-effort DB
+            // audit row is deliberately NOT written here — this layer runs
+            // before a pooled connection is acquired, and forcing a write on
+            // every probe would be a DoS vector.
+            tracing::warn!(
+                method = %request.method(),
+                path = %request.uri().path(),
+                "harvest: read-only principal denied mutation (403)"
+            );
+            return read_only_forbidden_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// The class gate for a **known-mutating** generated MCP tool route (issue
+/// #776, F1).
+///
+/// The generated MCP tool routes are registered app-level (via
+/// `AppBuilder::routes`), outside the nested management router that
+/// [`enforce_read_only_class`] wraps, so they would otherwise be a fully
+/// unguarded write surface reachable by a read-only principal. Unlike that
+/// layer (which resolves the class from `CLASSIFIED_ROUTES` by path), the
+/// caller ([`crate::mcp_tools::build_tool_route`]) already knows this route is
+/// a mutation ([`crate::mcp_tools::ToolKind::is_mutation`]), so this hard-denies
+/// a read-only principal with `403` — no path lookup needed. Installed **only**
+/// on mutating tools and **only** when `api_with_role_auth` is used; read tools
+/// (`status`/`watch`) never carry it.
+///
+/// This single gate closes both invocation paths: the tool's direct HTTP path
+/// AND the `/mcp` JSON-RPC `tools/call` envelope (autumn-web re-dispatches the
+/// envelope through this same route with the caller's forwarded credential).
+pub async fn enforce_read_only_mcp_mutation(
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let session = request.extensions().get::<Session>().cloned();
+    if has_harvest_readonly_access(session).await {
+        tracing::warn!(
+            method = %request.method(),
+            path = %request.uri().path(),
+            "harvest: read-only principal denied MCP mutation tool (403)"
+        );
+        return read_only_forbidden_response();
+    }
+    next.run(request).await
+}
+
 // ── Read-path payload decoding (issue #608) ───────────────────────────────────
 
 /// The pure decode-eligibility predicate (issue #608, AC1 + AC6): the
@@ -4649,6 +4973,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/summaries"),
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
+        ("GET", "/workflows/registered/{name}/interface"),
         ("GET", "/workflows/{id}"),
         ("GET", "/workflows/{id}/history"),
         ("GET", "/workflows/{id}/result"),
@@ -4687,7 +5012,14 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/query/{query_name}"),
         ("POST", "/workflows/{id}/update/{update_name}"),
         ("GET", "/workflows/{id}/update/{update_id}/result"),
+        // Workflow-type handler enumeration (read). Router-only until it was
+        // added here for the read-only-role classification sweep (issue #776).
+        ("GET", "/workflows/types/{workflow_name}/handlers"),
         // ── business-id ("latest run") variants (issue #805) ──────────────────
+        // Missing-workflow_id guard: always 400 (GET+POST share one handler).
+        // Router-only until listed here for the #776 classification sweep.
+        ("GET", "/workflows/by-id/{workflow_name}"),
+        ("POST", "/workflows/by-id/{workflow_name}"),
         ("GET", "/workflows/by-id/{workflow_name}/{workflow_id}"),
         (
             "GET",
@@ -5010,8 +5342,13 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
+                "error_class",
+                "dlq_reason",
+                "failure_signature",
                 "limit",
                 "dry_run",
             ]),
@@ -5022,8 +5359,13 @@ pub const fn management_api_request_fields()
             Some(&[
                 "activity_name",
                 "workflow_name",
+                "queue_name",
+                "min_attempts",
                 "failed_after",
                 "failed_before",
+                "error_class",
+                "dlq_reason",
+                "failure_signature",
                 "limit",
                 "dry_run",
             ]),
@@ -7149,6 +7491,95 @@ async fn get_registered_workflow_schema(
             .into_response()
         },
     )
+}
+
+/// `GET /workflows/registered/{name}/interface` — enumerate a registered
+/// workflow type's published interaction surface: its signal, query, and update
+/// handlers, each with an optional argument/response JSON Schema and description
+/// (issue #610).
+///
+/// Returns `200` with a [`WorkflowInterfaceRecord`] whose `signals`/`queries`/
+/// `updates` arrays are each sorted by handler name (so the response is
+/// deterministic across calls), or `404` when the workflow name is not
+/// registered. Handlers without a published schema simply omit the
+/// `arg_schema`/`response_schema`/`description` fields.
+///
+/// [`WorkflowInterfaceRecord`]: autumn_harvest::WorkflowInterfaceRecord
+async fn get_registered_workflow_interface(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::InterfaceHandlerRecord;
+    use axum::response::IntoResponse as _;
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    if !runtime.registry.workflows.contains_key(&name) {
+        return AutumnError::not_found_msg(format!("workflow '{name}' is not registered"))
+            .into_response();
+    }
+
+    let mut signals: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_signal)
+        .collect();
+    signals.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut queries: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .query_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_query)
+        .collect();
+    queries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut updates: Vec<InterfaceHandlerRecord> = runtime
+        .registry
+        .update_handlers
+        .iter()
+        .filter(|h| h.workflow == name)
+        .map(InterfaceHandlerRecord::from_update)
+        .collect();
+    updates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Json(autumn_harvest::WorkflowInterfaceRecord {
+        signals,
+        queries,
+        updates,
+    })
+    .into_response()
+}
+
+/// Build a `400 Bad Request` response for an interaction payload that failed
+/// its published `arg_schema` (issue #610).
+///
+/// Mirrors the `POST /workflows/{name}/start` input-validation response shape
+/// (issue #373): `{ "error": "...", "violations": [{ "message", "field_path" }] }`
+/// where each `field_path` is a JSON Pointer (RFC 6901). Used by the signal,
+/// signal-with-start, and update HTTP entry points to reject a structurally
+/// invalid payload *before* it is durably enqueued.
+fn schema_validation_response(
+    error: &'static str,
+    violations: Vec<autumn_harvest::info::SchemaViolation>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    #[derive(serde::Serialize)]
+    struct Body {
+        error: &'static str,
+        violations: Vec<autumn_harvest::info::SchemaViolation>,
+    }
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(Body { error, violations }),
+    )
+        .into_response()
 }
 
 /// Coerce a raw predicate token to a typed JSON scalar (issue #506).
@@ -13969,6 +14400,21 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // issue #610: structural schema validation of the signal payload against
+    // the signal handler's published `arg_schema` (if any). Runs before any
+    // durable start/attach so a malformed signal is rejected at the edge with a
+    // field-level 400. A signal with no published schema validates Ok (today's
+    // behavior, unchanged). Scoped by (workflow_name, signal_name).
+    if let Some(handler) = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .find(|h| h.workflow == workflow_name && h.name == request.signal_name)
+        && let Err(violations) = handler.validate_arg(&signal_payload)
+    {
+        return schema_validation_response("signal payload validation failed", violations);
+    }
+
     // Debounce admission is owned by POST /workflows/{name}/start; an atomic
     // start+signal cannot be deferred through the trailing-edge gate. Rather than
     // rejecting up front (which would block legitimate *attach* calls to a live
@@ -14726,43 +15172,73 @@ async fn update_with_start_workflow(
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
 
-    // Run the registered update handler's validator (if any) before admitting.
+    // Resolve the registered update handler once and reuse it for both the
+    // #610 schema-400 check and the #684 validator-422 check, mirroring the
+    // plain `admit_update` route so the two entry points stay consistent.
     if let Some(update_info) = runtime
         .registry
         .update_handlers
         .iter()
         .find(|h| h.workflow == workflow_name && h.name == request.update_name)
-        && let Some(validator) = update_info.validator
-        && let Err(reason) = (validator)(&update_args)
     {
+        // issue #610: structural schema validation of the update argument
+        // against the handler's published `arg_schema` (if any). Runs *before*
+        // the semantic validator below so a malformed payload is rejected at
+        // the edge with a field-level 400 rather than reaching the validator
+        // (422) or becoming durable history. A handler with no published schema
+        // validates Ok (today's behavior, unchanged). Closes the bypass where
+        // `update-with-start` durably admitted an unvalidated payload while the
+        // plain `admit_update` route already gated it.
+        if let Err(violations) = update_info.validate_arg(&update_args) {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("update payload validation failed"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return schema_validation_response("update payload validation failed", violations);
+        }
+
         // Issue #684: a durable pre-admission validator rejection.
-        runtime
-            .registry
-            .telemetry()
-            .metrics
-            .record_update_rejected(&workflow_name, &request.update_name);
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_UPDATE_WITH_START,
-            target_type: TARGET_WORKFLOW,
-            target_id: None,
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: request.idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some("update validator rejected"),
-            shard_id: Some(shard.as_i32()),
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "update rejected by validator",
-                "reason": reason,
-            })),
-        )
-            .into_response();
+        if let Some(validator) = update_info.validator
+            && let Err(reason) = (validator)(&update_args)
+        {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_update_rejected(&workflow_name, &request.update_name);
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("update validator rejected"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "update rejected by validator",
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let params = UpdateWithStartParams {
@@ -16612,7 +17088,9 @@ pub(crate) async fn signal_workflow(
     Query(query): Query<SignalQuery>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<(axum::http::StatusCode, Json<SignalAck>), AutumnError> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
 
@@ -16623,13 +17101,12 @@ pub(crate) async fn signal_workflow(
     // when the header is absent (an empty param there is treated as omitted).
     // No key at all reproduces today's at-least-once behavior exactly.
     let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
-        let key = raw.to_str().map_err(|_| {
-            AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
-        })?;
+        let Ok(key) = raw.to_str() else {
+            return AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
+                .into_response();
+        };
         if key.is_empty() {
-            return Err(AutumnError::bad_request_msg(
-                "Idempotency-Key header is empty",
-            ));
+            return AutumnError::bad_request_msg("Idempotency-Key header is empty").into_response();
         }
         Some(key.to_string())
     } else {
@@ -16657,34 +17134,135 @@ pub(crate) async fn signal_workflow(
                 };
                 let _ = audit::insert_audit(&mut conn, &ar).await;
             }
-            return Err(e);
+            return e.into_response();
         }
     };
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
     let exec_id_str = exec_id.to_string();
 
-    if let Err(e) = load_execution(&mut conn, exec_id).await {
-        let err_str = e.to_string();
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_SIGNAL,
-            target_type: TARGET_WORKFLOW,
-            target_id: Some(exec_id_str.as_str()),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some(err_str.as_str()),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return Err(map_error(e));
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(ex) => ex,
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // Issues #521 / #610: committed keyed-replay short-circuit. A keyed retry
+    // whose `(exec_id, idempotency_key)` row already landed must return the
+    // documented dedup no-op (202, `signal_delivered: false`) *before* the #610
+    // schema gate or the #252 payload cap runs below -- those may have been
+    // published or tightened since the original delivery, and rejecting an
+    // already-accepted signal with a 400 would regress #521's exactly-once
+    // contract (including the "retry after the run went terminal" case). A known
+    // duplicate needs neither the runtime nor validation, so this also works
+    // during the startup window before `install(runtime)`. The authoritative
+    // dedup stays in `send_signal_idempotent`'s insert-time `ON CONFLICT`; this
+    // read-only probe is a fast path for already-committed rows, so a concurrent
+    // first-delivery race (neither request sees a row yet) still falls through
+    // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
+    // so fresh + unkeyed deliveries are still fully validated before enqueue.
+    if let Some(key) = idempotency_key.as_deref() {
+        match signal::signal_idempotency_key_exists(&mut conn, exec_id, key).await {
+            Ok(true) => {
+                // Same success audit + response the normal on-conflict path
+                // writes when `send_signal_idempotent` returns `Ok(false)`.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: None,
+                    source: &source,
+                };
+                if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                    return map_error(e).into_response();
+                }
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(SignalAck {
+                        ok: true,
+                        signal_delivered: false,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return map_error(e).into_response();
+            }
+        }
     }
 
+    // Fail closed if the runtime isn't installed yet, rather than silently
+    // skipping the schema/cap checks below. `install_storage_pool` runs before
+    // `install(runtime)` during plugin startup (with a genuine `.await` -- the
+    // boot-time admission-gate load -- in between), so a request can reach this
+    // handler with a working storage pool while `runtime()` still errors.
+    // Without this check, that narrow startup window would let a payload slip
+    // through unvalidated (#610 schema gate) and uncapped (#252) into a durable
+    // signal row instead of being rejected at the edge. Mirrors `admit_update`
+    // and `update_with_start_workflow`'s identical hard requirement.
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // issue #610: structural schema validation of the signal payload against
+    // the signal handler's published `arg_schema` (if any). Resolved by
+    // (execution.workflow_name, signal_name) and run before enqueue so a
+    // malformed payload is rejected at the edge with a field-level 400. A
+    // signal with no published schema validates Ok (today's behavior).
+    //
     // Issue #252: enforce signal payload cap before inserting the signal row.
-    if let Ok(runtime) = api_state.runtime() {
-        check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)?;
+    if let Some(handler) = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .find(|h| h.workflow == execution.workflow_name && h.name == signal_name)
+        && let Err(violations) = handler.validate_arg(&payload)
+    {
+        return schema_validation_response("signal payload validation failed", violations);
+    }
+    if let Err(e) = check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes) {
+        return e.into_response();
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
@@ -16715,7 +17293,7 @@ pub(crate) async fn signal_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            return Err(map_error(e));
+            return map_error(e).into_response();
         }
     };
     let ar = NewAuditRecord {
@@ -16731,16 +17309,17 @@ pub(crate) async fn signal_workflow(
         shard_id: None,
         source: &source,
     };
-    audit::insert_audit(&mut conn, &ar)
-        .await
-        .map_err(map_error)?;
-    Ok((
+    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+        return map_error(e).into_response();
+    }
+    (
         axum::http::StatusCode::ACCEPTED,
         Json(SignalAck {
             ok: true,
             signal_delivered,
         }),
-    ))
+    )
+        .into_response()
 }
 
 /// Hydrate a workflow context by replaying its history into the workflow
@@ -22852,12 +23431,22 @@ struct BulkDlqApiBody {
     activity_name: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
+    #[serde(default)]
+    queue_name: Option<String>,
+    #[serde(default)]
+    min_attempts: Option<i32>,
     #[serde(default, alias = "task_kind")]
     task_type: Option<String>,
     #[serde(default)]
     failed_after: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    error_class: Option<String>,
+    #[serde(default)]
+    dlq_reason: Option<String>,
+    #[serde(default)]
+    failure_signature: Option<String>,
     #[serde(default)]
     shard_id: Option<i32>,
     #[serde(default)]
@@ -22877,8 +23466,21 @@ impl BulkDlqApiBody {
             filter: dlq::BulkDlqFilter {
                 activity_name: self.activity_name,
                 workflow_name: self.workflow_name,
+                // `queue_name` is a plain positive-equality filter — treat empty
+                // exactly like `activity_name`/`workflow_name` (a harmless
+                // matches-nothing predicate), not like the strict-reject cause
+                // dimensions (whose empty value would dangerously skip the
+                // filter and widen the cohort).
+                queue_name: self.queue_name,
+                min_attempts: self
+                    .min_attempts
+                    .map(validate_bulk_min_attempts)
+                    .transpose()?,
                 failed_after: self.failed_after,
                 failed_before: self.failed_before,
+                error_class: normalize_cause_filter(self.error_class)?,
+                dlq_reason: normalize_cause_filter(self.dlq_reason)?,
+                failure_signature: normalize_cause_filter(self.failure_signature)?,
                 limit: self.limit,
                 dry_run: self.dry_run,
             },
@@ -22886,6 +23488,46 @@ impl BulkDlqApiBody {
             task_type,
             shard_id: self.shard_id,
         })
+    }
+}
+
+/// Normalize a compute-on-read cause filter value (issue #613): an absent
+/// value stays absent; a present value is trimmed and, if empty after
+/// trimming, rejected with `400` rather than silently downgraded to "no
+/// filter" (which would replay/discard a far larger cohort than intended).
+fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, AutumnError> {
+    value.map_or_else(
+        || Ok(None),
+        |raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(AutumnError::bad_request_msg(
+                    "cause filter (error_class/dlq_reason/failure_signature) must not be empty",
+                ))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        },
+    )
+}
+
+/// Validate a bulk-DLQ `min_attempts` filter (issue #613). The aggregate read
+/// parser (`DlqAggregateParams::from_query_pairs`) only rejects negatives
+/// (accepting `>= 0`), but the bulk replay/discard paths are DESTRUCTIVE so we
+/// are stricter: attempt counts are 1-based, so a `min_attempts` of `0` or a
+/// negative value produces the predicate `attempts >= 0` (or lower) which
+/// matches EVERY DLQ row. That is not a genuine narrowing criterion, so it must
+/// not satisfy the substantive-filter safety guard (AC8) — otherwise a
+/// malformed request slips past `BulkDlqFilter::is_empty()` and acts on the
+/// whole DLQ. Reject at the request boundary (mirroring `normalize_cause_filter`)
+/// rather than touching the SQL predicate; require `>= 1`.
+fn validate_bulk_min_attempts(value: i32) -> Result<i32, AutumnError> {
+    if value < 1 {
+        Err(AutumnError::bad_request_msg(format!(
+            "invalid min_attempts '{value}'; expected a positive integer (>= 1)"
+        )))
+    } else {
+        Ok(value)
     }
 }
 
@@ -22978,6 +23620,19 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
     for (key, value) in parse_urlencoded_form(raw)? {
         let field = key.trim();
         let value = value.trim();
+        // Cause filters (issue #613) must be rejected — not silently skipped —
+        // when empty, so an accidental empty form value can't widen the cohort
+        // (the generic empty-value skip below would otherwise drop them).
+        if matches!(field, "error_class" | "dlq_reason" | "failure_signature") {
+            let normalized = normalize_cause_filter(Some(value.to_string()))?;
+            match field {
+                "error_class" => selector.filter.error_class = normalized,
+                "dlq_reason" => selector.filter.dlq_reason = normalized,
+                "failure_signature" => selector.filter.failure_signature = normalized,
+                _ => unreachable!(),
+            }
+            continue;
+        }
         if value.is_empty() {
             continue;
         }
@@ -22987,6 +23642,13 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
             }
             "activity_name" => selector.filter.activity_name = Some(value.to_string()),
             "workflow_name" => selector.filter.workflow_name = Some(value.to_string()),
+            "queue_name" => selector.filter.queue_name = Some(value.to_string()),
+            "min_attempts" => {
+                selector.filter.min_attempts = Some(validate_bulk_min_attempts(parse_i32_field(
+                    value,
+                    "min_attempts",
+                )?)?);
+            }
             "task_kind" | "task_type" => {
                 selector.task_type = Some(parse_dlq_task_type_filter(value)?);
             }
@@ -23114,7 +23776,7 @@ fn dlq_bulk_empty_filter_response(request: &ParsedBulkDlqRequest) -> axum::respo
 
     const MESSAGE: &str = "bulk filter must specify at least one criterion: dead_letter_id, \
                            activity_name, workflow_name, task_type, failed_after, failed_before, \
-                           or shard_id";
+                           error_class, dlq_reason, failure_signature, or shard_id";
 
     if request.wants_redirect {
         return dlq_form_redirect(request.return_to.as_deref(), MESSAGE);
@@ -23722,6 +24384,20 @@ async fn count_api_bulk_filter_matches(
 ) -> HarvestResult<i64> {
     let mut query = harvest_dead_letters::table.into_boxed();
     query = apply_api_bulk_filters(query, selector);
+    // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
+    // `error` strings and count the ones passing the cause post-filter.
+    if selector.filter.has_cause_filter() {
+        let errors: Vec<String> = query
+            .select(harvest_dead_letters::error)
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        let matched = errors
+            .iter()
+            .filter(|e| selector.filter.cause_matches(e))
+            .count();
+        return Ok(i64::try_from(matched).unwrap_or(i64::MAX));
+    }
     query.count().get_result(conn).await.map_err(database_error)
 }
 
@@ -23729,16 +24405,33 @@ async fn query_dead_letters_for_api_bulk(
     conn: &mut AsyncPgConnection,
     selector: &DlqBulkSelector,
 ) -> HarvestResult<Vec<DeadLetter>> {
+    // Cause dimensions (issue #613) are compute-on-read, so the SQL row limit
+    // cannot precede the post-filter (it would clip pre-filter rows). Drop the
+    // SQL limit, order oldest-first, then post-filter and `take` the limit — so
+    // the cause post-filter precedes the limit.
+    let cause = selector.filter.has_cause_filter();
     let mut query = harvest_dead_letters::table
         .into_boxed()
-        .order(harvest_dead_letters::failed_at.asc())
-        .limit(selector.filter.effective_limit());
+        .order(harvest_dead_letters::failed_at.asc());
+    if !cause {
+        query = query.limit(selector.filter.effective_limit());
+    }
     query = apply_api_bulk_filters(query, selector);
-    query
+    let rows = query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
-        .map_err(database_error)
+        .map_err(database_error)?;
+    if cause {
+        let limit = usize::try_from(selector.filter.effective_limit()).unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .filter(|r| selector.filter.cause_matches(&r.error))
+            .take(limit)
+            .collect())
+    } else {
+        Ok(rows)
+    }
 }
 
 fn apply_api_bulk_filters<'a>(
@@ -23757,6 +24450,12 @@ fn apply_api_bulk_filters<'a>(
                 .bind::<diesel::sql_types::Text, _>(task_type.clone())
                 .sql(")"),
         );
+    }
+    if let Some(ref queue) = selector.filter.queue_name {
+        query = query.filter(harvest_dead_letters::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = selector.filter.min_attempts {
+        query = query.filter(harvest_dead_letters::attempts.ge(min));
     }
     if let Some(after) = selector.filter.failed_after {
         query = query.filter(harvest_dead_letters::failed_at.ge(after));
@@ -28625,29 +29324,46 @@ pub(crate) async fn admit_update(
     // Scoped by (workflow_name, update_name), not update_name alone, since two
     // different workflows may register update handlers with the same name.
     let execution_for_validation = load_execution(&mut conn, exec_id).await;
+
+    // Resolve the registered update handler once and reuse it for both the
+    // #610 schema-400 check and the #684 validator-422 check. Scoped by
+    // (workflow_name, update_name), not update_name alone, since two different
+    // workflows may register update handlers with the same name.
     if let Ok(execution) = &execution_for_validation
         && let Some(update_info) = runtime
             .registry
             .update_handlers
             .iter()
             .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
-        && let Some(validator) = update_info.validator
-        && let Err(reason) = (validator)(&request.input)
     {
+        // issue #610: structural schema validation of the update argument
+        // against the handler's published `arg_schema` (if any). Runs *before*
+        // the semantic validator below so a malformed payload is rejected at
+        // the edge with a field-level 400 rather than reaching the validator
+        // (422) or becoming durable history. A handler with no published schema
+        // validates Ok (today's behavior, unchanged).
+        if let Err(violations) = update_info.validate_arg(&request.input) {
+            return schema_validation_response("update payload validation failed", violations);
+        }
+
         // Issue #684: a durable pre-admission validator rejection.
-        runtime
-            .registry
-            .telemetry()
-            .metrics
-            .record_update_rejected(&execution.workflow_name, &update_name);
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "update rejected by validator",
-                "reason": reason,
-            })),
-        )
-            .into_response();
+        if let Some(validator) = update_info.validator
+            && let Err(reason) = (validator)(&request.input)
+        {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_update_rejected(&execution.workflow_name, &update_name);
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "update rejected by validator",
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
     }
 
     let update_id = UpdateId::new();
@@ -31042,6 +31758,18 @@ mod tests {
         }
     }
 
+    /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
+    /// `0` and negatives — which match every 1-based-attempt row — are rejected
+    /// so a malformed request can't slip past the empty-filter safety guard.
+    #[test]
+    fn validate_bulk_min_attempts_rejects_non_positive() {
+        assert_eq!(validate_bulk_min_attempts(1).unwrap(), 1);
+        assert_eq!(validate_bulk_min_attempts(3).unwrap(), 3);
+        assert!(validate_bulk_min_attempts(0).is_err());
+        assert!(validate_bulk_min_attempts(-1).is_err());
+        assert!(validate_bulk_min_attempts(i32::MIN).is_err());
+    }
+
     /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
     /// different queue does NOT match it — letting us prove `check()` blocks a
     /// non-matching start only via fail-closed, never because the gate matched.
@@ -32664,6 +33392,130 @@ mod tests {
         );
     }
 
+    /// Codex P1 regression test (issue #610, PR #1092): the plain signal-send
+    /// route (`POST /workflows/{id}/signal/{name}`) gates its #610 payload
+    /// schema validation and #252 payload cap on `api_state.runtime()`. During
+    /// the plugin-startup window (storage pool installed, `install(runtime)`
+    /// not yet complete) `runtime()` errors -- so an `if let Ok(runtime)` guard
+    /// would skip both checks and let `send_signal_idempotent` durably enqueue
+    /// an unvalidated/uncapped payload. Reproduce that exact state and assert
+    /// `signal_workflow` fails closed instead, mirroring `admit_update` above.
+    #[tokio::test]
+    async fn signal_workflow_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to signal_workflow test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "signal_no_runtime",
+                workflow_id: "signal-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup window.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = signal_workflow(
+            Extension(state),
+            Path((exec_id.to_string(), "some_signal".to_string())),
+            Query(SignalQuery::default()),
+            axum::http::HeaderMap::new(),
+            Json(serde_json::json!({ "payload": true })),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "signal_workflow must fail closed when the runtime isn't installed yet, not silently \
+             enqueue an unvalidated payload"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // And the signal must NOT have been durably enqueued -- no
+        // `harvest_signals` row should exist for this execution. (This is the
+        // load-bearing "did not fall through to send_signal_idempotent" check:
+        // without the fail-closed guard the handler would insert a signal row
+        // here and return 202 instead of the 400 asserted above.)
+        let rows: Vec<CountRow> = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM harvest_signals WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .load(&mut conn)
+        .await
+        .expect("signal count query should run");
+        // `rows.as_slice()` avoids the diesel `RunQueryDsl::first`
+        // method-resolution ambiguity a bare `rows.first()` triggers on a `Vec`
+        // of query rows.
+        let signal_count = match rows.as_slice() {
+            [first, ..] => first.n,
+            [] => 0,
+        };
+        assert_eq!(
+            signal_count, 0,
+            "the signal must not have been durably enqueued while the runtime was unavailable"
+        );
+    }
+
     fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {
         let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
             diesel_async::AsyncPgConnection,
@@ -34108,6 +34960,265 @@ mod tests {
         assert!(state.decode_payloads_on_read());
         state.set_decode_payloads_on_read(false);
         assert!(!state.decode_payloads_on_read());
+    }
+
+    // ── Read-only operator role (issue #776) ─────────────────────────────────
+
+    fn session_with(pairs: &[(&str, &str)]) -> Session {
+        let mut data = std::collections::HashMap::new();
+        for (k, v) in pairs {
+            data.insert((*k).to_string(), (*v).to_string());
+        }
+        Session::new_for_test("harvest-test-session".to_string(), data)
+    }
+
+    #[tokio::test]
+    async fn readonly_access_recognizes_readonly_markers_and_rejects_admin() {
+        // No session ⇒ full access (not readonly-restricted).
+        assert!(!has_harvest_readonly_access(None).await);
+
+        // Every read-only role value + flag marker ⇒ readonly.
+        for role in [
+            "harvest_readonly",
+            "harvest_operator",
+            "operator",
+            "readonly",
+            "read_only",
+        ] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[("role", role)]))).await,
+                "role={role} must be recognized as read-only"
+            );
+        }
+        for flag in ["is_harvest_readonly", "is_harvest_operator"] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[(flag, "true")]))).await,
+                "flag {flag}=true must be recognized as read-only"
+            );
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[(flag, "1")]))).await,
+                "flag {flag}=1 must be recognized as read-only"
+            );
+        }
+
+        // Admin marker present ⇒ NOT readonly-restricted (admin wins),
+        // even if a read-only marker is also present.
+        for admin in [("role", "admin"), ("role", "harvest_admin")] {
+            assert!(!has_harvest_readonly_access(Some(session_with(&[admin]))).await);
+        }
+        for flag in ["is_harvest_admin", "is_admin"] {
+            assert!(!has_harvest_readonly_access(Some(session_with(&[(flag, "true")]))).await);
+        }
+        assert!(
+            !has_harvest_readonly_access(Some(session_with(&[
+                ("role", "harvest_readonly"),
+                ("is_harvest_admin", "true"),
+            ])))
+            .await,
+            "admin marker must win over a concurrent read-only marker"
+        );
+
+        // No relevant marker ⇒ full access (not readonly-restricted).
+        assert!(!has_harvest_readonly_access(Some(session_with(&[("user_id", "u1")]))).await);
+    }
+
+    #[tokio::test]
+    async fn readonly_access_normalizes_marker_case_and_truthy_spellings() {
+        // F2: a case-mismatched read-only marker must still be recognized —
+        // failing to would fail OPEN (an embedder intending restriction
+        // silently grants admin). Mixed-case / padded role values.
+        for role in [
+            "ReadOnly",
+            "READONLY",
+            "Read_Only",
+            "  harvest_readonly  ",
+            "Harvest_Operator",
+            "OPERATOR",
+        ] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[("role", role)]))).await,
+                "case/whitespace-variant role={role:?} must be recognized as read-only"
+            );
+        }
+        // Broader truthy spellings, case-insensitive.
+        for truthy in ["TRUE", "True", "yes", "YES", "On", "1", " true "] {
+            assert!(
+                has_harvest_readonly_access(Some(session_with(&[("is_harvest_readonly", truthy)])))
+                    .await,
+                "is_harvest_readonly={truthy:?} must be truthy"
+            );
+        }
+        // A mis-cased ADMIN marker must still win over a read-only marker
+        // (admin ⊇ read-only), so admin case-mismatch never restricts.
+        assert!(
+            !has_harvest_readonly_access(Some(session_with(&[
+                ("role", "harvest_readonly"),
+                ("is_harvest_admin", "TRUE"),
+            ])))
+            .await,
+            "mis-cased admin flag must still win over a concurrent read-only marker"
+        );
+        assert!(
+            !has_harvest_readonly_access(Some(session_with(&[("role", "Harvest_Admin")]))).await,
+            "mis-cased admin role must not be treated as read-only"
+        );
+    }
+
+    #[test]
+    fn classify_route_matches_class_and_precedence() {
+        use axum::http::Method;
+
+        // Static-beats-param precedence: /workflows/count is ReadOnly and must
+        // NOT be captured by the /workflows/{id} ReadOnly matcher (both read,
+        // but the precedence is the load-bearing property that a mutation like
+        // /workflows/batch_start is never mistaken for /workflows/{id}).
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/batch_start"),
+            RouteClass::Mutating,
+            "static POST /workflows/batch_start must not match a param route"
+        );
+        // Per-method divergence on the same path.
+        assert_eq!(
+            classify_route(&Method::GET, "/admin/schedules/abc-123"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::DELETE, "/admin/schedules/abc-123"),
+            RouteClass::Mutating
+        );
+        assert_eq!(
+            classify_route(&Method::PATCH, "/admin/schedules/abc-123"),
+            RouteClass::Mutating
+        );
+        // Concrete param path resolves to the templated route's class.
+        assert_eq!(
+            classify_route(&Method::GET, "/workflows/exec-uuid"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/exec-uuid/cancel"),
+            RouteClass::Mutating
+        );
+        // ReadOnly POST-for-body routes: keyed on class, never the verb.
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/exec-uuid/query/progress"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/admin/build-routing/retire"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/admin/schedules/preview"),
+            RouteClass::ReadOnly
+        );
+        // PublicSafe.
+        assert_eq!(
+            classify_route(&Method::GET, "/health"),
+            RouteClass::PublicSafe
+        );
+        // Newly-classified #776 mutations.
+        assert_eq!(
+            classify_route(&Method::POST, "/admin/circuits/act/force-open"),
+            RouteClass::Mutating
+        );
+        assert_eq!(
+            classify_route(&Method::DELETE, "/calendars/business"),
+            RouteClass::Mutating
+        );
+        // by-id 4-segment mutation vs 2-segment stub (ReadOnly).
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/by-id/wf/wid/cancel"),
+            RouteClass::Mutating
+        );
+        assert_eq!(
+            classify_route(&Method::POST, "/workflows/by-id/wf"),
+            RouteClass::ReadOnly
+        );
+    }
+
+    #[test]
+    fn classify_route_head_inherits_get_class() {
+        use axum::http::Method;
+        // F3: HEAD is served by axum via the GET handler, so it must inherit
+        // the GET route's read class rather than fail closed to Mutating — a
+        // read-only principal must be able to HEAD-probe readable resources.
+        assert_eq!(
+            classify_route(&Method::HEAD, "/health"),
+            RouteClass::PublicSafe
+        );
+        assert_eq!(
+            classify_route(&Method::HEAD, "/workflows/exec-uuid"),
+            RouteClass::ReadOnly
+        );
+        assert_eq!(
+            classify_route(&Method::HEAD, "/admin/schedules/abc-123"),
+            RouteClass::ReadOnly,
+            "HEAD must map to the GET class even where DELETE/PATCH are Mutating"
+        );
+        // A HEAD of a path with no GET route still fails closed.
+        assert_eq!(
+            classify_route(&Method::HEAD, "/totally/unknown/route"),
+            RouteClass::Mutating
+        );
+        // deny_readonly_mutation must permit HEAD of a read route.
+        assert!(!deny_readonly_mutation(
+            true,
+            classify_route(&Method::HEAD, "/workflows/exec-uuid")
+        ));
+    }
+
+    #[test]
+    fn classify_route_fails_closed_on_unknown() {
+        use axum::http::Method;
+        // Unmatched path ⇒ Mutating (fail closed).
+        assert_eq!(
+            classify_route(&Method::GET, "/totally/unknown/route"),
+            RouteClass::Mutating
+        );
+        // Unknown method for an existing path ⇒ Mutating (fail closed).
+        assert_eq!(
+            classify_route(&Method::PUT, "/workflows/exec-uuid"),
+            RouteClass::Mutating
+        );
+        // The /ui sub-router is unclassified ⇒ Mutating (fail closed).
+        assert_eq!(
+            classify_route(&Method::GET, "/ui/workflows"),
+            RouteClass::Mutating
+        );
+    }
+
+    #[test]
+    fn route_class_matchers_build_without_conflict() {
+        // Building the matchers panics on any matchit insert conflict; simply
+        // resolving them proves the whole CLASSIFIED_ROUTES set registers
+        // (positional param normalization avoids name-conflict panics) and
+        // parses cleanly (every template splits into a known method).
+        let matchers = route_class_matchers();
+        assert!(!matchers.is_empty());
+        assert!(matchers.contains_key(&axum::http::Method::GET));
+        assert!(matchers.contains_key(&axum::http::Method::POST));
+        assert!(matchers.contains_key(&axum::http::Method::DELETE));
+    }
+
+    #[test]
+    fn normalize_route_template_rewrites_params_positionally() {
+        assert_eq!(normalize_route_template("/health"), "/health");
+        assert_eq!(
+            normalize_route_template("/workflows/{id}"),
+            "/workflows/{p0}"
+        );
+        assert_eq!(
+            normalize_route_template("/workflows/{workflow_name}/start"),
+            "/workflows/{p0}/start"
+        );
+        // Distinct positional names within one route (matchit forbids dup names).
+        assert_eq!(
+            normalize_route_template(
+                "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}"
+            ),
+            "/workflows/by-id/{p0}/{p1}/query/{p2}"
+        );
     }
 
     #[test]

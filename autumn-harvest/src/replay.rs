@@ -521,6 +521,25 @@ struct StashedExternalCancel {
     terminal: Option<StashedCancelTerminal>,
 }
 
+/// The frozen resolution recorded on a `LocalActivityScheduled` event
+/// (issue #620, AC8; Codex P2). Returned by
+/// [`HistoryMatcher::recorded_local_activity_resolution`].
+///
+/// `Default` yields the "unresolved legacy" shape (`resolved == false`, both
+/// frozen fields `None`) so a pre-#620 event or an absent `activity_id` falls
+/// back to live re-derivation on crash recovery.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LocalActivityResolution {
+    /// `true` for a #620+ event whose frozen fields below are authoritative
+    /// (even when `None`); `false` for a legacy event → re-derive live.
+    pub(crate) resolved: bool,
+    /// The frozen fully-resolved retry policy, or `None`.
+    pub(crate) retry_policy: Option<crate::policy::RetryPolicy>,
+    /// The frozen fully-resolved `start_to_close` in nanoseconds (full
+    /// `Duration` precision), or `None`.
+    pub(crate) start_to_close_nanos: Option<u64>,
+}
+
 /// Walks through recorded workflow events during replay, matching
 /// commands against what was previously recorded.
 ///
@@ -1196,8 +1215,26 @@ impl HistoryMatcher {
                 WorkflowEvent::MarkerRecorded { .. }
                 | WorkflowEvent::SideEffectRecorded { .. }
                 | WorkflowEvent::TimerStarted { .. }
-                | WorkflowEvent::TimerCancelled { .. } => {
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Progress/terminal events of concurrent siblings from a mixed
+                // suspension batch — a sibling timer's fire (an expired timer
+                // firing before this activity's terminal, e.g.
+                // `tokio::join!(activity, ctx.timer(...))`), a child workflow's
+                // terminal, or a local activity's terminal — are transparent to
+                // this activity's terminal scan. Cross them NON-CONSUMINGLY,
+                // leaving each for its own matcher to claim after the rewind
+                // (issue #1071 manifestation #2). Keep this sibling-terminal set
+                // in sync with `match_signal_or_timer`'s and
+                // `match_timer_strict`'s (issue #1071).
+                WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. } => {
                     scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
@@ -2963,10 +3000,63 @@ impl HistoryMatcher {
                 continue;
             }
 
+            // Interleaved sibling commands from a mixed suspension batch
+            // (e.g. `tokio::join!(ctx.timer(...), ctx.execute_activity(...))`
+            // where the timer command is emitted FIRST). Keep the first one as
+            // the rewind cursor — mirroring `match_signal_or_timer` — and scan
+            // past it so this timer's own `TimerFired` recorded later is still
+            // found. `settle_terminal` rewinds to it so the sibling's own
+            // matcher re-scans in program order (issue #1071).
+            if matches!(
+                &self.events[scan_cursor],
+                WorkflowEvent::ActivityScheduled { .. }
+                    | WorkflowEvent::LocalActivityScheduled { .. }
+                    | WorkflowEvent::MarkerRecorded { .. }
+                    | WorkflowEvent::SideEffectRecorded { .. }
+            ) {
+                first_interleaved_command.get_or_insert(scan_cursor);
+                scan_cursor += 1;
+                continue;
+            }
+
+            // Progress and terminal events of those concurrent siblings — and
+            // fires of FOREIGN timers (id != timer_id; this timer's own fire is
+            // matched above) — are transparent to this timer's scan. Cross them
+            // NON-CONSUMINGLY, leaving each for its own matcher to claim after
+            // the rewind (a foreign `TimerFired` belongs to the sibling timer's
+            // own `match_timer_strict`; consuming it here would steal it). This
+            // is the reversed-fire-order multi-timer case (issue #1071 #4).
+            // Keep this sibling-terminal set in sync with
+            // `match_signal_or_timer`'s and `scan_activity_terminal`'s (issue #1071).
+            if matches!(
+                &self.events[scan_cursor],
+                WorkflowEvent::ActivityStarted { .. }
+                    | WorkflowEvent::ActivityHeartbeat { .. }
+                    | WorkflowEvent::ActivityCompleted { .. }
+                    | WorkflowEvent::ActivityFailed { .. }
+                    | WorkflowEvent::ActivityTimedOut { .. }
+                    | WorkflowEvent::LocalActivityCompleted { .. }
+                    | WorkflowEvent::LocalActivityFailed { .. }
+                    | WorkflowEvent::ChildWorkflowCompleted { .. }
+                    | WorkflowEvent::ChildWorkflowFailed { .. }
+                    | WorkflowEvent::TimerFired { .. }
+            ) {
+                scan_cursor += 1;
+                continue;
+            }
+
             break;
         }
 
-        // Timer was started but never fired — incomplete history
+        // Timer was started but never fired — incomplete history.
+        //
+        // No rewind is needed here even though the scan may have crossed
+        // interleaved sibling commands: `self.cursor` was never advanced past
+        // them (only the local `scan_cursor` moved). Only `settle_terminal`, on
+        // an actual win, persists scan progress by moving `self.cursor` — the
+        // no-match path leaves the cursor at this timer's `TimerStarted` so the
+        // suspending `ctx.timer` re-parks correctly and the interleaved siblings
+        // stay claimable by their own matchers in program order.
         HistoryMatch::NoMatch
     }
 
@@ -3341,6 +3431,25 @@ impl HistoryMatcher {
     /// Match a signal wait command against history.
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
+    ///
+    /// # Known limitation (issue #1071 / #768 finding 5.1)
+    ///
+    /// The forward scan of this method (and of `match_timer_strict` /
+    /// `scan_activity_terminal`) crosses an interleaved sibling's `TimerFired`
+    /// NON-CONSUMINGLY when the awaited signal wins, advancing the cursor PAST
+    /// the fire. If that fire belongs to a **cancellable timer** (issue #768:
+    /// `ctx.start_timer(...)` + `TimerHandle::await_fire()`) composed with this
+    /// plain signal wait in the SAME suspension batch — e.g.
+    /// `join!(ctx.wait_for_signal("go"), handle.await_fire())` where the
+    /// cancellable timer's `TimerFired` is recorded BEFORE the signal — the
+    /// signal-win strands that fire BEHIND the cursor. `await_fire` resolves via
+    /// `match_timer_or_cancel`, whose outcome scan only moves FORWARD from the
+    /// cursor, so it misses the behind-cursor fire and cannot resolve —
+    /// diverging strict `WorkflowReplayer` replay. On a live worker this
+    /// self-heals (the arm re-fires), but the composition is unsupported;
+    /// use `ctx.receive_signal_timeout` (issue #476) for a signal-or-deadline
+    /// shape. Pinned by
+    /// `known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order`.
     #[allow(clippy::too_many_lines)]
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
         if let Some(index) = self
@@ -3389,6 +3498,44 @@ impl HistoryMatcher {
                 }
                 ev if Self::is_update_event(ev) => {
                     // Update events are transparent to signal scanning.
+                    scan_cursor += 1;
+                }
+                // A reserved deadline timer (issue #476's
+                // `__signal_timeout:{seq}:{name}` convention) for THIS awaited
+                // signal — a spent deadline from this wait's own signal-or-deadline
+                // composition, recorded earlier in the batch, where the plain
+                // signal ultimately won AFTER the deadline event. Cross it WITHOUT
+                // setting `first_interleaved_command` (its paired `TimerFired`
+                // crosses via the arm below), so the awaited signal recorded after
+                // the spent deadline is found and the reserved events end up behind
+                // the cursor on the win — never flagging early completion (issue
+                // #1071 manifestation #3).
+                //
+                // The guard is scoped to THIS signal's OWN name. A reserved
+                // deadline for a DIFFERENT signal name (e.g. matching
+                // `wait_for_signal("a")` while a concurrent
+                // `receive_signal_timeout("b", …)` armed `__signal_timeout:N:b`)
+                // belongs to that sibling race's own `match_signal_or_timer("b")`,
+                // which positionally re-anchors on its `TimerStarted`. Crossing a
+                // FOREIGN reserved timer WITHOUT rewind here would advance the
+                // cursor past the sibling's reserved events, so its later poll can
+                // no longer find its own `TimerStarted` → false EarlyCompletion / a
+                // re-armed spent timer (Codex P1 on PR #1084). So a foreign-name
+                // reserved timer instead falls through to the generic
+                // `TimerStarted` rewind arm below (as does a genuine user
+                // `ctx.timer` sibling), which sets `first_interleaved_command` so
+                // the sibling race / `match_timer_strict` re-matches after the win.
+                //
+                // NOTE (issue #1071): this arm assumes the SAME-name reserved
+                // deadline is SPENT (the signal won after the deadline event was
+                // recorded). It does not disambiguate a same-name race that is
+                // still OPEN at this cursor and racing THIS plain wait for the same
+                // signal (a plain `wait_for_signal("go")` interleaved with a
+                // still-open `receive_signal_timeout("go", …)` for the same name in
+                // the same batch) — that composition is an unsupported/exotic shape.
+                WorkflowEvent::TimerStarted { timer_id, .. }
+                    if Self::signal_timeout_race_name(timer_id.as_str()) == Some(signal_name) =>
+                {
                     scan_cursor += 1;
                 }
                 // A detached-spawn or a cancellable-timer arm/cancel (issue #768)
@@ -3486,6 +3633,30 @@ impl HistoryMatcher {
                         p.terminal = Some(StashedCancelTerminal::Failed(code));
                     }
                     self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // A foreign timer's fire — a sibling deadline timer that fired
+                // before the awaited signal arrived (e.g. a concurrent
+                // `receive_signal_timeout`/`ctx.timer` in the same suspension
+                // batch, whose `TimerFired` is recorded ahead of the delivered
+                // `SignalReceived`) — is transparent to the signal scan. Cross
+                // it NON-CONSUMINGLY, leaving it for its own timer matcher, and
+                // keep scanning for the awaited signal (issue #1071
+                // manifestation #3). This does NOT set `first_interleaved_command`,
+                // so the round-13 stray-`TimerStarted` park-forever guard below
+                // (an interleaved timer with NO resolving signal → diverge) is
+                // untouched: a lone `TimerStarted` still diverges.
+                //
+                // DELIBERATE PARTIAL SCOPE (issue #1071): only the TIMER sibling
+                // is tolerated in `match_signal` — the sole case the issue's
+                // three comments name. An interleaved activity/child/local-activity
+                // sibling in a `join!(wait_for_signal, activity)` mixed batch is
+                // NOT crossed here and still falls through to `other =>` as a
+                // divergence. Full mixed-batch parity for the signal wait is out
+                // of scope; the fuller interleaved sets live in
+                // `match_timer_strict` / `scan_activity_terminal` /
+                // `match_signal_or_timer`.
+                WorkflowEvent::TimerFired { .. } => {
                     scan_cursor += 1;
                 }
                 other => {
@@ -4813,6 +4984,9 @@ impl HistoryMatcher {
                 activity_id,
                 name: recorded_name,
                 input: recorded_input,
+                // Issue #620: the recorded resolved retry policy is not part of
+                // strict-replay matching (name + input only), so ignore it here.
+                ..
             } => {
                 if recorded_name != activity_name {
                     return HistoryMatch::Diverged {
@@ -4853,6 +5027,45 @@ impl HistoryMatcher {
             } => HistoryMatch::NoMatch,
             other => other,
         }
+    }
+
+    /// The frozen resolution (retry policy + `start_to_close`) a local activity
+    /// was scheduled with at first-schedule time (issue #620, AC8; Codex P2).
+    /// Read-only, cursor-independent: scans recorded history for the
+    /// `LocalActivityScheduled` event carrying `activity_id` and clones its
+    /// three additive fields in one pass.
+    ///
+    /// `resolved` is the disambiguation marker: `true` for a #620+ event whose
+    /// frozen `retry_policy`/`start_to_close_nanos` are authoritative on
+    /// recovery even when `None` ("explicitly resolved to no floor"); `false`
+    /// for a pre-#620 legacy event (all three fields absent → the marker
+    /// deserializes to `false`), which the crash-recovery path in
+    /// [`WorkflowContext::execute_local_activity_raw`](crate::context::WorkflowContext::execute_local_activity_raw)
+    /// treats as "re-derive from the live defaults" for backward compatibility.
+    /// A missing `activity_id` (no matching scheduled event) reports the same
+    /// unresolved default.
+    #[must_use]
+    pub(crate) fn recorded_local_activity_resolution(
+        &self,
+        activity_id: ActivityExecId,
+    ) -> LocalActivityResolution {
+        self.events
+            .iter()
+            .find_map(|ev| match ev {
+                WorkflowEvent::LocalActivityScheduled {
+                    activity_id: recorded_id,
+                    resolved,
+                    retry_policy,
+                    start_to_close_nanos,
+                    ..
+                } if *recorded_id == activity_id => Some(LocalActivityResolution {
+                    resolved: *resolved,
+                    retry_policy: retry_policy.clone(),
+                    start_to_close_nanos: *start_to_close_nanos,
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// Versioning mechanism for safe workflow code changes.
@@ -8116,6 +8329,26 @@ mod tests {
     }
 
     #[test]
+    fn matcher_signal_scan_parks_on_lone_open_deadline_timer() {
+        // Determinism-review finding 1.2 (issue #1071): a LONE reserved
+        // signal-or-deadline race timer (`__signal_timeout:{seq}:{name}`, issue
+        // #476) with NO matching `TimerFired` and NO signal represents a
+        // legitimate concurrent OPEN `receive_signal_timeout` race whose signal
+        // has not arrived yet. A plain `match_signal` over that history must
+        // return `NoMatch` (park until the signal arrives), NOT `Diverged` —
+        // the reserved-timer arm crosses it WITHOUT setting
+        // `first_interleaved_command`, so the round-13 stray-`TimerStarted`
+        // park-forever guard does not falsely nd-block the open race.
+        let events = vec![ts("__signal_timeout:0:go", 300)];
+        let mut m = HistoryMatcher::new(events);
+        assert_eq!(
+            m.match_signal("go"),
+            HistoryMatch::NoMatch,
+            "a lone open signal-or-deadline race deadline timer must park (NoMatch), not diverge"
+        );
+    }
+
+    #[test]
     fn matcher_signal_scan_sequential_reset_then_signal_matches() {
         // Legit case (round-7 reason preserved): a sequential
         // `reset_timer(); receive_signal().await` records
@@ -8423,6 +8656,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -8448,6 +8684,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8485,6 +8724,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8520,6 +8762,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8575,6 +8820,9 @@ mod tests {
             activity_id: id,
             name: "other_activity".into(),
             input: Value::Null,
+            retry_policy: None,
+            resolved: false,
+            start_to_close_nanos: None,
         }];
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
@@ -8597,6 +8845,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8637,6 +8888,9 @@ mod tests {
                 activity_id: local_id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: local_id,
@@ -8789,6 +9043,9 @@ mod tests {
                 activity_id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,

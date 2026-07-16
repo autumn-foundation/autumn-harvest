@@ -1839,6 +1839,9 @@ mod tests {
                 activity_id,
                 name: "compute".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -1873,6 +1876,9 @@ mod tests {
                 activity_id,
                 name: "compute".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,

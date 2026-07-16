@@ -191,24 +191,55 @@
 //! `NOTIFY` push wake-ups, multi-server crash recovery, schedules, the management
 //! API, retention, worker sessions, sharding, and DAGs.
 //!
-//! ## Start-boundary reuse policy — NOT enforced in v0.1 (non-idempotent starts)
+//! ## Start-boundary reuse policy — enforced (issue #1068)
 //!
-//! This backend does **not** enforce `(workflow_name, workflow_id)` uniqueness and
-//! does **not** apply the core Postgres start path's `WorkflowIdReusePolicy` matrix.
-//! Every
-//! [`start_workflow`](crate::SqliteRuntime::start_workflow) /
-//! [`start_workflow_with_id`](crate::SqliteRuntime::start_workflow_with_id) call
-//! creates a NEW, independent execution — even when the supplied `workflow_id`
-//! matches a prior run — so a duplicate delivery repeats its side effects. The
-//! `workflow_id` is observability + idempotency-key *material* (surfaced faithfully
-//! via `ctx.info().workflow_id`, cross-backend-identical), NOT an enforced
-//! start-boundary uniqueness key. Callers needing idempotent starts must dedupe
-//! upstream in v0.1. Faithfully mirroring the core reuse-policy matrix (the sealed
-//! `TERMINATED` state, `AllowDuplicateFailedOnly`, the uniqueness-index-excludes-
-//! terminal nuance) is real, out-of-v0.1-scope work tracked as an issue #1068
-//! follow-up — a partial reuse impl would itself be a new cross-backend parity bug,
-//! so it is rejected here rather than implemented halfway. See the per-method
-//! rustdoc on `start_workflow_with_id` for the full contract.
+//! This backend enforces the `(workflow_name, workflow_id)` start-boundary
+//! reuse-policy matrix, mirroring the core Postgres PLAIN-start path.
+//! [`start_workflow_with_id`](crate::SqliteRuntime::start_workflow_with_id) is
+//! idempotent by default (the
+//! [`AllowDuplicate`](autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate)
+//! policy): a duplicate delivery for the same non-sealed `workflow_id` ATTACHES —
+//! the same [`ExecutionId`](crate::ExecutionId) is returned and no second run is
+//! started — so a retried webhook is idempotent instead of repeating its side
+//! effects.
+//! [`start_workflow_with_reuse_policy`](crate::SqliteRuntime::start_workflow_with_reuse_policy)
+//! exposes the full four-policy matrix and returns a
+//! [`StartOutcome`](crate::StartOutcome) (whether a fresh run was created);
+//! [`start_workflow`](crate::SqliteRuntime::start_workflow) (no id) still creates a
+//! distinct run every call, since its defaulted `workflow_id` is unique per run.
+//!
+//! The reuse decision is atomic in the single-writer start transaction (no
+//! concurrent writers ⇒ a lookup-then-decide needs no database uniqueness index; a
+//! unique index would also fail to build on reopen of a pre-#1068 file already
+//! holding duplicate active ids). A replaced/superseded prior is SEALED to
+//! `CONTINUED_AS_NEW` and thereby excluded from the reuse lookup, mirroring core's
+//! uniqueness-index-excludes-terminal nuance.
+//!
+//! ### State-model restriction vs. the Postgres core
+//!
+//! This backend's execution state model is a strict subset of the core's: an
+//! active run is only ever `RUNNING` (there is no `PAUSED`), and the only terminal
+//! states it writes are `COMPLETED`, `FAILED`, and the `CONTINUED_AS_NEW` SEAL used
+//! by the reuse "replace" cases (it never writes a distinct `TIMED_OUT`, an active
+//! `CANCELLED`, or a distinct `TERMINATED`). So the reuse matrix is realized over
+//! `{none, RUNNING, COMPLETED, FAILED}` priors only:
+//!
+//! - `AllowDuplicate` — attach to / return any non-sealed prior; else fresh.
+//! - `RejectDuplicate` — [`SqliteError::AlreadyExists`] for any non-sealed prior;
+//!   else fresh (a SEALED-only prior is invisible, so it creates fresh).
+//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED prior; return a
+//!   RUNNING/COMPLETED prior unchanged; else fresh. (Core also replaces a
+//!   `CANCELLED` prior, but this backend has no active `CANCELLED` state, so FAILED
+//!   is the only replace case.)
+//! - `TerminateIfRunning` — cancel (record `WorkflowCancelled` + clean up the
+//!   prior's PENDING tasks and unfired timers) then seal a RUNNING prior; seal an
+//!   already-terminal prior without a cancellation event; then start fresh. The
+//!   single-writer runtime replaces the prior atomically and never drives it again,
+//!   so this forcefully seals the prior (observably equivalent to core) rather than
+//!   delivering cooperative cancellation the prior's body could observe.
+//!
+//! See the per-method rustdoc on `start_workflow_with_reuse_policy` for the full
+//! matrix table.
 //!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!
@@ -494,5 +525,7 @@ mod worker;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
-pub use crate::runtime::{ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime};
+pub use crate::runtime::{
+    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
+};
 pub use crate::store::ActivityAttempt;

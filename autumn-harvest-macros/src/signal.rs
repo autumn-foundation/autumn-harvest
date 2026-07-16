@@ -9,18 +9,28 @@ use syn::{ItemFn, LitStr, parse::Parser as _};
 
 struct SignalAttrs {
     workflow: Option<String>,
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<SignalAttrs> {
-    let mut result = SignalAttrs { workflow: None };
+    let mut result = SignalAttrs {
+        workflow: None,
+        description: None,
+    };
 
     syn::meta::parser(|meta| {
         if meta.path.is_ident("workflow") {
             let value: LitStr = meta.value()?.parse()?;
             result.workflow = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected `workflow = \"workflow_name\"`"))
+            Err(meta.error(
+                "unsupported attribute: expected `workflow = \"workflow_name\"` or `description = \"…\"`",
+            ))
         }
     })
     .parse2(attr)?;
@@ -61,6 +71,16 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let method_name = format_ident!("signal_{fn_name}");
     let idem_method_name = format_ident!("signal_{fn_name}_idempotent");
+    let companion_name = format_ident!("__autumn_signal_handler_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
+
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
+
+    // Best-effort Rust type name for the payload (params after `ctx`).
+    let arg_type_hint = build_arg_type_hint(&func.sig.inputs.iter().skip(1).collect::<Vec<_>>());
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -214,8 +234,51 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #func
 
+        #[doc(hidden)]
+        pub fn #companion_name() -> ::autumn_harvest::SignalHandlerInfo {
+            ::autumn_harvest::SignalHandlerInfo {
+                name: #fn_name_str,
+                workflow: #workflow_simple_name,
+                module: module_path!(),
+                arg_type_hint: #arg_type_hint,
+                description: #description_expr,
+                arg_schema: ::std::option::Option::None,
+            }
+        }
+
+        /// Returns the [`::autumn_harvest::SignalHandlerInfo`] for this signal.
+        ///
+        /// Chain a payload-schema builder at registration, e.g.
+        /// `.signals(vec![#public_info_name().with_schemas::<Arg>()])`.
+        pub fn #public_info_name() -> ::autumn_harvest::SignalHandlerInfo {
+            #companion_name()
+        }
+
         #impl_block
     }
+}
+
+/// Returns a `String` describing the payload params for `arg_type_hint`.
+fn build_arg_type_hint(params: &[&syn::FnArg]) -> String {
+    if params.is_empty() {
+        return "()".to_string();
+    }
+    if params.len() == 1
+        && let syn::FnArg::Typed(pt) = params[0]
+    {
+        return crate::type_name_hint(&pt.ty);
+    }
+    let parts: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg {
+                Some(crate::type_name_hint(&pt.ty))
+            } else {
+                None
+            }
+        })
+        .collect();
+    format!("({})", parts.join(", "))
 }
 
 fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {

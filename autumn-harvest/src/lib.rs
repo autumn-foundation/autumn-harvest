@@ -248,6 +248,11 @@ pub mod store;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod timeout;
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_activities;
+/// Postgres storage and dispatch resolution for WASM activities (issue #965).
+#[cfg(feature = "wasm-activities")]
+pub mod wasm_store;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod worker;
@@ -289,8 +294,8 @@ pub use context::{
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
-    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
-    DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
+    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagInputBinding,
+    DagMapTaskRef, DagMergeSource, DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
 };
 #[cfg(feature = "testing")]
 pub use dag_export::export_profile_mermaid_gantt;
@@ -347,8 +352,9 @@ pub use history_export::{
     HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
 };
 pub use info::{
-    ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
-    UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
+    ActivityHandlerFn, ActivityInfo, DagInfo, InterfaceHandlerRecord, QueryHandlerFn,
+    QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerFn, UpdateHandlerInfo, UpdateValidatorFn,
+    WorkflowHandlerFn, WorkflowInfo, WorkflowInterfaceRecord,
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
@@ -444,6 +450,20 @@ pub use version_usage::{
 pub use webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookHandlerFn, WebhookTarget, WebhookTriggerInfo,
     validate_webhook_triggers,
+};
+
+#[cfg(feature = "wasm-activities")]
+pub use wasm_activities::{
+    DEFAULT_FUEL, DEFAULT_MAX_WALL_CLOCK, DEFAULT_MEMORY_BYTES, EPOCH_TICK_INTERVAL,
+    WASM_MAX_OUTPUT_BYTES, WasmCapabilities, WasmLimits, WasmModuleStore, deadline_ticks,
+    invoke_wasm_activity,
+};
+#[cfg(feature = "wasm-activities")]
+pub use wasm_store::{
+    MAX_WASM_MODULE_BYTES, PreparedWasmActivity, WasmActivityRegistration, WasmBinding,
+    WasmDispatch, WasmModuleRow, fetch_wasm_module_bytes, list_wasm_modules, publish_wasm_module,
+    resolve_active_wasm_hash, resolve_active_wasm_module, resolve_wasm_dispatch,
+    seed_registered_wasm_modules, seed_wasm_module,
 };
 
 #[cfg(feature = "db")]

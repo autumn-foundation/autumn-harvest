@@ -10,6 +10,41 @@ These come up in roughly the order you'll need them.
 for a flat retry, or build a `RetryPolicy` directly when you need a custom
 shape (max interval, backoff coefficient, non-retryable error filters).
 
+**A fleet-wide reliability floor (builder-default retry / `start_to_close`).**
+Instead of repeating the same `retry = …` / `start_to_close = …` on every
+`#[activity]`, set a default *floor* once on the worker and let activities that
+care override it:
+
+```rust
+WorkerConfig::default()
+    .with_default_activity_retry_policy(RetryPolicy::fixed(3, Duration::from_secs(1)))
+    .with_default_activity_start_to_close(Duration::from_secs(30))
+```
+
+The floor is resolved at **schedule time** as the lowest-priority fallback. The
+full precedence, highest first:
+
+1. **call-site override** — `ctx.execute_activity_with_opts(..)` / the DAG opts path
+2. **activity's own default** — `#[activity(retry = …, start_to_close = …)]`
+3. **builder default** — the two `with_default_activity_*` methods above
+4. **implicit fallback** — today's behaviour when nothing is set anywhere
+
+It is **opt-in**: leave both unset and every activity behaves byte-for-byte as
+it does today. In particular the implicit fallback is *not* "a single attempt" —
+a regular activity with no retry configured anywhere is still enqueued with the
+engine's default `max_attempts = 3` (a local activity's implicit fallback is a
+single attempt). The floor only raises the bar for activities that declared
+*nothing*; an activity that declares its own `retry` (or a call site that passes
+one) always wins.
+
+Scope: this covers **retry** and **`start_to_close`** only —
+`heartbeat_timeout` and `schedule_to_start` are deliberately out of scope (they
+have no fleet-wide "floor" semantics). For **local** activities the resolved
+`start_to_close` is still clamped by
+`WorkerConfig::max_local_activity_start_to_close` (60 s by default), so a
+builder default larger than that cap never grants a local activity more than the
+cap.
+
 **Per-activity concurrency caps.** Add `max_concurrent = N` to bound the
 cluster-wide in-flight count without provisioning a dedicated worker. Share
 the budget across activities by giving them the same `concurrency_key`.

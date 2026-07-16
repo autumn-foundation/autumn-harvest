@@ -100,13 +100,23 @@ async fn equal_deadline_timers_fire_in_arm_order_and_replay_on_core() {
     );
 }
 
-/// The falsifiable control that proves the fire ORDER is load-bearing: a
-/// hand-built history identical to the passing one EXCEPT the two `TimerFired`
-/// events are reversed does NOT replay on the core — it diverges. This is exactly
-/// the wedge the `arm_seq` tie-break prevents (the fix is what guarantees the
-/// backend never produces this reversed order for equal deadlines).
+/// Companion to the money test above, updated for issue #1071. Before #1071 the
+/// core `HistoryMatcher::match_timer` scan STOPPED at an unconsumed sibling
+/// `TimerFired`, so a hand-built history identical to the passing one EXCEPT the
+/// two `TimerFired` events reversed WEDGED core replay (`NonDeterminismDetected`)
+/// — and this test asserted exactly that wedge. Issue #1071 made the forward-scan
+/// timer matcher tolerate interleaved sibling terminals: `match_timer_strict` now
+/// crosses a FOREIGN `TimerFired` non-consumingly and each timer's own fire is
+/// still found, so the reversed order now replays CLEANLY on the core (the same
+/// intentional behavior pinned by
+/// `interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded` in the
+/// core `replayer_tests`). The `SQLite` `arm_seq` tie-break remains valuable — it
+/// guarantees a STABLE, arm-order fire sequence rather than a SQLite-unspecified
+/// one (asserted by the money test above) — but it is no longer a
+/// replay-correctness prerequisite. This test now pins that #1071 interaction so a
+/// future core regression that re-wedges reversed sibling fire order is caught.
 #[tokio::test]
-async fn reversed_timer_fire_order_breaks_core_replay() {
+async fn reversed_timer_fire_order_replays_on_core_after_1071() {
     let reversed = vec![
         WorkflowEvent::workflow_started(json!(0), Utc::now()),
         WorkflowEvent::TimerStarted {
@@ -132,9 +142,9 @@ async fn reversed_timer_fire_order_breaks_core_replay() {
         .replay_from_events(reversed)
         .await;
     assert!(
-        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
-        "a reversed equal-deadline fire order must break core replay (this is why the \
-         arm_seq tie-break is required):\n{report}"
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "after issue #1071 the core timer matcher tolerates a reversed equal-deadline \
+         sibling fire order, so this history must replay cleanly:\n{report}"
     );
 }
 

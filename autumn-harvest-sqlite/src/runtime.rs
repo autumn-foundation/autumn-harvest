@@ -14,7 +14,8 @@ use autumn_harvest::executor::{
 };
 use autumn_harvest::{
     ActivityExecId, ActivityInfo, ExecutionId, NoOpMetrics, TimerId, WorkflowCommand,
-    WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowInfo, WorkflowOutcome,
+    WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo,
+    WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -134,6 +135,34 @@ pub enum ExecutionOutcome {
     Completed(Value),
     /// Failed with this error.
     Failed(String),
+    /// A terminal state OTHER than a clean success/failure — inert and never
+    /// resumable, but carrying no output (unlike [`Self::Completed`]) and no
+    /// failure error (unlike [`Self::Failed`]). The dominant case is a prior run
+    /// SEALED to `CONTINUED_AS_NEW` when a `TerminateIfRunning` /
+    /// `AllowDuplicateFailedOnly` reuse-policy decision superseded it with a newer
+    /// run (issue #1068); it also covers `CANCELLED` / `TIMED_OUT` / `TERMINATED`.
+    /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
+    /// caller can distinguish which terminal it is. Reporting these terminally —
+    /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
+    /// driver's `erase::is_terminal_state` short-circuit (Codex #1080 P2): a client
+    /// polling a superseded prior must see it end, not spin forever.
+    Terminated(String),
+}
+
+/// The result of a start-boundary reuse-policy decision (issue #1068) — returned by
+/// [`SqliteRuntime::start_workflow_with_reuse_policy`](crate::SqliteRuntime::start_workflow_with_reuse_policy).
+///
+/// Mirrors the Postgres core start path's `started_fresh` reporting: `created`
+/// distinguishes a freshly inserted run from an attach / return-existing (the
+/// caller learns whether its call is the one that started the run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartOutcome {
+    /// The execution the start resolved to — a newly minted id when `created`, or
+    /// the existing run's id when the policy attached to / returned it.
+    pub exec_id: ExecutionId,
+    /// `true` for a fresh insert (a new `WorkflowStarted` was appended); `false`
+    /// when the policy returned an existing execution without starting a new run.
+    pub created: bool,
 }
 
 /// Maximum driver iterations before declaring a runaway (safety bound only — the
@@ -235,6 +264,12 @@ impl SqliteRuntime {
              PRAGMA synchronous = FULL;",
         )?;
         conn.execute_batch(schema::SCHEMA)?;
+        // Bring an existing file up to the current shape (issue #1068): the
+        // `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing table with its
+        // ORIGINAL columns, so this additive, idempotent step adds any column
+        // introduced since the file was created (e.g. `harvest_tasks`'s freeze
+        // columns) before any read/insert touches them. A no-op on a fresh file.
+        schema::migrate(&conn)?;
         // Single-server crash recovery: any task left `RUNNING` was claimed by a
         // process that exited without finalizing — flip it back to `PENDING` so
         // its body re-runs (at-least-once).
@@ -425,7 +460,19 @@ impl SqliteRuntime {
         workflow_name: &str,
         input: Value,
     ) -> SqliteResult<ExecutionId> {
-        self.start_workflow_inner(workflow_name, None, input)
+        // No business id ⇒ the run-scoped `workflow_id` defaults to the fresh
+        // exec-id string form (unique per run), so the reuse lookup never matches
+        // a prior and every call creates a distinct execution — unchanged v0.1
+        // behavior. Routed through the policy path (with the `AllowDuplicate`
+        // default) purely for code reuse; the outcome is always `created == true`.
+        Ok(self
+            .start_workflow_with_policy_inner(
+                workflow_name,
+                None,
+                input,
+                WorkflowIdReusePolicy::AllowDuplicate,
+            )?
+            .exec_id)
     }
 
     /// Like [`start_workflow`](Self::start_workflow) but with a caller-supplied
@@ -437,68 +484,142 @@ impl SqliteRuntime {
     ///
     /// An empty/whitespace-only `workflow_id` falls back to the generated
     /// [`ExecutionId`]'s string form (guaranteeing `ctx.info().workflow_id` is
-    /// never empty), matching the [`start_workflow`](Self::start_workflow) default.
+    /// never empty) and therefore has no reuse key — so a blank id ALWAYS creates a
+    /// fresh, distinct run, matching the [`start_workflow`](Self::start_workflow)
+    /// default.
     ///
-    /// # v0.1 start semantics — NOT idempotent
+    /// # Start semantics — idempotent by default (issue #1068)
     ///
-    /// This backend does **not** enforce `(workflow_name, workflow_id)` uniqueness
-    /// and does **not** apply the core Postgres start path's `WorkflowIdReusePolicy`
-    /// matrix. **Every call creates a new, independent execution** with a fresh
-    /// [`ExecutionId`], even when the supplied `workflow_id` matches a prior run —
-    /// so a duplicate delivery (for example a retried webhook) starts a second run
-    /// and repeats its side effects.
+    /// This method applies the DEFAULT reuse policy
+    /// [`WorkflowIdReusePolicy::AllowDuplicate`]: a non-blank `workflow_id` that
+    /// matches an existing, non-sealed execution for the same `workflow_name`
+    /// **attaches** — the SAME [`ExecutionId`] is returned and **no** second run is
+    /// started — so a duplicate delivery (a retried webhook) is idempotent rather
+    /// than starting a second run and repeating its side effects.
     ///
-    /// The `workflow_id` here is provided for **observability and idempotency-key
-    /// material**: it is surfaced faithfully through `ctx.info().workflow_id`
-    /// (matching the Postgres backend, so a workflow deriving an idempotency key
-    /// from it behaves identically across backends), but it is **not** an enforced
-    /// uniqueness / reuse key at the START boundary in v0.1. This is a deliberate,
-    /// documented divergence from the Postgres core start path, which DOES default
-    /// to applying the `(workflow_name, workflow_id)` reuse-policy matrix.
+    /// **This is an intentional behavior change from v0.1**, which always minted a
+    /// fresh execution here (a duplicate delivery started a second run). For any
+    /// other policy — reject-the-duplicate, replace-a-failed-run, or
+    /// terminate-and-restart — and to learn whether the call created a fresh run or
+    /// attached, use
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy),
+    /// which exposes the full `(workflow_name, workflow_id)` reuse matrix and
+    /// returns a [`StartOutcome`].
     ///
-    /// Callers that need idempotent starts (for example, deduplicating retried
-    /// webhook deliveries) must deduplicate upstream in v0.1, or wait for the
-    /// reuse-policy follow-up. The configurable `WorkflowIdReusePolicy` matrix is a
-    /// tracked follow-up — see the crate-level "Non-goals" docs and issue #1068.
+    /// The reuse decision is made atomically in the single-writer start
+    /// transaction (there are no concurrent writers, so a lookup-then-decide is
+    /// race-free without a database uniqueness index). A prior in a SEALED state
+    /// (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to the reuse check, so a
+    /// superseded run never blocks a fresh start — mirroring the Postgres core's
+    /// uniqueness-index-excludes-terminal nuance.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
-    /// registered handler, or [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a
-    /// persistence failure.
+    /// registered handler, [`SqliteError::PayloadTooLarge`] if `input` exceeds the
+    /// workflow-input cap, or [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a
+    /// persistence failure. (Under `AllowDuplicate` it never returns
+    /// [`SqliteError::AlreadyExists`] — that is only for
+    /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate).)
     pub fn start_workflow_with_id(
         &mut self,
         workflow_name: &str,
         workflow_id: &str,
         input: Value,
     ) -> SqliteResult<ExecutionId> {
-        self.start_workflow_inner(workflow_name, Some(workflow_id), input)
+        Ok(self
+            .start_workflow_with_policy_inner(
+                workflow_name,
+                Some(workflow_id),
+                input,
+                WorkflowIdReusePolicy::AllowDuplicate,
+            )?
+            .exec_id)
     }
 
-    /// Shared start path for [`start_workflow`](Self::start_workflow) and
-    /// [`start_workflow_with_id`](Self::start_workflow_with_id). `workflow_id`:
-    /// `Some(id)` uses the caller's business id (falling back to the exec-id string
-    /// form when blank); `None` defaults to the exec-id string form.
-    fn start_workflow_inner(
+    /// Start (or reuse) a workflow under an explicit
+    /// [`WorkflowIdReusePolicy`](autumn_harvest::WorkflowIdReusePolicy),
+    /// enforcing the `(workflow_name, workflow_id)` reuse matrix (issue #1068), and
+    /// return a [`StartOutcome`] reporting the resolved execution and whether a
+    /// fresh run was created.
+    ///
+    /// The single-writer PLAIN-start matrix, restricted to the states this backend
+    /// can hold (none / `RUNNING` / `COMPLETED` / `FAILED`; a replaced prior is
+    /// SEALED to `CONTINUED_AS_NEW`):
+    ///
+    /// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+    /// |-------------|------------------|-------------------|----------------------------|----------------------|
+    /// | none        | fresh            | fresh             | fresh                      | fresh                |
+    /// | RUNNING     | existing         | `AlreadyExists`   | existing                   | cancel + fresh       |
+    /// | COMPLETED   | existing         | `AlreadyExists`   | existing                   | fresh (no cancel)    |
+    /// | FAILED      | existing         | `AlreadyExists`   | **fresh (replace)**        | fresh (no cancel)    |
+    ///
+    /// - A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to
+    ///   the reuse check — ALL policies (including `RejectDuplicate`) create fresh
+    ///   over it, mirroring core's uniqueness-index-excludes-terminal nuance.
+    /// - "Replace" (`AllowDuplicateFailedOnly` over a FAILED prior;
+    ///   `TerminateIfRunning` over any prior) SEALS the prior to `CONTINUED_AS_NEW`
+    ///   so it leaves the active set and the fresh run takes the key
+    ///   (mirroring core's `replace_execution`).
+    /// - `TerminateIfRunning` over a still-`RUNNING` prior additionally appends a
+    ///   `WorkflowCancelled` event to the prior's history (recording the forced
+    ///   cancellation) and cleans up its PENDING task rows and unfired timers, then
+    ///   seals it. Because the single-writer backend replaces the prior atomically
+    ///   in the same transaction and never drives it again, this forcefully seals
+    ///   the prior (observably equivalent to core's outcome — prior inactive with a
+    ///   cancellation recorded, new run active) rather than delivering cooperative
+    ///   cancellation the prior's body could observe.
+    /// - A blank/whitespace-only `workflow_id` has no reuse key, so every call
+    ///   creates a fresh, distinct run (`created == true`) regardless of `policy`.
+    ///
+    /// This is NOT the signal-with-start matrix — a plain start RETURNS a terminal
+    /// `COMPLETED`/`FAILED` prior under `AllowDuplicate` (it does not escalate to a
+    /// fresh start).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::AlreadyExists`] when `policy` is
+    /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate) and a non-sealed
+    /// prior exists; [`SqliteError::UnknownWorkflow`] for an unregistered workflow;
+    /// [`SqliteError::PayloadTooLarge`] for an oversized `input`; or
+    /// [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a persistence failure.
+    pub fn start_workflow_with_reuse_policy(
+        &mut self,
+        workflow_name: &str,
+        workflow_id: &str,
+        input: Value,
+        policy: WorkflowIdReusePolicy,
+    ) -> SqliteResult<StartOutcome> {
+        self.start_workflow_with_policy_inner(workflow_name, Some(workflow_id), input, policy)
+    }
+
+    /// Shared start path applying the `(workflow_name, workflow_id)` reuse matrix
+    /// (issue #1068). `workflow_id`: `Some(id)` uses the caller's business id (a
+    /// blank id has no reuse key ⇒ always fresh); `None` (from
+    /// [`start_workflow`](Self::start_workflow)) always creates fresh with the
+    /// exec-id string as its `workflow_id`.
+    ///
+    /// The reuse lookup + decision + all writes happen in ONE transaction; the
+    /// single-writer contract makes the lookup-then-decide atomic without a
+    /// database uniqueness index. A `RejectDuplicate` collision returns
+    /// `Err(AlreadyExists)`, dropping the transaction uncommitted (no writes).
+    fn start_workflow_with_policy_inner(
         &mut self,
         workflow_name: &str,
         workflow_id: Option<&str>,
         input: Value,
-    ) -> SqliteResult<ExecutionId> {
+        policy: WorkflowIdReusePolicy,
+    ) -> SqliteResult<StartOutcome> {
         if !self.workflows.contains_key(workflow_name) {
             return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
         }
-        // Enforce the workflow-input cap BEFORE inserting the execution row or
-        // appending `WorkflowStarted` (issue #252, Codex #1069 `runtime.rs:264`).
-        // The Postgres start path rejects an oversized input with
+        // Enforce the workflow-input cap BEFORE any write (issue #252, Codex #1069
+        // `runtime.rs:264`). The Postgres start path rejects an oversized input with
         // `PayloadTooLarge` before persisting anything; without this the SQLite
         // backend would store/replay an unbounded input and accept a start other
         // backends reject. Measured as the serialized-JSON byte length, exactly as
-        // the core does (`serde_json::to_string(&input).len()`). A zero cap means
-        // uncapped (the core convention); the default `DEFAULT_MAX_WORKFLOW_INPUT_BYTES`
-        // (2 MiB) is > 0, so the check is active. The reused core context already
-        // enforces the *continue-as-new* and *side-effect* input caps; this closes
-        // the one boundary the executor never sees — the fresh START input.
+        // the core does. A zero cap means uncapped (the core convention); the default
+        // `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` (2 MiB) is > 0, so the check is active.
         if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
@@ -509,25 +630,86 @@ impl SqliteRuntime {
                 });
             }
         }
-        let exec = ExecutionId::new();
-        // Resolve the run-scoped business `workflow_id` (issue #698, Codex #1069 P2
-        // runtime.rs:780). Default — and fall back for a blank caller-supplied id —
-        // to the exec-id string form, so `ctx.info().workflow_id` is NEVER empty and
-        // is DISTINCT per run (mirroring the Postgres worker, which injects a
-        // non-empty `StartWorkflowParams.workflow_id`). A non-blank caller id is used
-        // verbatim, so the workflow observes exactly what it was started with.
-        let workflow_id = workflow_id
-            .filter(|id| !id.trim().is_empty())
-            .map_or_else(|| exec.to_string(), str::to_string);
+
+        // A non-blank caller-supplied id is the reuse key; a blank/None id has no
+        // reuse key (it defaults to the fresh exec-id string form, unique per run),
+        // so it always creates a distinct execution regardless of `policy`.
+        let business_id = workflow_id.filter(|id| !id.trim().is_empty());
+
         let tx = self.conn.transaction()?;
-        store::insert_execution(&tx, exec, workflow_name, &workflow_id, &input)?;
-        store::append_event(
-            &tx,
-            exec,
-            &WorkflowEvent::workflow_started(input, Utc::now()),
-        )?;
+        let outcome = match business_id {
+            // No reuse key → always fresh; `workflow_id` defaults to the exec-id
+            // string form so `ctx.info().workflow_id` is never empty and is
+            // distinct per run (issue #698).
+            None => insert_fresh_execution(&tx, workflow_name, None, input)?,
+            Some(id) => {
+                let prior = store::find_active_execution_by_key(&tx, workflow_name, id)?;
+                match (policy, prior) {
+                    // No active prior → create fresh under every policy.
+                    (_, None) => insert_fresh_execution(&tx, workflow_name, Some(id), input)?,
+
+                    // Return the existing execution unchanged.
+                    (WorkflowIdReusePolicy::AllowDuplicate, Some((prior_exec, _))) => {
+                        StartOutcome {
+                            exec_id: prior_exec,
+                            created: false,
+                        }
+                    }
+
+                    // Refuse the duplicate — drop the (uncommitted) transaction so no
+                    // fresh row is written, and surface the collision.
+                    (
+                        WorkflowIdReusePolicy::RejectDuplicate,
+                        Some((existing_exec_id, existing_state)),
+                    ) => {
+                        return Err(SqliteError::AlreadyExists {
+                            existing_exec_id,
+                            existing_state,
+                        });
+                    }
+
+                    // Replace a FAILED prior; otherwise return the existing run.
+                    (
+                        WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+                        Some((prior_exec, prior_state)),
+                    ) => {
+                        if prior_state == "FAILED" {
+                            store::seal_execution(&tx, prior_exec, SEALED_STATE)?;
+                            insert_fresh_execution(&tx, workflow_name, Some(id), input)?
+                        } else {
+                            StartOutcome {
+                                exec_id: prior_exec,
+                                created: false,
+                            }
+                        }
+                    }
+
+                    // Cancel + seal EVERY active prior for the key, then start fresh.
+                    // A pre-#1068 database may already hold MULTIPLE RUNNING rows for
+                    // one key (the old always-fresh behavior), so sealing only the
+                    // newest (`Some(_)` here) would leave older RUNNING duplicates
+                    // active and still driven by `run_until_idle` — defeating the
+                    // terminate-and-restart guarantee (Codex #1080 P2). Re-query the
+                    // FULL active set and reconcile every row: a still-RUNNING prior
+                    // records a `WorkflowCancelled` event and has its PENDING tasks /
+                    // unfired timers cleaned up; an already-terminal prior is sealed
+                    // without a cancellation event. All happen in this one start
+                    // transaction, so the result is exactly one active row (the fresh
+                    // run) with no orphaned RUNNING prior. (When there is no active
+                    // prior at all the `(_, None)` arm above already handles it.)
+                    (WorkflowIdReusePolicy::TerminateIfRunning, Some(_)) => {
+                        for (prior_exec, prior_state) in
+                            store::find_active_executions_by_key(&tx, workflow_name, id)?
+                        {
+                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
+                        }
+                        insert_fresh_execution(&tx, workflow_name, Some(id), input)?
+                    }
+                }
+            }
+        };
         tx.commit()?;
-        Ok(exec)
+        Ok(outcome)
     }
 
     /// Deliver an inbound signal (staged until a `wait_for_signal` consumes it).
@@ -684,6 +866,17 @@ impl SqliteRuntime {
             "FAILED" => Ok(ExecutionOutcome::Failed(
                 store::execution_error(&self.conn, exec)?.unwrap_or_default(),
             )),
+            // Any OTHER terminal state — a prior SEALED to `CONTINUED_AS_NEW` by a
+            // `TerminateIfRunning`/`AllowDuplicateFailedOnly` replace (issue #1068),
+            // or a `CANCELLED`/`TIMED_OUT`/`TERMINATED` run — is inert and must be
+            // reported TERMINALLY, consistent with the driver's
+            // `erase::is_terminal_state` short-circuit (Codex #1080 P2). Mapping it
+            // to `Running` (the old behavior) left a client polling a superseded run
+            // seeing it active forever, even though `drive_one_cycle` already treats
+            // it as terminal.
+            other if autumn_harvest::erase::is_terminal_state(other) => {
+                Ok(ExecutionOutcome::Terminated(other.to_string()))
+            }
             _ => Ok(ExecutionOutcome::Running),
         }
     }
@@ -860,17 +1053,30 @@ impl SqliteRuntime {
         // `future_not_send`) — the drivers' closures satisfy it.
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
-        // Already terminal? Return the stored outcome without re-running.
-        match store::execution_state(&self.conn, exec)?.as_str() {
-            "COMPLETED" => {
-                let out = store::execution_output(&self.conn, exec)?.unwrap_or(Value::Null);
-                return Ok(RunState::Completed(out));
-            }
-            "FAILED" => {
-                let err = store::execution_error(&self.conn, exec)?.unwrap_or_default();
-                return Ok(RunState::Failed(err));
-            }
-            _ => {}
+        // Already terminal? Return the stored outcome without re-running. This uses
+        // the core `erase::is_terminal_state` so it covers not only COMPLETED/FAILED
+        // but every SEALED / terminal state (issue #1068): a run replaced by the
+        // reuse-policy path is sealed `CONTINUED_AS_NEW`, and `CANCELLED`/`TIMED_OUT`/
+        // `TERMINATED` are defensively handled too. The fleet poll loop never reaches
+        // these (`store::running_executions` filters to `state = 'RUNNING'`), but a
+        // DIRECT `run_until_blocked(sealed_exec)` must short-circuit rather than
+        // re-drive a superseded run's handler.
+        let state = store::execution_state(&self.conn, exec)?;
+        if autumn_harvest::erase::is_terminal_state(&state) {
+            return match state.as_str() {
+                "COMPLETED" => Ok(RunState::Completed(
+                    store::execution_output(&self.conn, exec)?.unwrap_or(Value::Null),
+                )),
+                "FAILED" => Ok(RunState::Failed(
+                    store::execution_error(&self.conn, exec)?.unwrap_or_default(),
+                )),
+                // A sealed / superseded run (`CONTINUED_AS_NEW`) or any other terminal
+                // state is inert and not resumable — surface a terminal `Failed`
+                // naming the state rather than re-driving.
+                other => Ok(RunState::Failed(format!(
+                    "execution is terminal ({other}); not resumable"
+                ))),
+            };
         }
 
         let history = store::load_history(&self.conn, exec)?;
@@ -925,6 +1131,12 @@ impl SqliteRuntime {
             std::collections::HashMap::new(), // context headers (none)
             None,                             // payload offload threshold (none)
             std::sync::Arc::new(NoOpMetrics),
+            // Issue #620: builder-level default activity retry/timeout floor. This
+            // lightweight SQLite driver has no `HarvestBuilder` behind it, so there
+            // is no fleet-wide default to thread — `None`/`None` preserve today's
+            // "no floor" behavior (call-site/activity-level defaults still apply).
+            None,
+            None,
         )
         .await;
 
@@ -1093,19 +1305,19 @@ impl SqliteRuntime {
         for cmd in commands {
             match cmd {
                 cmd @ WorkflowCommand::ScheduleActivity { .. } => {
-                    // The activity's total (cross-retry) `schedule_to_close` deadline
-                    // (issue #378) is NOT resolved here (Codex #1069 P2,
-                    // `runtime.rs:944`). It is not carried on the `ScheduleActivity`
-                    // command, and resolving it at THIS (schedule) time from the
-                    // registry would silently DROP it for an activity scheduled before
-                    // its body/`ActivityInfo` is registered (`self.activities.get(name)`
-                    // would be `None`), never backfilling it on the later re-drive.
-                    // The stable schedule instant (`now`) is recorded as `scheduled_at`,
-                    // and [`worker::drain_ready`] resolves the deadline from the
-                    // registered spec at CLAIM time — when the body is guaranteed
-                    // present — exactly as the Postgres worker resolves `ActivityInfo`
-                    // from its `HandlerRegistry`.
-                    if apply_schedule_activity(&tx, exec, history, cmd, now)? {
+                    // Freeze the resolved defaults onto the task row when the activity
+                    // is already registered at schedule time (issue #1068): the four
+                    // scalars (retry policy, max_attempts, start_to_close,
+                    // schedule_to_close deadline) are resolved ONCE from the command
+                    // override / registered spec and made immutable for the run's
+                    // life. If the activity is NOT yet registered here (a late
+                    // registration — `self.activities.get(name)` is `None`), the row
+                    // is enqueued UNFROZEN and [`worker::drain_ready`] resolves and
+                    // freezes the defaults from the now-present spec at first CLAIM.
+                    // `self.conn` and `self.activities` are disjoint fields, so
+                    // borrowing the registry while the cycle transaction holds
+                    // `self.conn` is sound.
+                    if apply_schedule_activity(&tx, &self.activities, exec, history, cmd, now)? {
                         produced = true;
                     }
                 }
@@ -1348,15 +1560,20 @@ impl SqliteRuntime {
 ///   enforces it as a post-execution outcome (a body exceeding its budget records a
 ///   terminal `ActivityTimedOut { StartToClose }`, byte-equivalent to the Postgres
 ///   timeout scanner). `None` = no budget (unbounded).
-/// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378,
-///   Codex #1069 P2 `runtime.rs:944`) — honored, but resolved at CLAIM time, NOT
-///   here. It is not a command field, and resolving it at schedule time from the
-///   registry would silently DROP it for an activity scheduled before its body is
-///   registered. This site records only the stable schedule instant (`now`) as
-///   `scheduled_at`; [`worker::drain_ready`](crate::worker::drain_ready) resolves the
-///   absolute deadline (`scheduled_at + default_schedule_to_close`) from the
-///   guaranteed-present registered spec at claim, enforcing the total cross-retry cap
-///   (terminal `ActivityTimedOut { ScheduleToClose }`).
+/// - `schedule_to_close` (the `ActivityInfo::default_schedule_to_close`, issue #378)
+///   and the other three resolved defaults — FROZEN onto the row here when the
+///   activity is already registered (issue #1068). It is not a command field, so it
+///   is resolved from the registered spec's `default_schedule_to_close` anchored to
+///   the stable schedule instant (`now`) as the absolute deadline
+///   `scheduled_at + default_schedule_to_close`, and persisted alongside the frozen
+///   retry policy / `max_attempts` / `start_to_close` with `defaults_frozen = 1`. If
+///   the activity is NOT yet registered at schedule time (a late registration), the
+///   row is enqueued UNFROZEN (command overrides only, `defaults_frozen = 0`) and
+///   [`worker::drain_ready`](crate::worker::drain_ready) resolves and freezes the
+///   deadline (and the other defaults) from the now-present spec at first claim.
+///   Freezing makes an in-flight activity's cross-retry deadline immutable across a
+///   crash/reopen or a re-registration under a changed spec, mirroring the Postgres
+///   engine (terminal `ActivityTimedOut { ScheduleToClose }` on the cap).
 /// - `session_id`/`session_worker_id` (worker sessions, issue #606) and the
 ///   session-acquire-only `schedule_to_start_override` — REJECTED LOUDLY with
 ///   [`SqliteError::Unsupported`]: they are outside the single-writer subset (worker
@@ -1369,6 +1586,7 @@ impl SqliteRuntime {
 /// Returns `true` iff a durable row was produced (a fresh schedule).
 fn apply_schedule_activity(
     conn: &Connection,
+    activities: &HashMap<String, ActivitySpec>,
     exec: ExecutionId,
     history: &[WorkflowEvent],
     cmd: &WorkflowCommand,
@@ -1407,22 +1625,68 @@ fn apply_schedule_activity(
     if store::history_has_activity_scheduled(history, &activity_id.to_string()) {
         return Ok(false);
     }
-    let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
-    // Persist the WHOLE retry policy, not just its `max_attempts` (issue #1069 P2,
-    // Codex `runtime.rs:985`): the worker reads `initial_interval` /
-    // `backoff_coefficient` / `max_interval` (backoff timing) and
-    // `non_retryable_errors` (classification) from it. `None` on the raw path.
-    let retry_policy_json = retry_policy_override
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-    let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
-    // The total (cross-retry) `schedule_to_close` deadline is NOT resolved/persisted
-    // here (Codex #1069 P2, `runtime.rs:944`) — `now` is recorded as the stable
-    // `scheduled_at` anchor (inside `persist_scheduled_activity` → `enqueue_activity`,
-    // where the initial `run_at` doubles as `scheduled_at`), and the worker resolves
-    // the deadline from the registered spec at claim time so a LATE-registered
-    // activity keeps its declared deadline.
+
+    // Resolve the four defaults ONCE (issue #1068). When the activity is already
+    // registered, resolve the effective retry policy / `max_attempts` /
+    // `start_to_close` / `schedule_to_close` deadline from the command override
+    // (typed path) falling back to the registered spec (raw path / declared
+    // defaults), and FREEZE them onto the row (`defaults_frozen = true`). A later
+    // claim then reads them verbatim rather than re-resolving against a mutated
+    // registry — so a crash/reopen or a re-registration cannot alter an in-flight
+    // activity's contract. When the activity is NOT yet registered (a late
+    // registration), enqueue the command overrides only (`defaults_frozen = false`);
+    // the worker resolves and freezes the defaults from the now-present spec at first
+    // claim, anchored to the stable `scheduled_at` (== `now` here). `now` is recorded
+    // as `scheduled_at` inside `enqueue_activity` (the initial `run_at` doubles as it).
+    let (max_attempts, retry_policy_json, start_to_close_ms, schedule_to_close_at, defaults_frozen) =
+        if let Some(spec) = activities.get(name.as_str()) {
+            // The effective retry policy: the command override (typed path) wins;
+            // otherwise the registered spec's declared `default_retry_policy` (raw
+            // path). Serialize the WHOLE policy so the worker honors backoff timing +
+            // `non_retryable_errors`, not just the attempt cap.
+            let retry_policy = retry_policy_override
+                .clone()
+                .or_else(|| spec.default_retry_policy.clone());
+            let retry_json = retry_policy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            // The attempt cap: the override's cap wins; otherwise the spec's derived
+            // `max_attempts` (which `register_activity` derives from the same
+            // `default_retry_policy`, so it agrees with `retry_json`).
+            let max_attempts = retry_policy_override
+                .as_ref()
+                .map_or(spec.max_attempts, |p| p.max_attempts);
+            // The per-attempt start-to-close budget: override (typed) wins, else the
+            // spec's declared `default_start_to_close` (raw path).
+            let start_to_close_ms = start_to_close_override
+                .map(duration_to_millis_saturating)
+                .or_else(|| spec.start_to_close.map(duration_to_millis_saturating));
+            // The total (cross-retry) deadline: `scheduled_at (== now) +
+            // default_schedule_to_close`. There is no per-call schedule_to_close
+            // override, so the spec always supplies it.
+            let deadline = spec
+                .schedule_to_close
+                .map(|d| now.saturating_add(duration_to_millis_saturating(d)));
+            (
+                Some(max_attempts),
+                retry_json,
+                start_to_close_ms,
+                deadline,
+                true,
+            )
+        } else {
+            // Late registration: carry the command overrides only; the worker freezes
+            // the rest from the now-present spec at claim (`defaults_frozen = false`).
+            let max_attempts = retry_policy_override.as_ref().map(|p| p.max_attempts);
+            let retry_json = retry_policy_override
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let start_to_close_ms = start_to_close_override.map(duration_to_millis_saturating);
+            (max_attempts, retry_json, start_to_close_ms, None, false)
+        };
+
     persist_scheduled_activity(
         conn,
         exec,
@@ -1434,6 +1698,8 @@ fn apply_schedule_activity(
         max_attempts,
         retry_policy_json.as_deref(),
         start_to_close_ms,
+        schedule_to_close_at,
+        defaults_frozen,
     )?;
     Ok(true)
 }
@@ -1457,11 +1723,78 @@ fn apply_schedule_activity(
 /// onto the task row so the worker enforces it as a post-execution outcome; `None`
 /// leaves it NULL (no budget, prior behavior).
 ///
-/// The total (cross-retry) `schedule_to_close` deadline is deliberately **not** a
-/// parameter (issue #378, Codex #1069 P2 `runtime.rs:944`): `run_at` is recorded as
-/// the stable `scheduled_at` anchor (see [`queue::enqueue_activity`]), and the worker
-/// resolves the deadline from the registered spec at claim time so a LATE-registered
-/// activity keeps its declared deadline.
+/// `schedule_to_close_at`/`defaults_frozen` carry the FROZEN total (cross-retry)
+/// deadline and the resolved-defaults flag (issue #1068): `Some(at)` + `true` when
+/// the activity was registered at schedule time (the four scalars are frozen on the
+/// row), else `None` + `false` for a late registration (the worker freezes them at
+/// first claim). `run_at` is recorded as the stable `scheduled_at` anchor (see
+/// [`queue::enqueue_activity`]) so the frozen deadline is measured from when the
+/// activity was first scheduled.
+/// The sealed terminal state a reuse-policy "replace" moves a superseded prior to
+/// (issue #1068), mirroring the Postgres core's `replace_execution` — sealed rows
+/// are excluded from the active-run reuse lookup
+/// ([`store::find_active_execution_by_key`]) so the fresh run takes the key.
+const SEALED_STATE: &str = "CONTINUED_AS_NEW";
+
+/// Cancel-and-seal ONE active prior for a `TerminateIfRunning` replace (issue
+/// #1068; Codex #1080 P2), inside the caller's start transaction.
+///
+/// If the prior is still `RUNNING`, append a `WorkflowCancelled` event recording the
+/// forced cancellation and clean up its PENDING task rows + unfired timers (so no
+/// orphan can be claimed / fire against a run that is never driven again); then seal
+/// it to [`SEALED_STATE`] so it leaves the active set. An already-terminal prior
+/// (`COMPLETED`/`FAILED`) is sealed WITHOUT a cancellation event. Byte-identical to
+/// the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
+/// arm can loop it over EVERY active row for the key
+/// ([`store::find_active_executions_by_key`]), reconciling a pre-#1068 database that
+/// already holds multiple RUNNING duplicates.
+fn cancel_and_seal_prior(
+    conn: &Connection,
+    prior_exec: ExecutionId,
+    prior_state: &str,
+) -> SqliteResult<()> {
+    if prior_state == "RUNNING" {
+        store::append_event(
+            conn,
+            prior_exec,
+            &WorkflowEvent::WorkflowCancelled {
+                reason: "superseded by a TerminateIfRunning start (#1068)".to_string(),
+            },
+        )?;
+        queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
+        queue::delete_unfired_timers_for_execution(conn, prior_exec)?;
+    }
+    store::seal_execution(conn, prior_exec, SEALED_STATE)?;
+    Ok(())
+}
+
+/// Insert a fresh execution row + its `WorkflowStarted` event inside the caller's
+/// start transaction (issue #1068), returning a `created == true`
+/// [`StartOutcome`]. `business_id`: `Some(id)` records the caller's verbatim
+/// business `workflow_id`; `None` defaults it to the freshly minted exec-id string
+/// form so `ctx.info().workflow_id` is never empty and is distinct per run (issue
+/// #698). The `input` is moved into the `WorkflowStarted` event (borrowed once for
+/// the row insert first), so it is serialized exactly once.
+fn insert_fresh_execution(
+    conn: &Connection,
+    workflow_name: &str,
+    business_id: Option<&str>,
+    input: Value,
+) -> SqliteResult<StartOutcome> {
+    let exec = ExecutionId::new();
+    let workflow_id = business_id.map_or_else(|| exec.to_string(), str::to_string);
+    store::insert_execution(conn, exec, workflow_name, &workflow_id, &input)?;
+    store::append_event(
+        conn,
+        exec,
+        &WorkflowEvent::workflow_started(input, Utc::now()),
+    )?;
+    Ok(StartOutcome {
+        exec_id: exec,
+        created: true,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn persist_scheduled_activity(
     conn: &Connection,
@@ -1474,6 +1807,8 @@ pub fn persist_scheduled_activity(
     max_attempts: Option<u32>,
     retry_policy_json: Option<&str>,
     start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+    defaults_frozen: bool,
 ) -> SqliteResult<()> {
     store::append_event(
         conn,
@@ -1496,6 +1831,8 @@ pub fn persist_scheduled_activity(
         max_attempts,
         retry_policy_json,
         start_to_close_ms,
+        schedule_to_close_at,
+        defaults_frozen,
     )?;
     Ok(())
 }
@@ -2241,6 +2578,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .unwrap();
             // Drop `tx` WITHOUT commit → rollback.
@@ -2277,6 +2616,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .unwrap();
             tx.commit().unwrap();

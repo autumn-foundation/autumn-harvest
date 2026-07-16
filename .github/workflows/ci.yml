@@ -194,6 +194,12 @@ jobs:
       - name: Run long_lived_entity_deadline example tests (issue #772)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example long_lived_entity_deadline
+      - name: Run dag_data_flow example tests (issue #702)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow
+      - name: Run interface_schema_workflow example tests (issue #610)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.

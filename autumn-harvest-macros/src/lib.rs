@@ -191,7 +191,16 @@ pub fn webhook(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Marks a function as a Harvest workflow signal handler.
 ///
-/// Generates a typed signal sender method `signal_[signal_name]` on the sibling `[WorkflowName]Stub` struct.
+/// Generates a typed signal sender method `signal_[signal_name]` on the sibling
+/// `[WorkflowName]Stub` struct, plus a companion function
+/// `__autumn_signal_handler_info_{fn_name}() -> SignalHandlerInfo` and a public
+/// alias `{fn_name}_info()` for interface discovery (issue #610).
+///
+/// # Attributes
+///
+/// - `workflow = "name"` (**required**) — the workflow this signal belongs to.
+/// - `description = "…"` (optional) — human-readable description surfaced by the
+///   management API.
 #[proc_macro_attribute]
 pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     signal::signal_macro(attr.into(), item.into()).into()
@@ -241,6 +250,21 @@ pub fn queries(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn updates(input: TokenStream) -> TokenStream {
     collect::updates_macro(input.into()).into()
+}
+
+/// Collects multiple signal handler functions into a `Vec<SignalHandlerInfo>`
+/// (issue #610).
+///
+/// Each name must have been annotated with `#[signal(workflow = "…")]`.
+///
+/// # Example
+///
+/// ```ignore
+/// let ss: Vec<SignalHandlerInfo> = signals![cancel, pause];
+/// ```
+#[proc_macro]
+pub fn signals(input: TokenStream) -> TokenStream {
+    collect::signals_macro(input.into()).into()
 }
 
 /// Collects multiple `#[webhook]` mapping functions into a

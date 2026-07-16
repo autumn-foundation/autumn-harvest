@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::batch_start::BatchStartConfig;
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
-use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+use crate::info::{
+    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
@@ -68,6 +70,8 @@ pub struct HarvestBuilder {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers collected via `updates![…]`.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata collected via `signals![…]` (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
@@ -138,6 +142,17 @@ pub struct HarvestBuilder {
     /// execution; after it elapses the key is reusable. `None` uses
     /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
     start_idempotency_window: Option<Duration>,
+    /// Sandbox policy per registered WASM activity (issue #965), keyed by name.
+    #[cfg(feature = "wasm-activities")]
+    wasm_bindings: std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared WASM engine + compiled-module cache, created lazily on the first
+    /// `wasm_activity(...)` call (issue #965). `None` = no WASM activities.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for HarvestBuilder {
@@ -150,6 +165,7 @@ impl Default for HarvestBuilder {
             auto_registered_dag_workflows: Vec::new(),
             query_handlers: Vec::new(),
             update_handlers: Vec::new(),
+            signal_handlers: Vec::new(),
             worker_config: WorkerConfig::default(),
             state: std::collections::HashMap::new(),
             telemetry: None,
@@ -177,6 +193,12 @@ impl Default for HarvestBuilder {
             completion_callback_config:
                 crate::completion_callback::CompletionCallbackBuilderConfig::default(),
             start_idempotency_window: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: Vec::new(),
         }
     }
 }
@@ -194,6 +216,7 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -239,6 +262,8 @@ pub struct BuiltHarvest {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers indexed by workflow name for fast lookup.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
@@ -295,6 +320,17 @@ pub struct BuiltHarvest {
     /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
     /// (24h) when unset on the builder.
     pub start_idempotency_window: Duration,
+    /// Sandbox policy per registered WASM activity (issue #965), keyed by name.
+    #[cfg(feature = "wasm-activities")]
+    wasm_bindings: std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared WASM engine + compiled-module cache (issue #965). `None` = no WASM
+    /// activities registered.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -306,6 +342,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
@@ -650,6 +687,22 @@ pub enum HarvestBuilderError {
         /// The machine-readable SSRF rejection reason.
         rejection: crate::completion_callback::SsrfRejection,
     },
+
+    /// A native `#[activity]` registration shares its name with a WASM activity
+    /// binding (issue #965 review). The native registration would win in the
+    /// handler registry while the WASM binding lingered, so the worker's WASM
+    /// dispatch seam would run the sandboxed guest under the native activity's
+    /// metadata — a silent wrong-implementation. Rejected at build time; pick a
+    /// distinct name for one of them.
+    #[cfg(feature = "wasm-activities")]
+    #[error(
+        "activity '{activity}' is registered both as a native activity and as a WASM \
+         activity binding; rename one so the name is unambiguous"
+    )]
+    WasmActivityNameCollision {
+        /// The name registered as both native and WASM.
+        activity: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -662,6 +715,14 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
+    }
+
+    /// The `(activity_name, module_bytes)` WASM module registrations to publish
+    /// at worker startup (issue #965). Empty when no WASM activity is registered.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
+        &self.wasm_module_registrations
     }
 
     /// The configured large-payload offloader, if a [`PayloadStore`] is
@@ -755,6 +816,22 @@ impl BuiltHarvest {
         &self.update_handlers
     }
 
+    /// Declarative signal handler metadata collected via `.signals(signals![…])`
+    /// (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
+    /// Returns all signal handler infos for the named workflow (issue #610).
+    #[must_use]
+    pub fn signal_handlers_for(&self, workflow_name: &str) -> Vec<&SignalHandlerInfo> {
+        self.signal_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
+    }
+
     /// Returns all query handler infos for the named workflow.
     #[must_use]
     pub fn query_handlers_for(&self, workflow_name: &str) -> Vec<&QueryHandlerInfo> {
@@ -839,25 +916,43 @@ impl BuiltHarvest {
         // a second execution. Install the configured window here too so every
         // worker (plugin-embedded or standalone) sweeps on the same window.
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
+        #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
+        let mut registry = crate::worker::HandlerRegistry::with_state_and_telemetry(
+            self.workflows,
+            self.activities,
+            Arc::new(self.state),
+            self.telemetry,
+        )
+        .with_handler_infos(
+            self.query_handlers,
+            self.update_handlers,
+            self.signal_handlers,
+        )
+        .with_history_policy(self.history_policy)
+        .with_payload_caps(
+            self.max_activity_input_bytes,
+            self.max_workflow_input_bytes,
+            self.max_activity_result_bytes,
+            self.max_signal_payload_bytes,
+        )
+        .with_current_details_cap(self.max_current_details_bytes)
+        .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_payload_offloader(self.payload_offloader.clone())
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
+        #[cfg(feature = "wasm-activities")]
+        if let Some(store) = self.wasm_store {
+            registry = registry.with_wasm_activities(
+                store,
+                self.wasm_bindings,
+                self.wasm_module_registrations,
+            );
+        }
         (
-            crate::worker::HandlerRegistry::with_state_and_telemetry(
-                self.workflows,
-                self.activities,
-                Arc::new(self.state),
-                self.telemetry,
-            )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy)
-            .with_payload_caps(
-                self.max_activity_input_bytes,
-                self.max_workflow_input_bytes,
-                self.max_activity_result_bytes,
-                self.max_signal_payload_bytes,
-            )
-            .with_current_details_cap(self.max_current_details_bytes)
-            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
-            .with_payload_offloader(self.payload_offloader.clone())
-            .with_activity_interceptors(self.activity_interceptors.clone()),
+            registry,
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -886,25 +981,43 @@ impl BuiltHarvest {
         );
         crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
+        #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
+        let mut registry = crate::worker::HandlerRegistry::with_state_and_telemetry(
+            self.workflows,
+            self.activities,
+            Arc::new(self.state),
+            self.telemetry,
+        )
+        .with_handler_infos(
+            self.query_handlers,
+            self.update_handlers,
+            self.signal_handlers,
+        )
+        .with_history_policy(self.history_policy)
+        .with_payload_caps(
+            self.max_activity_input_bytes,
+            self.max_workflow_input_bytes,
+            self.max_activity_result_bytes,
+            self.max_signal_payload_bytes,
+        )
+        .with_current_details_cap(self.max_current_details_bytes)
+        .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_payload_offloader(self.payload_offloader.clone())
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
+        #[cfg(feature = "wasm-activities")]
+        if let Some(store) = self.wasm_store {
+            registry = registry.with_wasm_activities(
+                store,
+                self.wasm_bindings,
+                self.wasm_module_registrations,
+            );
+        }
         (
-            crate::worker::HandlerRegistry::with_state_and_telemetry(
-                self.workflows,
-                self.activities,
-                Arc::new(self.state),
-                self.telemetry,
-            )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy)
-            .with_payload_caps(
-                self.max_activity_input_bytes,
-                self.max_workflow_input_bytes,
-                self.max_activity_result_bytes,
-                self.max_signal_payload_bytes,
-            )
-            .with_current_details_cap(self.max_current_details_bytes)
-            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
-            .with_payload_offloader(self.payload_offloader.clone())
-            .with_activity_interceptors(self.activity_interceptors.clone()),
+            registry,
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -1005,6 +1118,14 @@ impl HarvestBuilder {
         &self.query_handlers
     }
 
+    /// Registered declarative signal handler metadata, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::signal_handlers`] (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
     /// Register activity definitions (output of `activities![]` macro).
     ///
     /// The runtime maps activity tasks to these definitions for execution.
@@ -1068,6 +1189,22 @@ impl HarvestBuilder {
     #[must_use]
     pub fn updates(mut self, handlers: Vec<UpdateHandlerInfo>) -> Self {
         self.update_handlers.extend(handlers);
+        self
+    }
+
+    /// Register declarative signal handler metadata (output of `signals![…]`
+    /// macro) for self-service interface discovery (issue #610).
+    ///
+    /// Each [`SignalHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute and carries an optional payload schema and
+    /// description. This metadata is published by the management API; it does not
+    /// register a runtime handler (push handlers register inside the workflow body
+    /// via [`WorkflowContext::register_signal_handler`](crate::context::WorkflowContext)).
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn signals(mut self, handlers: Vec<SignalHandlerInfo>) -> Self {
+        self.signal_handlers.extend(handlers);
         self
     }
 
@@ -1207,6 +1344,66 @@ impl HarvestBuilder {
         interceptor: impl crate::interceptor::ActivityInterceptor,
     ) -> Self {
         self.activity_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Register a sandboxed WebAssembly activity (issue #965).
+    ///
+    /// The activity is registered as a normal (non-local) `ActivityInfo` whose
+    /// module bytes are published to each worker's shard database at startup and
+    /// whose guest is run through the worker's WASM dispatch seam instead of a
+    /// native handler. Capabilities are deny-all by default; grant them (and
+    /// override the resource limits, queue, retry policy, or start-to-close) via
+    /// the [`WasmActivityRegistration`](crate::wasm_store::WasmActivityRegistration)
+    /// fluent setters.
+    ///
+    /// The shared WASM engine + compiled-module cache is created lazily on the
+    /// first call and reused across every registered WASM activity.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_activity(
+        mut self,
+        registration: crate::wasm_store::WasmActivityRegistration,
+    ) -> Self {
+        // Leak the name/queue to `'static` for the placeholder `ActivityInfo`
+        // (mirrors the MCP-tool route-generation precedent). A builder is a
+        // one-time process-startup object, so a bounded leak per registered
+        // activity is acceptable.
+        let name: &'static str = Box::leak(registration.name.clone().into_boxed_str());
+        let queue: Option<&'static str> = registration
+            .queue
+            .as_ref()
+            .map(|q| &*Box::leak(q.clone().into_boxed_str()));
+        self.activities.push(crate::info::ActivityInfo::wasm(
+            name,
+            queue,
+            Some(registration.retry.clone()),
+            registration.start_to_close,
+        ));
+        self.wasm_bindings
+            .insert(registration.name.clone(), registration.binding());
+        if self.wasm_store.is_none() {
+            self.wasm_store = Some(Arc::new(crate::wasm_activities::WasmModuleStore::new()));
+        }
+        // Keep the registration byte-blobs last-wins consistent with the binding
+        // (`wasm_bindings.insert`) and the `ActivityInfo` registry, both of which
+        // use the LATER definition on a duplicate name (issue #965 review). A
+        // blind append would leave the STALE first blob's bytes in the vector;
+        // `seed_registered_wasm_modules` activates the first same-name row when
+        // none is active, so on a clean shard it would seed+activate those stale
+        // bytes under the newer binding/retry/queue metadata — a mismatch.
+        // Replace-on-insert so exactly one entry per name survives, matching the
+        // last registration.
+        if let Some(existing) = self
+            .wasm_module_registrations
+            .iter_mut()
+            .find(|(existing_name, _)| *existing_name == registration.name)
+        {
+            existing.1 = registration.wasm_bytes;
+        } else {
+            self.wasm_module_registrations
+                .push((registration.name, registration.wasm_bytes));
+        }
         self
     }
 
@@ -1599,6 +1796,8 @@ impl HarvestBuilder {
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
         validate_rate_limit_keys(&self.activities)?;
+        #[cfg(feature = "wasm-activities")]
+        validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
             return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
         }
@@ -1646,6 +1845,7 @@ impl HarvestBuilder {
             workflow_schedules: self.workflow_schedules,
             query_handlers: self.query_handlers,
             update_handlers: self.update_handlers,
+            signal_handlers: self.signal_handlers,
             worker_config,
             state: self.state,
             telemetry: telemetry_arc,
@@ -1673,6 +1873,12 @@ impl HarvestBuilder {
             start_idempotency_window: self
                 .start_idempotency_window
                 .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
+            #[cfg(feature = "wasm-activities")]
+            wasm_bindings: self.wasm_bindings,
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: self.wasm_store,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: self.wasm_module_registrations,
         })
     }
 }
@@ -2057,6 +2263,35 @@ fn validate_rate_limit_keys(
     Ok(())
 }
 
+/// Reject a name registered as BOTH a WASM activity binding and a native
+/// `#[activity]` (issue #965 review).
+///
+/// `wasm_activity(...)` pushes a placeholder `ActivityInfo` ([`is_wasm_stub`]) and
+/// records a `WasmBinding`; a later native `.activities(...)` with the same name
+/// wins in the handler registry (a `HashMap`, last-registration-wins) while the
+/// WASM binding lingers, so the worker's WASM dispatch seam would still resolve
+/// the binding and run the sandboxed guest under the native metadata — a silent
+/// wrong-implementation. Fail closed instead.
+///
+/// [`is_wasm_stub`]: crate::info::ActivityInfo::is_wasm_stub
+#[cfg(feature = "wasm-activities")]
+fn validate_wasm_activity_name_collisions(
+    wasm_bindings: &std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    for activity in activities {
+        // A native (non-placeholder) activity whose name is also a WASM binding
+        // is the ambiguous case. The WASM-activity placeholder itself IS a WASM
+        // binding by construction, so exclude it via `is_wasm_stub`.
+        if !activity.is_wasm_stub() && wasm_bindings.contains_key(activity.name) {
+            return Err(HarvestBuilderError::WasmActivityNameCollision {
+                activity: activity.name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reject local activities whose `default_start_to_close` exceeds the worker
 /// cap. Failing early gives operators a clear error instead of a runtime surprise.
 fn validate_local_activity_timeouts(
@@ -2233,6 +2468,23 @@ pub struct WorkerConfig {
     /// Any local activity registered with `start_to_close > cap` is rejected
     /// at builder `try_build()` time.
     pub max_local_activity_start_to_close: Duration,
+    /// Builder-level default activity retry policy (issue #620).
+    ///
+    /// Applied at schedule time as the lowest-priority fallback in the
+    /// precedence chain: call-site override → activity `#[activity(retry = …)]`
+    /// default → this builder default → implicit fallback. `None` (the default)
+    /// is opt-in — an unset floor leaves today's behaviour byte-for-byte
+    /// unchanged. Set via [`WorkerConfig::with_default_activity_retry_policy`].
+    pub default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
+    /// call-site override → activity default → this builder default → no
+    /// timeout. `None` (the default) is opt-in. For *local* activities the
+    /// resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
+    /// [`WorkerConfig::with_default_activity_start_to_close`].
+    pub default_activity_start_to_close: Option<Duration>,
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
@@ -2390,6 +2642,8 @@ impl Default for WorkerConfig {
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -2790,6 +3044,32 @@ impl WorkerConfig {
         self.max_concurrent_sessions = n;
         self
     }
+
+    /// Set the builder-level default activity retry policy (issue #620).
+    ///
+    /// Resolved at schedule time as the lowest-priority fallback: a call-site
+    /// override or an activity's own `#[activity(retry = …)]` default both win
+    /// over this floor. Unset (the default) leaves today's behaviour
+    /// byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_default_activity_retry_policy(
+        mut self,
+        policy: crate::policy::RetryPolicy,
+    ) -> Self {
+        self.default_activity_retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
+    /// For *local* activities the resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`].
+    #[must_use]
+    pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
+        self.default_activity_start_to_close = Some(timeout);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -3082,6 +3362,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn harvest_builder_passes_history_policy_to_worker_registry() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .history_continue_as_new_threshold(9)
             .history_event_hard_cap(11)
@@ -3091,6 +3379,99 @@ mod tests {
 
         assert_eq!(registry.history_policy().continue_as_new_threshold(), 9);
         assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
+    }
+
+    // Issue #620: the two `into_worker_parts*` hunks copy the builder-level
+    // activity defaults out of `WorkerConfig` and into the `HandlerRegistry`.
+    // Every other #620 test injects them via `HandlerRegistry::
+    // with_activity_defaults` directly, bypassing those hunks — so this test
+    // drives the REAL public entry point (`WorkerConfig::with_default_*` ->
+    // `.worker(..)` -> `.build()` -> `.into_worker_parts()`) and asserts the
+    // registry carries the configured floor. Without the wiring hunks the
+    // registry would report `None` and this test would fail.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        7,
+                        Duration::from_millis(25),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(42)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(7),
+            "the builder-level default retry policy must be wired into the registry"
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(42)),
+            "the builder-level default start_to_close must be wired into the registry"
+        );
+    }
+
+    // Issue #620: the `into_worker_parts_with_extra_state` hunk is a distinct
+    // code path (used by the plugin's extra-state runner); assert it wires the
+    // same floor. An empty extra-state map is the minimal input.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_extra_state_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        // `into_worker_parts_with_extra_state` unconditionally writes the
+        // process-global start-idempotency sweep window; serialize against the
+        // sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        6,
+                        Duration::from_millis(15),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(17)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(6),
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(17)),
+        );
     }
 
     #[test]
@@ -3126,6 +3507,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn built_harvest_into_worker_parts_preserves_shared_state() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .workflows(vec![fake_workflow_info()])
             .activities(vec![ActivityInfo {
@@ -3552,6 +3941,45 @@ mod tests {
             }])
             .try_build();
         assert!(result.is_ok());
+    }
+
+    // ── Builder-level activity default floor (issue #620) ─────────────────
+    //
+    // RED PHASE: the `default_activity_retry_policy` / `default_activity_start_to_close`
+    // fields and their `with_*` builder methods do not exist yet — this test
+    // fails to COMPILE against the missing `WorkerConfig` symbols until the
+    // green phase adds them. Both default to `None` so an unset config is
+    // byte-for-byte identical to today (opt-in, AC1/AC6).
+
+    #[test]
+    fn worker_config_activity_defaults_default_to_none() {
+        use crate::policy::RetryPolicy;
+
+        let config = WorkerConfig::default();
+        assert!(
+            config.default_activity_retry_policy.is_none(),
+            "default activity retry policy must be unset by default (opt-in)"
+        );
+        assert!(
+            config.default_activity_start_to_close.is_none(),
+            "default activity start_to_close must be unset by default (opt-in)"
+        );
+
+        // The two builder methods set the floors and are chainable.
+        let configured = WorkerConfig::default()
+            .with_default_activity_retry_policy(RetryPolicy::fixed(4, Duration::from_millis(50)))
+            .with_default_activity_start_to_close(Duration::from_secs(300));
+        assert_eq!(
+            configured
+                .default_activity_retry_policy
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(4),
+        );
+        assert_eq!(
+            configured.default_activity_start_to_close,
+            Some(Duration::from_secs(300)),
+        );
     }
 
     // ── Local activity cap tests ──────────────────────────────────────────
@@ -4375,5 +4803,66 @@ mod tests {
             built.completion_callback_config().retry_policy.max_attempts,
             5
         );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn native_activity_shadowing_a_wasm_binding_is_rejected() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        // A native activity registered with the same name as a WASM activity is
+        // ambiguous: the native handler wins in the registry while the WASM
+        // binding lingers. try_build must reject it rather than silently run the
+        // guest under native metadata.
+        let result = HarvestBuilder::new()
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .activities(vec![make_activity("checksum", None, None)])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmActivityNameCollision { ref activity })
+                    if activity == "checksum"
+            ),
+            "expected WasmActivityNameCollision, got {result:?}"
+        );
+
+        // A WASM activity with no native shadow builds fine.
+        assert!(
+            HarvestBuilder::new()
+                .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+                .try_build()
+                .is_ok(),
+            "a lone WASM activity must build"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn duplicate_wasm_activity_registration_is_last_wins() {
+        use crate::policy::RetryPolicy;
+        use crate::wasm_store::WasmActivityRegistration;
+        use std::time::Duration;
+
+        let builder = HarvestBuilder::new()
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", vec![1, 1, 1])
+                    .with_queue("first")
+                    .with_retry(RetryPolicy::fixed(2, Duration::from_millis(10))),
+            )
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", vec![2, 2, 2])
+                    .with_queue("second")
+                    .with_retry(RetryPolicy::fixed(7, Duration::from_millis(20))),
+            );
+
+        // Exactly one registration entry for the name, carrying the LATER bytes.
+        let regs: Vec<&(String, Vec<u8>)> = builder
+            .wasm_module_registrations
+            .iter()
+            .filter(|(n, _)| n == "checksum")
+            .collect();
+        assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
+        assert_eq!(regs[0].1, vec![2, 2, 2], "must retain the later bytes");
     }
 }

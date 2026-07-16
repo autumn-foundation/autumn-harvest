@@ -354,9 +354,14 @@ pub enum WorkflowCommand {
         name: String,
         /// JSON input for the handler.
         input: Value,
-        /// Optional start-to-close timeout in seconds. `None` defers to the
-        /// worker's `max_local_activity_start_to_close` cap.
-        start_to_close_secs: Option<u64>,
+        /// Optional per-attempt start-to-close timeout as a full
+        /// [`std::time::Duration`] (issue #620, Codex P2). `None` defers to the
+        /// worker's `max_local_activity_start_to_close` cap. A `Duration` (not
+        /// secs/millis) so NO floor — subsecond or sub-millisecond — is ever
+        /// truncated: the worker builds the per-attempt timeout as
+        /// `start_to_close.min(cap)` and feeds it straight to
+        /// `tokio::time::timeout`.
+        start_to_close: Option<std::time::Duration>,
         /// Optional retry policy. `None` = no retries (fail immediately).
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The worker sends the final result (success or exhausted retries) here.
@@ -643,13 +648,13 @@ impl std::fmt::Debug for WorkflowCommand {
             Self::RunLocalActivity {
                 activity_id,
                 name,
-                start_to_close_secs,
+                start_to_close,
                 ..
             } => f
                 .debug_struct("RunLocalActivity")
                 .field("activity_id", activity_id)
                 .field("name", name)
-                .field("start_to_close_secs", start_to_close_secs)
+                .field("start_to_close", start_to_close)
                 .finish_non_exhaustive(),
             Self::UpsertSearchAttributes { patch } => f
                 .debug_struct("UpsertSearchAttributes")
@@ -1796,6 +1801,12 @@ pub struct WorkflowContext {
     /// size cap is not tripped by it. `None` means no store registered — caps are
     /// enforced exactly as before.
     payload_offload_threshold: Option<u64>,
+    /// Builder-level default activity retry policy (issue #620). Used by the
+    /// LOCAL activity path as the lowest-priority fallback. `None` = no floor.
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` (issue #620). Used by the
+    /// LOCAL activity path (still clamped by the worker's local-STC cap). `None`.
+    default_activity_start_to_close: Option<std::time::Duration>,
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
@@ -2193,6 +2204,8 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             payload_offload_threshold: None,
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -2335,6 +2348,8 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             payload_offload_threshold: None,
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -2392,6 +2407,8 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             payload_offload_threshold: None,
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -2479,6 +2496,23 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_offload_threshold = threshold;
+        self
+    }
+
+    /// Install the builder-level default activity retry/timeout floor (issue #620).
+    ///
+    /// Consumed by the LOCAL activity path (`execute_local_activity_with_opts`)
+    /// as the lowest-priority fallback. Both `None` (the default) preserves
+    /// today's behaviour. The regular/DAG activity path resolves the same floor
+    /// worker-side in `persist_scheduled_activities`.
+    #[must_use]
+    pub fn with_activity_defaults(
+        mut self,
+        retry: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<std::time::Duration>,
+    ) -> Self {
+        self.default_activity_retry_policy = retry;
+        self.default_activity_start_to_close = start_to_close;
         self
     }
 
@@ -4522,7 +4556,6 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
     pub async fn execute_local_activity_raw(
         &self,
         name: &str,
@@ -4530,6 +4563,61 @@ impl WorkflowContext {
         retry_policy: Option<crate::policy::RetryPolicy>,
         start_to_close_secs: Option<u64>,
     ) -> HarvestResult<Value> {
+        // Public seconds-granularity escape hatch (DAG/raw local dispatch). The
+        // whole-second value is exact; the subsecond-capable resolution (builder
+        // default and the typed `_with_opts` per-call/activity override) happens
+        // in `execute_local_activity_raw_resolved`, which carries the full
+        // `Duration` so a subsecond OR sub-millisecond floor never truncates to
+        // `0` (issue #620, Codex P2).
+        self.execute_local_activity_raw_resolved(
+            name,
+            input,
+            retry_policy,
+            start_to_close_secs.map(std::time::Duration::from_secs),
+        )
+        .await
+    }
+
+    /// Core local-activity dispatch state machine underlying
+    /// [`execute_local_activity_raw`](Self::execute_local_activity_raw) and the
+    /// typed [`execute_local_activity_with_opts`](Self::execute_local_activity_with_opts).
+    ///
+    /// `start_to_close` is a full [`std::time::Duration`] so subsecond
+    /// precision survives all the way to the worker's per-attempt timeout
+    /// (issue #620, Codex P2) — the typed path passes a subsecond override/default
+    /// through here without the seconds truncation the public `_raw` escape hatch
+    /// still exposes.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`execute_local_activity_raw`](Self::execute_local_activity_raw).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_local_activity_raw_resolved(
+        &self,
+        name: &str,
+        input: Value,
+        retry_policy: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<std::time::Duration>,
+    ) -> HarvestResult<Value> {
+        // Issue #620: builder-level default activity floor, applied as the
+        // lowest-priority fallback. `_with_opts` has already resolved
+        // call-site → activity-level into `retry_policy`/`start_to_close`,
+        // so appending the builder default here yields the full precedence
+        // (call → activity → builder). A direct `_raw` caller with `None`
+        // (e.g. a DAG/raw local dispatch) falls straight through to the builder
+        // default. Both `None` = today's behaviour, byte-for-byte. The
+        // regular/remote path resolves the same floor worker-side via the
+        // shared `policy::resolve_effective_*` helpers.
+        let retry_policy = retry_policy.or_else(|| self.default_activity_retry_policy.clone());
+        // Carry the FULL resolved `Duration` (issue #620, Codex P2) — no
+        // truncation at seconds OR milliseconds, so a subsecond floor
+        // (`from_millis(500)`) and a sub-millisecond floor (`from_micros(500)`)
+        // are both preserved end-to-end to the worker's `tokio::time::timeout`.
+        let start_to_close = start_to_close.or(self.default_activity_start_to_close);
         let history_match = if self.strict_replay {
             self.match_history(|m| m.match_local_activity_strict(name, &input))
         } else {
@@ -4603,10 +4691,47 @@ impl WorkflowContext {
                     ));
                 }
 
+                // Issue #620 (AC8): the retry budget AND per-attempt timeout for
+                // an in-flight local activity must come from the values it was
+                // ORIGINALLY scheduled with — frozen into the
+                // `LocalActivityScheduled` event — not a re-derivation from the
+                // current builder default, which may have changed during the
+                // crash-recovery window.
+                //
+                // The `resolved` marker (Codex P2) disambiguates a #620+ event —
+                // whose frozen retry/STC are authoritative even when `None`
+                // ("explicitly resolved to no floor") — from a genuine pre-#620
+                // legacy event, which has the marker absent and must fall back to
+                // today's live re-derivation for backward compatibility. Without
+                // the marker, a builder default ADDED from nothing after this
+                // activity was scheduled would wrongly apply on recovery.
+                //
+                // A pure, cursor-independent read: lock the matcher directly
+                // rather than routing through `match_history` so the
+                // signal-handler pump is not triggered a second time here.
+                let recorded = {
+                    let matcher = self.matcher.lock().expect("matcher lock poisoned");
+                    matcher.recorded_local_activity_resolution(activity_id)
+                };
+                let (effective_retry, effective_stc) = if recorded.resolved {
+                    // #620+ event: frozen values (Some OR None) are authoritative.
+                    // The frozen `start_to_close` is stored as nanos → restore the
+                    // exact `Duration` with no precision loss.
+                    (
+                        recorded.retry_policy,
+                        recorded
+                            .start_to_close_nanos
+                            .map(std::time::Duration::from_nanos),
+                    )
+                } else {
+                    // Legacy (pre-#620) event: re-derive from the live defaults.
+                    (retry_policy, start_to_close)
+                };
+
                 // If the recorded failure count already covers all retry
                 // attempts, return the last error immediately — no handler
                 // execution is needed and no command should be pushed.
-                let max_attempts = retry_policy.as_ref().map_or(1, |p| p.max_attempts);
+                let max_attempts = effective_retry.as_ref().map_or(1, |p| p.max_attempts);
                 if failed_attempts >= max_attempts {
                     let error = last_error.unwrap_or_else(|| {
                         format!("local activity '{name}' failed after {failed_attempts} attempts")
@@ -4616,13 +4741,16 @@ impl WorkflowContext {
 
                 // Some retry attempts remain — push the command so the worker
                 // re-runs the handler starting from the next unrecorded attempt.
+                // Thread the ORIGINAL resolved policy AND timeout so the worker's
+                // own `max_attempts`/backoff/per-attempt-timeout derivation stays
+                // consistent with the budget check above (issue #620 AC8).
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::RunLocalActivity {
                     activity_id,
                     name: name.to_string(),
                     input,
-                    start_to_close_secs,
-                    retry_policy,
+                    start_to_close: effective_stc,
+                    retry_policy: effective_retry,
                     result_tx: tx,
                     already_scheduled: true,
                     failed_attempts,
@@ -4673,7 +4801,7 @@ impl WorkflowContext {
                     activity_id,
                     name: name.to_string(),
                     input,
-                    start_to_close_secs,
+                    start_to_close,
                     retry_policy,
                     result_tx: tx,
                     already_scheduled: false,
@@ -5840,11 +5968,13 @@ impl WorkflowContext {
         }
         let json_input = serde_json::to_value(input)?;
         let retry = retry_override.or_else(|| info.default_retry_policy.clone());
-        let start_to_close_secs = timeout_override
-            .or(info.default_start_to_close)
-            .map(|d| d.as_secs());
+        // Preserve subsecond precision: pass the resolved call → activity
+        // `Duration` straight to the millis-carrying core (issue #620, Codex P2).
+        // The old `.as_secs()` truncated a subsecond override/default to `0`,
+        // instantly timing out every attempt.
+        let start_to_close = timeout_override.or(info.default_start_to_close);
         let raw = self
-            .execute_local_activity_raw(info.name, json_input, retry, start_to_close_secs)
+            .execute_local_activity_raw_resolved(info.name, json_input, retry, start_to_close)
             .await?;
         Ok(serde_json::from_value(raw)?)
     }
@@ -11791,6 +11921,9 @@ mod tests {
             handler: probe_handler,
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
 
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -11839,6 +11972,9 @@ mod tests {
             handler: deadline_at_handler,
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
 
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -11888,6 +12024,9 @@ mod tests {
             handler: parent_probe_handler,
             validator: None,
             mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
         };
 
         let parent_id = ExecutionId::new();
@@ -15737,6 +15876,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -15767,6 +15909,9 @@ mod tests {
                 activity_id: id,
                 name: "format_data".into(),
                 input: Value::Null,
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -17655,6 +17800,9 @@ mod tests {
                 activity_id,
                 name: "checksum".into(),
                 input: serde_json::json!("data"),
+                retry_policy: None,
+                resolved: false,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id,

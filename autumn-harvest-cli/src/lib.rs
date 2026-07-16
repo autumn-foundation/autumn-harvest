@@ -1574,12 +1574,30 @@ enum DeadLetterCommand {
         /// Exact match on workflow name.
         #[arg(long)]
         workflow_name: Option<String>,
+        /// Exact match on task queue name (e.g. to reproduce a queue-scoped facet).
+        #[arg(long)]
+        queue_name: Option<String>,
+        /// Only include entries with at least this many attempts.
+        #[arg(long)]
+        min_attempts: Option<i32>,
         /// Inclusive lower bound on `failed_at` (RFC 3339, e.g. `2026-04-27T12:30:00Z`).
         #[arg(long)]
         failed_after: Option<String>,
         /// Exclusive upper bound on `failed_at` (RFC 3339).
         #[arg(long)]
         failed_before: Option<String>,
+        /// Filter by derived error class (exact, `PascalCase`; e.g. `CircuitOpen`,
+        /// `PoisonPill`, `HandlerPanic`). Matching is exact-equality, not case-folded.
+        #[arg(long)]
+        error_class: Option<String>,
+        /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
+        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
+        #[arg(long)]
+        dlq_reason: Option<String>,
+        /// Filter by derived failure signature (exact match on the normalized
+        /// first line of the error).
+        #[arg(long)]
+        failure_signature: Option<String>,
         /// Maximum rows to act on per call (default 100, max 1000).
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: Option<u32>,
@@ -1592,10 +1610,12 @@ enum DeadLetterCommand {
     /// Groups the DLQ by one or more dimensions and reports per-group counts
     /// with representative sample IDs, merged across shards. Renders a table by
     /// default; pass --json for piping.
+    #[command(alias = "summary")]
     Aggregate {
         /// Grouping dimensions (comma-separated or repeated). Supported:
         /// `workflow_name`, `activity_name`, `queue_name`, `task_type`,
-        /// `time_bucket`, `failure_signature`. Order builds a hierarchical key.
+        /// `time_bucket`, `failure_signature`, `dlq_reason`, `error_class`.
+        /// Order builds a hierarchical key.
         #[arg(long = "group-by", value_delimiter = ',', required = true)]
         group_by: Vec<String>,
         /// Granularity for the `time_bucket` dimension: hour (default) or day.
@@ -1640,12 +1660,30 @@ enum DeadLetterCommand {
         /// Exact match on workflow name.
         #[arg(long)]
         workflow_name: Option<String>,
+        /// Exact match on task queue name (e.g. to reproduce a queue-scoped facet).
+        #[arg(long)]
+        queue_name: Option<String>,
+        /// Only include entries with at least this many attempts.
+        #[arg(long)]
+        min_attempts: Option<i32>,
         /// Inclusive lower bound on `failed_at` (RFC 3339, e.g. `2026-04-27T12:30:00Z`).
         #[arg(long)]
         failed_after: Option<String>,
         /// Exclusive upper bound on `failed_at` (RFC 3339).
         #[arg(long)]
         failed_before: Option<String>,
+        /// Filter by derived error class (exact, `PascalCase`; e.g. `CircuitOpen`,
+        /// `PoisonPill`, `HandlerPanic`). Matching is exact-equality, not case-folded.
+        #[arg(long)]
+        error_class: Option<String>,
+        /// Filter by derived DLQ reason class (exact, `snake_case`; e.g.
+        /// `poison_pill`, `workflow_task_timeout`, `retry_exhaustion`). Exact-equality.
+        #[arg(long)]
+        dlq_reason: Option<String>,
+        /// Filter by derived failure signature (exact match on the normalized
+        /// first line of the error).
+        #[arg(long)]
+        failure_signature: Option<String>,
         /// Maximum rows to act on per call (default 100, max 1000).
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: Option<u32>,
@@ -5331,8 +5369,13 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
         DeadLetterCommand::BulkReplay {
             activity_name,
             workflow_name,
+            queue_name,
+            min_attempts,
             failed_after,
             failed_before,
+            error_class,
+            dlq_reason,
+            failure_signature,
             limit,
             dry_run,
         } => ApiRequest::post(
@@ -5340,8 +5383,13 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             Some(build_bulk_dlq_body(
                 activity_name.as_deref(),
                 workflow_name.as_deref(),
+                queue_name.as_deref(),
+                *min_attempts,
                 failed_after.as_deref(),
                 failed_before.as_deref(),
+                error_class.as_deref(),
+                dlq_reason.as_deref(),
+                failure_signature.as_deref(),
                 *limit,
                 *dry_run,
             )),
@@ -5349,8 +5397,13 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
         DeadLetterCommand::BulkDiscard {
             activity_name,
             workflow_name,
+            queue_name,
+            min_attempts,
             failed_after,
             failed_before,
+            error_class,
+            dlq_reason,
+            failure_signature,
             limit,
             dry_run,
         } => ApiRequest::post(
@@ -5358,8 +5411,13 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
             Some(build_bulk_dlq_body(
                 activity_name.as_deref(),
                 workflow_name.as_deref(),
+                queue_name.as_deref(),
+                *min_attempts,
                 failed_after.as_deref(),
                 failed_before.as_deref(),
+                error_class.as_deref(),
+                dlq_reason.as_deref(),
+                failure_signature.as_deref(),
                 *limit,
                 *dry_run,
             )),
@@ -5471,19 +5529,32 @@ fn build_redrive_dlq_body(
     Value::Object(body)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_bulk_dlq_body(
     activity_name: Option<&str>,
     workflow_name: Option<&str>,
+    queue_name: Option<&str>,
+    min_attempts: Option<i32>,
     failed_after: Option<&str>,
     failed_before: Option<&str>,
+    error_class: Option<&str>,
+    dlq_reason: Option<&str>,
+    failure_signature: Option<&str>,
     limit: Option<u32>,
     dry_run: bool,
 ) -> Value {
     let mut body = Map::new();
     insert_string(&mut body, "activity_name", activity_name);
     insert_string(&mut body, "workflow_name", workflow_name);
+    insert_string(&mut body, "queue_name", queue_name);
+    if let Some(m) = min_attempts {
+        body.insert("min_attempts".to_string(), json!(m));
+    }
     insert_string(&mut body, "failed_after", failed_after);
     insert_string(&mut body, "failed_before", failed_before);
+    insert_string(&mut body, "error_class", error_class);
+    insert_string(&mut body, "dlq_reason", dlq_reason);
+    insert_string(&mut body, "failure_signature", failure_signature);
     if let Some(l) = limit {
         body.insert("limit".to_string(), json!(l));
     }
