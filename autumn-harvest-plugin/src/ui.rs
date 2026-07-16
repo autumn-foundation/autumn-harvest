@@ -54,7 +54,6 @@ use autumn_harvest::models::{
     NewAuditRecord, ScheduleDecision, TaskQueueItem, WorkflowExecution,
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
-use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetRequest, reset_workflow_execution,
 };
@@ -71,17 +70,21 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
+    StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
+};
+use autumn_harvest::{
     cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
     terminate_workflow_execution,
 };
 
 use crate::api::{
-    HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
-    audit_decoded_read, db_conn_for_execution, db_conn_for_shard, decode_error_field,
-    decode_workflow_execution_fields, extension_session, load_execution, load_workflows,
-    load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
-    require_harvest_admin,
+    DagRetryFailure, DagRetryResponse, HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES,
+    WorkflowFilters, acquire_conn, audit_decoded_read, db_conn_for_execution, db_conn_for_shard,
+    decode_error_field, decode_workflow_execution_fields, extension_session, load_execution,
+    load_workflows, load_workflows_from_shards, map_error, parse_execution_id, read_path_decoder,
+    require_harvest_admin, retry_dag_run_inner,
 };
+use crate::dag_graph::{DagNodeStatus, DagRunNode, build_run_graph};
 use crate::shard_fanout::UnavailableShard;
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -196,6 +199,36 @@ footer{padding:20px 24px;color:#64748b;font-size:12px;text-align:center;border-t
 .operator-actions button:hover,.operator-actions a.btn:hover{background:#2563eb;color:#fff}
 .operator-actions button.danger{background:#450a0a;color:#fca5a5;border-color:#991b1b}
 .operator-actions button.danger:hover{background:#991b1b;color:#fff}
+.dag-graph-scroll{overflow:auto;max-width:100%;max-height:70vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
+.dag-node{stroke:#0f172a;stroke-width:1}
+.dag-node.selected{stroke:#f8fafc;stroke-width:2}
+.dag-node-label{fill:#f8fafc;font:12px system-ui,-apple-system,sans-serif}
+.dag-edge{stroke:#64748b;stroke-width:1.5}
+.dag-legend,.timeline-legend{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0;font-size:.8rem;color:#cbd5e1}
+.dag-legend span,.timeline-legend span{display:inline-flex;align-items:center;gap:4px}
+.dag-legend .swatch,.timeline-legend .swatch{width:12px;height:12px;border-radius:3px;display:inline-block}
+.dag-run-current{color:#64748b;font-size:11px;margin-left:6px}
+.dag-run-detail{color:#94a3b8;font-size:11px;margin-left:8px}
+.gantt-scroll{overflow:auto;max-width:100%;max-height:75vh;border:1px solid #334155;border-radius:8px;background:#0f172a;padding:8px}
+.gantt-lane-label{fill:#cbd5e1;font:11px system-ui,-apple-system,sans-serif}
+.gantt-lane-group{fill:#93c5fd;font:600 11px system-ui,-apple-system,sans-serif}
+.gantt-axis-tick{stroke:#334155;stroke-width:1}
+.gantt-axis-label{fill:#64748b;font:10px system-ui,-apple-system,sans-serif}
+.gantt-span{stroke:#0f172a;stroke-width:1}
+.gantt-span-open{stroke-dasharray:4 3;stroke:#94a3b8;stroke-width:1.5}
+.gantt-span-slowest{stroke:#f8fafc;stroke-width:2}
+.gantt-seg-wait{opacity:.55}
+.gantt-seg-exec{opacity:1}
+.gantt-seg-whole{opacity:1}
+.gantt-badge{fill:#f8fafc;font:10px system-ui,-apple-system,sans-serif}
+.gantt-pause-band{fill:#78350f;opacity:.28}
+.gantt-pause-label{fill:#fbbf24;font:10px system-ui,-apple-system,sans-serif}
+.gantt-nd-marker{stroke:#f97316;stroke-width:2;stroke-dasharray:3 2}
+.gantt-nd-label{fill:#f97316;font:10px system-ui,-apple-system,sans-serif}
+.timeline-rollup{display:flex;flex-wrap:wrap;gap:16px;margin:8px 0;font-size:.85rem;color:#cbd5e1}
+.timeline-rollup .stat{display:flex;flex-direction:column;gap:2px}
+.timeline-rollup .stat .label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em}
+.timeline-rollup .stat .value{font-size:1rem;color:#e2e8f0}
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -548,8 +581,21 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/", get(index))
         .route("/dags", get(list_dags_ui))
         .route("/dags/{dag_name}", get(dag_detail_ui))
+        // issue #957: DAG-run-graph retry flow (dry-run confirm → admin commit).
+        // Both surface a single audited mutation via the extracted
+        // `retry_dag_run_inner`, so the UI introduces no unaudited path; both
+        // are admin-gated to match the API's admin-auth posture.
+        .route(
+            "/dags/{dag_name}/runs/{run_exec_id}/retry",
+            get(dag_retry_confirm_ui)
+                .post(dag_retry_commit_ui)
+                .route_layer(require_admin.clone()),
+        )
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
+        // issue #960: standalone execution timeline / Gantt view (read-only,
+        // non-admin — parity with the #739 API and the detail page).
+        .route("/workflows/{id}/timeline", get(workflow_timeline_ui))
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
         .route(
             "/workflows/{id}/terminate",
@@ -621,6 +667,8 @@ struct DagDetailParams {
     node: Option<usize>,
     #[serde(default)]
     refresh: Option<u64>,
+    #[serde(default)]
+    flash: Option<String>,
 }
 
 async fn list_dags_ui(
@@ -680,95 +728,73 @@ async fn dag_detail_ui(
         ..WorkflowFilters::default()
     };
     let runs = load_dag_runs_from_owning_shard(&api_state, &runtime, &dag_name, &filters).await?;
-    let requested_run = params
+    // Resolve which run to render. A `?run=` that is present-but-unknown is a
+    // 404 (issue #957 AC7: "unknown run ids render the 404 message"), NOT a
+    // silent fallback to a different run. An omitted `?run=` defaults to the
+    // latest run. The DB existence check only runs for a parseable run id that
+    // isn't already in the displayed page.
+    // A parseable run id counts as valid only when it names a run of *this* DAG
+    // (in the displayed page, or on the owning shard). An unparseable or unknown
+    // run id leaves this `None` — the resolution below maps a present-but-unknown
+    // `?run=` to a 404.
+    let parsed_run = params
         .run
         .as_deref()
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-    let requested_run_is_valid_for_dag = match requested_run {
-        Some(run_id) if runs.iter().any(|run| run.id == run_id) => true,
-        Some(run_id) => dag_run_exists_for_dag(&api_state, &dag_name, run_id).await?,
-        None => false,
+    let requested_valid_run = match parsed_run {
+        Some(run_id)
+            if runs.iter().any(|run| run.id == run_id)
+                || dag_run_exists_for_dag(&api_state, &dag_name, run_id).await? =>
+        {
+            Some(run_id)
+        }
+        _ => None,
     };
-    let selected_run = select_dag_run_id(
-        requested_run,
-        requested_run_is_valid_for_dag,
+    let Ok(selected_run) = resolve_dag_run_selection(
+        params.run.is_some(),
+        requested_valid_run,
         runs.as_slice().first().map(|r| r.id),
-    );
-    let node_states = if let Some(exec_id) = selected_run {
-        let mut conn = db_conn_for_execution(
-            &api_state,
-            autumn_harvest::types::ExecutionId::from_uuid(exec_id),
-        )
-        .await?;
-        let task_rows = harvest_task_queue::table
-            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id)))
-            .select(TaskQueueItem::as_select())
-            .load(&mut conn)
-            .await
-            .map_err(database_error)
-            .map_err(map_error)?;
-
-        // Load dag_skip: markers to distinguish condition-skipped nodes (issue #482).
-        let marker_events: Vec<HarvestEvent> = harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq(exec_id))
-            .filter(harvest_events::event_type.eq("MarkerRecorded"))
-            .select(HarvestEvent::as_select())
-            .load(&mut conn)
-            .await
-            .map_err(database_error)
-            .map_err(map_error)?;
-        let condition_skipped: std::collections::HashSet<usize> = marker_events
-            .iter()
-            .filter_map(|e| {
-                // event_data is adjacently-tagged: {"type":"MarkerRecorded","data":{...}}
-                let data = e.event_data.get("data")?;
-                let name = data["name"].as_str()?;
-                let idx = parse_dag_skip_marker_index(name)?;
-                let current_task = dag.definition.tasks().get(idx)?;
-                // Guard against task rename/reorder across deploys: only mark
-                // the node as condition-skipped when the recorded activity name
-                // still matches the task at that index in the current definition.
-                // MarkerRecorded serializes as {"type":…,"data":{"name":…,"details":{…}}},
-                // so the task field lives under data.details.task.
-                //
-                // `details` is a payload field, so on a non-identity PayloadCodec
-                // (or large-payload offload) deployment it is stored as an opaque
-                // envelope and `details.task` is not readable here — this read
-                // path does not codec-decode. When the fingerprint is unreadable,
-                // fall back to the (always-clear) marker name/index so a
-                // condition-skipped node is still shown skipped rather than
-                // pending, mirroring `dag_graph::has_skip_marker` (issue #690
-                // review). Reorder-safety is not available in that opaque case.
-                let Some(recorded_task) = data.get("details").and_then(|d| d["task"].as_str())
-                else {
-                    return Some(idx);
-                };
-                if recorded_task != current_task.activity_name.as_str() {
-                    return None;
-                }
-                // Also validate upstream fingerprint when present (new-format markers).
-                // Old markers without "upstreams" pass through for backward compat.
-                if let Some(arr) = data
-                    .get("details")
-                    .and_then(|d| d.get("upstreams"))
-                    .and_then(|v| v.as_array())
-                {
-                    let recorded: Vec<usize> = arr
-                        .iter()
-                        .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
-                        .collect();
-                    if recorded != current_task.upstreams {
-                        return None;
-                    }
-                }
-                Some(idx)
-            })
-            .collect();
-
-        map_node_states(&dag.definition, &task_rows, &condition_skipped)
-    } else {
-        HashMap::<usize, DagNodeState>::new()
+    ) else {
+        let raw = params.run.as_deref().unwrap_or_default();
+        return Err(AutumnError::not_found_msg(format!(
+            "run '{raw}' is not a run of DAG '{dag_name}'"
+        )));
     };
+
+    // Issue #957: render the node topology straight from
+    // `dag_graph::build_run_graph` — the same in-process derivation the #690 API
+    // handler uses — rather than a UI-side status fork. For a unified DAG with a
+    // selected run, this loads the run's timestamped history and annotates the
+    // registered `DagDefinition`; classic (non-unified) DAGs have no unified
+    // topology and render the degraded message (matching #690's 400).
+    let graph_data: Option<(Vec<DagRunNode>, String)> = if !dag.is_unified {
+        None
+    } else if let Some(run_uuid) = selected_run {
+        let exec_id = autumn_harvest::types::ExecutionId::from_uuid(run_uuid);
+        let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+        let execution = load_execution(&mut conn, exec_id)
+            .await
+            .map_err(map_error)?;
+        let timestamped = autumn_harvest::store::load_history_with_timestamps(&mut conn, exec_id)
+            .await
+            .map_err(map_error)?;
+        let nodes = build_run_graph(&dag.definition, &timestamped, &execution.state);
+        Some((nodes, execution.state))
+    } else {
+        None
+    };
+
+    let view = if !dag.is_unified {
+        DagGraphView::Classic
+    } else if let Some((nodes, run_state)) = graph_data.as_ref() {
+        DagGraphView::Run {
+            nodes: nodes.as_slice(),
+            run_state: run_state.as_str(),
+        }
+    } else {
+        DagGraphView::NoRun
+    };
+
     Ok(render_dag_detail(
         &dag_name,
         &dag,
@@ -776,18 +802,36 @@ async fn dag_detail_ui(
         selected_run,
         params.node,
         params.refresh,
-        &node_states,
+        params.flash.as_deref(),
+        view,
     ))
 }
 
-fn select_dag_run_id(
-    requested_run: Option<uuid::Uuid>,
-    requested_run_is_valid_for_dag: bool,
+/// Sentinel: a `?run=` param was explicitly provided but names no run of this
+/// DAG. The caller renders the 404 message (issue #957 AC7), never a silent
+/// substitution of a different run.
+#[derive(Debug)]
+struct DagRunNotFound;
+
+/// Resolve which DAG run to render from the `?run=` param state:
+/// - **omitted** (`run_param_present == false`) → default to `fallback_run`
+///   (the latest run), or `None` when the DAG has no runs.
+/// - **present and valid** (`requested_valid_run == Some`) → that run.
+/// - **present but unknown** (`run_param_present && requested_valid_run.is_none()`)
+///   → `Err(DagRunNotFound)`, so an explicit unknown run id is never silently
+///   swapped for a different run.
+fn resolve_dag_run_selection(
+    run_param_present: bool,
+    requested_valid_run: Option<uuid::Uuid>,
     fallback_run: Option<uuid::Uuid>,
-) -> Option<uuid::Uuid> {
-    requested_run
-        .filter(|_| requested_run_is_valid_for_dag)
-        .or(fallback_run)
+) -> Result<Option<uuid::Uuid>, DagRunNotFound> {
+    if run_param_present {
+        // Present: must resolve to a valid run of this DAG, else render 404.
+        requested_valid_run.map_or(Err(DagRunNotFound), |run| Ok(Some(run)))
+    } else {
+        // Omitted: default to the latest run (or `None` when the DAG has none).
+        Ok(fallback_run)
+    }
 }
 
 fn dag_run_shard(router: &ShardRouter, dag_name: &str) -> ShardId {
@@ -825,6 +869,172 @@ async fn dag_run_exists_for_dag(
         .map(|row| row.is_some())
         .map_err(database_error)
         .map_err(map_error)
+}
+
+// ── Issue #957 — DAG retry flow (dry-run confirm → admin commit) ─────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct DagRetryConfirmParams {
+    #[serde(default)]
+    from_node: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DagRetryCommitForm {
+    #[serde(default)]
+    from_node: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// GET the retry confirm page: run a **dry-run** retry through the shared,
+/// audited `retry_dag_run_inner` so the operator sees the authoritative widened
+/// node list (`nodes_to_re_execute`) before committing. On any endpoint error
+/// (400/404/409) the panel renders a human-readable message rather than raw
+/// JSON. Admin-gated at the router.
+async fn dag_retry_confirm_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+    Query(params): Query<DagRetryConfirmParams>,
+) -> Result<Markup, AutumnError> {
+    let from_node = params.from_node.unwrap_or_default();
+    let actor = api_state.extract_actor(&headers);
+    let reason = dag_retry_default_reason(&from_node);
+    let outcome = retry_dag_run_inner(
+        &api_state,
+        &dag_name,
+        &run_exec_id,
+        &headers,
+        vec![from_node.clone()],
+        reason.clone(),
+        actor,
+        true,
+        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(SOURCE_UI),
+    )
+    .await;
+    Ok(render_dag_retry_confirm(
+        &dag_name,
+        &run_exec_id,
+        &from_node,
+        &reason,
+        outcome,
+    ))
+}
+
+/// POST the retry commit: run the fork through `retry_dag_run_inner`
+/// (`dry_run = false`), which writes the `OP_DAG_RETRY` audit row with
+/// `source = ui`. Redirects back to the DAG page with a success flash naming
+/// the new run. If the fork committed but the audit row failed to write
+/// (a partial success), redirects to the *new* run with a warning flash rather
+/// than misreporting it as a failure. A genuine failure (400/404/409) redirects
+/// to the source run with a "Retry failed" flash. Admin-gated at the router.
+async fn dag_retry_commit_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path((dag_name, run_exec_id)): Path<(String, String)>,
+    Form(form): Form<DagRetryCommitForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let actor = api_state.extract_actor(&headers);
+    let reason = if form.reason.trim().is_empty() {
+        dag_retry_default_reason(&form.from_node)
+    } else {
+        form.reason.clone()
+    };
+    let outcome = retry_dag_run_inner(
+        &api_state,
+        &dag_name,
+        &run_exec_id,
+        &headers,
+        vec![form.from_node.clone()],
+        reason,
+        actor,
+        false,
+        "POST /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(SOURCE_UI),
+    )
+    .await;
+    let (target_run, flash_text) = dag_retry_commit_redirect(outcome, &run_exec_id);
+    let flash = url_encode(&flash_text);
+    let redirect_url = dag_detail_relative_url(&dag_name, &target_run, Some(&flash));
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+}
+
+/// Build a relative URL back to the DAG detail page from a retry route
+/// (`/dags/{dag}/runs/{run}/retry`): `../../../{dag}?run={run}` (+ an optional
+/// pre-encoded flash). Single-sources the relative depth so the confirm
+/// back-link and the commit redirect can never drift.
+fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> String {
+    let mut url = format!("../../../{}?run={}", url_encode(dag_name), url_encode(run));
+    if let Some(flash) = flash {
+        url.push_str("&flash=");
+        url.push_str(flash);
+    }
+    url
+}
+
+/// Render the retry confirm page from a dry-run outcome: on success, the
+/// widened re-execute list + carried-over list + an editable required reason and
+/// a Confirm form (`POSTing` to the same URL); on failure, the human message.
+fn render_dag_retry_confirm(
+    dag_name: &str,
+    run_exec_id: &str,
+    from_node: &str,
+    default_reason: &str,
+    outcome: Result<DagRetryResponse, DagRetryFailure>,
+) -> Markup {
+    let body = match outcome {
+        Ok(plan) => html! {
+            h2 { "Confirm retry of DAG " code { (dag_name) } }
+            p { "Source run: " code { (run_exec_id) } }
+            p { "Retry from node: " code { (from_node) } }
+            div class="card" {
+                h3 { "Nodes that will re-execute" }
+                p class="detail-row" {
+                    "The retry auto-widens to the node's full execution level plus its \
+                     downstream closure. These nodes will re-run:"
+                }
+                ul {
+                    @for node in &plan.nodes_to_re_execute {
+                        li { code { (node) } }
+                    }
+                }
+                @if !plan.nodes_carried_over.is_empty() {
+                    h3 { "Nodes carried over" }
+                    ul {
+                        @for node in &plan.nodes_carried_over {
+                            li { code { (node) } }
+                        }
+                    }
+                }
+            }
+            form method="post" {
+                input type="hidden" name="from_node" value=(from_node);
+                p {
+                    label {
+                        "Reason (required) "
+                        textarea name="reason" required[true] rows="2" cols="60" { (default_reason) }
+                    }
+                }
+                button type="submit" class="btn reset" { "Confirm retry" }
+            }
+        },
+        Err(failure) => html! {
+            div class="banner Warning" { (failure.human_message()) }
+            p {
+                a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
+                    "← Back to run"
+                }
+            }
+        },
+    };
+    layout_dag_detail(
+        &format!("Retry DAG {dag_name} · Vantage"),
+        &body,
+        "../../../../",
+        None,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4022,6 +4232,12 @@ fn render_workflow_detail(
                     button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;align-self:flex-start" { "Submit" }
                 }
             }
+            // issue #960: link to the standalone execution timeline (Gantt) —
+            // reads as a "Timeline" tab of the execution detail view. The
+            // #slowest fragment scroll-focuses the slowest span on load.
+            a.btn href={ (exec_id_str) "/timeline#slowest" } {
+                "Timeline"
+            }
             a.btn href={ "../../workflows/" (exec_id_str) "/history/export" } {
                 "Export history"
             }
@@ -4700,41 +4916,921 @@ fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DagNodeState {
-    Succeeded,
-    Failed,
-    Cancelled,
-    Running,
-    Queued,
-    /// Skipped because a trigger rule evaluated to false over upstream statuses.
-    Skipped,
-    /// Skipped because a data-dependent condition predicate evaluated to false
-    /// (issue #482).  Distinct from [`Skipped`] so the UI can show a different
-    /// label ("Skipped (condition)").
-    SkippedByCondition,
-    Unknown,
+// ── Issue #957 — DAG run graph rendering ─────────────────────────────────────
+//
+// Node statuses are NOT re-derived here: they come straight from
+// `dag_graph::build_run_graph` (the same in-process call the #690 API handler
+// makes), so the graph can never disagree with the API or the #366 retry
+// resolver. The helpers below turn that `Vec<DagRunNode>` into an inline,
+// server-rendered SVG laid out level-by-level, plus a click-through node detail
+// panel and a retry action.
+
+/// Node graph state for the DAG detail page, resolved by `dag_detail_ui`.
+/// `Copy` (all fields are shared references) so it can be passed by value into
+/// `render_dag_detail` without tripping `needless_pass_by_value`.
+#[derive(Clone, Copy)]
+enum DagGraphView<'a> {
+    /// A unified DAG with a selected run: annotated node graph.
+    Run {
+        nodes: &'a [DagRunNode],
+        run_state: &'a str,
+    },
+    /// A classic (non-unified) DAG: #690 rejects these with `400`, so there is
+    /// no unified topology to render.
+    Classic,
+    /// A unified DAG with no run selected.
+    NoRun,
 }
 
-/// Human-readable label for a [`DagNodeState`] used in the timeline table.
-const fn dag_node_state_label(state: DagNodeState) -> &'static str {
-    match state {
-        DagNodeState::Succeeded => "Succeeded",
-        DagNodeState::Failed => "Failed",
-        DagNodeState::Cancelled => "Cancelled",
-        DagNodeState::Running => "Running",
-        DagNodeState::Queued => "Queued",
-        DagNodeState::Skipped => "Skipped (upstream)",
-        DagNodeState::SkippedByCondition => "Skipped (condition)",
-        DagNodeState::Unknown => "Unknown",
+/// Node counts at or above this threshold render inside a scrollable container
+/// with an explicit note rather than being disabled (issue #957 AC).
+const DAG_GRAPH_LARGE_THRESHOLD: usize = 200;
+
+/// SVG geometry constants (px).
+const DAG_NODE_W: f64 = 160.0;
+const DAG_NODE_H: f64 = 40.0;
+const DAG_COL_W: f64 = 210.0;
+const DAG_ROW_H: f64 = 64.0;
+const DAG_PAD: f64 = 20.0;
+
+/// Fill colour keyed to node status. Distinct per status (colour is a secondary
+/// cue only; `dag_node_status_icon` carries the accessible, colour-independent
+/// distinction).
+const fn dag_node_status_fill(status: DagNodeStatus) -> &'static str {
+    match status {
+        DagNodeStatus::Succeeded => "#166534",
+        DagNodeStatus::Failed => "#991b1b",
+        DagNodeStatus::TimedOut => "#b45309",
+        DagNodeStatus::Cancelled => "#6b7280",
+        DagNodeStatus::Running => "#1d4ed8",
+        DagNodeStatus::Pending => "#334155",
+        DagNodeStatus::Skipped => "#475569",
+        DagNodeStatus::Waiting => "#7c3aed",
     }
 }
 
-/// Parse `dag_skip:{idx}` from a marker event name; returns `Some(idx)` on match.
-fn parse_dag_skip_marker_index(name: &str) -> Option<usize> {
-    name.strip_prefix("dag_skip:").and_then(|s| s.parse().ok())
+/// A distinct glyph per status so the graph is legible without colour (a11y).
+const fn dag_node_status_icon(status: DagNodeStatus) -> &'static str {
+    match status {
+        DagNodeStatus::Succeeded => "✓",
+        DagNodeStatus::Failed => "✗",
+        DagNodeStatus::TimedOut => "⏱",
+        DagNodeStatus::Cancelled => "⊘",
+        DagNodeStatus::Running => "●",
+        DagNodeStatus::Pending => "○",
+        DagNodeStatus::Skipped => "↳",
+        DagNodeStatus::Waiting => "⧗",
+    }
 }
 
+/// Human-readable label per status (matches the #690 bounded enum).
+const fn dag_node_status_label(status: DagNodeStatus) -> &'static str {
+    match status {
+        DagNodeStatus::Succeeded => "Succeeded",
+        DagNodeStatus::Failed => "Failed",
+        DagNodeStatus::TimedOut => "Timed out",
+        DagNodeStatus::Cancelled => "Cancelled",
+        DagNodeStatus::Running => "Running",
+        DagNodeStatus::Pending => "Pending",
+        DagNodeStatus::Skipped => "Skipped",
+        DagNodeStatus::Waiting => "Waiting",
+    }
+}
+
+/// Whether a "Retry from this node" action should be offered: the run must be
+/// terminally retryable (matching #366's accepted source states) and the node
+/// must be an attempted-but-not-succeeded node (so the #366 resolver won't
+/// reject it as never-attempted / already-succeeded).
+fn node_retry_offered(run_state: &str, status: DagNodeStatus) -> bool {
+    matches!(run_state, "FAILED" | "CANCELLED" | "TIMED_OUT")
+        && matches!(
+            status,
+            DagNodeStatus::Failed | DagNodeStatus::TimedOut | DagNodeStatus::Cancelled
+        )
+}
+
+/// Computed SVG geometry for a run graph: one `(x, y)` per node index, plus the
+/// overall canvas size. Deterministic (pure function of the level structure).
+#[derive(Debug, Clone, PartialEq)]
+struct GraphLayout {
+    pos: Vec<(f64, f64)>,
+    width: f64,
+    height: f64,
+}
+
+/// Lay nodes out level-by-level: each execution level is a column (x by level
+/// index), each node within a level is a row (y by position). Matches the
+/// executor's level semantics (#256/#366). Deterministic.
+fn build_graph_layout(levels: &[Vec<usize>], node_count: usize) -> GraphLayout {
+    let mut pos = vec![(0.0_f64, 0.0_f64); node_count];
+    let mut max_rows = 0usize;
+    for (col, level) in levels.iter().enumerate() {
+        for (row, &idx) in level.iter().enumerate() {
+            if idx < node_count {
+                #[allow(clippy::cast_precision_loss)]
+                let x = (col as f64).mul_add(DAG_COL_W, DAG_PAD);
+                #[allow(clippy::cast_precision_loss)]
+                let y = (row as f64).mul_add(DAG_ROW_H, DAG_PAD);
+                pos[idx] = (x, y);
+            }
+        }
+        max_rows = max_rows.max(level.len());
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let width =
+        DAG_PAD.mul_add(2.0, levels.len().max(1) as f64 * DAG_COL_W) - (DAG_COL_W - DAG_NODE_W);
+    #[allow(clippy::cast_precision_loss)]
+    let height =
+        DAG_PAD.mul_add(2.0, max_rows.max(1) as f64 * DAG_ROW_H) - (DAG_ROW_H - DAG_NODE_H);
+    GraphLayout { pos, width, height }
+}
+
+/// Format an SVG coordinate (whole px).
+fn dag_svg_coord(value: f64) -> String {
+    format!("{value:.0}")
+}
+
+/// Render the run graph as an inline, server-computed SVG. `upstreams[i]` holds
+/// the task-index upstreams of node `i` (used for edges); `selected` highlights
+/// the clicked node. Wrapped in a scrollable container so a large DAG stays
+/// navigable rather than being disabled. maud auto-escapes every text/attribute
+/// interpolation (node names, tooltips), so untrusted node names cannot inject
+/// markup.
+fn render_dag_run_graph_svg(
+    nodes: &[DagRunNode],
+    levels: &[Vec<usize>],
+    upstreams: &[Vec<usize>],
+    selected: Option<usize>,
+    run_id: uuid::Uuid,
+) -> Markup {
+    let layout = build_graph_layout(levels, nodes.len());
+    // Precompute edge endpoints so the maud macro stays declarative.
+    let mut edges: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for (idx, ups) in upstreams.iter().enumerate() {
+        let Some(&(nx, ny)) = layout.pos.get(idx) else {
+            continue;
+        };
+        for &u in ups {
+            if let Some(&(ux, uy)) = layout.pos.get(u) {
+                edges.push((
+                    ux + DAG_NODE_W,
+                    uy + DAG_NODE_H / 2.0,
+                    nx,
+                    ny + DAG_NODE_H / 2.0,
+                ));
+            }
+        }
+    }
+    html! {
+        div class="dag-graph-scroll" {
+            svg xmlns="http://www.w3.org/2000/svg"
+                width=(dag_svg_coord(layout.width))
+                height=(dag_svg_coord(layout.height))
+                role="img"
+                aria-label="DAG run graph" {
+                @for (x1, y1, x2, y2) in &edges {
+                    line x1=(dag_svg_coord(*x1)) y1=(dag_svg_coord(*y1))
+                         x2=(dag_svg_coord(*x2)) y2=(dag_svg_coord(*y2))
+                         class="dag-edge" {}
+                }
+                @for (idx, node) in nodes.iter().enumerate() {
+                    @let (x, y) = layout.pos.get(idx).copied().unwrap_or((0.0, 0.0));
+                    @let selected_class = if selected == Some(idx) { "dag-node selected" } else { "dag-node" };
+                    a href=(format!("?run={run_id}&node={idx}")) aria-label=(format!("{} — {}", node.node_name, dag_node_status_label(node.status))) {
+                        rect x=(dag_svg_coord(x)) y=(dag_svg_coord(y))
+                             width=(dag_svg_coord(DAG_NODE_W)) height=(dag_svg_coord(DAG_NODE_H))
+                             rx="6" fill=(dag_node_status_fill(node.status))
+                             class=(selected_class) {}
+                        text x=(dag_svg_coord(x + 8.0)) y=(dag_svg_coord(y + 25.0)) class="dag-node-label" {
+                            (dag_node_status_icon(node.status)) " " (node.node_name)
+                        }
+                        title { (node.node_name) " — " (dag_node_status_label(node.status)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A compact status legend for the graph (colour + icon + label per status).
+fn dag_status_legend() -> Markup {
+    const LEGEND: [DagNodeStatus; 8] = [
+        DagNodeStatus::Succeeded,
+        DagNodeStatus::Failed,
+        DagNodeStatus::TimedOut,
+        DagNodeStatus::Cancelled,
+        DagNodeStatus::Running,
+        DagNodeStatus::Pending,
+        DagNodeStatus::Skipped,
+        DagNodeStatus::Waiting,
+    ];
+    html! {
+        div class="dag-legend" {
+            @for status in LEGEND {
+                span {
+                    span class="swatch" style=(format!("background:{}", dag_node_status_fill(status))) {}
+                    (dag_node_status_icon(status)) " " (dag_node_status_label(status))
+                }
+            }
+        }
+    }
+}
+
+/// The click-through detail panel for a selected node: status, timing,
+/// attempts, dependencies, error (when failed), and — for an
+/// attempted-but-not-succeeded node on a terminally-failed run — the
+/// "Retry from this node" link into the dry-run confirm page.
+fn render_dag_node_panel(
+    node: &DagRunNode,
+    idx: usize,
+    run_state: &str,
+    dag_name: &str,
+    run_id: uuid::Uuid,
+) -> Markup {
+    html! {
+        div class="card" {
+            h3 { "Node " (idx) " · " code { (node.node_name) } }
+            p { "Status: " (dag_node_status_icon(node.status)) " " (dag_node_status_label(node.status)) }
+            @if let Some(started) = node.started_at {
+                p { "Started: " (format_timestamp(Some(started))) }
+            }
+            @if let Some(finished) = node.finished_at {
+                p { "Finished: " (format_timestamp(Some(finished))) }
+            }
+            p { "Attempts: " (node.attempts) }
+            @if !node.depends_on.is_empty() {
+                p { "Depends on: " (node.depends_on.join(", ")) }
+            }
+            @if let Some(error_type) = &node.error_type {
+                p { "Error type: " code { (error_type) } }
+            }
+            @if let Some(error) = &node.error {
+                p { "Error: " (error) }
+            }
+            @if node_retry_offered(run_state, node.status) {
+                p {
+                    a class="btn reset"
+                      href=(format!(
+                          "{}/runs/{}/retry?from_node={}",
+                          url_encode(dag_name),
+                          run_id,
+                          url_encode(&node.node_name)
+                      )) {
+                        "Retry from this node"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Success-flash text naming the new (forked) run id (issue #957).
+fn dag_retry_success_flash(new_run: &str) -> String {
+    format!("Retry started — new run {new_run}")
+}
+
+/// Warning-flash text for the audit-write-after-fork case (issue #957, Codex
+/// review): the fork **committed** (a new run exists) but the `dag.retry` audit
+/// row could not be written. This is a partial success — the operator must be
+/// able to find the run that actually started, so we name it and flag the
+/// missing audit record distinctly from the hard "Retry failed" message used
+/// for real failures (400/404/409).
+fn dag_retry_audit_warning_flash(new_run: &str) -> String {
+    format!("Retry started — new run {new_run} — but the audit record could not be written")
+}
+
+/// Pure decision for the retry-commit redirect: which run to open next and what
+/// flash text to show, given the shared `retry_dag_run_inner` outcome and the
+/// source run id. A successful fork opens the new run with the success flash; an
+/// [`DagRetryFailure::AuditFailed`] is a **partial success** (the fork committed)
+/// so it opens the *new* run with a warning flash rather than hiding it behind a
+/// failure message; every other failure opens the source run with the hard
+/// "Retry failed" message. Returns unencoded flash text — the caller percent-
+/// encodes it once.
+fn dag_retry_commit_redirect(
+    outcome: Result<DagRetryResponse, DagRetryFailure>,
+    source_run: &str,
+) -> (String, String) {
+    match outcome {
+        Ok(plan) => {
+            let new_run = plan
+                .new_run_exec_id
+                .unwrap_or_else(|| source_run.to_string());
+            let flash = dag_retry_success_flash(&new_run);
+            (new_run, flash)
+        }
+        Err(DagRetryFailure::AuditFailed { new_exec_id, .. }) => {
+            let flash = dag_retry_audit_warning_flash(&new_exec_id);
+            (new_exec_id, flash)
+        }
+        Err(failure) => (
+            source_run.to_string(),
+            format!("Retry failed: {}", failure.human_message()),
+        ),
+    }
+}
+
+/// Default, editable retry reason pre-filled into the confirm-page textarea.
+fn dag_retry_default_reason(from_node: &str) -> String {
+    format!("retry from node {from_node} via Vantage")
+}
+
+// ── Issue #960: execution timeline / Gantt view ────────────────────────────
+//
+// A standalone, read-only page at `GET /workflows/{id}/timeline` that renders
+// the shipped `autumn_harvest::derive_timeline` output as a server-computed
+// inline SVG Gantt. Pause (#383) and ND-block (#603) bands come from the
+// execution-row columns the handler already loads — never from the step data,
+// which carries no such fields. Payload-free (no #608 decode, no audit).
+
+/// Left gutter width (px) reserved for lane/step labels.
+const TL_GUTTER: f64 = 230.0;
+/// Wall-clock axis width (px) — the drawable time span.
+const TL_AXIS_W: f64 = 900.0;
+/// Per-step row height (px).
+const TL_ROW_H: f64 = 26.0;
+/// Span bar height (px) within a row.
+const TL_SPAN_H: f64 = 14.0;
+/// Header band height (px) holding the axis ticks.
+const TL_HEADER_H: f64 = 44.0;
+/// Minimum rendered span width (px) so sub-second slivers stay visible.
+const TL_MIN_SPAN_W: f64 = 3.0;
+/// Bottom padding (px).
+const TL_PAD: f64 = 14.0;
+/// Upper bound on rendered step rows; beyond this the view truncates with a
+/// note (the rollup is still computed over the full set by `derive_timeline`).
+const MAX_RENDER_STEPS: usize = 500;
+
+/// Fixed lane order for the Gantt (one lane per `step_kind`). Activity-family
+/// lanes lead so the common queue-wait/exec story reads first.
+const TIMELINE_LANES: [StepKind; 6] = [
+    StepKind::Activity,
+    StepKind::LocalActivity,
+    StepKind::ChildWorkflow,
+    StepKind::Timer,
+    StepKind::SignalWait,
+    StepKind::SideEffect,
+];
+
+/// Fill colour keyed to a step's outcome (distinct per outcome; the label is
+/// the accessible, colour-independent cue).
+const fn step_outcome_fill(outcome: StepOutcome) -> &'static str {
+    match outcome {
+        StepOutcome::Completed => "#166534",
+        StepOutcome::Failed => "#991b1b",
+        StepOutcome::TimedOut => "#b45309",
+        StepOutcome::Cancelled => "#6b7280",
+        StepOutcome::Fired => "#0e7490",
+        StepOutcome::Pending => "#1d4ed8",
+    }
+}
+
+/// Human-readable outcome label (matches the #739 bounded enum).
+const fn step_outcome_label(outcome: StepOutcome) -> &'static str {
+    match outcome {
+        StepOutcome::Completed => "Completed",
+        StepOutcome::Failed => "Failed",
+        StepOutcome::TimedOut => "Timed out",
+        StepOutcome::Cancelled => "Cancelled",
+        StepOutcome::Fired => "Fired",
+        StepOutcome::Pending => "Pending",
+    }
+}
+
+/// Lane label per step kind.
+const fn step_kind_lane_label(kind: StepKind) -> &'static str {
+    match kind {
+        StepKind::Activity => "Activity",
+        StepKind::LocalActivity => "Local activity",
+        StepKind::Timer => "Timer",
+        StepKind::ChildWorkflow => "Child workflow",
+        StepKind::SignalWait => "Signal wait",
+        StepKind::SideEffect => "Side effect",
+    }
+}
+
+/// Map a millisecond offset onto an axis of `axis_width` px, guarding a
+/// zero/negative span (an instantaneous or zero-duration run) so there is no
+/// divide-by-zero / NaN, and clamping the result inside `[0, axis_width]`.
+fn x_scale(offset_ms: i64, span_ms: i64, axis_width: f64) -> f64 {
+    if span_ms <= 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let frac = offset_ms as f64 / span_ms as f64;
+    (frac * axis_width).clamp(0.0, axis_width)
+}
+
+/// A within-span segment: the queue-wait vs execution split (only when the API
+/// provides both), else one undivided whole span. Never fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegKind {
+    Wait,
+    Exec,
+    Whole,
+}
+
+/// Split a step into its rendered segments. Two segments (`Wait`, `Exec`) only
+/// when the timeline recorded both `wait_ms` and `exec_ms` (a started regular
+/// activity); otherwise a single undivided `Whole` span — the split is never
+/// fabricated (#739 contract).
+fn span_segments(step: &TimelineStep) -> Vec<(SegKind, i64)> {
+    match (step.wait_ms, step.exec_ms) {
+        (Some(wait), Some(exec)) => vec![(SegKind::Wait, wait), (SegKind::Exec, exec)],
+        _ => vec![(SegKind::Whole, step.total_ms)],
+    }
+}
+
+/// CSS class for a segment kind.
+const fn seg_class(seg: SegKind) -> &'static str {
+    match seg {
+        SegKind::Wait => "gantt-seg-wait",
+        SegKind::Exec => "gantt-seg-exec",
+        SegKind::Whole => "gantt-seg-whole",
+    }
+}
+
+/// The rect class for a span segment (base + segment + open/slowest modifiers).
+fn span_rect_class(seg: SegKind, open: bool, slowest: bool) -> String {
+    let mut class = format!("gantt-span {}", seg_class(seg));
+    if open {
+        class.push_str(" gantt-span-open");
+    }
+    if slowest {
+        class.push_str(" gantt-span-slowest");
+    }
+    class
+}
+
+/// Format a millisecond duration compactly (`ms` under 1 s, `Ns` under a
+/// minute, `Nm Ns` beyond).
+fn format_ms(ms: i64) -> String {
+    let ms = ms.max(0);
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        #[allow(clippy::cast_precision_loss)]
+        let secs = ms as f64 / 1000.0;
+        format!("{secs:.1}s")
+    } else {
+        let secs = ms / 1000;
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+/// Index into `timeline.steps` of the slowest step by `total_ms` (first on
+/// ties). `None` when there are no steps. Matches the rollup's `slowest_step`.
+fn slowest_step_index(timeline: &Timeline) -> Option<usize> {
+    let mut best: Option<(usize, i64)> = None;
+    for (idx, step) in timeline.steps.iter().enumerate() {
+        if best.is_none_or(|(_, best_ms)| step.total_ms > best_ms) {
+            best = Some((idx, step.total_ms));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
+/// The wall-clock axis geometry for the Gantt: `[start, end]` mapped onto
+/// `[gutter, gutter + width]`, with `height` the full SVG height (used by the
+/// full-height pause band and ND marker).
+#[derive(Debug, Clone, Copy)]
+struct GanttAxis {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    gutter: f64,
+    width: f64,
+    height: f64,
+}
+
+impl GanttAxis {
+    /// Build an axis, ensuring `end > start` so a zero-duration run still has a
+    /// usable (1 ms) span rather than a degenerate axis.
+    fn new(start: DateTime<Utc>, end: DateTime<Utc>, gutter: f64, width: f64, height: f64) -> Self {
+        let end = if end > start {
+            end
+        } else {
+            start + chrono::Duration::milliseconds(1)
+        };
+        Self {
+            start,
+            end,
+            gutter,
+            width,
+            height,
+        }
+    }
+
+    fn span_ms(&self) -> i64 {
+        (self.end - self.start).num_milliseconds().max(1)
+    }
+
+    /// The x coordinate (px, including the gutter offset) for an instant.
+    fn x_for(&self, t: DateTime<Utc>) -> f64 {
+        let offset = (t - self.start).num_milliseconds();
+        self.gutter + x_scale(offset, self.span_ms(), self.width)
+    }
+}
+
+/// The full-height pause band (#383), sourced from the execution row's active
+/// pause columns. `None` when the row is not currently paused. The row retains
+/// only the *active* pause (resume nulls `paused_at`), so historical/resolved
+/// pauses are not renderable — a documented limitation.
+fn pause_band_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup> {
+    let paused_at = exec.paused_at?;
+    let x1 = axis.x_for(paused_at);
+    // An active pause extends to the current clock end (the axis end).
+    let x2 = axis.gutter + axis.width;
+    let width = (x2 - x1).max(1.0);
+    let mut label = String::from("Paused");
+    if let Some(reason) = exec.pause_reason.as_deref() {
+        label.push_str(": ");
+        label.push_str(reason);
+    }
+    if let Some(actor) = exec.pause_actor.as_deref() {
+        label.push_str(" (by ");
+        label.push_str(actor);
+        label.push(')');
+    }
+    Some(html! {
+        rect class="gantt-pause-band" x=(dag_svg_coord(x1)) y="0"
+             width=(dag_svg_coord(width)) height=(dag_svg_coord(axis.height)) {}
+        text class="gantt-pause-label" x=(dag_svg_coord(x1 + 4.0))
+             y=(dag_svg_coord(axis.height - 6.0)) { (label) }
+    })
+}
+
+/// The vertical ND-block marker (#603), sourced from the execution row's
+/// `nd_blocked_at`/`nd_block_reason`. `None` when the row is not ND-blocked.
+/// Surfaces the `nondeterminism-block` runbook *path* as inline SVG text — not a
+/// clickable link, since the runbook is a repo path, not a served URL (a relative
+/// `<a href>` here would 404 during ND-block triage). Matches the non-clickable
+/// `code { "docs/runbooks/safe-deploy.md" }` convention elsewhere in this file.
+fn nd_marker_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup> {
+    let nd_at = exec.nd_blocked_at?;
+    let x = axis.x_for(nd_at);
+    let reason = exec
+        .nd_block_reason
+        .as_deref()
+        .unwrap_or("non-determinism block");
+    Some(html! {
+        line class="gantt-nd-marker" x1=(dag_svg_coord(x)) y1="0"
+             x2=(dag_svg_coord(x)) y2=(dag_svg_coord(axis.height)) {}
+        text class="gantt-nd-label" x=(dag_svg_coord(x + 4.0)) y="14" {
+            "⚠ ND-block: " (reason) " — see docs/runbooks/nondeterminism-block.md"
+        }
+    })
+}
+
+/// The rollup header: total wall-clock, busy vs wait, and the slowest step.
+fn render_timeline_rollup(rollup: &TimelineRollup) -> Markup {
+    html! {
+        div class="timeline-rollup" {
+            div class="stat" {
+                span class="label" { "Total wall-clock" }
+                span class="value" { (format_ms(rollup.total_wall_clock_ms)) }
+            }
+            div class="stat" {
+                span class="label" { "Busy (exec)" }
+                span class="value" { (format_ms(rollup.busy_ms)) }
+            }
+            div class="stat" {
+                span class="label" { "Wait (queue/timer/signal)" }
+                span class="value" { (format_ms(rollup.wait_ms)) }
+            }
+            @if let Some(slow) = &rollup.slowest_step {
+                div class="stat" {
+                    span class="label" { "Slowest step" }
+                    span class="value" {
+                        (slow.name.as_deref().unwrap_or("(unnamed)"))
+                        " · " (step_kind_lane_label(slow.step_kind))
+                        " · " (format_ms(slow.total_ms))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A compact legend mapping outcome → colour + label.
+fn timeline_outcome_legend() -> Markup {
+    const OUTCOMES: [StepOutcome; 6] = [
+        StepOutcome::Completed,
+        StepOutcome::Failed,
+        StepOutcome::TimedOut,
+        StepOutcome::Cancelled,
+        StepOutcome::Fired,
+        StepOutcome::Pending,
+    ];
+    html! {
+        div class="timeline-legend" {
+            @for outcome in OUTCOMES {
+                span {
+                    span class="swatch" style=(format!("background:{}", step_outcome_fill(outcome))) {}
+                    (step_outcome_label(outcome))
+                }
+            }
+        }
+    }
+}
+
+/// Render one step row: the gutter labels (lane group label once per group,
+/// then the step name) plus the span segment rects grouped under an anchor
+/// `<g>` (carrying `id="slowest"` for the slowest step), and the retry badge
+/// for a genuine retry (`attempt > 1`). Segment x offsets are accumulated in
+/// plain Rust (maud cannot mutate inside a `@for`).
+fn render_timeline_row(
+    step: &TimelineStep,
+    kind: StepKind,
+    is_head: bool,
+    row: usize,
+    axis: &GanttAxis,
+    is_slowest: bool,
+) -> Markup {
+    let name = step.name.as_deref().unwrap_or("(unnamed)");
+    #[allow(clippy::cast_precision_loss)]
+    let y = TL_ROW_H.mul_add(row as f64, TL_HEADER_H);
+    let open = step.ended_at.is_none();
+
+    let x1 = axis.x_for(step.scheduled_at);
+    let step_end = step.ended_at.unwrap_or(axis.end);
+    let x2 = axis.x_for(step_end);
+    let span_w = (x2 - x1).max(TL_MIN_SPAN_W);
+    let span_y = y + (TL_ROW_H - TL_SPAN_H) / 2.0;
+
+    // The span's pixel width comes from the axis geometry (`span_w`), never from
+    // `total_ms`. A single `Whole` segment fills the whole geometric extent — so
+    // an open/in-flight step (whose `total_ms` may be 0) still renders visibly.
+    // Only a wait/exec split proportions `span_w` by the two segments' ms ratio.
+    let segs = span_segments(step);
+    let seg_total = segs.iter().map(|(_, ms)| *ms).sum::<i64>().max(1);
+    let single = segs.len() == 1;
+    let mut seg_markup: Vec<Markup> = Vec::with_capacity(segs.len());
+    let mut seg_x = x1;
+    for (seg, ms) in &segs {
+        #[allow(clippy::cast_precision_loss)]
+        let seg_w = if single {
+            span_w
+        } else {
+            (span_w * (*ms as f64 / seg_total as f64)).max(0.5)
+        };
+        seg_markup.push(html! {
+            rect x=(dag_svg_coord(seg_x)) y=(dag_svg_coord(span_y))
+                 width=(dag_svg_coord(seg_w)) height=(dag_svg_coord(TL_SPAN_H))
+                 rx="3" fill=(step_outcome_fill(step.outcome))
+                 class=(span_rect_class(*seg, open, is_slowest)) {
+                title {
+                    (name) " — " (step_outcome_label(step.outcome))
+                    " · " (format_ms(step.total_ms))
+                    @if let (Some(w), Some(e)) = (step.wait_ms, step.exec_ms) {
+                        " (wait " (format_ms(w)) " / exec " (format_ms(e)) ")"
+                    }
+                }
+            }
+        });
+        seg_x += seg_w;
+    }
+
+    html! {
+        // Gutter labels: lane group label once per group + step name.
+        @if is_head {
+            text class="gantt-lane-group" x="6" y=(dag_svg_coord(y + 10.0)) {
+                (step_kind_lane_label(kind))
+            }
+            text class="gantt-lane-label" x="16" y=(dag_svg_coord(y + 22.0)) { (name) }
+        } @else {
+            text class="gantt-lane-label" x="16" y=(dag_svg_coord(y + 16.0)) { (name) }
+        }
+        g id=[is_slowest.then_some("slowest")] {
+            @for m in &seg_markup { (m) }
+            @if let Some(att) = step.attempt {
+                @if att > 1 {
+                    text class="gantt-badge" x=(dag_svg_coord(x1 + span_w + 4.0))
+                         y=(dag_svg_coord(span_y + TL_SPAN_H - 2.0)) { "×" (att) }
+                }
+            }
+        }
+    }
+}
+
+/// Render the execution timeline as an inline, server-computed SVG Gantt.
+///
+/// Steps are lane-grouped by `step_kind` (in `TIMELINE_LANES` order), one row
+/// per step on a shared wall-clock axis `[started_at, completed_at|now]`. A
+/// started regular activity's `wait_ms`/`exec_ms` split renders as two
+/// segments; every other step renders as one undivided span (never fabricated).
+/// Open (in-flight) steps extend to the axis end and are dashed. The slowest
+/// step carries `id="slowest"` (for a no-JS fragment scroll) and a highlight
+/// outline. Pause and ND-block bands overlay the axis, sourced from the
+/// execution row. maud auto-escapes every text/attribute interpolation.
+#[allow(clippy::too_many_lines)]
+fn render_timeline_gantt(
+    timeline: &Timeline,
+    exec: &WorkflowExecution,
+    now: DateTime<Utc>,
+) -> Markup {
+    // Lane-group the steps (stable, in TIMELINE_LANES order), marking the first
+    // of each present lane so the lane label renders once per group.
+    let mut order: Vec<(StepKind, usize, bool)> = Vec::new();
+    for lane in TIMELINE_LANES {
+        let mut is_head = true;
+        for (idx, step) in timeline.steps.iter().enumerate() {
+            if step.step_kind == lane {
+                order.push((lane, idx, is_head));
+                is_head = false;
+            }
+        }
+    }
+    let total_steps = order.len();
+    let truncated = total_steps > MAX_RENDER_STEPS;
+    let slowest = slowest_step_index(timeline);
+
+    // Render the first `MAX_RENDER_STEPS` lane-grouped rows. Lane grouping orders
+    // rows by lane, not by duration, so the slowest step can fall outside the
+    // prefix (#960). The rollup and the execution-detail Timeline link both
+    // advertise `#slowest`, so the row carrying `id="slowest"` must always be
+    // rendered — otherwise the anchor dangles. When truncating, append the
+    // slowest step's lane-grouped entry as one extra row if it is not already in
+    // the rendered set. (`slowest`, when present, always names a real entry in
+    // `order`: every `StepKind` is a `TIMELINE_LANES` lane, so `order` holds one
+    // entry per step.)
+    let mut render_order: Vec<(StepKind, usize, bool)> =
+        order.iter().take(MAX_RENDER_STEPS).copied().collect();
+    let slowest_appended = if truncated
+        && let Some(slow_idx) = slowest
+        && !render_order.iter().any(|(_, idx, _)| *idx == slow_idx)
+        && let Some(entry) = order.iter().find(|(_, idx, _)| *idx == slow_idx)
+    {
+        render_order.push(*entry);
+        true
+    } else {
+        false
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let height = TL_ROW_H.mul_add(render_order.len() as f64, TL_HEADER_H) + TL_PAD;
+    let svg_width = TL_GUTTER + TL_AXIS_W + TL_PAD;
+
+    let axis_end = exec.completed_at.unwrap_or(now);
+    let axis = GanttAxis::new(exec.started_at, axis_end, TL_GUTTER, TL_AXIS_W, height);
+    let span_ms = axis.span_ms();
+
+    // Axis tick labels at 0 / 50 / 100 % of the wall-clock span.
+    let ticks: Vec<(f64, String)> = [0.0_f64, 0.5, 1.0]
+        .iter()
+        .map(|frac| {
+            let x = axis.gutter + axis.width * frac;
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let off = (span_ms as f64 * frac) as i64;
+            (x, format!("+{}", format_ms(off)))
+        })
+        .collect();
+
+    html! {
+        (render_timeline_rollup(&timeline.rollup))
+
+        @if let Some(details) = exec.current_details.as_deref() {
+            div class="card" {
+                strong { "Now: " } (details)
+                " · "
+                // Link to the execution-detail route. The timeline page is served
+                // at `{api_base}/workflows/{id}/timeline`, so its parent route is
+                // `{api_base}/workflows/{id}` — spelled out from the api base
+                // (mirroring the page's own `base_href = "../../"` nav) rather than
+                // a bare `../{id}`, which relies on `..` stripping exactly the
+                // `timeline` segment (Codex review, #960).
+                a href={ "../../workflows/" (timeline.exec_id) } { "what is it blocked on?" }
+            }
+        }
+
+        @if let Some(nd_at) = exec.nd_blocked_at {
+            div class="banner Warning" {
+                "This execution is non-determinism-blocked (since "
+                (format_timestamp(Some(nd_at))) ", "
+                (exec.nd_block_count) " occurrence(s)). "
+                @if let Some(reason) = exec.nd_block_reason.as_deref() { (reason) " · " }
+                // Runbook path as non-clickable code text (repo path, not a served
+                // URL) — matches the `docs/runbooks/safe-deploy.md` convention.
+                "See runbook " code { "docs/runbooks/nondeterminism-block.md" }
+            }
+        }
+
+        (timeline_outcome_legend())
+
+        @if truncated {
+            div class="banner Warning" {
+                "Showing first " (MAX_RENDER_STEPS) " of " (total_steps)
+                " steps"
+                @if slowest_appended { " (plus the slowest)" }
+                ". The rollup above covers all steps."
+            }
+        }
+
+        @if timeline.steps.is_empty() {
+            div class="empty" { "No steps recorded for this execution yet." }
+        } @else {
+            div class="gantt-scroll" {
+                svg xmlns="http://www.w3.org/2000/svg"
+                    width=(dag_svg_coord(svg_width))
+                    height=(dag_svg_coord(height))
+                    role="img"
+                    aria-label="Execution timeline Gantt" {
+                    // Axis ticks (behind everything).
+                    @for (x, label) in &ticks {
+                        line class="gantt-axis-tick" x1=(dag_svg_coord(*x)) y1=(dag_svg_coord(TL_HEADER_H - 6.0))
+                             x2=(dag_svg_coord(*x)) y2=(dag_svg_coord(height)) {}
+                        text class="gantt-axis-label" x=(dag_svg_coord(*x + 2.0)) y=(dag_svg_coord(TL_HEADER_H - 10.0)) {
+                            (label)
+                        }
+                    }
+
+                    // Pause band (behind the spans).
+                    @if let Some(band) = pause_band_markup(exec, &axis) { (band) }
+
+                    // Step rows.
+                    @for (row, (kind, idx, is_head)) in render_order.iter().enumerate() {
+                        (render_timeline_row(
+                            &timeline.steps[*idx],
+                            *kind,
+                            *is_head,
+                            row,
+                            &axis,
+                            slowest == Some(*idx),
+                        ))
+                    }
+
+                    // ND-block marker (on top).
+                    @if let Some(marker) = nd_marker_markup(exec, &axis) { (marker) }
+                }
+            }
+        }
+    }
+}
+
+/// `GET /workflows/{id}/timeline` — the standalone execution timeline (Gantt).
+///
+/// Consumes the shipped `autumn_harvest::derive_timeline` in-process (exactly as
+/// the #739 API handler does): loads the execution row + timestamped history,
+/// derives the timeline, and renders the server-computed inline-SVG Gantt.
+/// Pause/ND-block bands come from the execution row's columns. Read-only, and
+/// payload-free by the API's design — no #608 read-path decode, no audit row.
+/// An unknown execution (including a classic DAG run, which is not on the
+/// execution path) surfaces `load_execution`'s `NotFound` as a 404.
+async fn workflow_timeline_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Markup, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let execution = load_execution(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    let rows = autumn_harvest::store::load_timestamped_history(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    let now = Utc::now();
+    let timeline = derive_timeline(
+        &rows,
+        execution.started_at,
+        now,
+        execution.completed_at,
+        exec_id.to_string(),
+        execution.workflow_id.clone(),
+        execution.workflow_name.clone(),
+        execution.state.clone(),
+    );
+    let title = format!("Timeline · {} · Vantage", execution.workflow_name);
+    let body = render_timeline_body(&timeline, &execution, now);
+    Ok(layout(&title, &body, "../../"))
+}
+
+/// Build the timeline page body (back link + heading + Gantt). Extracted from
+/// `workflow_timeline_ui` so the navigation link is covered by a pure render
+/// test (Codex review, #960): both the "Back to execution" control here and the
+/// current-details card inside `render_timeline_gantt` must resolve to the
+/// execution-detail route `{api_base}/workflows/{id}` — not
+/// `{api_base}/workflows/{id}/{id}`. The timeline page is served at
+/// `{api_base}/workflows/{id}/timeline`, so the link spells the full path from
+/// the api base (matching the page's `base_href = "../../"` nav) rather than a
+/// bare `../{id}` that depends on `..` stripping exactly the `timeline` segment.
+fn render_timeline_body(
+    timeline: &Timeline,
+    execution: &WorkflowExecution,
+    now: DateTime<Utc>,
+) -> Markup {
+    html! {
+        div.detail-row {
+            a.back href={ "../../workflows/" (timeline.exec_id) } {
+                (PreEscaped("&larr;")) " Back to execution"
+            }
+        }
+        h2 {
+            "Timeline — " (execution.workflow_name) " "
+            (state_badge(&execution.state))
+        }
+        (render_timeline_gantt(timeline, execution, now))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_dag_detail(
     dag_name: &str,
     dag: &RegisteredDag,
@@ -4742,52 +5838,28 @@ fn render_dag_detail(
     selected_run: Option<uuid::Uuid>,
     selected_node: Option<usize>,
     refresh: Option<u64>,
-    node_states: &HashMap<usize, DagNodeState>,
+    flash: Option<&str>,
+    view: DagGraphView<'_>,
 ) -> Markup {
-    let too_large = dag.definition.tasks().len() > 200;
-    let selected_task = selected_node.and_then(|idx| dag.definition.tasks().get(idx));
-    let selected_node_state = selected_node
-        .and_then(|idx| node_states.get(&idx).copied())
-        .unwrap_or(DagNodeState::Unknown);
     let body = html! {
+        @if let Some(message) = flash {
+            div class="flash" { (message) }
+        }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
             p { "Selected run: " code { (run_id) } }
         }
-        @if too_large {
-            div class="banner Warning" { "Topology has " (dag.definition.tasks().len()) " nodes; graph disabled." }
-        } @else {
-            h3 { "Topology" }
-            table {
-                thead { tr { th { "Node" } th { "Activity" } th { "Trigger Rule" } th { "State" } th { "Upstreams" } } }
-                tbody {
-                    @for (idx, task) in dag.definition.tasks().iter().enumerate() {
-                        tr {
-                            td {
-                                @if let Some(run_id) = selected_run {
-                                    a href={ "?run=" (run_id) "&node=" (idx) } { (idx) }
-                                } @else {
-                                    a href={ "?node=" (idx) } { (idx) }
-                                }
-                            }
-                            td { (task.activity_name.as_str()) }
-                            td { (format!("{:?}", task.trigger_rule)) }
-                            td { (dag_node_state_label(node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
-                            td {
-                                @for (n, upstream) in task.upstreams.iter().enumerate() {
-                                    @if n > 0 { ", " }
-                                    (upstream)
-                                }
-                            }
-                        }
-                    }
+        @match view {
+            DagGraphView::Classic => {
+                div class="banner Warning" {
+                    "No topology available for classic DAG runs — classic DAGs are being retired."
                 }
             }
-            @if let Some(task) = selected_task {
-                h3 { "Node panel" }
-                p { "Activity: " code { (task.activity_name.as_str()) } }
-                p { "Trigger rule: " (format!("{:?}", task.trigger_rule)) }
-                p { "Current state: " (dag_node_state_label(selected_node_state)) }
+            DagGraphView::NoRun => {
+                p class="empty" { "Select a run below to view its node graph." }
+            }
+            DagGraphView::Run { nodes, run_state } => {
+                (render_dag_run_graph_section(dag, nodes, run_state, selected_run, selected_node, dag_name))
             }
         }
         table {
@@ -4799,19 +5871,78 @@ fn render_dag_detail(
                     th { "Duration" }
                 }
             }
-            tbody {
-                @for run in runs {
-                    tr {
-                        td { a href={ "../workflows/" (run.id) } { code { (run.id) } } }
-                        td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
-                        td { (format_timestamp(Some(run.started_at))) }
-                        td { (format_run_duration(run.started_at, run.completed_at)) }
-                    }
-                }
-            }
+            (render_dag_run_rows(runs, selected_run))
         }
     };
     layout_dag_detail(&format!("DAG {dag_name} · Vantage"), &body, "../", refresh)
+}
+
+/// Render the `<tbody>` of the DAG run list (issue #957).
+///
+/// Each run's **primary** affordance re-renders THIS page's node graph for that
+/// run via a same-page `?run=` query (the same selector the graph honors, and the
+/// same bare-relative form the SVG node links use). Without this, older runs' graphs
+/// were only reachable by hand-constructing the query URL. The currently-shown run
+/// is marked "(current)" instead of linked, so it is clear which run the graph
+/// reflects. A secondary "detail" link still opens each run's workflow-detail page.
+fn render_dag_run_rows(runs: &[WorkflowExecution], selected_run: Option<uuid::Uuid>) -> Markup {
+    html! {
+        tbody {
+            @for run in runs {
+                @let is_current = selected_run == Some(run.id);
+                tr {
+                    td {
+                        @if is_current {
+                            code { (run.id) }
+                            span class="dag-run-current" { "(current)" }
+                        } @else {
+                            a href={ "?run=" (url_encode(&run.id.to_string())) } { code { (run.id) } }
+                        }
+                        a class="dag-run-detail" href={ "../workflows/" (run.id) } { "detail" }
+                    }
+                    td { span class={ "badge " (run.state.to_uppercase()) } { (run.state.as_str()) } }
+                    td { (format_timestamp(Some(run.started_at))) }
+                    td { (format_run_duration(run.started_at, run.completed_at)) }
+                }
+            }
+        }
+    }
+}
+
+/// Render the graph SVG + legend + optional large-DAG note + selected-node
+/// panel for a unified DAG run.
+fn render_dag_run_graph_section(
+    dag: &RegisteredDag,
+    nodes: &[DagRunNode],
+    run_state: &str,
+    selected_run: Option<uuid::Uuid>,
+    selected_node: Option<usize>,
+    dag_name: &str,
+) -> Markup {
+    let levels = dag.definition.execution_levels();
+    let upstreams: Vec<Vec<usize>> = dag
+        .definition
+        .tasks()
+        .iter()
+        .map(|task| task.upstreams.clone())
+        .collect();
+    let run_id = selected_run.unwrap_or_else(uuid::Uuid::nil);
+    let large = nodes.len() >= DAG_GRAPH_LARGE_THRESHOLD;
+    html! {
+        h3 { "Run graph" }
+        (dag_status_legend())
+        @if large {
+            p class="banner Warning" {
+                "Large DAG (" (nodes.len()) " nodes) — scroll to explore the graph below."
+            }
+        }
+        (render_dag_run_graph_svg(nodes, levels, &upstreams, selected_node, run_id))
+        @if let Some(idx) = selected_node {
+            @if let Some(node) = nodes.get(idx) {
+                (render_dag_node_panel(node, idx, run_state, dag_name, run_id))
+            }
+        }
+    }
 }
 
 fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Option<u64>) -> Markup {
@@ -4841,99 +5972,6 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
                 footer { "Read-only dashboard — autumn-harvest" }
             }
         }
-    }
-}
-
-fn map_node_states(
-    dag: &autumn_harvest::dag::DagDefinition,
-    tasks: &[TaskQueueItem],
-    condition_skipped: &std::collections::HashSet<usize>,
-) -> HashMap<usize, DagNodeState> {
-    let mut out = HashMap::new();
-    let mut has_task_row = vec![false; dag.tasks().len()];
-
-    // Seed condition-skipped nodes first (highest-priority: they have a recorded
-    // marker telling us *why* they were skipped).
-    for &idx in condition_skipped {
-        out.insert(idx, DagNodeState::SkippedByCondition);
-    }
-
-    for (idx, node) in dag.tasks().iter().enumerate() {
-        let mut state = out.get(&idx).copied().unwrap_or(DagNodeState::Unknown);
-        for task in tasks
-            .iter()
-            .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
-        {
-            has_task_row[idx] = true;
-            state = merge_dag_task_state(state, task.state.as_str());
-        }
-        out.insert(idx, state);
-    }
-
-    for level in dag.execution_levels() {
-        for idx in level {
-            // Only infer trigger-rule skips for nodes that aren't already
-            // identified as condition-skipped or have task queue rows.
-            if !has_task_row[*idx]
-                && out.get(idx).copied() == Some(DagNodeState::Unknown)
-                && let Some(state) = infer_skipped_node_state(dag, *idx, &out)
-            {
-                out.insert(*idx, state);
-            }
-        }
-    }
-
-    out
-}
-
-fn merge_dag_task_state(current: DagNodeState, task_state: &str) -> DagNodeState {
-    // A condition-skip is backed by a recorded marker; task-row inference must
-    // never overwrite it, even when a same-named node at a different index has
-    // a FAILED/RUNNING/etc row (duplicate-activity-name scenario).
-    if current == DagNodeState::SkippedByCondition {
-        return current;
-    }
-    match task_state {
-        "FAILED" => DagNodeState::Failed,
-        "CANCELLED" if !matches!(current, DagNodeState::Failed) => DagNodeState::Cancelled,
-        "RUNNING" if !matches!(current, DagNodeState::Failed | DagNodeState::Cancelled) => {
-            DagNodeState::Running
-        }
-        "PENDING" | "QUEUED" if current == DagNodeState::Unknown => DagNodeState::Queued,
-        "COMPLETED" if current == DagNodeState::Unknown => DagNodeState::Succeeded,
-        "SKIPPED" if current == DagNodeState::Unknown => DagNodeState::Skipped,
-        _ => current,
-    }
-}
-
-fn infer_skipped_node_state(
-    dag: &autumn_harvest::dag::DagDefinition,
-    node_idx: usize,
-    node_states: &HashMap<usize, DagNodeState>,
-) -> Option<DagNodeState> {
-    let node = dag.tasks().get(node_idx)?;
-    let upstream_statuses = node
-        .upstreams
-        .iter()
-        .map(|upstream_idx| {
-            node_states
-                .get(upstream_idx)
-                .copied()
-                .and_then(dag_node_terminal_status)
-        })
-        .collect::<Option<Vec<_>>>()?;
-
-    (!node.trigger_rule.should_run(upstream_statuses.iter())).then_some(DagNodeState::Skipped)
-}
-
-const fn dag_node_terminal_status(state: DagNodeState) -> Option<TaskStatus> {
-    match state {
-        DagNodeState::Succeeded => Some(TaskStatus::Succeeded),
-        DagNodeState::Failed | DagNodeState::Cancelled => Some(TaskStatus::Failed),
-        // Both skip variants count as Skipped for trigger-rule propagation so
-        // downstream AllDone/AllSuccess rules see the correct upstream status.
-        DagNodeState::Skipped | DagNodeState::SkippedByCondition => Some(TaskStatus::Skipped),
-        DagNodeState::Running | DagNodeState::Queued | DagNodeState::Unknown => None,
     }
 }
 
@@ -7980,6 +9018,44 @@ mod tests {
         assert!(html.contains("content=\"30\""));
     }
 
+    // Issue #957 (Codex review): every non-current run in the list must link to
+    // its own graph via `?run=`, and the currently-shown run must be marked
+    // "current" rather than linked — so an operator can inspect an older run's
+    // graph from the page instead of hand-building the query URL.
+    #[test]
+    fn render_dag_run_rows_links_each_run_to_its_graph_and_marks_current() {
+        let mut run_a = stub_execution();
+        run_a.id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let mut run_b = stub_execution();
+        run_b.id = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let runs = vec![run_a.clone(), run_b.clone()];
+
+        // run_a is the selected/current run.
+        let html = render_dag_run_rows(&runs, Some(run_a.id)).into_string();
+
+        // The non-current run (run_b) is reachable as a graph via `?run=<id>`,
+        // with the id url-encoded.
+        let expected_href = format!("?run={}", url_encode(&run_b.id.to_string()));
+        assert!(
+            html.contains(&format!("href=\"{expected_href}\"")),
+            "non-current run must link to its graph via ?run=; html={html}"
+        );
+
+        // The current run is marked, not linked to a graph.
+        assert!(
+            html.contains("(current)"),
+            "current run must be marked; html={html}"
+        );
+        assert!(
+            !html.contains(&format!("?run={}", url_encode(&run_a.id.to_string()))),
+            "current run must NOT carry a ?run= graph link; html={html}"
+        );
+
+        // The secondary workflow-detail link is preserved for every run.
+        assert!(html.contains(&format!("../workflows/{}", run_a.id)));
+        assert!(html.contains(&format!("../workflows/{}", run_b.id)));
+    }
+
     #[test]
     fn render_dag_list_uses_dag_active_nav() {
         let dags = vec![];
@@ -7993,19 +9069,38 @@ mod tests {
         let newest_listed = uuid::Uuid::from_u128(2);
 
         assert_eq!(
-            select_dag_run_id(Some(requested), true, Some(newest_listed)),
+            resolve_dag_run_selection(true, Some(requested), Some(newest_listed)).unwrap(),
             Some(requested)
         );
     }
 
     #[test]
-    fn dag_run_selection_falls_back_when_requested_run_is_not_for_dag() {
-        let requested = uuid::Uuid::from_u128(1);
+    fn dag_run_selection_unknown_requested_run_is_not_found_never_falls_back() {
+        // Issue #957 AC7: an explicitly-provided-but-unknown `?run=` renders the
+        // 404 message; it must NOT silently substitute the latest run.
         let newest_listed = uuid::Uuid::from_u128(2);
+        assert!(
+            resolve_dag_run_selection(true, None, Some(newest_listed)).is_err(),
+            "an unknown present `?run=` must be a not-found, never a fallback"
+        );
+    }
 
+    #[test]
+    fn dag_run_selection_omitted_run_defaults_to_latest() {
+        let newest_listed = uuid::Uuid::from_u128(2);
         assert_eq!(
-            select_dag_run_id(Some(requested), false, Some(newest_listed)),
-            Some(newest_listed)
+            resolve_dag_run_selection(false, None, Some(newest_listed)).unwrap(),
+            Some(newest_listed),
+            "an omitted `?run=` defaults to the latest run"
+        );
+    }
+
+    #[test]
+    fn dag_run_selection_omitted_run_with_no_runs_is_none() {
+        assert_eq!(
+            resolve_dag_run_selection(false, None, None).unwrap(),
+            None,
+            "an omitted `?run=` on a DAG with no runs selects nothing (no 404)"
         );
     }
 
@@ -8021,48 +9116,6 @@ mod tests {
             dag_run_shard(&router, "daily_etl"),
             router.pick_for_dag("daily_etl")
         );
-    }
-
-    fn two_node_dag_with_downstream_rule(
-        rule: autumn_harvest::policy::TriggerRule,
-    ) -> (autumn_harvest::dag::DagDefinition, usize, usize) {
-        fn upstream_for_ui_state_test() {}
-        fn downstream_for_ui_state_test() {}
-
-        let mut builder = autumn_harvest::dag::DagBuilder::new();
-        let upstream = builder.activity(upstream_for_ui_state_test);
-        let upstream_idx = upstream.index();
-        let downstream = builder
-            .activity(downstream_for_ui_state_test)
-            .upstream(&upstream)
-            .trigger_rule(rule);
-        let downstream_idx = downstream.index();
-
-        (
-            builder.build().expect("test dag should compile"),
-            upstream_idx,
-            downstream_idx,
-        )
-    }
-
-    fn out_of_order_two_node_dag() -> (autumn_harvest::dag::DagDefinition, usize, usize) {
-        fn out_of_order_downstream_for_ui_state_test() {}
-        fn out_of_order_upstream_for_ui_state_test() {}
-
-        let mut builder = autumn_harvest::dag::DagBuilder::new();
-        let downstream = builder
-            .activity(out_of_order_downstream_for_ui_state_test)
-            .trigger_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
-        let downstream_idx = downstream.index();
-        let upstream = builder.activity(out_of_order_upstream_for_ui_state_test);
-        let upstream_idx = upstream.index();
-        let _downstream = downstream.upstream(&upstream);
-
-        (
-            builder.build().expect("test dag should compile"),
-            upstream_idx,
-            downstream_idx,
-        )
     }
 
     fn task_queue_item_for_activity(activity_name: &str, state: &str) -> TaskQueueItem {
@@ -8107,54 +9160,6 @@ mod tests {
             wake_requested: false,
             session_id: None,
         }
-    }
-
-    #[test]
-    fn dag_node_state_infers_skipped_when_trigger_rule_blocks_unscheduled_node() {
-        let (dag, upstream_idx, downstream_idx) =
-            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
-        let known_states = HashMap::from([(upstream_idx, DagNodeState::Failed)]);
-
-        assert_eq!(
-            infer_skipped_node_state(&dag, downstream_idx, &known_states),
-            Some(DagNodeState::Skipped)
-        );
-    }
-
-    #[test]
-    fn dag_node_state_infers_skipped_when_upstream_declared_after_downstream() {
-        let (dag, upstream_idx, downstream_idx) = out_of_order_two_node_dag();
-        assert_eq!(
-            dag.execution_levels(),
-            &[vec![upstream_idx], vec![downstream_idx]]
-        );
-
-        let task_rows = vec![task_queue_item_for_activity(
-            dag.tasks()[upstream_idx].activity_name.as_str(),
-            "FAILED",
-        )];
-        let states = map_node_states(&dag, &task_rows, &std::collections::HashSet::new());
-
-        assert_eq!(states.get(&downstream_idx), Some(&DagNodeState::Skipped));
-    }
-
-    #[test]
-    fn dag_node_state_stays_unknown_until_upstreams_are_terminal() {
-        let (dag, _, downstream_idx) =
-            two_node_dag_with_downstream_rule(autumn_harvest::policy::TriggerRule::AllSuccess);
-
-        assert_eq!(
-            infer_skipped_node_state(&dag, downstream_idx, &HashMap::new()),
-            None
-        );
-    }
-
-    #[test]
-    fn dag_task_state_cancelled_is_terminal() {
-        assert_eq!(
-            merge_dag_task_state(DagNodeState::Unknown, "CANCELLED"),
-            DagNodeState::Cancelled
-        );
     }
 
     #[test]
@@ -8766,71 +9771,1194 @@ mod tests {
         );
     }
 
-    // ── Issue #482 — DagNodeState label and condition-skip inference ──────────
+    // ── Issue #957 — DAG run graph rendering (consumes dag_graph::build_run_graph) ──
+    // `DagNodeStatus`/`DagRunNode`/`build_run_graph` come in via `super::*`
+    // (the module-level `use crate::dag_graph::…`); only `DagNodeKind` is
+    // test-only.
 
+    use crate::dag_graph::DagNodeKind;
+
+    const ALL_DAG_NODE_STATUSES: [DagNodeStatus; 8] = [
+        DagNodeStatus::Succeeded,
+        DagNodeStatus::Failed,
+        DagNodeStatus::TimedOut,
+        DagNodeStatus::Cancelled,
+        DagNodeStatus::Running,
+        DagNodeStatus::Pending,
+        DagNodeStatus::Skipped,
+        DagNodeStatus::Waiting,
+    ];
+
+    fn dag_run_node(name: &str, status: DagNodeStatus, depends_on: Vec<String>) -> DagRunNode {
+        DagRunNode {
+            node_name: name.to_string(),
+            kind: DagNodeKind::Activity,
+            status,
+            depends_on,
+            started_at: None,
+            finished_at: None,
+            attempts: 0,
+            error_type: None,
+            error: None,
+        }
+    }
+
+    // P1
     #[test]
-    fn dag_node_state_label_distinguishes_skip_variants() {
+    fn dag_node_status_fill_covers_all_eight_variants() {
+        let fills: Vec<&str> = ALL_DAG_NODE_STATUSES
+            .iter()
+            .map(|s| dag_node_status_fill(*s))
+            .collect();
+        for fill in &fills {
+            assert!(
+                fill.starts_with('#') && fill.len() >= 4,
+                "fill must be a non-empty hex colour: {fill:?}"
+            );
+        }
+        let unique: std::collections::HashSet<&&str> = fills.iter().collect();
         assert_eq!(
-            dag_node_state_label(DagNodeState::Skipped),
-            "Skipped (upstream)"
+            unique.len(),
+            8,
+            "each status must have a distinct fill: {fills:?}"
         );
+    }
+
+    // P2
+    #[test]
+    fn dag_node_status_icon_distinguishes_without_color() {
+        let icons: Vec<&str> = ALL_DAG_NODE_STATUSES
+            .iter()
+            .map(|s| dag_node_status_icon(*s))
+            .collect();
+        for icon in &icons {
+            assert!(!icon.is_empty(), "icon must be non-empty");
+        }
+        let unique: std::collections::HashSet<&&str> = icons.iter().collect();
         assert_eq!(
-            dag_node_state_label(DagNodeState::SkippedByCondition),
-            "Skipped (condition)"
+            unique.len(),
+            8,
+            "each status must have a distinct glyph: {icons:?}"
         );
-        assert_eq!(dag_node_state_label(DagNodeState::Succeeded), "Succeeded");
-        assert_eq!(dag_node_state_label(DagNodeState::Unknown), "Unknown");
+    }
+
+    // P3
+    #[test]
+    fn dag_node_status_label_all_variants() {
+        assert_eq!(dag_node_status_label(DagNodeStatus::TimedOut), "Timed out");
+        assert_eq!(dag_node_status_label(DagNodeStatus::Waiting), "Waiting");
+        assert_eq!(dag_node_status_label(DagNodeStatus::Pending), "Pending");
+        assert_eq!(dag_node_status_label(DagNodeStatus::Skipped), "Skipped");
+        let labels: Vec<&str> = ALL_DAG_NODE_STATUSES
+            .iter()
+            .map(|s| dag_node_status_label(*s))
+            .collect();
+        for label in &labels {
+            assert!(!label.is_empty(), "label must be non-empty");
+        }
+        let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            8,
+            "each status must have a distinct label: {labels:?}"
+        );
+    }
+
+    // P4
+    #[test]
+    fn node_retry_offered_matrix() {
+        // Terminal-failed run + attempted-not-succeeded node → offer retry.
+        assert!(node_retry_offered("FAILED", DagNodeStatus::Failed));
+        assert!(node_retry_offered("FAILED", DagNodeStatus::TimedOut));
+        assert!(node_retry_offered("FAILED", DagNodeStatus::Cancelled));
+        assert!(node_retry_offered("CANCELLED", DagNodeStatus::Failed));
+        assert!(node_retry_offered("TIMED_OUT", DagNodeStatus::Failed));
+        // Run not terminal-eligible → never offer.
+        assert!(!node_retry_offered("COMPLETED", DagNodeStatus::Failed));
+        assert!(!node_retry_offered("RUNNING", DagNodeStatus::Failed));
+        // Node not a retry candidate → never offer.
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Succeeded));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Pending));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Skipped));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Waiting));
+        assert!(!node_retry_offered("FAILED", DagNodeStatus::Running));
+    }
+
+    // P5
+    #[test]
+    fn build_graph_layout_columns_by_level() {
+        // 3-level linear chain → 3 monotonically increasing x-columns.
+        let layout = build_graph_layout(&[vec![0], vec![1], vec![2]], 3);
+        assert_eq!(layout.pos.len(), 3);
+        assert!(layout.pos[0].0 < layout.pos[1].0);
+        assert!(layout.pos[1].0 < layout.pos[2].0);
+
+        // Fan-out level → same column x, distinct rows y.
+        let layout2 = build_graph_layout(&[vec![0], vec![1, 2], vec![3]], 4);
+        assert!(
+            (layout2.pos[1].0 - layout2.pos[2].0).abs() < f64::EPSILON,
+            "same-level nodes share a column x"
+        );
+        assert!(
+            (layout2.pos[1].1 - layout2.pos[2].1).abs() > f64::EPSILON,
+            "same-level nodes occupy distinct rows"
+        );
+        assert!(layout2.width > 0.0 && layout2.height > 0.0);
+    }
+
+    // P6
+    #[test]
+    fn build_graph_layout_is_deterministic() {
+        let a = build_graph_layout(&[vec![0], vec![1, 2], vec![3]], 4);
+        let b = build_graph_layout(&[vec![0], vec![1, 2], vec![3]], 4);
+        assert_eq!(a.pos, b.pos);
+        assert!((a.width - b.width).abs() < f64::EPSILON);
+        assert!((a.height - b.height).abs() < f64::EPSILON);
+    }
+
+    // P7
+    #[test]
+    fn render_dag_run_graph_svg_contains_nodes_edges_fills() {
+        let nodes = vec![
+            dag_run_node("step_a", DagNodeStatus::Succeeded, vec![]),
+            dag_run_node("step_b", DagNodeStatus::Failed, vec!["step_a".to_string()]),
+        ];
+        let levels = vec![vec![0], vec![1]];
+        let upstreams = vec![vec![], vec![0]];
+        let svg = render_dag_run_graph_svg(&nodes, &levels, &upstreams, None, uuid::Uuid::nil())
+            .into_string();
+
+        assert!(svg.contains("<svg"), "must be an inline svg");
+        assert!(svg.contains("step_a"));
+        assert!(svg.contains("step_b"));
+        assert!(svg.contains(dag_node_status_fill(DagNodeStatus::Succeeded)));
+        assert!(svg.contains(dag_node_status_fill(DagNodeStatus::Failed)));
+        assert!(svg.contains("<line"), "edges rendered as <line>");
+        assert!(svg.contains("<a "), "each node is a click-through link");
+        assert!(svg.contains("?run="), "node links carry the run id");
+        assert!(svg.contains("node=0"));
+        assert!(svg.contains("node=1"));
+    }
+
+    // P8
+    #[test]
+    fn render_dag_run_graph_svg_escapes_node_names() {
+        let nodes = vec![dag_run_node("<b>evil</b>", DagNodeStatus::Failed, vec![])];
+        let svg = render_dag_run_graph_svg(&nodes, &[vec![0]], &[vec![]], None, uuid::Uuid::nil())
+            .into_string();
+        assert!(
+            !svg.contains("<b>evil</b>"),
+            "a markup-char node name must be escaped, not injected: {svg}"
+        );
+        assert!(svg.contains("&lt;b&gt;evil"), "escaped form present");
+    }
+
+    // P8b — accessibility: the per-status glyph is actually embedded in the
+    // rendered node SVG (not just returned by the helper), so dropping the icon
+    // from the render would fail this test. #957 AC: distinguishable without
+    // colour alone.
+    #[test]
+    fn render_dag_run_graph_svg_embeds_status_icon_glyphs() {
+        let nodes = vec![
+            dag_run_node("step_ok", DagNodeStatus::Succeeded, vec![]),
+            dag_run_node(
+                "step_bad",
+                DagNodeStatus::Failed,
+                vec!["step_ok".to_string()],
+            ),
+        ];
+        let svg = render_dag_run_graph_svg(
+            &nodes,
+            &[vec![0], vec![1]],
+            &[vec![], vec![0]],
+            None,
+            uuid::Uuid::nil(),
+        )
+        .into_string();
+        // The glyph rides on the node label text `(icon) " " (name)`.
+        assert!(
+            svg.contains(&format!(
+                "{} step_ok",
+                dag_node_status_icon(DagNodeStatus::Succeeded)
+            )),
+            "succeeded node label carries its icon glyph: {svg}"
+        );
+        assert!(
+            svg.contains(&format!(
+                "{} step_bad",
+                dag_node_status_icon(DagNodeStatus::Failed)
+            )),
+            "failed node label carries its icon glyph: {svg}"
+        );
+    }
+
+    // P9
+    #[test]
+    fn render_dag_node_panel_failed_shows_error_and_retry_link() {
+        let mut node = dag_run_node("step_b", DagNodeStatus::Failed, vec!["step_a".to_string()]);
+        node.attempts = 2;
+        node.error_type = Some("S3Error".to_string());
+        node.error = Some("transient S3 500".to_string());
+        let panel =
+            render_dag_node_panel(&node, 1, "FAILED", "graph_linear_dag", uuid::Uuid::nil())
+                .into_string();
+
+        assert!(panel.contains("S3Error"));
+        assert!(panel.contains("transient S3 500"));
+        assert!(panel.contains("/retry"), "retry link present: {panel}");
+        assert!(
+            panel.contains("from_node=step_b"),
+            "retry link names the source node: {panel}"
+        );
+    }
+
+    // P10
+    #[test]
+    fn render_dag_node_panel_no_retry_when_not_offered() {
+        // Succeeded node on a FAILED run → no retry.
+        let ok_node = dag_run_node("step_a", DagNodeStatus::Succeeded, vec![]);
+        let ok_panel =
+            render_dag_node_panel(&ok_node, 0, "FAILED", "d", uuid::Uuid::nil()).into_string();
+        assert!(!ok_panel.contains("/retry"));
+
+        // Failed node on a RUNNING run → no retry.
+        let live_node = dag_run_node("step_a", DagNodeStatus::Failed, vec![]);
+        let live_panel =
+            render_dag_node_panel(&live_node, 0, "RUNNING", "d", uuid::Uuid::nil()).into_string();
+        assert!(!live_panel.contains("/retry"));
+    }
+
+    // P11
+    #[test]
+    fn render_dag_node_panel_pending_vs_skipped_distinct() {
+        let pending = dag_run_node("n", DagNodeStatus::Pending, vec![]);
+        let skipped = dag_run_node("n", DagNodeStatus::Skipped, vec![]);
+        let pending_panel =
+            render_dag_node_panel(&pending, 0, "RUNNING", "d", uuid::Uuid::nil()).into_string();
+        let skipped_panel =
+            render_dag_node_panel(&skipped, 0, "COMPLETED", "d", uuid::Uuid::nil()).into_string();
+        assert!(pending_panel.contains(dag_node_status_label(DagNodeStatus::Pending)));
+        assert!(skipped_panel.contains(dag_node_status_label(DagNodeStatus::Skipped)));
+        assert_ne!(
+            dag_node_status_label(DagNodeStatus::Pending),
+            dag_node_status_label(DagNodeStatus::Skipped)
+        );
+    }
+
+    // P12
+    #[test]
+    fn dag_retry_success_flash_names_new_run() {
+        let flash = dag_retry_success_flash("new-run-abc-123");
+        assert!(
+            flash.contains("new-run-abc-123"),
+            "success flash must name the new run id: {flash}"
+        );
+    }
+
+    // Codex review (issue #957): a successful fork opens the NEW run.
+    #[test]
+    fn dag_retry_commit_redirect_opens_new_run_on_success() {
+        let plan = DagRetryResponse {
+            dry_run: false,
+            dag_name: "graph_linear".to_string(),
+            source_run_exec_id: "source-run".to_string(),
+            reset_to_event_id: 3,
+            nodes_to_re_execute: vec!["step_b".to_string()],
+            nodes_carried_over: vec!["step_a".to_string()],
+            new_run_exec_id: Some("forked-run-xyz".to_string()),
+            events_carried_over: Some(2),
+        };
+        let (target, flash) = dag_retry_commit_redirect(Ok(plan), "source-run");
+        assert_eq!(target, "forked-run-xyz", "success must open the new run");
+        assert!(
+            flash.contains("forked-run-xyz"),
+            "success flash must name the new run: {flash}"
+        );
+        assert!(
+            !flash.contains("Retry failed"),
+            "success must not use the failure message: {flash}"
+        );
+    }
+
+    // Codex review (issue #957): AuditFailed is a PARTIAL SUCCESS — the fork
+    // committed, so redirect to the NEW run with a distinct warning, never the
+    // hard "Retry failed" pointing back at the source (which would hide the run
+    // that actually started).
+    #[test]
+    fn dag_retry_commit_redirect_surfaces_new_run_on_audit_failure() {
+        let failure = DagRetryFailure::AuditFailed {
+            message: "audit insert failed: boom".to_string(),
+            new_exec_id: "forked-run-xyz".to_string(),
+        };
+        let (target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
+        assert_eq!(
+            target, "forked-run-xyz",
+            "audit failure must still open the NEW forked run, not the source"
+        );
+        assert_ne!(
+            target, "source-run",
+            "audit failure must not redirect back to the source run"
+        );
+        assert!(
+            flash.contains("forked-run-xyz"),
+            "warning flash must name the new run so the operator can find it: {flash}"
+        );
+        assert!(
+            !flash.contains("Retry failed"),
+            "audit failure is a partial success and must NOT use the hard failure message: {flash}"
+        );
+        assert!(
+            flash.contains("audit record"),
+            "warning flash must call out the missing audit record: {flash}"
+        );
+    }
+
+    // Codex review (issue #957): a genuine failure (400/404/409) redirects back
+    // to the SOURCE run with the hard "Retry failed" message.
+    #[test]
+    fn dag_retry_commit_redirect_opens_source_run_on_real_failure() {
+        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
+        let (target, flash) = dag_retry_commit_redirect(Err(failure), "source-run");
+        assert_eq!(
+            target, "source-run",
+            "a real failure must redirect back to the source run"
+        );
+        assert!(
+            flash.contains("Retry failed"),
+            "a real failure must use the hard failure message: {flash}"
+        );
     }
 
     #[test]
-    fn parse_dag_skip_marker_index_matches_prefix() {
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:3"), Some(3));
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:0"), Some(0));
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:42"), Some(42));
-        assert_eq!(parse_dag_skip_marker_index("fan_out:3"), None);
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:"), None);
-        assert_eq!(parse_dag_skip_marker_index("dag_skip:abc"), None);
-    }
-
-    #[test]
-    fn dag_node_terminal_status_treats_both_skip_variants_as_skipped() {
+    fn dag_detail_relative_url_builds_back_link_and_flash() {
         assert_eq!(
-            dag_node_terminal_status(DagNodeState::Skipped),
-            Some(autumn_harvest::policy::TaskStatus::Skipped),
+            dag_detail_relative_url("graph_linear", "run-1", None),
+            "../../../graph_linear?run=run-1"
         );
         assert_eq!(
-            dag_node_terminal_status(DagNodeState::SkippedByCondition),
-            Some(autumn_harvest::policy::TaskStatus::Skipped),
+            dag_detail_relative_url("graph_linear", "run-2", Some("done")),
+            "../../../graph_linear?run=run-2&flash=done"
+        );
+        // A `run` value carrying reserved chars (e.g. a raw path segment that
+        // failed to parse as an exec id on the retry-commit Err branch) must be
+        // percent-encoded — mirroring `dag_name` — so it cannot alter the
+        // redirect URL's query/fragment semantics (security P2-1).
+        assert_eq!(
+            dag_detail_relative_url("graph_linear", "run#x&y?z", None),
+            "../../../graph_linear?run=run%23x%26y%3Fz"
         );
     }
 
+    // ── Issue #960 — execution timeline / Gantt view ───────────────────────
+    //
+    // Pure render/geometry unit tests (run without Docker). The Gantt consumes
+    // the shipped `autumn_harvest::derive_timeline` output plus the execution
+    // row's pause/ND-block columns — it never forks history-derivation.
+
+    use autumn_harvest::{
+        SlowestStep, StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep,
+    };
+
+    const ALL_STEP_OUTCOMES: [StepOutcome; 6] = [
+        StepOutcome::Completed,
+        StepOutcome::Failed,
+        StepOutcome::TimedOut,
+        StepOutcome::Cancelled,
+        StepOutcome::Fired,
+        StepOutcome::Pending,
+    ];
+
+    const ALL_STEP_KINDS: [StepKind; 6] = [
+        StepKind::Activity,
+        StepKind::LocalActivity,
+        StepKind::Timer,
+        StepKind::ChildWorkflow,
+        StepKind::SignalWait,
+        StepKind::SideEffect,
+    ];
+
+    fn tl_base() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tl_step(
+        kind: StepKind,
+        name: Option<&str>,
+        sched_off_ms: i64,
+        end_off_ms: Option<i64>,
+        wait_ms: Option<i64>,
+        exec_ms: Option<i64>,
+        outcome: StepOutcome,
+        attempt: Option<i32>,
+    ) -> TimelineStep {
+        let base = tl_base();
+        let scheduled_at = base + chrono::Duration::milliseconds(sched_off_ms);
+        let ended_at = end_off_ms.map(|o| base + chrono::Duration::milliseconds(o));
+        let total_ms = end_off_ms.map_or(0, |e| (e - sched_off_ms).max(0));
+        TimelineStep {
+            step_kind: kind,
+            name: name.map(ToString::to_string),
+            scheduled_at,
+            ended_at,
+            total_ms,
+            wait_ms,
+            exec_ms,
+            outcome,
+            attempt,
+        }
+    }
+
+    fn tl_rollup(slowest: Option<SlowestStep>) -> TimelineRollup {
+        TimelineRollup {
+            total_wall_clock_ms: 12_000,
+            busy_ms: 8_000,
+            wait_ms: 3_000,
+            slowest_step: slowest,
+            step_count_by_kind: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn tl_timeline(steps: Vec<TimelineStep>, slowest: Option<SlowestStep>) -> Timeline {
+        Timeline {
+            exec_id: "exec-1".to_string(),
+            workflow_id: "wf-1".to_string(),
+            workflow_name: "order_flow".to_string(),
+            state: "RUNNING".to_string(),
+            steps,
+            rollup: tl_rollup(slowest),
+        }
+    }
+
+    // Q1
     #[test]
-    fn map_node_states_seeds_condition_skipped_nodes() {
-        use autumn_harvest::DagBuilder;
-
-        fn dummy() {}
-        fn dummy2() {}
-
-        let mut builder = DagBuilder::new();
-        let a = builder.activity(dummy);
-        let _b = builder.activity(dummy2).upstream(&a);
-        let dag = builder.build().unwrap();
-
-        let mut condition_skipped = std::collections::HashSet::new();
-        condition_skipped.insert(1usize); // task idx 1 condition-skipped
-
-        let states = map_node_states(&dag, &[], &condition_skipped);
+    fn step_outcome_fill_and_label_all_variants() {
+        let fills: Vec<&str> = ALL_STEP_OUTCOMES
+            .iter()
+            .map(|o| step_outcome_fill(*o))
+            .collect();
+        for fill in &fills {
+            assert!(
+                fill.starts_with('#') && fill.len() >= 4,
+                "outcome fill must be non-empty hex: {fill:?}"
+            );
+        }
+        let unique: std::collections::HashSet<&&str> = fills.iter().collect();
         assert_eq!(
-            states.get(&1),
-            Some(&DagNodeState::SkippedByCondition),
-            "condition-skipped node must be SkippedByCondition"
+            unique.len(),
+            6,
+            "each outcome has a distinct fill: {fills:?}"
         );
-        // SkippedByCondition is still Skipped for terminal status → AllSuccess
-        // downstream stays Skipped (trigger-rule inference), not SkippedByCondition.
+
+        let labels: Vec<&str> = ALL_STEP_OUTCOMES
+            .iter()
+            .map(|o| step_outcome_label(*o))
+            .collect();
+        let unique_labels: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(unique_labels.len(), 6, "distinct labels: {labels:?}");
+        assert!(labels.iter().all(|l| !l.is_empty()));
+    }
+
+    // Q2
+    #[test]
+    fn timeline_lanes_fixed_order_and_labels() {
+        // Fixed lane order, matching the AC's step_kind list.
         assert_eq!(
-            states.get(&0),
-            Some(&DagNodeState::Unknown),
-            "root with no task rows should remain Unknown"
+            TIMELINE_LANES,
+            [
+                StepKind::Activity,
+                StepKind::LocalActivity,
+                StepKind::ChildWorkflow,
+                StepKind::Timer,
+                StepKind::SignalWait,
+                StepKind::SideEffect,
+            ]
+        );
+        let labels: Vec<&str> = ALL_STEP_KINDS
+            .iter()
+            .map(|k| step_kind_lane_label(*k))
+            .collect();
+        let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(unique.len(), 6, "distinct lane labels: {labels:?}");
+        assert!(labels.iter().all(|l| !l.is_empty()));
+    }
+
+    // Q3
+    #[test]
+    fn x_scale_maps_endpoints() {
+        assert!((x_scale(0, 1000, 800.0) - 0.0).abs() < f64::EPSILON);
+        assert!((x_scale(1000, 1000, 800.0) - 800.0).abs() < f64::EPSILON);
+        assert!((x_scale(500, 1000, 800.0) - 400.0).abs() < f64::EPSILON);
+    }
+
+    // Q4
+    #[test]
+    fn x_scale_zero_duration_guard() {
+        // span_ms == 0 must not divide by zero / NaN / panic.
+        let a = x_scale(0, 0, 800.0);
+        let b = x_scale(5, 0, 800.0);
+        assert!(a.is_finite() && b.is_finite(), "no NaN/inf on zero span");
+        // Clamped inside the axis regardless.
+        assert!((0.0..=800.0).contains(&x_scale(9_000, 1_000, 800.0)));
+        assert!((0.0..=800.0).contains(&x_scale(-9_000, 1_000, 800.0)));
+    }
+
+    // Q5a
+    #[test]
+    fn span_segments_split_when_both_present() {
+        let step = tl_step(
+            StepKind::Activity,
+            Some("charge"),
+            0,
+            Some(1000),
+            Some(300),
+            Some(700),
+            StepOutcome::Completed,
+            Some(1),
+        );
+        let segs = span_segments(&step);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], (SegKind::Wait, 300));
+        assert_eq!(segs[1], (SegKind::Exec, 700));
+        assert_eq!(segs.iter().map(|(_, ms)| *ms).sum::<i64>(), 1000);
+    }
+
+    // Q5b
+    #[test]
+    fn span_segments_single_when_absent() {
+        // No split recorded → one undivided Whole segment (never fabricated).
+        let child = tl_step(
+            StepKind::ChildWorkflow,
+            Some("sub"),
+            0,
+            Some(500),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        );
+        assert_eq!(span_segments(&child), vec![(SegKind::Whole, 500)]);
+
+        // Only one of wait/exec present → still a single Whole span.
+        let half = tl_step(
+            StepKind::Activity,
+            Some("a"),
+            0,
+            Some(400),
+            Some(100),
+            None,
+            StepOutcome::Completed,
+            Some(1),
+        );
+        assert_eq!(span_segments(&half), vec![(SegKind::Whole, 400)]);
+    }
+
+    // Q6
+    #[test]
+    fn format_ms_units() {
+        assert!(format_ms(0).contains("ms"));
+        assert!(format_ms(500).contains("ms"));
+        assert!(format_ms(1500).contains('s') && !format_ms(1500).contains("ms"));
+        let long = format_ms(90_000);
+        assert!(long.contains('m') && long.contains('s'), "minutes: {long}");
+    }
+
+    // Q7
+    #[test]
+    fn render_timeline_gantt_lanes_and_spans() {
+        let steps = vec![
+            tl_step(
+                StepKind::Activity,
+                Some("charge"),
+                0,
+                Some(1000),
+                Some(300),
+                Some(700),
+                StepOutcome::Completed,
+                Some(1),
+            ),
+            tl_step(
+                StepKind::Timer,
+                Some("wait_24h"),
+                1000,
+                Some(2000),
+                None,
+                None,
+                StepOutcome::Fired,
+                None,
+            ),
+            tl_step(
+                StepKind::ChildWorkflow,
+                Some("fulfill"),
+                2000,
+                Some(3000),
+                None,
+                None,
+                StepOutcome::Completed,
+                None,
+            ),
+            tl_step(
+                StepKind::SignalWait,
+                Some("approve"),
+                3000,
+                Some(4000),
+                None,
+                None,
+                StepOutcome::Completed,
+                None,
+            ),
+        ];
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(4000));
+        exec.state = "COMPLETED".to_string();
+        let timeline = tl_timeline(steps, None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+
+        assert!(html.contains("<svg"), "inline svg present");
+        // A lane label per present kind.
+        assert!(html.contains(step_kind_lane_label(StepKind::Activity)));
+        assert!(html.contains(step_kind_lane_label(StepKind::Timer)));
+        assert!(html.contains(step_kind_lane_label(StepKind::ChildWorkflow)));
+        assert!(html.contains(step_kind_lane_label(StepKind::SignalWait)));
+        // A span per step (by name).
+        assert!(html.contains("charge"));
+        assert!(html.contains("wait_24h"));
+        assert!(html.contains("fulfill"));
+        assert!(html.contains("approve"));
+        // Outcome fills present.
+        assert!(html.contains(step_outcome_fill(StepOutcome::Completed)));
+        assert!(html.contains(step_outcome_fill(StepOutcome::Fired)));
+    }
+
+    // Codex review (#960): the timeline page's "Back to execution" control and
+    // the current-details card must both resolve to the execution-detail route
+    // `{api_base}/workflows/{id}` — NOT `{api_base}/workflows/{id}/{id}`. Both
+    // are built from the api base (`../../workflows/{id}`), matching the page's
+    // own `base_href = "../../"` nav, rather than a bare `../{id}` that relies on
+    // `..` stripping exactly the `timeline` segment.
+    #[test]
+    fn timeline_nav_links_point_at_execution_detail_route() {
+        let steps = vec![tl_step(
+            StepKind::Activity,
+            Some("charge"),
+            0,
+            Some(1000),
+            Some(300),
+            Some(700),
+            StepOutcome::Completed,
+            Some(1),
+        )];
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        // Non-empty current_details makes the "what is it blocked on?" card render.
+        exec.current_details = Some("charging card".to_string());
+        let timeline = tl_timeline(steps, None); // Timeline::exec_id == "exec-1"
+        let html = render_timeline_body(&timeline, &exec, tl_base()).into_string();
+
+        // Both nav links (back control + current-details card) resolve to the
+        // execution-detail route via the same api-base-relative href.
+        let want = r#"href="../../workflows/exec-1""#;
+        assert_eq!(
+            html.matches(want).count(),
+            2,
+            "both the back link and the current-details card must use {want:?}: {html}"
+        );
+        assert!(
+            html.contains(" Back to execution"),
+            "back control present: {html}"
+        );
+        assert!(
+            html.contains("what is it blocked on?"),
+            "current-details card link present: {html}"
+        );
+
+        // The old bare-`..` form (which relied on `..` stripping exactly the
+        // `timeline` segment) must be gone, and the href must NEVER produce the
+        // doubled `/{id}/{id}` execution segment Codex flagged.
+        assert!(
+            !html.contains(r#"href="../exec-1""#),
+            "must not use the fragile bare `../{{id}}` form: {html}"
+        );
+        assert!(
+            !html.contains("workflows/exec-1/exec-1"),
+            "href must not resolve to a doubled execution segment: {html}"
+        );
+    }
+
+    // Q8
+    #[test]
+    fn render_timeline_gantt_split_only_when_present() {
+        let split = tl_step(
+            StepKind::Activity,
+            Some("charge"),
+            0,
+            Some(1000),
+            Some(300),
+            Some(700),
+            StepOutcome::Completed,
+            Some(1),
+        );
+        let whole = tl_step(
+            StepKind::ChildWorkflow,
+            Some("sub"),
+            1000,
+            Some(1500),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        );
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1500));
+        let timeline = tl_timeline(vec![split, whole], None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        // Split activity → both wait and exec segment classes.
+        assert!(
+            html.contains("gantt-seg-wait"),
+            "wait segment rendered: {html}"
+        );
+        assert!(html.contains("gantt-seg-exec"), "exec segment rendered");
+        // Un-split child → the undivided whole class.
+        assert!(html.contains("gantt-seg-whole"), "whole span rendered");
+    }
+
+    // Q9
+    #[test]
+    fn render_timeline_gantt_open_span_to_now() {
+        // In-flight step: ended_at = None, outcome Pending → open-ended span.
+        let pending = tl_step(
+            StepKind::Activity,
+            Some("running"),
+            0,
+            None,
+            None,
+            None,
+            StepOutcome::Pending,
+            Some(1),
+        );
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = None;
+        exec.state = "RUNNING".to_string();
+        let timeline = tl_timeline(vec![pending], None);
+        let now = tl_base() + chrono::Duration::milliseconds(5000);
+        let html = render_timeline_gantt(&timeline, &exec, now).into_string();
+        assert!(html.contains("gantt-span-open"), "open span styled: {html}");
+        // Regression: an open step (total_ms == 0 in the fixture) must still render
+        // at its axis-derived width, not collapse to width="0". Scheduled at the
+        // axis start and open to `now` == full TL_AXIS_W (900px).
+        assert!(
+            html.contains("width=\"900\""),
+            "open span fills its geometric extent, not the (zero) total_ms: {html}"
+        );
+    }
+
+    // Q10
+    #[test]
+    fn render_timeline_gantt_attempt_badge() {
+        let retried = tl_step(
+            StepKind::Activity,
+            Some("flaky"),
+            0,
+            Some(1000),
+            Some(100),
+            Some(900),
+            StepOutcome::Completed,
+            Some(3),
+        );
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        let timeline = tl_timeline(vec![retried], None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert!(html.contains("×3"), "attempt badge visible: {html}");
+    }
+
+    // Q11a
+    #[test]
+    fn pause_band_present_when_paused() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.paused_at = Some(tl_base() + chrono::Duration::milliseconds(2000));
+        exec.pause_reason = Some("incident-4821".to_string());
+        exec.pause_actor = Some("oncall@corp".to_string());
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        let band = pause_band_markup(&exec, &axis).expect("band present when paused");
+        let html = band.into_string();
+        assert!(html.contains("gantt-pause-band"), "band rect class: {html}");
+        assert!(html.contains("incident-4821"), "reason labelled");
+        assert!(html.contains("oncall@corp"), "actor labelled");
+    }
+
+    // Q11b
+    #[test]
+    fn pause_band_absent_when_not_paused() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.paused_at = None;
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        assert!(pause_band_markup(&exec, &axis).is_none());
+    }
+
+    // Q12a
+    #[test]
+    fn nd_marker_present_when_blocked() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.nd_blocked_at = Some(tl_base() + chrono::Duration::milliseconds(3000));
+        exec.nd_block_reason = Some("expected ActivityScheduled got TimerStarted".to_string());
+        exec.nd_block_count = 4;
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        let marker = nd_marker_markup(&exec, &axis).expect("marker present when nd-blocked");
+        let html = marker.into_string();
+        assert!(html.contains("gantt-nd-marker"), "marker class: {html}");
+        assert!(html.contains("expected ActivityScheduled"), "reason shown");
+        assert!(
+            html.contains("nondeterminism-block"),
+            "runbook path surfaced (as text, not a link): {html}"
+        );
+        assert!(
+            !html.contains("<a "),
+            "runbook path is not a clickable link (would 404 during triage): {html}"
+        );
+    }
+
+    // Q12b
+    #[test]
+    fn nd_marker_absent_when_not_blocked() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.nd_blocked_at = None;
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+        assert!(nd_marker_markup(&exec, &axis).is_none());
+    }
+
+    // Q12c — operator-controlled `pause_reason`/`pause_actor`/`nd_block_reason`
+    // are assembled into SVG `<text>` bodies via `String::push_str`; prove maud
+    // still HTML-escapes them (a future refactor to `PreEscaped`/an attribute
+    // would regress this). Security review nit-4.
+    #[test]
+    fn pause_and_nd_reason_are_html_escaped_in_svg_text() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.paused_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        exec.pause_reason = Some("<script>alert(1)</script>".to_string());
+        exec.pause_actor = Some("<b>bad</b>".to_string());
+        exec.nd_blocked_at = Some(tl_base() + chrono::Duration::milliseconds(2000));
+        exec.nd_block_reason = Some("<img src=x onerror=1>".to_string());
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+
+        let pause = pause_band_markup(&exec, &axis)
+            .expect("band present")
+            .into_string();
+        assert!(
+            !pause.contains("<script>alert(1)</script>"),
+            "pause reason must be escaped, not injected into the SVG <text>: {pause}"
+        );
+        assert!(
+            !pause.contains("<b>bad</b>"),
+            "pause actor must be escaped: {pause}"
+        );
+        assert!(
+            pause.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "escaped pause reason present: {pause}"
+        );
+
+        let nd = nd_marker_markup(&exec, &axis)
+            .expect("marker present")
+            .into_string();
+        assert!(
+            !nd.contains("<img src=x onerror=1>"),
+            "nd reason must be escaped in the SVG <text>: {nd}"
+        );
+        assert!(
+            nd.contains("&lt;img src=x onerror=1&gt;"),
+            "escaped nd reason present: {nd}"
+        );
+    }
+
+    // Q13
+    #[test]
+    fn render_timeline_rollup_totals_and_slowest() {
+        let rollup = TimelineRollup {
+            total_wall_clock_ms: 42_000,
+            busy_ms: 30_000,
+            wait_ms: 9_000,
+            slowest_step: Some(SlowestStep {
+                name: Some("bottleneck_activity".to_string()),
+                step_kind: StepKind::Activity,
+                total_ms: 25_000,
+            }),
+            step_count_by_kind: std::collections::BTreeMap::new(),
+        };
+        let html = render_timeline_rollup(&rollup).into_string();
+        assert!(html.contains(&format_ms(42_000)), "total wall-clock shown");
+        assert!(html.contains(&format_ms(30_000)), "busy total shown");
+        assert!(html.contains(&format_ms(9_000)), "wait total shown");
+        assert!(html.contains("bottleneck_activity"), "slowest name shown");
+        assert!(html.contains(&format_ms(25_000)), "slowest duration shown");
+    }
+
+    // Q14
+    #[test]
+    fn slowest_step_highlighted_with_id() {
+        let steps = vec![
+            tl_step(
+                StepKind::Activity,
+                Some("quick"),
+                0,
+                Some(100),
+                Some(10),
+                Some(90),
+                StepOutcome::Completed,
+                Some(1),
+            ),
+            tl_step(
+                StepKind::Activity,
+                Some("slow_one"),
+                100,
+                Some(9100),
+                Some(50),
+                Some(9050),
+                StepOutcome::Completed,
+                Some(1),
+            ),
+        ];
+        // slowest_step_index picks the max total_ms step (index 1).
+        let timeline = tl_timeline(
+            steps,
+            Some(SlowestStep {
+                name: Some("slow_one".to_string()),
+                step_kind: StepKind::Activity,
+                total_ms: 9000,
+            }),
+        );
+        assert_eq!(slowest_step_index(&timeline), Some(1));
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(9100));
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert!(
+            html.contains("id=\"slowest\""),
+            "slowest anchor id present: {html}"
+        );
+        assert!(
+            html.contains("gantt-span-slowest"),
+            "slowest highlight class present"
+        );
+    }
+
+    // Q15
+    #[test]
+    fn render_timeline_gantt_escapes_names() {
+        let step = tl_step(
+            StepKind::Activity,
+            Some("<b>evil</b>"),
+            0,
+            Some(100),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        );
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(100));
+        let timeline = tl_timeline(vec![step], None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert!(
+            !html.contains("<b>evil</b>"),
+            "a markup-char step name must be escaped: {html}"
+        );
+        assert!(html.contains("&lt;b&gt;evil"), "escaped form present");
+    }
+
+    // Q16
+    #[test]
+    fn timeline_step_cap_truncates_and_notes() {
+        let n = MAX_RENDER_STEPS + 25;
+        let steps: Vec<TimelineStep> = (0..n)
+            .map(|i| {
+                let off = i64::try_from(i).unwrap() * 10;
+                tl_step(
+                    StepKind::Activity,
+                    Some("s"),
+                    off,
+                    Some(off + 5),
+                    None,
+                    None,
+                    StepOutcome::Completed,
+                    Some(1),
+                )
+            })
+            .collect();
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at =
+            Some(tl_base() + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10));
+        let timeline = tl_timeline(steps, None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        // A "showing N of M" note when capped.
+        assert!(
+            html.contains(&MAX_RENDER_STEPS.to_string()) && html.contains(&n.to_string()),
+            "truncation note names both the cap and the full count: {}",
+            &html[..html.len().min(400)]
+        );
+    }
+
+    // Q17 (#960): when the step list is capped, the slowest step must stay in the
+    // rendered set even though lane grouping can push it past the prefix — the
+    // rollup and the execution-detail Timeline link both advertise `#slowest`, so
+    // the `id="slowest"` element must always resolve.
+    #[test]
+    fn timeline_cap_keeps_slowest_step_rendered() {
+        // MAX_RENDER_STEPS + 1 short Activity steps fill the whole first-lane
+        // prefix, then a single slow SideEffect step (last lane) is lane-grouped
+        // *after* every Activity — beyond the rendered prefix.
+        let mut steps: Vec<TimelineStep> = (0..=MAX_RENDER_STEPS)
+            .map(|i| {
+                let off = i64::try_from(i).unwrap() * 10;
+                tl_step(
+                    StepKind::Activity,
+                    Some("act"),
+                    off,
+                    Some(off + 5),
+                    None,
+                    None,
+                    StepOutcome::Completed,
+                    Some(1),
+                )
+            })
+            .collect();
+        // The slowest step: distinctly named, largest total_ms, last (SideEffect)
+        // lane. Its index in `steps` is > MAX_RENDER_STEPS, and lane grouping
+        // places it after all Activities, so it falls outside the prefix.
+        steps.push(tl_step(
+            StepKind::SideEffect,
+            Some("SLOWEST_STEP"),
+            0,
+            Some(999_999),
+            None,
+            None,
+            StepOutcome::Completed,
+            None,
+        ));
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(999_999));
+        exec.state = "COMPLETED".to_string();
+        let timeline = tl_timeline(steps, None);
+        // Sanity: the slowest step is genuinely the SideEffect, and it is past the
+        // rendered prefix (so the pre-fix code would have dropped its anchor).
+        assert_eq!(slowest_step_index(&timeline), Some(MAX_RENDER_STEPS + 1));
+
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+
+        // Exactly one `#slowest` anchor is emitted — never zero (dangling link),
+        // never more than one.
+        assert_eq!(
+            html.matches("id=\"slowest\"").count(),
+            1,
+            "exactly one id=\"slowest\" element: {}",
+            &html[..html.len().min(400)]
+        );
+        // The anchored `<g id="slowest">…</g>` belongs to the actual slowest step:
+        // its distinctly-named title is inside the anchored group (and would be
+        // absent entirely without the fix, being past the prefix).
+        let anchor = html.find("id=\"slowest\"").expect("anchor present");
+        let group_end = html[anchor..].find("</g>").expect("anchored group closes");
+        let anchored_group = &html[anchor..anchor + group_end];
+        assert!(
+            anchored_group.contains("SLOWEST_STEP"),
+            "the #slowest anchor wraps the slowest step's span: {anchored_group}"
+        );
+        // The truncation note is accurate about the extra row.
+        assert!(
+            html.contains("(plus the slowest)"),
+            "truncation note flags the appended slowest step: {}",
+            &html[..html.len().min(600)]
+        );
+    }
+
+    // Q18 (#960): under the cap the slowest step is rendered in place, so the
+    // `#slowest` anchor resolves without any special-casing.
+    #[test]
+    fn timeline_slowest_anchor_present_under_cap() {
+        let steps = vec![
+            tl_step(
+                StepKind::Activity,
+                Some("quick"),
+                0,
+                Some(10),
+                None,
+                None,
+                StepOutcome::Completed,
+                Some(1),
+            ),
+            tl_step(
+                StepKind::ChildWorkflow,
+                Some("BIGGEST"),
+                10,
+                Some(5_000),
+                None,
+                None,
+                StepOutcome::Completed,
+                None,
+            ),
+        ];
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(5_000));
+        exec.state = "COMPLETED".to_string();
+        let timeline = tl_timeline(steps, None);
+        let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
+        assert_eq!(
+            html.matches("id=\"slowest\"").count(),
+            1,
+            "exactly one id=\"slowest\" element under the cap"
+        );
+        // No "(plus the slowest)" note — the slowest is in place, not appended.
+        assert!(!html.contains("(plus the slowest)"));
+        let anchor = html.find("id=\"slowest\"").expect("anchor present");
+        let group_end = html[anchor..].find("</g>").expect("group closes");
+        assert!(
+            html[anchor..anchor + group_end].contains("BIGGEST"),
+            "the #slowest anchor wraps the actual slowest (child) step"
         );
     }
 }
