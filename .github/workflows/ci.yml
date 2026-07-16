@@ -83,8 +83,10 @@ jobs:
         run: cargo test -p autumn-harvest-cli
       - name: Run business_metrics example tests (issue #758)
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
+      - name: Run interface_schema_workflow example tests (issue #610)
+        run: cargo test -p autumn-harvest --features schema --example interface_schema_workflow
       - name: Compile plugin integration tests
-        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test query_integration --test timeline_integration --no-run
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --test read_path_decode_integration --test ui_integration --test completion_triggers_integration --test fail_now_integration --test schedule_runs_integration --test query_integration --test timeline_integration --test interface_schema_integration --no-run
       - name: Run Docker-backed integration tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
@@ -118,6 +120,9 @@ jobs:
       - name: Run plugin terminal-query integration tests (issue #612)
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test query_integration -- --test-threads=1
+      - name: Run plugin interface-schema integration tests (issue #610)
+        if: runner.os == 'Linux'
+        run: cargo test -p autumn-harvest-plugin --test interface_schema_integration -- --test-threads=1
 
   quickstart:
     name: Quickstart example builds

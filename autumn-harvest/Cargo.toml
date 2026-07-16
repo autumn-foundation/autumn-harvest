@@ -92,6 +92,10 @@ name = "schema_workflow"
 required-features = ["schema"]
 
 [[example]]
+name = "interface_schema_workflow"
+required-features = ["schema"]
+
+[[example]]
 name = "business_metrics"
 
 [dev-dependencies]
