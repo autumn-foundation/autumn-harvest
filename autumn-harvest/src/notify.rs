@@ -472,4 +472,37 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, deserialized);
     }
+
+    // ── publish_progress channel (issue #791) ────────────────────────────
+
+    #[test]
+    fn workflow_progress_channel_naming() {
+        let exec_id =
+            Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").expect("valid uuid");
+        let channel = workflow_progress_channel(exec_id);
+        assert_eq!(channel, "harvest_progress_0191c1a23b4c7d5e8f60112233445566");
+        assert!(
+            !channel.contains('-'),
+            "progress channel must not contain hyphens: {channel}"
+        );
+        // Postgres identifiers are limited to NAMEDATALEN-1 = 63 bytes.
+        assert!(
+            channel.len() <= 63,
+            "progress channel {} exceeds Postgres 63-byte identifier limit ({} bytes)",
+            channel,
+            channel.len()
+        );
+    }
+
+    #[test]
+    fn progress_notify_payload_roundtrips() {
+        let original = ProgressNotifyPayload {
+            seq: 0x0000_0005_00FF_FFFF,
+            chunk: serde_json::json!({"phase": "mid", "pct": 50}),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: ProgressNotifyPayload =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, deserialized);
+    }
 }

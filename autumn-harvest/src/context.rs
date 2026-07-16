@@ -18011,6 +18011,118 @@ mod tests {
         );
     }
 
+    // ── publish_progress (issue #791) ────────────────────────────────────
+
+    #[test]
+    fn publish_progress_suppressed_during_replay() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "some-marker".into(),
+                details: Value::Null,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(ctx.is_replaying(), "context must be in replay mode");
+        let outcome = ctx.publish_progress(serde_json::json!({"pct": 42}));
+        assert!(outcome.is_ok(), "publish_progress must not error on replay");
+        // On replay, publish_progress is a no-op: zero commands, no seq consumed.
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.is_empty(),
+            "publish_progress must be suppressed during replay: no commands emitted"
+        );
+    }
+
+    #[test]
+    fn publish_progress_emits_bookkeeping_command_when_live() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_progress(serde_json::json!({"phase": "loading", "pct": 10}))
+            .expect("publish_progress must succeed live");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "exactly one PublishProgress command");
+        match &cmds[0] {
+            WorkflowCommand::PublishProgress { seq, chunk } => {
+                assert_eq!(*seq, 0, "first live chunk in a fresh cycle has local index 0");
+                assert_eq!(chunk, &serde_json::json!({"phase": "loading", "pct": 10}));
+            }
+            other => panic!("expected PublishProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_progress_local_index_increases_within_cycle() {
+        let ctx = WorkflowContext::new_test();
+        ctx.publish_progress(serde_json::json!("a")).expect("first");
+        ctx.publish_progress(serde_json::json!("b")).expect("second");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 2, "two PublishProgress commands");
+        let seq0 = match &cmds[0] {
+            WorkflowCommand::PublishProgress { seq, .. } => *seq,
+            other => panic!("expected PublishProgress, got {other:?}"),
+        };
+        let seq1 = match &cmds[1] {
+            WorkflowCommand::PublishProgress { seq, .. } => *seq,
+            other => panic!("expected PublishProgress, got {other:?}"),
+        };
+        assert!(
+            seq1 > seq0,
+            "seq must strictly increase within a cycle: {seq1} !> {seq0}"
+        );
+    }
+
+    #[test]
+    fn publish_progress_oversize_chunk_becomes_truncation_marker() {
+        let ctx = WorkflowContext::new_test();
+        // A string whose serialized JSON form far exceeds the chunk cap.
+        let huge = "x".repeat(PROGRESS_CHUNK_MAX_BYTES + 500);
+        ctx.publish_progress(serde_json::Value::String(huge))
+            .expect("oversize publish must still succeed");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "one command even for an oversize chunk");
+        match &cmds[0] {
+            WorkflowCommand::PublishProgress { seq, chunk } => {
+                assert_eq!(*seq, 0, "the ordered seq slot must be preserved");
+                assert_eq!(
+                    chunk.get("_harvest_progress_truncated"),
+                    Some(&serde_json::Value::Bool(true)),
+                    "an oversize chunk must be REPLACED with a truncation marker, not dropped"
+                );
+                assert!(
+                    chunk.get("bytes").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                        > PROGRESS_CHUNK_MAX_BYTES as u64,
+                    "the truncation marker must report the original byte length"
+                );
+            }
+            other => panic!("expected PublishProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_progress_seq_is_monotonic_across_epochs() {
+        // Epoch = loaded-history length at cycle start; it strictly grows across
+        // decision cycles (a cycle that makes progress appends >=1 event), so a
+        // higher-epoch seq must exceed EVERY lower-epoch seq regardless of the
+        // per-cycle local index — proving execution-lifetime monotonicity (AC6).
+        let cycle_n_last = encode_progress_seq(4, PROGRESS_SEQ_LOCAL_MASK);
+        let cycle_n_plus_1_first = encode_progress_seq(5, 0);
+        assert!(
+            cycle_n_plus_1_first > cycle_n_last,
+            "a later cycle's first seq ({cycle_n_plus_1_first}) must exceed the \
+             prior cycle's last seq ({cycle_n_last})"
+        );
+        // Within a cycle (fixed epoch) local index strictly increases seq.
+        assert!(encode_progress_seq(5, 1) > encode_progress_seq(5, 0));
+        // Deterministic on a crash-retry of the same cycle: same inputs → same seq.
+        assert_eq!(encode_progress_seq(7, 3), encode_progress_seq(7, 3));
+    }
+
     #[test]
     fn set_current_details_empty_string_pushes_empty_command() {
         // The context's job is only to forward the raw value (capped, replay-
