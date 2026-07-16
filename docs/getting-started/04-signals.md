@@ -282,6 +282,101 @@ in-flight per-tenant onboarding workflows" pattern. Run its replay tests with:
 cargo test -p saga-choreography
 ```
 
+## Discovering the interaction contract (issue #610)
+
+A workflow can *publish* the JSON shape of every way to interact with it — its
+signals, queries, and updates — so operators and non-Rust callers discover the
+contract without reading source, and malformed payloads are rejected at the HTTP
+boundary before they are ever enqueued. This extends the #373 workflow
+input/output schema story to the interaction surface.
+
+Attach a description and a JSON Schema to each handler at registration. With the
+`schema` feature the schema is auto-derived from a `schemars::JsonSchema` type
+(or supply it by hand with `with_arg_schema_fn`/`with_description`):
+
+```rust
+#[signal(workflow = "order_workflow", description = "Cancel the in-flight order")]
+fn cancel_order(_ctx: &WorkflowContext, _req: CancelRequest) {}
+
+#[query(workflow = "order_workflow", description = "Read the order's progress")]
+fn order_status(_ctx: &WorkflowContext, req: StatusRequest) -> Result<StatusResponse, String> { /* … */ }
+
+#[update(workflow = "order_workflow", description = "Change the run's priority")]
+async fn set_priority(_ctx: &WorkflowContext, _req: SetPriority) -> Result<PriorityAck, String> { /* … */ }
+
+let plugin = HarvestPlugin::new()
+    .workflows(workflows![order_workflow])
+    .signals(vec![cancel_order_info().with_schemas::<CancelRequest>()])
+    .queries(vec![order_status_info().with_schemas::<StatusRequest, StatusResponse>()])
+    .updates(vec![set_priority_info().with_schemas::<SetPriority, PriorityAck>()]);
+```
+
+### Discovery endpoint
+
+```
+GET /api/harvest/workflows/registered/{name}/interface
+```
+
+Returns the workflow type's published interaction surface. Each array is sorted
+by handler name (so the response is deterministic across calls); handlers with
+no published schema simply omit the schema/description fields, and signals never
+carry a `response_schema`:
+
+```json
+{
+  "signals": [
+    {
+      "name": "cancel_order",
+      "description": "Cancel the in-flight order",
+      "arg_schema": { "type": "object", "properties": { "reason": { "type": "string" } }, "required": ["reason"] }
+    }
+  ],
+  "queries": [
+    {
+      "name": "order_status",
+      "description": "Read the order's progress",
+      "arg_schema": { "type": "object", "properties": { "verbose": { "type": "boolean" } } },
+      "response_schema": { "type": "object", "properties": { "state": { "type": "string" }, "processed": { "type": "integer" } } }
+    }
+  ],
+  "updates": [
+    {
+      "name": "set_priority",
+      "description": "Change the run's priority",
+      "arg_schema": { "type": "object", "properties": { "priority": { "type": "integer" } }, "required": ["priority"] },
+      "response_schema": { "type": "object", "properties": { "applied": { "type": "boolean" } } }
+    }
+  ]
+}
+```
+
+A `404` is returned when the workflow type is not registered.
+
+### Boundary validation
+
+When a signal or update handler has a published `arg_schema`, the payload is
+validated **before** it is durably enqueued at all three interaction entry
+points — the signal-send route, `POST /workflows/{name}/signal-with-start`, and
+the update route. A malformed payload is rejected with a field-level `400`:
+
+```bash
+# `cancel` requires a string `reason` — send an empty object:
+curl -X POST '/api/harvest/workflows/<exec-id>/signal/cancel_order' \
+  -H 'Content-Type: application/json' -d '{}'
+# 400
+# {
+#   "error": "signal payload validation failed",
+#   "violations": [ { "message": "missing required field 'reason'", "field_path": "/reason" } ]
+# }
+```
+
+`field_path` is a JSON Pointer (RFC 6901), matching the #373 workflow-input
+validation response shape. A handler with **no** published `arg_schema` is never
+validated — its route behaves exactly as before. See
+`examples/interface_schema_workflow.rs` (run with `--features schema`) for a
+complete worked example, and the [queries](../management-api.md) and updates
+chapters for the request/response envelopes.
+
 ---
 
 [← Durable timers](03-durable-timers.md) · [Index](README.md) · [Next: Child workflows →](05-child-workflows.md)
