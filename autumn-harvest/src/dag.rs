@@ -330,6 +330,17 @@ pub enum DagBuildError {
         /// The activity name of the offending node.
         task: String,
     },
+    /// A signal-gate node declares an `input_from*` binding (issue #702). A gate
+    /// dispatches no activity, so the binding *value* is ignored — but the
+    /// binding also auto-adds a dependency edge, which would silently make the
+    /// gate wait for that upstream before its signal wait. Unlike the inert
+    /// activity-only setters (`.queue()`, `.retry()`, `.start_to_close()`), a
+    /// binding has a structural effect, so it is rejected rather than swallowed.
+    /// Use [`DagTaskRef::upstream`] to add a gate dependency deliberately.
+    InputBindingOnGate {
+        /// The signal name (identity) of the offending gate node.
+        task: String,
+    },
 }
 
 impl fmt::Display for DagBuildError {
@@ -351,6 +362,10 @@ impl fmt::Display for DagBuildError {
             Self::EmptyInputBinding { task } => write!(
                 f,
                 "dag task '{task}' has an input binding with no upstream sources"
+            ),
+            Self::InputBindingOnGate { task } => write!(
+                f,
+                "dag task '{task}' is a signal gate and cannot have an input binding; use `.upstream()` to add a dependency"
             ),
         }
     }
@@ -863,6 +878,15 @@ impl DagBuilder {
             let Some(binding) = &task.input_from else {
                 continue;
             };
+            // A signal gate dispatches no activity, so a binding's value is
+            // ignored — but its auto-added edge would silently make the gate wait
+            // for that upstream. Reject it (like the map_upstream conflict below)
+            // rather than adding a stray dependency the "ignored" contract hides.
+            if task.signal.is_some() {
+                return Err(DagBuildError::InputBindingOnGate {
+                    task: task.activity_name.clone(),
+                });
+            }
             // A binding and a mapped upstream are contradictory input sources.
             if task.map_upstream.is_some() {
                 return Err(DagBuildError::ConflictingInputBinding {
@@ -1836,6 +1860,36 @@ mod tests {
         assert!(
             matches!(err, DagBuildError::ConflictingInputBinding { .. }),
             "input_from on a mapped node must conflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_on_signal_gate_is_build_error() {
+        let mut builder = DagBuilder::new();
+        let up = builder.activity(dummy_activity); // 0
+        let gate = builder.signal_gate("approval"); // 1
+        // A gate dispatches no activity, so a binding would silently add a stray
+        // dependency edge — reject it rather than swallowing it.
+        let _ = gate.input_from(&up);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, DagBuildError::InputBindingOnGate { .. }),
+            "input_from on a signal gate must be a build error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_all_on_signal_gate_is_build_error() {
+        let mut builder = DagBuilder::new();
+        let up = builder.activity(dummy_activity); // 0
+        let gate = builder.signal_gate("approval"); // 1
+        let _ = gate.input_from_all(&[&up]);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, DagBuildError::InputBindingOnGate { .. }),
+            "input_from_all on a signal gate must be a build error, got {err:?}"
         );
     }
 

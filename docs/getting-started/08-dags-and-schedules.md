@@ -458,10 +458,15 @@ A few interactions worth knowing:
   unbound node (the trigger-input + `{ "conf": …, "dag_task": … }` wrapper)
   receives structurally different inputs in each position — write the activity's
   input deserialization to handle both shapes if you reuse it that way.
-* **`input_from*` on a signal-gate node is ignored.** A gate dispatches no
-  activity, so — consistent with a gate silently ignoring the other
-  activity-only setters (`.queue()`, `.retry()`, `.start_to_close()`) — an
-  `.input_from*` on a gate is a no-op, **not** a build error.
+* **`input_from*` on a signal-gate node is a build error.** A binding on a gate
+  is rejected at build time (`InputBindingOnGate`), mirroring the
+  `input_from` + `map_activity` conflict. A gate dispatches no activity, so the
+  binding *value* is ignored — but unlike the inert activity-only setters
+  (`.queue()`, `.retry()`, `.start_to_close()`), a binding also auto-adds a
+  dependency edge, which would silently make the gate wait for that upstream
+  before its signal wait. Because that edge is a *structural* effect (not an
+  inert dead field), the binding is rejected rather than swallowed. Use
+  `.upstream(&gate_dependency)` to add a gate dependency deliberately.
 
 ## Signal / approval gates
 
