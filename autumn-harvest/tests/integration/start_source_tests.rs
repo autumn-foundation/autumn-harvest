@@ -1,5 +1,12 @@
 #![cfg(feature = "db")]
-#![allow(clippy::too_many_lines, clippy::doc_markdown)]
+// Each test holds `TEST_SERIAL` across `.await` points to serialize the shared
+// DB scrub + the process-global `ShardedDbPool` static — same as the
+// admission-gate / start-idempotency suites.
+#![allow(
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::await_holding_lock
+)]
 //! Workflow-start provenance enumeration — issue #740 (AC3).
 //!
 //! Asserts that each CORE-reachable start path records the semantically-correct
@@ -36,12 +43,12 @@ use autumn_harvest::throttle::{AdmitThrottleParams, ThrottleAdmission, reserve_o
 use autumn_harvest::types::{ExecutionId, ShardId, StartSource, UpdateId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::DbPool;
 
+use autumn_harvest::telemetry::NoOpMetrics;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
 use std::time::Duration;
-use autumn_harvest::telemetry::NoOpMetrics;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -175,7 +182,9 @@ fn carrier_with_source(source: Option<&str>) -> DebounceStartOptions {
 
 #[tokio::test]
 async fn api_start_records_api_source() {
-    let _guard = TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
@@ -199,7 +208,9 @@ async fn api_start_records_api_source() {
 
 #[tokio::test]
 async fn signal_with_start_records_signal_with_start_source() {
-    let _guard = TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
@@ -257,7 +268,9 @@ async fn signal_with_start_records_signal_with_start_source() {
 
 #[tokio::test]
 async fn update_with_start_records_update_with_start_source() {
-    let _guard = TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
@@ -312,7 +325,9 @@ async fn update_with_start_records_update_with_start_source() {
 
 #[tokio::test]
 async fn debounce_fire_restores_captured_source() {
-    let _guard = TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let sharded = Some(ShardedDbPool::single(pool.clone()));
@@ -372,7 +387,9 @@ async fn debounce_fire_restores_captured_source() {
 
 #[tokio::test]
 async fn throttle_fire_restores_captured_source() {
-    let _guard = TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let sharded = Some(ShardedDbPool::single(pool.clone()));
@@ -470,7 +487,9 @@ async fn throttle_fire_restores_captured_source() {
 
 #[tokio::test]
 async fn batch_fire_defaults_to_batch_source() {
-    let _guard = TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;

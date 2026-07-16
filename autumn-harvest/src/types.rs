@@ -819,7 +819,7 @@ pub enum StartSource {
 }
 
 impl StartSource {
-    /// The stable, snake_case wire string for this source.
+    /// The stable, `snake_case` wire string for this source.
     ///
     /// Matches the `#[serde(rename_all = "snake_case")]` representation and is
     /// what is written to the `start_source` column.
@@ -847,6 +847,7 @@ impl StartSource {
     /// Unrecognized input maps to [`StartSource::Unknown`] and never errors, so
     /// a value written by a newer build is tolerated by an older reader.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "api" => Self::Api,

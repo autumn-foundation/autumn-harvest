@@ -719,6 +719,7 @@ async fn delete_debounce_row(
 /// no-op (e.g. `AlreadyExists` under a reject/duplicate reuse policy — the row
 /// is deleted so the scanner does not retry the doomed start forever).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
@@ -757,10 +758,10 @@ async fn fire_claimed_debounce_row(
     // Restore the provenance captured at admission (issue #740). A pre-#740 row
     // (no captured source) falls back to `Api`: the debounce admission path is
     // the plain HTTP start route.
-    let start_source = opts
-        .start_source
-        .as_deref()
-        .map_or(crate::types::StartSource::Api, crate::types::StartSource::from_str);
+    let start_source = opts.start_source.as_deref().map_or(
+        crate::types::StartSource::Api,
+        crate::types::StartSource::from_str,
+    );
     let start_source_ref = opts.start_source_ref;
     let started_by = opts.started_by;
 

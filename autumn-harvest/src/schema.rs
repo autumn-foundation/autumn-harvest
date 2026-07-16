@@ -116,7 +116,7 @@ diesel::table! {
         /// Principal that placed the legal hold (issue #747, audit trail).
         legal_hold_actor -> Nullable<Text>,
         /// Workflow-start provenance classifier (issue #740): a bounded
-        /// snake_case source string (`api` / `schedule` / `child` / ...). NULL
+        /// `snake_case` source string (`api` / `schedule` / `child` / ...). NULL
         /// for pre-upgrade rows, reported as "unknown". Distinct from `origin`
         /// (issue #534); never read on replay.
         start_source -> Nullable<Text>,

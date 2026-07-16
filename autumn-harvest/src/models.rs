@@ -178,7 +178,7 @@ pub struct WorkflowExecution {
     pub legal_hold_reason: Option<String>,
     /// Principal that placed the legal hold (issue #747, audit trail).
     pub legal_hold_actor: Option<String>,
-    /// Workflow-start provenance classifier (issue #740): a bounded snake_case
+    /// Workflow-start provenance classifier (issue #740): a bounded `snake_case`
     /// source string. `None` for pre-upgrade rows, reported as "unknown" in the
     /// serialized form. Distinct from `origin` (issue #534); never read on replay.
     #[serde(serialize_with = "serialize_start_source_or_unknown")]
@@ -195,6 +195,8 @@ pub struct WorkflowExecution {
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
 /// unclassified) row as the literal `"unknown"` string (issue #740, AC4).
+// `serialize_with` requires the `&Option<String>` signature exactly.
+#[allow(clippy::ref_option)]
 fn serialize_start_source_or_unknown<S>(
     value: &Option<String>,
     serializer: S,
@@ -258,7 +260,7 @@ pub struct NewWorkflowExecution<'a> {
     /// First (origin) execution of this continue-as-new chain (issue #701).
     /// `None` except when inserting a continue-as-new successor.
     pub first_exec_id: Option<Uuid>,
-    /// Workflow-start provenance classifier (issue #740): a bounded snake_case
+    /// Workflow-start provenance classifier (issue #740): a bounded `snake_case`
     /// source string. `None` = unclassified. Distinct from `origin` (issue #534).
     pub start_source: Option<&'a str>,
     /// Optional correlation reference for the start source (issue #740). `None`
