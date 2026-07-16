@@ -5654,7 +5654,13 @@ fn render_timeline_gantt(
             div class="card" {
                 strong { "Now: " } (details)
                 " · "
-                a href={ "../" (timeline.exec_id) } { "what is it blocked on?" }
+                // Link to the execution-detail route. The timeline page is served
+                // at `{api_base}/workflows/{id}/timeline`, so its parent route is
+                // `{api_base}/workflows/{id}` — spelled out from the api base
+                // (mirroring the page's own `base_href = "../../"` nav) rather than
+                // a bare `../{id}`, which relies on `..` stripping exactly the
+                // `timeline` segment (Codex review, #960).
+                a href={ "../../workflows/" (timeline.exec_id) } { "what is it blocked on?" }
             }
         }
 
@@ -5755,15 +5761,36 @@ async fn workflow_timeline_ui(
         execution.state.clone(),
     );
     let title = format!("Timeline · {} · Vantage", execution.workflow_name);
-    let body = html! {
-        div.detail-row { a.back href={ "../" (exec_id) } { (PreEscaped("&larr;")) " Back to execution" } }
+    let body = render_timeline_body(&timeline, &execution, now);
+    Ok(layout(&title, &body, "../../"))
+}
+
+/// Build the timeline page body (back link + heading + Gantt). Extracted from
+/// `workflow_timeline_ui` so the navigation link is covered by a pure render
+/// test (Codex review, #960): both the "Back to execution" control here and the
+/// current-details card inside `render_timeline_gantt` must resolve to the
+/// execution-detail route `{api_base}/workflows/{id}` — not
+/// `{api_base}/workflows/{id}/{id}`. The timeline page is served at
+/// `{api_base}/workflows/{id}/timeline`, so the link spells the full path from
+/// the api base (matching the page's `base_href = "../../"` nav) rather than a
+/// bare `../{id}` that depends on `..` stripping exactly the `timeline` segment.
+fn render_timeline_body(
+    timeline: &Timeline,
+    execution: &WorkflowExecution,
+    now: DateTime<Utc>,
+) -> Markup {
+    html! {
+        div.detail-row {
+            a.back href={ "../../workflows/" (timeline.exec_id) } {
+                (PreEscaped("&larr;")) " Back to execution"
+            }
+        }
         h2 {
             "Timeline — " (execution.workflow_name) " "
             (state_badge(&execution.state))
         }
-        (render_timeline_gantt(&timeline, &execution, now))
-    };
-    Ok(layout(&title, &body, "../../"))
+        (render_timeline_gantt(timeline, execution, now))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10293,6 +10320,62 @@ mod tests {
         // Outcome fills present.
         assert!(html.contains(step_outcome_fill(StepOutcome::Completed)));
         assert!(html.contains(step_outcome_fill(StepOutcome::Fired)));
+    }
+
+    // Codex review (#960): the timeline page's "Back to execution" control and
+    // the current-details card must both resolve to the execution-detail route
+    // `{api_base}/workflows/{id}` — NOT `{api_base}/workflows/{id}/{id}`. Both
+    // are built from the api base (`../../workflows/{id}`), matching the page's
+    // own `base_href = "../../"` nav, rather than a bare `../{id}` that relies on
+    // `..` stripping exactly the `timeline` segment.
+    #[test]
+    fn timeline_nav_links_point_at_execution_detail_route() {
+        let steps = vec![tl_step(
+            StepKind::Activity,
+            Some("charge"),
+            0,
+            Some(1000),
+            Some(300),
+            Some(700),
+            StepOutcome::Completed,
+            Some(1),
+        )];
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        // Non-empty current_details makes the "what is it blocked on?" card render.
+        exec.current_details = Some("charging card".to_string());
+        let timeline = tl_timeline(steps, None); // Timeline::exec_id == "exec-1"
+        let html = render_timeline_body(&timeline, &exec, tl_base()).into_string();
+
+        // Both nav links (back control + current-details card) resolve to the
+        // execution-detail route via the same api-base-relative href.
+        let want = r#"href="../../workflows/exec-1""#;
+        assert_eq!(
+            html.matches(want).count(),
+            2,
+            "both the back link and the current-details card must use {want:?}: {html}"
+        );
+        assert!(
+            html.contains(" Back to execution"),
+            "back control present: {html}"
+        );
+        assert!(
+            html.contains("what is it blocked on?"),
+            "current-details card link present: {html}"
+        );
+
+        // The old bare-`..` form (which relied on `..` stripping exactly the
+        // `timeline` segment) must be gone, and the href must NEVER produce the
+        // doubled `/{id}/{id}` execution segment Codex flagged.
+        assert!(
+            !html.contains(r#"href="../exec-1""#),
+            "must not use the fragile bare `../{{id}}` form: {html}"
+        );
+        assert!(
+            !html.contains("workflows/exec-1/exec-1"),
+            "href must not resolve to a doubled execution segment: {html}"
+        );
     }
 
     // Q8
