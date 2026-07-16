@@ -8010,3 +8010,276 @@ async fn interleaved_sibling_signal_stray_timer_started_still_diverges() {
          it:\n{report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1071 review-fix coverage (PR follow-up): additional replayer manifestations
+// and divergence guards flagged by review. NONE of these change matcher LOGIC —
+// they broaden the empirical coverage of the sibling-tolerance fix and pin the
+// genuine-divergence boundaries it must NOT over-swallow.
+// ---------------------------------------------------------------------------
+
+/// Variant of manifestation #3 that exercises the GENUINE-user-timer path:
+/// `tokio::join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` with the signal
+/// wait polled FIRST and a plain user `ctx.timer("t", …)` (NOT the reserved
+/// `__signal_timeout` deadline id) as the sibling. This drives `match_signal`'s
+/// generic-`TimerStarted` rewind arm (which sets `first_interleaved_command`) +
+/// the new foreign-`TimerFired` cross + the sibling `match_timer_strict("t")`
+/// re-matching after the rewind — the path the reserved-`__signal_timeout`
+/// variant (`interleaved_sibling_signal_after_deadline_...`) does NOT cover.
+fn signal_wait_with_user_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Signal-wait command emitted FIRST (polled first by tokio::join!),
+        // then a plain user timer.
+        let (sig_res, timer_res) = tokio::join!(ctx.wait_for_signal("go"), ctx.timer("t", 5));
+        sig_res.map_err(|e| e.to_string())?;
+        timer_res.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Test A (review §3a variant): a plain user `ctx.timer("t")` sibling whose fire
+/// is recorded before the awaited signal must replay. Complements the reserved
+/// `__signal_timeout` variant already covered by
+/// `interleaved_sibling_signal_after_deadline_timer_fired_replays_succeeded`.
+#[tokio::test]
+async fn interleaved_sibling_signal_after_plain_user_timer_fired_replays_succeeded() {
+    let t = TimerId::new("t");
+    let events = vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: t.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerFired { timer_id: t },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".into(),
+            payload: serde_json::json!({"ok": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "signal_wait_with_user_timer_workflow",
+            signal_wait_with_user_timer_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071: a plain user ctx.timer sibling whose fire is recorded \
+         before the awaited signal must replay — match_signal must rewind for \
+         the interleaved TimerStarted, cross the foreign TimerFired, find the \
+         signal, and let the sibling match_timer_strict re-match after the \
+         rewind:\n{report}"
+    );
+}
+
+/// Test B (review §3b): foreign-`TimerFired` genuine-divergence guard. Two timers
+/// are armed in one batch (`timer_a` matched first) but ONLY `timer_b` fires; the
+/// history also carries the terminal `WorkflowCompleted` that a fully-resolved
+/// run would reach. Crossing `TimerFired(timer_b)` non-consumingly must NOT let
+/// `timer_a` falsely resolve — so the workflow must NOT reach `WorkflowCompleted`,
+/// leaving that terminal unconsumed at the frontier → the replayer must flag a
+/// divergence, NOT `ReplaySucceeded`. This proves the foreign-`TimerFired` cross
+/// is transparent-only and never a false resolution of the polled timer.
+#[tokio::test]
+async fn interleaved_sibling_multi_timer_wrong_one_fires_still_diverges() {
+    let a = TimerId::new("timer_a");
+    let b = TimerId::new("timer_b");
+    let events = vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: a,
+            duration_secs: 5,
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: b.clone(),
+            duration_secs: 5,
+        },
+        // Only timer_b fires; timer_a NEVER fires.
+        WorkflowEvent::TimerFired { timer_id: b },
+        // A fully-resolved run would reach this terminal — it is unreachable
+        // unless timer_a is (wrongly) resolved by crossing TimerFired(timer_b).
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("interleaved_two_timers", interleaved_two_timers_workflow)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        !matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071: crossing a foreign TimerFired(timer_b) must NOT falsely \
+         resolve the polled timer_a — the workflow must stay parked on timer_a \
+         and never reach the recorded WorkflowCompleted, so the replay must \
+         diverge (early-completion) rather than succeed:\n{report}"
+    );
+}
+
+/// Test C (review §2a, resolved EMPIRICALLY): a stray FOREIGN `TimerFired` where a
+/// signal was expected, with NO `TimerStarted` and NO signal
+/// (`[WorkflowStarted, TimerFired(orphan)]`), fed to the plain `signal_wait_workflow`.
+/// The #1071 fix makes `match_signal` cross a `TimerFired` non-consumingly, so the
+/// scan reaches end-of-history and `wait_for_signal` returns `NoMatch` (park) — but
+/// the stray, unconsumed `TimerFired` remains at the frontier, so the replayer must
+/// still flag a divergence rather than silently swallowing the stray event as
+/// `ReplaySucceeded`. (If this ever returns `ReplaySucceeded`, the tolerance is
+/// over-swallowing and it is a correctness bug.)
+#[tokio::test]
+async fn interleaved_sibling_signal_stray_timer_fired_still_diverges() {
+    let events = vec![
+        interleaved_started(),
+        // Stray, unconsumed foreign fire: no TimerStarted, no SignalReceived.
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("orphan"),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_wait_workflow", signal_wait_workflow)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a stray unconsumed foreign TimerFired where a signal was expected must \
+         still diverge — the #1071 TimerFired-cross must NOT silently swallow a \
+         stray fire as a successful replay:\n{report}"
+    );
+}
+
+/// Composes a plain `wait_for_signal` with a cancellable-timer (`start_timer` /
+/// `TimerHandle::await_fire`, issue #768) in one `tokio::join!`. The cancellable
+/// timer's `TimerFired` is recorded BEFORE the delivered signal.
+fn signal_wait_with_cancellable_await_fire_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        let (sig_res, fire_res) = tokio::join!(ctx.wait_for_signal("go"), handle.await_fire());
+        sig_res.map_err(|e| e.to_string())?;
+        fire_res.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Test D (determinism-review finding 5.1 — KNOWN LIMITATION PIN): composing a
+/// plain `wait_for_signal` with a cancellable-timer `await_fire()` in one
+/// `tokio::join!` is NOT a supported shape when the history records the
+/// cancellable timer's fire BEFORE the signal.
+///
+/// Issue #768 already documents composing an armed cancellable-timer handle with
+/// a signal wait as a follow-up, not a supported composition. The #1071 fix
+/// broadens `match_signal`'s foreign-`TimerFired` cross: the plain
+/// `wait_for_signal` wins by crossing the cancellable timer's `TimerFired`
+/// non-consumingly and advancing the cursor past it, which STRANDS that fire
+/// BEHIND the cursor. The cancellable timer's `await_fire` uses
+/// `match_timer_or_cancel`, which scans only FORWARD from the cursor, so it
+/// misses the behind-cursor fire and cannot resolve — diverging strict replay.
+/// On a live worker this self-heals (the arm re-fires), but a `WorkflowReplayer`
+/// strict replay surfaces the divergence. Use `ctx.receive_signal_timeout`
+/// (issue #476) for a supported signal-or-deadline shape.
+///
+/// This test PINS the actual strict-replay outcome so a future change to the
+/// composition's behavior is noticed.
+#[tokio::test]
+async fn known_limitation_signal_wait_composed_with_cancellable_await_fire_diverges_on_reversed_order()
+ {
+    let events = vec![
+        interleaved_started(),
+        // Cancellable-timer arm (consumed positionally by match_timer_arm).
+        WorkflowEvent::TimerStarted {
+            timer_id: TimerId::new("idle"),
+            duration_secs: 300,
+        },
+        // The cancellable timer's fire is recorded BEFORE the signal.
+        WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("idle"),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "go".into(),
+            payload: serde_json::json!({"ok": true}),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "signal_wait_with_cancellable_await_fire_workflow",
+            signal_wait_with_cancellable_await_fire_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "known limitation (issue #768 follow-up / #1071): a plain wait_for_signal \
+         composed with a cancellable-timer await_fire whose fire is recorded \
+         before the signal is unsupported — the signal-win strands the \
+         cancellable fire behind the cursor and match_timer_or_cancel's \
+         forward-only scan misses it, diverging strict replay:\n{report}"
+    );
+}
+
+/// `tokio::join!(ctx.timer("t", 5), ctx.spawn_child_workflow(...))` — a mixed
+/// suspension batch of a timer and a child workflow, timer polled/matched first.
+fn timer_then_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (timer_res, child_res) = tokio::join!(
+            ctx.timer("t", 5),
+            ctx.spawn_child_workflow_raw("child_proc", serde_json::json!({"item": "A"})),
+        );
+        timer_res.map_err(|e| e.to_string())?;
+        let out = child_res.map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Test F (review §2c): an interleaved CHILD-WORKFLOW terminal must be crossed.
+/// `join!(ctx.timer("t"), ctx.spawn_child_workflow(...))` where the child
+/// completes BEFORE the timer fires:
+/// `[WorkflowStarted, TimerStarted(t), ChildWorkflowStarted, ChildWorkflowCompleted, TimerFired(t)]`.
+/// Exercises `match_timer_strict`'s `ChildWorkflowStarted` interleaved-command
+/// rewind + the new `ChildWorkflowCompleted` transparent cross, then the sibling
+/// `match_child_workflow` re-matching after the rewind.
+#[tokio::test]
+async fn interleaved_sibling_child_workflow_terminal_before_timer_replays_succeeded() {
+    let child_id = ExecutionId::new();
+    let t = TimerId::new("t");
+    let events = vec![
+        interleaved_started(),
+        WorkflowEvent::TimerStarted {
+            timer_id: t.clone(),
+            duration_secs: 5,
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "child_proc".into(),
+            input: serde_json::json!({"item": "A"}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id,
+            output: serde_json::json!({"done": true}),
+        },
+        WorkflowEvent::TimerFired { timer_id: t },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn("timer_then_child_workflow", timer_then_child_workflow)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1071 manifestation #2 (child-workflow variant): a child workflow \
+         completing before a sibling timer's fire must replay — \
+         match_timer_strict must cross the interleaved ChildWorkflowStarted \
+         (rewind) and ChildWorkflowCompleted (transparent), then the sibling \
+         match_child_workflow re-matches after the rewind:\n{report}"
+    );
+}
