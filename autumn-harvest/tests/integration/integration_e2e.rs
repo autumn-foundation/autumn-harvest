@@ -164,7 +164,11 @@ const INIT_SQL: &str = concat!(
     include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
     "\n",
     // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql")
+    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
+    "\n",
+    // issue #740: start_source/start_source_ref/started_by provenance columns on
+    // harvest_workflow_executions.
+    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

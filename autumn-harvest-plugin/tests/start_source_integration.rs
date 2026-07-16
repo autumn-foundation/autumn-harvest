@@ -446,3 +446,149 @@ async fn describe_surfaces_start_source_and_omits_absent_fields() {
     assert_eq!(row["start_source_ref"].as_str(), Some("sched-123"));
     assert_eq!(row["started_by"].as_str(), Some("operator@example.com"));
 }
+
+/// POST a JSON body to an arbitrary management-API path (admin header set) and
+/// return `(status, parsed_json_body)`.
+async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("POST request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let jsonv = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, jsonv)
+}
+
+/// The full provenance triple of a created execution row.
+#[derive(diesel::QueryableByName)]
+struct ProvenanceRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    start_source_ref: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    started_by: Option<String>,
+}
+
+async fn load_provenance(pool: &DbPool, exec_id: &str) -> ProvenanceRow {
+    let mut conn = pool.get().await.expect("pool conn");
+    diesel::sql_query(
+        "SELECT start_source, start_source_ref, started_by \
+         FROM harvest_workflow_executions WHERE id = $1::uuid",
+    )
+    .bind::<Text, _>(exec_id)
+    .get_result(&mut conn)
+    .await
+    .expect("load created execution provenance")
+}
+
+/// BLOCKER 1 (issue #740): the batch-start API's *immediate* (non-throttled)
+/// start branch records `start_source = "batch"` and attributes the issuing
+/// operator in `started_by` — NOT the placeholder `api`.
+#[tokio::test]
+async fn batch_start_immediate_records_batch_source() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("ss_batch_wf")]);
+
+    let wf_id = format!("ss-batch-{}", uuid::Uuid::new_v4());
+    let (status, body) = post_json(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                { "workflow_name": "ss_batch_wf", "workflow_id": wf_id, "input": {"k": "v"} }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "batch_start should be 200: {body}");
+    let exec_id = body["results"][0]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("execution_id in batch result: {body}"));
+
+    let row = load_provenance(&pool, exec_id).await;
+    assert_eq!(
+        row.start_source.as_deref(),
+        Some("batch"),
+        "an immediate (non-throttled) batch item must record start_source='batch'"
+    );
+    assert!(
+        row.started_by.is_some(),
+        "a batch item must attribute the issuing operator in started_by, got None"
+    );
+}
+
+/// BLOCKER 2 (issue #740): the manual trigger-now schedule route's *immediate*
+/// (non-throttled) start branch records `start_source = "schedule"`, references
+/// the schedule id in `start_source_ref`, and attributes the operator in
+/// `started_by` — NOT the placeholder `api`.
+#[tokio::test]
+async fn trigger_now_immediate_records_schedule_source() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![plain_info("ss_trigger_wf")]);
+
+    // Create a manual workflow schedule (no auto-fire; the offline monitor never
+    // ticks it — we drive it explicitly via trigger-now).
+    let (status, sched) = post_json(
+        &app,
+        "/admin/schedules/workflow",
+        json!({ "workflow_name": "ss_trigger_wf", "schedule_expr": "manual" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create schedule should be 201: {sched}"
+    );
+    let schedule_id = sched["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("schedule id in create response: {sched}"))
+        .to_string();
+
+    // Trigger it now → the direct (non-throttled) start branch (BLOCKER 2).
+    let (status, trig) = post_json(
+        &app,
+        &format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "trigger-now should be 200: {trig}");
+    let exec_id = trig["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("execution_id in trigger response: {trig}"));
+
+    let row = load_provenance(&pool, exec_id).await;
+    assert_eq!(
+        row.start_source.as_deref(),
+        Some("schedule"),
+        "manual trigger-now must record start_source='schedule'"
+    );
+    assert_eq!(
+        row.start_source_ref.as_deref(),
+        Some(schedule_id.as_str()),
+        "manual trigger-now must reference the schedule id in start_source_ref"
+    );
+    assert!(
+        row.started_by.is_some(),
+        "manual trigger-now must attribute the operator in started_by, got None"
+    );
+}

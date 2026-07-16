@@ -7864,18 +7864,22 @@ pub(crate) fn parse_workflow_filters(
             "start_source" => {
                 // Issue #740: bounded provenance filter. Accept any known
                 // `StartSource` variant or the literal "unknown" (matches
-                // NULL / pre-upgrade rows). Reject anything else with a 400
-                // (never a silent empty match, never a 500). `from_str` maps
+                // NULL / pre-upgrade rows). A blank/whitespace-only value is
+                // treated as absent (no filter), matching the state/workflow_name/
+                // owner siblings. A non-empty *invalid* value is rejected with a
+                // 400 (never a silent empty match, never a 500). `from_str` maps
                 // unrecognized input to `Unknown`, so a non-"unknown" value
                 // that parses to `Unknown` is an invalid source string.
                 let trimmed = value.trim().to_ascii_lowercase();
-                let parsed = autumn_harvest::StartSource::from_str(&trimmed);
-                if parsed == autumn_harvest::StartSource::Unknown && trimmed != "unknown" {
-                    return Err(AutumnError::bad_request_msg(format!(
-                        "invalid start_source '{trimmed}'; expected a known source or 'unknown'"
-                    )));
+                if !trimmed.is_empty() {
+                    let parsed = autumn_harvest::StartSource::from_str(&trimmed);
+                    if parsed == autumn_harvest::StartSource::Unknown && trimmed != "unknown" {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid start_source '{trimmed}'; expected a known source or 'unknown'"
+                        )));
+                    }
+                    filters.start_source = Some(trimmed);
                 }
-                filters.start_source = Some(trimmed);
             }
             "min_history_events" => {
                 let parsed = value.trim().parse::<u64>().map_err(|_| {
@@ -13727,9 +13731,12 @@ async fn batch_start_workflows(
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                     origin: None,
                     completion_callbacks: None,
-                    start_source: autumn_harvest::StartSource::Api,
+                    // Batch-start API immediate path (issue #740): provenance is
+                    // `batch`, attributed to the operator that issued the batch.
+                    // Mirrors the throttle-carrier branch above.
+                    start_source: autumn_harvest::StartSource::Batch,
                     start_source_ref: None,
-                    started_by: None,
+                    started_by: Some(actor.as_str()),
                 },
                 false,
                 item_reject_fresh,
@@ -20952,6 +20959,10 @@ async fn trigger_schedule_now(
         }
     }
 
+    // issue #740: manual trigger-now provenance is `schedule`, referencing the
+    // schedule id and attributed to the operator (mirrors the throttle-carrier
+    // branch above). Bound in the enclosing scope so the ref outlives the params.
+    let manual_schedule_id_str = schedule_id.to_string();
     let result = start_or_load_workflow_execution_with_metrics(
         &mut exec_conn,
         StartWorkflowParams {
@@ -21004,9 +21015,9 @@ async fn trigger_schedule_now(
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
-            start_source: autumn_harvest::StartSource::Api,
-            start_source_ref: None,
-            started_by: None,
+            start_source: autumn_harvest::StartSource::Schedule,
+            start_source_ref: Some(manual_schedule_id_str.as_str()),
+            started_by: Some(actor.as_str()),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         None,
@@ -25702,10 +25713,16 @@ pub(crate) async fn load_workflows(
     }
     if let Some(src) = &filters.start_source {
         // Issue #740: provenance filter. "unknown" matches NULL / pre-upgrade
-        // rows (new rows never store the literal "unknown"); any other value is
-        // an exact column match. Plain column predicate, cross-shard safe.
+        // rows *or* a literal "unknown" (a workflow-level retry of a pre-upgrade
+        // NULL predecessor round-trips through from_str→Unknown→as_str()="unknown"
+        // and could store the literal string); any other value is an exact column
+        // match. Plain column predicate, cross-shard safe.
         if src == "unknown" {
-            query = query.filter(harvest_workflow_executions::start_source.is_null());
+            query = query.filter(
+                harvest_workflow_executions::start_source
+                    .is_null()
+                    .or(harvest_workflow_executions::start_source.eq("unknown")),
+            );
         } else {
             query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
         }
@@ -26082,9 +26099,15 @@ pub(crate) async fn load_stalled_workflows(
     }
     // Honor the start_source provenance filter (issue #740) on the stalled path
     // too, for the same bypass reason as sla_breached/nd_blocked/legal_hold above.
+    // "unknown" matches NULL / pre-upgrade rows or a literal "unknown" (a retry of
+    // a NULL predecessor could store the literal string); see load_workflows.
     if let Some(src) = &filters.start_source {
         if src == "unknown" {
-            query = query.filter(harvest_workflow_executions::start_source.is_null());
+            query = query.filter(
+                harvest_workflow_executions::start_source
+                    .is_null()
+                    .or(harvest_workflow_executions::start_source.eq("unknown")),
+            );
         } else {
             query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
         }
@@ -32886,6 +32909,15 @@ mod tests {
         let unknown = parse_workflow_filters(&pairs(&[("start_source", "unknown")]))
             .expect("start_source=unknown parses");
         assert_eq!(unknown.start_source.as_deref(), Some("unknown"));
+
+        // A blank / whitespace-only value is treated as absent (no filter),
+        // matching the state/workflow_name/owner siblings — never a 400.
+        let blank = parse_workflow_filters(&pairs(&[("start_source", "   ")]))
+            .expect("blank start_source parses as absent");
+        assert!(blank.start_source.is_none());
+        let empty = parse_workflow_filters(&pairs(&[("start_source", "")]))
+            .expect("empty start_source parses as absent");
+        assert!(empty.start_source.is_none());
 
         // An unrecognized value is a 400, never a silent empty filter.
         let err = parse_workflow_filters(&pairs(&[("start_source", "bogus")]))

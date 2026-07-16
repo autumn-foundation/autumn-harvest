@@ -32,7 +32,22 @@
 //! reproduced here without disproportionate scaffolding. `backfill` is only
 //! reachable through the plugin's `POST /admin/schedules/{id}/backfill` HTTP
 //! handler and is directly asserted in the plugin's `api_scheduler_integration`
-//! suite. See AC3 mapping in the PR / worker report for the full path→test table.
+//! suite. The batch-API *immediate* start (`batch`) and manual trigger-now
+//! (`schedule`) HTTP branches are asserted in the plugin's
+//! `start_source_integration` suite. The workflow-level *retry* inheritance
+//! path (#523/#740) is asserted end-to-end in `workflow_retry_tests`
+//! (`workflow_retry_inherits_predecessor_start_source`). See AC3 mapping in the
+//! PR / worker report for the full path→test table.
+//!
+//! NOTE (outbox): the generic cross-shard outbox producer
+//! (`autumn-harvest-plugin::outbox::dispatch_workflow_start_request`) is
+//! production-wired to stamp `start_source = StartSource::Outbox`
+//! (`outbox.rs`), but is exercised only by the outbox drain loop under a
+//! multi-shard deployment. A dedicated integration assertion needs the
+//! cross-shard outbox scaffolding (a second shard, a queued outbox row, the
+//! drain sweep) which is disproportionate for this slice; the value is
+//! confirmed by code reading and the shared `start_or_load` insert test above
+//! (which proves the insert path writes `request.start_source` verbatim).
 
 use std::sync::Mutex;
 
