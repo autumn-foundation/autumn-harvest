@@ -101,7 +101,7 @@ fn throttled_info(rate: &str, burst: f64) -> WorkflowInfo {
 /// A plain, NON-throttled workflow. The batch route runs `_collect` immediately
 /// (no defer) for such a workflow, so its Phase-1 idempotent-retry pre-check —
 /// the code #1053 makes reuse-policy-aware — is exercised synchronously. Used by
-/// `batch_bypass_uses_start_will_create_predicate_not_bare_existence`.
+/// `batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_create`.
 fn plain_info() -> WorkflowInfo {
     let mut info = throttled_info("100/m", 1.0);
     info.name = "plain_job";
@@ -1294,39 +1294,87 @@ async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
     );
 }
 
-/// issue #1053, item 1 (STRUCTURAL / DEFENSIVE). The batch Phase-1 idempotent-
-/// retry pre-check decides whether a batch item BYPASSES the admission gate.
-/// #1053 swaps its bare `has_execution` existence boolean for
-/// `start_will_create_new_execution(prior_state, AllowDuplicate)`, mirroring the
-/// single-start route (#1051). Under the batch route's hardcoded `AllowDuplicate`
-/// policy those two implementations AGREE for every prior state (both attach for
-/// any present non-sealed prior, both CREATE for `None`/sealed), so this test
-/// cannot behaviorally distinguish them today — it PASSES against both the old
-/// and the new code. Its value is (a) locking the AllowDuplicate=attach bypass
-/// contract at the batch route so a future per-item reuse policy inherits the
-/// predicate-based gate decision, and (b) providing the red→green anchor #1053
-/// asks for. The SUBSTANTIVE batch residual (a bypass-prior force-terminated
-/// between the unlocked read and the deferred fire) is closed BEHAVIORALLY by the
-/// item-2 core test `throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate`,
+/// issue #1053 item 1 / issue #1085 heal. Guards the batch route's Phase-1
+/// admission-gate BYPASS DECISION end-to-end: the gate is bypassed for a batch
+/// item that would ATTACH to an existing run, and enforced for one that would
+/// CREATE a fresh run.
+///
+/// #1053 swapped the bypass pre-check's bare `has_execution` existence boolean
+/// for `!start_will_create_new_execution(prior_state, AllowDuplicate)`, mirroring
+/// the single-start route (#1051). VERIFIED against the #1073 diff: the OLD
+/// `has_execution` check used the *same* non-sealed-prior filter
+/// (`state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`) the predicate query applies,
+/// and the batch route hardcodes `AllowDuplicate` (`BatchStartItem` has no
+/// reuse-policy field). So for the batch route the predicate and the old
+/// bare-existence heuristic are BEHAVIORALLY IDENTICAL for every prior state —
+/// both attach for any present non-sealed prior, both create for `None`/sealed.
+/// The predicate-vs-bare-existence *implementation* distinction is therefore NOT
+/// black-box observable through this route today; it is a structural/defensive
+/// change (per #1073's own comment) that becomes observable only if a per-item
+/// reuse policy is ever added. The genuine predicate distinction is unit-tested
+/// directly in `execution::start_will_create_tests`; this integration test does
+/// NOT (and cannot) prove it, so it asserts the property it actually can — the
+/// end-to-end bypass DECISION OUTCOME — via a case that splits by will-create:
+///
+///  - COMPLETED prior occupies the uniqueness slot →
+///    `start_will_create_new_execution(Some("COMPLETED"), AllowDuplicate)` is
+///    `false` (ATTACH) → the item BYPASSES the gate, reaches Phase 2, and
+///    attaches to the prior.
+///  - TERMINATED prior is SEALED — excluded from the partial uniqueness index
+///    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')` — so the Phase-1
+///    `prior_state` query (same filter) sees `None` and
+///    `start_will_create_new_execution(None, AllowDuplicate)` is `true` (fresh
+///    CREATE) → the item does NOT bypass; it FACES the armed gate and is BLOCKED.
+///
+/// The TERMINATED-prior gate block is the load-bearing assertion: it proves the
+/// gate is enforced exactly for an item that would create a NEW admission — the
+/// substance of #1053/#1073. (It does not, and cannot, distinguish the predicate
+/// from the old bare-existence heuristic — both block a sealed prior.)
+///
+/// #1085 heal: the original assertion checked `status != "rejected"` for the
+/// COMPLETED item, which conflated the batch route's benign attach-to-existing
+/// report (`started.created == false` → `status: "rejected"` + a *duplicate*
+/// message + the prior's `execution_id`, a long-standing #1053-independent
+/// convention meaning "no NEW row inserted") with a Phase-1 gate block
+/// (`error = "admission blocked by gate …"`, `execution_id: null`). It was
+/// compile-checked only in #1073 (the plugin suite spins a testcontainers
+/// Postgres, Docker-only in CI), so the wrong runtime expectation never ran.
+/// Both an attach and a gate block report `status: "rejected"`; the two are
+/// distinguished by error content + `execution_id` presence.
+///
+/// The SUBSTANTIVE batch residual (a bypass-prior force-terminated between the
+/// unlocked read and the deferred fire) is closed BEHAVIORALLY by the item-2
+/// core test `throttle_deferred_fire_over_a_force_terminated_prior_faces_the_gate`,
 /// since a throttled batch item defers through the SAME `fire_claimed_throttle_row`
-/// scanner. (Compile-checked only in this sandbox: this plugin suite spins a
-/// testcontainers Postgres unconditionally; CI runs it Docker-backed.)
+/// scanner.
 #[tokio::test]
-async fn batch_bypass_uses_start_will_create_predicate_not_bare_existence() {
+async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_create() {
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let (app, api_state) = build_app_with_state(&pool, plain_info());
     let mut conn = raw_connect(&url).await;
 
-    // A COMPLETED prior for this explicit workflow_id. Under AllowDuplicate the
-    // predicate `start_will_create_new_execution(Some("COMPLETED"), AllowDuplicate)`
-    // is `false` (attach), so the item bypasses the gate — identical to the old
-    // bare-existence heuristic (a COMPLETED row exists).
-    seed_execution(&mut conn, "plain_job", "batch-predicate-job", "COMPLETED").await;
+    // Two priors for the SAME workflow_name, distinct workflow_ids:
+    //  - a COMPLETED prior occupies the uniqueness slot, so an AllowDuplicate
+    //    start ATTACHES to it (start_will_create_new_execution(Some("COMPLETED"),
+    //    AllowDuplicate) == false) -> the batch item BYPASSES the gate.
+    //  - a TERMINATED prior is SEALED: excluded from the partial uniqueness index
+    //    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`, so the batch's
+    //    Phase-1 prior_state query (same filter) sees None and
+    //    start_will_create_new_execution(None, AllowDuplicate) == true (fresh
+    //    create) -> the item does NOT bypass; it FACES the gate.
+    seed_execution(&mut conn, "plain_job", "batch-attach-job", "COMPLETED").await;
+    seed_execution(
+        &mut conn,
+        "plain_job",
+        "batch-fresh-create-job",
+        "TERMINATED",
+    )
+    .await;
     assert_eq!(
         execution_count(&mut conn, "plain_job").await,
-        1,
-        "one COMPLETED prior seeded"
+        2,
+        "two priors seeded (COMPLETED attach-target + TERMINATED sealed)"
     );
 
     // Arm a fleet-wide admission gate blocking all NEW (creating) admissions.
@@ -1340,34 +1388,84 @@ async fn batch_bypass_uses_start_will_create_predicate_not_bare_existence() {
         expires_at: None,
     }]);
 
-    // Submit a non-atomic batch item for the SAME workflow_id. AllowDuplicate
-    // attaches to the COMPLETED prior (will NOT create), so it is NOT rejected by
-    // the gate.
+    // One non-atomic batch, one item per prior, under the SAME armed gate. The
+    // handler sorts results by index, so results[0]/[1] map to items[0]/[1].
     let (status, body) = post_json(
         &app,
         "/workflows/batch_start",
         json!({
             "atomic": false,
             "items": [
-                {
-                    "workflow_name": "plain_job",
-                    "workflow_id": "batch-predicate-job",
-                    "input": { "hello": "world" },
-                }
+                { "workflow_name": "plain_job", "workflow_id": "batch-attach-job",       "input": { "hello": "world" } },
+                { "workflow_name": "plain_job", "workflow_id": "batch-fresh-create-job", "input": { "hello": "world" } },
             ],
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "batch request: {body:?}");
-    assert_ne!(
-        body["results"][0]["status"],
-        json!("rejected"),
-        "an AllowDuplicate attach to a COMPLETED prior must bypass the gate, not be rejected: {body:?}"
+    // Guard the result count before indexing so a wrong shape yields a clear
+    // message instead of an index-out-of-bounds panic.
+    assert_eq!(
+        body["results"].as_array().map_or(0, |a| a.len()),
+        2,
+        "expected exactly 2 results in the batch response: {body:?}"
     );
+
+    // -- item[0]: COMPLETED prior -> BYPASS + attach (NOT a gate block) --------
+    // The item bypassed the Phase-1 gate, reached Phase 2, and attached to the
+    // COMPLETED prior under AllowDuplicate. The batch route reports an attach
+    // (`started.created == false`) with `status: "rejected"` + a *duplicate*
+    // message + the prior's `execution_id` -- a long-standing, #1053-independent
+    // convention meaning "no NEW row inserted", NOT a gate block. Distinguish the
+    // two by error content + the presence of an execution_id, not by the
+    // `status` string (both an attach and a gate block report `"rejected"`).
+    let attach = &body["results"][0];
+    let attach_err = attach["error"].as_str().unwrap_or_default();
+    assert!(
+        !attach_err.contains("admission blocked by gate"),
+        "an AllowDuplicate attach to a COMPLETED prior must BYPASS the gate \
+         (reach Phase 2 and attach), not be gate-blocked in Phase 1: {body:?}"
+    );
+    assert!(
+        attach_err.contains("already has an existing execution"),
+        "the item must attach to the existing COMPLETED prior -- reported as a \
+         benign duplicate, not a gate block: {body:?}"
+    );
+    assert!(
+        attach["execution_id"].as_str().is_some(),
+        "an attach returns the prior's execution_id; a gate block returns none: {body:?}"
+    );
+
+    // -- item[1]: TERMINATED prior -> would create fresh -> BLOCKED by gate ----
+    // TERMINATED is released from the uniqueness index, so start_or_load_collect
+    // would CREATE a fresh run. Because that is a NEW admission, the bypass
+    // pre-check does NOT bypass and the item faces the armed gate: Phase 1 rejects
+    // it with `error = "admission blocked by gate …"` and `execution_id: null`.
+    // This is the load-bearing contrast to item[0]: the gate is bypassed exactly
+    // for an item that attaches and enforced for one that would create.
+    let blocked = &body["results"][1];
+    let blocked_err = blocked["error"].as_str().unwrap_or_default();
+    assert_eq!(
+        blocked["status"],
+        json!("rejected"),
+        "a would-be-fresh-create item over a sealed prior must be gate-rejected: {body:?}"
+    );
+    assert!(
+        blocked_err.contains("admission blocked by gate"),
+        "a TERMINATED (sealed) prior does not occupy the uniqueness slot, so the \
+         item would CREATE fresh and must FACE the gate -- a Phase-1 gate block: {body:?}"
+    );
+    assert!(
+        blocked["execution_id"].is_null(),
+        "a Phase-1 gate block carries no execution_id (nothing was created/attached): {body:?}"
+    );
+
+    // Neither item created a new execution: the attach reused the COMPLETED prior;
+    // the blocked item never reached Phase 2. Row count is unchanged.
     assert_eq!(
         execution_count(&mut conn, "plain_job").await,
-        1,
-        "attaching to the COMPLETED prior must not create a second execution row"
+        2,
+        "attach creates nothing and a gate-blocked item creates nothing"
     );
 }
 
