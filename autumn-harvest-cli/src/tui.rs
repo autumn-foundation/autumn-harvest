@@ -28,21 +28,18 @@ use crate::CliError;
 /// to fetch data, or if there is an error drawing to the terminal.
 pub async fn run_tui(cli: &Cli) -> Result<(), CliError> {
     // Setup terminal
-    enable_raw_mode().map_err(|e| CliError::ReadJson {
+    enable_raw_mode().map_err(|e| CliError::TerminalIo {
         label: "setup raw mode",
-        path: "terminal".to_string(),
         source: e,
     })?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|e| CliError::ReadJson {
+    execute!(stdout, EnterAlternateScreen).map_err(|e| CliError::TerminalIo {
         label: "enter alternate screen",
-        path: "terminal".to_string(),
         source: e,
     })?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| CliError::ReadJson {
+    let mut terminal = Terminal::new(backend).map_err(|e| CliError::TerminalIo {
         label: "create terminal",
-        path: "terminal".to_string(),
         source: e,
     })?;
 
@@ -119,9 +116,8 @@ async fn run_app(
 
                 f.render_widget(t, rects[0]);
             })
-            .map_err(|e| CliError::ReadJson {
+            .map_err(|e| CliError::TerminalIo {
                 label: "draw terminal",
-                path: "terminal".to_string(),
                 source: e,
             })?;
 
@@ -130,9 +126,8 @@ async fn run_app(
             .unwrap_or_else(|| Duration::from_secs(0));
 
         if event::poll(timeout).unwrap_or(false) {
-            let evt = event::read().map_err(|e| CliError::ReadJson {
+            let evt = event::read().map_err(|e| CliError::TerminalIo {
                 label: "read terminal event",
-                path: "terminal".to_string(),
                 source: e,
             })?;
             if let Event::Key(key) = evt

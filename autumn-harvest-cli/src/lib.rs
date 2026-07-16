@@ -221,6 +221,15 @@ pub enum CliError {
         source: std::io::Error,
     },
 
+    /// Terminal interaction failed.
+    #[error("terminal operation {label} failed: {source}")]
+    TerminalIo {
+        /// Operation that failed.
+        label: &'static str,
+        /// I/O failure.
+        source: std::io::Error,
+    },
+
     /// Both inline and file JSON sources were supplied for one field.
     #[error("{label} accepts either inline JSON or a file, not both")]
     ConflictingJsonSources {
