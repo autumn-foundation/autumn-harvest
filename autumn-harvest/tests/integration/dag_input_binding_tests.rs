@@ -49,9 +49,25 @@ async fn src_b(_ctx: &ActivityContext) -> Result<Value, String> {
 }
 
 #[activity]
+async fn src_c(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("c-out"))
+}
+
+#[activity]
 async fn sink_c(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
     let _ = input;
     Ok(json!("done"))
+}
+
+#[activity]
+async fn fail_root(_ctx: &ActivityContext) -> Result<Value, String> {
+    Err("boom".to_string())
+}
+
+#[activity]
+async fn fail_final(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
+    let _ = input;
+    Ok(json!("final"))
 }
 
 #[activity]
@@ -98,6 +114,27 @@ fn merged_dag(dag: &mut DagBuilder) {
     let _c = dag
         .activity(sink_c)
         .input_from_aliased(&[("a", &a), ("b", &b)]);
+}
+
+/// Fan-in: three roots → one sink whose input is a keyed merge of all three.
+#[dag]
+fn merged_three_dag(dag: &mut DagBuilder) {
+    let a = dag.activity(src_a);
+    let b = dag.activity(src_b);
+    let c = dag.activity(src_c);
+    let _sink = dag
+        .activity(sink_c)
+        .input_from_aliased(&[("a", &a), ("b", &b), ("c", &c)]);
+}
+
+/// A failed upstream feeding a bound downstream that runs anyway (`AllDone`).
+#[dag]
+fn fail_bind_dag(dag: &mut DagBuilder) {
+    let root = dag.activity(fail_root);
+    let _final = dag
+        .activity(fail_final)
+        .input_from(&root)
+        .trigger_rule(TriggerRule::AllDone);
 }
 
 /// A skipped upstream feeding a bound downstream that runs anyway (`AllDone`).
@@ -322,6 +359,111 @@ async fn bound_etl_replay_sweep_1000() {
     }
 }
 
+/// Stronger sweep: a 3-source merged fan-in with a genuine rotating permutation
+/// of the within-level completion order (3! = 6 orderings). Asserts
+/// `ReplaySucceeded` on every iteration — which is only possible if the handler
+/// reconstructs the merged keyed input identically regardless of the order the
+/// three sources completed in.
+#[tokio::test]
+async fn merged_three_source_replay_sweep_1000() {
+    // All 6 permutations of the level-0 completion order for [a, b, c].
+    const PERMS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+
+    let handler = __autumn_workflow_info_merged_three_dag().handler;
+
+    for i in 0u32..1_000 {
+        let id_a = ActivityExecId::new();
+        let id_b = ActivityExecId::new();
+        let id_c = ActivityExecId::new();
+        let id_sink = ActivityExecId::new();
+
+        let a_out = json!(format!("a-{i}"));
+        let b_out = json!(format!("b-{i}"));
+        let c_out = json!(format!("c-{i}"));
+
+        // Level 0 dispatches in task-index order (a idx0, b idx1, c idx2).
+        let mut history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id_a,
+                name: "src_a".into(),
+                input: dag_task_input("src_a"),
+                queue: String::new(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id_b,
+                name: "src_b".into(),
+                input: dag_task_input("src_b"),
+                queue: String::new(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id_c,
+                name: "src_c".into(),
+                input: dag_task_input("src_c"),
+                queue: String::new(),
+            },
+        ];
+
+        // Rotate the within-level completion ORDER across all 6 permutations.
+        // `match_activity` matches by id out of order, so a correct handler
+        // reconstructs the same merged sink input every time.
+        let completions = [
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id_a,
+                output: a_out.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id_b,
+                output: b_out.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id_c,
+                output: c_out.clone(),
+            },
+        ];
+        let perm = PERMS[(i % 6) as usize];
+        for &slot in &perm {
+            history.push(completions[slot].clone());
+        }
+
+        // Level 1: sink bound to a merged, aliased object of all three outputs.
+        history.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id_sink,
+            name: "sink_c".into(),
+            input: json!({ "a": a_out, "b": b_out, "c": c_out }),
+            queue: String::new(),
+        });
+        history.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id_sink,
+            output: json!("done"),
+        });
+
+        let report = WorkflowReplayer::new()
+            .register_fn("merged_three_dag", handler)
+            .replay_from_events(history)
+            .await;
+
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "3-source sweep iteration {i} (perm {perm:?}) must replay \
+             deterministically with the correct merged keys, got: {report}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AC1 (multi) — merged binding delivers a keyed object (live)
 // ---------------------------------------------------------------------------
@@ -389,6 +531,110 @@ async fn bound_to_skipped_upstream_yields_null() {
         scheduled_input(outcome.events(), "skip_final"),
         Value::Null,
         "recorded final input must be null for the skipped bound upstream"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC6 — binding to a failed upstream yields null (live + deterministic replay)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bound_to_failed_upstream_yields_null() {
+    // Live: fail_root fails, fail_final binds to it and runs anyway (AllDone).
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("fail_root", |_| Err("boom".to_string()))
+        .mock_activity("fail_final", |input| {
+            assert_eq!(
+                input,
+                Value::Null,
+                "binding to a failed upstream must yield null"
+            );
+            Ok(json!("final"))
+        })
+        .run(__autumn_workflow_info_fail_bind_dag().handler, Value::Null)
+        .await;
+
+    // A failed upstream fails the DAG as a whole (any Failed status → Err), so
+    // — unlike the condition-skip sibling — the terminal result is an error.
+    assert!(
+        outcome.result.is_err(),
+        "a DAG with a failed task must fail overall, got: {:?}",
+        outcome.result
+    );
+
+    // But the bound downstream still ran, with a deterministic null input.
+    let failed = outcome
+        .events()
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }));
+    assert!(failed, "fail_root must record an ActivityFailed event");
+    assert_eq!(
+        scheduled_input(outcome.events(), "fail_final"),
+        Value::Null,
+        "recorded final input must be null for the failed bound upstream"
+    );
+
+    // Replay a hand-built history (ActivityFailed root, no ActivityCompleted;
+    // final scheduled with the raw null output) to prove the bound-null branch
+    // is replay-deterministic. A failed DAG replays to a *deterministic*
+    // WorkflowFailed — never a NonDeterminismDetected.
+    let id_root = ActivityExecId::new();
+    let id_final = ActivityExecId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_root,
+            name: "fail_root".into(),
+            input: dag_task_input("fail_root"),
+            queue: String::new(),
+        },
+        // Root FAILED — no ActivityCompleted, so its output slot stays null.
+        WorkflowEvent::ActivityFailed {
+            activity_id: id_root,
+            error: "boom".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            non_retryable: false,
+            details: None,
+        },
+        // final is BOUND to the failed root → its recorded input is null.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_final,
+            name: "fail_final".into(),
+            input: Value::Null,
+            queue: String::new(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_final,
+            output: json!("final"),
+        },
+    ];
+    assert_eq!(
+        scheduled_input(&history, "fail_final"),
+        Value::Null,
+        "constructed history must carry the null bound input"
+    );
+
+    let expected_events = history.len();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "fail_bind_dag",
+            __autumn_workflow_info_fail_bind_dag().handler,
+        )
+        .replay_from_events(history)
+        .await;
+
+    assert_eq!(report.events_replayed, expected_events);
+    assert!(
+        matches!(report.status, ReplayStatus::WorkflowFailed { .. }),
+        "failed-upstream history must replay deterministically (WorkflowFailed, \
+         never NonDeterminismDetected), got: {report}"
     );
 }
 

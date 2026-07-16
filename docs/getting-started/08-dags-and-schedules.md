@@ -439,6 +439,30 @@ own output can feed a downstream [mapped fan-out](#dynamic-task-mapping-fan-out)
 does. A worked end-to-end example — a three-stage ETL plus a fan-in merge —
 lives in `autumn-harvest/examples/dag_data_flow.rs`.
 
+A few interactions worth knowing:
+
+* **A binding is also a `.condition(…)` edge.** Because a binding adds its
+  upstream to the node's dependency list, that upstream *also* shows up in the
+  node's `.condition(|ups| …)` slice — and `ups` is ordered by the sequence in
+  which the builder calls run, not by which method added the edge. So a
+  condition that indexes `ups[0]` must account for every `.input_from*` call:
+  interleave `.input_from(…)` and `.upstream(…)` deliberately, since their call
+  order determines the `ups[…]` indices your predicate sees (`.upstream(&a)`
+  before `.input_from(&b)` → `ups[0]` is `a`; the reverse → `ups[0]` is `b`).
+* **You can bind to a fan-out node's output.** `.input_from(&mapped_node)` — the
+  reverse of "a bound node's output feeds a fan-out" above — is legal; the bound
+  node receives the whole *collected array* the mapped node produced, as a single
+  JSON array value.
+* **An activity used in both bound and unbound positions gets different inputs.**
+  The same `#[activity]` reused in a bound node (raw upstream output) and an
+  unbound node (the trigger-input + `{ "conf": …, "dag_task": … }` wrapper)
+  receives structurally different inputs in each position — write the activity's
+  input deserialization to handle both shapes if you reuse it that way.
+* **`input_from*` on a signal-gate node is ignored.** A gate dispatches no
+  activity, so — consistent with a gate silently ignoring the other
+  activity-only setters (`.queue()`, `.retry()`, `.start_to_close()`) — an
+  `.input_from*` on a gate is a no-op, **not** a build error.
+
 ## Signal / approval gates
 
 A **gate node** pauses a DAG run until a named signal arrives, then makes the

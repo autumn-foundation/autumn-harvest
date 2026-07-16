@@ -322,6 +322,14 @@ pub enum DagBuildError {
         /// The activity name of the offending node.
         task: String,
     },
+    /// A [`DagInputBinding::Merged`] binding has no upstream sources
+    /// (issue #702) — an empty `input_from_all(&[])` / `input_from_aliased(&[])`
+    /// declares a binding that would deliver an empty JSON object, which is
+    /// almost certainly a mistake.
+    EmptyInputBinding {
+        /// The activity name of the offending node.
+        task: String,
+    },
 }
 
 impl fmt::Display for DagBuildError {
@@ -339,6 +347,10 @@ impl fmt::Display for DagBuildError {
             Self::InputBindingNotAnUpstream { task } => write!(
                 f,
                 "dag task '{task}' has an input binding referencing a node that is not an upstream"
+            ),
+            Self::EmptyInputBinding { task } => write!(
+                f,
+                "dag task '{task}' has an input binding with no upstream sources"
             ),
         }
     }
@@ -454,6 +466,17 @@ impl DagTaskRef {
     /// is not required). The bound activity receives the raw upstream output
     /// instead of the trigger-input + `dag_task` wrapper the unbound path uses.
     ///
+    /// A skipped or failed upstream contributes [`Value::Null`] (reachable when
+    /// a non-default trigger rule like [`TriggerRule::AllDone`] lets the node
+    /// run past a skip/failure).
+    ///
+    /// Calling a binding method adds a dependency edge; edges accumulate across
+    /// calls, but the binding itself is last-wins — a later `input_from*`
+    /// replaces the input source while keeping every prior edge as an
+    /// ordering-only dependency. The bound upstream therefore also appears in
+    /// the node's [`condition`](Self::condition) `ups` slice, in builder
+    /// call order.
+    ///
     /// # Panics
     ///
     /// Panics if `self` and `upstream` were created by different
@@ -479,7 +502,18 @@ impl DagTaskRef {
     /// Dependency edges are added automatically. Keys are the upstreams'
     /// activity names in the given order; two upstreams sharing an activity
     /// name is a [`DagBuildError::DuplicateInputBindingKey`] at build time (use
-    /// [`input_from_aliased`](Self::input_from_aliased) to disambiguate).
+    /// [`input_from_aliased`](Self::input_from_aliased) to disambiguate). An
+    /// empty `upstreams` slice is a [`DagBuildError::EmptyInputBinding`].
+    ///
+    /// A skipped or failed upstream contributes [`Value::Null`] for its key
+    /// (reachable when a non-default trigger rule like [`TriggerRule::AllDone`]
+    /// lets the node run past a skip/failure) — never a missing key.
+    ///
+    /// Binding edges accumulate across calls, but the binding itself is
+    /// last-wins — a later `input_from*` replaces the input source while
+    /// keeping every prior edge as an ordering-only dependency. Every bound
+    /// upstream therefore also appears in the node's
+    /// [`condition`](Self::condition) `ups` slice, in builder call order.
     ///
     /// # Panics
     ///
@@ -517,7 +551,18 @@ impl DagTaskRef {
     /// upstream's output, keyed by an explicit alias (issue #702).
     ///
     /// Dependency edges are added automatically. A duplicate alias is a
-    /// [`DagBuildError::DuplicateInputBindingKey`] at build time.
+    /// [`DagBuildError::DuplicateInputBindingKey`] at build time; an empty
+    /// `bindings` slice is a [`DagBuildError::EmptyInputBinding`].
+    ///
+    /// A skipped or failed upstream contributes [`Value::Null`] for its alias
+    /// (reachable when a non-default trigger rule like [`TriggerRule::AllDone`]
+    /// lets the node run past a skip/failure) — never a missing key.
+    ///
+    /// Binding edges accumulate across calls, but the binding itself is
+    /// last-wins — a later `input_from*` replaces the input source while
+    /// keeping every prior edge as an ordering-only dependency. Every bound
+    /// upstream therefore also appears in the node's
+    /// [`condition`](Self::condition) `ups` slice, in builder call order.
     ///
     /// # Panics
     ///
@@ -827,6 +872,13 @@ impl DagBuilder {
             let indices: Vec<usize> = match binding {
                 DagInputBinding::Single(i) => vec![*i],
                 DagInputBinding::Merged(sources) => {
+                    // An empty merge binding (`input_from_all(&[])` /
+                    // `input_from_aliased(&[])`) would deliver an empty object.
+                    if sources.is_empty() {
+                        return Err(DagBuildError::EmptyInputBinding {
+                            task: task.activity_name.clone(),
+                        });
+                    }
                     let mut seen = std::collections::HashSet::new();
                     for source in sources {
                         if !seen.insert(source.key.as_str()) {
@@ -928,12 +980,22 @@ impl DagBuilder {
 /// the raw output for a [`DagInputBinding::Single`], or a keyed JSON object for
 /// a [`DagInputBinding::Merged`]. No `dag_task` injection, no `conf` wrapping.
 fn bind_activity_input(binding: &DagInputBinding, outputs: &[Value]) -> Value {
+    // Indices are validated at build time, so the happy-path behaviour is
+    // unchanged; the defensive `.get(..).unwrap_or(Null)` matches the sibling
+    // `dispatch_decision` convention (defence in depth against an out-of-range
+    // index).
     match binding {
-        DagInputBinding::Single(idx) => outputs[*idx].clone(),
+        DagInputBinding::Single(idx) => outputs.get(*idx).cloned().unwrap_or(Value::Null),
         DagInputBinding::Merged(sources) => {
             let mut obj = serde_json::Map::new();
             for source in sources {
-                obj.insert(source.key.clone(), outputs[source.upstream_index].clone());
+                obj.insert(
+                    source.key.clone(),
+                    outputs
+                        .get(source.upstream_index)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
             }
             Value::Object(obj)
         }
@@ -1774,6 +1836,99 @@ mod tests {
         assert!(
             matches!(err, DagBuildError::ConflictingInputBinding { .. }),
             "input_from on a mapped node must conflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_all_empty_slice_is_build_error() {
+        let mut builder = DagBuilder::new();
+        let c = builder.activity(dummy_activity3); // 0
+        let _ = c.input_from_all(&[]);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, DagBuildError::EmptyInputBinding { .. }),
+            "empty input_from_all must be a build error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_aliased_empty_slice_is_build_error() {
+        let mut builder = DagBuilder::new();
+        let c = builder.activity(dummy_activity3); // 0
+        let _ = c.input_from_aliased(&[]);
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(err, DagBuildError::EmptyInputBinding { .. }),
+            "empty input_from_aliased must be a build error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn input_from_after_upstream_preserves_condition_ups_order() {
+        // Binding APPENDS its edge — it never reorders prior `.upstream()`
+        // edges. Because `dispatch_decision` builds the condition `ups` slice by
+        // iterating `upstreams` in order, builder call order determines the
+        // `ups[..]` indexing a `.condition(|ups| ...)` sees.
+
+        // Node built as `.upstream(&a).condition(...).input_from(&b)`:
+        // a's edge is declared first, so `upstreams == [a, b]` and the
+        // condition sees a's output at `ups[0]`.
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity); // 0
+        let b = builder.activity(dummy_activity2); // 1
+        let _node = builder
+            .activity(dummy_activity3) // 2
+            .upstream(&a)
+            .condition(|ups| ups[0] == serde_json::json!("a-out"))
+            .input_from(&b);
+
+        let dag = builder.build().unwrap();
+        assert_eq!(
+            dag.tasks()[2].upstreams,
+            vec![0, 1],
+            "explicit upstream(&a) precedes the binding edge to b — order preserved"
+        );
+        // Prove `ups[0]` is a's output via dispatch_decision.
+        let statuses = [
+            TaskStatus::Succeeded,
+            TaskStatus::Succeeded,
+            TaskStatus::Skipped,
+        ];
+        let outputs = [
+            serde_json::json!("a-out"),
+            serde_json::json!("b-out"),
+            Value::Null,
+        ];
+        assert_eq!(
+            dag.tasks()[2].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::Run,
+            "condition must see a's output at ups[0] (edges: [a, b])"
+        );
+
+        // Same two edges declared in the OTHER call order:
+        // `.input_from(&b).upstream(&a)` → binding edge to b is declared first,
+        // so `upstreams == [b, a]` and the condition sees b's output at ups[0].
+        let mut builder2 = DagBuilder::new();
+        let a2 = builder2.activity(dummy_activity); // 0
+        let b2 = builder2.activity(dummy_activity2); // 1
+        let _node2 = builder2
+            .activity(dummy_activity3) // 2
+            .input_from(&b2)
+            .upstream(&a2)
+            .condition(|ups| ups[0] == serde_json::json!("b-out"));
+
+        let dag2 = builder2.build().unwrap();
+        assert_eq!(
+            dag2.tasks()[2].upstreams,
+            vec![1, 0],
+            "binding edge to b precedes the explicit upstream(&a) edge — call order determines ups order"
+        );
+        assert_eq!(
+            dag2.tasks()[2].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::Run,
+            "condition must see b's output at ups[0] (edges: [b, a])"
         );
     }
 }
