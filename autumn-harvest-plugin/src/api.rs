@@ -16736,6 +16736,20 @@ pub(crate) async fn signal_workflow(
         }
     };
 
+    // Fail closed if the runtime isn't installed yet, rather than silently
+    // skipping the schema/cap checks below. `install_storage_pool` runs before
+    // `install(runtime)` during plugin startup (with a genuine `.await` -- the
+    // boot-time admission-gate load -- in between), so a request can reach this
+    // handler with a working storage pool while `runtime()` still errors.
+    // Without this check, that narrow startup window would let a payload slip
+    // through unvalidated (#610 schema gate) and uncapped (#252) into a durable
+    // signal row instead of being rejected at the edge. Mirrors `admit_update`
+    // and `update_with_start_workflow`'s identical hard requirement.
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
     // issue #610: structural schema validation of the signal payload against
     // the signal handler's published `arg_schema` (if any). Resolved by
     // (execution.workflow_name, signal_name) and run before enqueue so a
@@ -16743,21 +16757,17 @@ pub(crate) async fn signal_workflow(
     // signal with no published schema validates Ok (today's behavior).
     //
     // Issue #252: enforce signal payload cap before inserting the signal row.
-    if let Ok(runtime) = api_state.runtime() {
-        if let Some(handler) = runtime
-            .registry
-            .signal_handlers
-            .iter()
-            .find(|h| h.workflow == execution.workflow_name && h.name == signal_name)
-            && let Err(violations) = handler.validate_arg(&payload)
-        {
-            return schema_validation_response("signal payload validation failed", violations);
-        }
-        if let Err(e) =
-            check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes)
-        {
-            return e.into_response();
-        }
+    if let Some(handler) = runtime
+        .registry
+        .signal_handlers
+        .iter()
+        .find(|h| h.workflow == execution.workflow_name && h.name == signal_name)
+        && let Err(violations) = handler.validate_arg(&payload)
+    {
+        return schema_validation_response("signal payload validation failed", violations);
+    }
+    if let Err(e) = check_signal_payload_cap(&payload, runtime.registry.max_signal_payload_bytes) {
+        return e.into_response();
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
@@ -32720,6 +32730,130 @@ mod tests {
                 autumn_harvest::event::WorkflowEvent::UpdateAdmitted { .. }
             )),
             "the update must not have been durably admitted while the runtime was unavailable"
+        );
+    }
+
+    /// Codex P1 regression test (issue #610, PR #1092): the plain signal-send
+    /// route (`POST /workflows/{id}/signal/{name}`) gates its #610 payload
+    /// schema validation and #252 payload cap on `api_state.runtime()`. During
+    /// the plugin-startup window (storage pool installed, `install(runtime)`
+    /// not yet complete) `runtime()` errors -- so an `if let Ok(runtime)` guard
+    /// would skip both checks and let `send_signal_idempotent` durably enqueue
+    /// an unvalidated/uncapped payload. Reproduce that exact state and assert
+    /// `signal_workflow` fails closed instead, mirroring `admit_update` above.
+    #[tokio::test]
+    async fn signal_workflow_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to signal_workflow test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "signal_no_runtime",
+                workflow_id: "signal-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup window.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = signal_workflow(
+            Extension(state),
+            Path((exec_id.to_string(), "some_signal".to_string())),
+            Query(SignalQuery::default()),
+            axum::http::HeaderMap::new(),
+            Json(serde_json::json!({ "payload": true })),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "signal_workflow must fail closed when the runtime isn't installed yet, not silently \
+             enqueue an unvalidated payload"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // And the signal must NOT have been durably enqueued -- no
+        // `harvest_signals` row should exist for this execution. (This is the
+        // load-bearing "did not fall through to send_signal_idempotent" check:
+        // without the fail-closed guard the handler would insert a signal row
+        // here and return 202 instead of the 400 asserted above.)
+        let rows: Vec<CountRow> = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM harvest_signals WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .load(&mut conn)
+        .await
+        .expect("signal count query should run");
+        // `rows.as_slice()` avoids the diesel `RunQueryDsl::first`
+        // method-resolution ambiguity a bare `rows.first()` triggers on a `Vec`
+        // of query rows.
+        let signal_count = match rows.as_slice() {
+            [first, ..] => first.n,
+            [] => 0,
+        };
+        assert_eq!(
+            signal_count, 0,
+            "the signal must not have been durably enqueued while the runtime was unavailable"
         );
     }
 
