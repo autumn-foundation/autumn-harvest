@@ -3952,22 +3952,33 @@ async fn ui_dag_run_graph_large_dag_scrollable() {
 
     let exec_id = dag957_seed_run(&url, "dag957_large", "graph-large", vec![], "RUNNING").await;
 
+    // Issue #957 success metric: the graph view renders a large run (here 220
+    // nodes, well past the 100-node budget) in < 1 s server-side. Mirrors the
+    // sibling #960 J-G perf test and the workers-page precedent.
+    let start = std::time::Instant::now();
     let (status, html) = fetch_html(&app, &format!("/dags/dag957_large?run={exec_id}")).await;
+    let elapsed = start.elapsed();
     assert_eq!(status, StatusCode::OK, "body: {html}");
     assert!(
         html.contains("dag-graph-scroll"),
         "a large DAG uses the scrollable container, not a disabled render: {html}"
     );
     assert!(html.contains("Large DAG"), "a large-DAG note is shown");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "220-node DAG graph renders server-side in < 1s (took {elapsed:?})"
+    );
 }
 
 // I-I
 #[tokio::test]
-async fn ui_dag_run_graph_unknown_run_falls_back() {
+async fn ui_dag_run_graph_unknown_run_returns_404_message() {
     let (url, _c) = setup_test_database_url().await;
     let app = build_dag957_ui_app(&url, true, vec![]);
 
     let ia = autumn_harvest::ActivityExecId::new();
+    // A genuinely-valid run of this DAG exists — the unknown `?run=` must NOT be
+    // silently substituted for it.
     let valid = dag957_seed_run(
         &url,
         "dag957_linear",
@@ -3981,15 +3992,150 @@ async fn ui_dag_run_graph_unknown_run_falls_back() {
     )
     .await;
 
-    // An unknown (shard-0) run id → graceful fallback to the first valid run,
-    // never a 500.
+    // Issue #957 AC7: an explicitly-provided-but-unknown run id renders the 404
+    // message, never a silent fallback to a different run.
     let bogus = ExecutionId::new_for_shard(ShardId::new(0));
     let (status, html) = fetch_html(&app, &format!("/dags/dag957_linear?run={bogus}")).await;
-    assert_eq!(status, StatusCode::OK, "unknown run must not 500: {html}");
-    // The page still renders (the run list at minimum); the valid run is present.
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown present `?run=` renders the 404 message: {html}"
+    );
+    // The 404 body must not silently render the valid run's graph in its place.
     assert!(
-        html.contains(&valid.to_string()) || html.contains("dag957_step_a"),
-        "falls back to a renderable view: {html}"
+        !html.contains("<svg"),
+        "no substitute graph is rendered for an unknown run: {html}"
+    );
+    assert!(
+        !html.contains(&valid.to_string()),
+        "the valid run is not silently substituted: {html}"
+    );
+
+    // Sanity: the same DAG page WITHOUT `?run=` still defaults to the latest run
+    // and renders normally (omitted-run behavior is preserved).
+    let (default_status, default_html) = fetch_html(&app, "/dags/dag957_linear").await;
+    assert_eq!(
+        default_status,
+        StatusCode::OK,
+        "omitted `?run=` still renders: {default_html}"
+    );
+    assert!(
+        default_html.contains("dag957_step_a"),
+        "omitted `?run=` defaults to the latest run's graph: {default_html}"
+    );
+}
+
+// I-J — a real `skipped` node (via the #482 `dag_skip:` marker path, exactly as
+// `build_run_graph`/#690 read it) renders distinctly from a `pending` node end-
+// to-end, exercising #957 AC6 ("pending vs skipped visually distinct") through
+// the whole `build_run_graph` → SVG pipeline rather than the helpers in isolation.
+#[tokio::test]
+async fn ui_dag_run_graph_skipped_node_distinct_from_pending() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    // Fan-out: a -> {b, c} -> d. a and b succeed; c is condition-skipped (#482);
+    // d is never reached (RUNNING) → pending. So c renders `skipped`, d `pending`.
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_completed(ib),
+        // A #482 data-dependent skip of node index 2 (dag957_step_c, upstream a=0).
+        autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:2".to_string(),
+            details: json!({ "task": "dag957_step_c", "upstreams": [0] }),
+        },
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_fanout", "graph-skip", events, "RUNNING").await;
+
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_fanout?run={exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+
+    // The node rect fill attribute is node-specific (the legend swatch uses a
+    // `style="background:…"` attribute, never `fill="…"`), so these prove the
+    // node itself carries the Skipped vs Pending status — distinct fills.
+    assert!(
+        html.contains("fill=\"#475569\""),
+        "the skipped node renders with the Skipped fill: {html}"
+    );
+    assert!(
+        html.contains("fill=\"#334155\""),
+        "the pending node renders with the (distinct) Pending fill: {html}"
+    );
+    // Icon-per-status carries the accessible, colour-independent cue on the node
+    // label text: `↳ dag957_step_c` (Skipped) vs `○ dag957_step_d` (Pending).
+    assert!(
+        html.contains("↳ dag957_step_c"),
+        "skipped node label carries the Skipped icon+name: {html}"
+    );
+    assert!(
+        html.contains("○ dag957_step_d"),
+        "pending node label carries the (distinct) Pending icon+name: {html}"
+    );
+}
+
+// I-K — index-alignment invariant (security review nit-1). `build_run_graph`
+// returns nodes in `def.tasks()` order, so `nodes[i]` ↔ `tasks()[i]` ↔ the index
+// used by `execution_levels()` (columns) and the SVG's `?node=i` anchors. A
+// future reorder in `build_run_graph` or the DAG topology would silently mis-map
+// a node's status/edges onto the wrong box; this pins the alignment the whole
+// render depends on. Pure — no DB (uses `DagBuilder` + `build_run_graph`, which
+// this integration test file already links).
+#[test]
+fn dag957_build_run_graph_nodes_align_with_task_indices() {
+    use autumn_harvest_plugin::dag_graph::build_run_graph;
+
+    // Fan-out: a -> {b, c} -> d — distinct upstream sets per node so a swap
+    // would be caught.
+    let mut builder = DagBuilder::new();
+    let a = builder.activity(dag957_step_a);
+    let b = builder.activity(dag957_step_b).upstream(&a);
+    let c = builder.activity(dag957_step_c).upstream(&a);
+    let _d = builder.activity(dag957_step_d).upstream(&b).upstream(&c);
+    let def = builder.build().expect("fanout dag builds");
+
+    let nodes = build_run_graph(&def, &[], "RUNNING");
+
+    assert_eq!(nodes.len(), def.tasks().len(), "exactly one node per task");
+    for (i, task) in def.tasks().iter().enumerate() {
+        assert_eq!(
+            nodes[i].node_name, task.activity_name,
+            "node[{i}] name aligns with tasks()[{i}]"
+        );
+        // `depends_on` names must resolve to this task's upstream indices —
+        // proving the drawn edge set corresponds to the same task position.
+        let mut expected: Vec<String> = task
+            .upstreams
+            .iter()
+            .map(|&u| def.tasks()[u].activity_name.clone())
+            .collect();
+        let mut actual = nodes[i].depends_on.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "node[{i}] depends_on aligns with its upstream task names"
+        );
+    }
+    // Every execution-level task index is a valid node index, covering all
+    // nodes exactly once (columns map to real nodes).
+    let mut covered: Vec<usize> = def
+        .execution_levels()
+        .iter()
+        .flat_map(|level| level.iter().copied())
+        .collect();
+    covered.sort_unstable();
+    assert_eq!(
+        covered,
+        (0..nodes.len()).collect::<Vec<_>>(),
+        "execution levels cover every node index exactly once"
     );
 }
 
@@ -4213,11 +4359,16 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     assert!(html.contains("gantt-pause-band"), "pause band present");
     assert!(html.contains("incident-4821"), "pause reason labelled");
     assert!(html.contains("oncall@corp"), "pause actor labelled");
-    // ND marker + runbook link.
+    // ND marker + runbook path (surfaced as code/text, not a clickable link —
+    // the runbook is a repo path, not a served URL).
     assert!(html.contains("gantt-nd-marker"), "ND marker present");
     assert!(
-        html.contains("nondeterminism-block"),
-        "runbook link present"
+        html.contains("docs/runbooks/nondeterminism-block.md"),
+        "runbook path surfaced: {html}"
+    );
+    assert!(
+        !html.contains("href=\"docs/runbooks/nondeterminism-block.md\""),
+        "runbook path is not a dead relative link: {html}"
     );
 }
 

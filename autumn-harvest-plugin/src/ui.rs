@@ -726,20 +726,38 @@ async fn dag_detail_ui(
         ..WorkflowFilters::default()
     };
     let runs = load_dag_runs_from_owning_shard(&api_state, &runtime, &dag_name, &filters).await?;
-    let requested_run = params
+    // Resolve which run to render. A `?run=` that is present-but-unknown is a
+    // 404 (issue #957 AC7: "unknown run ids render the 404 message"), NOT a
+    // silent fallback to a different run. An omitted `?run=` defaults to the
+    // latest run. The DB existence check only runs for a parseable run id that
+    // isn't already in the displayed page.
+    // A parseable run id counts as valid only when it names a run of *this* DAG
+    // (in the displayed page, or on the owning shard). An unparseable or unknown
+    // run id leaves this `None` — the resolution below maps a present-but-unknown
+    // `?run=` to a 404.
+    let parsed_run = params
         .run
         .as_deref()
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-    let requested_run_is_valid_for_dag = match requested_run {
-        Some(run_id) if runs.iter().any(|run| run.id == run_id) => true,
-        Some(run_id) => dag_run_exists_for_dag(&api_state, &dag_name, run_id).await?,
-        None => false,
+    let requested_valid_run = match parsed_run {
+        Some(run_id)
+            if runs.iter().any(|run| run.id == run_id)
+                || dag_run_exists_for_dag(&api_state, &dag_name, run_id).await? =>
+        {
+            Some(run_id)
+        }
+        _ => None,
     };
-    let selected_run = select_dag_run_id(
-        requested_run,
-        requested_run_is_valid_for_dag,
+    let Ok(selected_run) = resolve_dag_run_selection(
+        params.run.is_some(),
+        requested_valid_run,
         runs.as_slice().first().map(|r| r.id),
-    );
+    ) else {
+        let raw = params.run.as_deref().unwrap_or_default();
+        return Err(AutumnError::not_found_msg(format!(
+            "run '{raw}' is not a run of DAG '{dag_name}'"
+        )));
+    };
 
     // Issue #957: render the node topology straight from
     // `dag_graph::build_run_graph` — the same in-process derivation the #690 API
@@ -787,14 +805,31 @@ async fn dag_detail_ui(
     ))
 }
 
-fn select_dag_run_id(
-    requested_run: Option<uuid::Uuid>,
-    requested_run_is_valid_for_dag: bool,
+/// Sentinel: a `?run=` param was explicitly provided but names no run of this
+/// DAG. The caller renders the 404 message (issue #957 AC7), never a silent
+/// substitution of a different run.
+#[derive(Debug)]
+struct DagRunNotFound;
+
+/// Resolve which DAG run to render from the `?run=` param state:
+/// - **omitted** (`run_param_present == false`) → default to `fallback_run`
+///   (the latest run), or `None` when the DAG has no runs.
+/// - **present and valid** (`requested_valid_run == Some`) → that run.
+/// - **present but unknown** (`run_param_present && requested_valid_run.is_none()`)
+///   → `Err(DagRunNotFound)`, so an explicit unknown run id is never silently
+///   swapped for a different run.
+fn resolve_dag_run_selection(
+    run_param_present: bool,
+    requested_valid_run: Option<uuid::Uuid>,
     fallback_run: Option<uuid::Uuid>,
-) -> Option<uuid::Uuid> {
-    requested_run
-        .filter(|_| requested_run_is_valid_for_dag)
-        .or(fallback_run)
+) -> Result<Option<uuid::Uuid>, DagRunNotFound> {
+    if run_param_present {
+        // Present: must resolve to a valid run of this DAG, else render 404.
+        requested_valid_run.map_or(Err(DagRunNotFound), |run| Ok(Some(run)))
+    } else {
+        // Omitted: default to the latest run (or `None` when the DAG has none).
+        Ok(fallback_run)
+    }
 }
 
 fn dag_run_shard(router: &ShardRouter, dag_name: &str) -> ShardId {
@@ -935,7 +970,7 @@ async fn dag_retry_commit_ui(
 /// pre-encoded flash). Single-sources the relative depth so the confirm
 /// back-link and the commit redirect can never drift.
 fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> String {
-    let mut url = format!("../../../{}?run={}", url_encode(dag_name), run);
+    let mut url = format!("../../../{}?run={}", url_encode(dag_name), url_encode(run));
     if let Some(flash) = flash {
         url.push_str("&flash=");
         url.push_str(flash);
@@ -5387,7 +5422,10 @@ fn pause_band_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Marku
 
 /// The vertical ND-block marker (#603), sourced from the execution row's
 /// `nd_blocked_at`/`nd_block_reason`. `None` when the row is not ND-blocked.
-/// Links to the `nondeterminism-block` runbook.
+/// Surfaces the `nondeterminism-block` runbook *path* as inline SVG text — not a
+/// clickable link, since the runbook is a repo path, not a served URL (a relative
+/// `<a href>` here would 404 during ND-block triage). Matches the non-clickable
+/// `code { "docs/runbooks/safe-deploy.md" }` convention elsewhere in this file.
 fn nd_marker_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup> {
     let nd_at = exec.nd_blocked_at?;
     let x = axis.x_for(nd_at);
@@ -5398,10 +5436,8 @@ fn nd_marker_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup
     Some(html! {
         line class="gantt-nd-marker" x1=(dag_svg_coord(x)) y1="0"
              x2=(dag_svg_coord(x)) y2=(dag_svg_coord(axis.height)) {}
-        a href="docs/runbooks/nondeterminism-block.md" {
-            text class="gantt-nd-label" x=(dag_svg_coord(x + 4.0)) y="14" {
-                "⚠ ND-block: " (reason) " — runbook"
-            }
+        text class="gantt-nd-label" x=(dag_svg_coord(x + 4.0)) y="14" {
+            "⚠ ND-block: " (reason) " — see docs/runbooks/nondeterminism-block.md"
         }
     })
 }
@@ -5606,7 +5642,9 @@ fn render_timeline_gantt(
                 (format_timestamp(Some(nd_at))) ", "
                 (exec.nd_block_count) " occurrence(s)). "
                 @if let Some(reason) = exec.nd_block_reason.as_deref() { (reason) " · " }
-                a href="docs/runbooks/nondeterminism-block.md" { "nondeterminism-block runbook" }
+                // Runbook path as non-clickable code text (repo path, not a served
+                // URL) — matches the `docs/runbooks/safe-deploy.md` convention.
+                "See runbook " code { "docs/runbooks/nondeterminism-block.md" }
             }
         }
 
@@ -8882,19 +8920,38 @@ mod tests {
         let newest_listed = uuid::Uuid::from_u128(2);
 
         assert_eq!(
-            select_dag_run_id(Some(requested), true, Some(newest_listed)),
+            resolve_dag_run_selection(true, Some(requested), Some(newest_listed)).unwrap(),
             Some(requested)
         );
     }
 
     #[test]
-    fn dag_run_selection_falls_back_when_requested_run_is_not_for_dag() {
-        let requested = uuid::Uuid::from_u128(1);
+    fn dag_run_selection_unknown_requested_run_is_not_found_never_falls_back() {
+        // Issue #957 AC7: an explicitly-provided-but-unknown `?run=` renders the
+        // 404 message; it must NOT silently substitute the latest run.
         let newest_listed = uuid::Uuid::from_u128(2);
+        assert!(
+            resolve_dag_run_selection(true, None, Some(newest_listed)).is_err(),
+            "an unknown present `?run=` must be a not-found, never a fallback"
+        );
+    }
 
+    #[test]
+    fn dag_run_selection_omitted_run_defaults_to_latest() {
+        let newest_listed = uuid::Uuid::from_u128(2);
         assert_eq!(
-            select_dag_run_id(Some(requested), false, Some(newest_listed)),
-            Some(newest_listed)
+            resolve_dag_run_selection(false, None, Some(newest_listed)).unwrap(),
+            Some(newest_listed),
+            "an omitted `?run=` defaults to the latest run"
+        );
+    }
+
+    #[test]
+    fn dag_run_selection_omitted_run_with_no_runs_is_none() {
+        assert_eq!(
+            resolve_dag_run_selection(false, None, None).unwrap(),
+            None,
+            "an omitted `?run=` on a DAG with no runs selects nothing (no 404)"
         );
     }
 
@@ -9747,6 +9804,45 @@ mod tests {
         assert!(svg.contains("&lt;b&gt;evil"), "escaped form present");
     }
 
+    // P8b — accessibility: the per-status glyph is actually embedded in the
+    // rendered node SVG (not just returned by the helper), so dropping the icon
+    // from the render would fail this test. #957 AC: distinguishable without
+    // colour alone.
+    #[test]
+    fn render_dag_run_graph_svg_embeds_status_icon_glyphs() {
+        let nodes = vec![
+            dag_run_node("step_ok", DagNodeStatus::Succeeded, vec![]),
+            dag_run_node(
+                "step_bad",
+                DagNodeStatus::Failed,
+                vec!["step_ok".to_string()],
+            ),
+        ];
+        let svg = render_dag_run_graph_svg(
+            &nodes,
+            &[vec![0], vec![1]],
+            &[vec![], vec![0]],
+            None,
+            uuid::Uuid::nil(),
+        )
+        .into_string();
+        // The glyph rides on the node label text `(icon) " " (name)`.
+        assert!(
+            svg.contains(&format!(
+                "{} step_ok",
+                dag_node_status_icon(DagNodeStatus::Succeeded)
+            )),
+            "succeeded node label carries its icon glyph: {svg}"
+        );
+        assert!(
+            svg.contains(&format!(
+                "{} step_bad",
+                dag_node_status_icon(DagNodeStatus::Failed)
+            )),
+            "failed node label carries its icon glyph: {svg}"
+        );
+    }
+
     // P9
     #[test]
     fn render_dag_node_panel_failed_shows_error_and_retry_link() {
@@ -9819,6 +9915,14 @@ mod tests {
         assert_eq!(
             dag_detail_relative_url("graph_linear", "run-2", Some("done")),
             "../../../graph_linear?run=run-2&flash=done"
+        );
+        // A `run` value carrying reserved chars (e.g. a raw path segment that
+        // failed to parse as an exec id on the retry-commit Err branch) must be
+        // percent-encoded — mirroring `dag_name` — so it cannot alter the
+        // redirect URL's query/fragment semantics (security P2-1).
+        assert_eq!(
+            dag_detail_relative_url("graph_linear", "run#x&y?z", None),
+            "../../../graph_linear?run=run%23x%26y%3Fz"
         );
     }
 
@@ -10255,7 +10359,11 @@ mod tests {
         assert!(html.contains("expected ActivityScheduled"), "reason shown");
         assert!(
             html.contains("nondeterminism-block"),
-            "runbook link present: {html}"
+            "runbook path surfaced (as text, not a link): {html}"
+        );
+        assert!(
+            !html.contains("<a "),
+            "runbook path is not a clickable link (would 404 during triage): {html}"
         );
     }
 
@@ -10273,6 +10381,56 @@ mod tests {
             300.0,
         );
         assert!(nd_marker_markup(&exec, &axis).is_none());
+    }
+
+    // Q12c — operator-controlled `pause_reason`/`pause_actor`/`nd_block_reason`
+    // are assembled into SVG `<text>` bodies via `String::push_str`; prove maud
+    // still HTML-escapes them (a future refactor to `PreEscaped`/an attribute
+    // would regress this). Security review nit-4.
+    #[test]
+    fn pause_and_nd_reason_are_html_escaped_in_svg_text() {
+        let mut exec = stub_execution();
+        exec.started_at = tl_base();
+        exec.paused_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        exec.pause_reason = Some("<script>alert(1)</script>".to_string());
+        exec.pause_actor = Some("<b>bad</b>".to_string());
+        exec.nd_blocked_at = Some(tl_base() + chrono::Duration::milliseconds(2000));
+        exec.nd_block_reason = Some("<img src=x onerror=1>".to_string());
+        let axis = GanttAxis::new(
+            tl_base(),
+            tl_base() + chrono::Duration::milliseconds(6000),
+            220.0,
+            900.0,
+            300.0,
+        );
+
+        let pause = pause_band_markup(&exec, &axis)
+            .expect("band present")
+            .into_string();
+        assert!(
+            !pause.contains("<script>alert(1)</script>"),
+            "pause reason must be escaped, not injected into the SVG <text>: {pause}"
+        );
+        assert!(
+            !pause.contains("<b>bad</b>"),
+            "pause actor must be escaped: {pause}"
+        );
+        assert!(
+            pause.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "escaped pause reason present: {pause}"
+        );
+
+        let nd = nd_marker_markup(&exec, &axis)
+            .expect("marker present")
+            .into_string();
+        assert!(
+            !nd.contains("<img src=x onerror=1>"),
+            "nd reason must be escaped in the SVG <text>: {nd}"
+        );
+        assert!(
+            nd.contains("&lt;img src=x onerror=1&gt;"),
+            "escaped nd reason present: {nd}"
+        );
     }
 
     // Q13
