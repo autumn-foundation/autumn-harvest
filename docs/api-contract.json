@@ -5949,8 +5949,9 @@
       "method": "POST",
       "path": "/admin/build-routing/retire",
       "category": "build_routing",
-      "read_only": false,
-      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe.",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe. Reachability-only: reads build reachability and writes no state (RouteClass::ReadOnly); POST is used solely to carry a JSON request body.",
       "idempotency": "Idempotent: repeated calls reflect current reachability state and do not mutate data.",
       "params": [],
       "request_body": {

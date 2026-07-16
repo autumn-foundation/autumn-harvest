@@ -682,6 +682,61 @@ fn contract_read_only_classification_is_consistent() {
     }
 }
 
+/// The contract's `read_only` bool is a SECOND read/mutate source of truth
+/// alongside `autumn_harvest::audit::CLASSIFIED_ROUTES` (the class the #776
+/// read-only enforcement layer actually keys on). The existing
+/// `contract_read_only_classification_is_consistent` test only self-checks the
+/// JSON (a mutating-verb route must not be `read_only:true` unless
+/// `post_for_body_only`); it never compares the JSON flag to the class table,
+/// so the two could silently drift (as `POST /admin/build-routing/retire` did
+/// — `ReadOnly` in the class table but `read_only:false` in the contract).
+///
+/// This test cross-checks them directly: for every route present in BOTH
+/// sources, `contract.read_only` must equal "the class is `ReadOnly` or
+/// `PublicSafe`". (Routes present in only one source are covered by the other
+/// contract/classification exhaustiveness tests.)
+#[test]
+fn contract_read_only_flag_matches_classified_routes() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    let contract = load_contract();
+    // "METHOD path" -> is-read (ReadOnly | PublicSafe).
+    let class_is_read: HashMap<String, bool> = CLASSIFIED_ROUTES
+        .iter()
+        .map(|(template, class)| {
+            (
+                (*template).to_string(),
+                matches!(class, RouteClass::ReadOnly | RouteClass::PublicSafe),
+            )
+        })
+        .collect();
+
+    let mut mismatches = Vec::new();
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap_or("");
+        let path = route["path"].as_str().unwrap_or("");
+        let key = format!("{method} {path}");
+        // Only routes classified in CLASSIFIED_ROUTES (the intersection).
+        let Some(&is_read) = class_is_read.get(&key) else {
+            continue;
+        };
+        let contract_read_only = route["read_only"].as_bool().unwrap_or(false);
+        if contract_read_only != is_read {
+            mismatches.push(format!(
+                "{key}: contract read_only={contract_read_only} but CLASSIFIED_ROUTES \
+                 class-is-read={is_read}"
+            ));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "docs/api-contract.json `read_only` must match \
+         autumn_harvest::audit::CLASSIFIED_ROUTES (ReadOnly/PublicSafe => read_only:true, \
+         Mutating => read_only:false):\n{mismatches:#?}"
+    );
+}
+
 /// Every contract route that has a structured `success_response` (i.e. a `fields`
 /// array rather than `free_form: true`) must have its top-level response field
 /// names listed in `management_api_response_fields()`, and vice-versa.
