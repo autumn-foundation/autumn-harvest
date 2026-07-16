@@ -16,7 +16,7 @@ use crate::schema::{
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_payload_refs,
     harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,
-    harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_signals, harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions,
 };
 
@@ -1320,4 +1320,37 @@ pub struct NewExecutionSummary {
     /// Parent execution UUID when demoting a child workflow, else `None`
     /// (issue #752).
     pub parent_id: Option<Uuid>,
+}
+
+// ── WASM activity module storage (issue #965) ───────────────────────────────
+
+/// A content-addressed WASM activity module row from `harvest_wasm_modules`
+/// (issue #965).
+///
+/// Reads carry the full `wasm_bytes` blob; callers that only need to know which
+/// version is active should prefer the hash-only resolution helpers in
+/// [`crate::wasm_store`] to avoid loading the bytes.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_wasm_modules)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestWasmModule {
+    pub hash: String,
+    pub activity_name: String,
+    pub wasm_bytes: Vec<u8>,
+    pub active: bool,
+    pub published_at: DateTime<Utc>,
+}
+
+/// Insert struct for publishing a WASM activity module version (issue #965).
+///
+/// `published_at` is omitted so Postgres fills its `DEFAULT now()`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_wasm_modules)]
+pub struct NewHarvestWasmModule<'a> {
+    pub hash: &'a str,
+    pub activity_name: &'a str,
+    pub wasm_bytes: &'a [u8],
+    pub active: bool,
 }

@@ -818,6 +818,22 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Content-addressed storage for sandboxed WebAssembly activity modules
+    /// (issue #965). Composite primary key `(hash, activity_name)` so identical
+    /// bytes can bind to two activity names independently; a partial unique
+    /// index (`WHERE active`) enforces at most one active version per name.
+    harvest_wasm_modules (hash, activity_name) {
+        hash          -> Text,
+        activity_name -> Text,
+        wasm_bytes    -> Bytea,
+        active        -> Bool,
+        published_at  -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -848,4 +864,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_deliveries,
     harvest_sessions,
     harvest_execution_summaries,
+    harvest_wasm_modules,
 );
