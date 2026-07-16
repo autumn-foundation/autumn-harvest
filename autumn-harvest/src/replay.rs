@@ -521,6 +521,24 @@ struct StashedExternalCancel {
     terminal: Option<StashedCancelTerminal>,
 }
 
+/// The frozen resolution recorded on a `LocalActivityScheduled` event
+/// (issue #620, AC8; Codex P2). Returned by
+/// [`HistoryMatcher::recorded_local_activity_resolution`].
+///
+/// `Default` yields the "unresolved legacy" shape (`resolved == false`, both
+/// frozen fields `None`) so a pre-#620 event or an absent `activity_id` falls
+/// back to live re-derivation on crash recovery.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LocalActivityResolution {
+    /// `true` for a #620+ event whose frozen fields below are authoritative
+    /// (even when `None`); `false` for a legacy event → re-derive live.
+    pub(crate) resolved: bool,
+    /// The frozen fully-resolved retry policy, or `None`.
+    pub(crate) retry_policy: Option<crate::policy::RetryPolicy>,
+    /// The frozen fully-resolved `start_to_close` in milliseconds, or `None`.
+    pub(crate) start_to_close_millis: Option<u64>,
+}
+
 /// Walks through recorded workflow events during replay, matching
 /// commands against what was previously recorded.
 ///
@@ -4999,30 +5017,43 @@ impl HistoryMatcher {
         }
     }
 
-    /// The retry policy a local activity was frozen with at first-schedule time
-    /// (issue #620, AC8). Read-only, cursor-independent: scans recorded history
-    /// for the `LocalActivityScheduled` event carrying `activity_id` and clones
-    /// its recorded `retry_policy`.
+    /// The frozen resolution (retry policy + `start_to_close`) a local activity
+    /// was scheduled with at first-schedule time (issue #620, AC8; Codex P2).
+    /// Read-only, cursor-independent: scans recorded history for the
+    /// `LocalActivityScheduled` event carrying `activity_id` and clones its
+    /// three additive fields in one pass.
     ///
-    /// Returns `None` for a pre-#620 event (the field is absent → deserializes
-    /// to `None`) or when no retry policy was resolved at schedule time. The
-    /// crash-recovery path in
+    /// `resolved` is the disambiguation marker: `true` for a #620+ event whose
+    /// frozen `retry_policy`/`start_to_close_millis` are authoritative on
+    /// recovery even when `None` ("explicitly resolved to no floor"); `false`
+    /// for a pre-#620 legacy event (all three fields absent → the marker
+    /// deserializes to `false`), which the crash-recovery path in
     /// [`WorkflowContext::execute_local_activity_raw`](crate::context::WorkflowContext::execute_local_activity_raw)
-    /// consults this so a builder-default change in the crash-recovery window
-    /// cannot shrink an in-flight local activity's retry budget.
+    /// treats as "re-derive from the live defaults" for backward compatibility.
+    /// A missing `activity_id` (no matching scheduled event) reports the same
+    /// unresolved default.
     #[must_use]
-    pub(crate) fn recorded_local_activity_retry(
+    pub(crate) fn recorded_local_activity_resolution(
         &self,
         activity_id: ActivityExecId,
-    ) -> Option<crate::policy::RetryPolicy> {
-        self.events.iter().find_map(|ev| match ev {
-            WorkflowEvent::LocalActivityScheduled {
-                activity_id: recorded_id,
-                retry_policy,
-                ..
-            } if *recorded_id == activity_id => retry_policy.clone(),
-            _ => None,
-        })
+    ) -> LocalActivityResolution {
+        self.events
+            .iter()
+            .find_map(|ev| match ev {
+                WorkflowEvent::LocalActivityScheduled {
+                    activity_id: recorded_id,
+                    resolved,
+                    retry_policy,
+                    start_to_close_millis,
+                    ..
+                } if *recorded_id == activity_id => Some(LocalActivityResolution {
+                    resolved: *resolved,
+                    retry_policy: retry_policy.clone(),
+                    start_to_close_millis: *start_to_close_millis,
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// Versioning mechanism for safe workflow code changes.
@@ -8614,6 +8645,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: id,
@@ -8640,6 +8673,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8678,6 +8713,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8714,6 +8751,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8770,6 +8809,8 @@ mod tests {
             name: "other_activity".into(),
             input: Value::Null,
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         }];
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
@@ -8793,6 +8834,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id: id,
@@ -8834,6 +8877,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: local_id,
@@ -8987,6 +9032,8 @@ mod tests {
                 name: "format_data".into(),
                 input: Value::Null,
                 retry_policy: None,
+                resolved: false,
+                start_to_close_millis: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,

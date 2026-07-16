@@ -3748,6 +3748,7 @@ impl WorkflowTestEnv {
                 name,
                 input: act_input,
                 retry_policy,
+                start_to_close_millis,
                 ..
             } => {
                 let call_num = Self::next_call_count(call_counts, &name);
@@ -3756,10 +3757,14 @@ impl WorkflowTestEnv {
                     activity_id,
                     name: name.clone(),
                     input: act_input,
-                    // Issue #620: mirror the worker anchor — record the resolved
-                    // retry policy the command carried so harness-based replay
-                    // fixtures observe the same frozen budget the worker writes.
+                    // Issue #620 (Codex P2): mirror the worker anchor — this is a
+                    // #620+ schedule, so record the resolution marker plus the
+                    // resolved retry/STC the command carried, so harness-based
+                    // replay fixtures observe the same frozen budget/timeout the
+                    // worker writes.
+                    resolved: true,
                     retry_policy,
+                    start_to_close_millis,
                 });
                 Self::push_local_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)

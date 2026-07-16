@@ -1619,7 +1619,10 @@ struct LocalActivityRun {
     activity_id: crate::types::ActivityExecId,
     name: String,
     input: serde_json::Value,
-    start_to_close_secs: Option<u64>,
+    /// Resolved per-attempt `start_to_close` in **milliseconds** (issue #620,
+    /// Codex P2 — millis, not seconds, so a subsecond floor is never truncated
+    /// to `0`). `None` defers to the worker cap.
+    start_to_close_millis: Option<u64>,
     retry_policy: Option<crate::policy::RetryPolicy>,
     /// `true` when `LocalActivityScheduled` is already in the durable history —
     /// the worker crashed after appending it but before recording a terminal event.
@@ -1713,7 +1716,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
                 activity_id,
                 name,
                 input,
-                start_to_close_secs,
+                start_to_close_millis,
                 retry_policy,
                 result_tx,
                 already_scheduled,
@@ -1725,7 +1728,7 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
                     activity_id,
                     name,
                     input,
-                    start_to_close_secs,
+                    start_to_close_millis,
                     retry_policy,
                     already_scheduled,
                     failed_attempts,
@@ -2248,9 +2251,14 @@ async fn run_local_activity_inline(
     }
     let history_event_hard_cap = registry.history_policy().event_hard_cap();
 
+    // Per-attempt timeout in **milliseconds** (issue #620, Codex P2). A
+    // subsecond floor (`start_to_close_millis = Some(500)`) must NOT truncate to
+    // `Duration::from_secs(0)` and instantly time out — the command now carries
+    // millis, so `Duration::from_millis(500)` is honored, then clamped by the
+    // worker cap.
     let per_attempt_timeout = run
-        .start_to_close_secs
-        .map_or(max_start_to_close, Duration::from_secs)
+        .start_to_close_millis
+        .map_or(max_start_to_close, Duration::from_millis)
         .min(max_start_to_close);
 
     let max_attempts = run.retry_policy.as_ref().map_or(1, |p| p.max_attempts);
@@ -2263,12 +2271,20 @@ async fn run_local_activity_inline(
             activity_id: run.activity_id,
             name: run.name.clone(),
             input: run.input.clone(),
-            // Issue #620 (AC8): freeze the fully-resolved retry policy (already
-            // call → activity → builder resolved in `execute_local_activity_raw`)
-            // so a crash-recovery replay keeps this original budget even if the
-            // builder-level default changed in the crash window. `None` when no
-            // retry policy was resolved (pre-#620 behaviour preserved).
+            // Issue #620 (AC8; Codex P2): the resolution marker. Every #620+
+            // schedule writes `true` at this first-schedule anchor so the
+            // crash-recovery path treats the frozen retry/STC below as
+            // authoritative (even when `None`), distinct from a pre-#620 legacy
+            // event (marker absent → `false` → re-derive live).
+            resolved: true,
+            // Freeze the fully-resolved retry policy AND start_to_close (already
+            // call → activity → builder resolved in
+            // `execute_local_activity_raw_resolved`) so a crash-recovery replay
+            // keeps this ORIGINAL budget/timeout even if the builder-level
+            // default changed in the crash window. `None` = "explicitly resolved
+            // to no floor" — still frozen, since the marker is `true`.
             retry_policy: run.retry_policy.clone(),
+            start_to_close_millis: run.start_to_close_millis,
         });
     }
     prefix_events.extend(post_schedule_events);
@@ -17284,7 +17300,7 @@ mod tests {
                 activity_id: crate::types::ActivityExecId::new(),
                 name: "format_data".to_string(),
                 input: serde_json::Value::Null,
-                start_to_close_secs: None,
+                start_to_close_millis: None,
                 retry_policy: None,
                 result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
                 already_scheduled: false,
@@ -17333,7 +17349,7 @@ mod tests {
                 activity_id: crate::types::ActivityExecId::new(),
                 name: "format_data".to_string(),
                 input: serde_json::Value::Null,
-                start_to_close_secs: None,
+                start_to_close_millis: None,
                 retry_policy: None,
                 result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
                 already_scheduled: false,

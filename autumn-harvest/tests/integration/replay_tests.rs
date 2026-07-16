@@ -412,6 +412,8 @@ async fn local_activity_completes_from_full_history() {
             name: "format_data".into(),
             input: Value::Null,
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: local_id,
@@ -493,6 +495,8 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             name: "step_1".into(),
             input: Value::Null,
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id1,
@@ -503,6 +507,8 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             name: "step_2".into(),
             input: out1.clone(),
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id2,
@@ -542,6 +548,8 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             name: "step_1".into(),
             input: Value::Null,
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         },
         WorkflowEvent::LocalActivityFailed {
             activity_id: id1,
@@ -562,6 +570,8 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             name: "step_2".into(),
             input: final_out.clone(),
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         },
         WorkflowEvent::LocalActivityCompleted {
             activity_id: id2,
@@ -598,6 +608,8 @@ async fn local_activity_exhausted_retries_fails_the_workflow() {
             name: "step_1".into(),
             input: Value::Null,
             retry_policy: None,
+            resolved: false,
+            start_to_close_millis: None,
         },
         WorkflowEvent::LocalActivityFailed {
             activity_id: id,

@@ -175,6 +175,27 @@ fn wf_slower_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_
     })
 }
 
+/// Local activity that sleeps ~50ms then echoes — well under a 500ms subsecond
+/// builder-default STC, so it MUST complete. Without the millis fix (issue #620,
+/// Codex P2) the 500ms builder default truncates to `Duration::from_secs(0)` and
+/// even this 50ms activity is instantly timed out.
+fn fast_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(input)
+    })
+}
+
+/// Workflow: run the ~50ms local activity with NO call-site STC override, so the
+/// subsecond builder-default STC governs.
+fn wf_fast_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("fast_local", input, None, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Workflow: schedule one regular activity WITH a call-site `start_to_close`
 /// override (5s), no retry override. Used to prove the call-site STC wins over
 /// the builder-default STC on the regular dispatch path.
@@ -360,18 +381,25 @@ async fn seed_workflow(
 }
 
 /// Seed a RUNNING execution whose local activity is MID-RETRY: its history
-/// already carries `LocalActivityScheduled` (frozen with `recorded_retry`) and
-/// one `LocalActivityFailed(attempt=1)`, and a workflow task is enqueued so a
+/// already carries `LocalActivityScheduled` (frozen with `recorded_resolved` /
+/// `recorded_retry` / `recorded_stc_millis`) and one
+/// `LocalActivityFailed(attempt=1)`, and a workflow task is enqueued so a
 /// worker resumes it. This reproduces the crash-recovery window for AC8: the
-/// original retry budget is frozen in history and must survive a later change to
-/// the builder-level default.
+/// original retry budget/timeout is frozen in history and must survive a later
+/// change to the builder-level default.
+///
+/// `recorded_resolved` is the #620 disambiguation marker (Codex P2): `true`
+/// models a #620+ event whose frozen values are authoritative (even `None`);
+/// `false` models a pre-#620 legacy event that falls back to live re-derivation.
 async fn seed_local_activity_in_progress(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
     activity_name: &str,
     input: serde_json::Value,
     queue: &str,
+    recorded_resolved: bool,
     recorded_retry: Option<RetryPolicy>,
+    recorded_stc_millis: Option<u64>,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
     let row = NewWorkflowExecution {
@@ -427,7 +455,9 @@ async fn seed_local_activity_in_progress(
                 activity_id,
                 name: activity_name.to_string(),
                 input: input.clone(),
+                resolved: recorded_resolved,
                 retry_policy: recorded_retry,
+                start_to_close_millis: recorded_stc_millis,
             },
             WorkflowEvent::LocalActivityFailed {
                 activity_id,
@@ -1170,14 +1200,17 @@ async fn local_activity_mid_retry_keeps_original_budget_across_default_change() 
     let mut conn = connect(&url).await;
 
     // Freeze the ORIGINAL builder default (fixed(2)) into the scheduled event,
-    // exactly as the worker would have at first schedule.
+    // exactly as the worker would have at first schedule. A #620+ event
+    // (resolved = true) → the frozen fixed(2) is authoritative.
     let exec_id = seed_local_activity_in_progress(
         &mut conn,
         "wf_failing_local",
         "failing_local",
         serde_json::json!({"v": 1}),
         queue,
+        true,
         Some(RetryPolicy::fixed(2, Duration::from_millis(10))),
+        None,
     )
     .await;
 
@@ -1232,13 +1265,16 @@ async fn local_activity_mid_retry_without_recorded_budget_uses_current_default()
     let queue = "q620-ac8-legacy";
     let mut conn = connect(&url).await;
 
-    // Pre-#620 event: no frozen retry_policy.
+    // Pre-#620 legacy event: the resolution marker is absent (resolved =
+    // false) and no frozen retry_policy → recovery re-derives the live default.
     let exec_id = seed_local_activity_in_progress(
         &mut conn,
         "wf_failing_local",
         "failing_local",
         serde_json::json!({"v": 1}),
         queue,
+        false,
+        None,
         None,
     )
     .await;
@@ -1273,6 +1309,206 @@ async fn local_activity_mid_retry_without_recorded_budget_uses_current_default()
         3,
         "with NO frozen budget (pre-#620 event), recovery re-derives the current \
          builder default (fixed(3)) — 1 pre-crash failure + 2 more = 3 total"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2 (AC8 — Codex P2, the resolution-marker refinement). A #620+ event that
+// resolved to NO floor (retry = None) is serialized identically to a genuine
+// pre-#620 legacy event (field absent → None). The `resolved` marker
+// disambiguates them: a #620+ event with `resolved = true` must keep its FROZEN
+// "no floor" (implicit 1 attempt) on recovery, NOT fall through to a builder
+// default that was ADDED FROM NOTHING after the activity was scheduled.
+//
+// Scenario: original schedule had NO retry floor of any kind (resolved = true,
+// retry = None → implicit 1 attempt). History: LocalActivityScheduled{resolved,
+// retry=None} + Failed(1). The operator then ADDS a builder default fixed(3) and
+// the worker resumes. With the marker, the frozen implicit 1 attempt governs →
+// `failed_attempts(1) >= max_attempts(1)` → exhausts immediately, NEVER running
+// attempt 2 → exactly 1 LocalActivityFailed. WITHOUT the marker, the added
+// fixed(3) would wrongly apply and run 3 total (the AC8-violating bug).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_resolved_to_no_floor_ignores_a_later_added_default() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-ac8-nofloor";
+    let mut conn = connect(&url).await;
+
+    // A #620+ event that resolved to NO retry AND NO STC floor: resolved = true,
+    // retry = None, stc = None — exactly what the worker writes when there is no
+    // call-site / activity-level / builder default at first schedule.
+    let exec_id = seed_local_activity_in_progress(
+        &mut conn,
+        "wf_failing_local",
+        "failing_local",
+        serde_json::json!({"v": 1}),
+        queue,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    // The operator has since ADDED a builder default (retry fixed(3) AND a 30s
+    // STC) that did NOT exist when the activity was scheduled. The frozen "no
+    // floor" must win — the added default must NOT leak onto this in-flight run.
+    let registry = build_registry(
+        vec![wf_info("wf_failing_local", wf_failing_local)],
+        vec![act_info("failing_local", failing_local, true, None, None)],
+        Some(RetryPolicy::fixed(3, Duration::from_millis(10))),
+        Some(Duration::from_secs(30)),
+    );
+    let worker = build_worker(
+        "w620-ac8-nofloor",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let history = load_history(&url, exec_id).await;
+    assert_eq!(
+        count_local_failed(&history),
+        1,
+        "a #620+ event that resolved to NO floor (resolved = true, retry = None) \
+         must keep its FROZEN implicit 1 attempt on recovery — the builder \
+         default fixed(3) ADDED after scheduling must NOT apply. Exactly 1 \
+         LocalActivityFailed (the pre-crash attempt); attempt 2 must never run. \
+         A count of 3 would mean the marker was ignored and the added default \
+         wrongly re-derived (the AC8-violating bug)."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 (Codex P2) — a SUBSECOND builder-default start_to_close must NOT
+// truncate to 0 and instantly time out every local activity. The command now
+// carries millis (not seconds), so `Duration::from_millis(500)` is honored
+// rather than `Duration::from_secs(0)`.
+//
+// Discriminating pair under a 500ms subsecond builder default (worker cap 60s):
+//   * a ~50ms activity COMPLETES — WITHOUT the fix, 500ms.as_secs() = 0 →
+//     from_secs(0) → even 50ms is instantly timed out → the workflow FAILS;
+//   * a ~2s activity TIMES OUT — proving the 500ms STC is actually enforced
+//     (not silently ignored / defaulting to the 60s cap).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_subsecond_builder_default_stc_is_not_truncated_to_zero() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-subsecond-fast";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_fast_local",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // Builder default STC = 500ms (SUBSECOND — the bug trigger), worker cap 60s.
+    // No retry, no activity-level STC, no call-site STC — the subsecond builder
+    // default is the sole source. The ~50ms activity must COMPLETE.
+    let registry = build_registry(
+        vec![wf_info("wf_fast_local", wf_fast_local)],
+        vec![act_info("fast_local", fast_local, true, None, None)],
+        None,
+        Some(Duration::from_millis(500)),
+    );
+    let worker = build_worker(
+        "w620-subsecond-fast",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let execution = run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        execution.state, "COMPLETED",
+        "a ~50ms local activity under a 500ms SUBSECOND builder-default STC must \
+         COMPLETE. Without the millis fix, 500ms truncates to Duration::from_secs(0) \
+         and even a 50ms activity is instantly timed out → FAILED."
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::LocalActivityFailed { .. })),
+        "a completed subsecond-STC local activity must record NO LocalActivityFailed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_activity_subsecond_builder_default_stc_still_enforces_the_deadline() {
+    let (url, _container) = setup_db().await;
+    let queue = "q620-subsecond-slow";
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(
+        &mut conn,
+        "wf_slower_local",
+        serde_json::json!({"v": 1}),
+        queue,
+    )
+    .await;
+
+    // Builder default STC = 500ms (subsecond), worker cap 60s. The ~2s activity
+    // must TIME OUT — the 500ms floor is actually enforced, not silently ignored.
+    let registry = build_registry(
+        vec![wf_info("wf_slower_local", wf_slower_local)],
+        vec![act_info("slower_local", slower_local, true, None, None)],
+        None,
+        Some(Duration::from_millis(500)),
+    );
+    let worker = build_worker(
+        "w620-subsecond-slow",
+        queue,
+        Arc::clone(&registry),
+        Duration::from_secs(60),
+    );
+    let pool = build_pool(&url);
+
+    let execution = run_to_state(
+        &url,
+        &pool,
+        worker,
+        exec_id,
+        "FAILED",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        execution.state, "FAILED",
+        "a ~2s local activity under a 500ms subsecond builder-default STC must \
+         TIME OUT — proving the subsecond floor is enforced, not defaulting to \
+         the 60s worker cap"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::LocalActivityFailed { .. })),
+        "the STC-killed subsecond local activity must record a LocalActivityFailed"
     );
 }
 

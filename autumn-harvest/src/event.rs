@@ -323,20 +323,48 @@ pub enum WorkflowEvent {
         name: String,
         /// JSON input for the activity.
         input: serde_json::Value,
+        /// Disambiguation marker distinguishing a #620+ event whose defaults were
+        /// fully resolved at first schedule from a genuine pre-#620 legacy event
+        /// (issue #620, Codex P2). BOTH `retry_policy` and `start_to_close_millis`
+        /// below serialize as absent when they resolved to "no floor", so an
+        /// absent value alone cannot tell a resolved-to-nothing #620+ event apart
+        /// from a legacy event — the former MUST stay frozen (implicit 1-attempt /
+        /// no STC floor) on recovery, the latter MUST fall back to live
+        /// re-derivation for backward compat. This one marker covers both frozen
+        /// fields: every #620+ schedule writes it `true` at the same first-schedule
+        /// anchor; a pre-#620 event has the field absent → deserializes to `false`.
+        #[serde(default)]
+        resolved: bool,
         /// The fully-resolved retry policy this local activity was scheduled
         /// with (call-site → activity default → builder default; issue #620).
         ///
-        /// Additive/optional: pre-#620 events deserialize to `None` and fall
-        /// back to today's live re-derivation. Populated only when a retry
-        /// policy was resolved at first-schedule time. Frozen here so a local
-        /// activity mid-retry across a worker crash keeps its ORIGINAL retry
-        /// budget even if the builder-level default (`WorkerConfig::
-        /// with_default_activity_retry_policy`) is changed in the crash-recovery
-        /// window (AC8: an in-flight execution is unaffected by later default
-        /// changes). Recorded on the live frontier at first schedule; read on
-        /// crash-recovery replay — the established side-effect pattern.
+        /// Additive/optional: pre-#620 events deserialize to `None`. On a #620+
+        /// event (`resolved == true`), a recorded `None` means "explicitly
+        /// resolved to no retry floor" and MUST stay frozen (implicit 1 attempt);
+        /// a legacy event (`resolved == false`) with `None` falls back to today's
+        /// live re-derivation. Frozen here so a local activity mid-retry across a
+        /// worker crash keeps its ORIGINAL retry budget even if the builder-level
+        /// default (`WorkerConfig::with_default_activity_retry_policy`) is changed
+        /// in the crash-recovery window (AC8: an in-flight execution is unaffected
+        /// by later default changes). Recorded on the live frontier at first
+        /// schedule; read on crash-recovery replay — the established side-effect
+        /// pattern.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_policy: Option<crate::policy::RetryPolicy>,
+        /// The fully-resolved `start_to_close` this local activity was scheduled
+        /// with, in **milliseconds** (call-site → activity default → builder
+        /// default; issue #620, Codex P2). Millis (not seconds) to preserve
+        /// subsecond precision — the local per-attempt timeout is
+        /// `Duration::from_millis(this).min(cap)`, so a seconds field would
+        /// truncate a subsecond floor to `0` and instantly time out every attempt.
+        ///
+        /// Additive/optional, same freeze semantics as `retry_policy`: on a #620+
+        /// event (`resolved == true`) a recorded value — `Some` OR `None` — is
+        /// authoritative on recovery (`None` = "explicitly resolved to no STC
+        /// floor", frozen); a legacy event (`resolved == false`) falls back to
+        /// live re-derivation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_to_close_millis: Option<u64>,
     },
     /// A local activity finished executing successfully.
     LocalActivityCompleted {
@@ -1146,15 +1174,66 @@ mod tests {
 
     #[test]
     fn local_activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
+        // Issue #620 (Codex P2): a #620+ event carrying the resolution marker
+        // plus frozen retry/STC must round-trip all three fields verbatim.
         let event = WorkflowEvent::LocalActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "format_data".into(),
             input: serde_json::json!({"x": 1}),
-            retry_policy: None,
+            resolved: true,
+            retry_policy: Some(crate::policy::RetryPolicy::fixed(
+                4,
+                std::time::Duration::from_millis(10),
+            )),
+            start_to_close_millis: Some(500),
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(back, WorkflowEvent::LocalActivityScheduled { .. }));
+        match back {
+            WorkflowEvent::LocalActivityScheduled {
+                resolved,
+                retry_policy,
+                start_to_close_millis,
+                ..
+            } => {
+                assert!(resolved, "resolution marker must round-trip as true");
+                assert_eq!(
+                    retry_policy.map(|p| p.max_attempts),
+                    Some(4),
+                    "frozen retry policy must round-trip"
+                );
+                assert_eq!(
+                    start_to_close_millis,
+                    Some(500),
+                    "frozen STC millis must round-trip"
+                );
+            }
+            other => panic!("expected LocalActivityScheduled, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pre_620_local_activity_scheduled_deserializes_as_unresolved() -> Result<(), serde_json::Error>
+    {
+        // A pre-#620 stored event has none of the three additive fields. It must
+        // deserialize with `resolved = false` (legacy → re-derive on recovery)
+        // and both frozen fields `None`, preserving the append-only invariant.
+        let legacy = r#"{"type":"LocalActivityScheduled","data":{"activity_id":"00000000-0000-0000-0000-000000000001","name":"format_data","input":{"x":1}}}"#;
+        let back: WorkflowEvent = serde_json::from_str(legacy)?;
+        match back {
+            WorkflowEvent::LocalActivityScheduled {
+                resolved,
+                retry_policy,
+                start_to_close_millis,
+                ..
+            } => {
+                assert!(!resolved, "a legacy event must deserialize as unresolved");
+                assert!(retry_policy.is_none());
+                assert!(start_to_close_millis.is_none());
+            }
+            other => panic!("expected LocalActivityScheduled, got {other:?}"),
+        }
         Ok(())
     }
 
@@ -1317,7 +1396,9 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 name: "format_data".into(),
                 input: serde_json::Value::Null,
+                resolved: false,
                 retry_policy: None,
+                start_to_close_millis: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: ActivityExecId::new(),

@@ -1197,6 +1197,8 @@ mod tests {
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
                     retry_policy: None,
+                    resolved: false,
+                    start_to_close_millis: None,
                 },
             ),
             row(
@@ -1247,6 +1249,8 @@ mod tests {
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
                     retry_policy: None,
+                    resolved: false,
+                    start_to_close_millis: None,
                 },
             ),
             row(
@@ -1387,6 +1391,8 @@ mod tests {
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
                     retry_policy: None,
+                    resolved: false,
+                    start_to_close_millis: None,
                 },
             ),
             row(
@@ -1420,6 +1426,8 @@ mod tests {
                     name: "checksum".into(),
                     input: serde_json::Value::Null,
                     retry_policy: None,
+                    resolved: false,
+                    start_to_close_millis: None,
                 },
             ),
             row(
