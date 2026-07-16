@@ -3767,9 +3767,15 @@ async fn persist_workflow_failure(
                         // predecessor's completion-callback targets (#605)
                         // rather than silently dropping them.
                         completion_callbacks: exec_ref.completion_callbacks.clone(),
-                        start_source: crate::types::StartSource::Api,
-                        start_source_ref: None,
-                        started_by: None,
+                        // Workflow-level retry (issue #523/#740) is the same
+                        // logical run trying again — inherit the predecessor's
+                        // start provenance rather than re-attributing it as a
+                        // fresh `api` start.
+                        start_source: crate::types::StartSource::from_str(
+                            exec_ref.start_source.as_deref().unwrap_or("unknown"),
+                        ),
+                        start_source_ref: exec_ref.start_source_ref.as_deref(),
+                        started_by: exec_ref.started_by.as_deref(),
                     };
 
                     match crate::execution::start_or_load_workflow_execution_collect(
@@ -5322,6 +5328,9 @@ async fn persist_all_started_child_workflows(
                 .await?;
 
                 // Insert rows and enqueue tasks for new children.
+                // Provenance ref for every child in this fan-out is the parent
+                // execution id (issue #740); compute it once outside the loop.
+                let parent_exec_id_str = parent_exec_id.to_string();
                 for child in &new_children {
                     let child_workflow_id = child.child_id.to_string();
                     let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
@@ -5381,8 +5390,8 @@ async fn persist_all_started_child_workflows(
                         // targets, resolved at their own terminal transition
                         // (issue #605) — no per-execution override here.
                         completion_callbacks: None,
-                        start_source: Some("api"),
-                        start_source_ref: None,
+                        start_source: Some(crate::types::StartSource::Child.as_str()),
+                        start_source_ref: Some(parent_exec_id_str.as_str()),
                         started_by: None,
                     };
                     let child_started_event = WorkflowEvent::WorkflowStarted {
@@ -5502,6 +5511,8 @@ async fn insert_awaited_child_execution(
     let queue_name = parent_execution.queue_name.clone();
 
     let child_workflow_id = child.child_id.to_string();
+    // Provenance ref for the child is the parent execution id (issue #740).
+    let parent_exec_id_str = parent_exec_id.to_string();
     let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
     let (owner, runbook_url, severity, child_sla, child_execution_timeout, child_retry_policy) =
         child_wf_info.map_or((None, None, None, None, None, None), |w| {
@@ -5551,8 +5562,8 @@ async fn insert_awaited_child_execution(
         // Children get only builder-wide default callback targets, resolved at
         // their own terminal transition (issue #605) — no per-execution override.
         completion_callbacks: None,
-        start_source: Some("api"),
-        start_source_ref: None,
+        start_source: Some(crate::types::StartSource::Child.as_str()),
+        start_source_ref: Some(parent_exec_id_str.as_str()),
         started_by: None,
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
@@ -6531,6 +6542,8 @@ async fn create_detached_child_executions(
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
 ) -> HarvestResult<()> {
+    // Provenance ref for every detached child is the parent execution id (#740).
+    let parent_exec_id_str = parent_execution.id.to_string();
     for cmd in commands {
         let WorkflowCommand::SpawnDetachedChildWorkflow {
             child_id,
@@ -6616,8 +6629,8 @@ async fn create_detached_child_executions(
             // Detached children get only builder-wide default callback
             // targets (issue #605) — no per-execution override here.
             completion_callbacks: None,
-            start_source: Some("api"),
-            start_source_ref: None,
+            start_source: Some(crate::types::StartSource::Child.as_str()),
+            start_source_ref: Some(parent_exec_id_str.as_str()),
             started_by: None,
         };
 
@@ -9336,6 +9349,8 @@ async fn persist_workflow_continue_as_new(
     let new_exec_id = ExecutionId::new_for_shard(persistence.exec_id.shard());
     let task_id = persistence.task.id;
     let exec_id = persistence.exec_id;
+    // Provenance ref for the successor is the predecessor execution id (#740).
+    let predecessor_exec_id_str = exec_id.to_string();
     let next_event_id = persistence.next_event_id;
     let worker_id = persistence.worker_id;
     let started_event = WorkflowEvent::WorkflowStarted {
@@ -9403,8 +9418,11 @@ async fn persist_workflow_continue_as_new(
         // itself a successor, else the predecessor's own id.
         continued_from_exec_id: Some(exec_id.as_uuid()),
         first_exec_id: Some(execution.first_exec_id.unwrap_or(execution.id)),
-        start_source: Some("api"),
-        start_source_ref: None,
+        // A continue-as-new successor has its OWN provenance — it is never
+        // re-attributed to the predecessor's source (issue #740 AC3). Ref is
+        // the predecessor execution id.
+        start_source: Some(crate::types::StartSource::ContinueAsNew.as_str()),
+        start_source_ref: Some(predecessor_exec_id_str.as_str()),
         started_by: None,
     };
     let mut enqueue =

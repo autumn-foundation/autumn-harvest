@@ -6417,6 +6417,8 @@ async fn execute_schedule_trigger_ui(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .or(wf_default_retry_policy);
 
+    // Provenance ref for a manual UI schedule trigger is the schedule id (#740).
+    let ui_schedule_id_str = row.id.to_string();
     let result = start_or_load_workflow_execution_with_metrics(
         conn,
         StartWorkflowParams {
@@ -6457,9 +6459,11 @@ async fn execute_schedule_trigger_ui(
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
             completion_callbacks: None,
-            start_source: autumn_harvest::StartSource::Api,
-            start_source_ref: None,
-            started_by: None,
+            // Manual UI schedule trigger (issue #740): provenance is `schedule`,
+            // referencing the schedule id, attributed to the UI operator.
+            start_source: autumn_harvest::StartSource::Schedule,
+            start_source_ref: Some(ui_schedule_id_str.as_str()),
+            started_by: Some("ui"),
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
         None,

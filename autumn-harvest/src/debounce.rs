@@ -197,6 +197,19 @@ pub struct DebounceStartOptions {
     /// Dispatch origin (issue #534): `scheduled`/`backfill`/`manual_trigger`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Workflow-start provenance captured at admission and restored at fire
+    /// (issue #740), so a debounced/throttled/batched run records where it
+    /// truly came from (e.g. `webhook`, `api`, `batch`) rather than a hardcoded
+    /// carrier-specific default. `None` on a pre-#740 serialized row → the fire
+    /// path falls back to a sensible per-carrier default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_source: Option<String>,
+    /// Provenance correlation ref captured at admission (issue #740).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_source_ref: Option<String>,
+    /// Operator attribution captured at admission (issue #740).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
 }
 
 /// Parameters for [`admit_debounced_start`].
@@ -741,6 +754,15 @@ async fn fire_claimed_debounce_row(
     let owner = opts.owner;
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
+    // Restore the provenance captured at admission (issue #740). A pre-#740 row
+    // (no captured source) falls back to `Api`: the debounce admission path is
+    // the plain HTTP start route.
+    let start_source = opts
+        .start_source
+        .as_deref()
+        .map_or(crate::types::StartSource::Api, crate::types::StartSource::from_str);
+    let start_source_ref = opts.start_source_ref;
+    let started_by = opts.started_by;
 
     let params = crate::execution::StartWorkflowParams {
         workflow_name: &workflow_name,
@@ -777,9 +799,9 @@ async fn fire_claimed_debounce_row(
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
         completion_callbacks: opts.completion_callbacks,
-        start_source: crate::types::StartSource::Api,
-        start_source_ref: None,
-        started_by: None,
+        start_source,
+        start_source_ref: start_source_ref.as_deref(),
+        started_by: started_by.as_deref(),
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

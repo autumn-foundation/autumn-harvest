@@ -1201,6 +1201,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // schema validation -- consistent with every other
                         // `validate_input` call site being in the HTTP handlers.
                         workflow_info: None,
+                        start_source_override: None,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

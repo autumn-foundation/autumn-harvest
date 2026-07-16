@@ -3793,6 +3793,7 @@ fn signal_with_start_fresh_params(workflow_id: &'static str) -> SignalWithStartP
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         workflow_info: None,
+        start_source_override: None,
     }
 }
 

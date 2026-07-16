@@ -1233,6 +1233,8 @@ async fn insert_fork_execution(
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
     // Re-anchor the soft SLA deadline per-fork (issue #487).
     let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
+    // Provenance ref for a reset fork is the source execution id (#740).
+    let source_exec_id_str = source.id.to_string();
     // Strip the six replay-non-determinism diagnostic keys unconditionally
     // (issue #603 fix): the source can legitimately be a currently-ND-blocked
     // RUNNING execution (the documented escalation path for a stuck block),
@@ -1286,8 +1288,11 @@ async fn insert_fork_execution(
         // fork continues the same logical run, so its terminal notification
         // targets should too.
         completion_callbacks: source.completion_callbacks.clone(),
-        start_source: Some("api"),
-        start_source_ref: None,
+        // A reset fork has its OWN provenance (issue #740 AC3) — it is an
+        // operator intervention, never re-attributed to the source's source.
+        // Ref is the source execution id.
+        start_source: Some(crate::types::StartSource::Reset.as_str()),
+        start_source_ref: Some(source_exec_id_str.as_str()),
         started_by: None,
     };
 

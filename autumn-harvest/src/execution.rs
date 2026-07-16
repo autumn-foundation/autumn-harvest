@@ -571,9 +571,9 @@ pub async fn start_or_load_workflow_execution_collect(
         retry_of_exec_id: request.retry_of_exec_id,
         origin: request.origin,
         completion_callbacks: request.completion_callbacks.clone(),
-        start_source: Some("api"),
-        start_source_ref: None,
-        started_by: None,
+        start_source: Some(request.start_source.as_str()),
+        start_source_ref: request.start_source_ref,
+        started_by: request.started_by,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -3241,6 +3241,11 @@ pub struct SignalWithStartParams<'a> {
     /// stub — that intentionally never validates, matching every other
     /// schema-validation call site being HTTP-JSON-boundary-only).
     pub workflow_info: Option<&'a WorkflowInfo>,
+    /// Workflow-start provenance override for a fresh start (issue #740).
+    /// `None` records the default [`StartSource::SignalWithStart`]; a webhook
+    /// `SignalsWithStart` delegation sets `Some(StartSource::Webhook)` so the
+    /// fresh run records `webhook` provenance.
+    pub start_source_override: Option<StartSource>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -3521,8 +3526,13 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                         origin: None,
                         completion_callbacks: None,
-                        start_source: crate::types::StartSource::Api,
-                        start_source_ref: None,
+                        start_source: request
+                            .start_source_override
+                            .unwrap_or(crate::types::StartSource::SignalWithStart),
+                        start_source_ref: request
+                            .idempotency_key
+                            .as_deref()
+                            .or(Some(request.workflow_id)),
                         started_by: None,
                     };
 
@@ -4097,8 +4107,11 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                         origin: None,
                         completion_callbacks: None,
-                        start_source: crate::types::StartSource::Api,
-                        start_source_ref: None,
+                        start_source: crate::types::StartSource::UpdateWithStart,
+                        start_source_ref: request
+                            .idempotency_key
+                            .as_deref()
+                            .or(Some(request.workflow_id)),
                         started_by: None,
                     };
 

@@ -961,6 +961,24 @@ async fn fire_claimed_throttle_row(
     let owner = opts.owner;
     let runbook_url = opts.runbook_url;
     let severity = opts.severity;
+    // Restore the provenance captured at admission (issue #740). A pre-#740 row
+    // has no captured source, so derive a sensible default from the persisted
+    // dispatch origin: scheduled/backfill throttled fires stay attributed to
+    // their schedule, everything else defaults to `Api`.
+    let start_source = opts.start_source.as_deref().map_or_else(
+        || match opts.origin.as_deref() {
+            Some(o) if o == crate::execution::ORIGIN_SCHEDULED => {
+                crate::types::StartSource::Schedule
+            }
+            Some(o) if o == crate::execution::ORIGIN_BACKFILL => {
+                crate::types::StartSource::Backfill
+            }
+            _ => crate::types::StartSource::Api,
+        },
+        crate::types::StartSource::from_str,
+    );
+    let start_source_ref = opts.start_source_ref;
+    let started_by = opts.started_by;
     // Only a scheduler-tick / buffered-run throttle branch should ever count
     // toward `harvest.schedule.runs` -- gated on `origin == "scheduled"`, not
     // merely `schedule_id.is_some()` (code review, issue #607): the HTTP
@@ -1011,9 +1029,9 @@ async fn fire_claimed_throttle_row(
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: opts.origin.as_deref(),
         completion_callbacks: opts.completion_callbacks,
-        start_source: crate::types::StartSource::Api,
-        start_source_ref: None,
-        started_by: None,
+        start_source,
+        start_source_ref: start_source_ref.as_deref(),
+        started_by: started_by.as_deref(),
     };
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,

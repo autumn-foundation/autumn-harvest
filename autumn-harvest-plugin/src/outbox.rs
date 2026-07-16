@@ -367,7 +367,8 @@ pub(crate) async fn dispatch_workflow_start_request(
             // Outbox delivery is not a schedule fire (issue #534).
             origin: None,
             completion_callbacks: None,
-            start_source: autumn_harvest::StartSource::Api,
+            // Started by the cross-shard outbox dispatcher (issue #740).
+            start_source: autumn_harvest::StartSource::Outbox,
             start_source_ref: None,
             started_by: None,
         },

@@ -2206,6 +2206,16 @@ pub(crate) struct StartWorkflowRequest {
     /// Mutually exclusive with a throttle / debounce / batch policy.
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Internal workflow-start provenance override (issue #740). Set by
+    /// [`Self::from_webhook`] so a webhook-delegated start records `webhook`
+    /// provenance instead of the default `api`. `#[serde(skip)]` so it is
+    /// never part of the public JSON request body.
+    #[serde(default, skip)]
+    start_source_override: Option<autumn_harvest::StartSource>,
+    /// Internal provenance correlation ref override (issue #740), paired with
+    /// [`Self::start_source_override`]. Never part of the public JSON body.
+    #[serde(default, skip)]
+    start_source_ref_override: Option<String>,
 }
 
 impl StartWorkflowRequest {
@@ -2236,6 +2246,8 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            start_source_override: None,
+            start_source_ref_override: None,
         }
     }
 
@@ -2275,6 +2287,9 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            // Webhook-delegated starts record `webhook` provenance (#740/#344).
+            start_source_override: Some(autumn_harvest::StartSource::Webhook),
+            start_source_ref_override: None,
         }
     }
 }
@@ -2313,6 +2328,12 @@ pub(crate) struct SignalWithStartRequest {
     /// GitHub `X-GitHub-Delivery`, etc.).
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Internal workflow-start provenance override (issue #740). Set by
+    /// [`Self::from_webhook`] so a webhook-delegated `SignalsWithStart` fresh
+    /// run records `webhook` instead of the default `signal_with_start`.
+    /// `#[serde(skip)]` so it is never part of the public JSON body.
+    #[serde(default, skip)]
+    start_source_override: Option<autumn_harvest::StartSource>,
 }
 
 impl SignalWithStartRequest {
@@ -2344,6 +2365,9 @@ impl SignalWithStartRequest {
             execution_timeout_secs: None,
             id_reuse_policy: None,
             idempotency_key,
+            // Webhook-delegated signal-with-start records `webhook` provenance
+            // on a fresh run (#740/#344).
+            start_source_override: Some(autumn_harvest::StartSource::Webhook),
         }
     }
 }
@@ -10268,6 +10292,15 @@ pub(crate) async fn start_workflow(
         }
     };
 
+    // Workflow-start provenance (issue #740): default `api` for the plain HTTP
+    // start route; a webhook-delegated start (`from_webhook`) overrides it to
+    // `webhook`. Applied uniformly to the direct start and every deferred
+    // (debounce/throttle/batch) admission carrier below.
+    let effective_start_source = request
+        .start_source_override
+        .unwrap_or(autumn_harvest::StartSource::Api);
+    let effective_start_source_ref = request.start_source_ref_override.clone();
+
     if matches!(
         request.reuse_policy.as_deref(),
         Some("terminate_if_running")
@@ -11188,6 +11221,11 @@ pub(crate) async fn start_workflow(
                     schedule_id: None,
                     scheduled_for: None,
                     origin: None,
+                    // Capture the effective start provenance so the eventual
+                    // debounced fire records it (issue #740).
+                    start_source: Some(effective_start_source.as_str().to_string()),
+                    start_source_ref: effective_start_source_ref.clone(),
+                    started_by: None,
                 },
             };
 
@@ -11495,6 +11533,11 @@ pub(crate) async fn start_workflow(
                 schedule_id: None,
                 scheduled_for: None,
                 origin: None,
+                // Capture the effective start provenance so the eventual
+                // batched fire records it (issue #740).
+                start_source: Some(effective_start_source.as_str().to_string()),
+                start_source_ref: effective_start_source_ref.clone(),
+                started_by: None,
             },
         };
 
@@ -11860,6 +11903,11 @@ pub(crate) async fn start_workflow(
             schedule_id: None,
             scheduled_for: None,
             origin: None,
+            // Capture the effective start provenance so the eventual throttled
+            // fire records it (issue #740).
+            start_source: Some(effective_start_source.as_str().to_string()),
+            start_source_ref: effective_start_source_ref.clone(),
+            started_by: None,
         };
 
         match autumn_harvest::throttle::reserve_or_defer(
@@ -12009,8 +12057,8 @@ pub(crate) async fn start_workflow(
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                 origin: None,
                 completion_callbacks,
-                start_source: autumn_harvest::StartSource::Api,
-                start_source_ref: None,
+                start_source: effective_start_source,
+                start_source_ref: effective_start_source_ref.as_deref(),
                 started_by: None,
             },
             key,
@@ -12231,8 +12279,8 @@ pub(crate) async fn start_workflow(
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         origin: None,
         completion_callbacks,
-        start_source: autumn_harvest::StartSource::Api,
-        start_source_ref: None,
+        start_source: effective_start_source,
+        start_source_ref: effective_start_source_ref.as_deref(),
         started_by: None,
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
@@ -13136,6 +13184,11 @@ async fn batch_start_workflows(
                     schedule_id: None,
                     scheduled_for: None,
                     origin: None,
+                    // Batch-start API item (issue #740): provenance is `batch`,
+                    // attributed to the operator that issued the batch.
+                    start_source: Some(autumn_harvest::StartSource::Batch.as_str().to_string()),
+                    start_source_ref: None,
+                    started_by: Some(actor.to_string()),
                 };
                 match autumn_harvest::throttle::reserve_or_defer(
                     &mut conn,
@@ -14240,6 +14293,7 @@ pub(crate) async fn signal_with_start_workflow(
             workflow_retry_policy: sws_workflow_retry_policy,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             workflow_info: runtime.registry.workflows.get(&workflow_name),
+            start_source_override: request.start_source_override,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
@@ -17268,6 +17322,10 @@ pub(crate) async fn trigger_dag_run_inner(
         dag.owner.as_deref(),
         dag.runbook_url.as_deref(),
         dag.severity.as_deref(),
+        // Manual DAG trigger is attributed to the schedule (issue #740),
+        // mirroring trigger_schedule_now; carry the operator actor.
+        autumn_harvest::StartSource::Schedule,
+        Some(actor.as_str()),
     )
     .await;
 
@@ -20191,6 +20249,11 @@ async fn trigger_schedule_now(
             schedule_id: Some(schedule_id),
             scheduled_for: None,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER.to_string()),
+            // Manual trigger-now (issue #740): provenance is `schedule`,
+            // referencing the schedule id, attributed to the operator.
+            start_source: Some(autumn_harvest::StartSource::Schedule.as_str().to_string()),
+            start_source_ref: Some(schedule_id.to_string()),
+            started_by: Some(actor.to_string()),
         };
         match autumn_harvest::throttle::reserve_or_defer(
             &mut exec_conn,
@@ -21586,6 +21649,13 @@ async fn schedule_backfill(
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL.to_string()),
+                        // Schedule backfill (issue #740): provenance is
+                        // `backfill`, referencing the schedule id, operator.
+                        start_source: Some(
+                            autumn_harvest::StartSource::Backfill.as_str().to_string(),
+                        ),
+                        start_source_ref: Some(schedule_id.to_string()),
+                        started_by: Some(actor.to_string()),
                     };
                     match autumn_harvest::throttle::reserve_or_defer(
                         &mut conn,
