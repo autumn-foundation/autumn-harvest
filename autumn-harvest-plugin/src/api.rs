@@ -4067,6 +4067,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         .route("/workflows/{id}/run-chain", get(get_run_chain))
+        // Ephemeral workflow progress SSE stream (issue #791). Deliberately NOT
+        // admin-gated — an app's end-users stream their own workflows (AC5). It
+        // inherits the general management API auth middleware (api_with_auth)
+        // like the other non-admin `/workflows/{id}/…` read routes.
+        .route("/workflows/{id}/stream", get(stream_workflow_progress))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -5010,6 +5015,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
         ("GET", "/workflows/{id}/run-chain"),
+        // Ephemeral workflow progress SSE stream (issue #791). Read-only,
+        // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
+        ("GET", "/workflows/{id}/stream"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -5688,6 +5696,10 @@ pub const fn management_api_response_fields()
             "/workflows/{id}/run-chain",
             Some(&["head_unknown", "workflow_id", "runs"]),
         ),
+        // Ephemeral workflow progress SSE stream (issue #791): text/event-stream,
+        // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
+        // monotonic seq), a terminal `event: end`, or `event: error`.
+        ("GET", "/workflows/{id}/stream", None),
         (
             "POST",
             "/workflows/{workflow_name}/start",
@@ -27574,6 +27586,198 @@ async fn stream_execution_events(
     // comments every keepalive_interval so proxies don't idle the connection.
     Sse::new(rx)
         .keep_alive(KeepAlive::new().interval(keepalive_interval).text("ping"))
+        .into_response()
+}
+
+/// Terminal-close poll cadence / keepalive ceiling for the workflow progress SSE
+/// stream (issue #791). Bounds how long after a workflow reaches a terminal
+/// state the final `event: end` frame is emitted (there is no terminal *chunk*,
+/// so the close is driven by a periodic terminal-state poll on the idle tick).
+/// Capped by the configured `sse_keepalive_interval` so operators (and tests)
+/// can shorten it; a modest default keeps close latency bounded.
+const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounded producer→SSE channel capacity for the progress stream. Progress is a
+/// best-effort side channel: if a slow client backs this up, the next send
+/// fails and the producer task ends cleanly (no unbounded buffering).
+const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
+
+/// Poll the execution's terminal state for the progress stream's close check.
+///
+/// Returns `Some(reason)` when the stream should end — the execution reached a
+/// terminal state, or its row was retention-deleted (which only happens once an
+/// execution is already terminal) — and `None` to keep waiting (still running,
+/// or a transient DB/pool error the next idle tick retries).
+async fn progress_stream_end_reason(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    let mut conn = db_conn_for_execution(api_state, exec_id).await.ok()?;
+    let state: Option<String> = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .optional()
+        .ok()?;
+    match state {
+        // Row gone: retention only deletes terminal executions, so end the stream.
+        None => Some("deleted".to_string()),
+        Some(s) if is_terminal_state(&s) => Some(s.to_lowercase().replace('_', "-")),
+        // Still running — keep the live loop open.
+        Some(_) => None,
+    }
+}
+
+/// `GET /workflows/{id}/stream`
+///
+/// Ephemeral, best-effort **live-output side channel** (issue #791). Streams the
+/// ordered progress chunks a running workflow publishes via
+/// [`WorkflowContext::publish_progress`](autumn_harvest::context::WorkflowContext::publish_progress)
+/// over Postgres LISTEN/NOTIFY, with sub-second delivery and no DB connection
+/// held between chunks.
+///
+/// **Auth**: this route inherits the management API's configured auth middleware
+/// (`HarvestPlugin::api_with_auth`); it is deliberately **NOT** admin-gated
+/// (issue #791 AC5 — an app's end-users stream their own workflows). If no
+/// middleware is configured the route is open — embedders exposing streams to
+/// untrusted end-users should configure `api_with_auth` or front it with their
+/// own auth.
+///
+/// SSE wire format:
+/// ```text
+/// id: <seq>            (monotonic, epoch-prefixed; a gap ⇒ missed chunk)
+/// event: progress
+/// data: <chunk JSON>   (compact, single-line)
+///
+/// ```
+/// A final `event: end` frame is emitted when the execution reaches a terminal
+/// state and the stream then closes; `event: error` is sent if the LISTEN
+/// connection drops. Keepalive `: ping` comments (axum `KeepAlive`) keep proxies
+/// from idling the connection.
+///
+/// **Progress chunks are EPHEMERAL**: never recorded in `harvest_events`, never
+/// replayed, and there is **no backfill** on (re)connect. A subscriber that
+/// connects after a chunk was published will not see it — deliberate, since
+/// chunk content may be non-deterministic precisely because it is never stored.
+///
+/// Responses: `404` if the execution does not exist; `503`/`400` if the
+/// LISTEN/NOTIFY database URL is not configured; a single `event: end` frame
+/// (then close) if the execution is already terminal at connect.
+async fn stream_workflow_progress(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::notify::{ProgressWaitOutcome, WorkflowProgressListener};
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+
+    // Parse execution ID (400 on malformed).
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // Resolve the LISTEN/NOTIFY database URL for this execution's shard.
+    let shard = exec_id.shard();
+    let notification_url = match api_state.sse_notification_url(shard) {
+        Ok(url) => url,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Establish LISTEN before verifying the execution so a chunk published in
+    // the window between the existence check and LISTEN setup is not missed.
+    let listener =
+        match WorkflowProgressListener::connect(&notification_url, exec_id.as_uuid()).await {
+            Ok(l) => l,
+            Err(e) => return map_error(e).into_response(),
+        };
+
+    // Verify the execution exists (404 otherwise) and capture its terminal state.
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(e) => e,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let already_terminal = is_terminal_state(&execution.state);
+    let terminal_reason = execution.state.to_lowercase().replace('_', "-");
+    // Release the pooled DB connection — SSE streams must not hold connections.
+    drop(conn);
+
+    // Terminal-close poll cadence, bounded by a modest default and shortenable
+    // via the shared SSE keepalive config.
+    let keepalive = api_state
+        .sse_keepalive_interval()
+        .min(PROGRESS_STREAM_KEEPALIVE);
+
+    // Bounded channel: when the axum SSE receiver drops (client disconnect),
+    // further sends fail and the producer task shuts down cleanly.
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        PROGRESS_STREAM_CHANNEL_CAPACITY,
+    );
+
+    if already_terminal {
+        // No chunks will come — emit a single end frame and close immediately.
+        let end_data = serde_json::json!({ "reason": terminal_reason }).to_string();
+        let _ = tx.try_send(Ok(Event::default().event("end").data(end_data)));
+    } else {
+        let api_clone = api_state.clone();
+        // Producer task: runs independently of the HTTP handler after we return.
+        tokio::spawn(async move {
+            let mut listener = listener;
+            loop {
+                match listener.wait_for_progress_timeout(keepalive).await {
+                    Ok(ProgressWaitOutcome::Chunk(payload)) => {
+                        // `chunk` is already an inner JSON value — serialize it
+                        // compactly (single line) and DO NOT re-wrap it in the
+                        // adjacently-tagged envelope; `id:` carries the seq.
+                        let event = Event::default()
+                            .id(payload.seq.to_string())
+                            .event("progress")
+                            .data(payload.chunk.to_string());
+                        if tx.send(Ok(event)).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    Ok(ProgressWaitOutcome::TimedOut) => {
+                        // Detect a client that disconnected while idle (send /
+                        // try_send only observe a drop on a write attempt); the
+                        // axum KeepAlive wrapper emits the `: ping` comment.
+                        if tx.is_closed() {
+                            break;
+                        }
+                        // Periodic terminal-state poll: there is no terminal
+                        // chunk, so this bounds close latency to one keepalive.
+                        if let Some(reason) = progress_stream_end_reason(&api_clone, exec_id).await
+                        {
+                            let end_data = serde_json::json!({ "reason": reason }).to_string();
+                            let _ = tx
+                                .send(Ok(Event::default().event("end").data(end_data)))
+                                .await;
+                            break;
+                        }
+                    }
+                    Ok(ProgressWaitOutcome::ChannelClosed) => {
+                        // LISTEN connection dropped; end with an error frame
+                        // rather than hanging (mirrors #597 watch robustness).
+                        let err_data =
+                            serde_json::json!({ "error": "listen_connection_closed" }).to_string();
+                        let _ = tx
+                            .send(Ok(Event::default().event("error").data(err_data)))
+                            .await;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
         .into_response()
 }
 

@@ -393,6 +393,47 @@ fn timeline_route_is_classified() {
     );
 }
 
+/// The ephemeral workflow progress SSE stream (issue #791) must be registered
+/// in the management route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES` — the exact
+/// read-only precedent set by `GET /workflows/{id}/timeline`.
+///
+/// Mirrors `timeline_route_is_classified`: the audit-side mutual cross-check
+/// (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if a route is
+/// dropped from BOTH lists, so this pins the route against the live router
+/// registry. Note the route is deliberately NOT admin-gated (AC5).
+#[test]
+fn progress_stream_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/{id}/stream";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
 /// The tiered/summary retention list (issue #752) must be registered in the
 /// live route registry and classified `ReadOnly`, listed in
 /// `ALL_MUTATION_ROUTES` with no audit op, and in `EXCLUDED_ROUTES`.
