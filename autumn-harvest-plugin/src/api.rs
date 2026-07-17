@@ -42,13 +42,14 @@ use autumn_harvest::audit::{
     OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ,
     OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
     OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
-    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
-    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
     OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
     TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -3454,6 +3455,161 @@ async fn lift_gate_handler(
     }
 }
 
+// ── Scoped API tokens (issue #942) ───────────────────────────────────────────
+
+/// Request body for `POST /admin/tokens`.
+#[derive(serde::Deserialize)]
+struct CreateTokenRequest {
+    name: String,
+    /// `"read"` or `"mutate"` — the verb-level scope drawn from the route
+    /// classification. Defaults to `read` (least privilege) when omitted.
+    #[serde(default = "default_token_scope")]
+    scope: String,
+    /// Optional expiry; an expired token is rejected 401 on the next request.
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn default_token_scope() -> String {
+    "read".to_string()
+}
+
+/// `POST /admin/tokens` — mint a scoped API token. The plaintext secret is
+/// returned **exactly once** in this response; only its hash is stored.
+async fn create_token_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CreateTokenRequest>,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let Some(scope) = crate::api_token::TokenScope::from_db(&body.scope) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown scope '{}' (expected 'read' or 'mutate')", body.scope)
+            })),
+        )
+            .into_response();
+    };
+
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    match crate::api_token::create_token(&mut conn, &body.name, scope, body.expires_at, &actor).await
+    {
+        Ok(mint) => {
+            let id_str = mint.view.id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_TOKEN_CREATE,
+                target_type: TARGET_TOKEN,
+                target_id: Some(id_str.as_str()),
+                route_or_command: "POST /admin/tokens",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+
+            // Flatten the metadata view and attach the one-time secret.
+            let mut value =
+                serde_json::to_value(&mint.view).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("secret".to_string(), serde_json::json!(mint.secret()));
+            }
+            (StatusCode::CREATED, Json(value)).into_response()
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_TOKEN_CREATE,
+                target_type: TARGET_TOKEN,
+                target_id: None,
+                route_or_command: "POST /admin/tokens",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            AutumnError::internal_server_error(e).into_response()
+        }
+    }
+}
+
+/// `GET /admin/tokens` — list all tokens as metadata-only views (no
+/// secret/hash). Not audited (a read).
+async fn list_tokens_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> axum::response::Response {
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match crate::api_token::list_tokens(&mut conn).await {
+        Ok(views) => (StatusCode::OK, Json(views)).into_response(),
+        Err(e) => AutumnError::internal_server_error(e).into_response(),
+    }
+}
+
+/// `DELETE /admin/tokens/{id}` — revoke a token. Idempotent; revocation is
+/// effective on the next request (no grant cache).
+async fn revoke_token_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let id_str = id.to_string();
+    match crate::api_token::revoke_token(&mut conn, id).await {
+        Ok(revoked) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_TOKEN_REVOKE,
+                target_type: TARGET_TOKEN,
+                target_id: Some(id_str.as_str()),
+                route_or_command: "DELETE /admin/tokens/{id}",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (StatusCode::OK, Json(serde_json::json!({ "revoked": revoked }))).into_response()
+        }
+        Err(e) => AutumnError::internal_server_error(e).into_response(),
+    }
+}
+
 // ── Business-id route variants (issue #805) ──────────────────────────────────
 //
 // Embedders assign a business `(workflow_name, workflow_id)` at start. These
@@ -4457,6 +4613,21 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/gates/{id}",
             delete(lift_gate_handler).route_layer(require_admin.clone()),
         )
+        // Scoped API tokens (issue #942): admin-gated lifecycle. The collection
+        // route is registered before the `/{id}` sibling so axum does not capture
+        // "tokens" as a path param.
+        .route(
+            "/admin/tokens",
+            get(list_tokens_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/tokens",
+            post(create_token_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/tokens/{id}",
+            delete(revoke_token_handler).route_layer(require_admin.clone()),
+        )
         // Stuck-task triage eligibility explainer (issue #380)
         .route(
             "/admin/queues/{queue_name}/eligibility",
@@ -4474,6 +4645,19 @@ pub(crate) async fn require_harvest_admin(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // Standalone-token admin mode (issue #942, AC6/D3): a request carrying a
+    // verified `TokenPrincipal` (set by `enforce_token_scope`) is admitted
+    // without a session/embedder boundary. Scope enforcement already ran in the
+    // outer `enforce_token_scope` layer, so a `read` token attempting a mutating
+    // admin route was denied 403 before reaching here; any principal that
+    // reaches this point is authorized for the route it is on.
+    if request
+        .extensions()
+        .get::<crate::api_token::TokenPrincipal>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
     let session = request.extensions().get::<Session>().cloned();
     if has_harvest_admin_access(&api_state, session).await {
         next.run(request).await
@@ -5211,6 +5395,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/gates"),
         ("POST", "/admin/gates"),
         ("DELETE", "/admin/gates/{id}"),
+        // ── scoped API tokens (issue #942) ────────────────────────────────────
+        ("GET", "/admin/tokens"),
+        ("POST", "/admin/tokens"),
+        ("DELETE", "/admin/tokens/{id}"),
         // ── stuck-task triage eligibility (issue #380) ────────────────────────
         ("GET", "/admin/queues/{queue_name}/eligibility"),
         ("GET", "/admin/tasks/{id}/eligibility"),
@@ -5605,6 +5793,13 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&[])),
+        // ── scoped API tokens (issue #942) ────────────────────────────────────
+        (
+            "POST",
+            "/admin/tokens",
+            Some(&["name", "scope", "expires_at"]),
+        ),
+        ("DELETE", "/admin/tokens/{id}", Some(&[])),
         (
             "POST",
             "/admin/workflows/replay-canary",
@@ -6630,6 +6825,27 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&["lifted"])),
+        // ── scoped API tokens (issue #942) ────────────────────────────────────
+        (
+            "GET",
+            "/admin/tokens",
+            None, // array of TokenView (metadata-only) rows
+        ),
+        (
+            "POST",
+            "/admin/tokens",
+            Some(&[
+                "id",
+                "name",
+                "scope",
+                "created_at",
+                "expires_at",
+                "last_used_at",
+                "revoked_at",
+                "secret",
+            ]),
+        ),
+        ("DELETE", "/admin/tokens/{id}", Some(&["revoked"])),
         (
             "GET",
             "/admin/queues/{queue_name}/eligibility",
