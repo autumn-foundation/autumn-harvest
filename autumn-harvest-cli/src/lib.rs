@@ -814,6 +814,31 @@ enum TokenCommand {
         #[arg(long)]
         expires_at: Option<String>,
     },
+    /// Seed the FIRST token offline (issue #942). Prints a fresh secret ONCE
+    /// and the exact `INSERT INTO harvest_api_tokens ...` SQL for you to run
+    /// against your database — no API call and no DB connection is made.
+    ///
+    /// Standalone (tokens-only) deployments use this to mint their first
+    /// `mutate` token: with tokens as the only auth there is no admin caller
+    /// yet to mint one via `POST /admin/tokens`. Run the printed SQL once (you
+    /// already have DB access — the trust anchor), then mint every further
+    /// token through the API. The printed SQL contains ONLY the hash; the
+    /// secret is shown separately for you to store.
+    Bootstrap {
+        /// Human-readable label for the seed token.
+        #[arg(long, default_value = "bootstrap")]
+        name: String,
+        /// Verb-level scope: `mutate` (can mint further tokens via the API) or
+        /// `read`. Defaults to `mutate` so the seed token can bootstrap the rest.
+        #[arg(long, default_value = "mutate", value_parser = ["read", "mutate"])]
+        scope: String,
+        /// Optional RFC 3339 expiry after which the token is rejected 401.
+        #[arg(long)]
+        expires_at: Option<String>,
+        /// Audit provenance recorded as `created_by`.
+        #[arg(long, default_value = "bootstrap")]
+        created_by: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2045,6 +2070,10 @@ pub mod tui;
 ///
 /// Returns an error if request construction, HTTP transport, response parsing,
 /// or response formatting fails.
+// A dispatcher: a sequence of `if let ... return` guards for locally-handled
+// commands (det-check, tui, events, worker-drain-wait, token bootstrap) followed
+// by the shared execute/render path. Splitting it would only scatter the guards.
+#[allow(clippy::too_many_lines)]
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     // det-check is read-only local source analysis: no HTTP, handled entirely
     // in-process before the API execute path (mirrors the Tui early-return).
@@ -2056,6 +2085,21 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return run_det_check(paths, *format, *deny_warnings, *list_suppressions);
+    }
+
+    // Token bootstrap is an OFFLINE seed: print the secret + INSERT SQL, open no
+    // DB connection, issue no HTTP request (mirrors the DetCheck early-return).
+    if let Commands::Token {
+        command:
+            TokenCommand::Bootstrap {
+                name,
+                scope,
+                expires_at,
+                created_by,
+            },
+    } = &cli.command
+    {
+        return run_token_bootstrap(name, scope, expires_at.as_deref(), created_by);
     }
 
     if matches!(cli.command, Commands::Tui) {
@@ -5712,7 +5756,134 @@ fn token_request(command: &TokenCommand) -> ApiRequest {
             }
             ApiRequest::post("/admin/tokens", Some(body))
         }
+        // Bootstrap is an OFFLINE seed: it issues no HTTP request and is handled
+        // entirely in-process in `run_cli` (mirrors DetCheck/Tui/Events).
+        TokenCommand::Bootstrap { .. } => {
+            unreachable!("token bootstrap is handled locally in run_cli")
+        }
     }
+}
+
+/// The offline seed-token output produced by `harvest token bootstrap`.
+///
+/// Carries the one-time plaintext `secret`, its stored `hash`, and the exact
+/// `INSERT INTO harvest_api_tokens ...` statement to run out-of-band. The SQL
+/// contains ONLY the hash — never the secret (issue #942).
+pub struct BootstrapToken {
+    /// The plaintext `hvst_...` secret — shown once, never stored.
+    pub secret: String,
+    /// `hex(SHA256(secret))` — the value embedded in the INSERT and stored.
+    pub hash: String,
+    /// The token scope (`read` | `mutate`).
+    pub scope: String,
+    /// The token label.
+    pub name: String,
+    /// A ready-to-run `INSERT INTO harvest_api_tokens (...) VALUES (...);`.
+    pub insert_sql: String,
+}
+
+/// Wrap `s` as a Postgres single-quoted string literal, escaping embedded
+/// single quotes (`'` → `''`). With `standard_conforming_strings` (the default),
+/// this fully neutralizes injection through a crafted `--name`/`--created-by`.
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Build the offline bootstrap seed: a fresh secret, its stored hash, and the
+/// exact INSERT SQL. Opens **no** database connection.
+///
+/// The secret and hash are produced by the SHARED core helpers
+/// ([`autumn_harvest::api_token::mint_secret`] / [`hash_secret`]) — the same
+/// functions the server mint route uses — so a seeded token authenticates
+/// byte-for-byte identically to a route-minted one (no drift).
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidInput`] if `expires_at` is not a valid RFC 3339
+/// timestamp (so a broken INSERT is never emitted).
+pub fn build_bootstrap_token(
+    name: &str,
+    scope: &str,
+    expires_at: Option<&str>,
+    created_by: &str,
+) -> Result<BootstrapToken, CliError> {
+    // Single source of truth: the mint route hashes with these exact helpers.
+    let secret = autumn_harvest::api_token::mint_secret();
+    let hash = autumn_harvest::api_token::hash_secret(&secret);
+
+    // Validate the expiry up front so we never print an INSERT that Postgres
+    // rejects at run time.
+    if let Some(e) = expires_at {
+        autumn_harvest::chrono::DateTime::parse_from_rfc3339(e).map_err(|source| {
+            CliError::InvalidInput(format!(
+                "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {source}"
+            ))
+        })?;
+    }
+
+    // `id`/`created_at` use the column defaults (gen_random_uuid()/NOW()); every
+    // user-supplied string is single-quote escaped so a crafted flag value
+    // cannot inject SQL. The statement embeds only the hash, never the secret.
+    let mut columns = String::from("id, name, token_hash, scope, created_at, created_by");
+    let mut values = format!(
+        "gen_random_uuid(), {}, {}, {}, NOW(), {}",
+        sql_quote(name),
+        sql_quote(&hash),
+        sql_quote(scope),
+        sql_quote(created_by),
+    );
+    if let Some(e) = expires_at {
+        use std::fmt::Write as _;
+        columns.push_str(", expires_at");
+        let _ = write!(values, ", {}::timestamptz", sql_quote(e));
+    }
+    let insert_sql = format!("INSERT INTO harvest_api_tokens ({columns})\nVALUES ({values});");
+
+    Ok(BootstrapToken {
+        secret,
+        hash,
+        scope: scope.to_string(),
+        name: name.to_string(),
+        insert_sql,
+    })
+}
+
+/// Execute `harvest token bootstrap`: print the one-time secret and the INSERT
+/// SQL. Opens no DB connection; the operator runs the SQL out-of-band.
+///
+/// # Errors
+///
+/// Propagates [`build_bootstrap_token`]'s validation error.
+fn run_token_bootstrap(
+    name: &str,
+    scope: &str,
+    expires_at: Option<&str>,
+    created_by: &str,
+) -> Result<(), CliError> {
+    let token = build_bootstrap_token(name, scope, expires_at, created_by)?;
+
+    println!("Harvest API token — offline bootstrap seed");
+    println!();
+    println!("  Token secret (shown once — store it now, it cannot be recovered):");
+    println!();
+    println!("    {}", token.secret);
+    println!();
+    println!("  1. Save the secret above in your secret store. Only its SHA-256 hash is");
+    println!("     written to the database, so the secret cannot be recovered later.");
+    println!("  2. Run this SQL against your Harvest database to create the token row");
+    println!("     (it embeds only the hash — never the secret):");
+    println!();
+    for line in token.insert_sql.lines() {
+        println!("    {line}");
+    }
+    println!();
+    println!("  3. Send the secret above as a bearer credential:");
+    println!("       Authorization: Bearer <secret>");
+    println!(
+        "     A `{}`-scoped token can mint every further token via POST /admin/tokens.",
+        token.scope
+    );
+    Ok(())
 }
 
 fn worker_request(command: &WorkerCommand) -> ApiRequest {
@@ -8346,5 +8517,152 @@ fn bad_helper() -> i64 {
             result.is_ok(),
             "--list-suppressions --format json must exit Ok, got: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod token_bootstrap_tests {
+    use super::*;
+
+    /// The builder produces a valid `hvst_` secret, an INSERT statement whose
+    /// `name`/`scope`/`created_by` match the inputs, embeds ONLY the hash, and
+    /// never leaks the secret into the SQL (issue #942, Codex P1 output-shape check).
+    #[test]
+    fn bootstrap_builder_emits_secret_and_hash_only_sql() {
+        let token = build_bootstrap_token("ci-seed", "mutate", None, "op").expect("builds");
+
+        assert!(
+            token.secret.starts_with("hvst_"),
+            "secret must carry the hvst_ prefix: {}",
+            token.secret
+        );
+        // No drift: the stored hash IS the shared core helper's output.
+        assert_eq!(
+            token.hash,
+            autumn_harvest::api_token::hash_secret(&token.secret),
+            "hash must be hash_secret(secret) — the shared mint helper"
+        );
+
+        let sql = &token.insert_sql;
+        assert!(
+            sql.contains("INSERT INTO harvest_api_tokens"),
+            "must be an INSERT: {sql}"
+        );
+        assert!(sql.contains("'mutate'"), "scope must appear in SQL: {sql}");
+        assert!(sql.contains("'ci-seed'"), "name must appear in SQL: {sql}");
+        assert!(sql.contains("'op'"), "created_by must appear in SQL: {sql}");
+        assert!(sql.contains(&token.hash), "hash must be embedded: {sql}");
+        assert!(
+            sql.contains("gen_random_uuid()"),
+            "id default expected: {sql}"
+        );
+        assert!(sql.contains("NOW()"), "created_at default expected: {sql}");
+        // The secret must NEVER be smuggled into the SQL — only the hash is.
+        assert!(
+            !sql.contains(&token.secret),
+            "the plaintext secret must not appear in the INSERT SQL: {sql}"
+        );
+    }
+
+    /// `--scope` defaults to `mutate` (a seed must be able to mint others) and
+    /// `--created-by`/`--name` default to `bootstrap`.
+    #[test]
+    fn bootstrap_defaults_scope_to_mutate() {
+        let cli = Cli::try_parse_from(["harvest", "token", "bootstrap"])
+            .expect("token bootstrap should parse with no flags");
+        match cli.command {
+            Commands::Token {
+                command:
+                    TokenCommand::Bootstrap {
+                        name,
+                        scope,
+                        expires_at,
+                        created_by,
+                    },
+            } => {
+                assert_eq!(scope, "mutate", "default scope must be mutate");
+                assert_eq!(name, "bootstrap");
+                assert_eq!(created_by, "bootstrap");
+                assert_eq!(expires_at, None);
+            }
+            other => panic!("expected token bootstrap, got {other:?}"),
+        }
+    }
+
+    /// The `value_parser` rejects a scope outside {read, mutate}.
+    #[test]
+    fn bootstrap_rejects_invalid_scope() {
+        let result = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "admin"]);
+        assert!(result.is_err(), "an invalid --scope must fail to parse");
+    }
+
+    /// A `read`-scoped bootstrap flows the flag values through to the SQL.
+    #[test]
+    fn bootstrap_read_scope_flows_through_to_sql() {
+        let cli = Cli::try_parse_from([
+            "harvest",
+            "token",
+            "bootstrap",
+            "--scope",
+            "read",
+            "--name",
+            "dashboard",
+            "--created-by",
+            "release-eng",
+        ])
+        .expect("parses");
+        let Commands::Token {
+            command:
+                TokenCommand::Bootstrap {
+                    name,
+                    scope,
+                    expires_at,
+                    created_by,
+                },
+        } = cli.command
+        else {
+            panic!("expected token bootstrap");
+        };
+        let token = build_bootstrap_token(&name, &scope, expires_at.as_deref(), &created_by)
+            .expect("builds");
+        assert!(token.insert_sql.contains("'read'"));
+        assert!(token.insert_sql.contains("'dashboard'"));
+        assert!(token.insert_sql.contains("'release-eng'"));
+        assert!(!token.insert_sql.contains(&token.secret));
+    }
+
+    /// A valid `--expires-at` is embedded as a `timestamptz` literal.
+    #[test]
+    fn bootstrap_with_expiry_includes_timestamptz() {
+        let token =
+            build_bootstrap_token("n", "read", Some("2027-01-01T00:00:00Z"), "op").expect("builds");
+        assert!(token.insert_sql.contains("expires_at"), "column present");
+        assert!(
+            token
+                .insert_sql
+                .contains("'2027-01-01T00:00:00Z'::timestamptz"),
+            "expiry literal present: {}",
+            token.insert_sql
+        );
+    }
+
+    /// A malformed `--expires-at` is rejected before any SQL is emitted.
+    #[test]
+    fn bootstrap_rejects_bad_expiry() {
+        let err = build_bootstrap_token("n", "read", Some("not-a-date"), "op");
+        assert!(err.is_err(), "a non-RFC-3339 expiry must be rejected");
+    }
+
+    /// A crafted name with a single quote is escaped (Postgres `'` -> `''`),
+    /// neutralizing SQL injection through the flag value.
+    #[test]
+    fn bootstrap_escapes_single_quotes_in_name() {
+        let token = build_bootstrap_token("O'Brien", "read", None, "op").expect("builds");
+        assert!(
+            token.insert_sql.contains("'O''Brien'"),
+            "single quote must be doubled: {}",
+            token.insert_sql
+        );
+        assert!(!token.insert_sql.contains(&token.secret));
     }
 }
