@@ -373,6 +373,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/gates", RouteClass::ReadOnly),
     ("POST /admin/gates", RouteClass::Mutating),
     ("DELETE /admin/gates/{id}", RouteClass::Mutating),
+    // Scoped API tokens (issue #942).
+    ("GET /admin/tokens", RouteClass::ReadOnly),
+    ("POST /admin/tokens", RouteClass::Mutating),
+    ("DELETE /admin/tokens/{id}", RouteClass::Mutating),
     ("GET /admin/schedules", RouteClass::ReadOnly),
     ("GET /admin/rate-limits", RouteClass::ReadOnly),
     ("GET /admin/audit", RouteClass::ReadOnly),
@@ -700,6 +704,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_RETRY,
     OP_CIRCUIT_FORCE_OPEN,
     OP_CIRCUIT_FORCE_CLOSE,
+    // Scoped API tokens (issue #942)
+    OP_TOKEN_CREATE,
+    OP_TOKEN_REVOKE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -768,6 +775,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /admin/build-routing/retire",
     // Admission gate list is read-only.
     "GET /admin/gates",
+    // Scoped API token list is read-only (issue #942).
+    "GET /admin/tokens",
     // Business-id ("latest run") read-only variants (issue #805). Each mirrors
     // its exec-id counterpart's EXCLUDED_ROUTES membership exactly. Note the
     // `.../result` variant is deliberately absent — its exec-id counterpart
@@ -977,6 +986,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/gates", None),
     ("POST /admin/gates", Some(OP_GATE_CREATE)),
     ("DELETE /admin/gates/{id}", Some(OP_GATE_LIFT)),
+    // Scoped API tokens (issue #942)
+    ("GET /admin/tokens", None),
+    ("POST /admin/tokens", Some(OP_TOKEN_CREATE)),
+    ("DELETE /admin/tokens/{id}", Some(OP_TOKEN_REVOKE)),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", Some(OP_TASK_REPRIORITIZE)),
     // PII erasure (issue #495)

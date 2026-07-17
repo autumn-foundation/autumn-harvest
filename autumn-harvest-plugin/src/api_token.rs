@@ -53,6 +53,8 @@ use axum::response::{IntoResponse, Response};
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use rand::RngCore as _;
+
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sha2::{Digest as _, Sha256};
@@ -183,9 +185,15 @@ impl std::fmt::Debug for MintResult {
 // ── Crypto / discrimination helpers (pure) ────────────────────────────────────
 
 /// Mint a fresh opaque secret `hvst_<base64url(32 random bytes)>`.
+///
+/// Uses the OS CSPRNG for 256 bits of entropy — this is a bearer credential,
+/// so the randomness source must be cryptographically secure.
 #[must_use]
 pub(crate) fn mint_secret() -> String {
-    unimplemented!("issue #942 GREEN phase")
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    format!("{TOKEN_PREFIX}{body}")
 }
 
 /// Hex-encoded SHA-256 of the full presented secret — the indexed lookup key.
@@ -194,28 +202,46 @@ pub(crate) fn mint_secret() -> String {
 /// GitHub-PAT / Hatchet model): no salt/argon needed because the secret is not
 /// a low-entropy human password.
 #[must_use]
-pub(crate) fn hash_secret(_secret: &str) -> String {
-    unimplemented!("issue #942 GREEN phase")
+pub(crate) fn hash_secret(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    // Lowercase hex, 64 chars.
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Whether a bearer credential claims to be a harvest-native token (AC7).
 #[must_use]
-pub(crate) fn looks_like_harvest_token(_bearer: &str) -> bool {
-    unimplemented!("issue #942 GREEN phase")
+pub(crate) fn looks_like_harvest_token(bearer: &str) -> bool {
+    bearer.starts_with(TOKEN_PREFIX)
 }
 
 /// Whether a token with the given (optional) expiry is expired at `now` (AC5).
+///
+/// The boundary is inclusive: a token whose `expires_at == now` is expired.
 #[must_use]
-pub(crate) fn is_expired(_expires_at: Option<DateTime<Utc>>, _now: DateTime<Utc>) -> bool {
-    unimplemented!("issue #942 GREEN phase")
+pub(crate) fn is_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match expires_at {
+        Some(at) => at <= now,
+        None => false,
+    }
 }
 
 /// The scope-gate decision (issue #942, AC3/AC4): reuses the #776
 /// route-classification single source of truth, so it fails closed for an
 /// unclassified route.
+///
+/// A `Mutate` token is never denied. A `Read` token is denied exactly when the
+/// route resolves to a mutating class — and [`classify_route`] fails closed by
+/// resolving an unmatched path to [`RouteClass::Mutating`], so an unclassified
+/// route is denied to a `read` token.
 #[must_use]
-pub(crate) fn token_scope_denies(_scope: TokenScope, _method: &Method, _path: &str) -> bool {
-    unimplemented!("issue #942 GREEN phase")
+pub(crate) fn token_scope_denies(scope: TokenScope, method: &Method, path: &str) -> bool {
+    let class = classify_route(method, path);
+    deny_readonly_mutation(matches!(scope, TokenScope::Read), class)
 }
 
 // ── DB CRUD (default/control shard) ───────────────────────────────────────────
