@@ -248,8 +248,10 @@ pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: Option<&str>) -> String
     // resolved empty-string tenant, which encodes as `L0:`) so the two never
     // share a bucket -- issue #699 review, Codex round-5 P2. The whole composite
     // key stays injective (the `L`/`H`/`U` first-byte tags are disjoint).
-    let resolved_component =
-        resolved.map_or_else(|| UNRESOLVED_RESOLVED_MARKER.to_string(), bound_key_component);
+    let resolved_component = resolved.map_or_else(
+        || UNRESOLVED_RESOLVED_MARKER.to_string(),
+        bound_key_component,
+    );
     format!(
         "{DYNAMIC_RATE_PREFIX}:{}:{}",
         bound_key_component(expr),

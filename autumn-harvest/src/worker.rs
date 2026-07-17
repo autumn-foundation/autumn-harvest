@@ -16497,8 +16497,7 @@ mod tests {
     #[test]
     fn worker_new_accepts_valid_positive_dynamic_rate_limit() {
         // The valid positive config still starts cleanly.
-        let act =
-            rate_limited_activity("charge", Some(50.0), Some(20.0), Some("input.tenant_id"));
+        let act = rate_limited_activity("charge", Some(50.0), Some(20.0), Some("input.tenant_id"));
         let cfg = default_runtime_config();
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
         assert!(Worker::new(cfg, registry).is_ok());
