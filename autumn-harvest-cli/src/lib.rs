@@ -956,6 +956,12 @@ enum WorkflowCommand {
         /// `allow_duplicate_failed_only`, `terminate_if_running`.
         #[arg(long, value_name = "POLICY")]
         reuse_policy: Option<String>,
+        /// How to handle a collision with a currently-active (RUNNING/PAUSED)
+        /// prior (issue #685). Orthogonal to `--reuse-policy` (which governs
+        /// terminal priors). One of: `unspecified` (default), `fail`,
+        /// `use_existing`, `terminate_existing`.
+        #[arg(long, value_name = "POLICY")]
+        conflict_policy: Option<String>,
         /// Target ISO 8601 / RFC 3339 timestamp to start the workflow.
         #[arg(long)]
         start_at: Option<String>,
@@ -4365,6 +4371,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             search_attrs_file,
             execution_timeout_secs,
             reuse_policy,
+            conflict_policy,
             start_at,
             delay,
         } => {
@@ -4398,6 +4405,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 body.insert("execution_timeout_secs".to_string(), json!(timeout));
             }
             insert_string(&mut body, "reuse_policy", reuse_policy.as_deref());
+            insert_string(&mut body, "conflict_policy", conflict_policy.as_deref());
             insert_string(&mut body, "start_at", start_at.as_deref());
             insert_string(&mut body, "delay", delay.as_deref());
 
@@ -7269,6 +7277,100 @@ mod reuse_policy_tests {
         assert!(rendered.contains("10.00"));
         assert!(rendered.contains("8.50"));
         assert!(rendered.contains("2026-05-22T22:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod conflict_policy_tests {
+    //! CLI mapping tests for `--conflict-policy` on `workflow start` (issue #685).
+    //! Mirror `mod reuse_policy_tests`: omit → no field; each of the 4 values
+    //! sends the correct snake_case string; preserves other fields alongside.
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn start_request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn start_omitting_conflict_policy_sends_no_field() {
+        let req = start_request(&["workflow", "start", "my_wf"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert!(
+            body.get("conflict_policy").is_none(),
+            "omitting --conflict-policy must not send the field"
+        );
+    }
+
+    #[test]
+    fn start_unspecified_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--conflict-policy",
+            "unspecified",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["conflict_policy"], "unspecified");
+    }
+
+    #[test]
+    fn start_fail_sends_correct_value() {
+        let req = start_request(&["workflow", "start", "my_wf", "--conflict-policy", "fail"]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["conflict_policy"], "fail");
+    }
+
+    #[test]
+    fn start_use_existing_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--conflict-policy",
+            "use_existing",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["conflict_policy"], "use_existing");
+    }
+
+    #[test]
+    fn start_terminate_existing_sends_correct_value() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--conflict-policy",
+            "terminate_existing",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["conflict_policy"], "terminate_existing");
+    }
+
+    #[test]
+    fn start_preserves_other_fields_alongside_conflict_policy() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--workflow-id",
+            "wf-123",
+            "--reuse-policy",
+            "terminate_if_running",
+            "--conflict-policy",
+            "use_existing",
+        ]);
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["workflow_id"], "wf-123");
+        assert_eq!(body["reuse_policy"], "terminate_if_running");
+        assert_eq!(body["conflict_policy"], "use_existing");
     }
 }
 
