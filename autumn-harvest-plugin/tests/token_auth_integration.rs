@@ -20,6 +20,12 @@
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
+// Local `#[derive(QueryableByName)]` row structs are declared next to the query
+// that uses them, mid-function — a common test idiom that trips this pedantic lint.
+#![allow(clippy::items_after_statements)]
+// `"actor must be token:{{id}}"` is a diagnostic message with intentional literal
+// braces, not a format argument.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 use std::sync::Arc;
 
@@ -35,7 +41,6 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};

@@ -229,10 +229,7 @@ pub(crate) fn looks_like_harvest_token(bearer: &str) -> bool {
 /// The boundary is inclusive: a token whose `expires_at == now` is expired.
 #[must_use]
 pub(crate) fn is_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    match expires_at {
-        Some(at) => at <= now,
-        None => false,
-    }
+    expires_at.is_some_and(|at| at <= now)
 }
 
 /// The scope-gate decision (issue #942, AC3/AC4): reuses the #776
@@ -313,8 +310,8 @@ pub(crate) async fn lookup_by_secret(
     conn: &mut AsyncPgConnection,
     secret: &str,
 ) -> HarvestResult<Option<ApiToken>> {
-    let hash = hash_secret(secret);
     use harvest_api_tokens::dsl;
+    let hash = hash_secret(secret);
     match dsl::harvest_api_tokens
         .filter(dsl::token_hash.eq(hash))
         .select(ApiToken::as_select())
@@ -398,9 +395,8 @@ pub async fn enforce_token_scope(
     let Ok(pool) = api_state.storage_pool() else {
         return service_unavailable("harvest token store unavailable");
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(_) => return service_unavailable("harvest token store unavailable"),
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return service_unavailable("harvest token store unavailable");
     };
 
     let token = match lookup_by_secret(&mut conn, &secret).await {
@@ -476,9 +472,8 @@ pub async fn enforce_token_scope_mcp_mutation(
     let Ok(pool) = api_state.storage_pool() else {
         return service_unavailable("harvest token store unavailable");
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(_) => return service_unavailable("harvest token store unavailable"),
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return service_unavailable("harvest token store unavailable");
     };
     let token = match lookup_by_secret(&mut conn, &secret).await {
         Ok(Some(t)) => t,
