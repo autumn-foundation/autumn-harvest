@@ -4692,15 +4692,18 @@ async fn persist_scheduled_activities(
 
         if let Some(expr) = activity.rate_limit_key_expr {
             // A dynamic per-key rate limit requires an `rps` to derive its
-            // bucket refill rate from. `HarvestBuilder::try_build` rejects a
-            // dynamic key without one (RateLimitKeyExprWithoutCap), but a worker
-            // built via a direct `HandlerRegistry` bypasses that validation. Fail
-            // the schedule transaction loudly here rather than silently enqueuing
-            // the activity with NO rate limit (issue #699 review, Codex P2):
-            // without this guard the `if let Some(refill_rate)` block below is
-            // skipped entirely, leaving both `params.rate_limit_key` and
-            // `dynamic_rate_buckets` unset, so the activity runs unrated -- the
-            // exact failure a rate-limiting feature exists to prevent.
+            // bucket refill rate from. `HarvestBuilder::try_build` AND the
+            // worker-startup gate (`crate::builder::validate_activity_rate_limits`,
+            // now run from `Worker::new`) both reject a dynamic key without one
+            // (RateLimitKeyExprWithoutCap). This schedule-time guard STAYS as
+            // defense-in-depth (the startup validation is the primary
+            // comprehensive gate as of issue #699 review, Codex round-5 P2):
+            // fail the schedule transaction loudly here rather than silently
+            // enqueuing the activity with NO rate limit -- without this guard the
+            // `if let Some(refill_rate)` block below is skipped entirely, leaving
+            // both `params.rate_limit_key` and `dynamic_rate_buckets` unset, so
+            // the activity runs unrated, the exact failure a rate-limiting
+            // feature exists to prevent.
             let Some(refill_rate) = activity.rate_limit_rps else {
                 return Err(HarvestError::Config(format!(
                     "activity '{}' declares a dynamic rate_limit(key = \"{}\") but has no \
@@ -4732,16 +4735,17 @@ async fn persist_scheduled_activities(
             }
             params.rate_limit_key = Some(bucket_key);
         } else {
-            // A static `rate_limit_key` reaching the worker via a direct
-            // `HandlerRegistry` bypasses both the macro parse-site reject and
-            // `HarvestBuilder::try_build`'s reserved-prefix validation. A static
-            // key beginning with the reserved `dyn-rate:` prefix would collide
-            // with the generated dynamic per-key buckets, and since startup
-            // registration and lazy dynamic registration both
-            // `INSERT ... ON CONFLICT (key) DO NOTHING`, the bucket's
-            // rate/burst would become insertion-order dependent. Fail the
-            // schedule transaction loudly here, mirroring the dynamic-no-rps
-            // guard above (issue #699 review, Codex P2). The literal mirrors
+            // A static `rate_limit_key` beginning with the reserved `dyn-rate:`
+            // prefix would collide with the generated dynamic per-key buckets,
+            // and since startup registration and lazy dynamic registration both
+            // `INSERT ... ON CONFLICT (key) DO NOTHING`, the bucket's rate/burst
+            // would become insertion-order dependent. The macro parse-site
+            // reject, `HarvestBuilder::try_build`, AND the worker-startup gate
+            // (`crate::builder::validate_activity_rate_limits`, run from
+            // `Worker::new`) all reject this now; this schedule-time guard STAYS
+            // as defense-in-depth behind the primary startup gate (issue #699
+            // review, Codex round-5 P2). Fail the schedule transaction loudly
+            // here, mirroring the dynamic-no-rps guard above. The literal mirrors
             // `queue::DYNAMIC_RATE_PREFIX` (`"dyn-rate"`) + `":"`, matching the
             // builder's own static-key reject.
             if let Some(key) = activity.rate_limit_key
@@ -12966,6 +12970,21 @@ impl Worker {
                 )));
             }
         }
+
+        // Comprehensive rate-limit validation (issue #699, Codex round-5 P2).
+        // A `HandlerRegistry` built directly (not via `HarvestBuilder::try_build`)
+        // bypasses ALL builder validation, so an invalid rate-limit config
+        // (a dynamic `rate_limit(key = …)` on a local activity, a dynamic key
+        // without an rps, or two activities sharing a normalized key-expression
+        // with conflicting rps/burst) would otherwise slip past and only be
+        // caught piecemeal — or not at all — at schedule time. Run the same
+        // shared validator the builder runs, here at the fallible worker-startup
+        // boundary, so the whole class fails loud ONCE before the poll loop and
+        // first enqueue. The ad-hoc schedule-time guards in
+        // `persist_scheduled_activities`/`register_rate_limit_buckets` remain as
+        // defense-in-depth; this startup gate is the primary comprehensive check.
+        crate::builder::validate_activity_rate_limits(registry.activities.values())
+            .map_err(|err| HarvestError::Config(err.to_string()))?;
 
         let mut ineligible_activities = Vec::new();
         for activity in registry.activities.values() {

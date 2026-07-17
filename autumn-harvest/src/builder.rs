@@ -645,6 +645,26 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
+    /// A local activity declares a dynamic per-key rate limit
+    /// (issue #699, `rate_limit(key = "…")`). Local activities run inline on
+    /// the workflow worker via `run_local_activity_inline`, bypassing the
+    /// task-dispatch / enqueue path where per-key rate limiting is enforced, so
+    /// the limit would be silently unenforced. The `#[activity]` macro rejects
+    /// this at parse time; a hand-built `ActivityInfo` (a directly-constructed
+    /// `HandlerRegistry`) bypasses the macro, so it is rejected here too.
+    #[error(
+        "activity '{activity}' is local (is_local = true) but declares a dynamic \
+         rate_limit(key = \"{key}\"); local activities run inline on the workflow worker \
+         and bypass the task-dispatch path where per-key rate limiting is enforced, so the \
+         limit would be silently unenforced -- remove `local = true` or the rate_limit(key = ...)"
+    )]
+    RateLimitKeyExprOnLocalActivity {
+        /// The activity name.
+        activity: String,
+        /// The dynamic key expression.
+        key: String,
+    },
+
     /// A completion trigger references an unknown workflow name as a source or target.
     #[non_exhaustive]
     #[error(
@@ -1827,7 +1847,7 @@ impl HarvestBuilder {
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
-        validate_rate_limit_keys(&self.activities)?;
+        validate_activity_rate_limits(&self.activities)?;
         #[cfg(feature = "wasm-activities")]
         validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
@@ -2236,8 +2256,41 @@ struct RateLimitKeyEntry {
 }
 
 /// Verify that rate limiting attributes on activities are consistent and valid.
-fn validate_rate_limit_keys(
-    activities: &[crate::info::ActivityInfo],
+/// Validate every activity's rate-limit configuration (issue #699).
+///
+/// This is the single, comprehensive rate-limit gate. It is called from
+/// [`HarvestBuilder::try_build`] (the builder path) **and** from
+/// [`crate::worker::Worker::new`] (the direct-`HandlerRegistry` / worker-startup
+/// path), so a worker constructed without going through the builder still
+/// fails loud, once, before its poll loop and first enqueue — rather than
+/// slipping an invalid config past the piecemeal schedule-time guards in
+/// `persist_scheduled_activities` (issue #699 review, Codex round-5 P2).
+///
+/// Checks, per activity:
+/// - a dynamic `rate_limit(key = …)` on a **local** activity — local activities
+///   run inline and bypass the dispatch path entirely, so the limit would be
+///   silently unenforced ([`HarvestBuilderError::RateLimitKeyExprOnLocalActivity`]);
+/// - a dynamic `rate_limit(key = …)` without an `rps`
+///   ([`HarvestBuilderError::RateLimitKeyExprWithoutCap`]);
+/// - two activities sharing a normalized dynamic key-expression that declare
+///   different `rps`/`burst` — the shared bucket's config would become
+///   insertion-order dependent under `ON CONFLICT DO NOTHING`
+///   ([`HarvestBuilderError::RateLimitKeyMismatch`]);
+/// - a static `rate_limit_key` squatting the reserved `dyn-rate:` prefix
+///   ([`HarvestBuilderError::RateLimitKeyReservedPrefix`]);
+/// - a static `rate_limit_key`/`rate_limit_burst` without `rps`;
+/// - two activities sharing a static key with different `rps`/`burst`.
+///
+/// Accepts an iterator of `&ActivityInfo` rather than a slice so both the
+/// builder's `Vec<ActivityInfo>` and the worker registry's
+/// `HashMap<String, ActivityInfo>::values()` can be validated without an owned
+/// copy (`ActivityInfo` is not `Clone`). Mismatch detection is order-independent
+/// (any two disagreeing configs reject regardless of which is seen first), so
+/// the registry's non-deterministic iteration order does not affect whether a
+/// conflicting set is rejected — only cosmetic ordering within the error's
+/// contributor list.
+pub(crate) fn validate_activity_rate_limits<'a>(
+    activities: impl IntoIterator<Item = &'a crate::info::ActivityInfo>,
 ) -> Result<(), HarvestBuilderError> {
     use std::collections::HashMap;
 
@@ -2253,6 +2306,21 @@ fn validate_rate_limit_keys(
         // never touches the static path below (its static `rate_limit_key` is
         // suppressed by the macro).
         if let Some(key_expr) = activity.rate_limit_key_expr {
+            // A dynamic per-key rate limit on a LOCAL activity is silently
+            // unenforced: local activities run inline via
+            // `run_local_activity_inline`, bypassing the task-dispatch/enqueue
+            // path where per-key rate limiting lives. The `#[activity]` macro
+            // rejects this at parse time, but a hand-built `ActivityInfo`
+            // (direct `HandlerRegistry`) bypasses the macro. Fail loud
+            // (issue #699 review, Codex round-5 P2). (Scope: this rejects the
+            // DYNAMIC form only; the pre-existing static-rate-on-local #332
+            // asymmetry is a documented follow-up, not expanded here.)
+            if activity.is_local {
+                return Err(HarvestBuilderError::RateLimitKeyExprOnLocalActivity {
+                    activity: activity.name.to_string(),
+                    key: key_expr.to_string(),
+                });
+            }
             // A dynamic key expression needs a rate to bucket against.
             let Some(rps) = activity.rate_limit_rps else {
                 return Err(HarvestBuilderError::RateLimitKeyExprWithoutCap {

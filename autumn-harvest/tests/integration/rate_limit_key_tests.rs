@@ -31,7 +31,7 @@ use autumn_harvest::queue::{
     self, EnqueueParams, TaskType, claim_task, dynamic_rate_bucket_key, ensure_rate_limit_bucket,
 };
 use autumn_harvest::types::{ExecutionId, Priority};
-use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::worker::{HandlerRegistry, Worker};
 use autumn_harvest::{
     StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution,
 };
@@ -726,36 +726,112 @@ async fn success_metric_cross_key_burst_fairness() {
     }
 }
 
-// ── Issue #699 review (Codex P2): fail-loud on an invalid dynamic key ─────────
+// ── Issue #699 review (Codex round-5 P2): comprehensive worker-startup gate ───
+//
+// The public `HandlerRegistry` path bypasses ALL `HarvestBuilder::try_build`
+// rate-limit validation, so an invalid config used to slip through and only be
+// caught piecemeal (or not at all) by the schedule-time guards in
+// `persist_scheduled_activities`. The class fix runs the SAME shared validator
+// (`crate::builder::validate_activity_rate_limits`) at the fallible
+// `Worker::new` startup boundary, so every invalid rate-limit config fails
+// loud ONCE at startup, before the poll loop and first enqueue. These tests
+// build a `HandlerRegistry` DIRECTLY (bypassing `try_build`) and assert
+// `Worker::new` returns `Err` (or `Ok` for a valid set). The schedule-time
+// guards remain as defense-in-depth behind this primary gate.
 
-#[tokio::test]
-async fn dynamic_rate_limit_key_without_rps_fails_schedule_not_silently_unrated() {
-    // An application that builds the public `HandlerRegistry` DIRECTLY bypasses
-    // `HarvestBuilder::try_build`'s validation (RateLimitKeyExprWithoutCap), so an
-    // `ActivityInfo { rate_limit_key_expr: Some(..), rate_limit_rps: None, .. }`
-    // can reach `persist_scheduled_activities`. It MUST fail the schedule
-    // transaction loudly rather than silently enqueue the activity with NO rate
-    // limit -- the exact failure a rate-limiting feature exists to prevent.
-    let (url, _guard) = crate::integration_e2e::setup_test_database_url_or_env().await;
-    let mut conn = connect(&url).await;
+/// A dynamic per-key rate limit on a LOCAL activity is silently unenforced:
+/// local activities run inline via `run_local_activity_inline`, bypassing the
+/// task-dispatch/enqueue path where per-key rate limiting lives. The
+/// `#[activity]` macro rejects this at parse time, but a hand-built
+/// `ActivityInfo` (direct `HandlerRegistry`) bypasses the macro. The
+/// worker-startup gate must reject it (Codex round-5 P2, worker.rs:4693).
+#[test]
+fn worker_startup_rejects_dynamic_rate_limit_on_local_activity() {
+    // `charge_info()` is a valid dynamic-key activity (key = input.tenant_id,
+    // rps = 50). Flip `is_local` to reproduce the exact state the macro would
+    // reject but a direct `HandlerRegistry` build leaves unvalidated.
+    let mut local_dynamic = charge_info();
+    assert!(
+        local_dynamic.rate_limit_key_expr.is_some(),
+        "charge must be a dynamic-key activity for this test to be meaningful"
+    );
+    local_dynamic.is_local = true; // <- the invalid, unvalidated state
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![tenant_wf_info()],
+        vec![local_dynamic],
+    ));
 
-    let exec = ExecutionId::new();
-    start_or_load_workflow_execution(
-        &mut conn,
-        resolution_start_params(
-            "wf-bad-rps",
-            exec,
-            serde_json::json!({ "tenant_id": "acme" }),
-        ),
-        None,
-    )
-    .await
-    .expect("start");
+    let result = Worker::new(
+        crate::integration_e2e::runtime_config("rlk-local-dynamic-worker", 2, 2, Duration::from_secs(10)),
+        registry,
+    );
+    let err = result.expect_err(
+        "a local activity declaring a dynamic rate_limit(key = ...) must be rejected at worker startup, \
+         not silently run inline unrated",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("charge") && msg.contains("local"),
+        "startup error must name the offending local activity and the local-bypass reason, got: {msg}"
+    );
+}
 
-    // Build the activity DIRECTLY with the invalid declaration: a dynamic
-    // `rate_limit_key_expr` but NO `rps`. The macro-generated `charge_info()` is a
-    // valid dynamic-key activity (rps = 50); we strip the rps to reproduce the
-    // exact state a direct `HandlerRegistry` build would leave unvalidated.
+/// Two activities sharing a normalized dynamic key-expression that declare
+/// DIFFERENT `rps` must be rejected: both register the same composite bucket
+/// `ON CONFLICT DO NOTHING`, so the bucket's rate/burst would become
+/// insertion-order dependent. The builder path (`try_build`) already rejects
+/// this; the worker-startup gate must too (Codex round-5 P2, worker.rs:4826).
+#[test]
+fn worker_startup_rejects_conflicting_rps_for_same_key_expr() {
+    // Two dynamic-key activities on the SAME normalized expression
+    // (`input.tenant_id`) but with different rps values (50 vs 100).
+    let a = charge_info(); // rps = 50, key = input.tenant_id
+    assert_eq!(a.rate_limit_rps, Some(50.0));
+    let mut b = charge_info();
+    b.name = "charge_conflict"; // distinct name so the HashMap keeps both
+    b.rate_limit_rps = Some(100.0); // <- conflicting rps for the same key expr
+    let registry = Arc::new(HandlerRegistry::new(vec![tenant_wf_info()], vec![a, b]));
+
+    let result = Worker::new(
+        crate::integration_e2e::runtime_config("rlk-conflict-worker", 2, 2, Duration::from_secs(10)),
+        registry,
+    );
+    let err = result.expect_err(
+        "two activities sharing a dynamic key expression with different rps must be rejected at worker \
+         startup -- the shared bucket's rate/burst would be insertion-order dependent",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tenant_id"),
+        "startup error must name the conflicting key expression, got: {msg}"
+    );
+}
+
+/// A VALID directly-built registry (a well-formed dynamic-key activity) must
+/// still build a worker without a false positive.
+#[test]
+fn worker_startup_accepts_valid_direct_registry() {
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![tenant_wf_info()],
+        vec![charge_info()], // valid: key = input.tenant_id, rps = 50
+    ));
+    let result = Worker::new(
+        crate::integration_e2e::runtime_config("rlk-valid-worker", 2, 2, Duration::from_secs(10)),
+        registry,
+    );
+    assert!(
+        result.is_ok(),
+        "a valid direct-registry rate-limit config must build a worker (no false positive), got: {:?}",
+        result.err(),
+    );
+}
+
+/// A dynamic `rate_limit(key = ...)` WITHOUT an `rps` reaching the worker via a
+/// direct `HandlerRegistry` must fail loud at the startup gate rather than run
+/// unrated (the primary gate as of Codex round-5 P2; the schedule-time guard in
+/// `persist_scheduled_activities` stays as defense-in-depth behind it).
+#[test]
+fn worker_startup_rejects_dynamic_key_without_rps() {
     let mut bad_charge = charge_info();
     assert!(
         bad_charge.rate_limit_key_expr.is_some(),
@@ -767,70 +843,29 @@ async fn dynamic_rate_limit_key_without_rps_fails_schedule_not_silently_unrated(
         vec![bad_charge],
     ));
 
-    let worker = crate::integration_e2e::build_runtime_worker("rlk-bad-rps-worker", 2, 2, registry);
-    let pool = crate::integration_e2e::build_test_pool(&url);
-    let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
-
-    // Give the worker time to attempt the schedule; each attempt must error on the
-    // guard and roll back its transaction (a fast Config error, never a hang).
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    worker.shutdown();
-    let _ = handle.await;
-
-    // The workflow MUST NOT complete: the guard fails the suspension/schedule
-    // transaction on every attempt.
-    assert_ne!(
-        task_state_workflow(&mut conn, exec).await,
-        "COMPLETED",
-        "an invalid dynamic-key-without-rps activity must never let the workflow complete"
+    let result = Worker::new(
+        crate::integration_e2e::runtime_config("rlk-bad-rps-worker", 2, 2, Duration::from_secs(10)),
+        registry,
     );
-    // And the activity MUST NEVER have been enqueued: the guard fires BEFORE the
-    // ActivityScheduled event / task row is persisted, so the activity can never
-    // run unrated.
-    let charge_rows = scalar_i64(
-        &mut conn,
-        "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue WHERE activity_name=$1",
-        "charge",
-    )
-    .await;
-    assert_eq!(
-        charge_rows, 0,
-        "the invalid activity must never be enqueued -- silently running unrated is exactly what the guard prevents"
+    let err = result.expect_err(
+        "a dynamic rate_limit(key = ...) without rps must be rejected at worker startup, not silently \
+         run unrated -- the exact failure a rate-limiting feature exists to prevent",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("charge") && msg.contains("rps"),
+        "startup error must name the offending activity and the missing rps, got: {msg}"
     );
 }
 
-#[tokio::test]
-async fn static_rate_limit_key_with_reserved_dyn_rate_prefix_fails_schedule() {
-    // A STATIC `rate_limit_key` beginning with the reserved `dyn-rate:` prefix
-    // reaching the worker via a direct `HandlerRegistry` bypasses both the macro
-    // parse-site reject and `HarvestBuilder::try_build`'s reserved-prefix
-    // validation (RateLimitKeyReservedPrefix). It MUST fail the schedule
-    // transaction loudly rather than register a bucket that collides with the
-    // generated dynamic per-key namespace -- because startup and lazy dynamic
-    // registration both `ON CONFLICT DO NOTHING`, a colliding key's rate/burst
-    // would otherwise become insertion-order dependent (issue #699 review,
-    // Codex P2).
-    let (url, _guard) = crate::integration_e2e::setup_test_database_url_or_env().await;
-    let mut conn = connect(&url).await;
-
-    let exec = ExecutionId::new();
-    start_or_load_workflow_execution(
-        &mut conn,
-        resolution_start_params(
-            "wf-reserved-static-key",
-            exec,
-            serde_json::json!({ "tenant_id": "acme" }),
-        ),
-        None,
-    )
-    .await
-    .expect("start");
-
-    // Build the activity DIRECTLY with the invalid static declaration: NO
-    // dynamic `rate_limit_key_expr`, but a static `rate_limit_key` that squats
-    // the reserved `dyn-rate:` namespace (using the current L/H composite-key
-    // encoding). This is the exact state a direct `HandlerRegistry` build would
-    // leave unvalidated.
+/// A STATIC `rate_limit_key` beginning with the reserved `dyn-rate:` prefix
+/// reaching the worker via a direct `HandlerRegistry` must fail loud at the
+/// startup gate rather than register a bucket colliding with the generated
+/// dynamic per-key namespace (the primary gate as of Codex round-5 P2; the
+/// schedule-time guard in `persist_scheduled_activities` stays as
+/// defense-in-depth behind it).
+#[test]
+fn worker_startup_rejects_reserved_static_prefix() {
     let mut bad_charge = charge_info();
     bad_charge.rate_limit_key_expr = None; // static mode
     bad_charge.rate_limit_key = Some("dyn-rate:L9:tenant_id:L4:acme");
@@ -840,45 +875,17 @@ async fn static_rate_limit_key_with_reserved_dyn_rate_prefix_fails_schedule() {
         vec![bad_charge],
     ));
 
-    let worker =
-        crate::integration_e2e::build_runtime_worker("rlk-reserved-static-worker", 2, 2, registry);
-    let pool = crate::integration_e2e::build_test_pool(&url);
-    let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
-
-    // Each schedule attempt must error on the guard and roll back (a fast Config
-    // error, never a hang).
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    worker.shutdown();
-    let _ = handle.await;
-
-    // The workflow MUST NOT complete: the guard fails the suspension/schedule
-    // transaction on every attempt.
-    assert_ne!(
-        task_state_workflow(&mut conn, exec).await,
-        "COMPLETED",
-        "a static rate_limit_key squatting the reserved `dyn-rate:` prefix must never let the workflow complete"
+    let result = Worker::new(
+        crate::integration_e2e::runtime_config("rlk-reserved-static-worker", 2, 2, Duration::from_secs(10)),
+        registry,
     );
-    // And the activity MUST NEVER have been enqueued: the guard fires BEFORE the
-    // ActivityScheduled event / task row is persisted.
-    let charge_rows = scalar_i64(
-        &mut conn,
-        "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue WHERE activity_name=$1",
-        "charge",
-    )
-    .await;
-    assert_eq!(
-        charge_rows, 0,
-        "the reserved-prefix static-key activity must never be enqueued"
+    let err = result.expect_err(
+        "a static rate_limit_key squatting the reserved `dyn-rate:` prefix must be rejected at worker \
+         startup -- it would race first-writer-wins on a colliding bucket's rate/burst",
     );
-    // And no colliding bucket row must have been registered under the reserved key.
-    let bucket_rows = scalar_i64(
-        &mut conn,
-        "SELECT COUNT(*)::bigint AS n FROM harvest_rate_limit_buckets WHERE key=$1",
-        "dyn-rate:L9:tenant_id:L4:acme",
-    )
-    .await;
-    assert_eq!(
-        bucket_rows, 0,
-        "the reserved-prefix static key must never register a colliding bucket row"
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dyn-rate:") && msg.contains("charge"),
+        "startup error must name the offending reserved-prefix static key and activity, got: {msg}"
     );
 }
