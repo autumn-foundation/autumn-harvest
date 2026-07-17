@@ -123,6 +123,103 @@ async fn sse_stream_returns_service_unavailable_when_not_configured() {
     );
 }
 
+// ── Progress stream (issue #791) ──────────────────────────────────────────────
+
+#[test]
+fn progress_stream_route_is_registered_in_management_api_routes() {
+    let routes = management_api_routes();
+    assert!(
+        routes.contains(&("GET", "/workflows/{id}/stream")),
+        "progress stream route not found in management_api_routes(); \
+         add it to the router and the canonical route list"
+    );
+}
+
+#[test]
+fn progress_stream_route_is_classified_as_read_only() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+    let route = "GET /workflows/{id}/stream";
+    let classification = CLASSIFIED_ROUTES
+        .iter()
+        .find(|(r, _)| *r == route)
+        .map(|(_, c)| c);
+    assert_eq!(
+        classification,
+        Some(&RouteClass::ReadOnly),
+        "progress stream route '{route}' must be classified as ReadOnly in CLASSIFIED_ROUTES"
+    );
+}
+
+/// AC5: the progress stream is deliberately NOT admin-gated — an app's
+/// end-users stream their own workflows. Prove it by contrast: with the admin
+/// boundary closed and no session, the admin-gated events stream rejects the
+/// request (401), while the same unauthenticated request to the progress stream
+/// REACHES the handler (never 401/403; here it fails config-side because no
+/// notification URL is set). This is the exact posture #791 AC5 requires.
+#[tokio::test]
+async fn progress_stream_is_not_admin_gated() {
+    use autumn_web::reexports::axum::body::Body;
+    use autumn_web::reexports::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    // Default state: admin boundary NOT open, no session, no notification URL.
+    let app = autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
+        .with_state(autumn_web::AppState::for_test());
+
+    let uuid = "00000000-0000-0000-0000-000000000001";
+
+    // The admin-gated events stream (#324) rejects an unauthenticated request.
+    let admin_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/executions/{uuid}/events/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "control: the admin-gated events stream must reject an unauthenticated request"
+    );
+
+    // The progress stream reaches the handler for the SAME request (not admin-gated).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/workflows/{uuid}/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "progress stream must NOT be admin-gated (issue #791 AC5)"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "progress stream must NOT be admin-gated (issue #791 AC5)"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "progress stream route must be registered"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "progress stream route registered with wrong HTTP method"
+    );
+}
+
 #[tokio::test]
 async fn sse_stream_route_exists_in_router() {
     use autumn_web::reexports::axum::body::Body;
