@@ -110,7 +110,7 @@ impl std::fmt::Display for TaskType {
 /// collide with either.
 pub const DYNAMIC_RATE_PREFIX: &str = "dyn-rate";
 
-/// Maximum length (chars) of the *resolved* portion of a dynamic per-key bucket
+/// Maximum length (bytes) of the *resolved* portion of a dynamic per-key bucket
 /// key before it is replaced with a stable hash (issue #699, btree-PK safety).
 ///
 /// The composite key is the PRIMARY KEY of `harvest_rate_limit_buckets`. A
@@ -138,11 +138,13 @@ const MAX_RESOLVED_KEY_LEN: usize = 256;
 /// same field, so the two spellings must resolve to the same bucket — the strip
 /// here mirrors the strip in [`crate::builder`]'s dynamic-key validation.
 ///
-/// `resolved` is length-bounded ([`MAX_RESOLVED_KEY_LEN`]): a value longer than
-/// the bound is replaced with a stable `seahash` digest so a pathological
-/// resolved value can never blow the btree PK size limit and wedge the enqueue
-/// transaction. Short values pass through unchanged (human-readable), and two
-/// distinct long values hash to distinct keys.
+/// `resolved` is byte-length-bounded ([`MAX_RESOLVED_KEY_LEN`]): a value whose
+/// UTF-8 byte length exceeds the bound is replaced with a stable `seahash`
+/// digest so a pathological resolved value can never blow the btree PK size
+/// limit and wedge the enqueue transaction. The byte-length check matches the
+/// Postgres btree PK limit (which is byte-based) and is O(1) on the hot enqueue
+/// path. Short values pass through unchanged (human-readable), and two distinct
+/// long values hash to distinct keys.
 ///
 /// The `:` delimiter is injective in practice: `key_expr` is a trusted
 /// compile-time dot-path (no `:`), and `resolved` is either a length-bounded
@@ -151,7 +153,7 @@ const MAX_RESOLVED_KEY_LEN: usize = 256;
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    if resolved.chars().count() > MAX_RESOLVED_KEY_LEN {
+    if resolved.len() > MAX_RESOLVED_KEY_LEN {
         // Deterministic, collision-resistant digest of the oversized value; the
         // `h:` marker keeps it visibly a hash and distinct from short literals.
         let digest = seahash::hash(resolved.as_bytes());
