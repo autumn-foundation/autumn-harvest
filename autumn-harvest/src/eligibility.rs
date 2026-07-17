@@ -1,3 +1,10 @@
+//! Worker routing and task capability requirements.
+//!
+//! This module defines how workflows and activities can specify constraints (requirements)
+//! that a worker must meet in order to be eligible to execute them. By attaching labels
+//! or capabilities to workers, the platform can dynamically route work to nodes with specific
+//! hardware, regions, or configurations (e.g., `gpu = "true"`, `region in ["eu-west-1", "eu-central-1"]`).
+
 use std::collections::HashMap;
 
 /// A single capability requirement for task execution.

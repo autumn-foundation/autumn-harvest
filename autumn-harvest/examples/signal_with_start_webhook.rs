@@ -89,6 +89,7 @@ async fn handle_webhook_after(
             execution_timeout: None,
             memo: None,
             search_attrs: None,
+            start_source_override: None,
             // Idempotent attach to an existing live run; reject if duplicate
             // starts must never happen (e.g., financial onboarding flows).
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,

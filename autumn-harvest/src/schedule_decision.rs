@@ -1,3 +1,11 @@
+//! Records and audits scheduler firing decisions.
+//!
+//! When the platform's scheduler polls for schedules that are due, it determines whether
+//! to fire the schedule, skip it, or wait for an overlapping execution to finish.
+//! This module provides the DB persistence layer for recording these decisions
+//! (`harvest_schedule_decisions`), giving operators an audit trail of why a schedule
+//! was triggered or skipped at any given time.
+
 use crate::models::NewScheduleDecision;
 use crate::schema::harvest_schedule_decisions;
 use crate::telemetry::MetricsRecorder;

@@ -1,3 +1,15 @@
+//! Fire-and-forget workflow completion hooks (issue #499).
+//!
+//! Completion triggers act as the "connective tissue" between decoupled workflows.
+//! Instead of a parent workflow synchronously awaiting a child, a completion trigger
+//! allows a target workflow to be enqueued automatically when a source workflow
+//! reaches a terminal state (`COMPLETED`, `FAILED`, `TIMED_OUT`, or `CANCELLED`).
+//!
+//! This module defines the types for specifying trigger behaviors, including:
+//! - Condition evaluation via [`TriggerCondition`] (e.g., triggering only on success).
+//! - Data projection via [`InputMapping`] (e.g., feeding the source's output into the target).
+//! - Resolution of SLA and retry policies for the target execution.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -438,6 +450,33 @@ impl CompletionTrigger {
     }
 }
 
+/// Extracts a nested value from a JSON structure using a dot-separated path.
+///
+/// This function powers the [`TriggerCondition`] evaluations, allowing workflow
+/// operators to conditionally fire triggers based on deeply nested fields in the
+/// source workflow's recorded output. If the path is not found, or if an intermediate
+/// node is not an object, it returns `Value::Null`.
+///
+/// ## Examples
+///
+/// ```rust
+/// use serde_json::json;
+/// use autumn_harvest::completion_trigger::project_json_path;
+///
+/// let data = json!({
+///     "user": {
+///         "metadata": {
+///             "role": "admin"
+///         }
+///     }
+/// });
+///
+/// // Successful extraction
+/// assert_eq!(project_json_path(&data, "user.metadata.role"), json!("admin"));
+///
+/// // Missing paths resolve to Null
+/// assert_eq!(project_json_path(&data, "user.missing"), json!(null));
+/// ```
 #[must_use]
 pub fn project_json_path(value: &Value, path: &str) -> Value {
     project_json_path_opt(value, path)
@@ -608,6 +647,13 @@ pub static GLOBAL_DEFAULT_WORKFLOW_QUEUE: std::sync::RwLock<Option<String>> =
 pub static GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING: std::sync::RwLock<Option<u32>> =
     std::sync::RwLock::new(None);
 
+/// Resolves the queue name for a target workflow enqueued by a completion trigger.
+///
+/// Workflow schedules (which map a workflow name to a queue) are typically stored
+/// on the default shard. This function queries the database to find the queue
+/// explicitly assigned to `target_workflow_name`. If the target shard is not the default,
+/// it will attempt to acquire a connection to the default shard's pool. If no schedule
+/// mapping is found, it falls back to the configured `default_workflow_queue()`.
 #[cfg(feature = "db")]
 pub async fn resolve_target_queue(
     conn: &mut diesel_async::AsyncPgConnection,
