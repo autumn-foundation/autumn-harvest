@@ -61,6 +61,62 @@ pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 /// Values longer than this cap are truncated to this length on the byte boundary.
 pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
 
+/// Maximum serialized byte length of a single [`publish_progress`] chunk
+/// (issue #791).
+///
+/// Postgres `NOTIFY` has a hard **8000-byte** payload limit. Progress chunks are
+/// wrapped in a `{"seq":..,"chunk":..}` envelope
+/// ([`ProgressNotifyPayload`](crate::notify::ProgressNotifyPayload)) that adds a
+/// small, bounded prefix (`{"seq":<=20 digits,"chunk":}` ≈ 40 bytes), so chunk
+/// content is capped **below** 8000 to leave headroom for the envelope. A chunk
+/// whose serialized JSON exceeds this cap is **replaced** with a truncation
+/// marker (`{"_harvest_progress_truncated": true, "bytes": <original_len>}`)
+/// rather than dropped, so the ordered `seq` slot survives and the SSE client
+/// learns content was cut.
+///
+/// [`publish_progress`]: WorkflowContext::publish_progress
+pub const PROGRESS_CHUNK_MAX_BYTES: usize = 7000;
+
+/// Bits reserved for the per-cycle local index in a progress `seq` (issue #791).
+///
+/// A progress `seq` is `(epoch << PROGRESS_SEQ_LOCAL_BITS) | local_index`, where
+/// `epoch` is the loaded-history length at the current decision cycle's start
+/// (it strictly grows across cycles, so seq is monotonic over the whole
+/// execution lifetime) and `local_index` is a per-cycle 0-based counter. The
+/// low 24 bits hold up to ~16.7M chunks per cycle before `local_index`
+/// saturates.
+const PROGRESS_SEQ_LOCAL_BITS: u32 = 24;
+
+/// Mask isolating the per-cycle local-index bits of a progress `seq` (issue #791).
+const PROGRESS_SEQ_LOCAL_MASK: u64 = (1u64 << PROGRESS_SEQ_LOCAL_BITS) - 1;
+
+/// Stride between successive epochs in a progress `seq` (`= 1 << PROGRESS_SEQ_LOCAL_BITS`).
+const PROGRESS_SEQ_LOCAL_STRIDE: u64 = 1u64 << PROGRESS_SEQ_LOCAL_BITS;
+
+/// Encode a monotonic, epoch-prefixed progress `seq` (issue #791).
+///
+/// `epoch` (the loaded-history length at the cycle's start) is placed in the high
+/// bits and `local_index` (per-cycle 0-based) in the low
+/// [`PROGRESS_SEQ_LOCAL_BITS`] bits. Because `epoch` strictly grows across
+/// decision cycles (a cycle that publishes always appends ≥1 event before the
+/// next cycle loads), the resulting `seq` is **strictly increasing over the whole
+/// execution lifetime** — a reconnecting SSE client can detect gaps. It is also
+/// **deterministic on a crash-retry of the same cycle** (same `epoch`, same
+/// publish order ⇒ same seq), giving idempotent seqs on best-effort redelivery.
+///
+/// `local_index` is clamped to [`PROGRESS_SEQ_LOCAL_MASK`] so it can never spill
+/// into the epoch bits, and the epoch shift is saturating so an astronomically
+/// long history cannot overflow `u64`.
+#[must_use]
+const fn encode_progress_seq(epoch: u64, local_index: u64) -> u64 {
+    let clamped_local = if local_index > PROGRESS_SEQ_LOCAL_MASK {
+        PROGRESS_SEQ_LOCAL_MASK
+    } else {
+        local_index
+    };
+    epoch.saturating_mul(PROGRESS_SEQ_LOCAL_STRIDE) | clamped_local
+}
+
 /// Replay-safe history guardrails made available to workflow code.
 ///
 /// `PartialEq` (but not `Eq`) because
@@ -424,6 +480,25 @@ pub enum WorkflowCommand {
         /// string -- the only condition that should clear the column.
         explicit_clear: bool,
     },
+    /// Publish an ephemeral, ordered progress chunk (issue #791).
+    ///
+    /// Emitted by [`WorkflowContext::publish_progress`] during live execution
+    /// (suppressed during replay). Pure **bookkeeping**: it carries no result
+    /// channel, never drives a suspension shape, and — unlike every other
+    /// command — appends **nothing** to `harvest_events`. The worker fires a
+    /// best-effort `pg_notify` per chunk on the per-execution progress channel
+    /// so any live SSE subscriber receives it; chunks are never recorded and
+    /// never replayed (their content MAY be non-deterministic).
+    PublishProgress {
+        /// Monotonic, epoch-prefixed sequence number (see
+        /// [`encode_progress_seq`]). Strictly increasing over the execution's
+        /// lifetime so a reconnecting subscriber can detect gaps.
+        seq: u64,
+        /// The chunk payload (already serialized to JSON and size-capped; an
+        /// oversize chunk is a `{"_harvest_progress_truncated": true, ..}`
+        /// marker).
+        chunk: Value,
+    },
     /// Spawn a child workflow in detached mode and return its `ExecutionId`
     /// immediately without suspending the parent.
     ///
@@ -667,6 +742,11 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("SetCurrentDetails")
                 .field("value", value)
                 .field("explicit_clear", explicit_clear)
+                .finish(),
+            Self::PublishProgress { seq, chunk } => f
+                .debug_struct("PublishProgress")
+                .field("seq", seq)
+                .field("chunk", chunk)
                 .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
@@ -1713,6 +1793,14 @@ pub struct WorkflowContext {
     /// so each session has a stable, unique `session:{seq}` marker name across
     /// replays, mirroring `fan_out_seq`/`race_seq`.
     session_seq: Mutex<u32>,
+    /// Per-cycle 0-based local index for progress `seq` generation (issue #791).
+    /// Incremented once per live [`publish_progress`](Self::publish_progress)
+    /// call; combined with the loaded-history-length epoch by
+    /// [`encode_progress_seq`] into a lifetime-monotonic `seq`. A fresh context
+    /// is constructed per decision cycle, so this resets to 0 each cycle — the
+    /// epoch (in the high bits) is what carries monotonicity across cycles.
+    /// Not part of replay state: `publish_progress` is a no-op during replay.
+    progress_local_index: std::sync::atomic::AtomicU64,
     /// Monotonically increasing counter for naming saga compensation dedup
     /// markers (issue #801). Each non-empty `Saga` unwind increments this
     /// once so each compensation sequence has stable, unique
@@ -2182,6 +2270,7 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            progress_local_index: std::sync::atomic::AtomicU64::new(0),
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2326,6 +2415,7 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            progress_local_index: std::sync::atomic::AtomicU64::new(0),
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -2385,6 +2475,7 @@ impl WorkflowContext {
             child_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
             session_seq: Mutex::new(0),
+            progress_local_index: std::sync::atomic::AtomicU64::new(0),
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
@@ -9671,6 +9762,83 @@ impl WorkflowContext {
             value: capped,
             explicit_clear,
         });
+    }
+
+    /// Publish an ordered, **ephemeral** progress chunk to any live SSE
+    /// subscriber (issue #791).
+    ///
+    /// This is a purpose-built live-output side channel for long-running or
+    /// streaming workflows (AI agents, large imports): it pushes ordered chunks
+    /// that the worker delivers over Postgres `LISTEN`/`NOTIFY` to a connected
+    /// `GET /workflows/{id}/stream` subscriber.
+    ///
+    /// # Semantics
+    ///
+    /// - **Best-effort**: a chunk is dropped when no subscriber is connected.
+    ///   There is no durable buffer, no delivery guarantee, and no back-pressure
+    ///   on the workflow.
+    /// - **Replay-neutral**: this is a **no-op during replay** and appends
+    ///   **nothing** to `harvest_events`. There is no new `WorkflowEvent`
+    ///   variant and no migration — a workflow that publishes progress produces
+    ///   byte-for-byte the same event history as one that does not.
+    /// - **Content MAY be non-deterministic**: precisely because chunks are
+    ///   never recorded or replayed, the payload can reflect live wall-clock
+    ///   state, partial output, token streams, etc. (This is the one place a
+    ///   workflow may emit non-deterministic data safely.)
+    /// - **Ordered `seq`**: each published chunk carries a monotonic, epoch-
+    ///   prefixed sequence number that strictly increases over the execution's
+    ///   whole lifetime, so a reconnecting subscriber can detect gaps.
+    /// - **Size-capped**: a chunk whose serialized JSON exceeds
+    ///   [`PROGRESS_CHUNK_MAX_BYTES`] (Postgres `NOTIFY` payload headroom) is
+    ///   **replaced** with a truncation marker
+    ///   (`{"_harvest_progress_truncated": true, "bytes": <original_len>}`)
+    ///   rather than dropped, so the ordered slot and the "content cut" signal
+    ///   survive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `chunk` cannot be serialized
+    /// to JSON. This is the only fallible part of the call; on replay it always
+    /// returns `Ok(())` without touching `chunk`.
+    pub fn publish_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
+        // Replay-neutrality gate: a progress chunk is never recorded and never
+        // replayed, so on replay we push no command and consume no seq slot.
+        // This mirrors `set_current_details` (issue #593) and query handlers
+        // (#234): a zero-footprint, replay-suppressed side channel.
+        if self.is_replaying() {
+            return Ok(());
+        }
+        // Serialize the caller's chunk (the only fallible step).
+        let mut value = serde_json::to_value(&chunk).map_err(HarvestError::Serialization)?;
+        // Cap the serialized size below the Postgres NOTIFY payload limit.
+        // Oversize chunks are REPLACED with a truncation marker (never silently
+        // dropped) so the ordered seq slot survives and the SSE client learns
+        // content was cut.
+        let serialized_len = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+        if serialized_len > PROGRESS_CHUNK_MAX_BYTES {
+            value = serde_json::json!({
+                "_harvest_progress_truncated": true,
+                "bytes": serialized_len,
+            });
+        }
+        // Epoch = the loaded-history length at this cycle's start. It is a pure
+        // function of the recorded history (the matcher's events vec is
+        // immutable within a cycle), constant across every `publish_progress`
+        // call in the cycle, and strictly grows across cycles (a cycle that
+        // publishes always appends >=1 event before the next cycle loads). We
+        // lock the matcher directly — NOT via `match_history` — so this read
+        // never triggers the `pump_signal_handlers` post-hook (mirroring
+        // `info()`).
+        let epoch = {
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
+            matcher.event_count()
+        };
+        let local_index = self
+            .progress_local_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = encode_progress_seq(epoch, local_index);
+        self.push_command(WorkflowCommand::PublishProgress { seq, chunk: value });
+        Ok(())
     }
 
     /// Drain all accumulated commands. Called by the worker after the
@@ -18049,7 +18217,10 @@ mod tests {
         assert_eq!(cmds.len(), 1, "exactly one PublishProgress command");
         match &cmds[0] {
             WorkflowCommand::PublishProgress { seq, chunk } => {
-                assert_eq!(*seq, 0, "first live chunk in a fresh cycle has local index 0");
+                assert_eq!(
+                    *seq, 0,
+                    "first live chunk in a fresh cycle has local index 0"
+                );
                 assert_eq!(chunk, &serde_json::json!({"phase": "loading", "pct": 10}));
             }
             other => panic!("expected PublishProgress, got {other:?}"),
@@ -18060,7 +18231,8 @@ mod tests {
     fn publish_progress_local_index_increases_within_cycle() {
         let ctx = WorkflowContext::new_test();
         ctx.publish_progress(serde_json::json!("a")).expect("first");
-        ctx.publish_progress(serde_json::json!("b")).expect("second");
+        ctx.publish_progress(serde_json::json!("b"))
+            .expect("second");
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 2, "two PublishProgress commands");
         let seq0 = match &cmds[0] {
@@ -18095,7 +18267,10 @@ mod tests {
                     "an oversize chunk must be REPLACED with a truncation marker, not dropped"
                 );
                 assert!(
-                    chunk.get("bytes").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                    chunk
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
                         > PROGRESS_CHUNK_MAX_BYTES as u64,
                     "the truncation marker must report the original byte length"
                 );

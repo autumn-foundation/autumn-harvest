@@ -973,6 +973,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
+        WorkflowCommand::PublishProgress { .. } => "PublishProgress",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
@@ -1031,6 +1032,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
+                | WorkflowCommand::PublishProgress { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1051,6 +1053,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
+                    | WorkflowCommand::PublishProgress { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
@@ -1301,6 +1304,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
+                | WorkflowCommand::PublishProgress { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1331,6 +1335,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1380,6 +1385,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
@@ -1436,6 +1442,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
+                | WorkflowCommand::PublishProgress { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
@@ -1463,6 +1470,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
+                    | WorkflowCommand::PublishProgress { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
@@ -1580,6 +1588,7 @@ fn extract_child_timeout_race(
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::CancelRaceLosers { .. } => {}
             // Anything else (activity, activity wait, signal wait, external
             // activity/signal/cancel, detached spawn, arm/cancel timer) → not this
@@ -1962,7 +1971,8 @@ fn split_mixed_signal_batch(
             }
             WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
-            | WorkflowCommand::SetCurrentDetails { .. } => {}
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. } => {}
             other => remaining.push(other),
         }
     }
@@ -4341,6 +4351,43 @@ async fn persist_current_details_from_commands(
         }
     }
     Ok(())
+}
+
+/// Fire a best-effort `pg_notify` for each [`WorkflowCommand::PublishProgress`]
+/// command in this decision cycle (issue #791).
+///
+/// Progress chunks are an **ephemeral** live-output side channel: they are never
+/// recorded to `harvest_events` and never replayed. Fired on the worker's
+/// persist connection alongside [`persist_current_details_from_commands`], so a
+/// rolled-back cycle's `NOTIFY` is discarded (pg delivers only on commit) and
+/// the retried cycle re-fires live — a committed chunk is never double-delivered.
+///
+/// One `pg_notify` per chunk (O(chunks) per cycle) preserves each chunk's
+/// distinct `seq` and payload. The context suppresses `publish_progress` during
+/// replay, so this only ever sees live-frontier chunks.
+///
+/// **Best-effort**: a notify failure is logged and swallowed, never failing the
+/// workflow — a progress chunk is disposable. The context caps each chunk below
+/// the Postgres 8000-byte `NOTIFY` limit, so a size-driven failure cannot occur.
+async fn notify_progress_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) {
+    for cmd in commands {
+        if let WorkflowCommand::PublishProgress { seq, chunk } = cmd {
+            if let Err(e) =
+                crate::notify::notify_workflow_progress(conn, exec_id.as_uuid(), *seq, chunk).await
+            {
+                tracing::warn!(
+                    workflow_exec_id = %exec_id.as_uuid(),
+                    seq = *seq,
+                    error = %e,
+                    "failed to publish progress chunk (best-effort, dropped)"
+                );
+            }
+        }
+    }
 }
 
 async fn persist_signal_wait_park(
@@ -8892,6 +8939,8 @@ async fn handle_suspended_workflow(
         )
         .await;
     }
+    // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
+    notify_progress_from_commands(conn, context.persistence.exec_id, commands).await;
 
     let sticky = context.persistence.sticky_hint();
     let detached_spawns = DetachedSpawnPersistence {
@@ -9833,6 +9882,8 @@ async fn persist_terminal_outcome_commands(
         .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
     persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
+    notify_progress_from_commands(conn, persistence.exec_id, pending_cmds).await;
 
     // Cancellable/renewable timer bookkeeping (issue #768) on a terminal cycle.
     // A sealing execution never awaits, so any `ArmTimer` here is a fresh arm
@@ -10564,6 +10615,8 @@ async fn process_workflow_task(
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Persist the current_details breadcrumb before inline execution (issue #473).
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Fire ephemeral progress chunks (issue #791) — best-effort, before inline run.
+                notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 // Sync in-memory snapshot so a subsequent continue_as_new in the
                 // same task copies the patched attrs to the successor row.
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
@@ -10743,6 +10796,7 @@ async fn process_workflow_task(
                             | WorkflowCommand::RecordUpdateResult { .. }
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
+                            | WorkflowCommand::PublishProgress { .. }
                     )
                 }) =>
             {
@@ -10807,6 +10861,8 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
+                notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
                     &commands,
@@ -11012,6 +11068,8 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
+                notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
                     &commands,

@@ -44,6 +44,34 @@ pub const fn workflow_events_channel() -> &'static str {
     "harvest_events"
 }
 
+/// Postgres NOTIFY channel used for a single execution's ephemeral progress
+/// stream (issue #791).
+///
+/// The convention is `harvest_progress_{exec_hex}` where `exec_hex` is the
+/// execution UUID as 32 lowercase hex digits (no hyphens — Postgres identifiers
+/// cannot contain them). The result is `17 + 32 = 49` characters, comfortably
+/// within Postgres' 63-byte identifier limit.
+///
+/// Unlike [`workflow_events_channel`] (a single global channel fired on real
+/// event appends), progress is per-execution so a subscriber LISTENs only to
+/// the one run it is streaming and is never woken by unrelated workflows.
+///
+/// # Examples
+///
+/// ```
+/// # use autumn_harvest::notify::workflow_progress_channel;
+/// # use uuid::Uuid;
+/// let id = Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").unwrap();
+/// assert_eq!(
+///     workflow_progress_channel(id),
+///     "harvest_progress_0191c1a23b4c7d5e8f60112233445566"
+/// );
+/// ```
+#[must_use]
+pub fn workflow_progress_channel(exec_id: Uuid) -> String {
+    format!("harvest_progress_{}", exec_id.simple())
+}
+
 #[must_use]
 fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -71,6 +99,24 @@ pub struct WorkflowEventNotifyPayload {
     pub last_event_type: String,
 }
 
+/// Payload sent on [`workflow_progress_channel`] for each published progress
+/// chunk (issue #791).
+///
+/// This is the wire envelope carried in the Postgres `NOTIFY` payload. The
+/// whole envelope must fit within Postgres' 8000-byte `NOTIFY` limit; the
+/// `chunk` is size-capped by the context (see
+/// [`PROGRESS_CHUNK_MAX_BYTES`](crate::context::PROGRESS_CHUNK_MAX_BYTES)) to
+/// leave headroom for the envelope.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProgressNotifyPayload {
+    /// Monotonic, epoch-prefixed sequence number (strictly increasing over the
+    /// execution's lifetime, so a reconnecting subscriber can detect gaps).
+    pub seq: u64,
+    /// The published chunk (JSON; possibly a truncation marker if the original
+    /// exceeded the size cap).
+    pub chunk: serde_json::Value,
+}
+
 /// Outcome of waiting on a queue listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueWaitOutcome {
@@ -90,6 +136,17 @@ pub enum WorkflowEventWaitOutcome {
     /// No notification arrived before the caller's timeout elapsed.
     TimedOut,
     /// The LISTEN connection closed.
+    ChannelClosed,
+}
+
+/// Outcome of waiting on a [`WorkflowProgressListener`] (issue #791).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressWaitOutcome {
+    /// A progress chunk arrived before the timeout elapsed.
+    Chunk(ProgressNotifyPayload),
+    /// No chunk arrived before the caller's timeout elapsed (send a keepalive).
+    TimedOut,
+    /// The LISTEN connection closed (the SSE stream should end with an error).
     ChannelClosed,
 }
 
@@ -177,6 +234,42 @@ pub async fn notify_workflow_events_appended(
 
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(workflow_events_channel())
+        .bind::<Text, _>(&payload)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+/// Fire a `NOTIFY` carrying one ephemeral progress chunk on the per-execution
+/// progress channel (issue #791).
+///
+/// Delivered on commit when called inside a transaction — so a rolled-back
+/// workflow-decision cycle's progress is discarded (never delivered) and the
+/// retried cycle re-fires live, and a committed chunk is delivered exactly once
+/// per commit. Best-effort by contract: callers should treat a failure as
+/// non-fatal (the chunk is disposable).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if payload serialization or `pg_notify`
+/// fails.
+pub async fn notify_workflow_progress(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    seq: u64,
+    chunk: &serde_json::Value,
+) -> HarvestResult<()> {
+    let channel = workflow_progress_channel(workflow_exec_id);
+    let payload = serde_json::to_string(&ProgressNotifyPayload {
+        seq,
+        chunk: chunk.clone(),
+    })
+    .map_err(|e| HarvestError::Database(format!("failed to serialize progress payload: {e}")))?;
+
+    diesel::sql_query("SELECT pg_notify($1, $2)")
+        .bind::<Text, _>(&channel)
         .bind::<Text, _>(&payload)
         .execute(conn)
         .await
@@ -410,6 +503,106 @@ impl WorkflowEventListener {
     }
 }
 
+/// Async listener for a single execution's ephemeral progress stream (issue
+/// #791).
+///
+/// Subscribes to the per-execution [`workflow_progress_channel`] and yields each
+/// [`ProgressNotifyPayload`] the worker fires via [`notify_workflow_progress`].
+/// Intended for the `GET /workflows/{id}/stream` SSE route: connect once per
+/// streamed run, then poll [`wait_for_progress_timeout`](Self::wait_for_progress_timeout)
+/// so the route can interleave keepalive ticks and terminal-state checks.
+pub struct WorkflowProgressListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
+    /// Receiver for notifications forwarded by the connection driver task.
+    rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
+    /// Background connection driver handle kept alive for the connection's lifetime.
+    _connection_handle: tokio::task::JoinHandle<()>,
+}
+
+impl WorkflowProgressListener {
+    /// Connect to Postgres and subscribe to `exec_id`'s progress channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
+        let (client, mut connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let handle = tokio::spawn(async move {
+            use futures::future::poll_fn;
+
+            loop {
+                let msg = poll_fn(|cx| connection.poll_message(cx)).await;
+                match msg {
+                    Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
+                        if tx.send(n).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "postgres workflow progress listener error");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        let channel = quote_pg_identifier(&workflow_progress_channel(exec_id));
+        client
+            .batch_execute(&format!("LISTEN {channel}"))
+            .await
+            .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
+
+        Ok(Self {
+            _client: client,
+            rx,
+            _connection_handle: handle,
+        })
+    }
+
+    /// Wait indefinitely for the next progress chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the notification payload is invalid.
+    pub async fn wait_for_progress(&mut self) -> HarvestResult<ProgressWaitOutcome> {
+        match self.rx.recv().await {
+            Some(notification) => {
+                let payload: ProgressNotifyPayload = serde_json::from_str(notification.payload())
+                    .map_err(|e| {
+                    HarvestError::Database(format!("bad progress notify payload: {e}"))
+                })?;
+                Ok(ProgressWaitOutcome::Chunk(payload))
+            }
+            None => Ok(ProgressWaitOutcome::ChannelClosed),
+        }
+    }
+
+    /// Wait for a progress chunk up to `timeout`.
+    ///
+    /// A [`ProgressWaitOutcome::TimedOut`] lets the SSE route send a keepalive
+    /// and re-check the execution's terminal state before waiting again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the notification payload is invalid.
+    pub async fn wait_for_progress_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> HarvestResult<ProgressWaitOutcome> {
+        match tokio::time::timeout(timeout, self.wait_for_progress()).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Ok(ProgressWaitOutcome::TimedOut),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -477,8 +670,7 @@ mod tests {
 
     #[test]
     fn workflow_progress_channel_naming() {
-        let exec_id =
-            Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").expect("valid uuid");
+        let exec_id = Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").expect("valid uuid");
         let channel = workflow_progress_channel(exec_id);
         assert_eq!(channel, "harvest_progress_0191c1a23b4c7d5e8f60112233445566");
         assert!(
@@ -501,8 +693,7 @@ mod tests {
             chunk: serde_json::json!({"phase": "mid", "pct": 50}),
         };
         let json = serde_json::to_string(&original).expect("serialize");
-        let deserialized: ProgressNotifyPayload =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: ProgressNotifyPayload = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, deserialized);
     }
 }
