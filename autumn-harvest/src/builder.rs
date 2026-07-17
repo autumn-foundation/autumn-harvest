@@ -4755,8 +4755,8 @@ mod tests {
         // helper. The builder-validation half above runs on every feature set.
         #[cfg(feature = "db")]
         assert_eq!(
-            crate::queue::dynamic_rate_bucket_key("input.tenant_id", "acme"),
-            crate::queue::dynamic_rate_bucket_key("tenant_id", "acme"),
+            crate::queue::dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
+            crate::queue::dynamic_rate_bucket_key("tenant_id", Some("acme")),
             "both spellings must share one bucket key"
         );
     }

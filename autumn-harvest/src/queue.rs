@@ -153,6 +153,22 @@ fn bound_key_component(component: &str) -> String {
     }
 }
 
+/// Marker for the *resolved-value* component of a dynamic per-key bucket key
+/// when the key expression could **not** be resolved from the workflow input
+/// (missing field / null / non-object input), i.e. `resolve_concurrency_key`
+/// returned `None`.
+///
+/// Structurally disjoint from every [`bound_key_component`] output (which always
+/// begins with `L` or `H`), so the *unresolved* fallback bucket
+/// `dyn-rate:{expr}:U` can never coincide with a *resolved* bucket — in
+/// particular with `dyn-rate:{expr}:L0:`, which is a legitimately-resolved
+/// **empty-string** tenant (`Some("")`). The previous `.unwrap_or_default()` at
+/// the call site collapsed both `None` (unresolved / missing / malformed input)
+/// and `Some("")` (a real empty-string tenant) onto the same `L0:` bucket,
+/// cross-throttling malformed/missing executions against a legitimate empty
+/// tenant (issue #699 review, Codex round-5 P2, worker.rs:4720).
+const UNRESOLVED_RESOLVED_MARKER: &str = "U";
+
 /// Build the token-bucket key for a *dynamic* per-key activity rate limit
 /// (issue #699).
 ///
@@ -161,9 +177,15 @@ fn bound_key_component(component: &str) -> String {
 /// that activities declaring the same expression share one bucket per resolved
 /// value (matching the static limiter's "same key → shared bucket → must agree
 /// on rps" rule), while distinct tenants get independent buckets. `resolved` is
-/// empty (`""`) for an execution whose key expression could not be resolved
-/// (missing / null / non-object input), giving one shared fallback bucket per
-/// expression so an unkeyed execution is still bounded rather than unbounded.
+/// `None` for an execution whose key expression could not be resolved (missing /
+/// null / non-object input); it encodes as the distinct
+/// [`UNRESOLVED_RESOLVED_MARKER`] (`U`), giving one shared fallback bucket per
+/// expression (`dyn-rate:{expr}:U`) so an unkeyed execution is still bounded
+/// rather than unbounded. Crucially, that unresolved bucket is **distinct** from
+/// `Some("")` — a legitimately-resolved empty-string tenant — which buckets
+/// under `L0:` (`dyn-rate:{expr}:L0:`); the `U`/`L`-tag disjointness stops a
+/// malformed/missing input from cross-throttling a real empty-string tenant
+/// (issue #699 review, Codex round-5 P2).
 ///
 /// `key_expr` is normalized by stripping a leading `input.` (issue #699 review):
 /// `resolve_concurrency_key` treats `"input.tenant_id"` and `"tenant_id"` as the
@@ -181,29 +203,39 @@ fn bound_key_component(component: &str) -> String {
 /// composite key is provably ≤ ~530 bytes regardless of the macro or a
 /// hand-built `ActivityInfo`.
 ///
-/// The key is **injective by construction**: each component is emitted by
+/// The key is **injective by construction**: the `expr` component is emitted by
 /// [`bound_key_component`] as either a length-tagged literal `L{len}:{bytes}`
 /// (self-delimiting: after the `L`, the decimal `len` up to the next `:` says
-/// exactly how many bytes follow) or a fixed-width hash `H{16hex}`. The `L`/`H`
-/// first-byte tags are structurally disjoint, so a literal value equal to a
-/// hash's encoding never collides with that hash, and a `:` inside `expr` (a
-/// dot-path can address a JSON key containing `:`) or inside `resolved` can
-/// never split ambiguously: the pair `(expr, resolved)` maps to exactly one key
-/// and vice-versa, whether either component passed through unchanged or was
-/// hashed. Without this self-delimiting encoding, `key="a"` + resolved `"b:c"`
-/// and `key="a:b"` + resolved `"c"` would both flatten to `dyn-rate:a:b:c` — two
-/// distinct exprs sharing one bucket, so their (independently validated,
-/// possibly different) rps configs would collide first-writer-wins.
+/// exactly how many bytes follow) or a fixed-width hash `H{16hex}`, and the
+/// `resolved` component is either the same (`Some`) or the single-byte
+/// [`UNRESOLVED_RESOLVED_MARKER`] (`U`, for `None`). The `L`/`H`/`U` first-byte
+/// tags are structurally disjoint, so a literal value equal to a hash's
+/// encoding never collides with that hash, an unresolved `U` bucket never
+/// collides with any resolved `L`/`H` bucket (in particular `Some("")`'s `L0:`),
+/// and a `:` inside `expr` (a dot-path can address a JSON key containing `:`) or
+/// inside `resolved` can never split ambiguously: the pair `(expr, resolved)`
+/// maps to exactly one key and vice-versa, whether either component passed
+/// through unchanged or was hashed. Without this self-delimiting encoding,
+/// `key="a"` + resolved `"b:c"` and `key="a:b"` + resolved `"c"` would both
+/// flatten to `dyn-rate:a:b:c` — two distinct exprs sharing one bucket, so their
+/// (independently validated, possibly different) rps configs would collide
+/// first-writer-wins.
 #[must_use]
-pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
+pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: Option<&str>) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    // Both components are self-delimiting (`L{len}:{bytes}` or `H{16hex}`), so
-    // the whole composite key is injective and both the hash/literal forms and
-    // the two components can never split or collide ambiguously.
+    // The expr component is self-delimiting (`L{len}:{bytes}` or `H{16hex}`);
+    // the resolved component is either the same (`Some`) or the disjoint
+    // single-byte `U` marker (`None`, unresolved). `None` (missing/null/
+    // non-object input) is kept DISTINCT from `Some("")` (a legitimately-
+    // resolved empty-string tenant, which encodes as `L0:`) so the two never
+    // share a bucket -- issue #699 review, Codex round-5 P2. The whole composite
+    // key stays injective (the `L`/`H`/`U` first-byte tags are disjoint).
+    let resolved_component =
+        resolved.map_or_else(|| UNRESOLVED_RESOLVED_MARKER.to_string(), bound_key_component);
     format!(
         "{DYNAMIC_RATE_PREFIX}:{}:{}",
         bound_key_component(expr),
-        bound_key_component(resolved),
+        resolved_component,
     )
 }
 
@@ -2672,7 +2704,7 @@ mod tests {
     #[test]
     fn dynamic_rate_bucket_key_is_prefixed_and_namespaced_by_expr_and_value() {
         // The `input.` prefix is normalized away (issue #699 review, #6).
-        let k = dynamic_rate_bucket_key("input.tenant_id", "acme");
+        let k = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
         // Each component is a self-delimiting length-tagged literal
         // (`L{len}:{value}`); `tenant_id` is 9 bytes, `acme` is 4.
         assert_eq!(k, "dyn-rate:L9:tenant_id:L4:acme");
@@ -2684,11 +2716,11 @@ mod tests {
         // Both spellings resolve the same field (via `resolve_concurrency_key`),
         // so they must share one bucket.
         assert_eq!(
-            dynamic_rate_bucket_key("input.tenant_id", "acme"),
-            dynamic_rate_bucket_key("tenant_id", "acme"),
+            dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
+            dynamic_rate_bucket_key("tenant_id", Some("acme")),
         );
         assert_eq!(
-            dynamic_rate_bucket_key("tenant_id", "acme"),
+            dynamic_rate_bucket_key("tenant_id", Some("acme")),
             "dyn-rate:L9:tenant_id:L4:acme"
         );
     }
@@ -2696,25 +2728,59 @@ mod tests {
     #[test]
     fn dynamic_rate_bucket_key_same_expr_and_value_is_stable() {
         assert_eq!(
-            dynamic_rate_bucket_key("input.tenant_id", "acme"),
-            dynamic_rate_bucket_key("input.tenant_id", "acme"),
+            dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
+            dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
         );
     }
 
     #[test]
     fn dynamic_rate_bucket_key_different_resolved_values_differ() {
         assert_ne!(
-            dynamic_rate_bucket_key("input.tenant_id", "acme"),
-            dynamic_rate_bucket_key("input.tenant_id", "globex"),
+            dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
+            dynamic_rate_bucket_key("input.tenant_id", Some("globex")),
         );
     }
 
     #[test]
     fn dynamic_rate_bucket_key_empty_resolved_fallback_is_distinct() {
-        let fallback = dynamic_rate_bucket_key("input.tenant_id", "");
-        // The empty resolved value encodes as the length-tagged literal `L0:`.
-        assert_eq!(fallback, "dyn-rate:L9:tenant_id:L0:");
-        assert_ne!(fallback, dynamic_rate_bucket_key("input.tenant_id", "acme"));
+        // A legitimately-resolved empty-string tenant (`Some("")`) encodes as
+        // the length-tagged literal `L0:`, distinct from a real tenant.
+        let empty_tenant = dynamic_rate_bucket_key("input.tenant_id", Some(""));
+        assert_eq!(empty_tenant, "dyn-rate:L9:tenant_id:L0:");
+        assert_ne!(
+            empty_tenant,
+            dynamic_rate_bucket_key("input.tenant_id", Some("acme"))
+        );
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_none_unresolved_is_distinct_from_empty_string_tenant() {
+        // Regression (issue #699 review, Codex round-5 P2): `None` (the key
+        // expression could NOT be resolved -- missing / null / non-object input)
+        // must NOT share a bucket with `Some("")` (a legitimately-resolved
+        // empty-string tenant). The previous `.unwrap_or_default()` at the call
+        // site collapsed both onto the same `L0:` bucket, cross-throttling
+        // malformed/missing executions against a real empty tenant.
+        let unresolved = dynamic_rate_bucket_key("input.tenant_id", None);
+        // The unresolved fallback encodes with the distinct `U` marker.
+        assert_eq!(unresolved, "dyn-rate:L9:tenant_id:U");
+
+        let empty_tenant = dynamic_rate_bucket_key("input.tenant_id", Some(""));
+        assert_eq!(empty_tenant, "dyn-rate:L9:tenant_id:L0:");
+
+        // The whole point: the two are DIFFERENT bucket keys.
+        assert_ne!(
+            unresolved, empty_tenant,
+            "an unresolved key (None) must never share a bucket with an \
+             empty-string tenant (Some(\"\"))"
+        );
+        // And the unresolved fallback is still distinct from a real tenant, and
+        // stable across calls (one shared fallback bucket per expression).
+        assert_ne!(
+            unresolved,
+            dynamic_rate_bucket_key("input.tenant_id", Some("acme"))
+        );
+        assert_eq!(unresolved, dynamic_rate_bucket_key("input.tenant_id", None));
     }
 
     #[test]
@@ -2724,11 +2790,17 @@ mod tests {
         // can address a JSON key containing `:`) or inside `resolved` could
         // collide two genuinely distinct `(expr, resolved)` pairs onto one
         // bucket string. Both of these used to flatten to `dyn-rate:a:b:c`.
-        assert_eq!(dynamic_rate_bucket_key("a", "b:c"), "dyn-rate:L1:a:L3:b:c");
-        assert_eq!(dynamic_rate_bucket_key("a:b", "c"), "dyn-rate:L3:a:b:L1:c");
+        assert_eq!(
+            dynamic_rate_bucket_key("a", Some("b:c")),
+            "dyn-rate:L1:a:L3:b:c"
+        );
+        assert_eq!(
+            dynamic_rate_bucket_key("a:b", Some("c")),
+            "dyn-rate:L3:a:b:L1:c"
+        );
         assert_ne!(
-            dynamic_rate_bucket_key("a", "b:c"),
-            dynamic_rate_bucket_key("a:b", "c"),
+            dynamic_rate_bucket_key("a", Some("b:c")),
+            dynamic_rate_bucket_key("a:b", Some("c")),
         );
     }
 
@@ -2759,8 +2831,8 @@ mod tests {
         );
         // And the same disjointness holds end-to-end through the composite key:
         // a long resolved value (hashed) vs a short literal equal to that hash.
-        let hashed = dynamic_rate_bucket_key("tenant_id", &long);
-        let literal = dynamic_rate_bucket_key("tenant_id", &literal_that_equals_the_hash);
+        let hashed = dynamic_rate_bucket_key("tenant_id", Some(&long));
+        let literal = dynamic_rate_bucket_key("tenant_id", Some(&literal_that_equals_the_hash));
         assert_ne!(hashed, literal);
     }
 
@@ -2777,7 +2849,7 @@ mod tests {
         // Static keys are bare activity names / user strings; throttle keys use
         // the `start-throttle:` prefix. The `dyn-rate:` prefix keeps dynamic
         // per-key buckets disjoint from both.
-        let dynamic = dynamic_rate_bucket_key("input.tenant_id", "acme");
+        let dynamic = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
         assert!(!dynamic.starts_with(crate::throttle::THROTTLE_BUCKET_PREFIX));
         assert_ne!(dynamic, "send_email"); // a bare static activity-name key
     }
@@ -2785,13 +2857,13 @@ mod tests {
     #[test]
     fn dynamic_rate_bucket_key_bounds_oversized_resolved_value() {
         // A short value is a human-readable length-tagged literal.
-        let short = dynamic_rate_bucket_key("tenant_id", "acme");
+        let short = dynamic_rate_bucket_key("tenant_id", Some("acme"));
         assert_eq!(short, "dyn-rate:L9:tenant_id:L4:acme");
 
         // A pathologically large resolved value (would blow the btree PK limit)
         // is replaced with a bounded, stable hash.
         let big = "x".repeat(5000);
-        let bounded = dynamic_rate_bucket_key("tenant_id", &big);
+        let bounded = dynamic_rate_bucket_key("tenant_id", Some(&big));
         assert!(
             bounded.chars().count() < 64,
             "oversized resolved value must be bounded, got len {}",
@@ -2800,10 +2872,10 @@ mod tests {
         // The resolved component is the fixed-width hash `H{16hex}`.
         assert!(bounded.starts_with("dyn-rate:L9:tenant_id:H"));
         // Deterministic: same long value → same key.
-        assert_eq!(bounded, dynamic_rate_bucket_key("tenant_id", &big));
+        assert_eq!(bounded, dynamic_rate_bucket_key("tenant_id", Some(&big)));
         // Injective in practice: two distinct long values → distinct keys.
         let big2 = "y".repeat(5000);
-        assert_ne!(bounded, dynamic_rate_bucket_key("tenant_id", &big2));
+        assert_ne!(bounded, dynamic_rate_bucket_key("tenant_id", Some(&big2)));
     }
 
     #[test]
@@ -2813,7 +2885,7 @@ mod tests {
         // must not be able to overflow the composite btree PRIMARY KEY and abort
         // the enqueue transaction. The expr component is now bounded/hashed too.
         let big_expr = "a".repeat(5000);
-        let bounded = dynamic_rate_bucket_key(&big_expr, "acme");
+        let bounded = dynamic_rate_bucket_key(&big_expr, Some("acme"));
         // The expr component is the fixed-width hash `H{16hex}`; the resolved
         // component is the length-tagged literal `L4:acme`.
         let digest = seahash::hash(big_expr.as_bytes());
@@ -2826,7 +2898,7 @@ mod tests {
             bounded.len()
         );
         // Deterministic: same long expr → same key.
-        assert_eq!(bounded, dynamic_rate_bucket_key(&big_expr, "acme"));
+        assert_eq!(bounded, dynamic_rate_bucket_key(&big_expr, Some("acme")));
     }
 
     #[test]
@@ -2836,8 +2908,8 @@ mod tests {
         let big_a = "a".repeat(5000);
         let big_b = "b".repeat(5000);
         assert_ne!(
-            dynamic_rate_bucket_key(&big_a, "acme"),
-            dynamic_rate_bucket_key(&big_b, "acme"),
+            dynamic_rate_bucket_key(&big_a, Some("acme")),
+            dynamic_rate_bucket_key(&big_b, Some("acme")),
         );
     }
 
@@ -2847,7 +2919,7 @@ mod tests {
         // well under the Postgres btree PRIMARY KEY size limit (~2704 bytes).
         let big_expr = "a".repeat(5000);
         let big_val = "x".repeat(5000);
-        let key = dynamic_rate_bucket_key(&big_expr, &big_val);
+        let key = dynamic_rate_bucket_key(&big_expr, Some(&big_val));
         assert!(
             key.len() < 530,
             "both-oversized key must be ≤ ~530 bytes, got len {}",

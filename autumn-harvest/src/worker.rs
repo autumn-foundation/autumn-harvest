@@ -4716,12 +4716,16 @@ async fn persist_scheduled_activities(
             // Dynamic per-key rate limit (issue #699): resolve the bucket key from
             // the workflow input at enqueue time so each tenant gets its own RPS
             // bucket. A key that cannot be resolved (missing / null / non-object
-            // input) falls back to a shared `dyn-rate:{expr}:` bucket so the
-            // execution is still bounded, not unbounded. Takes priority over the
-            // static `rate_limit_key` path entirely.
-            let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input)
-                .unwrap_or_default();
-            let bucket_key = queue::dynamic_rate_bucket_key(expr, &resolved);
+            // input) is passed through as `None` and falls back to a shared
+            // `dyn-rate:{expr}:U` bucket so the execution is still bounded, not
+            // unbounded -- kept DISTINCT from a legitimately-resolved empty-string
+            // tenant `Some("")` (which buckets under `L0:`) so the two never
+            // cross-throttle (issue #699 review, Codex round-5 P2). We deliberately
+            // do NOT `.unwrap_or_default()` here, which would collapse both onto
+            // the same `L0:` bucket. Takes priority over the static
+            // `rate_limit_key` path entirely.
+            let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input);
+            let bucket_key = queue::dynamic_rate_bucket_key(expr, resolved.as_deref());
             // The bucket is ensured in the same transaction below, so the
             // fail-closed claim/dispatch gate always has a bucket row to read
             // (else the task would stall forever). `refill_rate` is guaranteed

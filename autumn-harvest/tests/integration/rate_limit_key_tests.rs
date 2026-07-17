@@ -193,8 +193,8 @@ async fn ac2_dynamic_per_key_cross_tenant_isolation() {
     // stays claimable — zero cross-key bleed.
     let (mut conn, _g) = setup_db().await;
     let q = "iso-queue";
-    let key_a = dynamic_rate_bucket_key("input.tenant_id", "acme");
-    let key_b = dynamic_rate_bucket_key("input.tenant_id", "globex");
+    let key_a = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
+    let key_b = dynamic_rate_bucket_key("input.tenant_id", Some("globex"));
     ensure_rate_limit_bucket(&mut conn, &key_a, 5.0, 3.0)
         .await
         .unwrap();
@@ -231,7 +231,7 @@ async fn ac2_dynamic_shared_bucket_across_executions() {
     // draining it blocks both.
     let (mut conn, _g) = setup_db().await;
     let q = "shared-queue";
-    let key = dynamic_rate_bucket_key("input.tenant_id", "acme");
+    let key = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
     // Ensuring twice must not create a second row (idempotent).
     ensure_rate_limit_bucket(&mut conn, &key, 5.0, 5.0)
         .await
@@ -267,7 +267,7 @@ async fn ac6_dynamic_defer_not_fail() {
     // it claimable.
     let (mut conn, _g) = setup_db().await;
     let q = "defer-queue";
-    let key = dynamic_rate_bucket_key("input.tenant_id", "acme");
+    let key = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
     ensure_rate_limit_bucket(&mut conn, &key, 5.0, 3.0)
         .await
         .unwrap();
@@ -288,7 +288,7 @@ async fn ac6_dynamic_defer_not_fail() {
 #[tokio::test]
 async fn lazy_registration_creates_composite_bucket_row() {
     let (mut conn, _g) = setup_db().await;
-    let key = dynamic_rate_bucket_key("input.tenant_id", "acme");
+    let key = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
     // Bucket does not exist yet.
     assert_eq!(
         scalar_i64(
@@ -348,7 +348,7 @@ async fn ac8_dynamic_rate_composes_with_per_key_concurrency() {
     // limit (#699) is gated by both, independently.
     let (mut conn, _g) = setup_db().await;
     let q = "compose-queue";
-    let rate_key = dynamic_rate_bucket_key("input.tenant_id", "acme");
+    let rate_key = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
     ensure_rate_limit_bucket(&mut conn, &rate_key, 100.0, 100.0)
         .await
         .unwrap();
@@ -551,11 +551,14 @@ async fn worker_resolves_dynamic_key_from_workflow_input_not_activity_input() {
         "dyn-rate:L9:tenant_id:L4:acme",
         "acme's key must resolve from the WORKFLOW input"
     );
-    // Absent-field fallback: workflow input `{}` -> the shared fallback bucket.
+    // Absent-field fallback: workflow input `{}` -> the UNRESOLVED (`None`)
+    // shared fallback bucket, encoded with the distinct `U` marker (issue #699
+    // review, Codex round-5 P2). Distinct from a legitimately-resolved
+    // empty-string tenant `Some("")`, which would bucket under `L0:`.
     assert_eq!(
         rate_limit_key_for_exec(&mut conn, exec_empty).await,
-        "dyn-rate:L9:tenant_id:L0:",
-        "empty workflow input must fall back to the shared, still-bounded bucket"
+        "dyn-rate:L9:tenant_id:U",
+        "unresolved (missing-field) workflow input must fall back to the shared, still-bounded `U` bucket"
     );
 }
 
@@ -594,7 +597,7 @@ async fn concurrency_and_rate_limit_contention_never_over_dispatches() {
 
     let q = "contend-queue";
     let ckey = "tenant:acme";
-    let rkey = dynamic_rate_bucket_key("input.tenant_id", "acme");
+    let rkey = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
     ensure_rate_limit_bucket(&mut conn, &rkey, 10.0, 10.0)
         .await
         .unwrap();
@@ -671,8 +674,8 @@ async fn success_metric_cross_key_burst_fairness() {
     // at all (zero cross-key bleed) — one noisy tenant cannot starve another.
     let (mut conn, _g) = setup_db().await;
     let q = "fairness-queue";
-    let key_a = dynamic_rate_bucket_key("input.tenant_id", "acme");
-    let key_b = dynamic_rate_bucket_key("input.tenant_id", "globex");
+    let key_a = dynamic_rate_bucket_key("input.tenant_id", Some("acme"));
+    let key_b = dynamic_rate_bucket_key("input.tenant_id", Some("globex"));
     // Both tenants: burst 5. A tiny refill rate keeps the test deterministic —
     // neither bucket refills meaningfully during the tight claim loop, so a
     // drained A stays drained and a full B yields exactly its burst.
@@ -762,7 +765,12 @@ fn worker_startup_rejects_dynamic_rate_limit_on_local_activity() {
     ));
 
     let result = Worker::new(
-        crate::integration_e2e::runtime_config("rlk-local-dynamic-worker", 2, 2, Duration::from_secs(10)),
+        crate::integration_e2e::runtime_config(
+            "rlk-local-dynamic-worker",
+            2,
+            2,
+            Duration::from_secs(10),
+        ),
         registry,
     );
     let err = result.expect_err(
@@ -793,7 +801,12 @@ fn worker_startup_rejects_conflicting_rps_for_same_key_expr() {
     let registry = Arc::new(HandlerRegistry::new(vec![tenant_wf_info()], vec![a, b]));
 
     let result = Worker::new(
-        crate::integration_e2e::runtime_config("rlk-conflict-worker", 2, 2, Duration::from_secs(10)),
+        crate::integration_e2e::runtime_config(
+            "rlk-conflict-worker",
+            2,
+            2,
+            Duration::from_secs(10),
+        ),
         registry,
     );
     let err = result.expect_err(
@@ -876,7 +889,12 @@ fn worker_startup_rejects_reserved_static_prefix() {
     ));
 
     let result = Worker::new(
-        crate::integration_e2e::runtime_config("rlk-reserved-static-worker", 2, 2, Duration::from_secs(10)),
+        crate::integration_e2e::runtime_config(
+            "rlk-reserved-static-worker",
+            2,
+            2,
+            Duration::from_secs(10),
+        ),
         registry,
     );
     let err = result.expect_err(
