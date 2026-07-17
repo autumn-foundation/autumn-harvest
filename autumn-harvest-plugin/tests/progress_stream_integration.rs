@@ -51,7 +51,9 @@ use tower::ServiceExt;
 /// created database is left in place — the sandbox is ephemeral).
 #[allow(dead_code)]
 enum DbGuard {
-    Container(ContainerAsync<Postgres>),
+    // Boxed to keep the enum small (clippy::large_enum_variant): the container
+    // variant is ~800 bytes while LocalPg carries no data.
+    Container(Box<ContainerAsync<Postgres>>),
     LocalPg,
 }
 
@@ -91,7 +93,7 @@ async fn setup_database() -> (String, DbGuard) {
         let host = container.get_host().await.unwrap();
         let port = container.get_host_port_ipv4(5432).await.unwrap();
         let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-        (url, DbGuard::Container(container))
+        (url, DbGuard::Container(Box::new(container)))
     }
 }
 
@@ -120,29 +122,58 @@ fn progress_workflow<'a>(
     })
 }
 
+/// A workflow that publishes one chunk, suspends on a durable 1-second timer
+/// (ending decision cycle 1), then resumes (decision cycle 2) and publishes a
+/// second chunk before completing. The timer's `TimerStarted`/`TimerFired`
+/// events grow the loaded-history length (the `seq` epoch) between the two
+/// cycles, so the second chunk's `seq` must land in a strictly higher epoch than
+/// the first — the AC6 cross-cycle monotonicity crux.
+fn progress_multicycle_workflow<'a>(
+    ctx: &'a autumn_harvest::context::WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.publish_progress(json!({"cycle": 1, "msg": "before timer"}))
+            .map_err(|e| e.to_string())?;
+        // Suspend for a durable timer — this ends decision cycle 1 and appends
+        // TimerStarted; on fire, TimerFired is ingested before cycle 2 resumes.
+        ctx.timer("gate", 1).await.map_err(|e| e.to_string())?;
+        ctx.publish_progress(json!({"cycle": 2, "msg": "after timer"}))
+            .map_err(|e| e.to_string())?;
+        Ok(input)
+    })
+}
+
+fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name,
+        module: "tests",
+        handler,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    }
+}
+
 fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
-        vec![WorkflowInfo {
-            mcp: false,
-            name: "progress_wf",
-            module: "tests",
-            handler: progress_workflow,
-            execution_timeout: None,
-            sla: None,
-            concurrency: None,
-            debounce: None,
-            batch: None,
-            throttle: None,
-            max_input_bytes: None,
-            description: None,
-            input_schema: None,
-            output_schema: None,
-            error_schema: None,
-            retry_policy: None,
-            owner: None,
-            runbook_url: None,
-            severity: None,
-        }],
+        vec![
+            wf_info("progress_wf", progress_workflow),
+            wf_info("progress_multicycle_wf", progress_multicycle_workflow),
+        ],
         vec![],
     ))
 }
@@ -169,8 +200,16 @@ fn build_app(pool: &DbPool, url: &str) -> axum::Router {
 }
 
 fn start_params(exec_id: ExecutionId, workflow_id: &'static str) -> StartWorkflowParams<'static> {
+    start_params_named(exec_id, "progress_wf", workflow_id)
+}
+
+fn start_params_named(
+    exec_id: ExecutionId,
+    workflow_name: &'static str,
+    workflow_id: &'static str,
+) -> StartWorkflowParams<'static> {
     StartWorkflowParams {
-        workflow_name: "progress_wf",
+        workflow_name,
         workflow_id,
         exec_id,
         input: json!({"ok": true}),
@@ -277,8 +316,7 @@ async fn read_sse(
                         {
                             first_progress_at = Some(start.elapsed());
                         }
-                        let terminal =
-                            matches!(frame.event.as_deref(), Some("end") | Some("error"));
+                        let terminal = matches!(frame.event.as_deref(), Some("end" | "error"));
                         frames.push(frame);
                         if terminal {
                             return (frames, first_progress_at);
@@ -435,6 +473,100 @@ async fn progress_stream_on_already_terminal_execution_closes_immediately() {
         frames.last().and_then(|f| f.event.as_deref()),
         Some("end"),
         "already-terminal execution closes immediately with event:end"
+    );
+}
+
+/// AC6 (cross-cycle crux): a REAL workflow that publishes across TWO decision
+/// cycles (separated by a durable timer) must emit progress `seq`s whose EPOCH
+/// strictly grows across the cycle boundary — proving the epoch actually
+/// advances with the loaded-history length, not just the within-cycle local
+/// index. This exercises the real worker path (suspend → append timer events →
+/// resume) end-to-end and reads the real `seq`s off the live SSE stream.
+#[tokio::test]
+async fn progress_stream_seq_strictly_increases_across_decision_cycles() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "progress_multicycle_wf", "progress-multicycle"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Subscribe before the worker runs (progress has no backfill).
+    let resp = sse_response(&app, &format!("/workflows/{exec_id}/stream")).await;
+    assert_eq!(resp.status(), StatusCode::OK, "stream must open with 200");
+
+    let mut runtime_config = WorkerRuntimeConfig::from(WorkerConfig::default());
+    runtime_config.worker_id = "progress-multicycle-worker".to_string();
+    runtime_config.queues = vec!["default".to_string()];
+    runtime_config.poll_interval = Duration::from_millis(20);
+    runtime_config.shard_assignments = vec![ShardId::new(0)];
+    let worker = Arc::new(Worker::new(runtime_config, test_registry()).unwrap());
+    let worker_handle = {
+        let worker = worker.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            worker.run(&pool).await;
+        })
+    };
+
+    // Deadline must exceed the 1-second durable timer.
+    let (frames, _first_at) = read_sse(resp, Duration::from_secs(20)).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    let progress: Vec<&SseFrame> = frames
+        .iter()
+        .filter(|f| f.event.as_deref() == Some("progress"))
+        .collect();
+    assert_eq!(
+        progress.len(),
+        2,
+        "expected exactly 2 progress frames (one per cycle), got frames: {frames:#?}"
+    );
+
+    let seqs: Vec<u64> = progress
+        .iter()
+        .map(|f| {
+            f.id.as_deref()
+                .expect("progress frame carries an id (seq)")
+                .parse::<u64>()
+                .expect("seq is a u64")
+        })
+        .collect();
+
+    // Strictly increasing overall.
+    assert!(
+        seqs[1] > seqs[0],
+        "cross-cycle progress seqs must strictly increase, got {seqs:?}"
+    );
+
+    // The CRUX: the epoch (high bits, seq >> PROGRESS_SEQ_LOCAL_BITS=24) must be
+    // strictly higher for the second cycle — the loaded-history length grew when
+    // the timer's TimerStarted/TimerFired events were appended between cycles.
+    // A within-cycle local-index bump would leave the epoch unchanged; this
+    // asserts the epoch itself advanced across the decision-cycle boundary.
+    let epoch0 = seqs[0] >> 24;
+    let epoch1 = seqs[1] >> 24;
+    assert!(
+        epoch1 > epoch0,
+        "the second cycle's progress seq must land in a strictly higher epoch \
+         (epoch grows with loaded-history length across cycles): epoch1={epoch1} \
+         !> epoch0={epoch0} (seqs {seqs:?})"
+    );
+
+    // Stream closes on terminal state.
+    assert_eq!(
+        frames.last().and_then(|f| f.event.as_deref()),
+        Some("end"),
+        "stream must close with event:end on terminal state"
     );
 }
 

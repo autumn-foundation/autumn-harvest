@@ -27199,6 +27199,10 @@ async fn stream_execution_events(
 
     // Resolve the LISTEN/NOTIFY database URL for this execution's shard
     let shard = exec_id.shard();
+    // NOTE: a not-configured URL here is `HarvestError::Config` → 400 via
+    // `map_error`. That latent misclassification (server misconfig should be
+    // 503) is a pre-existing #324 behavior and out of scope for #791 — the
+    // sibling progress stream below returns 503 for the same case.
     let notification_url = match api_state.sse_notification_url(shard) {
         Ok(url) => url,
         Err(e) => return map_error(e).into_response(),
@@ -27598,9 +27602,24 @@ async fn stream_execution_events(
 const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounded producer→SSE channel capacity for the progress stream. Progress is a
-/// best-effort side channel: if a slow client backs this up, the next send
-/// fails and the producer task ends cleanly (no unbounded buffering).
+/// best-effort side channel: chunks are sent non-blocking (`try_send`), so a
+/// slow client that fills this buffer causes the *excess* chunks to be DROPPED
+/// (never buffered unboundedly, and — critically — never back-pressured into the
+/// shared Postgres async NOTIFY queue). The monotonic `seq` lets the client
+/// detect the resulting gap. A disconnected receiver ends the stream.
 const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
+
+/// Short, non-zero grace window used to drain any progress chunk still in flight
+/// in the LISTEN driver's internal buffer *before* emitting the terminal
+/// `event: end` frame.
+///
+/// The terminal close is driven by an idle keepalive tick that polls terminal
+/// state. When that tick fires, the workflow's FINAL published chunk may have
+/// been delivered on the listener socket but not yet forwarded by the driver
+/// task. A `Duration::ZERO` poll would race and drop it; a short non-zero grace
+/// gives the driver time to forward a just-delivered notification, so the last
+/// chunk is not lost on close.
+const PROGRESS_STREAM_FINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(75);
 
 /// Poll the execution's terminal state for the progress stream's close check.
 ///
@@ -27661,9 +27680,20 @@ async fn progress_stream_end_reason(
 /// connects after a chunk was published will not see it — deliberate, since
 /// chunk content may be non-deterministic precisely because it is never stored.
 ///
-/// Responses: `404` if the execution does not exist; `503`/`400` if the
-/// LISTEN/NOTIFY database URL is not configured; a single `event: end` frame
-/// (then close) if the execution is already terminal at connect.
+/// **Authorization**: this route only checks that the execution exists (→ 404
+/// otherwise). `exec_id` is effectively a bearer capability for this run's live
+/// chunk *content*; embedders exposing sensitive workflow output MUST add their
+/// own per-execution authorization on top. `exec_id` is a random `UUIDv4` (not
+/// enumerable), which mitigates blind probing but is not an access-control
+/// substitute. Each subscriber also holds one dedicated (non-pooled) Postgres
+/// `LISTEN` connection for the stream's lifetime, so embedders should rate-limit
+/// and/or cap concurrent streams per user to avoid DB connection exhaustion.
+///
+/// Responses: `404` if the execution does not exist; `503` if the LISTEN/NOTIFY
+/// database URL is not configured or the notification database is unreachable
+/// (both server-side conditions, retriable); a single `event: end` frame (then
+/// close) if the execution is already terminal at connect.
+#[allow(clippy::too_many_lines)]
 async fn stream_workflow_progress(
     Extension(api_state): Extension<HarvestApiState>,
     Path(exec_id_raw): Path<String>,
@@ -27679,14 +27709,25 @@ async fn stream_workflow_progress(
     };
 
     // Resolve the LISTEN/NOTIFY database URL for this execution's shard.
+    //
+    // No LISTEN/NOTIFY URL configured is a *server* misconfiguration, not a
+    // client error: return 503 (retriable once configured), matching the handler
+    // contract and docs/api-contract.json. A DB-unreachable failure on `connect`
+    // below is likewise 503 (via `map_error`'s `HarvestError::Database` arm), so
+    // both "not configured" and "unreachable" surface as 503, never a 400.
     let shard = exec_id.shard();
-    let notification_url = match api_state.sse_notification_url(shard) {
-        Ok(url) => url,
-        Err(e) => return map_error(e).into_response(),
+    let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+        return AutumnError::service_unavailable_msg(
+            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+        )
+        .into_response();
     };
 
     // Establish LISTEN before verifying the execution so a chunk published in
     // the window between the existence check and LISTEN setup is not missed.
+    // A connect failure is `HarvestError::Database` → 503 via `map_error`
+    // (LISTEN/NOTIFY database unreachable), consistent with the not-configured
+    // case above.
     let listener =
         match WorkflowProgressListener::connect(&notification_url, exec_id.as_uuid()).await {
             Ok(l) => l,
@@ -27713,8 +27754,10 @@ async fn stream_workflow_progress(
         .sse_keepalive_interval()
         .min(PROGRESS_STREAM_KEEPALIVE);
 
-    // Bounded channel: when the axum SSE receiver drops (client disconnect),
-    // further sends fail and the producer task shuts down cleanly.
+    // Bounded channel: chunks are pushed non-blocking (`try_send`) so a slow
+    // client can only ever cause chunk DROPS (best-effort), never unbounded
+    // buffering and never back-pressure into Postgres' NOTIFY queue. A dropped
+    // receiver (client disconnect) ends the producer cleanly.
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
         PROGRESS_STREAM_CHANNEL_CAPACITY,
     );
@@ -27727,18 +27770,39 @@ async fn stream_workflow_progress(
         let api_clone = api_state.clone();
         // Producer task: runs independently of the HTTP handler after we return.
         tokio::spawn(async move {
+            // Emit a progress chunk NON-BLOCKING. Returns `false` when the
+            // receiver has been dropped (client disconnected) so the caller
+            // ends the stream; a full channel (slow consumer) DROPS the chunk
+            // and returns `true` (keep going — the monotonic seq lets the
+            // client detect the gap). A blocking `send().await` here would
+            // back-pressure a slow client into the shared Postgres NOTIFY queue
+            // and stall the terminal-close poll below, so it must not block.
+            let emit_chunk = |tx: &mut futures::channel::mpsc::Sender<
+                Result<Event, std::convert::Infallible>,
+            >,
+                              payload: autumn_harvest::notify::ProgressNotifyPayload|
+             -> bool {
+                // `chunk` is already an inner JSON value — serialize it compactly
+                // (single line) and DO NOT re-wrap it in the adjacently-tagged
+                // envelope; `id:` carries the seq.
+                let event = Event::default()
+                    .id(payload.seq.to_string())
+                    .event("progress")
+                    .data(payload.chunk.to_string());
+                match tx.try_send(Ok(event)) {
+                    Ok(()) => true,
+                    // Slow consumer: drop this chunk, keep the stream alive.
+                    Err(e) if e.is_full() => true,
+                    // Receiver dropped (client disconnected): end the stream.
+                    Err(_) => false,
+                }
+            };
+
             let mut listener = listener;
             loop {
                 match listener.wait_for_progress_timeout(keepalive).await {
                     Ok(ProgressWaitOutcome::Chunk(payload)) => {
-                        // `chunk` is already an inner JSON value — serialize it
-                        // compactly (single line) and DO NOT re-wrap it in the
-                        // adjacently-tagged envelope; `id:` carries the seq.
-                        let event = Event::default()
-                            .id(payload.seq.to_string())
-                            .event("progress")
-                            .data(payload.chunk.to_string());
-                        if tx.send(Ok(event)).await.is_err() {
+                        if !emit_chunk(&mut tx, payload) {
                             break; // client disconnected
                         }
                     }
@@ -27753,6 +27817,23 @@ async fn stream_workflow_progress(
                         // chunk, so this bounds close latency to one keepalive.
                         if let Some(reason) = progress_stream_end_reason(&api_clone, exec_id).await
                         {
+                            // Bounded final-chunk drain: the workflow's LAST
+                            // published chunk may have arrived on the listener
+                            // socket but not yet been forwarded by the driver
+                            // task when this idle tick fired. Drain (non-blocking)
+                            // with a short grace so the primary "here's your
+                            // answer" frame is not dropped on close. A non-Chunk
+                            // outcome (no more chunks in flight, timeout, or the
+                            // listener dropped) exits the drain and proceeds to
+                            // close.
+                            while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
+                                .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
+                                .await
+                            {
+                                if !emit_chunk(&mut tx, payload) {
+                                    return; // client disconnected mid-drain
+                                }
+                            }
                             let end_data = serde_json::json!({ "reason": reason }).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("end").data(end_data)))

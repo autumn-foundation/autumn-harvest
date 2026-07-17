@@ -220,6 +220,34 @@ async fn progress_stream_is_not_admin_gated() {
     );
 }
 
+/// FIX (#791 review): an unconfigured / unavailable LISTEN/NOTIFY URL is a
+/// *server* misconfiguration, so the progress stream must return 503 (retriable),
+/// not the 400 a `HarvestError::Config` would otherwise map to. With no
+/// notification URL configured, the handler short-circuits to 503.
+#[tokio::test]
+async fn progress_stream_returns_service_unavailable_when_not_configured() {
+    use autumn_web::reexports::axum::body::Body;
+    use autumn_web::reexports::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = autumn_harvest_plugin::api::harvest_api_router(HarvestApiState::new())
+        .with_state(autumn_web::AppState::for_test());
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/workflows/00000000-0000-0000-0000-000000000001/stream")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "progress stream must return 503 (not 400) when the LISTEN/NOTIFY URL is \
+         not configured — it is a retriable server misconfiguration"
+    );
+}
+
 #[tokio::test]
 async fn sse_stream_route_exists_in_router() {
     use autumn_web::reexports::axum::body::Body;
