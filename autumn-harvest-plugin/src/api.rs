@@ -33610,6 +33610,7 @@ mod tests {
     /// an unvalidated/uncapped payload. Reproduce that exact state and assert
     /// `signal_workflow` fails closed instead, mirroring `admit_update` above.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // #685: required conflict_policy field tips this pre-existing literal-heavy test to 101 lines
     async fn signal_workflow_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
         #[derive(diesel::QueryableByName)]
         struct CountRow {

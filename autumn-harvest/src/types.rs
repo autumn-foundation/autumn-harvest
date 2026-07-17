@@ -758,7 +758,7 @@ pub enum WorkflowIdReusePolicy {
 /// (RUNNING or PAUSED) prior execution of the same `(workflow_name, workflow_id)`.
 ///
 /// This is *orthogonal* to [`WorkflowIdReusePolicy`], which governs TERMINAL
-/// priors (COMPLETED/FAILED/CANCELLED/TIMED_OUT). The two axes compose in the
+/// priors (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`). The two axes compose in the
 /// start-path admission logic: the conflict policy has no effect on a terminal
 /// prior, and the reuse policy has no effect on an active prior (except via the
 /// [`WorkflowIdConflictPolicy::Unspecified`] default, which defers to the reuse

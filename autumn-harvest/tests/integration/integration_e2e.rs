@@ -745,6 +745,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // #685: required conflict_policy field tips this pre-existing literal-heavy test to 101 lines
 async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts() {
     let (database_url, _container) = setup_blank_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -785,7 +786,6 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
-
         owner: None,
         runbook_url: None,
         severity: None,
@@ -6356,7 +6356,7 @@ async fn count_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64
         .n
 }
 
-/// UseExisting attaches to a RUNNING prior regardless of the reuse policy —
+/// `UseExisting` attaches to a RUNNING prior regardless of the reuse policy —
 /// returning the existing handle, appending no new `WorkflowStarted` event, and
 /// leaving the prior RUNNING (no cancel).
 #[tokio::test]
@@ -6404,7 +6404,7 @@ async fn conflict_use_existing_running_attaches_no_new_run() {
     );
 }
 
-/// UseExisting attaches to a PAUSED prior too (PAUSED is an active state).
+/// `UseExisting` attaches to a PAUSED prior too (PAUSED is an active state).
 #[tokio::test]
 async fn conflict_use_existing_paused_attaches() {
     let (mut conn, _container) = setup_test_db().await;
@@ -6438,7 +6438,7 @@ async fn conflict_use_existing_paused_attaches() {
 
 /// AC-3 corner: `TerminateIfRunning` reuse + `UseExisting` conflict on a
 /// COMPLETED (terminal) prior — the conflict axis governs only active priors, so
-/// the terminal prior is decided by the reuse axis (TerminateIfRunning) → fresh.
+/// the terminal prior is decided by the reuse axis (`TerminateIfRunning`) → fresh.
 #[tokio::test]
 async fn conflict_terminate_if_running_reuse_plus_use_existing_completed_starts_fresh() {
     let (mut conn, _container) = setup_test_db().await;
@@ -6465,7 +6465,7 @@ async fn conflict_terminate_if_running_reuse_plus_use_existing_completed_starts_
 }
 
 /// AC-3 corner (the pre-check gate fix): `TerminateIfRunning` reuse +
-/// `UseExisting` conflict on a RUNNING prior — UseExisting overrides the active
+/// `UseExisting` conflict on a RUNNING prior — `UseExisting` overrides the active
 /// behavior to Attach, so the prior is NOT cancelled by the pre-check.
 #[tokio::test]
 async fn conflict_terminate_if_running_reuse_plus_use_existing_running_attaches() {
@@ -6535,8 +6535,8 @@ async fn conflict_fail_running_errors() {
     assert_eq!(prior.state, "RUNNING");
 }
 
-/// TerminateExisting on a RUNNING prior cancels it and starts fresh, even with a
-/// reuse policy (AllowDuplicate) that would natively attach.
+/// `TerminateExisting` on a RUNNING prior cancels it and starts fresh, even with a
+/// reuse policy (`AllowDuplicate`) that would natively attach.
 #[tokio::test]
 async fn conflict_terminate_existing_running_cancels_and_starts_fresh() {
     let (mut conn, _container) = setup_test_db().await;
@@ -6574,7 +6574,7 @@ async fn conflict_terminate_existing_running_cancels_and_starts_fresh() {
 }
 
 /// AC-6 regression guard: `Unspecified` conflict preserves the reuse policy's
-/// native active behavior byte-for-byte — AllowDuplicate + RUNNING → attach.
+/// native active behavior byte-for-byte — `AllowDuplicate` + RUNNING → attach.
 #[tokio::test]
 async fn conflict_unspecified_preserves_allow_duplicate_running_attaches() {
     let (mut conn, _container) = setup_test_db().await;
@@ -6596,8 +6596,8 @@ async fn conflict_unspecified_preserves_allow_duplicate_running_attaches() {
 }
 
 /// Success-metric proof (scaled to 20 for CI speed; the 100/100 metric is this
-/// test's shape): N concurrent UseExisting starts against ONE running prior all
-/// converge on the same exec_id — zero AlreadyExists errors, zero terminations.
+/// test's shape): N concurrent `UseExisting` starts against ONE running prior all
+/// converge on the same `exec_id` — zero `AlreadyExists` errors, zero terminations.
 #[tokio::test]
 async fn conflict_concurrency_race_use_existing_converges() {
     let (database_url, _container) = setup_test_database_url_or_env().await;

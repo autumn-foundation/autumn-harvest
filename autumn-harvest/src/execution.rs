@@ -809,11 +809,8 @@ pub async fn start_or_load_workflow_execution_collect(
                                     workflow_id: request.workflow_id.to_string(),
                                 });
                             }
-                            let mut tx_cancel_metrics = Vec::new();
-                            tx_cancel_metrics.push((
-                                existing.workflow_name.clone(),
-                                existing.queue_name.clone(),
-                            ));
+                            let tx_cancel_metrics =
+                                vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
                             let mut deferred = inline_cancel(
                                 conn,
                                 ExecutionId::from_uuid(existing.id),
@@ -1208,37 +1205,35 @@ pub fn start_will_create_new_execution(
     reuse_policy: WorkflowIdReusePolicy,
     conflict_policy: WorkflowIdConflictPolicy,
 ) -> bool {
-    match prior_state {
-        // No non-sealed prior occupies the uniqueness slot → the INSERT succeeds
-        // → a fresh execution is created (covers "no prior" and "sealed prior").
-        None => true,
-        Some(state) => {
-            if is_active_conflict_state(state) {
-                // Active prior: the conflict axis decides. Only a Terminate
-                // resolution creates a fresh run (cancel-if-live, then replace).
-                matches!(
-                    effective_active_conflict_behavior(reuse_policy, conflict_policy),
-                    ActiveConflictBehavior::Terminate
-                )
-            } else {
-                // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT/
-                // SUSPENDED): the reuse axis decides, unchanged from today. The
-                // conflict axis has no effect on a terminal prior.
-                match reuse_policy {
-                    // AllowDuplicate ATTACHES; RejectDuplicate errors AlreadyExists —
-                    // neither creates a new execution.
-                    WorkflowIdReusePolicy::AllowDuplicate
-                    | WorkflowIdReusePolicy::RejectDuplicate => false,
-                    // Replace only a FAILED/CANCELLED prior; otherwise attach.
-                    WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                        matches!(state, "FAILED" | "CANCELLED")
-                    }
-                    // Always replaces (cancel-if-live, then replace) → fresh create.
-                    WorkflowIdReusePolicy::TerminateIfRunning => true,
+    // `None` = no non-sealed prior occupies the uniqueness slot → the INSERT
+    // succeeds → a fresh execution is created (covers "no prior" and "sealed prior").
+    prior_state.is_none_or(|state| {
+        if is_active_conflict_state(state) {
+            // Active prior: the conflict axis decides. Only a Terminate resolution
+            // creates a fresh run (cancel-if-live, then replace).
+            matches!(
+                effective_active_conflict_behavior(reuse_policy, conflict_policy),
+                ActiveConflictBehavior::Terminate
+            )
+        } else {
+            // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT/
+            // SUSPENDED): the reuse axis decides, unchanged from today. The
+            // conflict axis has no effect on a terminal prior.
+            match reuse_policy {
+                // AllowDuplicate ATTACHES; RejectDuplicate errors AlreadyExists —
+                // neither creates a new execution.
+                WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::RejectDuplicate => {
+                    false
                 }
+                // Replace only a FAILED/CANCELLED prior; otherwise attach.
+                WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                    matches!(state, "FAILED" | "CANCELLED")
+                }
+                // Always replaces (cancel-if-live, then replace) → fresh create.
+                WorkflowIdReusePolicy::TerminateIfRunning => true,
             }
         }
-    }
+    })
 }
 
 /// The three possible resolutions of an ACTIVE-prior collision (issue #685).
@@ -1261,10 +1256,12 @@ pub fn is_active_conflict_state(state: &str) -> bool {
 }
 
 /// Resolve the effective active-prior behavior from the two orthogonal axes
-/// (issue #685). With `WorkflowIdConflictPolicy::Unspecified`, each reuse policy
-/// maps to its documented native active behavior, so no existing caller changes.
+/// (issue #685).
+///
+/// With `WorkflowIdConflictPolicy::Unspecified`, each reuse policy maps to its
+/// documented native active behavior, so no existing caller changes.
 #[must_use]
-pub fn effective_active_conflict_behavior(
+pub const fn effective_active_conflict_behavior(
     reuse: WorkflowIdReusePolicy,
     conflict: WorkflowIdConflictPolicy,
 ) -> ActiveConflictBehavior {
@@ -1273,10 +1270,11 @@ pub fn effective_active_conflict_behavior(
         WorkflowIdConflictPolicy::UseExisting => ActiveConflictBehavior::Attach,
         WorkflowIdConflictPolicy::TerminateExisting => ActiveConflictBehavior::Terminate,
         WorkflowIdConflictPolicy::Unspecified => match reuse {
-            // NATIVE active behaviors of the 4 existing reuse policies:
-            WorkflowIdReusePolicy::AllowDuplicate => ActiveConflictBehavior::Attach,
+            // NATIVE active behaviors of the 4 existing reuse policies. AllowDuplicate
+            // and AllowDuplicateFailedOnly both natively attach to an active prior.
+            WorkflowIdReusePolicy::AllowDuplicate
+            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly => ActiveConflictBehavior::Attach,
             WorkflowIdReusePolicy::RejectDuplicate => ActiveConflictBehavior::Fail,
-            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => ActiveConflictBehavior::Attach,
             WorkflowIdReusePolicy::TerminateIfRunning => ActiveConflictBehavior::Terminate,
         },
     }
