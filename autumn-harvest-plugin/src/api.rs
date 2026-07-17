@@ -10764,23 +10764,16 @@ pub(crate) async fn start_workflow(
         .unwrap_or(autumn_harvest::StartSource::Api);
     let effective_start_source_ref = request.start_source_ref_override.clone();
 
-    // A start that can forcibly cancel a live prior requires admin auth. That is
-    // `reuse_policy = terminate_if_running` (cancels a RUNNING/PAUSED prior) and,
-    // since issue #685, `conflict_policy = terminate_existing` (the same
-    // destructive capability on an active prior via the orthogonal conflict
-    // axis). Gating only the reuse string would let `conflict_policy` reach the
-    // identical cancel-and-replace behavior without admin — a privilege gap.
-    if (matches!(
-        request.reuse_policy.as_deref(),
-        Some("terminate_if_running")
-    ) || matches!(
-        request.conflict_policy.as_deref(),
-        Some("terminate_existing")
-    )) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
-        .await
-    {
-        return AutumnError::unauthorized_msg("authentication required").into_response();
-    }
+    // A start that can forcibly cancel a live prior requires admin auth. The
+    // gate is NARROWED (issue #685 review) to the precise "can cancel a live
+    // run" capability — the resolved active-prior behavior being `Terminate` —
+    // rather than a raw-string match on the reuse/conflict wire values. This is
+    // computed AFTER both policies are parsed (below), because the flagship
+    // non-admin idempotent-starter shape `reuse = terminate_if_running` +
+    // `conflict = use_existing` resolves to `Attach` (return the existing
+    // handle) and provably CANNOT cancel a live run — gating it on the raw
+    // `terminate_if_running` string would wrongly force admin and defeat the
+    // non-admin webhook/cron user story. See the gate below the two parses.
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
@@ -10963,11 +10956,13 @@ pub(crate) async fn start_workflow(
     // is even computed; those apply only to a genuine fresh keyed start (a probe
     // miss). Only genuine prerequisites run above it: key validation, the
     // registry/DAG 404/400 existence check, and workflow_id + shard resolution
-    // (needed to know which shard to probe). The `terminate_if_running` admin
-    // gate at the very top of the handler is an authorization boundary (not a
-    // fresh-start validation) and deliberately stays ahead of the probe — a
-    // non-admin must never be able to invoke that capability, and a legitimate
-    // idempotent retry comes from the same authorized caller anyway.
+    // (needed to know which shard to probe). The capability-precise admin gate
+    // (issue #685 review) is computed from the PARSED reuse+conflict policies, so
+    // it runs after them and hence after this probe. That is safe: a committed
+    // replay returns the already-committed run and performs no NEW cancel, and a
+    // non-admin can never commit a `Terminate` start in the first place (the
+    // fresh-start path always gates before creating one), so there is never a
+    // committed replay for a non-admin to bypass the gate through.
     //
     // We probe the keyed claim read-only on the same key-derived `shard` the
     // reserve below uses (so we observe the claim the original delivery wrote),
@@ -11059,6 +11054,34 @@ pub(crate) async fn start_workflow(
             return e.into_response();
         }
     };
+
+    // Capability-precise admin gate (issue #685 review). Admin is required iff
+    // this request could cancel a currently-active (RUNNING/PAUSED) prior — i.e.
+    // the resolved active-prior behavior is `Terminate`. `Terminate` is the ONLY
+    // active-prior resolution that cancels live work; the other two (`Attach` →
+    // return the existing handle, `Fail` → `Err(AlreadyExists)`) touch nothing.
+    // Reachable Terminate combos (all admin-gated here): `conflict =
+    // terminate_existing` (any reuse), or `reuse = terminate_if_running` with the
+    // default/omitted conflict (`Unspecified` falls back to the reuse policy's
+    // native `Terminate`). Deliberately NON-admin (the fix): `reuse =
+    // terminate_if_running` + `conflict = use_existing` (→ Attach) or `+ fail`
+    // (→ Fail) — the flagship non-admin idempotent-starter, which cannot cancel a
+    // live run. A `terminate_if_running` + `use_existing` start over a TERMINAL
+    // prior does a fresh-replace of an already-dead run (no live work touched) —
+    // equivalent to the already-non-admin `allow_duplicate_failed_only` replace
+    // path — so it is correctly not admin-gated. This runs after both parses (an
+    // invalid value now returns `400` before reaching the gate, which is more
+    // correct); for a keyed start it also runs after the #808 committed-replay
+    // probe, which is safe because a replay returns the already-committed run and
+    // never performs a NEW cancel, and a non-admin can never commit a Terminate
+    // start in the first place (the fresh path always gates).
+    if autumn_harvest::execution::effective_active_conflict_behavior(reuse_policy, conflict_policy)
+        == autumn_harvest::execution::ActiveConflictBehavior::Terminate
+        && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+            .await
+    {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
