@@ -2275,6 +2275,39 @@ struct RateLimitKeyEntry {
     contributors: Vec<(String, f64, Option<f64>)>,
 }
 
+/// Reject an activity whose `rate_limit_rps` or `rate_limit_burst` is not
+/// finite and strictly greater than zero (issue #699 review, Codex P2).
+///
+/// Applies to static AND dynamic rate limits — the `#[activity]` macro enforces
+/// positivity universally at parse time (`n <= 0.0` -> compile error), but a
+/// hand-built `ActivityInfo` (a directly-constructed `HandlerRegistry`)
+/// bypasses the macro; a non-positive / non-finite rps yields a
+/// `burst = tokens = 0` bucket whose gate can never reach one token,
+/// permanently wedging every scheduled activity on that bucket. This goes
+/// stricter than the macro by also rejecting `NaN`/`±inf`, which `n <= 0.0`
+/// alone lets through.
+fn check_rate_limit_positive(
+    activity: &crate::info::ActivityInfo,
+) -> Result<(), HarvestBuilderError> {
+    if let Some(rps) = activity.rate_limit_rps
+        && (!rps.is_finite() || rps <= 0.0)
+    {
+        return Err(HarvestBuilderError::RateLimitRateNotPositive {
+            activity: activity.name.to_string(),
+            field: "rate_limit_rps",
+        });
+    }
+    if let Some(burst) = activity.rate_limit_burst
+        && (!burst.is_finite() || burst <= 0.0)
+    {
+        return Err(HarvestBuilderError::RateLimitRateNotPositive {
+            activity: activity.name.to_string(),
+            field: "rate_limit_burst",
+        });
+    }
+    Ok(())
+}
+
 /// Verify that rate limiting attributes on activities are consistent and valid.
 /// Validate every activity's rate-limit configuration (issue #699).
 ///
@@ -2322,31 +2355,10 @@ pub(crate) fn validate_activity_rate_limits<'a>(
     let mut seen_dynamic: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
 
     for activity in activities {
-        // Positivity (issue #699 review, Codex P2): a rate/burst — static OR
-        // dynamic — must be finite and strictly positive. The `#[activity]` macro
-        // enforces this universally at parse time (`n <= 0.0` -> error), but a
-        // hand-built `ActivityInfo` (direct `HandlerRegistry`) bypasses the macro;
-        // a non-positive / non-finite rps yields a `burst = tokens = 0` bucket
-        // whose gate can never reach one token, permanently wedging every
-        // scheduled activity on that bucket. Match the macro's universal check
-        // here — and go stricter, also rejecting `NaN`/`±inf` (which `n <= 0.0`
-        // alone lets through) — before either the dynamic or the static branch.
-        if let Some(rps) = activity.rate_limit_rps
-            && (!rps.is_finite() || rps <= 0.0)
-        {
-            return Err(HarvestBuilderError::RateLimitRateNotPositive {
-                activity: activity.name.to_string(),
-                field: "rate_limit_rps",
-            });
-        }
-        if let Some(burst) = activity.rate_limit_burst
-            && (!burst.is_finite() || burst <= 0.0)
-        {
-            return Err(HarvestBuilderError::RateLimitRateNotPositive {
-                activity: activity.name.to_string(),
-                field: "rate_limit_burst",
-            });
-        }
+        // Positivity (issue #699 review, Codex P2): reject a non-finite /
+        // non-positive rps or burst — static OR dynamic — before either branch
+        // (see `check_rate_limit_positive`).
+        check_rate_limit_positive(activity)?;
 
         // Dynamic per-key rate limit (issue #699): validated in its own map and
         // never touches the static path below (its static `rate_limit_key` is
