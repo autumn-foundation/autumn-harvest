@@ -16424,6 +16424,86 @@ mod tests {
         assert!(worker.is_ok());
     }
 
+    /// Build a bare `ActivityInfo` with the rate-limit fields overridden,
+    /// everything else defaulted — for the `Worker::new` positivity gate tests
+    /// (issue #699 review, Codex P2).
+    fn rate_limited_activity(
+        name: &'static str,
+        rate_limit_rps: Option<f64>,
+        rate_limit_burst: Option<f64>,
+        rate_limit_key_expr: Option<&'static str>,
+    ) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps,
+            rate_limit_burst,
+            rate_limit_key: None,
+            rate_limit_key_expr,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    #[test]
+    fn worker_new_rejects_non_positive_dynamic_rate_limit_rps() {
+        // A hand-built registry (bypassing the `#[activity]` macro) with a dynamic
+        // per-key rate limit whose rps is 0.0 would create a `burst = tokens = 0`
+        // bucket whose gate can never reach one token, permanently wedging every
+        // scheduled activity on it. Worker::new must reject it up front.
+        let act = rate_limited_activity("charge", Some(0.0), None, Some("input.tenant_id"));
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+        let err = Worker::new(cfg, registry).unwrap_err();
+        assert!(
+            err.to_string().contains("rate_limit_rps"),
+            "expected a non-positive rate_limit_rps config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn worker_new_rejects_non_positive_or_non_finite_rate_limit_burst() {
+        // A valid positive rps paired with a non-positive / non-finite burst is
+        // also rejected — the burst is what seeds the bucket's token ceiling.
+        for bad_burst in [0.0_f64, -3.0, f64::NAN, f64::INFINITY] {
+            let act = rate_limited_activity(
+                "charge",
+                Some(50.0),
+                Some(bad_burst),
+                Some("input.tenant_id"),
+            );
+            let cfg = default_runtime_config();
+            let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+            let err = Worker::new(cfg, registry).unwrap_err();
+            assert!(
+                err.to_string().contains("rate_limit_burst"),
+                "burst {bad_burst}: expected a rate_limit_burst config error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_new_accepts_valid_positive_dynamic_rate_limit() {
+        // The valid positive config still starts cleanly.
+        let act =
+            rate_limited_activity("charge", Some(50.0), Some(20.0), Some("input.tenant_id"));
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+        assert!(Worker::new(cfg, registry).is_ok());
+    }
+
     #[test]
     fn worker_rejects_history_ceiling_at_or_below_soft_threshold() {
         // Default soft threshold is 10_000; ceiling must be strictly greater.
