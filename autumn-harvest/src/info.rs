@@ -1426,6 +1426,7 @@ impl std::fmt::Debug for ActivityInfo {
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("rate_limit_key", &self.rate_limit_key)
+            .field("rate_limit_key_expr", &self.rate_limit_key_expr)
             .field("circuit_breaker", &self.circuit_breaker)
             .field("requires", &self.requires)
             .field("handler", &"<fn>")

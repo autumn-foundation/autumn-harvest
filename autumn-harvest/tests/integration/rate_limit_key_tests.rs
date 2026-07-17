@@ -321,7 +321,7 @@ async fn ac8_dynamic_rate_composes_with_per_key_concurrency() {
     ensure_rate_limit_bucket(&mut conn, &rate_key, 100.0, 100.0)
         .await
         .unwrap();
-    let conc = ("tenant:acme".to_string(), 1u32);
+    let concurrency = ("tenant:acme".to_string(), 1u32);
 
     // Two tasks, same concurrency key (cap 1), same rate key (plenty of tokens).
     let t1 = enqueue_activity(
@@ -329,7 +329,7 @@ async fn ac8_dynamic_rate_composes_with_per_key_concurrency() {
         q,
         "charge",
         Some(rate_key.clone()),
-        Some(conc.clone()),
+        Some(concurrency.clone()),
     )
     .await;
     let _t2 = enqueue_activity(
@@ -337,7 +337,7 @@ async fn ac8_dynamic_rate_composes_with_per_key_concurrency() {
         q,
         "charge",
         Some(rate_key.clone()),
-        Some(conc.clone()),
+        Some(concurrency.clone()),
     )
     .await;
 
