@@ -109,7 +109,8 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use autumn_harvest::types::{
-    ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
+    ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
@@ -2184,6 +2185,15 @@ pub(crate) struct StartWorkflowRequest {
     /// An unknown string value returns `400 Bad Request` with the offending value
     /// echoed in the response body.
     reuse_policy: Option<String>,
+    /// How to handle a collision with a currently-active (RUNNING/PAUSED) prior
+    /// (issue #685). Orthogonal to `reuse_policy` (which governs *terminal*
+    /// priors). Omitted or `null` → `unspecified` (each reuse policy's native
+    /// active behavior, byte-for-byte identical to today). One of:
+    /// `unspecified`, `fail`, `use_existing`, `terminate_existing`. An unknown
+    /// value returns `400 Bad Request`. Not supported combined with a throttle /
+    /// debounce / batch policy (the start is deferred and has no active prior to
+    /// resolve at request time) — returns `400`.
+    conflict_policy: Option<String>,
     #[serde(default)]
     start_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
@@ -2242,6 +2252,7 @@ impl StartWorkflowRequest {
             execution_timeout_secs: None,
             sla_secs: None,
             reuse_policy: None,
+            conflict_policy: None,
             start_at: None,
             delay: None,
             batch_key: None,
@@ -2283,6 +2294,7 @@ impl StartWorkflowRequest {
             execution_timeout_secs: None,
             sla_secs: None,
             reuse_policy: None,
+            conflict_policy: None,
             start_at: None,
             delay: None,
             batch_key: None,
@@ -5221,6 +5233,7 @@ pub const fn management_api_request_fields()
                 "execution_timeout_secs",
                 "sla_secs",
                 "reuse_policy",
+                "conflict_policy",
                 "start_at",
                 "delay",
                 "batch_key",
@@ -10751,11 +10764,16 @@ pub(crate) async fn start_workflow(
         .unwrap_or(autumn_harvest::StartSource::Api);
     let effective_start_source_ref = request.start_source_ref_override.clone();
 
-    if matches!(
-        request.reuse_policy.as_deref(),
-        Some("terminate_if_running")
-    ) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
-        .await
+    // A start that can forcibly cancel a live prior requires admin auth. That is
+    // `reuse_policy = terminate_if_running` (cancels a RUNNING/PAUSED prior) and,
+    // since issue #685, `conflict_policy = terminate_existing` (the same
+    // destructive capability on an active prior via the orthogonal conflict
+    // axis). Gating only the reuse string would let `conflict_policy` reach the
+    // identical cancel-and-replace behavior without admin — a privilege gap.
+    if (matches!(request.reuse_policy.as_deref(), Some("terminate_if_running"))
+        || matches!(request.conflict_policy.as_deref(), Some("terminate_existing")))
+        && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+            .await
     {
         return AutumnError::unauthorized_msg("authentication required").into_response();
     }
@@ -11006,6 +11024,38 @@ pub(crate) async fn start_workflow(
         }
     };
 
+    // Fresh-start-only validation: parse the active-prior conflict policy
+    // (issue #685). Runs AFTER the committed-replay probe (like `reuse_policy`
+    // above) so a retry of an already-successful keyed start with a now-invalid
+    // `conflict_policy` string returns the `200` no-op rather than a `400`. The
+    // parsed `conflict_policy` is threaded into the `StartWorkflowParams` built
+    // below (both the plain and the #808 keyed paths) and consulted by the
+    // throttle admission-gate bypass; it governs a RUNNING/PAUSED prior only.
+    let conflict_policy = match parse_conflict_policy(request.conflict_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid conflict policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
+    };
+
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
     // starts so a gate on that shard can't reject a request whose work would be
@@ -11119,6 +11169,32 @@ pub(crate) async fn start_workflow(
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "idempotency_key cannot be combined with throttle/debounce/batch start"
+            })),
+        )
+            .into_response();
+    }
+
+    // issue #685: a non-default `conflict_policy` resolves a collision with an
+    // *active* (RUNNING/PAUSED) prior at request time (attach / fail / cancel +
+    // start fresh). Throttle / debounce / batch all DEFER the start — no start
+    // happens synchronously and there is no active prior to resolve at request
+    // time — so a `use_existing` / `fail` / `terminate_existing` decision is
+    // undefined combined with them. Reject the combination (mirrors the
+    // `idempotency_key`-vs-deferred-start mutual-exclusion above). `unspecified`
+    // (the default) is unaffected, so a throttled/debounced/batched workflow
+    // that omits the field — or sends `unspecified` — is byte-for-byte
+    // unchanged (AC-6/AC-7). `conflict_policy` combined with `idempotency_key`
+    // is allowed — those compose (the keyed path still resolves an active-prior
+    // collision under the reservation transaction).
+    if conflict_policy != WorkflowIdConflictPolicy::Unspecified
+        && (throttle_applies || is_debounced_start || has_batch_policy)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "conflict_policy is not supported for a throttled, debounced, or batched \
+                          workflow; the start is deferred and has no active prior to resolve at \
+                          request time"
             })),
         )
             .into_response();
@@ -12268,11 +12344,17 @@ pub(crate) async fn start_workflow(
                 // create-on-retry policy (`AllowDuplicateFailedOnly` +
                 // FAILED/CANCELLED prior, `TerminateIfRunning`), returns `true`
                 // here, so `attaches_to_existing` is `false` and the gate blocks.
+                // Pass the request's `conflict_policy` so the create-vs-attach
+                // decision matches the authoritative core gate exactly (issue
+                // #685). In practice this is always `Unspecified` on the throttle
+                // path — the mutual-exclusion guard above rejects a non-default
+                // `conflict_policy` combined with a throttle — but threading it
+                // keeps this predicate byte-identical to the core one.
                 let attaches_to_existing =
                     !autumn_harvest::execution::start_will_create_new_execution(
                         prior_state.as_deref(),
                         reuse_policy,
-                        autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                        conflict_policy,
                     );
                 attaches_to_existing
                     || autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
@@ -12484,7 +12566,7 @@ pub(crate) async fn start_workflow(
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
                 reuse_policy,
-                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                conflict_policy,
                 trace_context: trace_ctx,
                 max_execution_timeout_ceiling: api_state
                     .max_workflow_execution_timeout()
@@ -12707,7 +12789,7 @@ pub(crate) async fn start_workflow(
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         reuse_policy,
-        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        conflict_policy,
         trace_context: trace_ctx,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
@@ -12888,9 +12970,18 @@ pub(crate) async fn start_workflow(
                     workflow_name: start.workflow_name,
                     workflow_id: start.workflow_id,
                     state: start.state,
-                    // No-key path: omit the #808 flags so the response is
-                    // byte-for-byte identical to a pre-#808 build.
-                    started_fresh: None,
+                    // issue #685 (AC-4/AC-7): surface `started_fresh` — the
+                    // attach-vs-fresh distinguisher — ONLY when the caller opted
+                    // into the conflict axis by sending a `conflict_policy` field
+                    // (even `"unspecified"`). Omitting the field keeps the
+                    // response byte-for-byte identical to a pre-#685/#808 build
+                    // (both #808 flags omitted via `skip_serializing_if`).
+                    started_fresh: if request.conflict_policy.is_some() {
+                        Some(start.created)
+                    } else {
+                        None
+                    },
+                    // No-key path never sets `deduplicated` (idempotency-key only).
                     deduplicated: None,
                 }),
             )
@@ -26914,6 +27005,24 @@ fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, Autumn
     }
 }
 
+/// Parse the active-prior conflict policy (issue #685). Mirrors
+/// [`parse_reuse_policy`]. Omitted / empty / `unspecified` → `Unspecified`
+/// (each reuse policy's native active behavior, byte-for-byte identical to
+/// today). An unknown value returns `400 Bad Request` with the offending value
+/// echoed, never a silent fallback.
+fn parse_conflict_policy(raw: Option<&str>) -> Result<WorkflowIdConflictPolicy, AutumnError> {
+    match raw {
+        None | Some("" | "unspecified") => Ok(WorkflowIdConflictPolicy::Unspecified),
+        Some("fail") => Ok(WorkflowIdConflictPolicy::Fail),
+        Some("use_existing") => Ok(WorkflowIdConflictPolicy::UseExisting),
+        Some("terminate_existing") => Ok(WorkflowIdConflictPolicy::TerminateExisting),
+        Some(other) => Err(AutumnError::bad_request_msg(format!(
+            "unknown conflict_policy '{other}'; expected one of: unspecified, fail, use_existing, \
+             terminate_existing"
+        ))),
+    }
+}
+
 fn parse_workflow_result_wait_query(
     pairs: &[(String, String)],
     max_wait: Duration,
@@ -33239,6 +33348,61 @@ mod tests {
         // Ensure "allow_DUPLICATE" (wrong case) is rejected, not silently coerced.
         assert!(
             parse_reuse_policy(Some("allow_DUPLICATE")).is_err(),
+            "wrong case must not silently fall back"
+        );
+    }
+
+    // -- conflict_policy parsing (issue #685) --
+
+    #[test]
+    fn parse_conflict_policy_none_and_empty_and_unspecified_default_to_unspecified() {
+        for raw in [None, Some(""), Some("unspecified")] {
+            assert_eq!(
+                parse_conflict_policy(raw).unwrap(),
+                WorkflowIdConflictPolicy::Unspecified,
+                "failed for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_conflict_policy_accepts_all_known_values() {
+        use WorkflowIdConflictPolicy::{Fail, TerminateExisting, Unspecified, UseExisting};
+        let cases = [
+            ("unspecified", Unspecified),
+            ("fail", Fail),
+            ("use_existing", UseExisting),
+            ("terminate_existing", TerminateExisting),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_conflict_policy(Some(input)).unwrap(),
+                expected,
+                "failed for '{input}'"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_conflict_policy_unknown_value_returns_400_error() {
+        let err =
+            parse_conflict_policy(Some("bogus_conflict")).expect_err("unknown value must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus_conflict"),
+            "offending value must be echoed in error: {msg}"
+        );
+        assert!(
+            msg.contains("unknown conflict_policy"),
+            "error must mention unknown conflict_policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_conflict_policy_unknown_value_is_not_silent_fallback() {
+        // Wrong-case must be rejected, not silently coerced to Unspecified.
+        assert!(
+            parse_conflict_policy(Some("USE_EXISTING")).is_err(),
             "wrong case must not silently fall back"
         );
     }
