@@ -38,7 +38,7 @@ use autumn_harvest::info::{QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInf
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
@@ -468,17 +468,32 @@ async fn get_raw(app: &HarvestApiApp, uri: &str) -> (StatusCode, Vec<u8>) {
 /// given workflow type so `load_execution`/`admit_update`/`send_signal`
 /// succeed. Returns the execution id.
 async fn seed_running_execution(pool: &DbPool, workflow_name: &str) -> ExecutionId {
+    seed_execution_in_state(pool, workflow_name, "RUNNING").await
+}
+
+/// State-parameterized variant of [`seed_running_execution`]. The multi-shard
+/// `found_shard` scan in signal-/update-with-start excludes only
+/// `CONTINUED_AS_NEW`/`TERMINATED`, so `COMPLETED`/`PAUSED` rows are found and
+/// route correctly — and the read-only committed-replay probes join
+/// `harvest_signals`/`harvest_events` with no state filter at all, so they
+/// resolve a dedup hit against a terminal prior too.
+async fn seed_execution_in_state(
+    pool: &DbPool,
+    workflow_name: &str,
+    state: &str,
+) -> ExecutionId {
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, input, queue_name, state) \
-         VALUES ($1, $2, $3, 0, $4, 'default', 'RUNNING')",
+         VALUES ($1, $2, $3, 0, $4, 'default', $5)",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Text, _>(workflow_name)
     .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
     .bind::<diesel::sql_types::Jsonb, _>(json!({}))
+    .bind::<diesel::sql_types::Text, _>(state)
     .execute(&mut conn)
     .await
     .expect("seed execution");
@@ -494,6 +509,58 @@ async fn seed_running_execution(pool: &DbPool, workflow_name: &str) -> Execution
         .await
         .expect("seed history");
     exec_id
+}
+
+/// Reproduce the deterministic `update_id` the `update-with-start` handler
+/// derives from an idempotency key (UUIDv5 over the OID namespace), so a test
+/// can seed a matching `UpdateAdmitted` event that the committed-replay probe
+/// will find.
+fn derive_uws_update_id(key: &str) -> UpdateId {
+    let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        .expect("static namespace UUID is valid");
+    UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+}
+
+/// Seed an `UpdateAdmitted` event for `(exec_id, update_id)` directly, simulating
+/// an update that was admitted on a prior committed delivery. `lookup_idempotent_
+/// update_dedupe` matches on `event_data->'data'->>'update_id'`, so the seeded
+/// event's `update_id` must serialize to the same UUID string the probe binds.
+async fn seed_update_admitted_event(
+    pool: &DbPool,
+    exec_id: ExecutionId,
+    update_id: UpdateId,
+    update_name: &str,
+) {
+    let mut conn = pool.get().await.expect("pooled conn");
+    let events = vec![WorkflowEvent::UpdateAdmitted {
+        update_id,
+        name: update_name.to_string(),
+        input: json!({}),
+        timestamp: Utc::now(),
+    }];
+    // WorkflowStarted was appended at event_id 0 by the seed helper; continue at 1.
+    store::append_events(&mut conn, exec_id, &events, 1)
+        .await
+        .expect("seed UpdateAdmitted event");
+}
+
+/// Count `UpdateAdmitted` events for a given execution.
+async fn count_update_admitted_events(pool: &DbPool, exec_id: ExecutionId) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = pool.get().await.expect("pooled conn");
+    let row: Cnt = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = 'UpdateAdmitted'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut conn)
+    .await
+    .expect("count UpdateAdmitted events");
+    row.n
 }
 
 fn names(arr: &Value) -> Vec<String> {
@@ -1095,5 +1162,399 @@ async fn signal_with_start_accepts_valid_payload() {
     assert!(
         status.is_success(),
         "valid signal-with-start should proceed (2xx), got {status}: {body}"
+    );
+}
+
+// ── with-start keyed committed-replay: validation ordering (this PR) ─────────
+//
+// A retry of an already-committed keyed signal-/update-with-start must replay to
+// its documented no-op BEFORE any fresh-start-only validation runs (#610 schema
+// gate, #373 start_input schema, #684 validator). Otherwise, if validation
+// TIGHTENED between the original delivery and the retry (schema published/made
+// stricter, payload cap lowered), the retry is wrongly rejected 400/422 instead
+// of returning the cached outcome. This mirrors #808 (plain start route) and
+// #1092 (plain signal route). A probe MISS falls through to the untouched
+// authoritative in-lock path, which stays the source of truth.
+
+/// AC1: a committed keyed signal-with-start that ATTACHED to a live (RUNNING)
+/// run replays to `200 signal_delivered: false` even when the retry payload is
+/// now schema-invalid — the committed-replay probe short-circuits before the
+/// #610 signal-payload schema gate. No second signal row is enqueued.
+#[tokio::test]
+async fn sws_committed_keyed_replay_after_attach_short_circuits_before_schema_gate() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "RUNNING").await;
+    let wid = exec_id.to_string();
+
+    // Simulate a signal-with-start that committed before the `approve` schema
+    // was published: seed a matching signal row whose payload is now invalid.
+    let committed_key = "k-sws-attach";
+    seed_signal_row(
+        &pool,
+        exec_id,
+        "approve",
+        json!({ "reason": 123 }),
+        committed_key,
+    )
+    .await;
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "precondition: exactly one committed signal row"
+    );
+
+    // Same-key retry with a now-schema-invalid signal payload (`{}`, missing the
+    // required string `reason`) → committed-replay no-op, NOT the schema 400.
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": wid,
+            "signal_name": "approve",
+            "signal_payload": {},
+            "idempotency_key": committed_key
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed signal-with-start replay must dedup to 200, not be rejected by the \
+         schema gate: {body}"
+    );
+    assert_eq!(
+        body["signal_delivered"],
+        json!(false),
+        "committed replay must report signal_delivered: false: {body}"
+    );
+    assert_eq!(
+        body["execution_id"],
+        json!(exec_id.to_string()),
+        "committed replay must return the original execution_id: {body}"
+    );
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "committed replay must NOT enqueue a second signal row"
+    );
+}
+
+/// AC2: the same short-circuit holds when the committed prior is TERMINAL
+/// (COMPLETED). The in-lock path would escalate a terminal prior to a fresh
+/// start, but the idempotency-key dedup (and the probe mirroring it) recognizes
+/// the committed key first and replays the no-op. Payload again now-invalid.
+#[tokio::test]
+async fn sws_committed_keyed_replay_after_terminal_fresh_start_short_circuits() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "COMPLETED").await;
+    let wid = exec_id.to_string();
+
+    let committed_key = "k-sws-fresh";
+    seed_signal_row(
+        &pool,
+        exec_id,
+        "approve",
+        json!({ "reason": 123 }),
+        committed_key,
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": wid,
+            "signal_name": "approve",
+            "signal_payload": {},
+            "idempotency_key": committed_key
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed replay against a terminal prior must dedup to 200: {body}"
+    );
+    assert_eq!(
+        body["signal_delivered"],
+        json!(false),
+        "committed replay must report signal_delivered: false: {body}"
+    );
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "committed replay must NOT enqueue a second signal row"
+    );
+}
+
+/// AC3: a committed keyed update-with-start replay against a RUNNING run
+/// short-circuits before the #610 update-arg schema gate (and the #373
+/// start_input gate). Retry args are now schema-invalid; the response is the
+/// cached admission (`200`, `started_fresh: false`), NOT a 400. No second
+/// `UpdateAdmitted` event is appended.
+#[tokio::test]
+async fn uws_committed_keyed_replay_after_running_short_circuits_before_validation() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "RUNNING").await;
+    let wid = exec_id.to_string();
+
+    let committed_key = "k-uws-run";
+    let update_id = derive_uws_update_id(committed_key);
+    seed_update_admitted_event(&pool, exec_id, update_id, "set_priority").await;
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "precondition: exactly one committed UpdateAdmitted event"
+    );
+
+    // Retry with a now-schema-invalid update arg (`priority` string, not int).
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": wid,
+            "update_name": "set_priority",
+            "update_args": { "priority": "high" },
+            "idempotency_key": committed_key,
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "committed keyed update-with-start replay must NOT be rejected by the schema gate: {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed replay must return the cached admission (200): {body}"
+    );
+    assert_eq!(
+        body["update_id"],
+        json!(update_id.to_string()),
+        "committed replay must return the derived update_id: {body}"
+    );
+    assert_eq!(
+        body["started_fresh"],
+        json!(false),
+        "committed replay must report started_fresh: false: {body}"
+    );
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "committed replay must NOT append a second UpdateAdmitted event"
+    );
+}
+
+/// AC4: a committed keyed update-with-start replay does not re-run the #684
+/// semantic validator. Seeded against a COMPLETED prior with `set_priority_gated`
+/// (validator rejects `priority > 10`); the retry carries `priority: 99` which
+/// would 422, but the committed-replay probe returns the cached outcome (200)
+/// before the validator runs.
+#[tokio::test]
+async fn uws_committed_keyed_replay_validator_not_rerun() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "COMPLETED").await;
+    let wid = exec_id.to_string();
+
+    let committed_key = "k-uws-gated";
+    let update_id = derive_uws_update_id(committed_key);
+    seed_update_admitted_event(&pool, exec_id, update_id, "set_priority_gated").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": wid,
+            "update_name": "set_priority_gated",
+            "update_args": { "priority": 99 },
+            "idempotency_key": committed_key,
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "committed keyed replay must NOT re-run the validator (422): {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed replay must return the cached admission (200): {body}"
+    );
+    assert_eq!(
+        body["update_id"],
+        json!(update_id.to_string()),
+        "committed replay must return the derived update_id: {body}"
+    );
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "committed replay must NOT append a second UpdateAdmitted event"
+    );
+}
+
+/// AC5a: a FRESH keyed signal-with-start with a malformed payload (key never
+/// seen) is still validated at the edge → 400. The probe misses, so the #610
+/// schema gate runs as before.
+#[tokio::test]
+async fn sws_fresh_keyed_malformed_still_400() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": "sws-fresh-bad",
+            "signal_name": "approve",
+            "signal_payload": {},
+            "idempotency_key": "k-sws-fresh-bad"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a fresh keyed malformed signal-with-start must still be validated: {body}"
+    );
+    assert_field_violation(&body, "signal payload validation failed", "/reason");
+}
+
+/// AC5b: a FRESH keyed update-with-start with a malformed payload is still
+/// validated at the edge → 400.
+#[tokio::test]
+async fn uws_fresh_keyed_malformed_still_400() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": "uws-fresh-bad",
+            "update_name": "set_priority",
+            "update_args": { "priority": "high" },
+            "idempotency_key": "k-uws-fresh-bad",
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a fresh keyed malformed update-with-start must still be validated: {body}"
+    );
+    assert_field_violation(&body, "update payload validation failed", "/priority");
+}
+
+/// AC6: the UNKEYED path is byte-for-byte unchanged — a valid unkeyed
+/// signal-/update-with-start still proceeds (2xx), and a malformed unkeyed one
+/// is still rejected 400. The probe is keyed-only, so it never runs here.
+#[tokio::test]
+async fn sws_uws_unkeyed_behavior_unchanged() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Valid unkeyed signal-with-start → proceeds (2xx).
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": "sws-unkeyed-ok",
+            "signal_name": "approve",
+            "signal_payload": { "reason": "ok" }
+        }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "valid unkeyed signal-with-start must still proceed (2xx): {status} {body}"
+    );
+
+    // Malformed unkeyed signal-with-start → still 400.
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": "sws-unkeyed-bad",
+            "signal_name": "approve",
+            "signal_payload": {}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "malformed unkeyed signal-with-start must still be validated: {body}"
+    );
+
+    // Malformed unkeyed update-with-start → still 400.
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": "uws-unkeyed-bad",
+            "update_name": "set_priority",
+            "update_args": { "priority": "high" },
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "malformed unkeyed update-with-start must still be validated: {body}"
+    );
+}
+
+/// AC7: a genuine FRESH keyed update-with-start against a PAUSED prior still
+/// returns 409 WorkflowPaused. This confirms the authoritative in-lock path is
+/// preserved for non-committed requests: probe MISSES → validation runs (payload
+/// valid) → authoritative call → WorkflowPaused.
+#[tokio::test]
+async fn uws_paused_fresh_keyed_still_409() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "PAUSED").await;
+    let wid = exec_id.to_string();
+
+    // Fresh key (never committed) + a schema-valid update arg + AllowDuplicate
+    // (default). Probe misses; validation passes; the authoritative resolver
+    // rejects an update to a PAUSED prior with WorkflowPaused (409).
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": wid,
+            "update_name": "set_priority",
+            "update_args": { "priority": 3 },
+            "idempotency_key": "k-uws-paused-fresh",
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a fresh keyed update-with-start to a PAUSED prior must still 409: {body}"
+    );
+    assert_eq!(
+        body["error"], "workflow is paused",
+        "409 body must carry the paused error: {body}"
     );
 }
