@@ -2,7 +2,7 @@
 #![allow(clippy::items_after_statements)]
 //! HTTP integration test for per-key activity rate limits (issue #699), AC7.
 //!
-//! A dynamic per-key rate-limit bucket (`dyn-rate:{expr}:{tenant}`) is stored in
+//! A dynamic per-key rate-limit bucket (`dyn-rate:{expr_len}:{expr}:{tenant}`) is stored in
 //! the same `harvest_rate_limit_buckets` table as static and throttle buckets,
 //! so it is enumerated by the existing read-only `GET /admin/rate-limits`
 //! management endpoint with no new surface. This test proves a composite key is
@@ -121,8 +121,10 @@ async fn dynamic_composite_key_is_listed_by_admin_rate_limits() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // A dynamic per-key bucket, exactly as the enqueue path would lazily register.
-    let composite = "dyn-rate:input.tenant_id:acme";
+    // A dynamic per-key bucket, exactly as the enqueue path would lazily register:
+    // the expr is length-prefixed (`tenant_id` is 9 bytes) and the `input.`
+    // prefix is normalized away.
+    let composite = "dyn-rate:9:tenant_id:acme";
     seed_bucket(&url, composite).await;
     // A static bucket for good measure.
     seed_bucket(&url, "send_email").await;

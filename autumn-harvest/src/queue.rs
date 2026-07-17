@@ -125,7 +125,7 @@ const MAX_RESOLVED_KEY_LEN: usize = 256;
 /// (issue #699).
 ///
 /// The key is namespaced by both the dot-path *expression* and the resolved
-/// per-execution *value* — `dyn-rate:{normalized_expr}:{resolved}` — so that
+/// per-execution *value* — `dyn-rate:{expr_len}:{normalized_expr}:{resolved}` — so that
 /// activities declaring the same expression share one bucket per resolved value
 /// (matching the static limiter's "same key → shared bucket → must agree on rps"
 /// rule), while distinct tenants get independent buckets. `resolved` is empty
@@ -146,21 +146,36 @@ const MAX_RESOLVED_KEY_LEN: usize = 256;
 /// path. Short values pass through unchanged (human-readable), and two distinct
 /// long values hash to distinct keys.
 ///
-/// The `:` delimiter is injective in practice: `key_expr` is a trusted
-/// compile-time dot-path (no `:`), and `resolved` is either a length-bounded
-/// value or a fixed-width hash, so `dyn-rate:{expr}:{resolved}` parses back
-/// unambiguously.
+/// The key is **injective by construction**: `dyn-rate:{expr_len}:{expr}:{resolved}`
+/// length-prefixes the (variable-length, possibly-`:`-containing) `expr`
+/// component with its UTF-8 byte length. After the `dyn-rate:` prefix, the
+/// decimal `expr_len` (digits up to the next `:`) tells the reader exactly how
+/// many bytes `expr` occupies, so a `:` inside `expr` (a dot-path can address a
+/// JSON key containing `:`) or inside `resolved` can never split ambiguously:
+/// the pair `(expr, resolved)` maps to exactly one key and vice-versa. Without
+/// the length prefix, `key="a"` + resolved `"b:c"` and `key="a:b"` + resolved
+/// `"c"` would both flatten to `dyn-rate:a:b:c` — two distinct exprs sharing one
+/// bucket, so their (independently validated, possibly different) rps configs
+/// would collide first-writer-wins.
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    if resolved.len() > MAX_RESOLVED_KEY_LEN {
+    // Bound the resolved value first (btree PK safety); the hashed-or-short value
+    // is the free, unambiguous tail once the expr is length-prefixed below.
+    let resolved_tail = if resolved.len() > MAX_RESOLVED_KEY_LEN {
         // Deterministic, collision-resistant digest of the oversized value; the
         // `h:` marker keeps it visibly a hash and distinct from short literals.
         let digest = seahash::hash(resolved.as_bytes());
-        format!("{DYNAMIC_RATE_PREFIX}:{expr}:h:{digest:016x}")
+        format!("h:{digest:016x}")
     } else {
-        format!("{DYNAMIC_RATE_PREFIX}:{expr}:{resolved}")
-    }
+        resolved.to_string()
+    };
+    format!(
+        "{DYNAMIC_RATE_PREFIX}:{}:{}:{}",
+        expr.len(),
+        expr,
+        resolved_tail
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2217,7 +2232,7 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
 /// caller ([`crate::worker::Worker::emit_throttle_metrics`]) feeds each returned
 /// value into [`crate::telemetry::MetricsRecorder::record_rate_limit_throttled`],
 /// which uses it as a metric label. Since a dynamic per-key bucket key
-/// (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
+/// (`dyn-rate:{expr_len}:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
 /// resolved key must never become a label; the activity name is bounded by the
 /// registered activity set, so it is what we return and label by.
 ///
@@ -2565,7 +2580,7 @@ pub async fn ensure_rate_limit_bucket(
 /// **Cardinality rule (ADR-0001 §7):** the per-key token/refill GAUGES are
 /// emitted with the bucket `key` as a metric LABEL. A caller-controlled /
 /// per-execution-resolved key family — dynamic per-key limits
-/// (`dyn-rate:{expr}:{tenant}`, #699) and start throttles
+/// (`dyn-rate:{expr_len}:{expr}:{tenant}`, #699) and start throttles
 /// (`start-throttle:{workflow}:{tenant}`, #607) — embeds unbounded tenant input
 /// and buckets are never GC'd, so labelling by it would create one time-series
 /// per tenant forever. Those families are excluded here; their per-tenant bucket
@@ -2629,7 +2644,8 @@ mod tests {
     fn dynamic_rate_bucket_key_is_prefixed_and_namespaced_by_expr_and_value() {
         // The `input.` prefix is normalized away (issue #699 review, #6).
         let k = dynamic_rate_bucket_key("input.tenant_id", "acme");
-        assert_eq!(k, "dyn-rate:tenant_id:acme");
+        // `tenant_id` is 9 bytes; the expr component is length-prefixed.
+        assert_eq!(k, "dyn-rate:9:tenant_id:acme");
         assert!(k.starts_with(DYNAMIC_RATE_PREFIX));
     }
 
@@ -2643,7 +2659,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_rate_bucket_key("tenant_id", "acme"),
-            "dyn-rate:tenant_id:acme"
+            "dyn-rate:9:tenant_id:acme"
         );
     }
 
@@ -2666,8 +2682,23 @@ mod tests {
     #[test]
     fn dynamic_rate_bucket_key_empty_resolved_fallback_is_distinct() {
         let fallback = dynamic_rate_bucket_key("input.tenant_id", "");
-        assert_eq!(fallback, "dyn-rate:tenant_id:");
+        assert_eq!(fallback, "dyn-rate:9:tenant_id:");
         assert_ne!(fallback, dynamic_rate_bucket_key("input.tenant_id", "acme"));
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_is_injective_across_colon_containing_components() {
+        // Regression (issue #699 review, Codex P2): before the expr byte-length
+        // prefix, a `:` inside `key_expr` (a dot-path can address a JSON key
+        // containing `:`) or inside `resolved` could collide two genuinely
+        // distinct `(expr, resolved)` pairs onto one bucket string. Both of
+        // these used to flatten to `dyn-rate:a:b:c`.
+        assert_eq!(dynamic_rate_bucket_key("a", "b:c"), "dyn-rate:1:a:b:c");
+        assert_eq!(dynamic_rate_bucket_key("a:b", "c"), "dyn-rate:3:a:b:c");
+        assert_ne!(
+            dynamic_rate_bucket_key("a", "b:c"),
+            dynamic_rate_bucket_key("a:b", "c"),
+        );
     }
 
     #[test]
@@ -2692,7 +2723,7 @@ mod tests {
     fn dynamic_rate_bucket_key_bounds_oversized_resolved_value() {
         // A short value is human-readable and unchanged.
         let short = dynamic_rate_bucket_key("tenant_id", "acme");
-        assert_eq!(short, "dyn-rate:tenant_id:acme");
+        assert_eq!(short, "dyn-rate:9:tenant_id:acme");
 
         // A pathologically large resolved value (would blow the btree PK limit)
         // is replaced with a bounded, stable hash.
@@ -2703,7 +2734,7 @@ mod tests {
             "oversized resolved value must be bounded, got len {}",
             bounded.chars().count()
         );
-        assert!(bounded.starts_with("dyn-rate:tenant_id:h:"));
+        assert!(bounded.starts_with("dyn-rate:9:tenant_id:h:"));
         // Deterministic: same long value → same key.
         assert_eq!(bounded, dynamic_rate_bucket_key("tenant_id", &big));
         // Injective in practice: two distinct long values → distinct keys.

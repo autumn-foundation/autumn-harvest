@@ -548,13 +548,13 @@ async fn worker_resolves_dynamic_key_from_workflow_input_not_activity_input() {
     // The key MUST be derived from the workflow input, not the activity input.
     assert_eq!(
         rate_limit_key_for_exec(&mut conn, exec_acme).await,
-        "dyn-rate:tenant_id:acme",
+        "dyn-rate:9:tenant_id:acme",
         "acme's key must resolve from the WORKFLOW input"
     );
     // Absent-field fallback: workflow input `{}` -> the shared fallback bucket.
     assert_eq!(
         rate_limit_key_for_exec(&mut conn, exec_empty).await,
-        "dyn-rate:tenant_id:",
+        "dyn-rate:9:tenant_id:",
         "empty workflow input must fall back to the shared, still-bounded bucket"
     );
 }

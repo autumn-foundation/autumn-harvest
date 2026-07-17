@@ -273,7 +273,7 @@ production APM. Use `ATTR_EXECUTION_ID` only on *spans*, never on *metrics*.
 operators).** `harvest.rate_limit.throttled` is now labelled by the **bounded
 activity name** (`activity`), not the raw bucket `key`. Per-key rate limits
 (#699) resolve a bucket key from workflow input at enqueue time
-(`dyn-rate:{expr}:{tenant}`), which embeds unbounded tenant input; using it as a
+(`dyn-rate:{expr_len}:{expr}:{tenant}`), which embeds unbounded tenant input; using it as a
 metric label would create one time-series per tenant forever. The counter is
 therefore labelled by the registered activity name, which is bounded. **Any
 dashboard or alert keyed on the old `key` label of `harvest_rate_limit_throttled`

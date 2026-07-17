@@ -1120,7 +1120,7 @@ pub struct ActivityInfo {
     /// `#[activity(rate_limit(key = "input.tenant_id", rps = 50))]`.
     ///
     /// The bucket key is namespaced by both the expression and the resolved
-    /// value (`dyn-rate:{expr}:{resolved}` — see
+    /// value (`dyn-rate:{expr_len}:{expr}:{resolved}` — see
     /// [`crate::queue::dynamic_rate_bucket_key`]) so it can never collide with a
     /// static [`Self::rate_limit_key`] bucket or a throttle bucket. `rps` flows
     /// through [`Self::rate_limit_rps`] as the bucket refill rate exactly as for

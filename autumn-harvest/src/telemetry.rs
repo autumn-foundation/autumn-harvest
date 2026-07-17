@@ -1746,7 +1746,7 @@ pub trait MetricsRecorder: Send + Sync {
     /// **Cardinality (ADR-0001 §7):** the `activity` argument MUST be a bounded
     /// value (the registered activity name). It is used as a metric label, so a
     /// caller must never pass the raw rate-limit bucket key — a dynamic per-key
-    /// key (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant
+    /// key (`dyn-rate:{expr_len}:{expr}:{tenant}`, issue #699) embeds unbounded tenant
     /// input and would explode label cardinality.
     fn record_rate_limit_throttled(&self, activity: &str) {
         let _ = activity;

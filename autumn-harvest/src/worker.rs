@@ -4694,7 +4694,7 @@ async fn persist_scheduled_activities(
             // Dynamic per-key rate limit (issue #699): resolve the bucket key from
             // the workflow input at enqueue time so each tenant gets its own RPS
             // bucket. A key that cannot be resolved (missing / null / non-object
-            // input) falls back to a shared `dyn-rate:{expr}:` bucket so the
+            // input) falls back to a shared `dyn-rate:{expr_len}:{expr}:` bucket so the
             // execution is still bounded, not unbounded. Takes priority over the
             // static `rate_limit_key` path entirely.
             let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input)
