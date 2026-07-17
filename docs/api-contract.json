@@ -735,7 +735,12 @@
           {
             "name": "reuse_policy",
             "required": false,
-            "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+            "description": "Duplicate-id policy for a TERMINAL prior run: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running. Orthogonal to conflict_policy (issue #685), which governs an ACTIVE prior."
+          },
+          {
+            "name": "conflict_policy",
+            "required": false,
+            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication (same as reuse_policy=terminate_if_running). Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
           },
           {
             "name": "start_at",
@@ -776,7 +781,7 @@
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 when conflict_policy=use_existing attaches to an ACTIVE (RUNNING/PAUSED) prior (issue #685); returns 201 when conflict_policy=terminate_existing cancels the active prior and starts fresh. When the request sends a conflict_policy field (even 'unspecified'), the response includes started_fresh (true = created a new run, false = attached to the existing run); omitting conflict_policy omits started_fresh so the response is byte-for-byte identical to today. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -797,11 +802,15 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, or when idempotency_key is combined with a throttle/debounce/batch policy (issue #808)."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, or when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685)."
+        },
+        {
+          "status": 401,
+          "description": "reuse_policy=terminate_if_running or conflict_policy=terminate_existing (issue #685) requires admin authentication — both can forcibly cancel a live prior."
         },
         {
           "status": 409,
-          "description": "Duplicate workflow_id with conflicting reuse policy."
+          "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
         },
         {
           "status": 503,
