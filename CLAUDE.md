@@ -498,8 +498,20 @@ running prior is returned rather than cancelled. This is the canonical
   the response byte-for-byte identical to today).
 - *cancel + start fresh* → `201 Created`, `started_fresh: true`.
 - *fail over an active prior* → `409 Conflict`.
-- `terminate_existing` → **`401`** without admin (parity with
-  `reuse=terminate_if_running`: both can forcibly cancel a live prior).
+- **Admin auth (capability-precise gate, #685 review).** Admin is required
+  **iff the request can cancel a live run** — i.e. the resolved active-prior
+  behavior (the matrix cell) is *cancel + start fresh* (`Terminate`). That is
+  exactly `conflict=terminate_existing` (any reuse), or
+  `reuse=terminate_if_running` with the **default/omitted** conflict
+  (`unspecified` → native `Terminate`). Without admin these → **`401`**. The
+  other two active resolutions never cancel live work and are **non-admin**:
+  *attach* (`use_existing`, or the native-attach reuse policies) and *fail*
+  (`fail`). In particular the flagship idempotent-starter
+  `reuse=terminate_if_running` + `conflict=use_existing` resolves to *attach*
+  and is **not** admin-gated — a non-admin webhook/cron caller can use it
+  directly. The gate is computed from the parsed policies via
+  `effective_active_conflict_behavior(reuse, conflict) == ActiveConflictBehavior::Terminate`,
+  so an invalid policy value returns `400` before the gate is reached.
 - an unknown `conflict_policy` value → `400`.
 
 **Deferred-start restriction.** A non-default `conflict_policy` combined with a
@@ -507,6 +519,14 @@ running prior is returned rather than cancelled. This is the canonical
 there is no active prior to resolve at request time. `unspecified` (or omitting
 the field) is always accepted. `conflict_policy` combined with `idempotency_key`
 (#808) is allowed — they compose.
+
+**Concurrency note (#685 review).** Concurrent `terminate_existing` starts of
+the same `(workflow_name, workflow_id)` against one live prior are
+last-writer-wins; a loser may observe a transient `404 NotFound` (a pre-existing
+`load_workflow_execution_by_key_for_update` race, more reachable now that
+`terminate_existing` has no pre-check). It does **not** corrupt data, deadlock,
+or double-run — the seal + insert is transactional, and `use_existing` never
+enters this branch — so a loser should simply retry the start.
 
 ### Typed Dispatch
 

@@ -124,11 +124,13 @@ don't set it.
 | `unspecified` *(default)* | Each reuse policy's native active behavior (byte-for-byte identical to today). |
 | `fail` | Return `409` — never touch or attach to the active prior. |
 | `use_existing` | Attach: return the running execution (`200`), no new run, no cancel. |
-| `terminate_existing` | Cancel the active prior and start fresh (`201`). Requires admin auth. |
+| `terminate_existing` | Cancel the active prior and start fresh (`201`). Requires admin auth (can cancel a live run). |
 
 ```bash
 # Start-or-attach a singleton entity workflow in one call: replace a terminal
-# prior, but attach to (return) a still-running one — the idempotent-starter shape.
+# prior, but attach to (return) a still-running one — the idempotent-starter
+# shape. This does NOT require admin: over an active prior it attaches
+# (use_existing), and over a terminal prior it replaces an already-dead run.
 curl -s -X POST http://localhost:3000/api/harvest/workflows/cart/start \
   -H 'content-type: application/json' \
   -d '{"workflow_id":"cart-42","input":{},
@@ -137,11 +139,28 @@ curl -s -X POST http://localhost:3000/api/harvest/workflows/cart/start \
 
 When the request sends a `conflict_policy` field (even `unspecified`), the
 response includes `started_fresh` (`true` = a new run was created, `false` =
-attached to the existing run). `terminate_existing` — like
-`reuse_policy=terminate_if_running` — requires admin authentication because it
-can forcibly cancel a live run. `conflict_policy` is **not** supported combined
-with a throttle / debounce / batch policy (the start is deferred and has no
-active prior to resolve at request time) — that combination returns `400`.
+attached to the existing run).
+
+**Admin auth is required iff the request can cancel a live run** — that is, when
+the resolved active-prior behavior is *Terminate*: namely `conflict_policy =
+terminate_existing`, or `reuse_policy = terminate_if_running` with the
+default/omitted `conflict_policy`. The flagship idempotent-starter shape above
+(`terminate_if_running` + `use_existing`) resolves to *attach* and provably
+cannot cancel a live run, so it does **not** require admin — non-admin
+webhook/cron callers can use it directly. `terminate_if_running` +
+`fail` (resolves to `409`) is likewise non-admin.
+
+`conflict_policy` is **not** supported combined with a throttle / debounce /
+batch policy (the start is deferred and has no active prior to resolve at
+request time) — that combination returns `400`.
+
+> **Concurrency note.** Concurrent `terminate_existing` starts of the same
+> `(workflow_name, workflow_id)` against one live prior are last-writer-wins; a
+> loser may observe a transient `404 NotFound` (it does not corrupt data,
+> deadlock, or double-run) and should simply retry the start.
+
+For the full `reuse_policy` × `conflict_policy` matrix see the
+"Standalone Start — Conflict Policy" section in `CLAUDE.md`.
 
 ---
 
