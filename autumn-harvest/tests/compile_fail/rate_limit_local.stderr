@@ -1,0 +1,5 @@
+error: local activities do not support rate_limit(...); per-key rate limiting is enforced on the task-dispatch path, which local activities bypass by running inline on the workflow worker
+ --> tests/compile_fail/rate_limit_local.rs:8:7
+  |
+8 | async fn local_rate_limited(_ctx: &ActivityContext, x: i64) -> Result<i64, String> {
+  |       ^^

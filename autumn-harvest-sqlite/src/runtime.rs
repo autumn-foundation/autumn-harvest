@@ -2263,12 +2263,13 @@ const fn unsupported_activity_feature(info: &ActivityInfo) -> Option<(&'static s
     if info.rate_limit_rps.is_some()
         || info.rate_limit_burst.is_some()
         || info.rate_limit_key.is_some()
+        || info.rate_limit_key_expr.is_some()
     {
         return Some((
             "rate_limit",
-            "Per-activity rate limiting (#332) is a dispatch-admission feature backed \
-             by the shared task queue's token buckets, which the single-writer backend \
-             has no analog for.",
+            "Per-activity rate limiting (#332, per-key #699) is a dispatch-admission \
+             feature backed by the shared task queue's token buckets, which the \
+             single-writer backend has no analog for.",
         ));
     }
     if info.max_concurrent.is_some() {

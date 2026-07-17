@@ -171,6 +171,7 @@ fn local_activity_circuit_breaker_is_not_tracked() {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: Some(CircuitBreakerPolicy::new(
             1,
             Duration::from_secs(30),

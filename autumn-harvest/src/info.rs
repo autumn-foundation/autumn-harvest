@@ -1110,6 +1110,28 @@ pub struct ActivityInfo {
     /// Rate limit bucket key. Multiple activities sharing a key share the
     /// rate limit. Defaults to the activity's own name when rate limits are set.
     pub rate_limit_key: Option<&'static str>,
+    /// Dynamic per-key rate-limit expression (issue #699).
+    ///
+    /// When `Some(expr)`, `expr` is a dot-notation JSON path (e.g.
+    /// `"input.tenant_id"`) resolved against the **workflow input** at enqueue
+    /// time to give each resolved value (e.g. each tenant) its own token
+    /// bucket, so one noisy tenant cannot exhaust the shared RPS budget for
+    /// every other tenant. Declared via
+    /// `#[activity(rate_limit(key = "input.tenant_id", rps = 50))]`.
+    ///
+    /// The bucket key is namespaced by both the expression and the resolved
+    /// value (`dyn-rate:{expr}:{resolved}` — see
+    /// [`crate::queue::dynamic_rate_bucket_key`]) so it can never collide with a
+    /// static [`Self::rate_limit_key`] bucket or a throttle bucket. `rps` flows
+    /// through [`Self::rate_limit_rps`] as the bucket refill rate exactly as for
+    /// the static form.
+    ///
+    /// Presence of this field selects *dynamic* mode: when set, the enqueue
+    /// path resolves the per-execution key from the workflow input and ignores
+    /// [`Self::rate_limit_key`]. `None` retains today's static behaviour.
+    /// **Not supported on local activities** — the macro rejects the nested
+    /// `rate_limit(...)` form at compile time.
+    pub rate_limit_key_expr: Option<&'static str>,
     /// Optional circuit-breaker policy (issue #369). When set, the worker
     /// fast-fails dispatches of this activity with a non-retryable
     /// `"CircuitOpen"` failure while the breaker is open. `None` retains
@@ -1181,6 +1203,7 @@ impl ActivityInfo {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: wasm_activity_stub_handler,
@@ -1901,6 +1924,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1931,6 +1955,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1969,6 +1994,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1998,6 +2024,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2031,6 +2058,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2125,6 +2153,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

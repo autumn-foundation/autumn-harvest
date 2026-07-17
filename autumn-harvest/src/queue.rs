@@ -98,6 +98,35 @@ impl std::fmt::Display for TaskType {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic per-key rate-limit bucket keys (issue #699)
+// ---------------------------------------------------------------------------
+
+/// Namespace prefix for a *dynamic* per-key activity rate-limit bucket stored in
+/// `harvest_rate_limit_buckets`.
+///
+/// Distinct from a *static* [`EnqueueParams::rate_limit_key`] (a bare activity
+/// name or an author-supplied `rate_limit_key` string) and from the throttle
+/// bucket prefix (`start-throttle:`), so a dynamic per-tenant bucket can never
+/// collide with either.
+pub const DYNAMIC_RATE_PREFIX: &str = "dyn-rate";
+
+/// Build the token-bucket key for a *dynamic* per-key activity rate limit
+/// (issue #699).
+///
+/// The key is namespaced by both the dot-path *expression* and the resolved
+/// per-execution *value* — `dyn-rate:{key_expr}:{resolved}` — so that activities
+/// declaring the same expression share one bucket per resolved value (matching
+/// the static limiter's "same key → shared bucket → must agree on rps" rule),
+/// while distinct tenants get independent buckets. `resolved` is empty (`""`)
+/// for an execution whose key expression could not be resolved (missing / null /
+/// non-object input), giving one shared fallback bucket per expression so an
+/// unkeyed execution is still bounded rather than unbounded.
+#[must_use]
+pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
+    format!("{DYNAMIC_RATE_PREFIX}:{key_expr}:{resolved}")
+}
+
+// ---------------------------------------------------------------------------
 // EnqueueParams
 // ---------------------------------------------------------------------------
 
@@ -2124,9 +2153,18 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
     Ok(found.is_some())
 }
 
-/// Check if any pending tasks in the specified queues are throttled due to rate limits.
+/// Check which activities in the specified queues have pending tasks currently
+/// throttled by rate limits.
 ///
-/// Returns the rate limit keys that are currently saturated (have < 1.0 tokens).
+/// Returns the **bounded activity names** whose saturated (`< 1.0` token) buckets
+/// are blocking claimable pending tasks — deliberately *not* the raw
+/// `rate_limit_key`. **Cardinality contract (team convention, ADR-0001 §7):** the
+/// caller ([`crate::worker::Worker::emit_throttle_metrics`]) feeds each returned
+/// value into [`crate::telemetry::MetricsRecorder::record_rate_limit_throttled`],
+/// which uses it as a metric label. Since a dynamic per-key bucket key
+/// (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
+/// resolved key must never become a label; the activity name is bounded by the
+/// registered activity set, so it is what we return and label by.
 ///
 /// # Errors
 ///
@@ -2138,15 +2176,16 @@ pub async fn check_throttled_keys(
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]
-        rate_limit_key: String,
+        activity_name: String,
     }
 
     let rows: Vec<Row> = diesel::sql_query(
-        "SELECT DISTINCT q.rate_limit_key \
+        "SELECT DISTINCT q.activity_name \
          FROM harvest_task_queue q \
          JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key \
          WHERE q.queue_name = ANY($1) \
            AND q.state = 'PENDING' \
+           AND q.activity_name IS NOT NULL \
            AND q.scheduled_at <= NOW() \
            AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) < 1.0"
     )
@@ -2155,7 +2194,7 @@ pub async fn check_throttled_keys(
     .await
     .map_err(crate::error::database_error)?;
 
-    Ok(rows.into_iter().map(|r| r.rate_limit_key).collect())
+    Ok(rows.into_iter().map(|r| r.activity_name).collect())
 }
 
 /// Atomically consume one rate-limit token from `key`'s bucket at dispatch time.
@@ -2433,6 +2472,38 @@ pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) ->
     Ok(())
 }
 
+/// Ensure a token bucket exists for `key`, preserving any operator override.
+///
+/// `INSERT … ON CONFLICT (key) DO NOTHING` with the initial `tokens = burst`, so
+/// a rate change across a deploy never silently resets a live bucket. Shared by
+/// the static activity-limiter startup registration and the dynamic per-key
+/// enqueue path (issue #699) so the fail-closed `EXISTS` gate in [`claim_task`]
+/// (and the dispatch-time [`try_consume_rate_limit_token`]) always has a bucket
+/// row to read, matching [`crate::throttle`]'s bucket-ensure exactly.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn ensure_rate_limit_bucket(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+    refill_rate: f64,
+    burst: f64,
+) -> HarvestResult<()> {
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
+         VALUES ($1, $2, $3, $3, NOW()) \
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::Double, _>(refill_rate)
+    .bind::<diesel::sql_types::Double, _>(burst)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2440,6 +2511,48 @@ pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Dynamic per-key rate-limit bucket keys (issue #699) ─────────────────
+
+    #[test]
+    fn dynamic_rate_bucket_key_is_prefixed_and_namespaced_by_expr_and_value() {
+        let k = dynamic_rate_bucket_key("input.tenant_id", "acme");
+        assert_eq!(k, "dyn-rate:input.tenant_id:acme");
+        assert!(k.starts_with(DYNAMIC_RATE_PREFIX));
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_same_expr_and_value_is_stable() {
+        assert_eq!(
+            dynamic_rate_bucket_key("input.tenant_id", "acme"),
+            dynamic_rate_bucket_key("input.tenant_id", "acme"),
+        );
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_different_resolved_values_differ() {
+        assert_ne!(
+            dynamic_rate_bucket_key("input.tenant_id", "acme"),
+            dynamic_rate_bucket_key("input.tenant_id", "globex"),
+        );
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_empty_resolved_fallback_is_distinct() {
+        let fallback = dynamic_rate_bucket_key("input.tenant_id", "");
+        assert_eq!(fallback, "dyn-rate:input.tenant_id:");
+        assert_ne!(fallback, dynamic_rate_bucket_key("input.tenant_id", "acme"));
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_cannot_collide_with_static_or_throttle_keys() {
+        // Static keys are bare activity names / user strings; throttle keys use
+        // the `start-throttle:` prefix. The `dyn-rate:` prefix keeps dynamic
+        // per-key buckets disjoint from both.
+        let dynamic = dynamic_rate_bucket_key("input.tenant_id", "acme");
+        assert!(!dynamic.starts_with(crate::throttle::THROTTLE_BUCKET_PREFIX));
+        assert_ne!(dynamic, "send_email"); // a bare static activity-name key
+    }
 
     // ── Dropped-wake fix (issue #601 CI hardening) ──────────────────────────
 

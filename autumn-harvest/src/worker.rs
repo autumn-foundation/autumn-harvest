@@ -395,6 +395,7 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
@@ -4558,11 +4559,18 @@ async fn persist_scheduled_activities(
     assigned_build_id: Option<&str>,
     parent_priority: i32,
     context_headers: Option<&serde_json::Value>,
+    workflow_input: &serde_json::Value,
 ) -> HarvestResult<()> {
     // activity_events is built in scheduled_activities order (= ScheduleActivity command order).
     // After the loop we interleave them with marker/detached-spawn events in full command order.
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
+    // Dynamic per-key rate-limit buckets (issue #699) to lazily register inside
+    // the enqueue transaction: `(bucket_key, refill_rate, burst)`. Deduped so a
+    // fan-out of N activities sharing one resolved tenant key ensures the bucket
+    // once. Registration must happen so the fail-closed claim/dispatch gate has a
+    // bucket row to read (else the task would stall forever).
+    let mut dynamic_rate_buckets: Vec<(String, f64, f64)> = Vec::new();
 
     for scheduled in scheduled_activities {
         let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
@@ -4682,8 +4690,28 @@ async fn persist_scheduled_activities(
             params.max_concurrent = activity.max_concurrent;
         }
 
-        let effective_rate_limit_key =
-            activity
+        if let Some(expr) = activity.rate_limit_key_expr {
+            // Dynamic per-key rate limit (issue #699): resolve the bucket key from
+            // the workflow input at enqueue time so each tenant gets its own RPS
+            // bucket. A key that cannot be resolved (missing / null / non-object
+            // input) falls back to a shared `dyn-rate:{expr}:` bucket so the
+            // execution is still bounded, not unbounded. Takes priority over the
+            // static `rate_limit_key` path entirely.
+            let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input)
+                .unwrap_or_default();
+            let bucket_key = queue::dynamic_rate_bucket_key(expr, &resolved);
+            if let Some(refill_rate) = activity.rate_limit_rps {
+                let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
+                if !dynamic_rate_buckets
+                    .iter()
+                    .any(|(k, _, _)| *k == bucket_key)
+                {
+                    dynamic_rate_buckets.push((bucket_key.clone(), refill_rate, burst));
+                }
+            }
+            params.rate_limit_key = Some(bucket_key);
+        } else {
+            let effective_rate_limit_key = activity
                 .rate_limit_key
                 .map(ToString::to_string)
                 .or_else(|| {
@@ -4693,8 +4721,9 @@ async fn persist_scheduled_activities(
                         None
                     }
                 });
-        if let Some(key) = effective_rate_limit_key {
-            params.rate_limit_key = Some(key);
+            if let Some(key) = effective_rate_limit_key {
+                params.rate_limit_key = Some(key);
+            }
         }
 
         // Worker sessions (issue #606): a member activity carrying a
@@ -4767,6 +4796,14 @@ async fn persist_scheduled_activities(
                 store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
                     .await?;
                 detached_spawns.persist(conn, commands).await?;
+                // Lazily register any dynamic per-key rate-limit buckets (issue
+                // #699) in the same transaction as the enqueue so the fail-closed
+                // claim/dispatch gate always finds a bucket row (else the task
+                // would stall forever). ON CONFLICT DO NOTHING preserves operator
+                // overrides and is idempotent across replays/re-dispatch.
+                for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
+                    queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+                }
                 let mut activity_task_ids = Vec::with_capacity(enqueued.len());
                 for params in &enqueued {
                     activity_task_ids.push(queue::enqueue(conn, params).await?);
@@ -7464,10 +7501,13 @@ async fn process_activity_task(
                     Duration::from_secs_f64(1.0 / rps)
                 })
                 .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+            // Label the throttle metric by the bounded activity name, never the
+            // rate-limit bucket key (which for a dynamic per-key limit,
+            // issue #699, embeds unbounded tenant input — ADR-0001 §7).
             registry
                 .telemetry()
                 .metrics
-                .record_rate_limit_throttled(key);
+                .record_rate_limit_throttled(activity_name);
             let scheduled_at = chrono::Utc::now()
                 + chrono::Duration::from_std(refill_delay)
                     .unwrap_or_else(|_| chrono::Duration::seconds(5));
@@ -8937,6 +8977,7 @@ async fn handle_suspended_workflow(
             context.execution.assigned_build_id.as_deref(),
             context.persistence.task.priority,
             context.execution.context_headers.as_ref(),
+            &context.execution.input,
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -14269,21 +14310,20 @@ impl Worker {
                     let Some(refill_rate) = activity.rate_limit_rps else {
                         continue;
                     };
+                    // Dynamic per-key limits (issue #699) register their buckets
+                    // lazily at enqueue time (one per resolved tenant key), so
+                    // there is no single static bucket to pre-register here.
+                    if activity.rate_limit_key_expr.is_some() {
+                        continue;
+                    }
                     let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
                     let key = activity.rate_limit_key.unwrap_or(activity.name);
 
                     // Insert rate limit bucket if it doesn't already exist.
                     // This preserves operator overrides.
-                    let q = diesel::sql_query(
-                        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
-                         VALUES ($1, $2, $3, $3, NOW()) \
-                         ON CONFLICT (key) DO NOTHING"
-                    )
-                    .bind::<diesel::sql_types::Text, _>(key)
-                    .bind::<diesel::sql_types::Double, _>(refill_rate)
-                    .bind::<diesel::sql_types::Double, _>(burst);
-
-                    if let Err(error) = q.execute(&mut conn).await {
+                    if let Err(error) =
+                        queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
+                    {
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
                             key = %key,
@@ -14334,12 +14374,17 @@ impl Worker {
     /// Shared between the weighted and unweighted poll paths so that the
     /// throttle-recording logic only lives in one place.
     async fn emit_throttle_metrics(&self, conn: &mut AsyncPgConnection) {
-        if let Ok(throttled_keys) = queue::check_throttled_keys(conn, &self.config.queues).await {
-            for key in throttled_keys {
+        // `check_throttled_keys` returns bounded activity names (not raw bucket
+        // keys), so labelling the throttle counter with them is cardinality-safe
+        // for dynamic per-key limits (issue #699 / ADR-0001 §7).
+        if let Ok(throttled_activities) =
+            queue::check_throttled_keys(conn, &self.config.queues).await
+        {
+            for activity in throttled_activities {
                 self.registry
                     .telemetry()
                     .metrics
-                    .record_rate_limit_throttled(&key);
+                    .record_rate_limit_throttled(&activity);
             }
         }
     }
@@ -16096,6 +16141,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -16197,6 +16243,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -16243,6 +16290,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -17454,6 +17502,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -17476,6 +17525,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
