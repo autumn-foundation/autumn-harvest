@@ -507,10 +507,9 @@ async fn seed_execution_in_state(pool: &DbPool, workflow_name: &str, state: &str
     exec_id
 }
 
-/// Reproduce the deterministic `update_id` the `update-with-start` handler
-/// derives from an idempotency key (UUIDv5 over the OID namespace), so a test
-/// can seed a matching `UpdateAdmitted` event that the committed-replay probe
-/// will find.
+// Reproduce the deterministic update_id the update-with-start handler derives
+// from an idempotency key (UUIDv5 over the OID namespace), so a test can seed a
+// matching UpdateAdmitted event that the committed-replay probe will find.
 fn derive_uws_update_id(key: &str) -> UpdateId {
     let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
         .expect("static namespace UUID is valid");
@@ -1287,11 +1286,11 @@ async fn sws_committed_keyed_replay_after_terminal_fresh_start_short_circuits() 
     );
 }
 
-/// AC3: a committed keyed update-with-start replay against a RUNNING run
-/// short-circuits before the #610 update-arg schema gate (and the #373
-/// start_input gate). Retry args are now schema-invalid; the response is the
-/// cached admission (`200`, `started_fresh: false`), NOT a 400. No second
-/// `UpdateAdmitted` event is appended.
+// AC3: a committed keyed update-with-start replay against a RUNNING run
+// short-circuits before the #610 update-arg schema gate (and the #373
+// start_input gate). Retry args are now schema-invalid; the response is the
+// cached admission (200, started_fresh: false), NOT a 400. No second
+// UpdateAdmitted event is appended.
 #[tokio::test]
 async fn uws_committed_keyed_replay_after_running_short_circuits_before_validation() {
     let (url, _guard) = setup_database().await;
@@ -1400,9 +1399,9 @@ async fn uws_committed_keyed_replay_validator_not_rerun() {
     );
 }
 
-/// AC5a: a FRESH keyed signal-with-start with a malformed payload (key never
-/// seen) is still validated at the edge → 400. The probe misses, so the #610
-/// schema gate runs as before.
+// AC5a: a FRESH keyed signal-with-start with a malformed payload (key never
+// seen) is still validated at the edge → 400. The probe misses, so the #610
+// schema gate runs as before.
 #[tokio::test]
 async fn sws_fresh_keyed_malformed_still_400() {
     let (url, _guard) = setup_database().await;
@@ -1428,8 +1427,8 @@ async fn sws_fresh_keyed_malformed_still_400() {
     assert_field_violation(&body, "signal payload validation failed", "/reason");
 }
 
-/// AC5b: a FRESH keyed update-with-start with a malformed payload is still
-/// validated at the edge → 400.
+// AC5b: a FRESH keyed update-with-start with a malformed payload is still
+// validated at the edge → 400.
 #[tokio::test]
 async fn uws_fresh_keyed_malformed_still_400() {
     let (url, _guard) = setup_database().await;
@@ -1517,10 +1516,10 @@ async fn sws_uws_unkeyed_behavior_unchanged() {
     );
 }
 
-/// AC7: a genuine FRESH keyed update-with-start against a PAUSED prior still
-/// returns 409 WorkflowPaused. This confirms the authoritative in-lock path is
-/// preserved for non-committed requests: probe MISSES → validation runs (payload
-/// valid) → authoritative call → WorkflowPaused.
+// AC7: a genuine FRESH keyed update-with-start against a PAUSED prior still
+// returns 409 WorkflowPaused. This confirms the authoritative in-lock path is
+// preserved for non-committed requests: probe MISSES → validation runs (payload
+// valid) → authoritative call → WorkflowPaused.
 #[tokio::test]
 async fn uws_paused_fresh_keyed_still_409() {
     let (url, _guard) = setup_database().await;

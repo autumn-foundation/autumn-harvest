@@ -10892,7 +10892,7 @@ async fn probe_committed_start_replay(
 /// plain signal route, PR #1092): a retry of an already-committed keyed
 /// signal-with-start must replay to its documented `200 signal_delivered: false`
 /// no-op BEFORE any fresh-start-only validation runs (the #610 signal-payload
-/// schema gate, the #373 start_input schema gate, the #252 cap). Otherwise a
+/// schema gate, the #373 `start_input` schema gate, the #252 cap). Otherwise a
 /// tightened schema/cap between the original delivery and the retry would
 /// wrongly reject a retry that creates no new work. This probe runs only when an
 /// `idempotency_key` is present; on a miss the caller falls through to the
@@ -10906,6 +10906,7 @@ async fn probe_committed_start_replay(
 /// fresh-start arm's 503-on-audit-failure: the original start was already
 /// audited, so a failed dedup audit is a no-op read that never fails the reply)
 /// and returns the documented `200` response.
+#[allow(clippy::too_many_arguments)]
 async fn probe_committed_sws_replay(
     api_state: &HarvestApiState,
     workflow_name: &str,
@@ -10919,12 +10920,11 @@ async fn probe_committed_sws_replay(
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
     for (shard, shard_pool) in pool.iter_shards() {
-        let mut probe_conn = match acquire_conn(shard_pool).await {
-            Ok(c) => c,
-            // A transient probe-connection failure must not masquerade as a
-            // dedup miss (which would fall through to a fresh start); skip this
-            // shard and let a genuine all-shard miss fall through instead.
-            Err(_) => continue,
+        // A transient probe-connection failure must not masquerade as a dedup
+        // miss (which would fall through to a fresh start); skip this shard and
+        // let a genuine all-shard miss fall through instead.
+        let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
+            continue;
         };
         let Some(existing) = autumn_harvest::execution::lookup_idempotent_signal_dedupe(
             &mut probe_conn,
@@ -10975,7 +10975,7 @@ async fn probe_committed_sws_replay(
 ///
 /// INVARIANT (mirrors [`probe_committed_sws_replay`]): a retry of an
 /// already-committed keyed update-with-start must replay to its cached admission
-/// BEFORE any fresh-start-only validation runs (the #373 start_input schema
+/// BEFORE any fresh-start-only validation runs (the #373 `start_input` schema
 /// gate, the #610 update-arg schema gate, the #684 semantic validator).
 /// Otherwise a tightened schema — or a validator that would now reject the same
 /// args — would wrongly reject a retry that admits no new update. Keyed-only; a
@@ -10995,9 +10995,8 @@ async fn probe_committed_uws_replay(
 ) -> Option<UpdateWithStartOutcome> {
     let pool = api_state.storage_pool().ok()?;
     for (_shard, shard_pool) in pool.iter_shards() {
-        let mut probe_conn = match acquire_conn(shard_pool).await {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
+            continue;
         };
         let Some(row) = autumn_harvest::execution::lookup_idempotent_update_dedupe(
             &mut probe_conn,
