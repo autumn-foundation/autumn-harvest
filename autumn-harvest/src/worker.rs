@@ -4369,13 +4369,27 @@ async fn persist_current_details_from_commands(
 /// **Best-effort**: a notify failure is logged and swallowed, never failing the
 /// workflow — a progress chunk is disposable. The context caps each chunk below
 /// the Postgres 8000-byte `NOTIFY` limit, so a size-driven failure cannot occur.
+///
+/// **Per-cycle ceiling**: each chunk is one `SELECT pg_notify(...)` round-trip
+/// in the persist transaction, so a pathological publish loop (thousands of
+/// chunks in one decision cycle) would fire thousands of serial round-trips and
+/// burst into Postgres' shared async NOTIFY queue. Chunks beyond
+/// [`PROGRESS_MAX_CHUNKS_PER_CYCLE`] are DROPPED best-effort for that cycle with
+/// a single aggregated `tracing::warn!` (not one per dropped chunk).
 async fn notify_progress_from_commands(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
 ) {
+    let mut fired = 0usize;
+    let mut dropped_over_cap = 0usize;
     for cmd in commands {
         if let WorkflowCommand::PublishProgress { seq, chunk } = cmd {
+            if fired >= PROGRESS_MAX_CHUNKS_PER_CYCLE {
+                dropped_over_cap += 1;
+                continue;
+            }
+            fired += 1;
             if let Err(e) =
                 crate::notify::notify_workflow_progress(conn, exec_id.as_uuid(), *seq, chunk).await
             {
@@ -4388,7 +4402,23 @@ async fn notify_progress_from_commands(
             }
         }
     }
+    if dropped_over_cap > 0 {
+        tracing::warn!(
+            workflow_exec_id = %exec_id.as_uuid(),
+            dropped = dropped_over_cap,
+            cap = PROGRESS_MAX_CHUNKS_PER_CYCLE,
+            "progress chunks exceeded per-cycle ceiling; excess dropped (best-effort)"
+        );
+    }
 }
+
+/// Per-decision-cycle ceiling on the number of `ctx.publish_progress` chunks the
+/// worker forwards as `pg_notify` round-trips (issue #791). Each chunk is one
+/// serial `SELECT pg_notify(...)` in the persist transaction; this bounds a
+/// pathological publish loop's round-trips and its burst into the shared
+/// Postgres async NOTIFY queue. Excess chunks in a single cycle are dropped
+/// best-effort (progress is disposable).
+const PROGRESS_MAX_CHUNKS_PER_CYCLE: usize = 10_000;
 
 async fn persist_signal_wait_park(
     conn: &mut AsyncPgConnection,
