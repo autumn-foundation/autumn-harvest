@@ -2462,6 +2462,15 @@ mod tests {
                 }),
                 Some("rate_limit"),
             );
+            // A dynamic per-key rate-limit expression (issue #699) is equally
+            // unsupported on the single-writer backend.
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    rate_limit_key_expr: Some("input.tenant_id"),
+                    ..base_info()
+                }),
+                Some("rate_limit"),
+            );
             assert_eq!(
                 rejected_feature(&ActivityInfo {
                     max_concurrent: Some(4),

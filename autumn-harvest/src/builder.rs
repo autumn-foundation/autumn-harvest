@@ -613,6 +613,21 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
+    /// An activity declares a dynamic per-key rate limit (issue #699,
+    /// `rate_limit(key = "…")`) but no `rps`. Parallel to
+    /// [`Self::RateLimitKeyWithoutCap`] with dynamic-form wording so the fix
+    /// names the right attribute.
+    #[error(
+        "activity '{activity}' declares rate_limit(key = \"{key}\") but no rps; \
+         add rps, e.g. rate_limit(key = \"{key}\", rps = 50)"
+    )]
+    RateLimitKeyExprWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The dynamic key expression.
+        key: String,
+    },
+
     /// A completion trigger references an unknown workflow name as a source or target.
     #[non_exhaustive]
     #[error(
@@ -2223,14 +2238,18 @@ fn validate_rate_limit_keys(
         if let Some(key_expr) = activity.rate_limit_key_expr {
             // A dynamic key expression needs a rate to bucket against.
             let Some(rps) = activity.rate_limit_rps else {
-                return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
+                return Err(HarvestBuilderError::RateLimitKeyExprWithoutCap {
                     activity: activity.name.to_string(),
                     key: key_expr.to_string(),
                 });
             };
+            // Normalize the `input.` prefix (issue #699 review, #6) so
+            // `key = "input.tenant_id"` and `key = "tenant_id"` — which resolve
+            // the same field and share one bucket — are validated together.
+            let normalized_expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
             let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
             let entry = seen_dynamic
-                .entry(key_expr)
+                .entry(normalized_expr)
                 .or_insert_with(|| RateLimitKeyEntry {
                     first_rps: rps,
                     first_burst: effective_burst,
@@ -4527,10 +4546,22 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(HarvestBuilderError::RateLimitKeyWithoutCap { ref activity, ref key })
+                Err(HarvestBuilderError::RateLimitKeyExprWithoutCap { ref activity, ref key })
                     if activity == "charge" && key == "input.tenant_id"
             ),
-            "expected RateLimitKeyWithoutCap for dynamic key, got: {result:?}"
+            "expected RateLimitKeyExprWithoutCap for dynamic key, got: {result:?}"
+        );
+        // The dynamic-form message names `rate_limit(...)` and `rps`, not the
+        // static `rate_limit_key` wording (issue #699 review, #11).
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("rate_limit(key"),
+            "message should name rate_limit(key = ...): {msg}"
+        );
+        assert!(msg.contains("rps"), "message should mention rps: {msg}");
+        assert!(
+            !msg.contains("rate_limit_key ="),
+            "dynamic message must not use the static rate_limit_key wording: {msg}"
         );
     }
 
@@ -4546,6 +4577,40 @@ mod tests {
                     if key == "input.tenant_id"
             ),
             "expected RateLimitKeyMismatch for dynamic key_expr, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_normalizes_input_prefix_so_both_spellings_share_validation() {
+        // `key = "input.tenant_id"` and `key = "tenant_id"` resolve the same
+        // field and share one bucket, so a mismatched rps across the two spellings
+        // must be caught by the mismatch guard (issue #699 review, #6).
+        let a = rate_activity("charge", Some(10.0), None, None, Some("input.tenant_id"));
+        let b = rate_activity("refund", Some(20.0), None, None, Some("tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![a, b]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { .. })
+            ),
+            "the two `input.` spellings must be validated together, got: {result:?}"
+        );
+
+        // Same field, same rps across both spellings → OK, and they produce the
+        // SAME normalized bucket key.
+        let c = rate_activity("a", Some(10.0), None, None, Some("input.tenant_id"));
+        let d = rate_activity("b", Some(10.0), None, None, Some("tenant_id"));
+        assert!(
+            HarvestBuilder::new()
+                .activities(vec![c, d])
+                .try_build()
+                .is_ok(),
+            "matching rps across both spellings must build"
+        );
+        assert_eq!(
+            crate::queue::dynamic_rate_bucket_key("input.tenant_id", "acme"),
+            crate::queue::dynamic_rate_bucket_key("tenant_id", "acme"),
+            "both spellings must share one bucket key"
         );
     }
 

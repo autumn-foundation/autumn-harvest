@@ -3344,8 +3344,8 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "topk(10, sum by (key) (rate(harvest_rate_limit_throttled_total[$__rate_interval])))",
-              "legendFormat": "{{key}}",
+              "expr": "topk(10, sum by (activity) (rate(harvest_rate_limit_throttled_total[$__rate_interval])))",
+              "legendFormat": "{{activity}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

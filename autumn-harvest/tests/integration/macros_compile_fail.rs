@@ -33,5 +33,6 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/throttle_infinite_burst.rs");
     t.compile_fail("tests/compile_fail/rate_limit_local.rs");
     t.compile_fail("tests/compile_fail/rate_limit_missing_rps.rs");
+    t.compile_fail("tests/compile_fail/rate_limit_flat_and_nested.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

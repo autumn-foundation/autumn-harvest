@@ -28,6 +28,12 @@ struct ActivityAttrs {
     /// resolved against the workflow input at enqueue time. Set only by the
     /// nested `rate_limit(key = "…", rps = …)` attribute form.
     rate_limit_key_expr: Option<String>,
+    /// True when a flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key`
+    /// attribute was seen (issue #699 review, #7) — used to reject combining the
+    /// flat form with the nested `rate_limit(...)` form.
+    flat_rate_limit_seen: bool,
+    /// True when the nested `rate_limit(...)` attribute was seen (issue #699).
+    nested_rate_limit_seen: bool,
     /// Circuit-breaker policy expression (issue #369), e.g.
     /// `CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60))`.
     circuit_breaker: Option<Expr>,
@@ -52,6 +58,8 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         rate_limit_burst: None,
         rate_limit_key: None,
         rate_limit_key_expr: None,
+        flat_rate_limit_seen: false,
+        nested_rate_limit_seen: false,
         circuit_breaker: None,
         requires: None,
     };
@@ -130,6 +138,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
                 return Err(meta.error("rate_limit_rps must be greater than zero"));
             }
             result.rate_limit_rps = Some(n);
+            result.flat_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("rate_limit_burst") {
             let value: syn::Lit = meta.value()?.parse()?;
@@ -142,10 +151,12 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
                 return Err(meta.error("rate_limit_burst must be greater than zero"));
             }
             result.rate_limit_burst = Some(n);
+            result.flat_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("rate_limit_key") {
             let value: LitStr = meta.value()?.parse()?;
             result.rate_limit_key = Some(value.value());
+            result.flat_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("rate_limit") {
             // Nested per-key form (issue #699):
@@ -205,6 +216,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             result.rate_limit_key_expr = Some(key);
             result.rate_limit_rps = Some(rps);
             result.rate_limit_burst = burst;
+            result.nested_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("circuit_breaker") {
             // Parse as Expr so nested constructor calls with commas work, e.g.
@@ -226,6 +238,17 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         }
     })
     .parse2(attr)?;
+
+    // Reject combining the flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key`
+    // attributes with the nested `rate_limit(...)` per-key form (issue #699
+    // review, #7). They configure the same bucket in two incompatible ways.
+    if result.flat_rate_limit_seen && result.nested_rate_limit_seen {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cannot combine the flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key` \
+             attributes with the nested `rate_limit(...)` form; use one",
+        ));
+    }
 
     Ok(result)
 }

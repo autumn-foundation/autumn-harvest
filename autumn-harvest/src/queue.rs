@@ -110,20 +110,55 @@ impl std::fmt::Display for TaskType {
 /// collide with either.
 pub const DYNAMIC_RATE_PREFIX: &str = "dyn-rate";
 
+/// Maximum length (chars) of the *resolved* portion of a dynamic per-key bucket
+/// key before it is replaced with a stable hash (issue #699, btree-PK safety).
+///
+/// The composite key is the PRIMARY KEY of `harvest_rate_limit_buckets`. A
+/// pathologically large resolved value (a giant tenant id, or a non-scalar field
+/// serialized to JSON) would exceed the Postgres btree PK size limit (~2704
+/// bytes) and abort the enqueue transaction in a retry loop. Bounding the
+/// resolved portion keeps the composite key well under that limit while leaving
+/// ordinary short values human-readable.
+const MAX_RESOLVED_KEY_LEN: usize = 256;
+
 /// Build the token-bucket key for a *dynamic* per-key activity rate limit
 /// (issue #699).
 ///
 /// The key is namespaced by both the dot-path *expression* and the resolved
-/// per-execution *value* — `dyn-rate:{key_expr}:{resolved}` — so that activities
-/// declaring the same expression share one bucket per resolved value (matching
-/// the static limiter's "same key → shared bucket → must agree on rps" rule),
-/// while distinct tenants get independent buckets. `resolved` is empty (`""`)
-/// for an execution whose key expression could not be resolved (missing / null /
-/// non-object input), giving one shared fallback bucket per expression so an
-/// unkeyed execution is still bounded rather than unbounded.
+/// per-execution *value* — `dyn-rate:{normalized_expr}:{resolved}` — so that
+/// activities declaring the same expression share one bucket per resolved value
+/// (matching the static limiter's "same key → shared bucket → must agree on rps"
+/// rule), while distinct tenants get independent buckets. `resolved` is empty
+/// (`""`) for an execution whose key expression could not be resolved (missing /
+/// null / non-object input), giving one shared fallback bucket per expression so
+/// an unkeyed execution is still bounded rather than unbounded.
+///
+/// `key_expr` is normalized by stripping a leading `input.` (issue #699 review):
+/// `resolve_concurrency_key` treats `"input.tenant_id"` and `"tenant_id"` as the
+/// same field, so the two spellings must resolve to the same bucket — the strip
+/// here mirrors the strip in [`crate::builder`]'s dynamic-key validation.
+///
+/// `resolved` is length-bounded ([`MAX_RESOLVED_KEY_LEN`]): a value longer than
+/// the bound is replaced with a stable `seahash` digest so a pathological
+/// resolved value can never blow the btree PK size limit and wedge the enqueue
+/// transaction. Short values pass through unchanged (human-readable), and two
+/// distinct long values hash to distinct keys.
+///
+/// The `:` delimiter is injective in practice: `key_expr` is a trusted
+/// compile-time dot-path (no `:`), and `resolved` is either a length-bounded
+/// value or a fixed-width hash, so `dyn-rate:{expr}:{resolved}` parses back
+/// unambiguously.
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
-    format!("{DYNAMIC_RATE_PREFIX}:{key_expr}:{resolved}")
+    let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
+    if resolved.chars().count() > MAX_RESOLVED_KEY_LEN {
+        // Deterministic, collision-resistant digest of the oversized value; the
+        // `h:` marker keeps it visibly a hash and distinct from short literals.
+        let digest = seahash::hash(resolved.as_bytes());
+        format!("{DYNAMIC_RATE_PREFIX}:{expr}:h:{digest:016x}")
+    } else {
+        format!("{DYNAMIC_RATE_PREFIX}:{expr}:{resolved}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +481,24 @@ pub async fn claim_task(
     //
     // The concurrency cap is never bypassed: a real call must always respect
     // `max_concurrent`.
+    //
+    // Known limitation — safe-side rate-limit token leak under concurrency
+    // contention (pre-existing, shared with the static-rate path; issue #699
+    // review, #9): the `rate_limit_debit` CTE debits a token whenever the
+    // candidate's bucket has one, but the `claimed` UPDATE can still match 0 rows
+    // if a per-key concurrency (`concurrency_key`) advisory-lock race is lost or
+    // the re-checked cap is now saturated. In that case the token is spent but
+    // the task is NOT claimed. This is SAFE-SIDE (it over-throttles: the
+    // protective invariant "a real call always holds a token" is never violated —
+    // the leak only ever *reduces* dispatch below budget, never allows a claim
+    // without a token), bounded (at most one token per lost claim attempt), and
+    // self-healing (the bucket refills at `refill_rate`, so a leaked token is
+    // recovered within one refill interval). Fixing it would require moving the
+    // debit inside the `claimed` UPDATE's success condition — a change to this
+    // hot-path CTE for a pre-existing, harmless-direction edge — so it is
+    // deliberately left as-is; a scoped follow-up may revisit it. It applies
+    // identically to a task carrying both a per-key concurrency cap and any rate
+    // limit (static #332 or dynamic per-key #699).
     //
     // Pause gating (issue #383): workflow tasks whose execution is in the
     // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
@@ -2504,6 +2557,62 @@ pub async fn ensure_rate_limit_bucket(
     Ok(())
 }
 
+/// `WHERE` clause that excludes *unbounded* rate-limit key families from the
+/// per-key gauge sampler (issue #699 review, #1).
+///
+/// **Cardinality rule (ADR-0001 §7):** the per-key token/refill GAUGES are
+/// emitted with the bucket `key` as a metric LABEL. A caller-controlled /
+/// per-execution-resolved key family — dynamic per-key limits
+/// (`dyn-rate:{expr}:{tenant}`, #699) and start throttles
+/// (`start-throttle:{workflow}:{tenant}`, #607) — embeds unbounded tenant input
+/// and buckets are never GC'd, so labelling by it would create one time-series
+/// per tenant forever. Those families are excluded here; their per-tenant bucket
+/// state is observable via `GET /admin/rate-limits`, not metrics. Bounded static
+/// keys (bare activity names / author strings) keep their per-key gauges.
+pub const RATE_LIMIT_GAUGE_SAMPLER_FILTER: &str =
+    "WHERE key NOT LIKE 'dyn-rate:%' AND key NOT LIKE 'start-throttle:%'";
+
+/// One sampled *bounded-key* rate-limit bucket, for the per-key gauge sampler.
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct RateLimitBucketSample {
+    /// The bounded bucket key (safe to use as a metric label).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub key: String,
+    /// The bucket's refill rate (tokens/sec).
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    pub refill_rate: f64,
+    /// Estimated currently-available tokens (`LEAST(burst, tokens + elapsed*rate)`).
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    pub estimated_tokens: f64,
+}
+
+/// Sample all *bounded-key* rate-limit buckets on one shard for the per-key gauge
+/// sampler (issue #699 review, #1).
+///
+/// Deliberately excludes the unbounded per-tenant key families
+/// ([`RATE_LIMIT_GAUGE_SAMPLER_FILTER`]) so a resolved per-tenant key can never
+/// become an unbounded metric label. The caller
+/// ([`crate::worker`]'s rate-limit sampler) aggregates across shards and forwards
+/// each row's `key` to the token/refill gauges.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn sample_rate_limit_buckets(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<RateLimitBucketSample>> {
+    diesel::sql_query(format!(
+        "SELECT \
+             key, \
+             refill_rate, \
+             LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
+         FROM harvest_rate_limit_buckets {RATE_LIMIT_GAUGE_SAMPLER_FILTER}"
+    ))
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2516,9 +2625,24 @@ mod tests {
 
     #[test]
     fn dynamic_rate_bucket_key_is_prefixed_and_namespaced_by_expr_and_value() {
+        // The `input.` prefix is normalized away (issue #699 review, #6).
         let k = dynamic_rate_bucket_key("input.tenant_id", "acme");
-        assert_eq!(k, "dyn-rate:input.tenant_id:acme");
+        assert_eq!(k, "dyn-rate:tenant_id:acme");
         assert!(k.starts_with(DYNAMIC_RATE_PREFIX));
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_normalizes_input_prefix() {
+        // Both spellings resolve the same field (via `resolve_concurrency_key`),
+        // so they must share one bucket.
+        assert_eq!(
+            dynamic_rate_bucket_key("input.tenant_id", "acme"),
+            dynamic_rate_bucket_key("tenant_id", "acme"),
+        );
+        assert_eq!(
+            dynamic_rate_bucket_key("tenant_id", "acme"),
+            "dyn-rate:tenant_id:acme"
+        );
     }
 
     #[test]
@@ -2540,8 +2664,16 @@ mod tests {
     #[test]
     fn dynamic_rate_bucket_key_empty_resolved_fallback_is_distinct() {
         let fallback = dynamic_rate_bucket_key("input.tenant_id", "");
-        assert_eq!(fallback, "dyn-rate:input.tenant_id:");
+        assert_eq!(fallback, "dyn-rate:tenant_id:");
         assert_ne!(fallback, dynamic_rate_bucket_key("input.tenant_id", "acme"));
+    }
+
+    #[test]
+    fn rate_limit_gauge_sampler_filter_excludes_unbounded_key_families() {
+        // Cardinality guard (issue #699 review, #1): the per-key gauge sampler
+        // must never emit an unbounded per-tenant key as a metric label.
+        assert!(RATE_LIMIT_GAUGE_SAMPLER_FILTER.contains("NOT LIKE 'dyn-rate:%'"));
+        assert!(RATE_LIMIT_GAUGE_SAMPLER_FILTER.contains("NOT LIKE 'start-throttle:%'"));
     }
 
     #[test]
@@ -2552,6 +2684,29 @@ mod tests {
         let dynamic = dynamic_rate_bucket_key("input.tenant_id", "acme");
         assert!(!dynamic.starts_with(crate::throttle::THROTTLE_BUCKET_PREFIX));
         assert_ne!(dynamic, "send_email"); // a bare static activity-name key
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_bounds_oversized_resolved_value() {
+        // A short value is human-readable and unchanged.
+        let short = dynamic_rate_bucket_key("tenant_id", "acme");
+        assert_eq!(short, "dyn-rate:tenant_id:acme");
+
+        // A pathologically large resolved value (would blow the btree PK limit)
+        // is replaced with a bounded, stable hash.
+        let big = "x".repeat(5000);
+        let bounded = dynamic_rate_bucket_key("tenant_id", &big);
+        assert!(
+            bounded.chars().count() < 64,
+            "oversized resolved value must be bounded, got len {}",
+            bounded.chars().count()
+        );
+        assert!(bounded.starts_with("dyn-rate:tenant_id:h:"));
+        // Deterministic: same long value → same key.
+        assert_eq!(bounded, dynamic_rate_bucket_key("tenant_id", &big));
+        // Injective in practice: two distinct long values → distinct keys.
+        let big2 = "y".repeat(5000);
+        assert_ne!(bounded, dynamic_rate_bucket_key("tenant_id", &big2));
     }
 
     // ── Dropped-wake fix (issue #601 CI hardening) ──────────────────────────

@@ -4700,6 +4700,12 @@ async fn persist_scheduled_activities(
             let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input)
                 .unwrap_or_default();
             let bucket_key = queue::dynamic_rate_bucket_key(expr, &resolved);
+            // Only stamp the dynamic key when its bucket is guaranteed to be
+            // ensured in the same transaction (issue #699 review, #4). Stamping
+            // `rate_limit_key` without a bucket row would make the fail-closed
+            // claim/dispatch gate stall the task forever. `rps` is always set for
+            // a dynamic key (the builder rejects a dynamic key without `rps`),
+            // so the `else` branch is defensive only.
             if let Some(refill_rate) = activity.rate_limit_rps {
                 let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
                 if !dynamic_rate_buckets
@@ -4708,8 +4714,8 @@ async fn persist_scheduled_activities(
                 {
                     dynamic_rate_buckets.push((bucket_key.clone(), refill_rate, burst));
                 }
+                params.rate_limit_key = Some(bucket_key);
             }
-            params.rate_limit_key = Some(bucket_key);
         } else {
             let effective_rate_limit_key = activity
                 .rate_limit_key
@@ -12012,16 +12018,6 @@ fn spawn_rate_limit_sampler(
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    #[derive(diesel::QueryableByName)]
-    struct BucketRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        key: String,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        refill_rate: f64,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        estimated_tokens: f64,
-    }
-
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -12033,6 +12029,13 @@ fn spawn_rate_limit_sampler(
             // available tokens are summed (total budget fleet-wide) and the
             // refill rate is the max (it is configured identically per shard, so
             // max == any present value).
+            //
+            // Cardinality rule (issue #699 review, #1 / ADR-0001 §7): the sampler
+            // query excludes unbounded per-tenant key families
+            // (`dyn-rate:`/`start-throttle:`) because `key` is emitted as a metric
+            // LABEL here and per-tenant buckets are never GC'd — labelling by a
+            // caller-resolved key would create one time-series per tenant forever.
+            // Per-tenant bucket state is observable via `GET /admin/rate-limits`.
             let mut tokens_by_key: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
             let mut refill_by_key: std::collections::HashMap<String, f64> =
@@ -12053,15 +12056,7 @@ fn spawn_rate_limit_sampler(
                     }
                 };
 
-                let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
-                    "SELECT \
-                         key, \
-                         refill_rate, \
-                         LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
-                     FROM harvest_rate_limit_buckets"
-                )
-                .load(&mut conn)
-                .await;
+                let result = queue::sample_rate_limit_buckets(&mut conn).await;
 
                 match result {
                     Ok(buckets) => {
