@@ -55,3 +55,30 @@ blocking the `cargo clippy -p autumn-harvest-plugin --all-targets` gate):
 which failed to compile with `missing field conflict_policy`. Added
 `conflict_policy: WorkflowIdConflictPolicy::Unspecified` matching the sweep's
 convention.
+
+**Post-review hardening (Codex P2): the early gate now defers idempotency-keyed
+requests.** The early gate above rejected any cleanly-parsed `Terminate`-capable
+combo by a non-admin with `401` — with no regard for an idempotency key. But the
+#808 committed-replay claim is keyed on `(workflow_name, idempotency_key)`
+**alone** — independent of the reuse/conflict policy and the caller's auth — so a
+keyed `Terminate` start committed by an **admin** can legitimately be replayed by
+a later **non-admin** retry carrying the same key, which must return the #808
+`200` no-op. The early gate's own comment (and the authoritative gate's) claimed
+"a non-admin can never have committed a `Terminate` start, so no committed replay
+exists" — flawed reasoning, since the committer and the retrier need not be the
+same principal. **Fix:** narrow the early gate to fire only when **no** idempotency
+key is present (a cheap presence-only boolean — header `Idempotency-Key` present,
+or a non-empty body `idempotency_key`; no validation here, so the downstream
+resolver still `400`s an empty/over-long key unchanged). Any keyed request defers
+past the early gate to the downstream path, preserving BOTH #808 outcomes: a
+committed-replay hit returns its `200` at the committed-replay probe
+(caller/body-independent), while a genuinely-fresh keyed `Terminate` by a
+non-admin is still `401`'d by the authoritative gate — which runs **after** that
+probe, so the narrowing opens no hole. Both misleading comments are rewritten to
+state the correct invariant (the early gate is an observable, key-absent-only auth
+check; keyed requests defer downstream). New no-DB regression tests
+(`eris_keyed_terminate_if_running_defers_past_early_gate`,
+`eris_keyed_terminate_existing_conflict_defers_past_early_gate`) assert a keyed
+cancel-capable request is no longer early-`401`'d (in the no-DB harness it
+fails-closed at the runtime check → non-`401`), contrasted against the unkeyed
+cases which still assert `401`.
