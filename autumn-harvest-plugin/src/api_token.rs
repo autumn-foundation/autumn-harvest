@@ -327,15 +327,26 @@ fn service_unavailable(msg: &'static str) -> Response {
 }
 
 /// Extract a harvest-prefixed bearer secret, or `None` to pass through (AC7).
+///
+/// The `Authorization` **scheme** is matched case-insensitively per RFC 7235
+/// §2.1 (the scheme is a case-insensitive token), so `Bearer`, `bearer`,
+/// `BEARER`, `bEaReR`, … all authenticate identically. Only the scheme is
+/// case-folded — the credential (`hvst_…`) is taken verbatim and never altered,
+/// since the token secret is case-sensitive. A non-`hvst_` credential (any
+/// scheme case) still returns `None` so a non-Harvest bearer passes through to
+/// the embedder untouched.
 fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
-    let token = raw
-        .strip_prefix("Bearer ")
-        .or_else(|| raw.strip_prefix("bearer "))?
-        .trim();
+    // Split on the first space into (scheme, credential); the scheme is
+    // case-insensitive, the credential is byte-for-byte preserved.
+    let (scheme, credential) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = credential.trim();
     if looks_like_harvest_token(token) {
         Some(token.to_string())
     } else {
@@ -648,6 +659,50 @@ mod tests {
             &Method::POST,
             "/nope/not-a-real-route"
         ));
+    }
+
+    fn auth_headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn harvest_bearer_scheme_is_case_insensitive_credential_is_not() {
+        // RFC 7235 §2.1: the auth scheme is case-insensitive. Every scheme case
+        // must extract the SAME credential, byte-for-byte.
+        let canonical = harvest_bearer(&auth_headers("Bearer hvst_MixedCaseSecret"));
+        assert_eq!(canonical.as_deref(), Some("hvst_MixedCaseSecret"));
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR", "BeArEr"] {
+            let got = harvest_bearer(&auth_headers(&format!("{scheme} hvst_MixedCaseSecret")));
+            assert_eq!(
+                got, canonical,
+                "scheme `{scheme}` must authenticate identically to `Bearer`"
+            );
+            // The credential itself is preserved verbatim — never case-folded.
+            assert_eq!(got.as_deref(), Some("hvst_MixedCaseSecret"));
+        }
+    }
+
+    #[test]
+    fn harvest_bearer_passes_through_non_harvest_and_malformed() {
+        // A non-`hvst_` credential passes through (None) regardless of scheme case.
+        assert_eq!(harvest_bearer(&auth_headers("Bearer some.jwt.value")), None);
+        assert_eq!(harvest_bearer(&auth_headers("BEARER some.jwt.value")), None);
+        // A non-bearer scheme is ignored even if the credential looks harvesty.
+        assert_eq!(harvest_bearer(&auth_headers("Basic hvst_abc")), None);
+        assert_eq!(harvest_bearer(&auth_headers("Token hvst_abc")), None);
+        // No space / no scheme → None.
+        assert_eq!(harvest_bearer(&auth_headers("Bearerhvst_abc")), None);
+        assert_eq!(harvest_bearer(&auth_headers("hvst_abc")), None);
+        // Extra whitespace around the credential is trimmed (canonical behavior).
+        assert_eq!(
+            harvest_bearer(&auth_headers("bearer    hvst_abc")).as_deref(),
+            Some("hvst_abc")
+        );
     }
 
     #[test]

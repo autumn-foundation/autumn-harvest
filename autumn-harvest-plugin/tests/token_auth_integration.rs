@@ -176,6 +176,18 @@ async fn send(
     (status, json)
 }
 
+/// Send a GET request with a caller-controlled raw `Authorization` header value
+/// (so a test can exercise a mixed-case auth scheme). Returns the status.
+async fn send_with_raw_auth(app: &HarvestApiApp, uri: &str, authorization: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", authorization)
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.expect("request").status()
+}
+
 /// Mint a token via the boundary app and return its plaintext secret.
 async fn mint(app: &HarvestApiApp, name: &str, scope: &str, expires_at: Option<&str>) -> String {
     let mut body = json!({ "name": name, "scope": scope });
@@ -280,6 +292,40 @@ async fn verify_with_secret_authenticates_a_read_route() {
     let (status, _resp) = send(&app, "GET", "/workflows", None, Some(&secret), false, None).await;
     assert_ne!(status, StatusCode::UNAUTHORIZED);
     assert_ne!(status, StatusCode::FORBIDDEN);
+}
+
+/// RFC 7235 §2.1 (Codex P2): the `Authorization` scheme is case-insensitive, so
+/// a valid `hvst_` token presented with a mixed-case scheme (`BEARER`, `bEaReR`)
+/// must authenticate **identically** to the canonical `Bearer`. The credential
+/// itself stays case-sensitive — only the scheme is folded.
+#[tokio::test]
+async fn mixed_case_bearer_scheme_authenticates_identically() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = build_app_boundary(&pool);
+
+    let secret = mint(&app, "case", "read", None).await;
+
+    // Canonical scheme: authenticates (not 401/403).
+    let canonical = send_with_raw_auth(&app, "/workflows", &format!("Bearer {secret}")).await;
+    assert_ne!(canonical, StatusCode::UNAUTHORIZED);
+    assert_ne!(canonical, StatusCode::FORBIDDEN);
+
+    // Mixed-case schemes must reach the same route with the same result.
+    for scheme in ["BEARER", "bEaReR", "bearer"] {
+        let status = send_with_raw_auth(&app, "/workflows", &format!("{scheme} {secret}")).await;
+        assert_eq!(
+            status, canonical,
+            "scheme `{scheme}` must authenticate identically to canonical `Bearer`"
+        );
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "mixed-case scheme `{scheme}` must not 401 a valid token"
+        );
+    }
 }
 
 #[tokio::test]
