@@ -477,11 +477,7 @@ async fn seed_running_execution(pool: &DbPool, workflow_name: &str) -> Execution
 /// route correctly — and the read-only committed-replay probes join
 /// `harvest_signals`/`harvest_events` with no state filter at all, so they
 /// resolve a dedup hit against a terminal prior too.
-async fn seed_execution_in_state(
-    pool: &DbPool,
-    workflow_name: &str,
-    state: &str,
-) -> ExecutionId {
+async fn seed_execution_in_state(pool: &DbPool, workflow_name: &str, state: &str) -> ExecutionId {
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
     diesel::sql_query(
