@@ -7284,7 +7284,7 @@ mod reuse_policy_tests {
 mod conflict_policy_tests {
     //! CLI mapping tests for `--conflict-policy` on `workflow start` (issue #685).
     //! Mirror `mod reuse_policy_tests`: omit → no field; each of the 4 values
-    //! sends the correct snake_case string; preserves other fields alongside.
+    //! sends the correct `snake_case` string; preserves other fields alongside.
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {
