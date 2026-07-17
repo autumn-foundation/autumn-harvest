@@ -631,3 +631,156 @@ async fn create_and_revoke_are_audited_with_actor() {
         assert!(!r.actor.is_empty(), "audit actor must be non-empty");
     }
 }
+
+/// Offline `harvest token bootstrap` parity (issue #942, Codex P1 — the
+/// no-drift guarantee).
+///
+/// A token row seeded OUT-OF-BAND — its secret minted and hash computed with the
+/// SAME shared `autumn_harvest::api_token::{mint_secret, hash_secret}` helpers
+/// the CLI `harvest token bootstrap` command and the server mint route both use,
+/// then inserted directly as the operator would run the printed SQL — must
+/// authenticate and audit **byte-for-byte identically** to a route-minted token.
+/// This locks in that the offline seed path and the server mint path can never
+/// drift on how a secret is generated or hashed.
+#[tokio::test]
+async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    // ── Part A: the route stores exactly `hash_secret(secret)` ────────────────
+    // Prove the server mint path uses the SAME shared hashing helper the offline
+    // bootstrap does: hash the route's returned secret with the shared helper and
+    // confirm it equals the hash the route persisted.
+    let boundary = build_app_boundary(&pool);
+    let route_secret = mint(&boundary, "route-minted", "read", None).await;
+    #[derive(diesel::QueryableByName)]
+    struct HashRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        token_hash: String,
+    }
+    let route_hash: HashRow =
+        diesel::sql_query("SELECT token_hash FROM harvest_api_tokens WHERE name = 'route-minted'")
+            .get_result(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        route_hash.token_hash,
+        autumn_harvest::api_token::hash_secret(&route_secret),
+        "the mint route must store hash_secret(secret) — the shared bootstrap helper"
+    );
+
+    // ── Part B: a bootstrap-seeded row authenticates + audits identically ─────
+    // Seed a `mutate` token EXACTLY as `harvest token bootstrap` does: mint the
+    // secret and compute the hash via the shared helpers, then INSERT the row
+    // directly (as the operator runs the printed SQL). The SQL stores ONLY the
+    // hash — never the secret.
+    let seed_secret = autumn_harvest::api_token::mint_secret();
+    let seed_hash = autumn_harvest::api_token::hash_secret(&seed_secret);
+    assert!(seed_secret.starts_with("hvst_"));
+    assert_ne!(
+        seed_hash, seed_secret,
+        "the stored hash must not be the plaintext secret"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+    }
+    let seeded: IdRow = diesel::sql_query(
+        "INSERT INTO harvest_api_tokens (name, token_hash, scope, created_by) \
+         VALUES ('bootstrap-seed', $1, 'mutate', 'bootstrap') RETURNING id::text AS id",
+    )
+    .bind::<diesel::sql_types::Text, _>(&seed_hash)
+    .get_result(&mut conn)
+    .await
+    .unwrap();
+    let seed_id = seeded.id;
+
+    // B1: parity with `mutate_token_reaches_admin_route_standalone` — the seeded
+    // mutate token satisfies `require_admin` on the standalone (no-boundary) app.
+    let standalone = build_app_standalone(&pool);
+    let (authed, _) = send(
+        &standalone,
+        "POST",
+        "/workflows/some-wf/cancel",
+        Some(json!({})),
+        Some(&seed_secret),
+        false,
+        None,
+    )
+    .await;
+    assert_ne!(
+        authed,
+        StatusCode::UNAUTHORIZED,
+        "bootstrap-seeded mutate token must pass require_admin standalone"
+    );
+    assert_ne!(
+        authed,
+        StatusCode::FORBIDDEN,
+        "bootstrap-seeded mutate token is not read-scoped"
+    );
+
+    // B2: parity with `token_authed_mutation_audit_actor_is_token_id` — a
+    // mutation authenticated by the seeded token audits as `token:{id}`,
+    // spoof-proof, never carrying the secret.
+    let throwaway = mint(&boundary, "throwaway", "read", None).await;
+    let _ = throwaway;
+    let (_, list) = send(&boundary, "GET", "/admin/tokens", None, None, true, None).await;
+    let throwaway_id = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "throwaway")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Isolate the revoke audit row (KEEP api token rows — the seeded token
+    // authenticates the revoke below).
+    let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
+        .execute(&mut conn)
+        .await;
+
+    let (status, _) = send(
+        &boundary,
+        "DELETE",
+        &format!("/admin/tokens/{throwaway_id}"),
+        None,
+        Some(&seed_secret),
+        true,
+        Some("attacker@evil"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the bootstrap-seeded token must authorize the revoke"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct A {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        actor: String,
+    }
+    let rows: Vec<A> =
+        diesel::sql_query("SELECT actor FROM harvest_audit_log WHERE operation = 'token.revoke'")
+            .load(&mut conn)
+            .await
+            .unwrap();
+    assert!(!rows.is_empty(), "a revoke audit row must exist");
+    for r in &rows {
+        assert_eq!(
+            r.actor,
+            format!("token:{seed_id}"),
+            "a bootstrap-seeded token must audit as token:{{id}}, identical to a route-minted token"
+        );
+        assert_ne!(r.actor, "attacker@evil", "spoofed actor must be ignored");
+        assert!(
+            !r.actor.contains(&seed_secret),
+            "actor must not carry the secret"
+        );
+    }
+}
