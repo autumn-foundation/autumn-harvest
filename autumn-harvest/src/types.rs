@@ -754,6 +754,57 @@ pub enum WorkflowIdReusePolicy {
     TerminateIfRunning,
 }
 
+/// Controls what happens when a plain start collides with a currently-ACTIVE
+/// (RUNNING or PAUSED) prior execution of the same `(workflow_name, workflow_id)`.
+///
+/// This is *orthogonal* to [`WorkflowIdReusePolicy`], which governs TERMINAL
+/// priors (COMPLETED/FAILED/CANCELLED/TIMED_OUT). The two axes compose in the
+/// start-path admission logic: the conflict policy has no effect on a terminal
+/// prior, and the reuse policy has no effect on an active prior (except via the
+/// [`WorkflowIdConflictPolicy::Unspecified`] default, which defers to the reuse
+/// policy's *native* active behavior).
+///
+/// Like [`WorkflowIdReusePolicy`], this is a *caller* concern chosen at request
+/// time; it is never persisted.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::WorkflowIdConflictPolicy;
+///
+/// // Unspecified is the default — it preserves each reuse policy's native
+/// // active behavior, so no existing caller changes.
+/// assert_eq!(
+///     WorkflowIdConflictPolicy::default(),
+///     WorkflowIdConflictPolicy::Unspecified
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowIdConflictPolicy {
+    /// Default. Do not override the active-prior behavior — the reuse policy's
+    /// NATIVE active behavior applies (`AllowDuplicate` → return existing;
+    /// `RejectDuplicate` → `Err(AlreadyExists)`; `AllowDuplicateFailedOnly` →
+    /// return existing; `TerminateIfRunning` → cancel + start fresh). Preserves
+    /// the exact documented behavior of all four reuse policies, so no existing
+    /// caller changes.
+    #[default]
+    Unspecified,
+
+    /// On an active prior, return [`crate::error::HarvestError::AlreadyExists`]
+    /// regardless of reuse policy.
+    Fail,
+
+    /// On an active prior, return the existing running/paused execution's handle
+    /// (`created == false`). No new `WorkflowStarted` event, no task enqueued, no
+    /// cancel — the idempotent "attach to the in-flight run" path.
+    UseExisting,
+
+    /// On an active prior, cancel it and start a fresh run (same as
+    /// `TerminateIfRunning`'s active behavior) regardless of reuse policy.
+    TerminateExisting,
+}
+
 // ---------------------------------------------------------------------------
 // StartSource
 // ---------------------------------------------------------------------------
