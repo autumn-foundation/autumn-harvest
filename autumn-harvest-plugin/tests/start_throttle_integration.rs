@@ -1300,7 +1300,7 @@ async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
 /// CREATE a fresh run.
 ///
 /// #1053 swapped the bypass pre-check's bare `has_execution` existence boolean
-/// for `!start_will_create_new_execution(prior_state, AllowDuplicate)`, mirroring
+/// for `!start_will_create_new_execution(prior_state, AllowDuplicate, Unspecified)`, mirroring
 /// the single-start route (#1051). VERIFIED against the #1073 diff: the OLD
 /// `has_execution` check used the *same* non-sealed-prior filter
 /// (`state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`) the predicate query applies,
@@ -1317,13 +1317,13 @@ async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
 /// end-to-end bypass DECISION OUTCOME — via a case that splits by will-create:
 ///
 ///  - COMPLETED prior occupies the uniqueness slot →
-///    `start_will_create_new_execution(Some("COMPLETED"), AllowDuplicate)` is
+///    `start_will_create_new_execution(Some("COMPLETED"), AllowDuplicate, Unspecified)` is
 ///    `false` (ATTACH) → the item BYPASSES the gate, reaches Phase 2, and
 ///    attaches to the prior.
 ///  - TERMINATED prior is SEALED — excluded from the partial uniqueness index
 ///    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')` — so the Phase-1
 ///    `prior_state` query (same filter) sees `None` and
-///    `start_will_create_new_execution(None, AllowDuplicate)` is `true` (fresh
+///    `start_will_create_new_execution(None, AllowDuplicate, Unspecified)` is `true` (fresh
 ///    CREATE) → the item does NOT bypass; it FACES the armed gate and is BLOCKED.
 ///
 /// The TERMINATED-prior gate block is the load-bearing assertion: it proves the
@@ -1357,11 +1357,11 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
     // Two priors for the SAME workflow_name, distinct workflow_ids:
     //  - a COMPLETED prior occupies the uniqueness slot, so an AllowDuplicate
     //    start ATTACHES to it (start_will_create_new_execution(Some("COMPLETED"),
-    //    AllowDuplicate) == false) -> the batch item BYPASSES the gate.
+    //    AllowDuplicate, Unspecified) == false) -> the batch item BYPASSES the gate.
     //  - a TERMINATED prior is SEALED: excluded from the partial uniqueness index
     //    `WHERE state NOT IN ('CONTINUED_AS_NEW','TERMINATED')`, so the batch's
     //    Phase-1 prior_state query (same filter) sees None and
-    //    start_will_create_new_execution(None, AllowDuplicate) == true (fresh
+    //    start_will_create_new_execution(None, AllowDuplicate, Unspecified) == true (fresh
     //    create) -> the item does NOT bypass; it FACES the gate.
     seed_execution(&mut conn, "plain_job", "batch-attach-job", "COMPLETED").await;
     seed_execution(

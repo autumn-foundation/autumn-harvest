@@ -20,15 +20,28 @@
 //! - **omitting conflict_policy** preserves today's response (no `started_fresh`
 //!   / `deduplicated` keys — AC-7 byte-identical).
 //! - **unknown conflict_policy** → `400`.
-//! - **conflict_policy on a throttled workflow** → `400` (mutual exclusion).
-//! - **terminate_existing without admin** → `401` (parity with
-//!   `reuse=terminate_if_running`).
+//! - **conflict_policy on a throttled / debounced / batched workflow** → `400`
+//!   (mutual exclusion — all three deferred-start legs of the guard covered).
+//! - **terminate_existing without admin** → `401` (the admin gate is narrowed to
+//!   the precise "can cancel a live run" capability = effective active behavior
+//!   is `Terminate`).
+//! - **terminate_if_running + use_existing without admin, RUNNING prior** →
+//!   `200` attach (NOT admin-gated: effective is `Attach`, cannot cancel a live
+//!   run) — the flagship non-admin idempotent-starter shape, doubling as the
+//!   HTTP AC-3 RUNNING-prior corner (zero WorkflowCancelled for the prior).
+//! - **terminate_if_running + use_existing without admin, COMPLETED prior** →
+//!   `201` fresh (still non-admin; the terminal prior is replaced by the reuse
+//!   axis).
+//! - **terminate_if_running with omitted conflict without admin** → `401`
+//!   (unchanged; native `Terminate` still requires admin — no regression).
 //! - **concurrent use_existing** — N simultaneous same-workflow_id starts →
 //!   exactly one execution, all 200/201, zero 409, prior stays RUNNING.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
+use autumn_harvest::debounce::DebouncePolicy;
+use autumn_harvest::event_batch::BatchPolicy;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::throttle::ThrottlePolicy;
@@ -124,6 +137,26 @@ fn throttled_info(name: &'static str) -> WorkflowInfo {
         ThrottlePolicy::from_rate_str("100/m", Some(10.0), Some("input.tenant_id"), None)
             .expect("valid rate"),
     );
+    info
+}
+
+fn debounced_info(name: &'static str) -> WorkflowInfo {
+    let mut info = plain_info(name);
+    info.debounce = Some(DebouncePolicy {
+        key_expr: "input.tenant_id",
+        window: std::time::Duration::from_secs(30),
+        max_wait: None,
+    });
+    info
+}
+
+fn batched_info(name: &'static str) -> WorkflowInfo {
+    let mut info = plain_info(name);
+    info.batch = Some(BatchPolicy {
+        key_expr: "input.tenant_id".to_string(),
+        max_size: 10,
+        max_wait: std::time::Duration::from_secs(10),
+    });
     info
 }
 
@@ -510,6 +543,82 @@ async fn conflict_policy_on_throttled_workflow_returns_400() {
     );
 }
 
+/// FIX 5: the debounce leg of the `conflict_policy != Unspecified &&
+/// (throttle||debounce||batch) → 400` mutual-exclusion guard (the throttle leg
+/// is covered above; this exercises the debounce leg).
+#[tokio::test]
+async fn conflict_policy_on_debounced_workflow_returns_400() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![debounced_info("debounced_ue")]);
+
+    let (s, b) = post_start(
+        &app,
+        "debounced_ue",
+        json!({
+            "workflow_id": "db-1",
+            "input": {"tenant_id": "acme"},
+            "conflict_policy": "use_existing"
+        }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "conflict_policy + debounce → 400: {b}"
+    );
+    // Omitting conflict_policy on the same debounced workflow is accepted (defers)
+    // — proving the 400 is caused by conflict_policy, not the debounce itself.
+    let (s_ok, _b_ok) = post_start(
+        &app,
+        "debounced_ue",
+        json!({"workflow_id": "db-2", "input": {"tenant_id": "acme"}}),
+    )
+    .await;
+    assert_ne!(
+        s_ok,
+        StatusCode::BAD_REQUEST,
+        "omitting conflict_policy must not 400 on a debounced workflow"
+    );
+}
+
+/// FIX 5: the batch leg of the same mutual-exclusion guard.
+#[tokio::test]
+async fn conflict_policy_on_batched_workflow_returns_400() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, vec![batched_info("batched_ue")]);
+
+    let (s, b) = post_start(
+        &app,
+        "batched_ue",
+        json!({
+            "workflow_id": "ba-1",
+            "input": {"tenant_id": "acme"},
+            "conflict_policy": "use_existing"
+        }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "conflict_policy + batch → 400: {b}"
+    );
+    // Omitting conflict_policy on the same batched workflow is accepted (defers)
+    // — proving the 400 is caused by conflict_policy, not the batch itself.
+    let (s_ok, _b_ok) = post_start(
+        &app,
+        "batched_ue",
+        json!({"workflow_id": "ba-2", "input": {"tenant_id": "acme"}}),
+    )
+    .await;
+    assert_ne!(
+        s_ok,
+        StatusCode::BAD_REQUEST,
+        "omitting conflict_policy must not 400 on a batched workflow"
+    );
+}
+
 /// AC (security parity): `conflict_policy=terminate_existing` requires admin —
 /// without admin it returns `401`, exactly like `reuse=terminate_if_running`.
 #[tokio::test]
@@ -541,6 +650,164 @@ async fn terminate_existing_without_admin_returns_401() {
         s_ok,
         StatusCode::CREATED,
         "use_existing without admin must be allowed"
+    );
+}
+
+/// FIX 1 gate-narrowing + semantics-review L1 (HTTP AC-3 RUNNING-prior corner):
+/// the flagship non-admin idempotent-starter shape `reuse=terminate_if_running`
+/// + `conflict=use_existing` over a RUNNING prior resolves to `Attach` and
+/// provably cannot cancel a live run, so it is NOT admin-gated — `200`,
+/// `started_fresh:false`, same execution_id, prior stays RUNNING, ZERO
+/// WorkflowCancelled events for the prior. This is the shape the narrowed
+/// capability-precise gate exists to permit.
+#[tokio::test]
+async fn terminate_if_running_plus_use_existing_is_not_admin_gated() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let app = build_app_no_admin(&pool, vec![plain_info("tir_ue_noadmin")]);
+
+    // Seed a RUNNING prior with a plain (non-admin) start.
+    let (s1, b1) = post_start(
+        &app,
+        "tir_ue_noadmin",
+        json!({"workflow_id": "tir-ue-1", "input": {}}),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "seed running prior: {b1}");
+    let prior = b1["execution_id"].as_str().unwrap().to_string();
+
+    // The flagship non-admin shape: terminate_if_running + use_existing over the
+    // RUNNING prior → attach, NOT 401.
+    let (s2, b2) = post_start(
+        &app,
+        "tir_ue_noadmin",
+        json!({
+            "workflow_id": "tir-ue-1",
+            "input": {},
+            "reuse_policy": "terminate_if_running",
+            "conflict_policy": "use_existing"
+        }),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "terminate_if_running + use_existing over a RUNNING prior must NOT be admin-gated (attach → 200): {b2}"
+    );
+    assert_eq!(b2["started_fresh"], json!(false), "attach: {b2}");
+    assert_eq!(
+        b2["execution_id"].as_str().unwrap(),
+        prior,
+        "attach returns the existing execution_id"
+    );
+
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(execution_count(&mut conn, "tir_ue_noadmin").await, 1);
+    assert_eq!(
+        execution_state(&mut conn, &prior).await,
+        "RUNNING",
+        "the attached-to prior must stay RUNNING (zero terminations)"
+    );
+    assert_eq!(
+        event_type_count(&mut conn, &prior, "WorkflowCancelled").await,
+        0,
+        "an Attach resolution must never cancel the prior"
+    );
+}
+
+/// FIX 1: the AC-3 corner as a non-admin idempotent starter —
+/// `reuse=terminate_if_running` + `conflict=use_existing` over a COMPLETED
+/// (terminal) prior on a NO-admin app → `201` fresh. The gate is
+/// state-independent (Attach resolution regardless of prior state), so it never
+/// requires admin; the terminal prior is then replaced by the reuse axis.
+#[tokio::test]
+async fn terminate_if_running_plus_use_existing_over_completed_is_not_admin_gated() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let app = build_app_no_admin(&pool, vec![plain_info("tir_ue_completed")]);
+
+    let (s1, b1) = post_start(
+        &app,
+        "tir_ue_completed",
+        json!({"workflow_id": "tir-uc-1", "input": {}}),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "seed prior: {b1}");
+    let prior = b1["execution_id"].as_str().unwrap().to_string();
+
+    let mut conn = raw_connect(&url).await;
+    mark_completed(&mut conn, "tir_ue_completed", "tir-uc-1").await;
+
+    let (s2, b2) = post_start(
+        &app,
+        "tir_ue_completed",
+        json!({
+            "workflow_id": "tir-uc-1",
+            "input": {},
+            "reuse_policy": "terminate_if_running",
+            "conflict_policy": "use_existing"
+        }),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::CREATED,
+        "non-admin terminate_if_running + use_existing over a COMPLETED prior → fresh 201: {b2}"
+    );
+    assert_eq!(b2["started_fresh"], json!(true), "fresh: {b2}");
+    assert_ne!(
+        b2["execution_id"].as_str().unwrap(),
+        prior,
+        "a fresh run gets a new execution_id"
+    );
+}
+
+/// FIX 1 no-regression: `reuse=terminate_if_running` with the conflict axis
+/// OMITTED (Unspecified → native Terminate) over a RUNNING prior STILL requires
+/// admin — the narrowed gate must not weaken the stock trunk behavior.
+#[tokio::test]
+async fn terminate_if_running_without_conflict_still_requires_admin() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let app = build_app_no_admin(&pool, vec![plain_info("tir_noconflict_noadmin")]);
+
+    // Seed a RUNNING prior with a plain (non-admin) start.
+    let (s1, b1) = post_start(
+        &app,
+        "tir_noconflict_noadmin",
+        json!({"workflow_id": "tir-nc-1", "input": {}}),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+    let prior = b1["execution_id"].as_str().unwrap().to_string();
+
+    let (s2, b2) = post_start(
+        &app,
+        "tir_noconflict_noadmin",
+        json!({
+            "workflow_id": "tir-nc-1",
+            "input": {},
+            "reuse_policy": "terminate_if_running"
+        }),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::UNAUTHORIZED,
+        "terminate_if_running with omitted conflict (native Terminate) must still require admin: {b2}"
+    );
+
+    // The prior was never touched (still RUNNING, not cancelled).
+    let mut conn = raw_connect(&url).await;
+    assert_eq!(
+        execution_state(&mut conn, &prior).await,
+        "RUNNING",
+        "a rejected (401) terminate must leave the prior RUNNING"
+    );
+    assert_eq!(
+        event_type_count(&mut conn, &prior, "WorkflowCancelled").await,
+        0,
+        "a rejected (401) terminate must never cancel the prior"
     );
 }
 
