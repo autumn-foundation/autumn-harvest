@@ -237,10 +237,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "plugin:webhook_durable_integration",
         ALLOWLIST_WEBHOOKS_IGNORED_REASON,
     ),
-    (
-        "plugin:webhook_receiver_integration",
-        ALLOWLIST_WEBHOOKS_IGNORED_REASON,
-    ),
+    // `webhook_receiver_integration` is intentionally absent: its current-thread
+    // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
+    // un-ignored, so it is now wired to a covering `linux` manifest row and runs
+    // for real against Docker Postgres in CI.
     ("plugin:workflow_count_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:workflow_filter_integration", ALLOWLIST_DEBT_REASON),
     (
@@ -604,14 +604,12 @@ fn allos_row_without_db_does_not_cover_a_db_module() {
 #[test]
 fn paved_path_db_tests_are_classified_and_flagged_all_ignored() {
     let dir = plugin_tests_dir();
-    // These three spin a real container via `autumn_web::test::TestDb` +
+    // These spin a real container via `autumn_web::test::TestDb` +
     // `run_pending(MIGRATIONS)` — the paved path the original three-token list
     // missed. They must now classify as DB tests, and each is fully `#[ignore]`d.
-    for stem in [
-        "mcp_tools_integration",
-        "webhook_receiver_integration",
-        "webhook_durable_integration",
-    ] {
+    // (`webhook_receiver_integration` was un-ignored + wired to a `linux`
+    // manifest row, so it no longer belongs in this all-ignored list.)
+    for stem in ["mcp_tools_integration", "webhook_durable_integration"] {
         let src = read_source(&dir.join(format!("{stem}.rs")));
         assert!(
             needs_live_db(&src),

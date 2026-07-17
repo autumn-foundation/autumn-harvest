@@ -185,8 +185,11 @@ impl WebhookTestDb {
 /// AC (issue #344): "a synthetic vendor sends two identical webhook
 /// deliveries; exactly one workflow execution is created; both responses
 /// return the same `workflow_exec_id`."
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
+// Multi-thread runtime: `TestApp::plugin(HarvestPlugin)` runs the plugin
+// startup hook on a spawned thread via `Handle::block_on` while the test thread
+// blocks on its join, which deadlocks a current-thread runtime (see the fuller
+// note on `webhook_start_records_webhook_source`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec_id() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -281,7 +284,6 @@ async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec
 /// plugin startup hook on a spawned thread via `Handle::block_on` while the
 /// test thread blocks on its join, which deadlocks a current-thread runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker (testcontainers)"]
 async fn webhook_start_records_webhook_source() {
     #[derive(diesel::QueryableByName)]
     struct SourceRow {
@@ -346,8 +348,9 @@ async fn webhook_start_records_webhook_source() {
 
 /// The `signals` target variant dedupes on the verified delivery ID: two
 /// identical deliveries admit exactly one `SignalReceived` event, not two.
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
+// Multi-thread runtime: `TestApp::plugin` deadlocks a current-thread runtime
+// (see `webhook_start_records_webhook_source`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_webhook_delivery_to_signals_target_delivers_signal_exactly_once() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -426,8 +429,9 @@ async fn duplicate_webhook_delivery_to_signals_target_delivers_signal_exactly_on
 /// delivery id resolved" -- not a genuine, if empty, id that would let two
 /// unrelated `SignalsWithStart` deliveries collide on the same namespaced
 /// idempotency key (Codex review, PR #918).
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
+// Multi-thread runtime: `TestApp::plugin` deadlocks a current-thread runtime
+// (see `webhook_start_records_webhook_source`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blank_delivery_id_is_rejected_as_missing_for_signals_target() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -478,8 +482,9 @@ async fn blank_delivery_id_is_rejected_as_missing_for_signals_target() {
 /// Harvest start key. The webhook receiver strips it before delegating, so the
 /// mutual-exclusion `400` is never reached and the throttled start proceeds
 /// via the normal webhook path.
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
+// Multi-thread runtime: `TestApp::plugin` deadlocks a current-thread runtime
+// (see `webhook_start_records_webhook_source`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_idempotency_key_header_does_not_trip_throttle_mutual_exclusion_on_starts() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -552,8 +557,9 @@ async fn upstream_idempotency_key_header_does_not_trip_throttle_mutual_exclusion
 /// the first even though it is a genuinely different order. Webhook starts
 /// dedupe via the mapper's `workflow_id` (reuse policy on
 /// `(workflow_name, workflow_id)`), never the provider's header.
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
+// Multi-thread runtime: `TestApp::plugin` deadlocks a current-thread runtime
+// (see `webhook_start_records_webhook_source`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn distinct_deliveries_sharing_an_upstream_idempotency_key_are_not_collapsed() {
     let _ = tracing_subscriber::fmt::try_init();
 
