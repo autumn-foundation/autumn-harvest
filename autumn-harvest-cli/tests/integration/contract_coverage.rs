@@ -1087,3 +1087,33 @@ fn build_ramp_set_body_fields_are_documented() {
         "25",
     ]);
 }
+
+// ── Scoped API tokens (issue #942) ────────────────────────────────────────────
+
+#[test]
+fn token_create_is_covered() {
+    assert_covered(&["token", "create", "ci-bot", "--scope", "read"]);
+}
+
+#[test]
+fn token_list_is_covered() {
+    assert_covered(&["token", "list"]);
+}
+
+#[test]
+fn token_revoke_is_covered() {
+    assert_covered(&["token", "revoke", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn token_rotate_is_covered() {
+    assert_covered(&["token", "rotate", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
+fn token_create_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "token", "create", "ci-bot", "--scope", "read", "--expires-at",
+        "2027-01-01T00:00:00Z",
+    ]);
+}

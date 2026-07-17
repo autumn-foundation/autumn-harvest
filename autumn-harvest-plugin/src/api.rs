@@ -4713,7 +4713,7 @@ pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteCl
 ///
 /// Built directly rather than via an `AutumnError` constructor so it does not
 /// depend on an autumn-web `forbidden` helper.
-fn read_only_forbidden_response() -> axum::response::Response {
+pub(crate) fn read_only_forbidden_response() -> axum::response::Response {
     (
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({

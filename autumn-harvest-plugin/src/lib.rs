@@ -1,6 +1,8 @@
 //! Autumn plugin crate for autumn-harvest.
 
 pub mod api;
+/// Scoped API tokens + rotation for the management API (issue #942).
+pub mod api_token;
 /// Default `reqwest`-based completion-callback deliverer (issue #605).
 ///
 /// Implements [`autumn_harvest::completion_callback::CompletionCallbackDeliverer`],
