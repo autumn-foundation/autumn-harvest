@@ -10770,10 +10770,14 @@ pub(crate) async fn start_workflow(
     // destructive capability on an active prior via the orthogonal conflict
     // axis). Gating only the reuse string would let `conflict_policy` reach the
     // identical cancel-and-replace behavior without admin — a privilege gap.
-    if (matches!(request.reuse_policy.as_deref(), Some("terminate_if_running"))
-        || matches!(request.conflict_policy.as_deref(), Some("terminate_existing")))
-        && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
-            .await
+    if (matches!(
+        request.reuse_policy.as_deref(),
+        Some("terminate_if_running")
+    ) || matches!(
+        request.conflict_policy.as_deref(),
+        Some("terminate_existing")
+    )) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+        .await
     {
         return AutumnError::unauthorized_msg("authentication required").into_response();
     }
