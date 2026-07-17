@@ -58,6 +58,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          panic_containment_tests
+linux        autumn-harvest         integration                      -                          rate_limit_key
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          schedule_runs_tests
@@ -85,6 +86,7 @@ linux        autumn-harvest-plugin  interface_schema_integration     -          
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
 linux        autumn-harvest-plugin  progress_stream_integration      -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
+linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -

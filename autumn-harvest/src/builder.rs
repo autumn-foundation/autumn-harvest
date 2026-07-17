@@ -613,6 +613,78 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
+    /// An activity declares a dynamic per-key rate limit (issue #699,
+    /// `rate_limit(key = "…")`) but no `rps`. Parallel to
+    /// [`Self::RateLimitKeyWithoutCap`] with dynamic-form wording so the fix
+    /// names the right attribute.
+    #[error(
+        "activity '{activity}' declares rate_limit(key = \"{key}\") but no rps; \
+         add rps, e.g. rate_limit(key = \"{key}\", rps = 50)"
+    )]
+    RateLimitKeyExprWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The dynamic key expression.
+        key: String,
+    },
+
+    /// A static `rate_limit_key` begins with the reserved `dyn-rate:` prefix
+    /// (issue #699). That prefix namespaces per-key/dynamic rate-limit buckets;
+    /// a static key beginning with it could collide with a generated dynamic
+    /// bucket, so it is rejected to keep the static and dynamic bucket
+    /// namespaces provably disjoint.
+    #[error(
+        "activity '{activity}' sets rate_limit_key = \"{key}\", which begins with the reserved \
+         `dyn-rate:` prefix (reserved for per-key/dynamic rate-limit buckets); \
+         choose a different rate_limit_key"
+    )]
+    RateLimitKeyReservedPrefix {
+        /// The activity name.
+        activity: String,
+        /// The offending static key.
+        key: String,
+    },
+
+    /// A local activity declares a dynamic per-key rate limit
+    /// (issue #699, `rate_limit(key = "…")`). Local activities run inline on
+    /// the workflow worker via `run_local_activity_inline`, bypassing the
+    /// task-dispatch / enqueue path where per-key rate limiting is enforced, so
+    /// the limit would be silently unenforced. The `#[activity]` macro rejects
+    /// this at parse time; a hand-built `ActivityInfo` (a directly-constructed
+    /// `HandlerRegistry`) bypasses the macro, so it is rejected here too.
+    #[error(
+        "activity '{activity}' is local (is_local = true) but declares a dynamic \
+         rate_limit(key = \"{key}\"); local activities run inline on the workflow worker \
+         and bypass the task-dispatch path where per-key rate limiting is enforced, so the \
+         limit would be silently unenforced -- remove `local = true` or the rate_limit(key = ...)"
+    )]
+    RateLimitKeyExprOnLocalActivity {
+        /// The activity name.
+        activity: String,
+        /// The dynamic key expression.
+        key: String,
+    },
+
+    /// An activity declares a `rate_limit_rps` or `rate_limit_burst` that is not
+    /// finite and strictly greater than zero (issue #699 review, Codex P2). The
+    /// `#[activity]` macro rejects `<= 0` at parse time, but a hand-built
+    /// `ActivityInfo` (a directly-constructed `HandlerRegistry`) bypasses the
+    /// macro; a non-positive / non-finite rate yields a `burst = tokens = 0`
+    /// bucket whose gate can never reach one token, permanently wedging every
+    /// scheduled activity on that bucket. Match the macro's universal positivity
+    /// check here (and go stricter — also reject `NaN`/`±inf`, which
+    /// `n <= 0.0` alone lets through).
+    #[error(
+        "activity '{activity}' sets {field} to a non-positive or non-finite value; \
+         {field} must be finite and greater than zero"
+    )]
+    RateLimitRateNotPositive {
+        /// The activity name.
+        activity: String,
+        /// The offending field name (`rate_limit_rps` or `rate_limit_burst`).
+        field: &'static str,
+    },
+
     /// A completion trigger references an unknown workflow name as a source or target.
     #[non_exhaustive]
     #[error(
@@ -1795,7 +1867,7 @@ impl HarvestBuilder {
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
-        validate_rate_limit_keys(&self.activities)?;
+        validate_activity_rate_limits(&self.activities)?;
         #[cfg(feature = "wasm-activities")]
         validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
         if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
@@ -2203,15 +2275,169 @@ struct RateLimitKeyEntry {
     contributors: Vec<(String, f64, Option<f64>)>,
 }
 
+/// Reject an activity whose `rate_limit_rps` or `rate_limit_burst` is not
+/// finite and strictly greater than zero (issue #699 review, Codex P2).
+///
+/// Applies to static AND dynamic rate limits — the `#[activity]` macro enforces
+/// positivity universally at parse time (`n <= 0.0` -> compile error), but a
+/// hand-built `ActivityInfo` (a directly-constructed `HandlerRegistry`)
+/// bypasses the macro; a non-positive / non-finite rps yields a
+/// `burst = tokens = 0` bucket whose gate can never reach one token,
+/// permanently wedging every scheduled activity on that bucket. This goes
+/// stricter than the macro by also rejecting `NaN`/`±inf`, which `n <= 0.0`
+/// alone lets through.
+fn check_rate_limit_positive(
+    activity: &crate::info::ActivityInfo,
+) -> Result<(), HarvestBuilderError> {
+    if let Some(rps) = activity.rate_limit_rps
+        && (!rps.is_finite() || rps <= 0.0)
+    {
+        return Err(HarvestBuilderError::RateLimitRateNotPositive {
+            activity: activity.name.to_string(),
+            field: "rate_limit_rps",
+        });
+    }
+    if let Some(burst) = activity.rate_limit_burst
+        && (!burst.is_finite() || burst <= 0.0)
+    {
+        return Err(HarvestBuilderError::RateLimitRateNotPositive {
+            activity: activity.name.to_string(),
+            field: "rate_limit_burst",
+        });
+    }
+    Ok(())
+}
+
 /// Verify that rate limiting attributes on activities are consistent and valid.
-fn validate_rate_limit_keys(
-    activities: &[crate::info::ActivityInfo],
+/// Validate every activity's rate-limit configuration (issue #699).
+///
+/// This is the single, comprehensive rate-limit gate. It is called from
+/// [`HarvestBuilder::try_build`] (the builder path) **and** from
+/// [`crate::worker::Worker::new`] (the direct-`HandlerRegistry` / worker-startup
+/// path), so a worker constructed without going through the builder still
+/// fails loud, once, before its poll loop and first enqueue — rather than
+/// slipping an invalid config past the piecemeal schedule-time guards in
+/// `persist_scheduled_activities` (issue #699 review, Codex round-5 P2).
+///
+/// Checks, per activity:
+/// - a dynamic `rate_limit(key = …)` on a **local** activity — local activities
+///   run inline and bypass the dispatch path entirely, so the limit would be
+///   silently unenforced ([`HarvestBuilderError::RateLimitKeyExprOnLocalActivity`]);
+/// - a dynamic `rate_limit(key = …)` without an `rps`
+///   ([`HarvestBuilderError::RateLimitKeyExprWithoutCap`]);
+/// - two activities sharing a normalized dynamic key-expression that declare
+///   different `rps`/`burst` — the shared bucket's config would become
+///   insertion-order dependent under `ON CONFLICT DO NOTHING`
+///   ([`HarvestBuilderError::RateLimitKeyMismatch`]);
+/// - a static `rate_limit_key` squatting the reserved `dyn-rate:` prefix
+///   ([`HarvestBuilderError::RateLimitKeyReservedPrefix`]);
+/// - a static `rate_limit_key`/`rate_limit_burst` without `rps`;
+/// - two activities sharing a static key with different `rps`/`burst`.
+///
+/// Accepts an iterator of `&ActivityInfo` rather than a slice so both the
+/// builder's `Vec<ActivityInfo>` and the worker registry's
+/// `HashMap<String, ActivityInfo>::values()` can be validated without an owned
+/// copy (`ActivityInfo` is not `Clone`). Mismatch detection is order-independent
+/// (any two disagreeing configs reject regardless of which is seen first), so
+/// the registry's non-deterministic iteration order does not affect whether a
+/// conflicting set is rejected — only cosmetic ordering within the error's
+/// contributor list.
+pub(crate) fn validate_activity_rate_limits<'a>(
+    activities: impl IntoIterator<Item = &'a crate::info::ActivityInfo>,
 ) -> Result<(), HarvestBuilderError> {
     use std::collections::HashMap;
 
     let mut seen: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
+    // Dynamic per-key rate-limit expressions (issue #699) live in an independent
+    // map keyed on the dot-path EXPRESSION so static (bare-name / string) keys and
+    // dynamic (`dyn-rate:{expr}:{tenant}`) buckets — which the enqueue path
+    // namespaces so they can never collide — are validated separately.
+    let mut seen_dynamic: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
 
     for activity in activities {
+        // Positivity (issue #699 review, Codex P2): reject a non-finite /
+        // non-positive rps or burst — static OR dynamic — before either branch
+        // (see `check_rate_limit_positive`).
+        check_rate_limit_positive(activity)?;
+
+        // Dynamic per-key rate limit (issue #699): validated in its own map and
+        // never touches the static path below (its static `rate_limit_key` is
+        // suppressed by the macro).
+        if let Some(key_expr) = activity.rate_limit_key_expr {
+            // A dynamic per-key rate limit on a LOCAL activity is silently
+            // unenforced: local activities run inline via
+            // `run_local_activity_inline`, bypassing the task-dispatch/enqueue
+            // path where per-key rate limiting lives. The `#[activity]` macro
+            // rejects this at parse time, but a hand-built `ActivityInfo`
+            // (direct `HandlerRegistry`) bypasses the macro. Fail loud
+            // (issue #699 review, Codex round-5 P2). (Scope: this rejects the
+            // DYNAMIC form only; the pre-existing static-rate-on-local #332
+            // asymmetry is a documented follow-up, not expanded here.)
+            if activity.is_local {
+                return Err(HarvestBuilderError::RateLimitKeyExprOnLocalActivity {
+                    activity: activity.name.to_string(),
+                    key: key_expr.to_string(),
+                });
+            }
+            // A dynamic key expression needs a rate to bucket against.
+            let Some(rps) = activity.rate_limit_rps else {
+                return Err(HarvestBuilderError::RateLimitKeyExprWithoutCap {
+                    activity: activity.name.to_string(),
+                    key: key_expr.to_string(),
+                });
+            };
+            // Normalize the `input.` prefix (issue #699 review, #6) so
+            // `key = "input.tenant_id"` and `key = "tenant_id"` — which resolve
+            // the same field and share one bucket — are validated together.
+            let normalized_expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
+            let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
+            let entry = seen_dynamic
+                .entry(normalized_expr)
+                .or_insert_with(|| RateLimitKeyEntry {
+                    first_rps: rps,
+                    first_burst: effective_burst,
+                    contributors: Vec::new(),
+                });
+            entry
+                .contributors
+                .push((activity.name.to_string(), rps, activity.rate_limit_burst));
+            if (entry.first_rps - rps).abs() > 1e-9
+                || (entry.first_burst - effective_burst).abs() > 1e-9
+            {
+                let mapped = entry
+                    .contributors
+                    .iter()
+                    .map(|(name, r, b)| (name.clone(), FloatEq(*r), b.map(FloatEq)))
+                    .collect();
+                return Err(HarvestBuilderError::RateLimitKeyMismatch {
+                    key: key_expr.to_string(),
+                    activities: mapped,
+                });
+            }
+            continue;
+        }
+
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699). Both static and
+        // dynamic keys register `ON CONFLICT DO NOTHING` against the shared
+        // `harvest_rate_limit_buckets` table, so a static key colliding with a
+        // generated `dyn-rate:{expr}:{tenant}` string would race
+        // first-writer-wins on the bucket's rate/burst. Reject it up front.
+        // (The `start-throttle:` prefix from #607 is a separate pre-existing
+        // namespace; this validation reserves `dyn-rate:` — the one this PR
+        // generates — and leaves `start-throttle:` as a follow-up.)
+        // The literal mirrors `crate::queue::DYNAMIC_RATE_PREFIX` (the `queue`
+        // module is `db`-gated, but this validation runs in every build) and the
+        // macro's own compile-time reject in `autumn-harvest-macros`.
+        if let Some(key) = activity.rate_limit_key
+            && key.starts_with("dyn-rate:")
+        {
+            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
         // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
         if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
             return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
@@ -3534,6 +3760,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -3627,6 +3854,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -3651,6 +3879,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -4160,6 +4389,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -4360,6 +4590,7 @@ mod tests {
             rate_limit_rps: Some(10.0),
             rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -4381,6 +4612,7 @@ mod tests {
             rate_limit_rps: Some(20.0), // mismatched rps!
             rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -4417,6 +4649,7 @@ mod tests {
             rate_limit_rps: None, // Missing RPS!
             rate_limit_burst: None,
             rate_limit_key: Some("stripe"),
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -4433,6 +4666,203 @@ mod tests {
                     if activity == "act1" && key == "stripe"
             ),
             "expected RateLimitKeyWithoutCap error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_static_rate_limit_key_with_reserved_dyn_rate_prefix() {
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699 review, Codex P2) —
+        // it could collide first-writer-wins with a generated dynamic bucket.
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(50.0),
+            rate_limit_burst: None,
+            rate_limit_key: Some("dyn-rate:9:tenant_id:acme"),
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix { ref activity, ref key })
+                    if activity == "act1" && key == "dyn-rate:9:tenant_id:acme"
+            ),
+            "expected RateLimitKeyReservedPrefix, got: {result:?}"
+        );
+    }
+
+    // ── Dynamic per-key rate limits (issue #699) ──────────────────────────────
+
+    /// Build a bare `ActivityInfo` for the dynamic-per-key rate-limit tests.
+    fn rate_activity(
+        name: &'static str,
+        rps: Option<f64>,
+        burst: Option<f64>,
+        key: Option<&'static str>,
+        key_expr: Option<&'static str>,
+    ) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: rps,
+            rate_limit_burst: burst,
+            rate_limit_key: key,
+            rate_limit_key_expr: key_expr,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_dynamic_rate_limit_key_without_rps() {
+        let act = rate_activity("charge", None, None, None, Some("input.tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyExprWithoutCap { ref activity, ref key })
+                    if activity == "charge" && key == "input.tenant_id"
+            ),
+            "expected RateLimitKeyExprWithoutCap for dynamic key, got: {result:?}"
+        );
+        // The dynamic-form message names `rate_limit(...)` and `rps`, not the
+        // static `rate_limit_key` wording (issue #699 review, #11).
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("rate_limit(key"),
+            "message should name rate_limit(key = ...): {msg}"
+        );
+        assert!(msg.contains("rps"), "message should mention rps: {msg}");
+        assert!(
+            !msg.contains("rate_limit_key ="),
+            "dynamic message must not use the static rate_limit_key wording: {msg}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_same_dynamic_key_expr_with_different_rps() {
+        let a = rate_activity("charge", Some(10.0), None, None, Some("input.tenant_id"));
+        let b = rate_activity("refund", Some(20.0), None, None, Some("input.tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![a, b]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { ref key, .. })
+                    if key == "input.tenant_id"
+            ),
+            "expected RateLimitKeyMismatch for dynamic key_expr, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_normalizes_input_prefix_so_both_spellings_share_validation() {
+        // `key = "input.tenant_id"` and `key = "tenant_id"` resolve the same
+        // field and share one bucket, so a mismatched rps across the two spellings
+        // must be caught by the mismatch guard (issue #699 review, #6).
+        let a = rate_activity("charge", Some(10.0), None, None, Some("input.tenant_id"));
+        let b = rate_activity("refund", Some(20.0), None, None, Some("tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![a, b]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { .. })
+            ),
+            "the two `input.` spellings must be validated together, got: {result:?}"
+        );
+
+        // Same field, same rps across both spellings → OK, and they produce the
+        // SAME normalized bucket key.
+        let c = rate_activity("a", Some(10.0), None, None, Some("input.tenant_id"));
+        let d = rate_activity("b", Some(10.0), None, None, Some("tenant_id"));
+        assert!(
+            HarvestBuilder::new()
+                .activities(vec![c, d])
+                .try_build()
+                .is_ok(),
+            "matching rps across both spellings must build"
+        );
+        // The bucket-key equality is proven directly against the (db-gated) queue
+        // helper. The builder-validation half above runs on every feature set.
+        #[cfg(feature = "db")]
+        assert_eq!(
+            crate::queue::dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
+            crate::queue::dynamic_rate_bucket_key("tenant_id", Some("acme")),
+            "both spellings must share one bucket key"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_matching_dynamic_key_expr_and_distinct_exprs() {
+        // Same expr + same rps → OK; distinct exprs → OK; a static key alongside
+        // is independent and does not collide.
+        let a = rate_activity(
+            "charge",
+            Some(10.0),
+            Some(20.0),
+            None,
+            Some("input.tenant_id"),
+        );
+        let b = rate_activity(
+            "refund",
+            Some(10.0),
+            Some(20.0),
+            None,
+            Some("input.tenant_id"),
+        );
+        let c = rate_activity("notify", Some(5.0), None, None, Some("input.org"));
+        let d = rate_activity("email", Some(3.0), None, Some("input.tenant_id"), None);
+        let result = HarvestBuilder::new()
+            .activities(vec![a, b, c, d])
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "expected matching/distinct dynamic rate limits to build, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn builder_static_and_dynamic_key_maps_are_independent() {
+        // A static key "tenant" and a dynamic key_expr "tenant" (same string) must
+        // NOT be conflated — they live in separate validation maps and namespaced
+        // buckets, so mismatched rps across the two is not an error.
+        let stat = rate_activity("s", Some(10.0), None, Some("tenant"), None);
+        let dyn_ = rate_activity("d", Some(99.0), None, None, Some("tenant"));
+        let result = HarvestBuilder::new()
+            .activities(vec![stat, dyn_])
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "static and dynamic keys sharing a string must be independent, got: {:?}",
+            result.err()
         );
     }
 

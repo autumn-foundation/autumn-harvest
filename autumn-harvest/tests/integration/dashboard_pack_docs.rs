@@ -274,7 +274,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_concurrency_deferred", &["key"]),
     ("harvest_rate_limit_tokens_available", &["key"]),
     ("harvest_rate_limit_refill_rate", &["key"]),
-    ("harvest_rate_limit_throttled", &["key"]),
+    ("harvest_rate_limit_throttled", &["activity"]),
     ("harvest_admission_blocked", &["scope", "reason"]),
     ("harvest_admission_bypassed", &["producer"]),
     ("harvest_admission_gates_active", &[]),

@@ -939,41 +939,60 @@ fn build_runtime_worker_with_task_timeout(
 ) -> Arc<Worker> {
     Arc::new(
         Worker::new(
-            WorkerRuntimeConfig {
-                worker_id: worker_id.to_string(),
-                queues: vec!["default".to_string()],
-                notification_database_url: None,
+            runtime_config(
+                worker_id,
                 max_concurrent_workflows,
                 max_concurrent_activities,
-                poll_interval: Duration::from_millis(25),
-                shutdown_timeout: Duration::from_secs(1),
-                cancellation_grace_period: Duration::from_secs(1),
-                sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
-                workflow_cache_size: 1000,
-                priority_aging_secs: None,
-                unknown_target_grace_window: Duration::from_secs(5),
-                poison_pill_threshold: 3,
-
                 workflow_task_timeout,
-                workflow_panic_max_attempts: 3,
-                labels: std::collections::HashMap::new(),
-                queue_weights: std::collections::HashMap::new(),
-                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
-                max_workflow_history_events: None,
-                shard_notification_database_urls: Vec::new(),
-                sharded_pool: None,
-                slot_tuner: None,
-                max_concurrent_sessions: 0,
-            },
+            ),
             registry,
         )
         .expect("worker should build"),
     )
+}
+
+/// Build a `WorkerRuntimeConfig` with the standard test defaults.
+///
+/// Extracted so tests that need to inspect `Worker::new`'s `Result` (e.g. the
+/// issue #699 worker-startup rate-limit validation tests) can pass a registry
+/// directly without the `.expect(...)` that `build_runtime_worker*` applies.
+pub(crate) fn runtime_config(
+    worker_id: &str,
+    max_concurrent_workflows: usize,
+    max_concurrent_activities: usize,
+    workflow_task_timeout: Duration,
+) -> WorkerRuntimeConfig {
+    WorkerRuntimeConfig {
+        worker_id: worker_id.to_string(),
+        queues: vec!["default".to_string()],
+        notification_database_url: None,
+        max_concurrent_workflows,
+        max_concurrent_activities,
+        poll_interval: Duration::from_millis(25),
+        shutdown_timeout: Duration::from_secs(1),
+        cancellation_grace_period: Duration::from_secs(1),
+        sticky_timeout: Duration::from_secs(5),
+        max_local_activity_start_to_close: Duration::from_secs(60),
+        shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+        worker_heartbeat_interval: Duration::from_secs(5),
+        build_id: String::new(),
+        deployment_name: None,
+        workflow_cache_size: 1000,
+        priority_aging_secs: None,
+        unknown_target_grace_window: Duration::from_secs(5),
+        poison_pill_threshold: 3,
+
+        workflow_task_timeout,
+        workflow_panic_max_attempts: 3,
+        labels: std::collections::HashMap::new(),
+        queue_weights: std::collections::HashMap::new(),
+        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+        max_workflow_history_events: None,
+        shard_notification_database_urls: Vec::new(),
+        sharded_pool: None,
+        slot_tuner: None,
+        max_concurrent_sessions: 0,
+    }
 }
 
 pub(crate) fn spawn_test_worker(worker: Arc<Worker>, pool: DbPool) -> tokio::task::JoinHandle<()> {
@@ -2435,6 +2454,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -2602,6 +2622,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -2723,6 +2744,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     rate_limit_rps: None,
                     rate_limit_burst: None,
                     rate_limit_key: None,
+                    rate_limit_key_expr: None,
                     circuit_breaker: None,
                     is_local: false,
                     max_input_bytes: None,
@@ -3003,6 +3025,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     rate_limit_rps: None,
                     rate_limit_burst: None,
                     rate_limit_key: None,
+                    rate_limit_key_expr: None,
                     circuit_breaker: None,
                     is_local: false,
                     max_input_bytes: None,
@@ -4272,6 +4295,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -4918,6 +4942,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -8437,6 +8462,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -8592,6 +8618,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             // Trip after a single failure; long cooldown so it stays open.
             circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
                 1,
@@ -8726,6 +8753,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -9933,6 +9961,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -10213,6 +10242,7 @@ fn saga_activity_info(
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         is_local: false,
         max_input_bytes: None,

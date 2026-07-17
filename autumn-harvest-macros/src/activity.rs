@@ -24,6 +24,16 @@ struct ActivityAttrs {
     rate_limit_rps: Option<f64>,
     rate_limit_burst: Option<f64>,
     rate_limit_key: Option<String>,
+    /// Dynamic per-key rate-limit expression (issue #699), the dot-path
+    /// resolved against the workflow input at enqueue time. Set only by the
+    /// nested `rate_limit(key = "…", rps = …)` attribute form.
+    rate_limit_key_expr: Option<String>,
+    /// True when a flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key`
+    /// attribute was seen (issue #699 review, #7) — used to reject combining the
+    /// flat form with the nested `rate_limit(...)` form.
+    flat_rate_limit_seen: bool,
+    /// True when the nested `rate_limit(...)` attribute was seen (issue #699).
+    nested_rate_limit_seen: bool,
     /// Circuit-breaker policy expression (issue #369), e.g.
     /// `CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60))`.
     circuit_breaker: Option<Expr>,
@@ -47,6 +57,9 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
+        flat_rate_limit_seen: false,
+        nested_rate_limit_seen: false,
         circuit_breaker: None,
         requires: None,
     };
@@ -125,6 +138,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
                 return Err(meta.error("rate_limit_rps must be greater than zero"));
             }
             result.rate_limit_rps = Some(n);
+            result.flat_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("rate_limit_burst") {
             let value: syn::Lit = meta.value()?.parse()?;
@@ -137,10 +151,82 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
                 return Err(meta.error("rate_limit_burst must be greater than zero"));
             }
             result.rate_limit_burst = Some(n);
+            result.flat_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("rate_limit_key") {
             let value: LitStr = meta.value()?.parse()?;
-            result.rate_limit_key = Some(value.value());
+            let key = value.value();
+            // The `dyn-rate:` prefix is reserved for per-key/dynamic rate-limit
+            // buckets (issue #699); a static key beginning with it could collide
+            // with a generated dynamic bucket, so reject it at compile time.
+            if key.starts_with("dyn-rate:") {
+                return Err(meta.error(
+                    "`rate_limit_key` must not begin with the reserved `dyn-rate:` prefix \
+                     (reserved for per-key/dynamic rate-limit buckets)",
+                ));
+            }
+            result.rate_limit_key = Some(key);
+            result.flat_rate_limit_seen = true;
+            Ok(())
+        } else if meta.path.is_ident("rate_limit") {
+            // Nested per-key form (issue #699):
+            // `rate_limit(key = "input.tenant_id", rps = 50, burst = 20)`.
+            // Models the workflow-side `concurrency(key = …, limit = …)` shape.
+            // `key` and `rps` are required; `burst` is optional.
+            let mut key: Option<String> = None;
+            let mut rps: Option<f64> = None;
+            let mut burst: Option<f64> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("rps") {
+                    let value: syn::Lit = inner.value()?.parse()?;
+                    let n = match value {
+                        syn::Lit::Float(f) => f.base10_parse::<f64>()?,
+                        syn::Lit::Int(i) => i.base10_parse::<f64>()?,
+                        _ => return Err(inner.error("rate_limit rps must be an integer or float")),
+                    };
+                    if n <= 0.0 {
+                        return Err(inner.error("rate_limit rps must be greater than zero"));
+                    }
+                    rps = Some(n);
+                    Ok(())
+                } else if inner.path.is_ident("burst") {
+                    let value: syn::Lit = inner.value()?.parse()?;
+                    let n = match value {
+                        syn::Lit::Float(f) => f.base10_parse::<f64>()?,
+                        syn::Lit::Int(i) => i.base10_parse::<f64>()?,
+                        _ => {
+                            return Err(inner.error("rate_limit burst must be an integer or float"));
+                        }
+                    };
+                    if n <= 0.0 {
+                        return Err(inner.error("rate_limit burst must be greater than zero"));
+                    }
+                    burst = Some(n);
+                    Ok(())
+                } else {
+                    Err(inner.error("expected `key`, `rps`, or `burst`"))
+                }
+            })?;
+            let key = key.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "rate_limit requires `key = \"...\"`",
+                )
+            })?;
+            let rps = rps.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "rate_limit requires `rps = N`",
+                )
+            })?;
+            result.rate_limit_key_expr = Some(key);
+            result.rate_limit_rps = Some(rps);
+            result.rate_limit_burst = burst;
+            result.nested_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("circuit_breaker") {
             // Parse as Expr so nested constructor calls with commas work, e.g.
@@ -157,11 +243,22 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
                 "unsupported attribute: expected retry, start_to_close, heartbeat_timeout, \
                  schedule_to_start, schedule_to_close, queue, max_concurrent, concurrency_key, \
                  local, max_input_bytes, max_result_bytes, rate_limit_rps, rate_limit_burst, \
-                 rate_limit_key, circuit_breaker, or requires",
+                 rate_limit_key, rate_limit, circuit_breaker, or requires",
             ))
         }
     })
     .parse2(attr)?;
+
+    // Reject combining the flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key`
+    // attributes with the nested `rate_limit(...)` per-key form (issue #699
+    // review, #7). They configure the same bucket in two incompatible ways.
+    if result.flat_rate_limit_seen && result.nested_rate_limit_seen {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cannot combine the flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key` \
+             attributes with the nested `rate_limit(...)` form; use one",
+        ));
+    }
 
     Ok(result)
 }
@@ -264,6 +361,15 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 input_fn.sig.fn_token,
                 "local activities do not support circuit_breaker; \
                  the circuit breaker is enforced on the task-dispatch path, which \
+                 local activities bypass by running inline on the workflow worker",
+            )
+            .to_compile_error();
+        }
+        if attrs.rate_limit_key_expr.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support rate_limit(...); \
+                 per-key rate limiting is enforced on the task-dispatch path, which \
                  local activities bypass by running inline on the workflow worker",
             )
             .to_compile_error();
@@ -440,16 +546,27 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let rate_limit_burst_expr = attrs
         .rate_limit_burst
         .map_or_else(|| quote! { None }, |n| quote! { Some(#n) });
-    let rate_limit_key_expr = match attrs.rate_limit_key.as_deref() {
+    // Static rate-limit bucket key (`ActivityInfo.rate_limit_key`). When a
+    // dynamic per-key expression is present (issue #699) the static default is
+    // suppressed so the enqueue path resolves the key from the workflow input
+    // instead of bucketing every execution under the activity name.
+    let static_rate_limit_key_expr = match attrs.rate_limit_key.as_deref() {
         Some(key) => quote! { Some(#key) },
         None => {
-            if attrs.rate_limit_rps.is_some() || attrs.rate_limit_burst.is_some() {
+            if attrs.rate_limit_key_expr.is_none()
+                && (attrs.rate_limit_rps.is_some() || attrs.rate_limit_burst.is_some())
+            {
                 quote! { Some(#fn_name_str) }
             } else {
                 quote! { None }
             }
         }
     };
+    // Dynamic per-key rate-limit expression (`ActivityInfo.rate_limit_key_expr`).
+    let dynamic_rate_limit_key_expr = attrs
+        .rate_limit_key_expr
+        .as_deref()
+        .map_or_else(|| quote! { None }, |e| quote! { Some(#e) });
 
     let circuit_breaker_expr = attrs
         .circuit_breaker
@@ -482,7 +599,8 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 max_result_bytes: #max_result_bytes_expr,
                 rate_limit_rps: #rate_limit_rps_expr,
                 rate_limit_burst: #rate_limit_burst_expr,
-                rate_limit_key: #rate_limit_key_expr,
+                rate_limit_key: #static_rate_limit_key_expr,
+                rate_limit_key_expr: #dynamic_rate_limit_key_expr,
                 circuit_breaker: #circuit_breaker_expr,
                 requires: #requires_expr,
                 handler: |ctx, input| {

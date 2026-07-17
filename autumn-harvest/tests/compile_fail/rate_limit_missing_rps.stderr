@@ -1,0 +1,7 @@
+error: rate_limit requires `rps = N`
+ --> tests/compile_fail/rate_limit_missing_rps.rs:5:1
+  |
+5 | #[activity(rate_limit(key = "input.tenant_id"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `activity` (in Nightly builds, run with -Z macro-backtrace for more info)

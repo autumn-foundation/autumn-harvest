@@ -45,6 +45,55 @@ async fn breaker_activity(_ctx: &ActivityContext, addr: String) -> Result<(), St
     Ok(())
 }
 
+// Static (flat) rate limit — AC3: unchanged from #332.
+#[activity(rate_limit_rps = 100, rate_limit_burst = 20, rate_limit_key = "stripe")]
+async fn flat_rate_activity(_ctx: &ActivityContext, x: i64) -> Result<i64, String> {
+    Ok(x)
+}
+
+// Dynamic per-key rate limit (issue #699), nested form.
+#[activity(rate_limit(key = "input.tenant_id", rps = 50))]
+async fn dyn_rate_activity(_ctx: &ActivityContext, x: i64) -> Result<i64, String> {
+    Ok(x)
+}
+
+// Dynamic per-key rate limit with explicit burst.
+#[activity(rate_limit(key = "input.tenant_id", rps = 50, burst = 10))]
+async fn dyn_rate_burst_activity(_ctx: &ActivityContext, x: i64) -> Result<i64, String> {
+    Ok(x)
+}
+
+#[test]
+fn flat_rate_limit_attributes_populate_activity_info() {
+    // AC3: the pre-existing flat form keeps working and does NOT set the dynamic
+    // key expression.
+    let info = __autumn_activity_info_flat_rate_activity();
+    assert_eq!(info.rate_limit_rps, Some(100.0));
+    assert_eq!(info.rate_limit_burst, Some(20.0));
+    assert_eq!(info.rate_limit_key, Some("stripe"));
+    assert_eq!(info.rate_limit_key_expr, None);
+}
+
+#[test]
+fn nested_rate_limit_sets_dynamic_key_expr_and_rps() {
+    // issue #699: the nested form sets the dynamic key expression, threads rps
+    // through, defaults burst to rps, and leaves the static key suppressed.
+    let info = __autumn_activity_info_dyn_rate_activity();
+    assert_eq!(info.rate_limit_key_expr, Some("input.tenant_id"));
+    assert_eq!(info.rate_limit_rps, Some(50.0));
+    assert_eq!(info.rate_limit_burst, None);
+    assert_eq!(info.rate_limit_key, None);
+}
+
+#[test]
+fn nested_rate_limit_with_burst_populates_burst() {
+    let info = __autumn_activity_info_dyn_rate_burst_activity();
+    assert_eq!(info.rate_limit_key_expr, Some("input.tenant_id"));
+    assert_eq!(info.rate_limit_rps, Some(50.0));
+    assert_eq!(info.rate_limit_burst, Some(10.0));
+    assert_eq!(info.rate_limit_key, None);
+}
+
 #[test]
 fn activity_companion_returns_name() {
     let info = __autumn_activity_info_simple_activity();

@@ -2271,12 +2271,13 @@ const fn unsupported_activity_feature(info: &ActivityInfo) -> Option<(&'static s
     if info.rate_limit_rps.is_some()
         || info.rate_limit_burst.is_some()
         || info.rate_limit_key.is_some()
+        || info.rate_limit_key_expr.is_some()
     {
         return Some((
             "rate_limit",
-            "Per-activity rate limiting (#332) is a dispatch-admission feature backed \
-             by the shared task queue's token buckets, which the single-writer backend \
-             has no analog for.",
+            "Per-activity rate limiting (#332, per-key #699) is a dispatch-admission \
+             feature backed by the shared task queue's token buckets, which the \
+             single-writer backend has no analog for.",
         ));
     }
     if info.max_concurrent.is_some() {
@@ -2465,6 +2466,15 @@ mod tests {
             assert_eq!(
                 rejected_feature(&ActivityInfo {
                     rate_limit_key: Some("bucket"),
+                    ..base_info()
+                }),
+                Some("rate_limit"),
+            );
+            // A dynamic per-key rate-limit expression (issue #699) is equally
+            // unsupported on the single-writer backend.
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    rate_limit_key_expr: Some("input.tenant_id"),
                     ..base_info()
                 }),
                 Some("rate_limit"),

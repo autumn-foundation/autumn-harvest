@@ -269,6 +269,20 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 metric label. It is unbounded and would explode the metric time-series in any
 production APM. Use `ATTR_EXECUTION_ID` only on *spans*, never on *metrics*.
 
+**Rate-limit throttle counter — label change (issue #699, BREAKING for
+operators).** `harvest.rate_limit.throttled` is now labelled by the **bounded
+activity name** (`activity`), not the raw bucket `key`. Per-key rate limits
+(#699) resolve a bucket key from workflow input at enqueue time
+(`dyn-rate:{expr}:{tenant}`), which embeds unbounded tenant input; using it as a
+metric label would create one time-series per tenant forever. The counter is
+therefore labelled by the registered activity name, which is bounded. **Any
+dashboard or alert keyed on the old `key` label of `harvest_rate_limit_throttled`
+must move to `activity`.** For the same reason, the per-key token/refill
+**gauges** (`harvest.rate_limit.tokens_available` / `harvest.rate_limit.refill_rate`)
+exclude the unbounded `dyn-rate:` and `start-throttle:` bucket families from their
+per-key sampler; per-tenant bucket state is observable via
+`GET /admin/rate-limits`, not metrics.
+
 ---
 
 ### 8. Worked example — full end-to-end trace

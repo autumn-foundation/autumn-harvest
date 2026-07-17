@@ -395,6 +395,7 @@ fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
         handler: session_internal_stub_handler,
@@ -4636,11 +4637,18 @@ async fn persist_scheduled_activities(
     assigned_build_id: Option<&str>,
     parent_priority: i32,
     context_headers: Option<&serde_json::Value>,
+    workflow_input: &serde_json::Value,
 ) -> HarvestResult<()> {
     // activity_events is built in scheduled_activities order (= ScheduleActivity command order).
     // After the loop we interleave them with marker/detached-spawn events in full command order.
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
+    // Dynamic per-key rate-limit buckets (issue #699) to lazily register inside
+    // the enqueue transaction: `(bucket_key, refill_rate, burst)`. Deduped so a
+    // fan-out of N activities sharing one resolved tenant key ensures the bucket
+    // once. Registration must happen so the fail-closed claim/dispatch gate has a
+    // bucket row to read (else the task would stall forever).
+    let mut dynamic_rate_buckets: Vec<(String, f64, f64)> = Vec::new();
 
     for scheduled in scheduled_activities {
         let activity = registry.activities.get(&scheduled.name).ok_or_else(|| {
@@ -4760,8 +4768,82 @@ async fn persist_scheduled_activities(
             params.max_concurrent = activity.max_concurrent;
         }
 
-        let effective_rate_limit_key =
-            activity
+        if let Some(expr) = activity.rate_limit_key_expr {
+            // A dynamic per-key rate limit requires an `rps` to derive its
+            // bucket refill rate from. `HarvestBuilder::try_build` AND the
+            // worker-startup gate (`crate::builder::validate_activity_rate_limits`,
+            // now run from `Worker::new`) both reject a dynamic key without one
+            // (RateLimitKeyExprWithoutCap). This schedule-time guard STAYS as
+            // defense-in-depth (the startup validation is the primary
+            // comprehensive gate as of issue #699 review, Codex round-5 P2):
+            // fail the schedule transaction loudly here rather than silently
+            // enqueuing the activity with NO rate limit -- without this guard the
+            // `if let Some(refill_rate)` block below is skipped entirely, leaving
+            // both `params.rate_limit_key` and `dynamic_rate_buckets` unset, so
+            // the activity runs unrated, the exact failure a rate-limiting
+            // feature exists to prevent.
+            let Some(refill_rate) = activity.rate_limit_rps else {
+                return Err(HarvestError::Config(format!(
+                    "activity '{}' declares a dynamic rate_limit(key = \"{}\") but has no \
+                     rate_limit_rps; a dynamic per-key rate limit requires an rps. \
+                     (HarvestBuilder::try_build rejects this; you likely built \
+                     HandlerRegistry directly.)",
+                    activity.name, expr
+                )));
+            };
+            // Dynamic per-key rate limit (issue #699): resolve the bucket key from
+            // the workflow input at enqueue time so each tenant gets its own RPS
+            // bucket. A key that cannot be resolved (missing / null / non-object
+            // input) is passed through as `None` and falls back to a shared
+            // `dyn-rate:{expr}:U` bucket so the execution is still bounded, not
+            // unbounded -- kept DISTINCT from a legitimately-resolved empty-string
+            // tenant `Some("")` (which buckets under `L0:`) so the two never
+            // cross-throttle (issue #699 review, Codex round-5 P2). We deliberately
+            // do NOT `.unwrap_or_default()` here, which would collapse both onto
+            // the same `L0:` bucket. Takes priority over the static
+            // `rate_limit_key` path entirely.
+            let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input);
+            let bucket_key = queue::dynamic_rate_bucket_key(expr, resolved.as_deref());
+            // The bucket is ensured in the same transaction below, so the
+            // fail-closed claim/dispatch gate always has a bucket row to read
+            // (else the task would stall forever). `refill_rate` is guaranteed
+            // present by the guard above.
+            let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
+            if !dynamic_rate_buckets
+                .iter()
+                .any(|(k, _, _)| *k == bucket_key)
+            {
+                dynamic_rate_buckets.push((bucket_key.clone(), refill_rate, burst));
+            }
+            params.rate_limit_key = Some(bucket_key);
+        } else {
+            // A static `rate_limit_key` beginning with the reserved `dyn-rate:`
+            // prefix would collide with the generated dynamic per-key buckets,
+            // and since startup registration and lazy dynamic registration both
+            // `INSERT ... ON CONFLICT (key) DO NOTHING`, the bucket's rate/burst
+            // would become insertion-order dependent. The macro parse-site
+            // reject, `HarvestBuilder::try_build`, AND the worker-startup gate
+            // (`crate::builder::validate_activity_rate_limits`, run from
+            // `Worker::new`) all reject this now; this schedule-time guard STAYS
+            // as defense-in-depth behind the primary startup gate (issue #699
+            // review, Codex round-5 P2). Fail the schedule transaction loudly
+            // here, mirroring the dynamic-no-rps guard above. The literal mirrors
+            // `queue::DYNAMIC_RATE_PREFIX` (`"dyn-rate"`) + `":"`, matching the
+            // builder's own static-key reject.
+            if let Some(key) = activity.rate_limit_key
+                && key.starts_with("dyn-rate:")
+            {
+                return Err(HarvestError::Config(format!(
+                    "activity '{}' sets a static rate_limit_key = \"{}\" beginning with the \
+                     reserved `dyn-rate:` prefix (reserved for dynamic per-key buckets); \
+                     this collides with the generated dynamic bucket namespace and would \
+                     race first-writer-wins on the shared bucket's rate/burst. \
+                     (HarvestBuilder::try_build rejects this; you likely built \
+                     HandlerRegistry directly.)",
+                    activity.name, key
+                )));
+            }
+            let effective_rate_limit_key = activity
                 .rate_limit_key
                 .map(ToString::to_string)
                 .or_else(|| {
@@ -4771,8 +4853,9 @@ async fn persist_scheduled_activities(
                         None
                     }
                 });
-        if let Some(key) = effective_rate_limit_key {
-            params.rate_limit_key = Some(key);
+            if let Some(key) = effective_rate_limit_key {
+                params.rate_limit_key = Some(key);
+            }
         }
 
         // Worker sessions (issue #606): a member activity carrying a
@@ -4845,6 +4928,14 @@ async fn persist_scheduled_activities(
                 store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
                     .await?;
                 detached_spawns.persist(conn, commands).await?;
+                // Lazily register any dynamic per-key rate-limit buckets (issue
+                // #699) in the same transaction as the enqueue so the fail-closed
+                // claim/dispatch gate always finds a bucket row (else the task
+                // would stall forever). ON CONFLICT DO NOTHING preserves operator
+                // overrides and is idempotent across replays/re-dispatch.
+                for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
+                    queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+                }
                 let mut activity_task_ids = Vec::with_capacity(enqueued.len());
                 for params in &enqueued {
                     activity_task_ids.push(queue::enqueue(conn, params).await?);
@@ -7542,10 +7633,13 @@ async fn process_activity_task(
                     Duration::from_secs_f64(1.0 / rps)
                 })
                 .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+            // Label the throttle metric by the bounded activity name, never the
+            // rate-limit bucket key (which for a dynamic per-key limit,
+            // issue #699, embeds unbounded tenant input — ADR-0001 §7).
             registry
                 .telemetry()
                 .metrics
-                .record_rate_limit_throttled(key);
+                .record_rate_limit_throttled(activity_name);
             let scheduled_at = chrono::Utc::now()
                 + chrono::Duration::from_std(refill_delay)
                     .unwrap_or_else(|_| chrono::Duration::seconds(5));
@@ -9017,6 +9111,7 @@ async fn handle_suspended_workflow(
             context.execution.assigned_build_id.as_deref(),
             context.persistence.task.priority,
             context.execution.context_headers.as_ref(),
+            &context.execution.input,
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -12060,16 +12155,6 @@ fn spawn_rate_limit_sampler(
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    #[derive(diesel::QueryableByName)]
-    struct BucketRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        key: String,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        refill_rate: f64,
-        #[diesel(sql_type = diesel::sql_types::Double)]
-        estimated_tokens: f64,
-    }
-
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -12081,6 +12166,13 @@ fn spawn_rate_limit_sampler(
             // available tokens are summed (total budget fleet-wide) and the
             // refill rate is the max (it is configured identically per shard, so
             // max == any present value).
+            //
+            // Cardinality rule (issue #699 review, #1 / ADR-0001 §7): the sampler
+            // query excludes unbounded per-tenant key families
+            // (`dyn-rate:`/`start-throttle:`) because `key` is emitted as a metric
+            // LABEL here and per-tenant buckets are never GC'd — labelling by a
+            // caller-resolved key would create one time-series per tenant forever.
+            // Per-tenant bucket state is observable via `GET /admin/rate-limits`.
             let mut tokens_by_key: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
             let mut refill_by_key: std::collections::HashMap<String, f64> =
@@ -12101,15 +12193,7 @@ fn spawn_rate_limit_sampler(
                     }
                 };
 
-                let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
-                    "SELECT \
-                         key, \
-                         refill_rate, \
-                         LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
-                     FROM harvest_rate_limit_buckets"
-                )
-                .load(&mut conn)
-                .await;
+                let result = queue::sample_rate_limit_buckets(&mut conn).await;
 
                 match result {
                     Ok(buckets) => {
@@ -12979,6 +13063,21 @@ impl Worker {
                 )));
             }
         }
+
+        // Comprehensive rate-limit validation (issue #699, Codex round-5 P2).
+        // A `HandlerRegistry` built directly (not via `HarvestBuilder::try_build`)
+        // bypasses ALL builder validation, so an invalid rate-limit config
+        // (a dynamic `rate_limit(key = …)` on a local activity, a dynamic key
+        // without an rps, or two activities sharing a normalized key-expression
+        // with conflicting rps/burst) would otherwise slip past and only be
+        // caught piecemeal — or not at all — at schedule time. Run the same
+        // shared validator the builder runs, here at the fallible worker-startup
+        // boundary, so the whole class fails loud ONCE before the poll loop and
+        // first enqueue. The ad-hoc schedule-time guards in
+        // `persist_scheduled_activities`/`register_rate_limit_buckets` remain as
+        // defense-in-depth; this startup gate is the primary comprehensive check.
+        crate::builder::validate_activity_rate_limits(registry.activities.values())
+            .map_err(|err| HarvestError::Config(err.to_string()))?;
 
         let mut ineligible_activities = Vec::new();
         for activity in registry.activities.values() {
@@ -14355,24 +14454,64 @@ impl Worker {
         match pool.get().await {
             Ok(mut conn) => {
                 for activity in self.registry.activities.values() {
+                    // A dynamic rate_limit(key = ...) with no rps is an invalid
+                    // declaration that `HarvestBuilder::try_build` rejects. A
+                    // worker built via a direct `HandlerRegistry` bypasses that
+                    // validation; surface it loudly at startup (the enqueue path
+                    // also fails the schedule transaction -- see
+                    // `persist_scheduled_activities`) rather than silently running
+                    // the activity unrated (issue #699 review, Codex P2).
+                    if activity.rate_limit_key_expr.is_some() && activity.rate_limit_rps.is_none() {
+                        tracing::error!(
+                            worker_id = %self.config.worker_id,
+                            activity = %activity.name,
+                            "activity declares a dynamic rate_limit(key = ...) without \
+                             rate_limit_rps; it will fail at schedule time -- add an rps \
+                             or remove the key"
+                        );
+                        continue;
+                    }
                     let Some(refill_rate) = activity.rate_limit_rps else {
                         continue;
                     };
+                    // Dynamic per-key limits (issue #699) register their buckets
+                    // lazily at enqueue time (one per resolved tenant key), so
+                    // there is no single static bucket to pre-register here.
+                    if activity.rate_limit_key_expr.is_some() {
+                        continue;
+                    }
+                    // A static `rate_limit_key` beginning with the reserved
+                    // `dyn-rate:` prefix reaching a worker via a direct
+                    // `HandlerRegistry` (bypassing the macro reject and
+                    // `HarvestBuilder::try_build`) would collide with the
+                    // generated dynamic per-key buckets; since both this
+                    // registration and the lazy enqueue registration use
+                    // `ON CONFLICT DO NOTHING`, the bucket's rate/burst would
+                    // become insertion-order dependent. Skip it loudly here,
+                    // mirroring the dynamic-no-rps guard above (issue #699
+                    // review, Codex P2). The enqueue path also fails the
+                    // schedule transaction (see `persist_scheduled_activities`).
+                    if let Some(static_key) = activity.rate_limit_key
+                        && static_key.starts_with("dyn-rate:")
+                    {
+                        tracing::error!(
+                            worker_id = %self.config.worker_id,
+                            activity = %activity.name,
+                            key = %static_key,
+                            "activity sets a static rate_limit_key beginning with the reserved \
+                             `dyn-rate:` prefix; not registering this colliding bucket -- rename \
+                             the key or use rate_limit(key = ...) for dynamic per-key buckets"
+                        );
+                        continue;
+                    }
                     let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
                     let key = activity.rate_limit_key.unwrap_or(activity.name);
 
                     // Insert rate limit bucket if it doesn't already exist.
                     // This preserves operator overrides.
-                    let q = diesel::sql_query(
-                        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at) \
-                         VALUES ($1, $2, $3, $3, NOW()) \
-                         ON CONFLICT (key) DO NOTHING"
-                    )
-                    .bind::<diesel::sql_types::Text, _>(key)
-                    .bind::<diesel::sql_types::Double, _>(refill_rate)
-                    .bind::<diesel::sql_types::Double, _>(burst);
-
-                    if let Err(error) = q.execute(&mut conn).await {
+                    if let Err(error) =
+                        queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
+                    {
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
                             key = %key,
@@ -14423,12 +14562,17 @@ impl Worker {
     /// Shared between the weighted and unweighted poll paths so that the
     /// throttle-recording logic only lives in one place.
     async fn emit_throttle_metrics(&self, conn: &mut AsyncPgConnection) {
-        if let Ok(throttled_keys) = queue::check_throttled_keys(conn, &self.config.queues).await {
-            for key in throttled_keys {
+        // `check_throttled_keys` returns bounded activity names (not raw bucket
+        // keys), so labelling the throttle counter with them is cardinality-safe
+        // for dynamic per-key limits (issue #699 / ADR-0001 §7).
+        if let Ok(throttled_activities) =
+            queue::check_throttled_keys(conn, &self.config.queues).await
+        {
+            for activity in throttled_activities {
                 self.registry
                     .telemetry()
                     .metrics
-                    .record_rate_limit_throttled(&key);
+                    .record_rate_limit_throttled(&activity);
             }
         }
     }
@@ -16185,6 +16329,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -16286,6 +16431,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -16332,6 +16478,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -16364,6 +16511,85 @@ mod tests {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(cfg, registry);
         assert!(worker.is_ok());
+    }
+
+    /// Build a bare `ActivityInfo` with the rate-limit fields overridden,
+    /// everything else defaulted — for the `Worker::new` positivity gate tests
+    /// (issue #699 review, Codex P2).
+    fn rate_limited_activity(
+        name: &'static str,
+        rate_limit_rps: Option<f64>,
+        rate_limit_burst: Option<f64>,
+        rate_limit_key_expr: Option<&'static str>,
+    ) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps,
+            rate_limit_burst,
+            rate_limit_key: None,
+            rate_limit_key_expr,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    #[test]
+    fn worker_new_rejects_non_positive_dynamic_rate_limit_rps() {
+        // A hand-built registry (bypassing the `#[activity]` macro) with a dynamic
+        // per-key rate limit whose rps is 0.0 would create a `burst = tokens = 0`
+        // bucket whose gate can never reach one token, permanently wedging every
+        // scheduled activity on it. Worker::new must reject it up front.
+        let act = rate_limited_activity("charge", Some(0.0), None, Some("input.tenant_id"));
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+        let err = Worker::new(cfg, registry).unwrap_err();
+        assert!(
+            err.to_string().contains("rate_limit_rps"),
+            "expected a non-positive rate_limit_rps config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn worker_new_rejects_non_positive_or_non_finite_rate_limit_burst() {
+        // A valid positive rps paired with a non-positive / non-finite burst is
+        // also rejected — the burst is what seeds the bucket's token ceiling.
+        for bad_burst in [0.0_f64, -3.0, f64::NAN, f64::INFINITY] {
+            let act = rate_limited_activity(
+                "charge",
+                Some(50.0),
+                Some(bad_burst),
+                Some("input.tenant_id"),
+            );
+            let cfg = default_runtime_config();
+            let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+            let err = Worker::new(cfg, registry).unwrap_err();
+            assert!(
+                err.to_string().contains("rate_limit_burst"),
+                "burst {bad_burst}: expected a rate_limit_burst config error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_new_accepts_valid_positive_dynamic_rate_limit() {
+        // The valid positive config still starts cleanly.
+        let act = rate_limited_activity("charge", Some(50.0), Some(20.0), Some("input.tenant_id"));
+        let cfg = default_runtime_config();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act]));
+        assert!(Worker::new(cfg, registry).is_ok());
     }
 
     #[test]
@@ -17543,6 +17769,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: Some("gpu = true"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -17565,6 +17792,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: Some("region in [us-east-1, us-west-2]"),
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

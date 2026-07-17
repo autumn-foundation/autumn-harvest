@@ -740,6 +740,7 @@ fn act_info_with_breaker(
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker,
         is_local,
         max_input_bytes: None,
