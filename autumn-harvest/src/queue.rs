@@ -110,16 +110,34 @@ impl std::fmt::Display for TaskType {
 /// collide with either.
 pub const DYNAMIC_RATE_PREFIX: &str = "dyn-rate";
 
-/// Maximum length (bytes) of the *resolved* portion of a dynamic per-key bucket
-/// key before it is replaced with a stable hash (issue #699, btree-PK safety).
+/// Maximum length (bytes) of any single *component* (the normalized expression
+/// or the resolved value) of a dynamic per-key bucket key before it is replaced
+/// with a stable hash (issue #699, btree-PK safety).
 ///
 /// The composite key is the PRIMARY KEY of `harvest_rate_limit_buckets`. A
-/// pathologically large resolved value (a giant tenant id, or a non-scalar field
-/// serialized to JSON) would exceed the Postgres btree PK size limit (~2704
-/// bytes) and abort the enqueue transaction in a retry loop. Bounding the
-/// resolved portion keeps the composite key well under that limit while leaving
+/// pathologically large component — a giant tenant id or non-scalar field
+/// serialized to JSON in `resolved`, or a very long dot-path / hand-built
+/// `ActivityInfo.rate_limit_key` in the expression — would exceed the Postgres
+/// btree PK size limit (~2704 bytes) and abort the enqueue transaction in a
+/// retry loop, wedging the workflow. Bounding *both* components keeps the whole
+/// composite key provably well under that limit (≤ ~530 bytes) while leaving
 /// ordinary short values human-readable.
-const MAX_RESOLVED_KEY_LEN: usize = 256;
+const MAX_KEY_COMPONENT_LEN: usize = 256;
+
+/// Bound a single dynamic-key component to at most [`MAX_KEY_COMPONENT_LEN`]
+/// bytes (issue #699, btree-PK safety). A value within the bound passes through
+/// unchanged (human-readable); a longer value is replaced with a deterministic,
+/// collision-resistant `seahash` digest carrying an `h:` marker that keeps it
+/// visibly a hash and distinct from any short literal. Applied to both the
+/// expression and the resolved value so neither can blow the composite PK size.
+fn bound_key_component(component: &str) -> String {
+    if component.len() > MAX_KEY_COMPONENT_LEN {
+        let digest = seahash::hash(component.as_bytes());
+        format!("h:{digest:016x}")
+    } else {
+        component.to_string()
+    }
+}
 
 /// Build the token-bucket key for a *dynamic* per-key activity rate limit
 /// (issue #699).
@@ -138,21 +156,28 @@ const MAX_RESOLVED_KEY_LEN: usize = 256;
 /// same field, so the two spellings must resolve to the same bucket — the strip
 /// here mirrors the strip in [`crate::builder`]'s dynamic-key validation.
 ///
-/// `resolved` is byte-length-bounded ([`MAX_RESOLVED_KEY_LEN`]): a value whose
+/// *Both* the normalized `expr` and the `resolved` value are byte-length-bounded
+/// ([`MAX_KEY_COMPONENT_LEN`], via [`bound_key_component`]): a component whose
 /// UTF-8 byte length exceeds the bound is replaced with a stable `seahash`
-/// digest so a pathological resolved value can never blow the btree PK size
-/// limit and wedge the enqueue transaction. The byte-length check matches the
-/// Postgres btree PK limit (which is byte-based) and is O(1) on the hot enqueue
-/// path. Short values pass through unchanged (human-readable), and two distinct
-/// long values hash to distinct keys.
+/// digest so a pathological value — an oversized resolved tenant id *or* a very
+/// long dot-path / hand-built `ActivityInfo.rate_limit_key` expression — can
+/// never blow the btree PK size limit and wedge the enqueue transaction. The
+/// byte-length check matches the Postgres btree PK limit (which is byte-based)
+/// and is O(1) on the hot enqueue path. Short values pass through unchanged
+/// (human-readable), and two distinct long values hash to distinct keys. With
+/// both components bounded the whole composite key is provably ≤ ~530 bytes
+/// regardless of the macro or a hand-built `ActivityInfo`.
 ///
-/// The key is **injective by construction**: `dyn-rate:{expr_len}:{expr}:{resolved}`
-/// length-prefixes the (variable-length, possibly-`:`-containing) `expr`
-/// component with its UTF-8 byte length. After the `dyn-rate:` prefix, the
-/// decimal `expr_len` (digits up to the next `:`) tells the reader exactly how
-/// many bytes `expr` occupies, so a `:` inside `expr` (a dot-path can address a
-/// JSON key containing `:`) or inside `resolved` can never split ambiguously:
-/// the pair `(expr, resolved)` maps to exactly one key and vice-versa. Without
+/// The key is **injective by construction**:
+/// `dyn-rate:{expr_component_len}:{expr_component}:{resolved_tail}` length-prefixes
+/// the (variable-length, possibly-`:`-containing) *final* `expr` component with
+/// its UTF-8 byte length. After the `dyn-rate:` prefix, the decimal
+/// `expr_component_len` (digits up to the next `:`) tells the reader exactly how
+/// many bytes the expr component occupies, so a `:` inside `expr` (a dot-path can
+/// address a JSON key containing `:`) or inside `resolved` can never split
+/// ambiguously: the pair `(expr, resolved)` maps to exactly one key and
+/// vice-versa. The length prefix is taken over the *bounded* expr component, so
+/// the invariant holds whether the expr passed through or was hashed. Without
 /// the length prefix, `key="a"` + resolved `"b:c"` and `key="a:b"` + resolved
 /// `"c"` would both flatten to `dyn-rate:a:b:c` — two distinct exprs sharing one
 /// bucket, so their (independently validated, possibly different) rps configs
@@ -160,20 +185,15 @@ const MAX_RESOLVED_KEY_LEN: usize = 256;
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    // Bound the resolved value first (btree PK safety); the hashed-or-short value
-    // is the free, unambiguous tail once the expr is length-prefixed below.
-    let resolved_tail = if resolved.len() > MAX_RESOLVED_KEY_LEN {
-        // Deterministic, collision-resistant digest of the oversized value; the
-        // `h:` marker keeps it visibly a hash and distinct from short literals.
-        let digest = seahash::hash(resolved.as_bytes());
-        format!("h:{digest:016x}")
-    } else {
-        resolved.to_string()
-    };
+    // Bound both components (btree PK safety); the length prefix below is taken
+    // over the *bounded* expr component so injectivity holds whether it passed
+    // through unchanged or was replaced by its hash.
+    let expr_component = bound_key_component(expr);
+    let resolved_tail = bound_key_component(resolved);
     format!(
         "{DYNAMIC_RATE_PREFIX}:{}:{}:{}",
-        expr.len(),
-        expr,
+        expr_component.len(),
+        expr_component,
         resolved_tail
     )
 }
@@ -2740,6 +2760,55 @@ mod tests {
         // Injective in practice: two distinct long values → distinct keys.
         let big2 = "y".repeat(5000);
         assert_ne!(bounded, dynamic_rate_bucket_key("tenant_id", &big2));
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_bounds_oversized_expr_component() {
+        // Regression (issue #699 review, Codex P2): an unbounded expression (a
+        // very long dot-path, or a hand-built `ActivityInfo.rate_limit_key`)
+        // must not be able to overflow the composite btree PRIMARY KEY and abort
+        // the enqueue transaction. The expr component is now bounded/hashed too.
+        let big_expr = "a".repeat(5000);
+        let bounded = dynamic_rate_bucket_key(&big_expr, "acme");
+        // The expr component is the hash: `dyn-rate:{len}:h:{16hex}:acme`.
+        // `h:` + 16 hex digits == 18 bytes, so the length prefix is `18`.
+        let digest = seahash::hash(big_expr.as_bytes());
+        assert_eq!(bounded, format!("dyn-rate:18:h:{digest:016x}:acme"));
+        assert!(bounded.starts_with("dyn-rate:18:h:"));
+        // The whole composite key is provably well under the ~2704 btree limit.
+        assert!(
+            bounded.len() < 2704,
+            "bounded key must fit the btree PK limit, got len {}",
+            bounded.len()
+        );
+        // Deterministic: same long expr → same key.
+        assert_eq!(bounded, dynamic_rate_bucket_key(&big_expr, "acme"));
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_distinct_oversized_exprs_get_distinct_keys() {
+        // Two DISTINCT oversized expressions must not collapse onto one bucket
+        // (they are independently validated and may declare different rps).
+        let big_a = "a".repeat(5000);
+        let big_b = "b".repeat(5000);
+        assert_ne!(
+            dynamic_rate_bucket_key(&big_a, "acme"),
+            dynamic_rate_bucket_key(&big_b, "acme"),
+        );
+    }
+
+    #[test]
+    fn dynamic_rate_bucket_key_is_provably_bounded_for_two_oversized_components() {
+        // Both components oversized → both hashed; the whole key stays tiny and
+        // well under the Postgres btree PRIMARY KEY size limit (~2704 bytes).
+        let big_expr = "a".repeat(5000);
+        let big_val = "x".repeat(5000);
+        let key = dynamic_rate_bucket_key(&big_expr, &big_val);
+        assert!(
+            key.len() < 530,
+            "both-oversized key must be ≤ ~530 bytes, got len {}",
+            key.len()
+        );
     }
 
     // ── Dropped-wake fix (issue #601 CI hardening) ──────────────────────────
