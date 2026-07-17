@@ -74,6 +74,7 @@ linux        autumn-harvest-plugin  api_scheduler_integration        -          
 linux        autumn-harvest-plugin  build_ramp_integration           -                          -
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
+linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
 linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -

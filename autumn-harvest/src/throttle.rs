@@ -1001,6 +1001,7 @@ async fn fire_claimed_throttle_row(
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
+        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         concurrency_key: opts.concurrency_key,

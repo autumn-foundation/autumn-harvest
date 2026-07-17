@@ -193,6 +193,7 @@ async fn seed_workflow(
             memo: None,
             search_attrs,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,

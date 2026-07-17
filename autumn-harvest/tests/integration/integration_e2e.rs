@@ -268,9 +268,23 @@ const LEGACY_INIT_SQL: &str = concat!(
 /// Start a Postgres container with the harvest schema applied and return
 /// an `AsyncPgConnection` ready for use.
 ///
+/// Honours `HARVEST_TEST_DATABASE_URL` (a pre-migrated Postgres) so DB tests can
+/// run against a local instance when Docker/testcontainers is unavailable. In
+/// that mode the returned container `Option` is `None`; callers keep the
+/// returned value alive for the test's duration exactly as they would the
+/// container. When the env var is unset (the CI default), a throwaway container
+/// is started as before.
+///
 /// CRITICAL: the returned `ContainerAsync` must be held alive for the duration
 /// of the test -- dropping it kills the container.
-async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+async fn setup_test_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+    if let Ok(database_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect to HARVEST_TEST_DATABASE_URL");
+        return (conn, None);
+    }
+
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
         .with_tag("16")
@@ -292,7 +306,7 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         .await
         .expect("failed to connect to Postgres container");
 
-    (conn, container)
+    (conn, Some(container))
 }
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -731,6 +745,7 @@ pub(crate) async fn insert_workflow_execution_with_id(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // #685: required conflict_policy field tips this pre-existing literal-heavy test to 101 lines
 async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts() {
     let (database_url, _container) = setup_blank_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -761,6 +776,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         memo: None,
         search_attrs: None,
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
         concurrency_key: None,
@@ -770,7 +786,6 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
-
         owner: None,
         runbook_url: None,
         severity: None,
@@ -1687,6 +1702,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         memo: None,
         search_attrs: None,
         reuse_policy: WorkflowIdReusePolicy::default(),
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
         concurrency_key: None,
@@ -1887,6 +1903,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         memo: None,
         search_attrs: None,
         reuse_policy: WorkflowIdReusePolicy::default(),
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
         concurrency_key: None,
@@ -5821,6 +5838,7 @@ mod reuse_policy_helpers {
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
@@ -6311,6 +6329,565 @@ async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempo
     assert!(second.created, "retry must mint a fresh execution");
     assert_eq!(second.exec_id, second_id);
     assert_ne!(second.exec_id, first.exec_id);
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowIdConflictPolicy — orthogonal active-prior axis (issue #685)
+// ---------------------------------------------------------------------------
+//
+// These exercise the active (RUNNING/PAUSED) collision axis end-to-end through
+// the real start transaction, composing with each reuse policy. The unit-level
+// matrix (predicate + effective behavior) lives in `execution.rs`.
+
+/// Count `harvest_events` rows for an execution, to prove an ATTACH appended no
+/// new `WorkflowStarted` event.
+async fn count_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    use diesel::sql_types::BigInt;
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_events WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .get_result::<Cnt>(conn)
+        .await
+        .expect("count events")
+        .n
+}
+
+/// Count `harvest_events` rows of a given `event_type` for an execution, to prove
+/// a cancel actually appended a `WorkflowCancelled` event.
+async fn count_events_of_type(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event_type: &str,
+) -> i64 {
+    use diesel::sql_types::{BigInt, Text};
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<Text, _>(event_type)
+    .get_result::<Cnt>(conn)
+    .await
+    .expect("count events of type")
+    .n
+}
+
+/// Count `harvest_task_queue` rows for an execution, to prove an ATTACH enqueued
+/// no task against the fresh (allocated-but-unused) `exec_id`.
+async fn count_tasks_for_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    use diesel::sql_types::BigInt;
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .get_result::<Cnt>(conn)
+        .await
+        .expect("count tasks")
+        .n
+}
+
+/// `UseExisting` attaches to a RUNNING prior regardless of the reuse policy —
+/// returning the existing handle, appending no new `WorkflowStarted` event, and
+/// leaving the prior RUNNING (no cancel).
+#[tokio::test]
+async fn conflict_use_existing_running_attaches_no_new_run() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-use-run", first_id);
+    // Pair with a reuse policy whose NATIVE active behavior differs from Attach
+    // (AllowDuplicateFailedOnly natively attaches, but TerminateIfRunning would
+    // cancel) — here we prove UseExisting overrides regardless. Use
+    // AllowDuplicateFailedOnly to also confirm no interaction with the reuse axis.
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    assert_eq!(first.state, "RUNNING");
+    let events_before = count_events(&mut conn, first.exec_id).await;
+
+    // Capture the fresh exec_id that is allocated for this second start but never
+    // used, because UseExisting attaches to the prior instead (FIX 3).
+    let fresh_exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = fresh_exec_id;
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::UseExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("UseExisting on RUNNING should attach");
+    assert!(!second.created, "UseExisting must NOT create a fresh run");
+    assert_eq!(
+        second.exec_id, first.exec_id,
+        "must return the running exec_id"
+    );
+    assert_eq!(second.state, "RUNNING");
+
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_eq!(
+        prior.state, "RUNNING",
+        "prior must remain RUNNING (no cancel)"
+    );
+    let events_after = count_events(&mut conn, first.exec_id).await;
+    assert_eq!(
+        events_before, events_after,
+        "attach must append no new WorkflowStarted event"
+    );
+    // FIX 3: the attach enqueues NO task against the fresh (unused) exec_id.
+    assert_eq!(
+        count_tasks_for_execution(&mut conn, fresh_exec_id).await,
+        0,
+        "UseExisting attach must enqueue no task for the allocated-but-unused exec_id"
+    );
+}
+
+/// `UseExisting` attaches to a PAUSED prior too (PAUSED is an active state).
+#[tokio::test]
+async fn conflict_use_existing_paused_attaches() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-use-paused", first_id);
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "PAUSED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::UseExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("UseExisting on PAUSED should attach");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "PAUSED");
+
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_eq!(
+        prior.state, "PAUSED",
+        "prior must remain PAUSED (no cancel)"
+    );
+}
+
+/// AC-3 corner: `TerminateIfRunning` reuse + `UseExisting` conflict on a
+/// COMPLETED (terminal) prior — the conflict axis governs only active priors, so
+/// the terminal prior is decided by the reuse axis (`TerminateIfRunning`) → fresh.
+#[tokio::test]
+async fn conflict_terminate_if_running_reuse_plus_use_existing_completed_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-tir-use-cmp", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "COMPLETED").await;
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::UseExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("terminal prior is decided by the reuse axis (TIR) → fresh");
+    assert!(
+        second.created,
+        "TerminateIfRunning replaces a terminal prior"
+    );
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+}
+
+/// AC-3 corner (the pre-check gate fix): `TerminateIfRunning` reuse +
+/// `UseExisting` conflict on a RUNNING prior — `UseExisting` overrides the active
+/// behavior to Attach, so the prior is NOT cancelled by the pre-check.
+#[tokio::test]
+async fn conflict_terminate_if_running_reuse_plus_use_existing_running_attaches() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-tir-use-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::TerminateIfRunning;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    assert_eq!(first.state, "RUNNING");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::UseExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("UseExisting overrides TerminateIfRunning on a RUNNING prior → attach");
+    assert!(!second.created, "must attach, not cancel + start fresh");
+    assert_eq!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "RUNNING");
+
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_eq!(
+        prior.state, "RUNNING",
+        "the pre-check must NOT cancel the prior when UseExisting overrides"
+    );
+}
+
+/// Fail conflict on a RUNNING prior errors regardless of reuse policy.
+#[tokio::test]
+async fn conflict_fail_running_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-fail-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::Fail;
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect_err("Fail on RUNNING must error even with AllowDuplicate reuse");
+    match err {
+        HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        } => {
+            assert_eq!(existing_exec_id, first.exec_id);
+            assert_eq!(existing_state, "RUNNING");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+    // Prior must be untouched.
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_eq!(prior.state, "RUNNING");
+}
+
+/// `TerminateExisting` on a RUNNING prior cancels it and starts fresh, even with a
+/// reuse policy (`AllowDuplicate`) that would natively attach.
+#[tokio::test]
+async fn conflict_terminate_existing_running_cancels_and_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-term-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    assert_eq!(first.state, "RUNNING");
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("TerminateExisting overrides AllowDuplicate → cancel + fresh");
+    assert!(second.created, "must mint a fresh execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "RUNNING");
+
+    // Prior run must have been superseded (sealed as CONTINUED_AS_NEW by the
+    // inline cancel + replace path).
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_eq!(
+        prior.state, "CONTINUED_AS_NEW",
+        "prior run must be sealed (superseded), not left RUNNING"
+    );
+}
+
+/// FIX 2 (AC-2 coverage gap): `TerminateExisting` on a PAUSED prior cancels it and
+/// starts fresh. Unlike the RUNNING case — which the native `TerminateIfRunning`
+/// pre-check can reach — a PAUSED prior is resolved by the IN-TRANSACTION
+/// `inline_cancel` + `replace_execution` under the row lock (the pre-check-based
+/// path never terminates a PAUSED prior). We pair it with `AllowDuplicate` reuse
+/// (which natively attaches) to prove `TerminateExisting` overrides.
+#[tokio::test]
+async fn conflict_terminate_existing_paused_cancels_and_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-term-paused", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    // Force PAUSED. `force_state` sets the `state` column only — there is no live
+    // worker in this test, so this is sufficient to exercise the active-PAUSED
+    // conflict branch.
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "PAUSED").await;
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("TerminateExisting on PAUSED → inline cancel + fresh");
+    assert!(second.created, "must mint a fresh execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "RUNNING");
+
+    // The PAUSED prior was cancelled (WorkflowCancelled appended by `inline_cancel`)
+    // and then sealed (CONTINUED_AS_NEW by `replace_execution`) — no longer active.
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_ne!(prior.state, "RUNNING", "prior must not be RUNNING");
+    assert_ne!(prior.state, "PAUSED", "prior must not be PAUSED");
+    assert_eq!(
+        prior.state, "CONTINUED_AS_NEW",
+        "the cancelled-then-replaced prior is sealed as CONTINUED_AS_NEW"
+    );
+    assert_eq!(
+        count_events_of_type(&mut conn, first.exec_id, "WorkflowCancelled").await,
+        1,
+        "the inline cancel must append exactly one WorkflowCancelled event"
+    );
+}
+
+/// FIX 2 companion: `Fail` conflict on a PAUSED prior errors (`AlreadyExists`)
+/// with the prior's `existing_state` reported as `PAUSED`.
+#[tokio::test]
+async fn conflict_fail_paused_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-fail-paused", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "PAUSED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::Fail;
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect_err("Fail on a PAUSED prior must error");
+    match err {
+        HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        } => {
+            assert_eq!(existing_exec_id, first.exec_id);
+            assert_eq!(existing_state, "PAUSED");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+/// AC-6 regression guard: `Unspecified` conflict preserves the reuse policy's
+/// native active behavior byte-for-byte — `AllowDuplicate` + RUNNING → attach.
+#[tokio::test]
+async fn conflict_unspecified_preserves_allow_duplicate_running_attaches() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-unspec-run", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    // conflict_policy defaults to Unspecified via base_params.
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("Unspecified preserves AllowDuplicate attach");
+    assert!(!second.created);
+    assert_eq!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "RUNNING");
+}
+
+/// Success-metric proof (scaled to 20 for CI speed; the 100/100 metric is this
+/// test's shape): N concurrent `UseExisting` starts against ONE running prior all
+/// converge on the same `exec_id` — zero `AlreadyExists` errors, zero terminations.
+#[tokio::test]
+async fn conflict_concurrency_race_use_existing_converges() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&database_url);
+
+    // Seed one running prior.
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-race-use", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let mut seed_conn = pool.get().await.expect("pool conn");
+    let first = start_or_load_workflow_execution(&mut seed_conn, params.clone(), None)
+        .await
+        .expect("seed start should succeed");
+    assert_eq!(first.state, "RUNNING");
+    drop(seed_conn);
+
+    let n = 20usize;
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pool = pool.clone();
+        let mut p = params.clone();
+        p.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+        p.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::UseExisting;
+        // StartWorkflowParams borrows 'static &str fields, so it is Send + 'static.
+        handles.push(tokio::spawn(async move {
+            let mut conn = pool.get().await.expect("pool conn");
+            start_or_load_workflow_execution(&mut conn, p, None).await
+        }));
+    }
+
+    let mut converged = 0usize;
+    for h in handles {
+        let res = h
+            .await
+            .expect("task join")
+            .expect("no AlreadyExists / no error");
+        assert!(
+            !res.created,
+            "every UseExisting start must attach, not create"
+        );
+        assert_eq!(res.exec_id, first.exec_id, "all must converge on the prior");
+        converged += 1;
+    }
+    assert_eq!(converged, n, "all {n} concurrent starts converged");
+
+    // The prior was never terminated.
+    let mut conn = pool.get().await.expect("pool conn");
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_eq!(prior.state, "RUNNING", "no start may terminate the prior");
+}
+
+/// Codex P2 (issue #685 review): N concurrent `terminate_existing` starts against
+/// ONE running prior for a single `(workflow_name, workflow_id)` CONVERGE — every
+/// call returns Ok (no transient `NotFound`, no `AlreadyExists`) and the storm
+/// settles to exactly ONE surviving non-terminal (RUNNING) execution, with all
+/// others sealed.
+///
+/// This guards the convergence invariant (0 errors, 1 survivor), NOT a
+/// deterministic reproduction of the pre-fix 404: the seal race is timing
+/// dependent (a loser must reach the post-INSERT load in the window after a
+/// winner sealed the prior it locked but before the loser's own snapshot sees the
+/// replacement). Without the seal-race retry loop around
+/// `load_workflow_execution_by_key_for_update`, a loser that lands in that window
+/// surfaces `NotFound` -> the assertion `Ok` below would fail intermittently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflict_terminate_existing_concurrent_converges() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&database_url);
+
+    // Seed exactly one RUNNING prior for the key.
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-term-race-converge", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let mut seed_conn = pool.get().await.expect("pool conn");
+    let first = start_or_load_workflow_execution(&mut seed_conn, params.clone(), None)
+        .await
+        .expect("seed start should succeed");
+    assert_eq!(first.state, "RUNNING");
+    drop(seed_conn);
+
+    // Storm the same key with N concurrent terminate_existing starts on a shared
+    // pool. Each is a genuine replace (cancel-if-live + fresh insert), so they
+    // race to seal each other's replacement row.
+    let n = 20usize;
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pool = pool.clone();
+        let mut p = params.clone();
+        p.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+        p.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+        p.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting;
+        handles.push(tokio::spawn(async move {
+            let mut conn = pool.get().await.expect("pool conn");
+            start_or_load_workflow_execution(&mut conn, p, None).await
+        }));
+    }
+
+    // AC: zero calls returned an error (no NotFound, no AlreadyExists).
+    let mut ok_count = 0usize;
+    for h in handles {
+        let res = h.await.expect("task join");
+        match res {
+            Ok(started) => {
+                assert!(
+                    started.created,
+                    "terminate_existing always mints a fresh run"
+                );
+                assert_eq!(started.state, "RUNNING");
+                ok_count += 1;
+            }
+            Err(e) => panic!("concurrent terminate_existing must converge, got error: {e:?}"),
+        }
+    }
+    assert_eq!(
+        ok_count, n,
+        "all {n} concurrent terminate_existing starts returned Ok"
+    );
+
+    // AC: the storm settled to exactly ONE surviving non-terminal (RUNNING) run
+    // for the key; every other row (the seed + the N-1 superseded replacements)
+    // is sealed/cancelled and no longer active.
+    let mut conn = pool.get().await.expect("pool conn");
+    let rows: Vec<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("reuse_policy_wf"))
+        .filter(harvest_workflow_executions::workflow_id.eq("cf-term-race-converge"))
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .expect("load rows for the key");
+
+    let running = rows.iter().filter(|s| s.as_str() == "RUNNING").count();
+    let paused = rows.iter().filter(|s| s.as_str() == "PAUSED").count();
+    assert_eq!(
+        running, 1,
+        "exactly one surviving RUNNING execution after the storm (states: {rows:?})"
+    );
+    assert_eq!(paused, 0, "no active PAUSED execution should remain");
+    assert_eq!(
+        rows.len(),
+        n + 1,
+        "seed + N replacements = {} total rows (states: {rows:?})",
+        n + 1
+    );
+    // Every non-surviving row is sealed as CONTINUED_AS_NEW by replace_execution.
+    let sealed = rows
+        .iter()
+        .filter(|s| s.as_str() == "CONTINUED_AS_NEW")
+        .count();
+    assert_eq!(
+        sealed, n,
+        "the N superseded runs (seed + N-1 losers' priors) are all sealed (states: {rows:?})"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -7132,6 +7709,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             memo: None,
             search_attrs: Some(serde_json::json!({"tenant": "acme"})),
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
@@ -7307,6 +7885,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             memo: None,
             search_attrs: Some(serde_json::json!({"tenant": "acme"})),
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,

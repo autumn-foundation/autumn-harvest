@@ -336,6 +336,7 @@ async fn start_workflow(
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,

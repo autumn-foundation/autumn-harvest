@@ -451,6 +451,88 @@ HTTP route:
 See `examples/signal_with_start_webhook.rs` for a worked Stripe webhook
 example.
 
+### Standalone Start — Conflict Policy (issue #685)
+
+The plain `POST /workflows/{workflow_name}/start` route (and the CLI
+`harvest workflow start`) accepts **two orthogonal axes** for handling a
+`(workflow_name, workflow_id)` collision:
+
+- **`reuse_policy`** (unchanged, 4 values) governs a **terminal** prior run
+  (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`SUSPENDED`).
+- **`conflict_policy`** (new) governs an **active** (`RUNNING`/`PAUSED`) prior
+  run. `unspecified` (the default) defers to the reuse policy's *native* active
+  behavior, so omitting the field is byte-for-byte identical to today.
+
+The two axes are independent: `conflict_policy` has no effect on a terminal
+prior, and `reuse_policy` has no effect on an active prior (except via the
+`unspecified` fallback).
+
+**Effective ACTIVE-prior behavior** — `reuse_policy` (rows) × `conflict_policy`
+(columns). Cells: `Err(AlreadyExists)` (409) / *return existing* (attach, 200) /
+*cancel + start fresh* (201).
+
+| reuse_policy \ conflict_policy | `unspecified` (default) | `fail` | `use_existing` | `terminate_existing` |
+|--------------------------------|-------------------------|--------|----------------|----------------------|
+| `allow_duplicate`              | return existing (attach) | Err(AlreadyExists) | return existing (attach) | cancel + start fresh |
+| `reject_duplicate`             | Err(AlreadyExists)      | Err(AlreadyExists) | return existing (attach) | cancel + start fresh |
+| `allow_duplicate_failed_only`  | return existing (attach) | Err(AlreadyExists) | return existing (attach) | cancel + start fresh |
+| `terminate_if_running`         | cancel + start fresh    | Err(AlreadyExists) | return existing (attach) | cancel + start fresh |
+
+**Backward continuity.** The `unspecified` column *is* today's four `reuse_policy`
+variants exactly — `(reuse, conflict=unspecified)` is byte-for-byte the pre-#685
+behavior for every reuse policy. Terminal priors are unaffected by
+`conflict_policy` entirely.
+
+**AC-3 — the idempotent-starter shape.** `reuse=terminate_if_running` +
+`conflict=use_existing` gives *fresh-for-all-terminal* + *attach-active*: a
+terminal prior is replaced with a fresh run (the `terminate_if_running` *terminal*
+half is unchanged — it always starts fresh), while `use_existing` overrides
+`terminate_if_running`'s *active* half from **cancel** to **attach**, so a still-
+running prior is returned rather than cancelled. This is the canonical
+"start-or-attach a singleton entity workflow" pattern with a single HTTP call.
+
+**HTTP mapping.**
+- *attach* → `200 OK`, `created: false` (and `started_fresh: false` **when the
+  request sent a `conflict_policy` field** — sending the field, even
+  `unspecified`, opts into the attach-vs-fresh distinguisher; omitting it keeps
+  the response byte-for-byte identical to today).
+- *cancel + start fresh* → `201 Created`, `started_fresh: true`.
+- *fail over an active prior* → `409 Conflict`.
+- **Admin auth (capability-precise gate, #685 review).** Admin is required
+  **iff the request can cancel a live run** — i.e. the resolved active-prior
+  behavior (the matrix cell) is *cancel + start fresh* (`Terminate`). That is
+  exactly `conflict=terminate_existing` (any reuse), or
+  `reuse=terminate_if_running` with the **default/omitted** conflict
+  (`unspecified` → native `Terminate`). Without admin these → **`401`**. The
+  other two active resolutions never cancel live work and are **non-admin**:
+  *attach* (`use_existing`, or the native-attach reuse policies) and *fail*
+  (`fail`). In particular the flagship idempotent-starter
+  `reuse=terminate_if_running` + `conflict=use_existing` resolves to *attach*
+  and is **not** admin-gated — a non-admin webhook/cron caller can use it
+  directly. The gate is computed from the parsed policies via
+  `effective_active_conflict_behavior(reuse, conflict) == ActiveConflictBehavior::Terminate`,
+  so an invalid policy value returns `400` before the gate is reached.
+- an unknown `conflict_policy` value → `400`.
+
+**Deferred-start restriction.** A non-default `conflict_policy` combined with a
+**throttle / debounce / batch** policy returns `400`: those defer the start, so
+there is no active prior to resolve at request time. `unspecified` (or omitting
+the field) is always accepted. `conflict_policy` combined with `idempotency_key`
+(#808) is allowed — they compose.
+
+**Concurrency note (#685 review).** Concurrent `terminate_existing` starts of
+the same `(workflow_name, workflow_id)` against one live prior are
+last-writer-wins and **converge to a single surviving run via a bounded internal
+retry** — no transient `NotFound` is surfaced. A loser whose post-INSERT
+`load_workflow_execution_by_key_for_update` observes the winner seal the prior
+row it locked (a pre-existing seal race, more reachable now that
+`terminate_existing` has no pre-check) is retried internally: under READ
+COMMITTED each SELECT gets a fresh snapshot, so the loser picks up the winner's
+committed replacement RUNNING row and starts fresh against it (a bounded cap
+guards the pathological "sealed without a replacement" case, falling back to the
+pre-existing `NotFound`). It does **not** corrupt data, deadlock, or double-run —
+the seal + insert is transactional, and `use_existing` never enters this branch.
+
 ### Typed Dispatch
 
 Use the companion functions generated by `#[workflow]` and `#[activity]` instead of raw string names when dispatching from within a workflow. The companion name is `{fn_name}_info()` (the public alias for the hidden `__autumn_{workflow|activity}_info_{name}()` function).
