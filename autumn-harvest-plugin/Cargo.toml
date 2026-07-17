@@ -51,12 +51,6 @@ tower = "0.5"
 matchit = "0.8"
 maud = { version = "0.27", features = ["axum"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-# Scoped API tokens (issue #942): mint a high-entropy random secret (rand),
-# base64url-encode it (base64), and store only its SHA-256 hash (sha2). All
-# three are already workspace/core deps — no new crate is pulled.
-sha2 = "0.10"
-base64 = "0.22"
-rand = { workspace = true }
 
 [dev-dependencies]
 autumn-web = { version = "0.5", features = ["test-support", "mcp"] }

@@ -66,6 +66,8 @@ pub const fn full_migrations_sql() -> &'static str {
 pub mod admission_gate;
 /// History analyzer and linter.
 pub mod analyzer;
+/// Pure token-secret helpers shared by the mint route and the CLI (issue #942).
+pub mod api_token;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;

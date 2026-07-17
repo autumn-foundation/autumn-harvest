@@ -51,24 +51,23 @@ use axum::http::{HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use rand::RngCore as _;
 
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use autumn_harvest::HarvestResult;
+// The token secret helpers live in CORE (`autumn_harvest::api_token`) as the
+// single source of truth (issue #942): the offline `harvest token bootstrap`
+// CLI mints/hashes with these exact functions, so an offline-seeded token
+// authenticates byte-for-byte identically to one minted via the route below.
+pub(crate) use autumn_harvest::api_token::{hash_secret, looks_like_harvest_token, mint_secret};
 use autumn_harvest::audit::{HEADER_ACTOR, deny_readonly_mutation};
 use autumn_harvest::models::{ApiToken, NewApiToken};
 use autumn_harvest::schema::harvest_api_tokens;
 
 use crate::api::{HarvestApiState, acquire_conn, classify_route, read_only_forbidden_response};
-
-/// The credential-namespace discriminator for a harvest-native token.
-pub(crate) const TOKEN_PREFIX: &str = "hvst_";
 
 /// The audit-actor namespace reserved for genuinely token-authenticated
 /// requests (issue #942, AC6). Only the valid-token path may set an actor in
@@ -200,42 +199,12 @@ impl std::fmt::Debug for MintResult {
     }
 }
 
-// ── Crypto / discrimination helpers (pure) ────────────────────────────────────
-
-/// Mint a fresh opaque secret `hvst_<base64url(32 random bytes)>`.
-///
-/// Uses the OS CSPRNG for 256 bits of entropy — this is a bearer credential,
-/// so the randomness source must be cryptographically secure.
-#[must_use]
-pub(crate) fn mint_secret() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    format!("{TOKEN_PREFIX}{body}")
-}
-
-/// Hex-encoded SHA-256 of the full presented secret — the indexed lookup key.
-///
-/// A plain SHA-256 of a 256-bit random secret is standard for API keys (the
-/// GitHub-PAT / Hatchet model): no salt/argon needed because the secret is not
-/// a low-entropy human password.
-#[must_use]
-pub(crate) fn hash_secret(secret: &str) -> String {
-    let digest = Sha256::digest(secret.as_bytes());
-    // Lowercase hex, 64 chars.
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Whether a bearer credential claims to be a harvest-native token (AC7).
-#[must_use]
-pub(crate) fn looks_like_harvest_token(bearer: &str) -> bool {
-    bearer.starts_with(TOKEN_PREFIX)
-}
+// ── Expiry helper (pure) ──────────────────────────────────────────────────────
+//
+// `mint_secret` / `hash_secret` / `looks_like_harvest_token` (and `TOKEN_PREFIX`)
+// live in `autumn_harvest::api_token` (the single source of truth, shared with
+// the offline bootstrap CLI): the three used here are re-exported via the
+// `pub(crate) use` above.
 
 /// Whether a token with the given (optional) expiry is expired at `now` (AC5).
 ///
@@ -562,6 +531,7 @@ pub async fn enforce_token_scope_mcp_mutation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_harvest::api_token::TOKEN_PREFIX;
 
     #[test]
     fn hash_is_deterministic_and_hex() {
