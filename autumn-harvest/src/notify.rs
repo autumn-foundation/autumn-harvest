@@ -696,4 +696,34 @@ mod tests {
         let deserialized: ProgressNotifyPayload = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, deserialized);
     }
+
+    #[test]
+    fn progress_notify_payload_stays_within_pg_notify_limit() {
+        // Postgres `pg_notify` payloads are hard-capped at 8000 bytes. The
+        // context caps each chunk's serialized JSON at
+        // `PROGRESS_CHUNK_MAX_BYTES` (7000) and this envelope wraps it as
+        // `{"seq":..,"chunk":..}`. Pin the worst case directly: a max-`u64` seq
+        // (20 decimal digits) plus a chunk serialized right at the cap must
+        // still leave the whole envelope under the 8000-byte NOTIFY limit.
+        let cap = crate::context::PROGRESS_CHUNK_MAX_BYTES;
+        // A JSON string of (cap - 2) chars serializes (with its two quotes) to
+        // exactly `cap` bytes — the largest chunk the context will forward.
+        let max_chunk = serde_json::Value::String("x".repeat(cap - 2));
+        assert_eq!(
+            serde_json::to_vec(&max_chunk).unwrap().len(),
+            cap,
+            "test fixture: chunk must serialize to exactly the cap"
+        );
+        let payload = ProgressNotifyPayload {
+            seq: u64::MAX,
+            chunk: max_chunk,
+        };
+        let serialized = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            serialized.len() < 8000,
+            "progress NOTIFY envelope must stay under the Postgres 8000-byte \
+             pg_notify limit (max-u64 seq + max chunk), was {} bytes",
+            serialized.len()
+        );
+    }
 }

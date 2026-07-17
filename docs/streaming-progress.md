@@ -93,6 +93,12 @@ This is a **product-UX channel, not an audit record.**
   connects late does not receive earlier chunks. There is no buffering for late
   subscribers and no gap-filling across a reconnect — durable per-execution logs
   (#790) are the separate primitive for a persisted, replayable record.
+- **Dropped under back-pressure from a slow-but-connected client.** The SSE
+  producer sends chunks **non-blocking**: if a slow subscriber lets the bounded
+  per-stream buffer fill, the *excess* chunks are **dropped** rather than
+  buffered unboundedly or back-pressured into Postgres' shared `NOTIFY` queue.
+  The monotonic `seq` lets the client detect the resulting gap. Only a
+  *disconnected* client ends the stream.
 - **Best-effort by construction.** A `NOTIFY` failure at the worker is logged and
   **swallowed** — publishing can never fail or slow a workflow. A published chunk
   is capped at **7000 serialized bytes** (Postgres' `NOTIFY` payload limit is
@@ -143,19 +149,31 @@ one keepalive interval; an idle client disconnect and a dropped `LISTEN`
 connection both end the stream rather than hanging. A malformed execution id
 returns `400`; an unknown execution returns `404`.
 
-### Monotonic `seq` and reconnect gap detection (AC6)
+### Monotonic `seq` — the client contract (AC6)
 
 Each chunk carries a **strictly increasing, execution-lifetime-monotonic**
 sequence number, surfaced as the SSE `id:`. It is `epoch`-prefixed — the high
 bits encode the workflow's loaded-history length at the start of the decision
 cycle that published the chunk, and the low bits are a per-cycle counter — so the
-number always grows across decision cycles as well as within one. A client that
-reconnects and sees the first new `id:` jump past `last_seen_id + 1` knows chunks
-were missed in the gap (delivery is best-effort; **the engine does not fill the
-gap** — refetch authoritative state from the workflow result or a query handler
-if you need completeness). Because the same inputs produce the same `seq`, a
-best-effort duplicate delivered after a crash-retry of the same cycle is
-**dedupable by `seq`**.
+number grows across decision cycles as well as within one. Crucially, `seq` is a
+**logical-position identity, not a per-chunk counter**: a re-driven workflow
+position (a spurious wake, or a rolled-back cycle that re-runs) deterministically
+re-emits the **same** `seq`.
+
+What a subscriber should do:
+
+- **Dedupe by `seq`, keep-first.** For at-most-once-per-position display, ignore
+  a chunk whose `seq` you have already seen. A re-emitted chunk MAY carry
+  *different content* for a non-deterministic chunk (an LLM token stream, a live
+  metric) — **the first-delivered is canonical**.
+- **Detect gaps via forward `seq` jumps.** After a reconnect, if the first new
+  `id:` jumps past the last seen `seq`, chunks were missed in the gap (delivery
+  is best-effort — a slow-consumer drop, a late connect, or a reconnect window).
+  **The engine does not fill the gap**; refetch authoritative state from the
+  workflow result or a query handler if you need completeness.
+- **`seq` is per `exec_id`.** A continue-as-new successor is a **new `exec_id` on
+  a new stream** whose `seq` restarts — subscribe to the successor's stream to
+  follow the chain.
 
 ## Auth — default posture (AC5)
 
@@ -169,6 +187,21 @@ route is open.** Embedders surfacing streams to untrusted end-users **must** fro
 this route with their own authentication and per-execution authorization
 (typically your app already knows which `exec_id` belongs to the requesting
 user). Do not expose an unauthenticated `/stream` to the public internet.
+
+**`exec_id` is a bearer capability for live chunk content.** The engine only
+checks that the execution *exists* (returning `404` otherwise) — it performs **no
+authorization**. Anyone who presents a valid `exec_id` receives that run's live
+chunk **content**, which may include sensitive workflow output. If your chunks
+carry anything sensitive, you **must** add a per-execution authorization check in
+your own middleware. `exec_id` is a random UUIDv4 (not enumerable), which
+mitigates blind probing but is **not** an access-control substitute.
+
+**Cap concurrent streams (DoS).** Each subscriber holds **one dedicated,
+non-pooled Postgres `LISTEN` connection** for the lifetime of the stream. A flood
+of concurrent `/stream` requests can therefore exhaust database connections.
+Embedders should rate-limit stream opens and/or cap concurrent streams per user.
+A global concurrent-stream cap is a possible future enhancement; today it is the
+embedder's responsibility.
 
 ## Out of scope
 

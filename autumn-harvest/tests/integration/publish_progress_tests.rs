@@ -10,7 +10,7 @@
 //!
 //! Run with:
 //!   cargo test -p autumn-harvest --test integration --features testing \
-//!     --no-default-features -- publish_progress
+//!     --no-default-features -- `publish_progress`
 
 use std::future::Future;
 use std::pin::Pin;

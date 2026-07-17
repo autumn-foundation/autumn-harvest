@@ -97,12 +97,15 @@ const PROGRESS_SEQ_LOCAL_STRIDE: u64 = 1u64 << PROGRESS_SEQ_LOCAL_BITS;
 ///
 /// `epoch` (the loaded-history length at the cycle's start) is placed in the high
 /// bits and `local_index` (per-cycle 0-based) in the low
-/// [`PROGRESS_SEQ_LOCAL_BITS`] bits. Because `epoch` strictly grows across
-/// decision cycles (a cycle that publishes always appends ≥1 event before the
-/// next cycle loads), the resulting `seq` is **strictly increasing over the whole
-/// execution lifetime** — a reconnecting SSE client can detect gaps. It is also
-/// **deterministic on a crash-retry of the same cycle** (same `epoch`, same
-/// publish order ⇒ same seq), giving idempotent seqs on best-effort redelivery.
+/// [`PROGRESS_SEQ_LOCAL_BITS`] bits. `seq` is a **logical-position identity**:
+/// for a chunk to fire LIVE in a later cycle the workflow must reach a live
+/// position PAST the previous frontier, which requires the loaded history
+/// (`epoch`) to have grown — so a later live cycle's `seq` strictly exceeds every
+/// earlier one, and a reconnecting SSE client detects gaps via forward jumps. A
+/// same-position re-drive (spurious wake / rolled-back retry) re-loads the same
+/// history and re-runs the same publish order, so it is **deterministic on a
+/// crash-retry of the same cycle** (same `epoch`, same order ⇒ same seq), giving
+/// idempotent, dedupe-by-seq redelivery.
 ///
 /// `local_index` is clamped to [`PROGRESS_SEQ_LOCAL_MASK`] so it can never spill
 /// into the epoch bits, and the epoch shift is saturating so an astronomically
@@ -9786,8 +9789,16 @@ impl WorkflowContext {
     ///   state, partial output, token streams, etc. (This is the one place a
     ///   workflow may emit non-deterministic data safely.)
     /// - **Ordered `seq`**: each published chunk carries a monotonic, epoch-
-    ///   prefixed sequence number that strictly increases over the execution's
-    ///   whole lifetime, so a reconnecting subscriber can detect gaps.
+    ///   prefixed sequence number. `seq` is a **logical-position identity**, not
+    ///   a per-chunk counter: it strictly increases as the workflow advances
+    ///   over its lifetime, and a re-driven position (spurious wake / rolled-back
+    ///   retry) deterministically re-emits the **same** `seq`. A subscriber
+    ///   should therefore **dedupe by `seq` (keep-first)** for at-most-once-per-
+    ///   position display and use forward `seq` **jumps** to detect gaps after a
+    ///   reconnect. A re-emitted chunk MAY carry different content for a
+    ///   non-deterministic chunk — the first-delivered is canonical. `seq` is
+    ///   per `exec_id`; a continue-as-new successor is a new `exec_id` on a new
+    ///   stream whose `seq` restarts.
     /// - **Size-capped**: a chunk whose serialized JSON exceeds
     ///   [`PROGRESS_CHUNK_MAX_BYTES`] (Postgres `NOTIFY` payload headroom) is
     ///   **replaced** with a truncation marker
@@ -9799,15 +9810,39 @@ impl WorkflowContext {
     ///
     /// Returns [`HarvestError::Serialization`] if `chunk` cannot be serialized
     /// to JSON. This is the only fallible part of the call; on replay it always
-    /// returns `Ok(())` without touching `chunk`.
+    /// returns `Ok(())` without touching `chunk`. Serialization failure is
+    /// effectively unreachable for a well-formed chunk, so fire-and-forget usage
+    /// (`let _ = ctx.publish_progress(..);`) is fine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned (mirroring
+    /// [`is_replaying`](Self::is_replaying)).
     pub fn publish_progress(&self, chunk: impl serde::Serialize) -> HarvestResult<()> {
-        // Replay-neutrality gate: a progress chunk is never recorded and never
-        // replayed, so on replay we push no command and consume no seq slot.
-        // This mirrors `set_current_details` (issue #593) and query handlers
-        // (#234): a zero-footprint, replay-suppressed side channel.
-        if self.is_replaying() {
-            return Ok(());
-        }
+        // Single matcher lock: read the replay flag AND the epoch together. We
+        // lock the matcher directly — NOT via `match_history`/`is_replaying()` —
+        // so this read never triggers the `pump_signal_handlers` post-hook
+        // (mirroring `info()`).
+        //
+        // - Replay-neutrality gate: a progress chunk is never recorded and never
+        //   replayed, so on replay we push no command and consume no seq slot
+        //   (mirrors `set_current_details` #593 and query handlers #234). We
+        //   return BEFORE any serialization or command push.
+        // - Epoch = the loaded-history length at this cycle's start: a pure
+        //   function of the recorded history (the matcher's events vec is
+        //   immutable within a cycle), constant across every `publish_progress`
+        //   call in the cycle. Monotonicity across cycles holds because for a
+        //   chunk to fire LIVE in a later cycle the workflow must reach a live
+        //   position PAST the previous frontier, which requires the loaded
+        //   history (epoch) to have grown; a same-position re-drive (spurious
+        //   wake / rolled-back retry) re-emits the SAME seq deterministically.
+        let epoch = {
+            let matcher = self.matcher.lock().expect("matcher lock poisoned");
+            if matcher.is_replaying() {
+                return Ok(());
+            }
+            matcher.event_count()
+        };
         // Serialize the caller's chunk (the only fallible step).
         let mut value = serde_json::to_value(&chunk).map_err(HarvestError::Serialization)?;
         // Cap the serialized size below the Postgres NOTIFY payload limit.
@@ -9821,18 +9856,6 @@ impl WorkflowContext {
                 "bytes": serialized_len,
             });
         }
-        // Epoch = the loaded-history length at this cycle's start. It is a pure
-        // function of the recorded history (the matcher's events vec is
-        // immutable within a cycle), constant across every `publish_progress`
-        // call in the cycle, and strictly grows across cycles (a cycle that
-        // publishes always appends >=1 event before the next cycle loads). We
-        // lock the matcher directly — NOT via `match_history` — so this read
-        // never triggers the `pump_signal_handlers` post-hook (mirroring
-        // `info()`).
-        let epoch = {
-            let matcher = self.matcher.lock().expect("matcher lock poisoned");
-            matcher.event_count()
-        };
         let local_index = self
             .progress_local_index
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18281,10 +18304,14 @@ mod tests {
 
     #[test]
     fn encode_progress_seq_is_monotonic_across_epochs() {
-        // Epoch = loaded-history length at cycle start; it strictly grows across
-        // decision cycles (a cycle that makes progress appends >=1 event), so a
-        // higher-epoch seq must exceed EVERY lower-epoch seq regardless of the
-        // per-cycle local index — proving execution-lifetime monotonicity (AC6).
+        // Epoch = loaded-history length at cycle start. For a chunk to fire LIVE
+        // in a later cycle the workflow must reach a live position past the prior
+        // frontier, which requires the loaded history (epoch) to have grown — so
+        // a higher-epoch seq must exceed EVERY lower-epoch seq regardless of the
+        // per-cycle local index, proving execution-lifetime monotonicity (AC6).
+        // (That epoch actually grows across REAL cycles is proven end-to-end by
+        // `progress_stream_seq_strictly_increases_across_decision_cycles` in the
+        // plugin's progress_stream_integration.rs.)
         let cycle_n_last = encode_progress_seq(4, PROGRESS_SEQ_LOCAL_MASK);
         let cycle_n_plus_1_first = encode_progress_seq(5, 0);
         assert!(
