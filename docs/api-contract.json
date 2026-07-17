@@ -6357,6 +6357,128 @@
     },
     {
       "method": "GET",
+      "path": "/admin/tokens",
+      "category": "api_tokens",
+      "read_only": true,
+      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/tokens",
+      "category": "api_tokens",
+      "read_only": false,
+      "description": "Mint a scoped API token (issue #942). The plaintext secret is returned exactly once in this response; only its SHA-256 hash is stored at rest. Scope is drawn from the route classification: 'read' reaches every read-only route and is denied 403 on mutations; 'mutate' reaches everything.",
+      "idempotency": "Not idempotent: each call mints a new token row with a fresh UUID and secret.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "name",
+            "required": true,
+            "description": "Human-readable label for the caller (CI job, dashboard, on-call, SDK)."
+          },
+          {
+            "name": "scope",
+            "required": false,
+            "description": "Verb-level scope: 'read' (default) or 'mutate'."
+          },
+          {
+            "name": "expires_at",
+            "required": false,
+            "description": "RFC 3339 timestamp after which the token is rejected 401."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "id",
+          "name",
+          "scope",
+          "created_at",
+          "expires_at",
+          "last_used_at",
+          "revoked_at",
+          "secret"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Unknown scope (expected 'read' or 'mutate')."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/tokens/{id}",
+      "category": "api_tokens",
+      "read_only": false,
+      "description": "Revoke a scoped API token (issue #942). Revocation is effective on the next request (no grant cache).",
+      "idempotency": "Idempotent: revoking an unknown or already-revoked token returns revoked=false without error.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "UUID of the token to revoke."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "revoked"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/queues/{queue_name}/eligibility",
       "category": "queue",
       "read_only": true,

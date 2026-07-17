@@ -441,6 +441,12 @@ enum Commands {
         #[command(subcommand)]
         command: GateCommand,
     },
+    /// Manage scoped API tokens for the management API (issue #942).
+    #[command(alias = "tokens")]
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     /// Report per-tenant/per-workflow usage for chargeback and capacity planning (issue #596).
     ///
     /// The historical companion to `harvest concurrency status`. Renders a
@@ -769,6 +775,44 @@ enum GateCommand {
     Lift {
         /// Gate ID (UUID) to lift.
         id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Mint a scoped API token. The secret is returned exactly once.
+    #[command(alias = "add")]
+    Create {
+        /// Human-readable label for the caller (CI job, dashboard, on-call, SDK).
+        name: String,
+        /// Verb-level scope: `read` (read-only routes) or `mutate` (everything).
+        /// Defaults to `read` (least privilege).
+        #[arg(long, default_value = "read")]
+        scope: String,
+        /// Optional RFC 3339 expiry after which the token is rejected 401.
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// List all tokens as metadata (never the secret/hash).
+    #[command(alias = "ls")]
+    List,
+    /// Revoke a token by ID (effective on the next request).
+    #[command(alias = "delete", alias = "rm", alias = "remove")]
+    Revoke {
+        /// Token ID (UUID) to revoke.
+        id: String,
+    },
+    /// Rotate a token: mint a replacement via the create route. Revoking the
+    /// old token is a documented second step (`harvest token revoke <old-id>`).
+    Rotate {
+        /// The existing token ID being rotated out (used to name the replacement).
+        old_id: String,
+        /// Scope for the replacement token. Defaults to `read`.
+        #[arg(long, default_value = "read")]
+        scope: String,
+        /// Optional RFC 3339 expiry for the replacement token.
+        #[arg(long)]
+        expires_at: Option<String>,
     },
 }
 
@@ -1879,6 +1923,7 @@ impl Cli {
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Gate { command } => gate_request(command),
+            Commands::Token { command } => token_request(command),
             Commands::Worker { command } => Ok(worker_request(command)),
             Commands::Usage {
                 from,
@@ -5625,6 +5670,47 @@ fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
                 body["expires_at"] = serde_json::json!(exp);
             }
             Ok(ApiRequest::post("/admin/gates", Some(body)))
+        }
+    }
+}
+
+fn token_request(command: &TokenCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        TokenCommand::List => Ok(ApiRequest::get("/admin/tokens")),
+        TokenCommand::Revoke { id } => Ok(ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!("/admin/tokens/{}", path_segment(id)),
+            body: None,
+        }),
+        TokenCommand::Create {
+            name,
+            scope,
+            expires_at,
+        } => {
+            let mut body = serde_json::json!({
+                "name": name,
+                "scope": scope,
+            });
+            if let Some(exp) = expires_at {
+                body["expires_at"] = serde_json::json!(exp);
+            }
+            Ok(ApiRequest::post("/admin/tokens", Some(body)))
+        }
+        // Rotation has no dedicated server route: the CLI mints a replacement via
+        // the create route. The old token is revoked as a documented second step.
+        TokenCommand::Rotate {
+            old_id,
+            scope,
+            expires_at,
+        } => {
+            let mut body = serde_json::json!({
+                "name": format!("rotation-of-{old_id}"),
+                "scope": scope,
+            });
+            if let Some(exp) = expires_at {
+                body["expires_at"] = serde_json::json!(exp);
+            }
+            Ok(ApiRequest::post("/admin/tokens", Some(body)))
         }
     }
 }

@@ -28,7 +28,7 @@
 //!
 //! # Scope enforcement (AC3/AC4)
 //!
-//! A `read` token reaches every [`RouteClass::ReadOnly`]/`PublicSafe` route and
+//! A `read` token reaches every [`autumn_harvest::audit::RouteClass::ReadOnly`]/`PublicSafe` route and
 //! is denied **403** on every mutating route; a `mutate` token reaches
 //! everything. The decision is [`deny_readonly_mutation`] over
 //! [`crate::api::classify_route`] — the single source of truth — which **fails
@@ -61,7 +61,7 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use autumn_harvest::HarvestResult;
-use autumn_harvest::audit::{HEADER_ACTOR, RouteClass, deny_readonly_mutation};
+use autumn_harvest::audit::{HEADER_ACTOR, deny_readonly_mutation};
 use autumn_harvest::models::{ApiToken, NewApiToken};
 use autumn_harvest::schema::harvest_api_tokens;
 
@@ -236,7 +236,7 @@ pub(crate) fn is_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) 
 ///
 /// A `Mutate` token is never denied. A `Read` token is denied exactly when the
 /// route resolves to a mutating class — and [`classify_route`] fails closed by
-/// resolving an unmatched path to [`RouteClass::Mutating`], so an unclassified
+/// resolving an unmatched path to [`autumn_harvest::audit::RouteClass::Mutating`], so an unclassified
 /// route is denied to a `read` token.
 #[must_use]
 pub(crate) fn token_scope_denies(scope: TokenScope, method: &Method, path: &str) -> bool {
