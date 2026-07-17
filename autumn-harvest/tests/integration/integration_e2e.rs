@@ -6356,6 +6356,48 @@ async fn count_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64
         .n
 }
 
+/// Count `harvest_events` rows of a given `event_type` for an execution, to prove
+/// a cancel actually appended a `WorkflowCancelled` event.
+async fn count_events_of_type(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    event_type: &str,
+) -> i64 {
+    use diesel::sql_types::{BigInt, Text};
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<Text, _>(event_type)
+    .get_result::<Cnt>(conn)
+    .await
+    .expect("count events of type")
+    .n
+}
+
+/// Count `harvest_task_queue` rows for an execution, to prove an ATTACH enqueued
+/// no task against the fresh (allocated-but-unused) `exec_id`.
+async fn count_tasks_for_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    use diesel::sql_types::BigInt;
+    #[derive(diesel::QueryableByName)]
+    struct Cnt {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .get_result::<Cnt>(conn)
+        .await
+        .expect("count tasks")
+        .n
+}
+
 /// `UseExisting` attaches to a RUNNING prior regardless of the reuse policy —
 /// returning the existing handle, appending no new `WorkflowStarted` event, and
 /// leaving the prior RUNNING (no cancel).
@@ -6375,7 +6417,10 @@ async fn conflict_use_existing_running_attaches_no_new_run() {
     assert_eq!(first.state, "RUNNING");
     let events_before = count_events(&mut conn, first.exec_id).await;
 
-    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    // Capture the fresh exec_id that is allocated for this second start but never
+    // used, because UseExisting attaches to the prior instead (FIX 3).
+    let fresh_exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = fresh_exec_id;
     params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::UseExisting;
     let second = start_or_load_workflow_execution(&mut conn, params, None)
         .await
@@ -6401,6 +6446,12 @@ async fn conflict_use_existing_running_attaches_no_new_run() {
     assert_eq!(
         events_before, events_after,
         "attach must append no new WorkflowStarted event"
+    );
+    // FIX 3: the attach enqueues NO task against the fresh (unused) exec_id.
+    assert_eq!(
+        count_tasks_for_execution(&mut conn, fresh_exec_id).await,
+        0,
+        "UseExisting attach must enqueue no task for the allocated-but-unused exec_id"
     );
 }
 
@@ -6571,6 +6622,88 @@ async fn conflict_terminate_existing_running_cancels_and_starts_fresh() {
         prior.state, "CONTINUED_AS_NEW",
         "prior run must be sealed (superseded), not left RUNNING"
     );
+}
+
+/// FIX 2 (AC-2 coverage gap): `TerminateExisting` on a PAUSED prior cancels it and
+/// starts fresh. Unlike the RUNNING case — which the native `TerminateIfRunning`
+/// pre-check can reach — a PAUSED prior is resolved by the IN-TRANSACTION
+/// `inline_cancel` + `replace_execution` under the row lock (the pre-check-based
+/// path never terminates a PAUSED prior). We pair it with `AllowDuplicate` reuse
+/// (which natively attaches) to prove `TerminateExisting` overrides.
+#[tokio::test]
+async fn conflict_terminate_existing_paused_cancels_and_starts_fresh() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-term-paused", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    // Force PAUSED. `force_state` sets the `state` column only — there is no live
+    // worker in this test, so this is sufficient to exercise the active-PAUSED
+    // conflict branch.
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "PAUSED").await;
+
+    let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.exec_id = second_id;
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting;
+    let second = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("TerminateExisting on PAUSED → inline cancel + fresh");
+    assert!(second.created, "must mint a fresh execution");
+    assert_eq!(second.exec_id, second_id);
+    assert_ne!(second.exec_id, first.exec_id);
+    assert_eq!(second.state, "RUNNING");
+
+    // The PAUSED prior was cancelled (WorkflowCancelled appended by `inline_cancel`)
+    // and then sealed (CONTINUED_AS_NEW by `replace_execution`) — no longer active.
+    let prior = harvest_workflow_executions::table
+        .find(first.exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("prior row must exist");
+    assert_ne!(prior.state, "RUNNING", "prior must not be RUNNING");
+    assert_ne!(prior.state, "PAUSED", "prior must not be PAUSED");
+    assert_eq!(
+        prior.state, "CONTINUED_AS_NEW",
+        "the cancelled-then-replaced prior is sealed as CONTINUED_AS_NEW"
+    );
+    assert_eq!(
+        count_events_of_type(&mut conn, first.exec_id, "WorkflowCancelled").await,
+        1,
+        "the inline cancel must append exactly one WorkflowCancelled event"
+    );
+}
+
+/// FIX 2 companion: `Fail` conflict on a PAUSED prior errors (`AlreadyExists`)
+/// with the prior's `existing_state` reported as `PAUSED`.
+#[tokio::test]
+async fn conflict_fail_paused_errors() {
+    let (mut conn, _container) = setup_test_db().await;
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-fail-paused", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let first = start_or_load_workflow_execution(&mut conn, params.clone(), None)
+        .await
+        .expect("first start should succeed");
+    reuse_policy_helpers::force_state(&mut conn, first.exec_id, "PAUSED").await;
+
+    params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    params.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::Fail;
+    let err = start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect_err("Fail on a PAUSED prior must error");
+    match err {
+        HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        } => {
+            assert_eq!(existing_exec_id, first.exec_id);
+            assert_eq!(existing_state, "PAUSED");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
 }
 
 /// AC-6 regression guard: `Unspecified` conflict preserves the reuse policy's
