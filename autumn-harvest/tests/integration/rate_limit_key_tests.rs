@@ -725,3 +725,76 @@ async fn success_metric_cross_key_burst_fairness() {
         );
     }
 }
+
+// ── Issue #699 review (Codex P2): fail-loud on an invalid dynamic key ─────────
+
+#[tokio::test]
+async fn dynamic_rate_limit_key_without_rps_fails_schedule_not_silently_unrated() {
+    // An application that builds the public `HandlerRegistry` DIRECTLY bypasses
+    // `HarvestBuilder::try_build`'s validation (RateLimitKeyExprWithoutCap), so an
+    // `ActivityInfo { rate_limit_key_expr: Some(..), rate_limit_rps: None, .. }`
+    // can reach `persist_scheduled_activities`. It MUST fail the schedule
+    // transaction loudly rather than silently enqueue the activity with NO rate
+    // limit -- the exact failure a rate-limiting feature exists to prevent.
+    let (url, _guard) = crate::integration_e2e::setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let exec = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut conn,
+        resolution_start_params(
+            "wf-bad-rps",
+            exec,
+            serde_json::json!({ "tenant_id": "acme" }),
+        ),
+        None,
+    )
+    .await
+    .expect("start");
+
+    // Build the activity DIRECTLY with the invalid declaration: a dynamic
+    // `rate_limit_key_expr` but NO `rps`. The macro-generated `charge_info()` is a
+    // valid dynamic-key activity (rps = 50); we strip the rps to reproduce the
+    // exact state a direct `HandlerRegistry` build would leave unvalidated.
+    let mut bad_charge = charge_info();
+    assert!(
+        bad_charge.rate_limit_key_expr.is_some(),
+        "charge must be a dynamic-key activity for this test to be meaningful"
+    );
+    bad_charge.rate_limit_rps = None; // <- the invalid, unvalidated state
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![tenant_wf_info()],
+        vec![bad_charge],
+    ));
+
+    let worker = crate::integration_e2e::build_runtime_worker("rlk-bad-rps-worker", 2, 2, registry);
+    let pool = crate::integration_e2e::build_test_pool(&url);
+    let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Give the worker time to attempt the schedule; each attempt must error on the
+    // guard and roll back its transaction (a fast Config error, never a hang).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    worker.shutdown();
+    let _ = handle.await;
+
+    // The workflow MUST NOT complete: the guard fails the suspension/schedule
+    // transaction on every attempt.
+    assert_ne!(
+        task_state_workflow(&mut conn, exec).await,
+        "COMPLETED",
+        "an invalid dynamic-key-without-rps activity must never let the workflow complete"
+    );
+    // And the activity MUST NEVER have been enqueued: the guard fires BEFORE the
+    // ActivityScheduled event / task row is persisted, so the activity can never
+    // run unrated.
+    let charge_rows = scalar_i64(
+        &mut conn,
+        "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue WHERE activity_name=$1",
+        "charge",
+    )
+    .await;
+    assert_eq!(
+        charge_rows, 0,
+        "the invalid activity must never be enqueued -- silently running unrated is exactly what the guard prevents"
+    );
+}

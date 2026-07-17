@@ -4691,6 +4691,25 @@ async fn persist_scheduled_activities(
         }
 
         if let Some(expr) = activity.rate_limit_key_expr {
+            // A dynamic per-key rate limit requires an `rps` to derive its
+            // bucket refill rate from. `HarvestBuilder::try_build` rejects a
+            // dynamic key without one (RateLimitKeyExprWithoutCap), but a worker
+            // built via a direct `HandlerRegistry` bypasses that validation. Fail
+            // the schedule transaction loudly here rather than silently enqueuing
+            // the activity with NO rate limit (issue #699 review, Codex P2):
+            // without this guard the `if let Some(refill_rate)` block below is
+            // skipped entirely, leaving both `params.rate_limit_key` and
+            // `dynamic_rate_buckets` unset, so the activity runs unrated -- the
+            // exact failure a rate-limiting feature exists to prevent.
+            let Some(refill_rate) = activity.rate_limit_rps else {
+                return Err(HarvestError::Config(format!(
+                    "activity '{}' declares a dynamic rate_limit(key = \"{}\") but has no \
+                     rate_limit_rps; a dynamic per-key rate limit requires an rps. \
+                     (HarvestBuilder::try_build rejects this; you likely built \
+                     HandlerRegistry directly.)",
+                    activity.name, expr
+                )));
+            };
             // Dynamic per-key rate limit (issue #699): resolve the bucket key from
             // the workflow input at enqueue time so each tenant gets its own RPS
             // bucket. A key that cannot be resolved (missing / null / non-object
@@ -4700,22 +4719,18 @@ async fn persist_scheduled_activities(
             let resolved = crate::concurrency::resolve_concurrency_key(expr, workflow_input)
                 .unwrap_or_default();
             let bucket_key = queue::dynamic_rate_bucket_key(expr, &resolved);
-            // Only stamp the dynamic key when its bucket is guaranteed to be
-            // ensured in the same transaction (issue #699 review, #4). Stamping
-            // `rate_limit_key` without a bucket row would make the fail-closed
-            // claim/dispatch gate stall the task forever. `rps` is always set for
-            // a dynamic key (the builder rejects a dynamic key without `rps`),
-            // so the `else` branch is defensive only.
-            if let Some(refill_rate) = activity.rate_limit_rps {
-                let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
-                if !dynamic_rate_buckets
-                    .iter()
-                    .any(|(k, _, _)| *k == bucket_key)
-                {
-                    dynamic_rate_buckets.push((bucket_key.clone(), refill_rate, burst));
-                }
-                params.rate_limit_key = Some(bucket_key);
+            // The bucket is ensured in the same transaction below, so the
+            // fail-closed claim/dispatch gate always has a bucket row to read
+            // (else the task would stall forever). `refill_rate` is guaranteed
+            // present by the guard above.
+            let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
+            if !dynamic_rate_buckets
+                .iter()
+                .any(|(k, _, _)| *k == bucket_key)
+            {
+                dynamic_rate_buckets.push((bucket_key.clone(), refill_rate, burst));
             }
+            params.rate_limit_key = Some(bucket_key);
         } else {
             let effective_rate_limit_key = activity
                 .rate_limit_key
@@ -14302,6 +14317,23 @@ impl Worker {
         match pool.get().await {
             Ok(mut conn) => {
                 for activity in self.registry.activities.values() {
+                    // A dynamic rate_limit(key = ...) with no rps is an invalid
+                    // declaration that `HarvestBuilder::try_build` rejects. A
+                    // worker built via a direct `HandlerRegistry` bypasses that
+                    // validation; surface it loudly at startup (the enqueue path
+                    // also fails the schedule transaction -- see
+                    // `persist_scheduled_activities`) rather than silently running
+                    // the activity unrated (issue #699 review, Codex P2).
+                    if activity.rate_limit_key_expr.is_some() && activity.rate_limit_rps.is_none() {
+                        tracing::error!(
+                            worker_id = %self.config.worker_id,
+                            activity = %activity.name,
+                            "activity declares a dynamic rate_limit(key = ...) without \
+                             rate_limit_rps; it will fail at schedule time -- add an rps \
+                             or remove the key"
+                        );
+                        continue;
+                    }
                     let Some(refill_rate) = activity.rate_limit_rps else {
                         continue;
                     };
