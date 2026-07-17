@@ -12272,6 +12272,7 @@ pub(crate) async fn start_workflow(
                     !autumn_harvest::execution::start_will_create_new_execution(
                         prior_state.as_deref(),
                         reuse_policy,
+                        autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                     );
                 attaches_to_existing
                     || autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
@@ -12483,6 +12484,7 @@ pub(crate) async fn start_workflow(
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
                 reuse_policy,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: trace_ctx,
                 max_execution_timeout_ceiling: api_state
                     .max_workflow_execution_timeout()
@@ -12705,6 +12707,7 @@ pub(crate) async fn start_workflow(
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         reuse_policy,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: trace_ctx,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
@@ -13228,6 +13231,7 @@ async fn batch_start_workflows(
                                 !autumn_harvest::execution::start_will_create_new_execution(
                                     prior_state.as_deref(),
                                     WorkflowIdReusePolicy::AllowDuplicate,
+                                    autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                                 );
                             attaches_to_existing
                                 || (workflow_resolving_throttle(
@@ -13714,6 +13718,7 @@ async fn batch_start_workflows(
                     memo: None,
                     search_attrs: item.search_attributes.clone(),
                     reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                    conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: trace_ctx,
                     max_execution_timeout_ceiling: max_exec_timeout_ceiling,
                     concurrency_key,
@@ -21083,6 +21088,7 @@ async fn trigger_schedule_now(
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
@@ -22465,6 +22471,8 @@ async fn schedule_backfill(
                         memo: None,
                         search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                        conflict_policy:
+                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
@@ -22778,6 +22786,8 @@ async fn schedule_backfill(
                         memo: None,
                         search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
+                        conflict_policy:
+                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
@@ -33422,6 +33432,7 @@ mod tests {
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
@@ -33506,6 +33517,7 @@ mod tests {
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
@@ -33627,6 +33639,7 @@ mod tests {
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,

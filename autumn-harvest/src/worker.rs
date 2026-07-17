@@ -3747,6 +3747,7 @@ async fn persist_workflow_failure(
                         memo: exec_ref.memo.clone(),
                         search_attrs: exec_ref.search_attrs.clone(),
                         reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
                         concurrency_key: concurrency_key.clone(),

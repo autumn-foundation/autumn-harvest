@@ -7470,6 +7470,7 @@ async fn execute_schedule_trigger_ui(
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
