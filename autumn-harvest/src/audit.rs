@@ -381,6 +381,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /executions/{exec_id}/events/stream",
         RouteClass::ReadOnly,
     ),
+    // SSE ephemeral workflow progress stream (issue #791): read-only side
+    // channel over LISTEN/NOTIFY, never mutates state. NOT admin-gated (AC5).
+    ("GET /workflows/{id}/stream", RouteClass::ReadOnly),
     // ── Mutating ── modifies workflow execution or system configuration ───────
     // All of these are covered by the audit trail (harvest_audit_log) or are
     // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
@@ -750,6 +753,9 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/audit",
     // SSE stream is read-only; stream open/close are audited manually in the handler.
     "GET /executions/{exec_id}/events/stream",
+    // Ephemeral progress stream (issue #791): read-only, no audit trail
+    // (disposable side channel; no open/close audit rows are written).
+    "GET /workflows/{id}/stream",
     // Build routing reads and the retire safety check never write audit rows.
     "GET /admin/build-routing",
     "GET /admin/build-routing/compat",
@@ -936,6 +942,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/audit", None),
     // SSE execution event stream (issue #324): read-only; open/close audited in handler.
     ("GET /executions/{exec_id}/events/stream", None),
+    // Ephemeral progress stream (issue #791): read-only, not audited.
+    ("GET /workflows/{id}/stream", None),
     // Build routing management (issue #362)
     ("GET /admin/build-routing", None),
     (
@@ -1428,6 +1436,34 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn progress_stream_route_is_classified_read_only() {
+        // The ephemeral workflow progress SSE stream (issue #791) is a
+        // read-only, best-effort side channel; it never mutates state and
+        // writes no audit rows. This pinned test — not just the general
+        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
+        // and ALL_MUTATION_ROUTES against each other rather than against the
+        // live router — is what actually catches the route being dropped from
+        // BOTH lists at once.
+        let route = "GET /workflows/{id}/stream";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #791)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #791)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #791)"
         );
     }
 

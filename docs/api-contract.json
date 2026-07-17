@@ -679,6 +679,42 @@
       "idempotency": "Fully idempotent; read-only."
     },
     {
+      "method": "GET",
+      "path": "/workflows/{id}/stream",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect — a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq — a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 — end-users stream their own workflows). If no api_with_auth middleware is configured the route is open — embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) — exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 503,
+          "description": "Progress streaming is unavailable server-side (retriable): either the LISTEN/NOTIFY notification URL is not configured, or that notification database is unreachable (LISTEN connect failed)."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
       "method": "POST",
       "path": "/workflows/{workflow_name}/start",
       "category": "workflow",
