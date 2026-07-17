@@ -105,6 +105,23 @@ async fn task_state(conn: &mut AsyncPgConnection, id: Uuid) -> String {
         .state
 }
 
+/// Insert a minimal RUNNING execution row so an activity task can satisfy the
+/// `harvest_task_queue.workflow_exec_id` foreign key. Returns the execution id.
+async fn insert_execution(conn: &mut AsyncPgConnection) -> Uuid {
+    use diesel_async::RunQueryDsl;
+    let id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'rlk', $2, 0, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(id.to_string())
+    .execute(conn)
+    .await
+    .expect("insert execution");
+    id
+}
+
 /// Enqueue an activity task, optionally with a rate-limit key and per-key
 /// concurrency cap. Returns the task id.
 async fn enqueue_activity(
@@ -114,8 +131,9 @@ async fn enqueue_activity(
     rate_limit_key: Option<String>,
     concurrency: Option<(String, u32)>,
 ) -> Uuid {
+    let exec_id = insert_execution(conn).await;
     let mut params = EnqueueParams::new(queue, TaskType::Activity, serde_json::json!({}));
-    params.workflow_exec_id = Some(Uuid::new_v4());
+    params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some(activity.to_string());
     params.activity_id = Some(Uuid::new_v4());
     params.rate_limit_key = rate_limit_key;
