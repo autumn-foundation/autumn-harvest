@@ -131,23 +131,40 @@ const MAX_KEY_COMPONENT_LEN: usize = 256;
 ///
 /// - A value within the bound is emitted as a **length-tagged literal**:
 ///   `L{byte_len}:{value}` (starts with `L`, self-delimiting).
-/// - A longer value is replaced with a deterministic, collision-resistant
-///   `seahash` **digest**: `H{16hex}` (starts with `H`, fixed 17 bytes).
+/// - A longer value is replaced with a deterministic, **collision-resistant
+///   SHA-256** digest: `H{64hex}` (starts with `H`, fixed 65 bytes).
+///
+/// The digest is the full 256-bit SHA-256 of the component's UTF-8 bytes,
+/// hex-encoded. This is deliberately a *cryptographic* digest rather than the
+/// 64-bit `seahash` this originally used: the component is tenant-influenced
+/// input (a resolved per-execution value, or a hand-built
+/// `ActivityInfo.rate_limit_key`), so two distinct oversized values sharing a
+/// 64-bit digest would silently share a `dyn-rate` bucket — the `L`/`H` tags
+/// fix *format* collisions, not *digest* collisions. SHA-256 makes a digest
+/// collision computationally infeasible, so distinct oversized components get
+/// distinct buckets in practice.
 ///
 /// The `L`/`H` first-byte tags make the two forms provably disjoint: a short
-/// literal whose value happens to be the string `H0123456789abcdef` (17 bytes)
-/// encodes to `L17:H0123456789abcdef`, which can never equal a hash encoding
-/// `H0123456789abcdef`. Without the tag, `h:{digest}` was itself a valid short
+/// literal whose value happens to be a 65-byte string beginning with `H`
+/// followed by 64 hex characters encodes to `L65:H…`, which can never equal a
+/// hash encoding `H…`. Without the tag, `h:{digest}` was itself a valid short
 /// literal, so a long value hashing to digest `D` and a short literal value
 /// equal to the string `h:{D}` produced the same component — cross-tenant
 /// bucket sharing without a hash collision. Applied to both the expression and
 /// the resolved value so neither can blow the composite PK size, and so the
 /// whole composite key is injective (each component is self-delimiting: an
-/// `L{len}:{len-bytes}` literal or a fixed-width `H{16hex}` hash).
+/// `L{len}:{len-bytes}` literal or a fixed-width `H{64hex}` hash).
 fn bound_key_component(component: &str) -> String {
     if component.len() > MAX_KEY_COMPONENT_LEN {
-        let digest = seahash::hash(component.as_bytes());
-        format!("H{digest:016x}")
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let digest = Sha256::digest(component.as_bytes());
+        let mut out = String::with_capacity(1 + 64);
+        out.push('H');
+        for b in digest {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
     } else {
         format!("L{}:{}", component.len(), component)
     }
@@ -194,8 +211,9 @@ const UNRESOLVED_RESOLVED_MARKER: &str = "U";
 ///
 /// *Both* the normalized `expr` and the `resolved` value are byte-length-bounded
 /// ([`MAX_KEY_COMPONENT_LEN`], via [`bound_key_component`]): a component whose
-/// UTF-8 byte length exceeds the bound is replaced with a stable `seahash`
-/// digest so a pathological value — an oversized resolved tenant id *or* a very
+/// UTF-8 byte length exceeds the bound is replaced with a stable, collision-
+/// resistant SHA-256 digest so a pathological value — an oversized resolved
+/// tenant id *or* a very
 /// long dot-path / hand-built `ActivityInfo.rate_limit_key` expression — can
 /// never blow the btree PK size limit and wedge the enqueue transaction. The
 /// byte-length check matches the Postgres btree PK limit (which is byte-based)
@@ -206,7 +224,7 @@ const UNRESOLVED_RESOLVED_MARKER: &str = "U";
 /// The key is **injective by construction**: the `expr` component is emitted by
 /// [`bound_key_component`] as either a length-tagged literal `L{len}:{bytes}`
 /// (self-delimiting: after the `L`, the decimal `len` up to the next `:` says
-/// exactly how many bytes follow) or a fixed-width hash `H{16hex}`, and the
+/// exactly how many bytes follow) or a fixed-width hash `H{64hex}`, and the
 /// `resolved` component is either the same (`Some`) or the single-byte
 /// [`UNRESOLVED_RESOLVED_MARKER`] (`U`, for `None`). The `L`/`H`/`U` first-byte
 /// tags are structurally disjoint, so a literal value equal to a hash's
@@ -2813,10 +2831,15 @@ mod tests {
         // a valid short literal, so a long value hashing to digest `D` and a
         // short literal value equal to `h:{D}` produced the same component.
         let long = "x".repeat(300);
-        let hash_form = bound_key_component(&long); // `H{16hex}` (long > 256)
+        let hash_form = bound_key_component(&long); // `H{64hex}` (long > 256)
         assert!(
             hash_form.starts_with('H'),
             "long value must hash, got {hash_form}"
+        );
+        assert_eq!(
+            hash_form.len(),
+            65,
+            "SHA-256 hash form is `H` + 64 hex chars, got {hash_form}"
         );
         // A literal whose value is exactly the hash's string encoding.
         let literal_that_equals_the_hash = hash_form.clone();
@@ -2864,12 +2887,14 @@ mod tests {
         // is replaced with a bounded, stable hash.
         let big = "x".repeat(5000);
         let bounded = dynamic_rate_bucket_key("tenant_id", Some(&big));
+        // `dyn-rate:L9:tenant_id:H{64hex}` = 87 bytes regardless of the 5000-char
+        // input — bounded far below the ~2704-byte btree PK limit.
         assert!(
-            bounded.chars().count() < 64,
+            bounded.chars().count() < 128,
             "oversized resolved value must be bounded, got len {}",
             bounded.chars().count()
         );
-        // The resolved component is the fixed-width hash `H{16hex}`.
+        // The resolved component is the fixed-width hash `H{64hex}`.
         assert!(bounded.starts_with("dyn-rate:L9:tenant_id:H"));
         // Deterministic: same long value → same key.
         assert_eq!(bounded, dynamic_rate_bucket_key("tenant_id", Some(&big)));
@@ -2886,10 +2911,19 @@ mod tests {
         // the enqueue transaction. The expr component is now bounded/hashed too.
         let big_expr = "a".repeat(5000);
         let bounded = dynamic_rate_bucket_key(&big_expr, Some("acme"));
-        // The expr component is the fixed-width hash `H{16hex}`; the resolved
-        // component is the length-tagged literal `L4:acme`.
-        let digest = seahash::hash(big_expr.as_bytes());
-        assert_eq!(bounded, format!("dyn-rate:H{digest:016x}:L4:acme"));
+        // The expr component is the fixed-width hash `H{64hex}` (collision-
+        // resistant SHA-256); the resolved component is the length-tagged
+        // literal `L4:acme`. Recompute the expected digest via the same SHA-256.
+        let expected_hex = {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write as _;
+            let mut s = String::new();
+            for b in Sha256::digest(big_expr.as_bytes()) {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        assert_eq!(bounded, format!("dyn-rate:H{expected_hex}:L4:acme"));
         assert!(bounded.starts_with("dyn-rate:H"));
         // The whole composite key is provably well under the ~2704 btree limit.
         assert!(
