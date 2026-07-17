@@ -6787,6 +6787,109 @@ async fn conflict_concurrency_race_use_existing_converges() {
     assert_eq!(prior.state, "RUNNING", "no start may terminate the prior");
 }
 
+/// Codex P2 (issue #685 review): N concurrent `terminate_existing` starts against
+/// ONE running prior for a single `(workflow_name, workflow_id)` CONVERGE — every
+/// call returns Ok (no transient `NotFound`, no `AlreadyExists`) and the storm
+/// settles to exactly ONE surviving non-terminal (RUNNING) execution, with all
+/// others sealed.
+///
+/// This guards the convergence invariant (0 errors, 1 survivor), NOT a
+/// deterministic reproduction of the pre-fix 404: the seal race is timing
+/// dependent (a loser must reach the post-INSERT load in the window after a
+/// winner sealed the prior it locked but before the loser's own snapshot sees the
+/// replacement). Without the seal-race retry loop around
+/// `load_workflow_execution_by_key_for_update`, a loser that lands in that window
+/// surfaces `NotFound` -> the assertion `Ok` below would fail intermittently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflict_terminate_existing_concurrent_converges() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&database_url);
+
+    // Seed exactly one RUNNING prior for the key.
+    let first_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let mut params = reuse_policy_helpers::base_params("cf-term-race-converge", first_id);
+    params.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+    let mut seed_conn = pool.get().await.expect("pool conn");
+    let first = start_or_load_workflow_execution(&mut seed_conn, params.clone(), None)
+        .await
+        .expect("seed start should succeed");
+    assert_eq!(first.state, "RUNNING");
+    drop(seed_conn);
+
+    // Storm the same key with N concurrent terminate_existing starts on a shared
+    // pool. Each is a genuine replace (cancel-if-live + fresh insert), so they
+    // race to seal each other's replacement row.
+    let n = 20usize;
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pool = pool.clone();
+        let mut p = params.clone();
+        p.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+        p.reuse_policy = WorkflowIdReusePolicy::AllowDuplicate;
+        p.conflict_policy = autumn_harvest::types::WorkflowIdConflictPolicy::TerminateExisting;
+        handles.push(tokio::spawn(async move {
+            let mut conn = pool.get().await.expect("pool conn");
+            start_or_load_workflow_execution(&mut conn, p, None).await
+        }));
+    }
+
+    // AC: zero calls returned an error (no NotFound, no AlreadyExists).
+    let mut ok_count = 0usize;
+    for h in handles {
+        let res = h.await.expect("task join");
+        match res {
+            Ok(started) => {
+                assert!(
+                    started.created,
+                    "terminate_existing always mints a fresh run"
+                );
+                assert_eq!(started.state, "RUNNING");
+                ok_count += 1;
+            }
+            Err(e) => panic!("concurrent terminate_existing must converge, got error: {e:?}"),
+        }
+    }
+    assert_eq!(
+        ok_count, n,
+        "all {n} concurrent terminate_existing starts returned Ok"
+    );
+
+    // AC: the storm settled to exactly ONE surviving non-terminal (RUNNING) run
+    // for the key; every other row (the seed + the N-1 superseded replacements)
+    // is sealed/cancelled and no longer active.
+    let mut conn = pool.get().await.expect("pool conn");
+    let rows: Vec<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("reuse_policy_wf"))
+        .filter(harvest_workflow_executions::workflow_id.eq("cf-term-race-converge"))
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .expect("load rows for the key");
+
+    let running = rows.iter().filter(|s| s.as_str() == "RUNNING").count();
+    let paused = rows.iter().filter(|s| s.as_str() == "PAUSED").count();
+    assert_eq!(
+        running, 1,
+        "exactly one surviving RUNNING execution after the storm (states: {rows:?})"
+    );
+    assert_eq!(paused, 0, "no active PAUSED execution should remain");
+    assert_eq!(
+        rows.len(),
+        n + 1,
+        "seed + N replacements = {} total rows (states: {rows:?})",
+        n + 1
+    );
+    // Every non-surviving row is sealed as CONTINUED_AS_NEW by replace_execution.
+    let sealed = rows
+        .iter()
+        .filter(|s| s.as_str() == "CONTINUED_AS_NEW")
+        .count();
+    assert_eq!(
+        sealed, n,
+        "the N superseded runs (seed + N-1 losers' priors) are all sealed (states: {rows:?})"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency-cap integration tests (issue #88)
 // ---------------------------------------------------------------------------

@@ -169,6 +169,34 @@ pub const ORIGIN_BACKFILL: &str = "backfill";
 /// Origin marker for an ad-hoc operator `trigger-now` fire of a schedule (issue #534).
 pub const ORIGIN_MANUAL_TRIGGER: &str = "manual_trigger";
 
+/// Bounded retry cap for the active-conflict seal-race load (issue #685 review,
+/// Codex P2). Each retry's `FOR UPDATE` naturally blocks on whichever concurrent
+/// contender currently holds the row lock, so this caps the number of distinct
+/// serialized winners a single loser will wait behind before falling back to the
+/// pre-existing `NotFound`.
+///
+/// N concurrent replace-type starts (e.g. `terminate_existing`) against one key
+/// serialize: each seals the current survivor before inserting its own, so the
+/// LAST loser can wait behind up to N-1 winners and needs up to N-1 retries to
+/// see the final survivor. Convergence is therefore guaranteed once the cap
+/// exceeds the concurrent-burst size (there are only ever N fixed contenders, so
+/// after at most N seals the last survivor is never sealed again and stays
+/// RUNNING). This cap is set generously above realistic concurrent-delivery
+/// bursts; because a retry BLOCKS on a real lock holder (forward progress, not a
+/// busy-loop), a high cap costs nothing in the common case — it only bounds the
+/// truly-stuck pathological case (a burst larger than the cap, or a prior sealed
+/// WITHOUT a replacement, e.g. a concurrent reset), which falls back to the
+/// pre-existing terminal `NotFound`.
+const SEAL_RACE_MAX_LOAD_RETRIES: u32 = 64;
+
+/// Small fixed backoff (milliseconds) between seal-race load retries. In the
+/// contended case the re-issued `FOR UPDATE` already blocks on the current lock
+/// holder (so the winner is committed and this sleep is negligible); the backoff
+/// only prevents a tight busy-loop in the pathological "sealed without a
+/// replacement" case, where the re-issued load returns `None` immediately with no
+/// lock holder to block on.
+const SEAL_RACE_LOAD_BACKOFF_MS: u64 = 1;
+
 impl StartWorkflowParams<'_> {
     /// Shard derived from the encoded `exec_id`, used to populate the row's
     /// `shard_id` column. Returns `0` when the caller passed an unencoded id
@@ -760,14 +788,79 @@ pub async fn start_or_load_workflow_execution_collect(
                     ));
                 }
 
-                // INSERT was a no-op: a prior execution exists. Lock the row to
-                // prevent concurrent state changes while we decide what to do.
-                let existing = load_workflow_execution_by_key_for_update(
-                    conn,
-                    request.workflow_name,
-                    request.workflow_id,
-                )
-                .await?;
+                // INSERT was a no-op: a NON-SEALED prior existed at INSERT time
+                // (the active-uniqueness partial index only covers non-sealed
+                // states). Lock that prior row to decide what to do.
+                //
+                // Seal-race retry (issue #685 review, Codex P2): under concurrent
+                // `terminate_existing` (or any replace-type) starts of the same
+                // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
+                // a concurrent winner has sealed the prior it locked
+                // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
+                // non-sealed filter) and inserted a fresh RUNNING replacement. The
+                // loser's first `FOR UPDATE` SELECT took its statement snapshot
+                // before the winner committed, blocks on the prior's row lock, and
+                // -- on the winner's commit -- sees the prior filtered out via
+                // EvalPlanQual while the winner's freshly-inserted row is invisible
+                // to that same statement's snapshot, so the load returns `None`.
+                //
+                // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
+                // so re-issuing the load after the winner has committed picks up the
+                // replacement RUNNING row and the start CONVERGES (last-writer-wins)
+                // instead of surfacing a transient `NotFound`. The loser holds no
+                // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
+                // never locks the conflicting row, and a `None` `FOR UPDATE` locks
+                // nothing -- so the retry is safe. Once a row IS found and
+                // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
+                // `replace_execution` cannot be sealed out from under us (a rival
+                // must first take the same lock, which blocks until we commit). Each
+                // retry's `FOR UPDATE` naturally blocks on the current lock holder,
+                // so this is not a busy-loop; the small backoff only guards the
+                // pathological "sealed without a replacement" case (e.g. a
+                // concurrent reset), where the cap falls back to the pre-existing
+                // `NotFound`.
+                //
+                // Non-racing requests never reach a `None` here (the prior is still
+                // non-sealed under the lock), so this is transparent to the common
+                // path across every reuse/conflict policy.
+                let existing = {
+                    let mut existing: Option<WorkflowExecution> = None;
+                    for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
+                        match load_workflow_execution_by_key_for_update(
+                            conn,
+                            request.workflow_name,
+                            request.workflow_id,
+                        )
+                        .await
+                        {
+                            Ok(row) => {
+                                existing = Some(row);
+                                break;
+                            }
+                            // Seal race: retry with a fresh statement snapshot until
+                            // the winner's replacement row is visible or the cap is
+                            // exhausted (then fall through to the terminal NotFound).
+                            Err(HarvestError::NotFound(_))
+                                if attempt < SEAL_RACE_MAX_LOAD_RETRIES =>
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    SEAL_RACE_LOAD_BACKOFF_MS,
+                                ))
+                                .await;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    match existing {
+                        Some(row) => row,
+                        None => {
+                            return Err(HarvestError::NotFound(format!(
+                                "workflow execution {}/{}",
+                                request.workflow_name, request.workflow_id
+                            )));
+                        }
+                    }
+                };
 
                 // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
                 // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
@@ -803,18 +896,19 @@ pub async fn start_or_load_workflow_execution_collect(
                         // under the lock; we inline the cancel here so the new start
                         // is not silently blocked.
                         //
-                        // Concurrency note (issue #685 review, FIX 4): concurrent
-                        // `terminate_existing` starts of the SAME
+                        // Concurrency note (issue #685 review, FIX 4 + Codex P2):
+                        // concurrent `terminate_existing` starts of the SAME
                         // `(workflow_name, workflow_id)` against one live prior are
-                        // last-writer-wins. `terminate_existing` has no pre-check,
-                        // so more contenders reach this inline branch than the
-                        // pre-#685 `TerminateIfRunning` path did, making the
-                        // pre-existing `load_workflow_execution_by_key_for_update`
-                        // race (a loser can observe a transient `NotFound` after the
-                        // winner seals the prior row it locked) more reachable. It
-                        // does NOT corrupt data, deadlock, or double-run (the seal +
-                        // insert is transactional; `use_existing` never enters this
-                        // branch). A loser should simply retry the start.
+                        // last-writer-wins and CONVERGE to a single surviving run.
+                        // `terminate_existing` has no pre-check, so more contenders
+                        // reach this inline branch than the pre-#685
+                        // `TerminateIfRunning` path did; a loser that observed the
+                        // winner seal the prior row it locked is retried internally
+                        // by the seal-race loop around the load above (a fresh READ
+                        // COMMITTED snapshot picks up the winner's replacement RUNNING
+                        // row), so no transient `NotFound` is surfaced. It does NOT
+                        // corrupt data, deadlock, or double-run (the seal + insert is
+                        // transactional; `use_existing` never enters this branch).
                         ActiveConflictBehavior::Terminate => {
                             if reject_fresh_if_debounced {
                                 return Err(HarvestError::DebounceFreshStart {

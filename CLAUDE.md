@@ -522,11 +522,16 @@ the field) is always accepted. `conflict_policy` combined with `idempotency_key`
 
 **Concurrency note (#685 review).** Concurrent `terminate_existing` starts of
 the same `(workflow_name, workflow_id)` against one live prior are
-last-writer-wins; a loser may observe a transient `404 NotFound` (a pre-existing
-`load_workflow_execution_by_key_for_update` race, more reachable now that
-`terminate_existing` has no pre-check). It does **not** corrupt data, deadlock,
-or double-run — the seal + insert is transactional, and `use_existing` never
-enters this branch — so a loser should simply retry the start.
+last-writer-wins and **converge to a single surviving run via a bounded internal
+retry** — no transient `NotFound` is surfaced. A loser whose post-INSERT
+`load_workflow_execution_by_key_for_update` observes the winner seal the prior
+row it locked (a pre-existing seal race, more reachable now that
+`terminate_existing` has no pre-check) is retried internally: under READ
+COMMITTED each SELECT gets a fresh snapshot, so the loser picks up the winner's
+committed replacement RUNNING row and starts fresh against it (a bounded cap
+guards the pathological "sealed without a replacement" case, falling back to the
+pre-existing `NotFound`). It does **not** corrupt data, deadlock, or double-run —
+the seal + insert is transactional, and `use_existing` never enters this branch.
 
 ### Typed Dispatch
 

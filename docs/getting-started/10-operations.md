@@ -155,9 +155,11 @@ batch policy (the start is deferred and has no active prior to resolve at
 request time) — that combination returns `400`.
 
 > **Concurrency note.** Concurrent `terminate_existing` starts of the same
-> `(workflow_name, workflow_id)` against one live prior are last-writer-wins; a
-> loser may observe a transient `404 NotFound` (it does not corrupt data,
-> deadlock, or double-run) and should simply retry the start.
+> `(workflow_name, workflow_id)` against one live prior are last-writer-wins and
+> CONVERGE to a single surviving run via a bounded internal retry — no transient
+> `NotFound` is surfaced (the loser waits for the winner to commit, then resolves
+> against the current replacement row). It does not corrupt data, deadlock, or
+> double-run.
 
 For the full `reuse_policy` × `conflict_policy` matrix see the
 "Standalone Start — Conflict Policy" section in `CLAUDE.md`.
