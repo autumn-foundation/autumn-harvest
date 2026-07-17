@@ -798,3 +798,87 @@ async fn dynamic_rate_limit_key_without_rps_fails_schedule_not_silently_unrated(
         "the invalid activity must never be enqueued -- silently running unrated is exactly what the guard prevents"
     );
 }
+
+#[tokio::test]
+async fn static_rate_limit_key_with_reserved_dyn_rate_prefix_fails_schedule() {
+    // A STATIC `rate_limit_key` beginning with the reserved `dyn-rate:` prefix
+    // reaching the worker via a direct `HandlerRegistry` bypasses both the macro
+    // parse-site reject and `HarvestBuilder::try_build`'s reserved-prefix
+    // validation (RateLimitKeyReservedPrefix). It MUST fail the schedule
+    // transaction loudly rather than register a bucket that collides with the
+    // generated dynamic per-key namespace -- because startup and lazy dynamic
+    // registration both `ON CONFLICT DO NOTHING`, a colliding key's rate/burst
+    // would otherwise become insertion-order dependent (issue #699 review,
+    // Codex P2).
+    let (url, _guard) = crate::integration_e2e::setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let exec = ExecutionId::new();
+    start_or_load_workflow_execution(
+        &mut conn,
+        resolution_start_params(
+            "wf-reserved-static-key",
+            exec,
+            serde_json::json!({ "tenant_id": "acme" }),
+        ),
+        None,
+    )
+    .await
+    .expect("start");
+
+    // Build the activity DIRECTLY with the invalid static declaration: NO
+    // dynamic `rate_limit_key_expr`, but a static `rate_limit_key` that squats
+    // the reserved `dyn-rate:` namespace (using the current L/H composite-key
+    // encoding). This is the exact state a direct `HandlerRegistry` build would
+    // leave unvalidated.
+    let mut bad_charge = charge_info();
+    bad_charge.rate_limit_key_expr = None; // static mode
+    bad_charge.rate_limit_key = Some("dyn-rate:L9:tenant_id:L4:acme");
+    bad_charge.rate_limit_rps = Some(50.0);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![tenant_wf_info()],
+        vec![bad_charge],
+    ));
+
+    let worker =
+        crate::integration_e2e::build_runtime_worker("rlk-reserved-static-worker", 2, 2, registry);
+    let pool = crate::integration_e2e::build_test_pool(&url);
+    let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Each schedule attempt must error on the guard and roll back (a fast Config
+    // error, never a hang).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    worker.shutdown();
+    let _ = handle.await;
+
+    // The workflow MUST NOT complete: the guard fails the suspension/schedule
+    // transaction on every attempt.
+    assert_ne!(
+        task_state_workflow(&mut conn, exec).await,
+        "COMPLETED",
+        "a static rate_limit_key squatting the reserved `dyn-rate:` prefix must never let the workflow complete"
+    );
+    // And the activity MUST NEVER have been enqueued: the guard fires BEFORE the
+    // ActivityScheduled event / task row is persisted.
+    let charge_rows = scalar_i64(
+        &mut conn,
+        "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue WHERE activity_name=$1",
+        "charge",
+    )
+    .await;
+    assert_eq!(
+        charge_rows, 0,
+        "the reserved-prefix static-key activity must never be enqueued"
+    );
+    // And no colliding bucket row must have been registered under the reserved key.
+    let bucket_rows = scalar_i64(
+        &mut conn,
+        "SELECT COUNT(*)::bigint AS n FROM harvest_rate_limit_buckets WHERE key=$1",
+        "dyn-rate:L9:tenant_id:L4:acme",
+    )
+    .await;
+    assert_eq!(
+        bucket_rows, 0,
+        "the reserved-prefix static key must never register a colliding bucket row"
+    );
+}

@@ -4732,6 +4732,31 @@ async fn persist_scheduled_activities(
             }
             params.rate_limit_key = Some(bucket_key);
         } else {
+            // A static `rate_limit_key` reaching the worker via a direct
+            // `HandlerRegistry` bypasses both the macro parse-site reject and
+            // `HarvestBuilder::try_build`'s reserved-prefix validation. A static
+            // key beginning with the reserved `dyn-rate:` prefix would collide
+            // with the generated dynamic per-key buckets, and since startup
+            // registration and lazy dynamic registration both
+            // `INSERT ... ON CONFLICT (key) DO NOTHING`, the bucket's
+            // rate/burst would become insertion-order dependent. Fail the
+            // schedule transaction loudly here, mirroring the dynamic-no-rps
+            // guard above (issue #699 review, Codex P2). The literal mirrors
+            // `queue::DYNAMIC_RATE_PREFIX` (`"dyn-rate"`) + `":"`, matching the
+            // builder's own static-key reject.
+            if let Some(key) = activity.rate_limit_key
+                && key.starts_with("dyn-rate:")
+            {
+                return Err(HarvestError::Config(format!(
+                    "activity '{}' sets a static rate_limit_key = \"{}\" beginning with the \
+                     reserved `dyn-rate:` prefix (reserved for dynamic per-key buckets); \
+                     this collides with the generated dynamic bucket namespace and would \
+                     race first-writer-wins on the shared bucket's rate/burst. \
+                     (HarvestBuilder::try_build rejects this; you likely built \
+                     HandlerRegistry directly.)",
+                    activity.name, key
+                )));
+            }
             let effective_rate_limit_key = activity
                 .rate_limit_key
                 .map(ToString::to_string)
@@ -14341,6 +14366,30 @@ impl Worker {
                     // lazily at enqueue time (one per resolved tenant key), so
                     // there is no single static bucket to pre-register here.
                     if activity.rate_limit_key_expr.is_some() {
+                        continue;
+                    }
+                    // A static `rate_limit_key` beginning with the reserved
+                    // `dyn-rate:` prefix reaching a worker via a direct
+                    // `HandlerRegistry` (bypassing the macro reject and
+                    // `HarvestBuilder::try_build`) would collide with the
+                    // generated dynamic per-key buckets; since both this
+                    // registration and the lazy enqueue registration use
+                    // `ON CONFLICT DO NOTHING`, the bucket's rate/burst would
+                    // become insertion-order dependent. Skip it loudly here,
+                    // mirroring the dynamic-no-rps guard above (issue #699
+                    // review, Codex P2). The enqueue path also fails the
+                    // schedule transaction (see `persist_scheduled_activities`).
+                    if let Some(static_key) = activity.rate_limit_key
+                        && static_key.starts_with("dyn-rate:")
+                    {
+                        tracing::error!(
+                            worker_id = %self.config.worker_id,
+                            activity = %activity.name,
+                            key = %static_key,
+                            "activity sets a static rate_limit_key beginning with the reserved \
+                             `dyn-rate:` prefix; not registering this colliding bucket -- rename \
+                             the key or use rate_limit(key = ...) for dynamic per-key buckets"
+                        );
                         continue;
                     }
                     let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
