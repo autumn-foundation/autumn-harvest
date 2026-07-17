@@ -125,17 +125,31 @@ pub const DYNAMIC_RATE_PREFIX: &str = "dyn-rate";
 const MAX_KEY_COMPONENT_LEN: usize = 256;
 
 /// Bound a single dynamic-key component to at most [`MAX_KEY_COMPONENT_LEN`]
-/// bytes (issue #699, btree-PK safety). A value within the bound passes through
-/// unchanged (human-readable); a longer value is replaced with a deterministic,
-/// collision-resistant `seahash` digest carrying an `h:` marker that keeps it
-/// visibly a hash and distinct from any short literal. Applied to both the
-/// expression and the resolved value so neither can blow the composite PK size.
+/// bytes (issue #699, btree-PK safety) with **structurally disjoint** literal
+/// and hash encodings so a literal value can never coincide with a hash
+/// encoding (issue #699 review, Codex P2):
+///
+/// - A value within the bound is emitted as a **length-tagged literal**:
+///   `L{byte_len}:{value}` (starts with `L`, self-delimiting).
+/// - A longer value is replaced with a deterministic, collision-resistant
+///   `seahash` **digest**: `H{16hex}` (starts with `H`, fixed 17 bytes).
+///
+/// The `L`/`H` first-byte tags make the two forms provably disjoint: a short
+/// literal whose value happens to be the string `H0123456789abcdef` (17 bytes)
+/// encodes to `L17:H0123456789abcdef`, which can never equal a hash encoding
+/// `H0123456789abcdef`. Without the tag, `h:{digest}` was itself a valid short
+/// literal, so a long value hashing to digest `D` and a short literal value
+/// equal to the string `h:{D}` produced the same component — cross-tenant
+/// bucket sharing without a hash collision. Applied to both the expression and
+/// the resolved value so neither can blow the composite PK size, and so the
+/// whole composite key is injective (each component is self-delimiting: an
+/// `L{len}:{len-bytes}` literal or a fixed-width `H{16hex}` hash).
 fn bound_key_component(component: &str) -> String {
     if component.len() > MAX_KEY_COMPONENT_LEN {
         let digest = seahash::hash(component.as_bytes());
-        format!("h:{digest:016x}")
+        format!("H{digest:016x}")
     } else {
-        component.to_string()
+        format!("L{}:{}", component.len(), component)
     }
 }
 
@@ -143,13 +157,13 @@ fn bound_key_component(component: &str) -> String {
 /// (issue #699).
 ///
 /// The key is namespaced by both the dot-path *expression* and the resolved
-/// per-execution *value* — `dyn-rate:{expr_len}:{normalized_expr}:{resolved}` — so that
-/// activities declaring the same expression share one bucket per resolved value
-/// (matching the static limiter's "same key → shared bucket → must agree on rps"
-/// rule), while distinct tenants get independent buckets. `resolved` is empty
-/// (`""`) for an execution whose key expression could not be resolved (missing /
-/// null / non-object input), giving one shared fallback bucket per expression so
-/// an unkeyed execution is still bounded rather than unbounded.
+/// per-execution *value* — `dyn-rate:{expr_component}:{resolved_component}` — so
+/// that activities declaring the same expression share one bucket per resolved
+/// value (matching the static limiter's "same key → shared bucket → must agree
+/// on rps" rule), while distinct tenants get independent buckets. `resolved` is
+/// empty (`""`) for an execution whose key expression could not be resolved
+/// (missing / null / non-object input), giving one shared fallback bucket per
+/// expression so an unkeyed execution is still bounded rather than unbounded.
 ///
 /// `key_expr` is normalized by stripping a leading `input.` (issue #699 review):
 /// `resolve_concurrency_key` treats `"input.tenant_id"` and `"tenant_id"` as the
@@ -163,38 +177,33 @@ fn bound_key_component(component: &str) -> String {
 /// long dot-path / hand-built `ActivityInfo.rate_limit_key` expression — can
 /// never blow the btree PK size limit and wedge the enqueue transaction. The
 /// byte-length check matches the Postgres btree PK limit (which is byte-based)
-/// and is O(1) on the hot enqueue path. Short values pass through unchanged
-/// (human-readable), and two distinct long values hash to distinct keys. With
-/// both components bounded the whole composite key is provably ≤ ~530 bytes
-/// regardless of the macro or a hand-built `ActivityInfo`.
+/// and is O(1) on the hot enqueue path. With both components bounded the whole
+/// composite key is provably ≤ ~530 bytes regardless of the macro or a
+/// hand-built `ActivityInfo`.
 ///
-/// The key is **injective by construction**:
-/// `dyn-rate:{expr_component_len}:{expr_component}:{resolved_tail}` length-prefixes
-/// the (variable-length, possibly-`:`-containing) *final* `expr` component with
-/// its UTF-8 byte length. After the `dyn-rate:` prefix, the decimal
-/// `expr_component_len` (digits up to the next `:`) tells the reader exactly how
-/// many bytes the expr component occupies, so a `:` inside `expr` (a dot-path can
-/// address a JSON key containing `:`) or inside `resolved` can never split
-/// ambiguously: the pair `(expr, resolved)` maps to exactly one key and
-/// vice-versa. The length prefix is taken over the *bounded* expr component, so
-/// the invariant holds whether the expr passed through or was hashed. Without
-/// the length prefix, `key="a"` + resolved `"b:c"` and `key="a:b"` + resolved
-/// `"c"` would both flatten to `dyn-rate:a:b:c` — two distinct exprs sharing one
-/// bucket, so their (independently validated, possibly different) rps configs
-/// would collide first-writer-wins.
+/// The key is **injective by construction**: each component is emitted by
+/// [`bound_key_component`] as either a length-tagged literal `L{len}:{bytes}`
+/// (self-delimiting: after the `L`, the decimal `len` up to the next `:` says
+/// exactly how many bytes follow) or a fixed-width hash `H{16hex}`. The `L`/`H`
+/// first-byte tags are structurally disjoint, so a literal value equal to a
+/// hash's encoding never collides with that hash, and a `:` inside `expr` (a
+/// dot-path can address a JSON key containing `:`) or inside `resolved` can
+/// never split ambiguously: the pair `(expr, resolved)` maps to exactly one key
+/// and vice-versa, whether either component passed through unchanged or was
+/// hashed. Without this self-delimiting encoding, `key="a"` + resolved `"b:c"`
+/// and `key="a:b"` + resolved `"c"` would both flatten to `dyn-rate:a:b:c` — two
+/// distinct exprs sharing one bucket, so their (independently validated,
+/// possibly different) rps configs would collide first-writer-wins.
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: &str) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    // Bound both components (btree PK safety); the length prefix below is taken
-    // over the *bounded* expr component so injectivity holds whether it passed
-    // through unchanged or was replaced by its hash.
-    let expr_component = bound_key_component(expr);
-    let resolved_tail = bound_key_component(resolved);
+    // Both components are self-delimiting (`L{len}:{bytes}` or `H{16hex}`), so
+    // the whole composite key is injective and both the hash/literal forms and
+    // the two components can never split or collide ambiguously.
     format!(
-        "{DYNAMIC_RATE_PREFIX}:{}:{}:{}",
-        expr_component.len(),
-        expr_component,
-        resolved_tail
+        "{DYNAMIC_RATE_PREFIX}:{}:{}",
+        bound_key_component(expr),
+        bound_key_component(resolved),
     )
 }
 
@@ -2252,7 +2261,7 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
 /// caller ([`crate::worker::Worker::emit_throttle_metrics`]) feeds each returned
 /// value into [`crate::telemetry::MetricsRecorder::record_rate_limit_throttled`],
 /// which uses it as a metric label. Since a dynamic per-key bucket key
-/// (`dyn-rate:{expr_len}:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
+/// (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant input, the
 /// resolved key must never become a label; the activity name is bounded by the
 /// registered activity set, so it is what we return and label by.
 ///
@@ -2600,7 +2609,7 @@ pub async fn ensure_rate_limit_bucket(
 /// **Cardinality rule (ADR-0001 §7):** the per-key token/refill GAUGES are
 /// emitted with the bucket `key` as a metric LABEL. A caller-controlled /
 /// per-execution-resolved key family — dynamic per-key limits
-/// (`dyn-rate:{expr_len}:{expr}:{tenant}`, #699) and start throttles
+/// (`dyn-rate:{expr}:{tenant}`, #699) and start throttles
 /// (`start-throttle:{workflow}:{tenant}`, #607) — embeds unbounded tenant input
 /// and buckets are never GC'd, so labelling by it would create one time-series
 /// per tenant forever. Those families are excluded here; their per-tenant bucket
@@ -2664,8 +2673,9 @@ mod tests {
     fn dynamic_rate_bucket_key_is_prefixed_and_namespaced_by_expr_and_value() {
         // The `input.` prefix is normalized away (issue #699 review, #6).
         let k = dynamic_rate_bucket_key("input.tenant_id", "acme");
-        // `tenant_id` is 9 bytes; the expr component is length-prefixed.
-        assert_eq!(k, "dyn-rate:9:tenant_id:acme");
+        // Each component is a self-delimiting length-tagged literal
+        // (`L{len}:{value}`); `tenant_id` is 9 bytes, `acme` is 4.
+        assert_eq!(k, "dyn-rate:L9:tenant_id:L4:acme");
         assert!(k.starts_with(DYNAMIC_RATE_PREFIX));
     }
 
@@ -2679,7 +2689,7 @@ mod tests {
         );
         assert_eq!(
             dynamic_rate_bucket_key("tenant_id", "acme"),
-            "dyn-rate:9:tenant_id:acme"
+            "dyn-rate:L9:tenant_id:L4:acme"
         );
     }
 
@@ -2702,23 +2712,56 @@ mod tests {
     #[test]
     fn dynamic_rate_bucket_key_empty_resolved_fallback_is_distinct() {
         let fallback = dynamic_rate_bucket_key("input.tenant_id", "");
-        assert_eq!(fallback, "dyn-rate:9:tenant_id:");
+        // The empty resolved value encodes as the length-tagged literal `L0:`.
+        assert_eq!(fallback, "dyn-rate:L9:tenant_id:L0:");
         assert_ne!(fallback, dynamic_rate_bucket_key("input.tenant_id", "acme"));
     }
 
     #[test]
     fn dynamic_rate_bucket_key_is_injective_across_colon_containing_components() {
-        // Regression (issue #699 review, Codex P2): before the expr byte-length
-        // prefix, a `:` inside `key_expr` (a dot-path can address a JSON key
-        // containing `:`) or inside `resolved` could collide two genuinely
-        // distinct `(expr, resolved)` pairs onto one bucket string. Both of
-        // these used to flatten to `dyn-rate:a:b:c`.
-        assert_eq!(dynamic_rate_bucket_key("a", "b:c"), "dyn-rate:1:a:b:c");
-        assert_eq!(dynamic_rate_bucket_key("a:b", "c"), "dyn-rate:3:a:b:c");
+        // Regression (issue #699 review, Codex P2): before the self-delimiting
+        // length-tagged component encoding, a `:` inside `key_expr` (a dot-path
+        // can address a JSON key containing `:`) or inside `resolved` could
+        // collide two genuinely distinct `(expr, resolved)` pairs onto one
+        // bucket string. Both of these used to flatten to `dyn-rate:a:b:c`.
+        assert_eq!(dynamic_rate_bucket_key("a", "b:c"), "dyn-rate:L1:a:L3:b:c");
+        assert_eq!(dynamic_rate_bucket_key("a:b", "c"), "dyn-rate:L3:a:b:L1:c");
         assert_ne!(
             dynamic_rate_bucket_key("a", "b:c"),
             dynamic_rate_bucket_key("a:b", "c"),
         );
+    }
+
+    #[test]
+    fn bound_key_component_literal_never_collides_with_a_hash_encoding() {
+        // Regression (issue #699 review, Codex P2): the `L`/`H` first-byte tags
+        // make the literal and hash encodings structurally disjoint. A short
+        // literal whose *value* is exactly a hash's string encoding must NOT
+        // collide with that hash — the pre-fix `h:{digest}` hash form was itself
+        // a valid short literal, so a long value hashing to digest `D` and a
+        // short literal value equal to `h:{D}` produced the same component.
+        let long = "x".repeat(300);
+        let hash_form = bound_key_component(&long); // `H{16hex}` (long > 256)
+        assert!(
+            hash_form.starts_with('H'),
+            "long value must hash, got {hash_form}"
+        );
+        // A literal whose value is exactly the hash's string encoding.
+        let literal_that_equals_the_hash = hash_form.clone();
+        let literal_form = bound_key_component(&literal_that_equals_the_hash);
+        assert!(
+            literal_form.starts_with('L'),
+            "short literal must be length-tagged, got {literal_form}"
+        );
+        assert_ne!(
+            hash_form, literal_form,
+            "a literal equal to a hash's encoding must not collide with that hash"
+        );
+        // And the same disjointness holds end-to-end through the composite key:
+        // a long resolved value (hashed) vs a short literal equal to that hash.
+        let hashed = dynamic_rate_bucket_key("tenant_id", &long);
+        let literal = dynamic_rate_bucket_key("tenant_id", &literal_that_equals_the_hash);
+        assert_ne!(hashed, literal);
     }
 
     #[test]
@@ -2741,9 +2784,9 @@ mod tests {
 
     #[test]
     fn dynamic_rate_bucket_key_bounds_oversized_resolved_value() {
-        // A short value is human-readable and unchanged.
+        // A short value is a human-readable length-tagged literal.
         let short = dynamic_rate_bucket_key("tenant_id", "acme");
-        assert_eq!(short, "dyn-rate:9:tenant_id:acme");
+        assert_eq!(short, "dyn-rate:L9:tenant_id:L4:acme");
 
         // A pathologically large resolved value (would blow the btree PK limit)
         // is replaced with a bounded, stable hash.
@@ -2754,7 +2797,8 @@ mod tests {
             "oversized resolved value must be bounded, got len {}",
             bounded.chars().count()
         );
-        assert!(bounded.starts_with("dyn-rate:9:tenant_id:h:"));
+        // The resolved component is the fixed-width hash `H{16hex}`.
+        assert!(bounded.starts_with("dyn-rate:L9:tenant_id:H"));
         // Deterministic: same long value → same key.
         assert_eq!(bounded, dynamic_rate_bucket_key("tenant_id", &big));
         // Injective in practice: two distinct long values → distinct keys.
@@ -2770,11 +2814,11 @@ mod tests {
         // the enqueue transaction. The expr component is now bounded/hashed too.
         let big_expr = "a".repeat(5000);
         let bounded = dynamic_rate_bucket_key(&big_expr, "acme");
-        // The expr component is the hash: `dyn-rate:{len}:h:{16hex}:acme`.
-        // `h:` + 16 hex digits == 18 bytes, so the length prefix is `18`.
+        // The expr component is the fixed-width hash `H{16hex}`; the resolved
+        // component is the length-tagged literal `L4:acme`.
         let digest = seahash::hash(big_expr.as_bytes());
-        assert_eq!(bounded, format!("dyn-rate:18:h:{digest:016x}:acme"));
-        assert!(bounded.starts_with("dyn-rate:18:h:"));
+        assert_eq!(bounded, format!("dyn-rate:H{digest:016x}:L4:acme"));
+        assert!(bounded.starts_with("dyn-rate:H"));
         // The whole composite key is provably well under the ~2704 btree limit.
         assert!(
             bounded.len() < 2704,

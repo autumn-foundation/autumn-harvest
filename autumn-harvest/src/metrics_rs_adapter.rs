@@ -549,7 +549,7 @@ impl MetricsRecorder for MetricsRsRecorder {
 
     fn record_rate_limit_throttled(&self, activity: &str) {
         // Labelled by the bounded activity name, never the raw bucket key:
-        // a dynamic per-key key (`dyn-rate:{expr_len}:{expr}:{tenant}`, issue #699) embeds
+        // a dynamic per-key key (`dyn-rate:{expr}:{tenant}`, issue #699) embeds
         // unbounded tenant input and must never become a metric label
         // (ADR-0001 §7).
         counter!(

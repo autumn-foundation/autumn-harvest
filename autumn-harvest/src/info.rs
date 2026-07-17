@@ -1112,7 +1112,7 @@ pub struct ActivityInfo {
     ///
     /// Must not begin with the reserved `dyn-rate:` prefix (issue #699): that
     /// namespace belongs to per-key/dynamic buckets ([`Self::rate_limit_key_expr`],
-    /// keyed `dyn-rate:{expr_len}:{expr}:{resolved}`), and a static key squatting
+    /// keyed `dyn-rate:{expr}:{resolved}`), and a static key squatting
     /// it could collide with a generated dynamic bucket first-writer-wins. Both
     /// the `#[activity(rate_limit_key = "…")]` macro and `HarvestBuilder::try_build`
     /// reject a static key with this prefix, keeping the static and dynamic
@@ -1128,7 +1128,7 @@ pub struct ActivityInfo {
     /// `#[activity(rate_limit(key = "input.tenant_id", rps = 50))]`.
     ///
     /// The bucket key is namespaced by both the expression and the resolved
-    /// value (`dyn-rate:{expr_len}:{expr}:{resolved}` — see
+    /// value (`dyn-rate:{expr}:{resolved}` — see
     /// [`crate::queue::dynamic_rate_bucket_key`], which length-bounds/hashes both
     /// components so the composite PRIMARY KEY stays well under the btree limit)
     /// so it can never collide with a static [`Self::rate_limit_key`] bucket or a

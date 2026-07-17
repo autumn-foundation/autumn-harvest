@@ -2244,7 +2244,7 @@ fn validate_rate_limit_keys(
     let mut seen: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
     // Dynamic per-key rate-limit expressions (issue #699) live in an independent
     // map keyed on the dot-path EXPRESSION so static (bare-name / string) keys and
-    // dynamic (`dyn-rate:{expr_len}:{expr}:{tenant}`) buckets — which the enqueue path
+    // dynamic (`dyn-rate:{expr}:{tenant}`) buckets — which the enqueue path
     // namespaces so they can never collide — are validated separately.
     let mut seen_dynamic: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
 
@@ -2295,7 +2295,7 @@ fn validate_rate_limit_keys(
         // reserved for per-key/dynamic buckets (issue #699). Both static and
         // dynamic keys register `ON CONFLICT DO NOTHING` against the shared
         // `harvest_rate_limit_buckets` table, so a static key colliding with a
-        // generated `dyn-rate:{expr_len}:{expr}:{tenant}` string would race
+        // generated `dyn-rate:{expr}:{tenant}` string would race
         // first-writer-wins on the bucket's rate/burst. Reject it up front.
         // (The `start-throttle:` prefix from #607 is a separate pre-existing
         // namespace; this validation reserves `dyn-rate:` — the one this PR
