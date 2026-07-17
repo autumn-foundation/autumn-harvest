@@ -802,6 +802,19 @@ pub async fn start_or_load_workflow_execution_collect(
                         // extreme-concurrency race where the prior is still active
                         // under the lock; we inline the cancel here so the new start
                         // is not silently blocked.
+                        //
+                        // Concurrency note (issue #685 review, FIX 4): concurrent
+                        // `terminate_existing` starts of the SAME
+                        // `(workflow_name, workflow_id)` against one live prior are
+                        // last-writer-wins. `terminate_existing` has no pre-check,
+                        // so more contenders reach this inline branch than the
+                        // pre-#685 `TerminateIfRunning` path did, making the
+                        // pre-existing `load_workflow_execution_by_key_for_update`
+                        // race (a loser can observe a transient `NotFound` after the
+                        // winner seals the prior row it locked) more reachable. It
+                        // does NOT corrupt data, deadlock, or double-run (the seal +
+                        // insert is transactional; `use_existing` never enters this
+                        // branch). A loser should simply retry the start.
                         ActiveConflictBehavior::Terminate => {
                             if reject_fresh_if_debounced {
                                 return Err(HarvestError::DebounceFreshStart {
