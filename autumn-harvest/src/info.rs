@@ -1109,6 +1109,14 @@ pub struct ActivityInfo {
     pub rate_limit_burst: Option<f64>,
     /// Rate limit bucket key. Multiple activities sharing a key share the
     /// rate limit. Defaults to the activity's own name when rate limits are set.
+    ///
+    /// Must not begin with the reserved `dyn-rate:` prefix (issue #699): that
+    /// namespace belongs to per-key/dynamic buckets ([`Self::rate_limit_key_expr`],
+    /// keyed `dyn-rate:{expr_len}:{expr}:{resolved}`), and a static key squatting
+    /// it could collide with a generated dynamic bucket first-writer-wins. Both
+    /// the `#[activity(rate_limit_key = "…")]` macro and `HarvestBuilder::try_build`
+    /// reject a static key with this prefix, keeping the static and dynamic
+    /// bucket namespaces provably disjoint.
     pub rate_limit_key: Option<&'static str>,
     /// Dynamic per-key rate-limit expression (issue #699).
     ///
@@ -1121,8 +1129,10 @@ pub struct ActivityInfo {
     ///
     /// The bucket key is namespaced by both the expression and the resolved
     /// value (`dyn-rate:{expr_len}:{expr}:{resolved}` — see
-    /// [`crate::queue::dynamic_rate_bucket_key`]) so it can never collide with a
-    /// static [`Self::rate_limit_key`] bucket or a throttle bucket. `rps` flows
+    /// [`crate::queue::dynamic_rate_bucket_key`], which length-bounds/hashes both
+    /// components so the composite PRIMARY KEY stays well under the btree limit)
+    /// so it can never collide with a static [`Self::rate_limit_key`] bucket or a
+    /// throttle bucket. `rps` flows
     /// through [`Self::rate_limit_rps`] as the bucket refill rate exactly as for
     /// the static form.
     ///

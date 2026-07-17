@@ -155,7 +155,17 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             Ok(())
         } else if meta.path.is_ident("rate_limit_key") {
             let value: LitStr = meta.value()?.parse()?;
-            result.rate_limit_key = Some(value.value());
+            let key = value.value();
+            // The `dyn-rate:` prefix is reserved for per-key/dynamic rate-limit
+            // buckets (issue #699); a static key beginning with it could collide
+            // with a generated dynamic bucket, so reject it at compile time.
+            if key.starts_with("dyn-rate:") {
+                return Err(meta.error(
+                    "`rate_limit_key` must not begin with the reserved `dyn-rate:` prefix \
+                     (reserved for per-key/dynamic rate-limit buckets)",
+                ));
+            }
+            result.rate_limit_key = Some(key);
             result.flat_rate_limit_seen = true;
             Ok(())
         } else if meta.path.is_ident("rate_limit") {

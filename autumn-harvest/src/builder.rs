@@ -628,6 +628,23 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
+    /// A static `rate_limit_key` begins with the reserved `dyn-rate:` prefix
+    /// (issue #699). That prefix namespaces per-key/dynamic rate-limit buckets;
+    /// a static key beginning with it could collide with a generated dynamic
+    /// bucket, so it is rejected to keep the static and dynamic bucket
+    /// namespaces provably disjoint.
+    #[error(
+        "activity '{activity}' sets rate_limit_key = \"{key}\", which begins with the reserved \
+         `dyn-rate:` prefix (reserved for per-key/dynamic rate-limit buckets); \
+         choose a different rate_limit_key"
+    )]
+    RateLimitKeyReservedPrefix {
+        /// The activity name.
+        activity: String,
+        /// The offending static key.
+        key: String,
+    },
+
     /// A completion trigger references an unknown workflow name as a source or target.
     #[non_exhaustive]
     #[error(
@@ -2272,6 +2289,27 @@ fn validate_rate_limit_keys(
                 });
             }
             continue;
+        }
+
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699). Both static and
+        // dynamic keys register `ON CONFLICT DO NOTHING` against the shared
+        // `harvest_rate_limit_buckets` table, so a static key colliding with a
+        // generated `dyn-rate:{expr_len}:{expr}:{tenant}` string would race
+        // first-writer-wins on the bucket's rate/burst. Reject it up front.
+        // (The `start-throttle:` prefix from #607 is a separate pre-existing
+        // namespace; this validation reserves `dyn-rate:` — the one this PR
+        // generates — and leaves `start-throttle:` as a follow-up.)
+        // The literal mirrors `crate::queue::DYNAMIC_RATE_PREFIX` (the `queue`
+        // module is `db`-gated, but this validation runs in every build) and the
+        // macro's own compile-time reject in `autumn-harvest-macros`.
+        if let Some(key) = activity.rate_limit_key {
+            if key.starts_with("dyn-rate:") {
+                return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                    activity: activity.name.to_string(),
+                    key: key.to_string(),
+                });
+            }
         }
 
         // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
@@ -4502,6 +4540,44 @@ mod tests {
                     if activity == "act1" && key == "stripe"
             ),
             "expected RateLimitKeyWithoutCap error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_static_rate_limit_key_with_reserved_dyn_rate_prefix() {
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699 review, Codex P2) —
+        // it could collide first-writer-wins with a generated dynamic bucket.
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(50.0),
+            rate_limit_burst: None,
+            rate_limit_key: Some("dyn-rate:9:tenant_id:acme"),
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix { ref activity, ref key })
+                    if activity == "act1" && key == "dyn-rate:9:tenant_id:acme"
+            ),
+            "expected RateLimitKeyReservedPrefix, got: {result:?}"
         );
     }
 
