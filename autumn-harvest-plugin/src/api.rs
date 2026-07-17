@@ -10779,13 +10779,50 @@ pub(crate) async fn start_workflow(
     // A start that can forcibly cancel a live prior requires admin auth. The
     // gate is NARROWED (issue #685 review) to the precise "can cancel a live
     // run" capability — the resolved active-prior behavior being `Terminate` —
-    // rather than a raw-string match on the reuse/conflict wire values. This is
-    // computed AFTER both policies are parsed (below), because the flagship
-    // non-admin idempotent-starter shape `reuse = terminate_if_running` +
-    // `conflict = use_existing` resolves to `Attach` (return the existing
+    // rather than a raw-string match on the reuse/conflict wire values. The
+    // flagship non-admin idempotent-starter shape `reuse = terminate_if_running`
+    // + `conflict = use_existing` resolves to `Attach` (return the existing
     // handle) and provably CANNOT cancel a live run — gating it on the raw
     // `terminate_if_running` string would wrongly force admin and defeat the
-    // non-admin webhook/cron user story. See the gate below the two parses.
+    // non-admin webhook/cron user story.
+    //
+    // This gate is enforced in TWO places:
+    //
+    //  1. EARLY (here) — a lenient evaluation before the fail-closed
+    //     `api_state.runtime()` check below. The auth decision is a pure
+    //     function of the two request-body strings and `api_state` config; it
+    //     needs neither the runtime nor a DB. Evaluating it first means an
+    //     unauthenticated caller that could cancel a live run is rejected with
+    //     `401` regardless of runtime readiness (defense in depth — authorize
+    //     before the fail-closed resource check — and it restores the pre-#685
+    //     property that the gate is observable without a running DB). It is
+    //     LENIENT: an unparseable policy string makes the `Ok`/`Ok` guard fail,
+    //     so it defers to the authoritative gate below (a fresh invalid string
+    //     still `400`s at the real parse; an #808 keyed committed-replay still
+    //     returns its `200` — a non-admin can never have committed a `Terminate`
+    //     start, so no committed replay exists for one to bypass this through).
+    //     A cleanly-parsed non-`Terminate` combo (e.g. the flagship
+    //     `terminate_if_running` + `use_existing` → `Attach`) is a no-op here.
+    //
+    //  2. AUTHORITATIVE (below, after both parses) — the belt-and-suspenders
+    //     backstop on the cleanly-parsed policies. Reachable only for requests
+    //     the early gate already let through (admin, or non-`Terminate`), so it
+    //     never changes a running deployment's outcome.
+    if let (Ok(early_reuse), Ok(early_conflict)) = (
+        parse_reuse_policy(request.reuse_policy.as_deref()),
+        parse_conflict_policy(request.conflict_policy.as_deref()),
+    ) && autumn_harvest::execution::effective_active_conflict_behavior(
+        early_reuse,
+        early_conflict,
+    ) == autumn_harvest::execution::ActiveConflictBehavior::Terminate
+        && !has_harvest_admin_access(
+            &api_state,
+            maybe_session.as_ref().map(|Extension(s)| s.clone()),
+        )
+        .await
+    {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
