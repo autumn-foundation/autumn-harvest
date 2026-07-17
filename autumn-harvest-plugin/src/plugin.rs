@@ -125,6 +125,10 @@ pub struct HarvestPlugin {
     /// [`Self::api_with_role_auth`]; installs the class-aware enforcement
     /// layer. Default off — the router is byte-for-byte unchanged.
     role_auth_enabled: bool,
+    /// Opt-in for scoped API tokens (issue #942). Set true by
+    /// [`Self::enable_api_tokens`]; installs the token verification + scope
+    /// layer. Default off — the router is byte-for-byte unchanged (AC7).
+    api_tokens_enabled: bool,
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
     status_thresholds: crate::status_summary::StatusThresholds,
@@ -157,6 +161,7 @@ impl HarvestPlugin {
             mcp_tools_prefix: None,
             decode_payloads_on_read: false,
             role_auth_enabled: false,
+            api_tokens_enabled: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
@@ -332,6 +337,26 @@ impl HarvestPlugin {
         self
     }
 
+    /// Enable scoped API tokens for the management API (issue #942).
+    ///
+    /// Installs the token verification + scope-enforcement layer
+    /// ([`crate::api_token::enforce_token_scope`]) on the nested
+    /// `harvest_api_router`. A bearer that begins with `hvst_` is verified
+    /// against the `harvest_api_tokens` table (rejecting an unknown/expired/
+    /// revoked token 401, a `read`-scoped token attempting a mutating route
+    /// 403), and its stable identity is threaded into the audit trail as
+    /// `token:{id}`. A bearer that does **not** begin with `hvst_` (or an absent
+    /// bearer) is passed through untouched, so token auth **composes with** — it
+    /// never replaces — an embedder's own `api_with_auth` middleware (AC7).
+    ///
+    /// Default off: an embedder that never calls this sees byte-for-byte
+    /// unchanged behavior (no layer installed).
+    #[must_use]
+    pub const fn enable_api_tokens(mut self) -> Self {
+        self.api_tokens_enabled = true;
+        self
+    }
+
     /// Expose every `#[workflow(mcp)]` workflow, and every `#[dag(mcp)]`
     /// unified DAG, as MCP tools (issue #597; DAG support added in issue #601
     /// follow-up).
@@ -502,6 +527,7 @@ impl Plugin for HarvestPlugin {
             mcp_tools_prefix,
             decode_payloads_on_read,
             role_auth_enabled,
+            api_tokens_enabled,
             status_thresholds,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
@@ -682,6 +708,9 @@ impl Plugin for HarvestPlugin {
 
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());
+            // Clone the state for the token layer only when it will be installed,
+            // so a disabled deployment does an identical amount of work as before.
+            let token_layer_state = api_tokens_enabled.then(|| api_state.clone());
             let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
             // Issue #776: install the class-aware read-only enforcement layer
             // BEFORE the embedder's auth middleware wraps the router, so the
@@ -697,11 +726,25 @@ impl Plugin for HarvestPlugin {
                     crate::api::enforce_read_only_class,
                 ));
             }
+            // Issue #942: install the scoped-API-token verification + scope layer
+            // OUTSIDE the read-only-class layer (so it runs first: verify token →
+            // set TokenPrincipal / authoritative actor → deny read-scope mutation)
+            // and INSIDE the embedder's auth middleware. Only installed under
+            // enable_api_tokens(); the default path is byte-for-byte unchanged (AC7).
+            if let Some(state) = token_layer_state {
+                router = router.layer(
+                    autumn_web::reexports::axum::middleware::from_fn_with_state(
+                        state,
+                        crate::api_token::enforce_token_scope,
+                    ),
+                );
+            }
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
             app.nest(&path, router)
         } else {
+            let _ = api_tokens_enabled;
             app
         }
     }

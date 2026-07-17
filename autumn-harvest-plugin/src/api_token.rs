@@ -108,6 +108,11 @@ impl TokenScope {
 /// (issue #942, AC6/AC7).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TokenPrincipal {
+    // The token id is carried for provenance and future consumers. Actor
+    // attribution flows through the `x-harvest-actor` header the middleware
+    // rewrites to `token:{id}`, and `require_harvest_admin` only needs the
+    // extension's *presence*, so neither field is read on the admin path today.
+    #[allow(dead_code)]
     pub id: Uuid,
     #[allow(dead_code)] // consulted by tests + future MCP gating; not read on the admin path
     pub scope: TokenScope,

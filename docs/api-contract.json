@@ -6365,8 +6365,7 @@
       "params": [],
       "request_body": {
         "required": false,
-        "free_form": false,
-        "fields": []
+        "free_form": true
       },
       "success_response": {
         "status": 200,
