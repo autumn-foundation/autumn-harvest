@@ -149,6 +149,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 memo: None,
                 search_attrs: Some(json!({"tenant": "acme"})),
                 reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
