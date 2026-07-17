@@ -145,6 +145,126 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+// A `conflict_policy = terminate_existing` request (with ANY reuse policy)
+// resolves to `Terminate` — it can cancel a live RUNNING/PAUSED prior — so it is
+// admin-gated exactly like `terminate_if_running` with the default conflict.
+#[tokio::test]
+async fn eris_unauthenticated_start_workflow_terminate_existing_conflict_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/my-workflow/start",
+            r#"{"conflict_policy": "terminate_existing"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+// Narrowing proof (issue #685): the flagship non-admin idempotent-starter shape
+// `reuse = terminate_if_running` + `conflict = use_existing` resolves to
+// `Attach` (return the existing handle) and provably CANNOT cancel a live run,
+// so it must NOT be admin-gated — it is allowed through the auth gate (and then
+// fails later for an unrelated boot-window reason, exactly like every other
+// "allowed through" eris start case, so we assert only "not blocked by auth").
+#[tokio::test]
+async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_use_existing_is_allowed() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/my-workflow/start",
+            r#"{"reuse_policy": "terminate_if_running", "conflict_policy": "use_existing"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+// Narrowing proof: `reuse = terminate_if_running` + `conflict = fail` resolves to
+// `Fail` (`Err(AlreadyExists)` over a live prior) — it touches no live work — so
+// it is likewise NOT admin-gated.
+#[tokio::test]
+async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_fail_is_allowed() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/my-workflow/start",
+            r#"{"reuse_policy": "terminate_if_running", "conflict_policy": "fail"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+// Narrowing proof: a `conflict_policy = use_existing` (attach) start with the
+// default reuse policy resolves to `Attach` — non-destructive — and is NOT
+// admin-gated.
+#[tokio::test]
+async fn eris_unauthenticated_start_workflow_use_existing_conflict_is_allowed() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/my-workflow/start",
+            r#"{"conflict_policy": "use_existing"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+// issue #685 review (Codex P2): the early cancel-capable admin gate must NOT
+// pre-empt a request that carries an idempotency key. The #808 committed-replay
+// claim is keyed on `(workflow_name, idempotency_key)` ALONE — independent of the
+// reuse/conflict policy and the caller's auth — so an ADMIN may legitimately have
+// committed a keyed `terminate_if_running` start that a later NON-admin retry
+// (same key) must replay as a `200`, not a `401`. A keyed cancel-capable request
+// therefore defers past the early gate to the downstream path. In this no-DB
+// harness the downstream path fails-closed at the runtime-not-started check (a
+// non-`401` status), which is exactly the "no longer early-`401`'d" proof: the
+// UNKEYED `terminate_if_running` case above asserts `401`, this KEYED case must
+// NOT. (A genuinely-fresh keyed `Terminate` by a non-admin is still `401`'d
+// downstream by the authoritative gate, which runs AFTER the committed-replay
+// probe — that requires a DB and is covered by the #808 integration tests.)
+#[tokio::test]
+async fn eris_keyed_terminate_if_running_defers_past_early_gate() {
+    let app = unauthenticated_app();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/workflows/my-workflow/start")
+        .header("Content-Type", "application/json")
+        .header("Idempotency-Key", "replay-key-1")
+        .body(Body::from(
+            r#"{"reuse_policy": "terminate_if_running"}"#.to_owned(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+// Companion narrowing proof for the other cancel-capable shape: a keyed
+// `conflict_policy = terminate_existing` request likewise defers past the early
+// gate (the UNKEYED variant above asserts `401`).
+#[tokio::test]
+async fn eris_keyed_terminate_existing_conflict_defers_past_early_gate() {
+    let app = unauthenticated_app();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/workflows/my-workflow/start")
+        .header("Content-Type", "application/json")
+        .header("Idempotency-Key", "replay-key-2")
+        .body(Body::from(
+            r#"{"conflict_policy": "terminate_existing"}"#.to_owned(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn eris_start_workflow_terminate_if_running_honors_configured_session_key() {
     let api_state = HarvestApiState::new();

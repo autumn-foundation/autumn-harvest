@@ -11004,16 +11004,81 @@ pub(crate) async fn start_workflow(
         .unwrap_or(autumn_harvest::StartSource::Api);
     let effective_start_source_ref = request.start_source_ref_override.clone();
 
+    // issue #685 review (Codex P2): the early gate must NOT pre-empt a request
+    // that carries an idempotency key. The #808 committed-replay claim is keyed
+    // on `(workflow_name, idempotency_key)` ALONE — independent of the
+    // reuse/conflict policy and of the caller's auth — so a committed KEYED
+    // `Terminate` start (which an ADMIN may legitimately have made) can be
+    // replayed by a later NON-admin retry carrying the same key, which must
+    // return the #808 `200` no-op, not a `401`. A presence-only boolean
+    // (below) therefore defers any keyed request past this early gate to the
+    // downstream path. Presence only — no validation/erroring here; the
+    // downstream resolver (`extract_start_idempotency_header_key` /
+    // `validate_start_idempotency_key`) still `400`s an empty/over-long key
+    // unchanged. Header-present counts even if it is empty/invalid: such a key
+    // resolves to a downstream `400`, which is the correct answer for a caller
+    // that signalled idempotent intent — never an early `401` and never a
+    // false `200`.
+    let idempotency_key_present = headers.contains_key(HEADER_IDEMPOTENCY_KEY)
+        || request
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty());
+
     // A start that can forcibly cancel a live prior requires admin auth. The
     // gate is NARROWED (issue #685 review) to the precise "can cancel a live
     // run" capability — the resolved active-prior behavior being `Terminate` —
-    // rather than a raw-string match on the reuse/conflict wire values. This is
-    // computed AFTER both policies are parsed (below), because the flagship
-    // non-admin idempotent-starter shape `reuse = terminate_if_running` +
-    // `conflict = use_existing` resolves to `Attach` (return the existing
+    // rather than a raw-string match on the reuse/conflict wire values. The
+    // flagship non-admin idempotent-starter shape `reuse = terminate_if_running`
+    // + `conflict = use_existing` resolves to `Attach` (return the existing
     // handle) and provably CANNOT cancel a live run — gating it on the raw
     // `terminate_if_running` string would wrongly force admin and defeat the
-    // non-admin webhook/cron user story. See the gate below the two parses.
+    // non-admin webhook/cron user story.
+    //
+    // This gate is enforced in TWO places:
+    //
+    //  1. EARLY (here) — an observable, KEY-ABSENT-ONLY auth check before the
+    //     fail-closed `api_state.runtime()` check below. The auth decision is a
+    //     pure function of the two request-body strings, the key-presence
+    //     boolean, and `api_state` config; it needs neither the runtime nor a
+    //     DB. Evaluating it first means an unauthenticated caller that could
+    //     cancel a live run with NO idempotency key is rejected with `401`
+    //     regardless of runtime readiness (defense in depth — authorize before
+    //     the fail-closed resource check — and it restores the pre-#685 property
+    //     that the gate is observable without a running DB). It is LENIENT in
+    //     two ways: an unparseable policy string makes the `Ok`/`Ok` guard fail
+    //     (a fresh invalid string still `400`s at the real parse), and a KEYED
+    //     request (`idempotency_key_present`) always defers. Deferring a keyed
+    //     request is what preserves BOTH #808 outcomes: a committed-replay hit
+    //     returns its `200` at the probe below (caller/body-independent), while
+    //     a genuinely-fresh keyed `Terminate` by a non-admin is still rejected
+    //     `401` by the authoritative gate below (which runs AFTER that probe).
+    //     A cleanly-parsed non-`Terminate` combo (e.g. the flagship
+    //     `terminate_if_running` + `use_existing` → `Attach`) is a no-op here.
+    //
+    //  2. AUTHORITATIVE (below, after both parses AND the #808 committed-replay
+    //     probe) — the belt-and-suspenders backstop on the cleanly-parsed
+    //     policies. Reachable for requests the early gate let through: admin,
+    //     non-`Terminate`, OR keyed. For a keyed request it runs after the probe
+    //     that already returned `200` for a committed replay, so it only ever
+    //     sees a genuinely-fresh keyed `Terminate` — which it correctly `401`s
+    //     for a non-admin. It never changes a running deployment's outcome.
+    if let (Ok(early_reuse), Ok(early_conflict)) = (
+        parse_reuse_policy(request.reuse_policy.as_deref()),
+        parse_conflict_policy(request.conflict_policy.as_deref()),
+    ) && autumn_harvest::execution::effective_active_conflict_behavior(
+        early_reuse,
+        early_conflict,
+    ) == autumn_harvest::execution::ActiveConflictBehavior::Terminate
+        && !idempotency_key_present
+        && !has_harvest_admin_access(
+            &api_state,
+            maybe_session.as_ref().map(|Extension(s)| s.clone()),
+        )
+        .await
+    {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
@@ -11311,10 +11376,13 @@ pub(crate) async fn start_workflow(
     // equivalent to the already-non-admin `allow_duplicate_failed_only` replace
     // path — so it is correctly not admin-gated. This runs after both parses (an
     // invalid value now returns `400` before reaching the gate, which is more
-    // correct); for a keyed start it also runs after the #808 committed-replay
-    // probe, which is safe because a replay returns the already-committed run and
-    // never performs a NEW cancel, and a non-admin can never commit a Terminate
-    // start in the first place (the fresh path always gates).
+    // correct); for a keyed start it runs AFTER the #808 committed-replay probe,
+    // so a committed replay has already returned its `200` and this gate only
+    // ever sees a genuinely-fresh keyed `Terminate` — which it correctly `401`s
+    // for a non-admin. This is the authoritative backstop for keyed
+    // cancel-capable requests, which the early gate deliberately defers (a keyed
+    // request may be a committed replay of an ADMIN's start, so it must reach the
+    // probe before any auth rejection).
     if autumn_harvest::execution::effective_active_conflict_behavior(reuse_policy, conflict_policy)
         == autumn_harvest::execution::ActiveConflictBehavior::Terminate
         && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
