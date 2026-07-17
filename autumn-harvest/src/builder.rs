@@ -2303,13 +2303,13 @@ fn validate_rate_limit_keys(
         // The literal mirrors `crate::queue::DYNAMIC_RATE_PREFIX` (the `queue`
         // module is `db`-gated, but this validation runs in every build) and the
         // macro's own compile-time reject in `autumn-harvest-macros`.
-        if let Some(key) = activity.rate_limit_key {
-            if key.starts_with("dyn-rate:") {
-                return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
-                    activity: activity.name.to_string(),
-                    key: key.to_string(),
-                });
-            }
+        if let Some(key) = activity.rate_limit_key
+            && key.starts_with("dyn-rate:")
+        {
+            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
         }
 
         // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
