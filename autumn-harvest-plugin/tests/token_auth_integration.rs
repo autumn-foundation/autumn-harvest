@@ -433,8 +433,16 @@ async fn mutate_token_reaches_admin_route_standalone() {
         None,
     )
     .await;
-    assert_ne!(authed, StatusCode::UNAUTHORIZED, "mutate token must pass admin");
-    assert_ne!(authed, StatusCode::FORBIDDEN, "mutate token is not read-scoped");
+    assert_ne!(
+        authed,
+        StatusCode::UNAUTHORIZED,
+        "mutate token must pass admin"
+    );
+    assert_ne!(
+        authed,
+        StatusCode::FORBIDDEN,
+        "mutate token is not read-scoped"
+    );
 }
 
 /// AC6: a token-authed mutation records `actor = token:{id}`, never the
@@ -453,9 +461,15 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
     let (_, list) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
     let id = list[0]["id"].as_str().unwrap().to_string();
 
-    scrub(&mut conn).await; // clear the mint audit rows for a clean assertion
-    // Re-mint the token row is gone now; instead perform a mutation with the
-    // token bearer: revoke a (freshly minted) throwaway token.
+    // Clear the mint audit rows for a clean assertion, but KEEP the api token
+    // rows — the mutate token (`secret`) authenticates the revoke below, so the
+    // two-table `scrub` (which also wipes `harvest_api_tokens`) would delete the
+    // very token we authenticate with and 401 before the actor assertion runs.
+    let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
+        .execute(&mut conn)
+        .await;
+    // Now perform a mutation with the token bearer: revoke a (freshly minted)
+    // throwaway token.
     let throwaway = mint(&app, "throwaway", "read", None).await;
     let _ = throwaway;
     let (_, list2) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
@@ -489,18 +503,88 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
         #[diesel(sql_type = diesel::sql_types::Text)]
         actor: String,
     }
-    let rows: Vec<A> = diesel::sql_query(
-        "SELECT actor FROM harvest_audit_log WHERE operation = 'token.revoke'",
-    )
-    .load(&mut conn)
-    .await
-    .unwrap();
+    let rows: Vec<A> =
+        diesel::sql_query("SELECT actor FROM harvest_audit_log WHERE operation = 'token.revoke'")
+            .load(&mut conn)
+            .await
+            .unwrap();
     assert!(!rows.is_empty(), "a revoke audit row must exist");
     for r in &rows {
         assert_eq!(r.actor, format!("token:{id}"), "actor must be token:{{id}}");
         assert_ne!(r.actor, "attacker@evil", "spoofed actor must be ignored");
-        assert!(!r.actor.contains(&secret), "actor must not carry the secret");
+        assert!(
+            !r.actor.contains(&secret),
+            "actor must not carry the secret"
+        );
     }
+}
+
+/// AC6 anti-spoof (P2-1): with the token layer installed, a caller admitted by
+/// the embedder admin boundary but carrying NO valid `hvst_` token cannot forge
+/// a `token:`-namespaced audit actor — the reserved namespace is stripped on the
+/// pass-through path — while a legitimate non-`token:` actor still passes
+/// through unchanged (the embedder's own actor mechanism).
+#[tokio::test]
+async fn passthrough_cannot_forge_token_namespaced_actor() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = build_app_boundary(&pool);
+
+    // No bearer at all, admin-authorized by the embedder boundary, carrying a
+    // spoofed `token:`-namespaced actor. The mint is an audited mutation.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/admin/tokens",
+        Some(json!({ "name": "spoofer", "scope": "read" })),
+        None,
+        true,
+        Some("token:deadbeef-0000-0000-0000-000000000000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "mint should 201");
+
+    // A second mint with a legitimate (non-`token:`) actor must pass through.
+    let (status2, _) = send(
+        &app,
+        "POST",
+        "/admin/tokens",
+        Some(json!({ "name": "legit", "scope": "read" })),
+        None,
+        true,
+        Some("release-eng"),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED, "second mint should 201");
+
+    #[derive(diesel::QueryableByName)]
+    struct A {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        actor: String,
+    }
+    let rows: Vec<A> =
+        diesel::sql_query("SELECT actor FROM harvest_audit_log WHERE operation = 'token.create'")
+            .load(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2, "two mints must be audited");
+    for r in &rows {
+        assert_ne!(
+            r.actor, "token:deadbeef-0000-0000-0000-000000000000",
+            "a non-token caller must not forge a token:-namespaced audit actor"
+        );
+        assert!(
+            !r.actor.starts_with("token:"),
+            "the reserved token: namespace must be stripped on the pass-through path: {}",
+            r.actor
+        );
+    }
+    assert!(
+        rows.iter().any(|r| r.actor == "release-eng"),
+        "a legitimate non-token actor must pass through unchanged"
+    );
 }
 
 /// AC6 companion: the create/revoke operations themselves write an audit row

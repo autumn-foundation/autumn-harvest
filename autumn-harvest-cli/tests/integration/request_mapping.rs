@@ -2238,7 +2238,10 @@ fn token_create_maps_to_post() {
 
     assert_eq!(request.method, ApiMethod::Post);
     assert_eq!(request.path, "/admin/tokens");
-    assert_eq!(request.body, Some(json!({ "name": "ci-bot", "scope": "read" })));
+    assert_eq!(
+        request.body,
+        Some(json!({ "name": "ci-bot", "scope": "read" }))
+    );
 }
 
 #[test]
@@ -2277,7 +2280,10 @@ fn token_create_defaults_scope_to_read() {
     let request = cli.api_request().expect("request should build");
     assert_eq!(request.method, ApiMethod::Post);
     assert_eq!(request.path, "/admin/tokens");
-    assert_eq!(request.body, Some(json!({ "name": "reader", "scope": "read" })));
+    assert_eq!(
+        request.body,
+        Some(json!({ "name": "reader", "scope": "read" }))
+    );
 }
 
 #[test]

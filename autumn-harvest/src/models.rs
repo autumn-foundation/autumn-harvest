@@ -11,9 +11,8 @@ use uuid::Uuid;
 
 use crate::schema::{
     harvest_admission_gates, harvest_api_tokens, harvest_audit_log, harvest_backfill_log,
-    harvest_batch_jobs,
-    harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
-    harvest_completion_deliveries, harvest_completion_trigger_fires,
+    harvest_batch_jobs, harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions,
+    harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_payload_refs,
     harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,

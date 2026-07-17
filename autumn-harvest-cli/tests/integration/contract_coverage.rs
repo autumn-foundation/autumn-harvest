@@ -1115,7 +1115,12 @@ fn token_rotate_is_covered() {
 #[test]
 fn token_create_body_fields_are_documented() {
     assert_body_fields_documented(&[
-        "token", "create", "ci-bot", "--scope", "read", "--expires-at",
+        "token",
+        "create",
+        "ci-bot",
+        "--scope",
+        "read",
+        "--expires-at",
         "2027-01-01T00:00:00Z",
     ]);
 }

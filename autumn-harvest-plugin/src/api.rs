@@ -3502,7 +3502,8 @@ async fn create_token_handler(
         Err(e) => return e.into_response(),
     };
 
-    match crate::api_token::create_token(&mut conn, &body.name, scope, body.expires_at, &actor).await
+    match crate::api_token::create_token(&mut conn, &body.name, scope, body.expires_at, &actor)
+        .await
     {
         Ok(mint) => {
             let id_str = mint.view.id.to_string();
@@ -3545,7 +3546,14 @@ async fn create_token_handler(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            AutumnError::internal_server_error(e).into_response()
+            // Do NOT surface the raw DB error text (a unique-violation `DETAIL`
+            // echoes the row) into the HTTP response; the real error is captured
+            // in the audit `error_summary` above. Return a clean generic 500.
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to create api token" })),
+            )
+                .into_response()
         }
     }
 }
@@ -3604,7 +3612,11 @@ async fn revoke_token_handler(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            (StatusCode::OK, Json(serde_json::json!({ "revoked": revoked }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "revoked": revoked })),
+            )
+                .into_response()
         }
         Err(e) => AutumnError::internal_server_error(e).into_response(),
     }

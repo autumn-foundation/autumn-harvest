@@ -70,6 +70,19 @@ use crate::api::{HarvestApiState, acquire_conn, classify_route, read_only_forbid
 /// The credential-namespace discriminator for a harvest-native token.
 pub(crate) const TOKEN_PREFIX: &str = "hvst_";
 
+/// The audit-actor namespace reserved for genuinely token-authenticated
+/// requests (issue #942, AC6). Only the valid-token path may set an actor in
+/// this namespace; any inbound `x-harvest-actor` claiming it on a non-token
+/// request is stripped so a caller admitted by some other means cannot forge a
+/// token-namespaced audit actor.
+pub(crate) const TOKEN_ACTOR_PREFIX: &str = "token:";
+
+/// Debounce window for the best-effort `last_used_at` bump. A token whose
+/// `last_used_at` is newer than this is not re-touched, so a high-rate client
+/// (the intended CI-fleet use case) does not turn every read into a write or
+/// double the pool-checkout pressure.
+const LAST_USED_DEBOUNCE_SECS: i64 = 60;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Verb-level scope drawn from the route classification (issue #942, AC3).
@@ -361,6 +374,27 @@ fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+/// Reserve the `token:` audit-actor namespace on a pass-through request.
+///
+/// Strips any inbound `x-harvest-actor` header whose value begins with
+/// [`TOKEN_ACTOR_PREFIX`], so a caller admitted by some *other* means (a session
+/// admin, or any request under an embedder admin boundary) cannot forge a
+/// token-namespaced audit actor and impersonate a minted token (issue #942,
+/// AC6). Non-`token:` actor values — the embedder's legitimate actor mechanism —
+/// pass through untouched. This only runs inside [`enforce_token_scope`], which
+/// is installed solely under [`crate::HarvestPlugin::enable_api_tokens`], so a
+/// default (token-disabled) deployment is byte-for-byte unchanged (AC7).
+fn strip_reserved_actor(request: &mut Request) {
+    let reserved = request
+        .headers()
+        .get(HEADER_ACTOR)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with(TOKEN_ACTOR_PREFIX));
+    if reserved {
+        request.headers_mut().remove(HEADER_ACTOR);
+    }
+}
+
 /// The token-verification + scope-gate layer (issue #942).
 ///
 /// Installed on `harvest_api_router` only under
@@ -374,19 +408,27 @@ fn harvest_bearer(headers: &HeaderMap) -> Option<String> {
 /// `token:{id}` so every audited mutation is attributed to the token, and no
 /// caller can spoof a different actor (AC6). A `read` token attempting a
 /// mutating route is denied 403 here, before any handler runs.
+///
+/// On the pass-through path (no/invalid `hvst_` bearer) it still reserves the
+/// `token:` audit-actor namespace via [`strip_reserved_actor`], so a non-token
+/// caller admitted by other means cannot forge a token-namespaced audit actor.
 pub async fn enforce_token_scope(
     State(api_state): State<HarvestApiState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    // OPTIONS is a preflight/metadata verb, never a mutation — pass through.
+    // OPTIONS is a preflight/metadata verb, never a mutation — pass through
+    // (still reserving the token: actor namespace, defense in depth).
     if *request.method() == Method::OPTIONS {
+        strip_reserved_actor(&mut request);
         return next.run(request).await;
     }
 
-    // AC7: absent or non-`hvst_` bearer → pass through untouched (it is the
-    // embedder's credential, or an unauthenticated read).
+    // AC7: absent or non-`hvst_` bearer → pass through (it is the embedder's
+    // credential, or an unauthenticated read). Reserve the `token:` actor
+    // namespace so a non-token caller cannot forge a token-namespaced actor.
     let Some(secret) = harvest_bearer(request.headers()) else {
+        strip_reserved_actor(&mut request);
         return next.run(request).await;
     };
 
@@ -426,25 +468,36 @@ pub async fn enforce_token_scope(
     }
 
     // AC6/D3: mark the verified principal so `require_admin` admits it.
-    request
-        .extensions_mut()
-        .insert(TokenPrincipal { id: token.id, scope });
+    request.extensions_mut().insert(TokenPrincipal {
+        id: token.id,
+        scope,
+    });
 
     // AC6: authoritative actor. Strip any spoofed inbound value, set token:{id}.
-    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("token:{}", token.id)) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{TOKEN_ACTOR_PREFIX}{}", token.id)) {
         request.headers_mut().remove(HEADER_ACTOR);
         request.headers_mut().insert(HEADER_ACTOR, v);
     }
 
-    // Best-effort last-used update, OFF the request critical path (no
-    // write-amplification DoS; mirrors #776's no-hot-write policy).
-    let touch_pool = pool.default_pool().clone();
-    let id = token.id;
-    tokio::spawn(async move {
-        if let Ok(mut c) = touch_pool.get().await {
-            let _ = touch_last_used(&mut c, id).await;
-        }
-    });
+    // Best-effort `last_used_at` bump, OFF the request critical path AND
+    // debounced: the token row we just looked up carries `last_used_at`, so we
+    // only spawn the (second-connection) UPDATE when it is NULL or older than
+    // `LAST_USED_DEBOUNCE_SECS`. In the common repeated-request case this skips
+    // the write entirely — no extra pool checkout, no read-turned-into-write
+    // amplification for a high-rate token client.
+    let now = Utc::now();
+    let stale = token
+        .last_used_at
+        .is_none_or(|at| now.signed_duration_since(at).num_seconds() >= LAST_USED_DEBOUNCE_SECS);
+    if stale {
+        let touch_pool = pool.default_pool().clone();
+        let id = token.id;
+        tokio::spawn(async move {
+            if let Ok(mut c) = touch_pool.get().await {
+                let _ = touch_last_used(&mut c, id).await;
+            }
+        });
+    }
 
     next.run(request).await
 }
@@ -456,8 +509,15 @@ pub async fn enforce_token_scope(
 /// management router that [`enforce_token_scope`] wraps), so a `read`-scoped
 /// token would otherwise reach a mutating tool. This layer verifies the bearer
 /// and hard-denies a valid `read` token `403`. A non-`hvst_` bearer / no bearer
-/// passes through (the embedder or `require_admin` governs). Installed only on
-/// mutating tools and only when `enable_api_tokens()` is set.
+/// passes through (the embedder or `require_admin` governs).
+///
+/// **Provided but NOT auto-installed.** Because the generated MCP tool routes
+/// live outside the nested management router, [`crate::HarvestPlugin::enable_api_tokens`]
+/// does **not** wire this layer onto them — `build_tool_route` installs only the
+/// #776 `enforce_read_only_mcp_mutation`. An embedder that wants token scopes to
+/// extend to app-level MCP tool routes must install this helper on the mutating
+/// tool routes manually. Absent that, token scopes do not govern MCP tools
+/// (embedder auth does).
 pub async fn enforce_token_scope_mcp_mutation(
     State(api_state): State<HarvestApiState>,
     request: Request,
@@ -519,7 +579,10 @@ mod tests {
     #[test]
     fn mint_secret_is_prefixed_and_high_entropy() {
         let s = mint_secret();
-        assert!(s.starts_with(TOKEN_PREFIX), "secret must carry the hvst_ prefix");
+        assert!(
+            s.starts_with(TOKEN_PREFIX),
+            "secret must carry the hvst_ prefix"
+        );
         let body = &s[TOKEN_PREFIX.len()..];
         // 32 bytes base64url-no-pad = 43 chars.
         assert!(body.len() >= 43, "secret body too short: {}", body.len());
@@ -595,7 +658,11 @@ mod tests {
     #[test]
     fn scope_read_allows_readonly() {
         // AC3: a read token reaches read-only routes.
-        assert!(!token_scope_denies(TokenScope::Read, &Method::GET, "/workflows"));
+        assert!(!token_scope_denies(
+            TokenScope::Read,
+            &Method::GET,
+            "/workflows"
+        ));
         assert!(!token_scope_denies(
             TokenScope::Read,
             &Method::GET,

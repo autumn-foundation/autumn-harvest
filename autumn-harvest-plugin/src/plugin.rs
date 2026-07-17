@@ -732,12 +732,10 @@ impl Plugin for HarvestPlugin {
             // and INSIDE the embedder's auth middleware. Only installed under
             // enable_api_tokens(); the default path is byte-for-byte unchanged (AC7).
             if let Some(state) = token_layer_state {
-                router = router.layer(
-                    autumn_web::reexports::axum::middleware::from_fn_with_state(
-                        state,
-                        crate::api_token::enforce_token_scope,
-                    ),
-                );
+                router = router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
+                    state,
+                    crate::api_token::enforce_token_scope,
+                ));
             }
             if let Some(mw) = api_middleware {
                 router = mw(router);
