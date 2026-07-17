@@ -1923,7 +1923,7 @@ impl Cli {
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Gate { command } => gate_request(command),
-            Commands::Token { command } => token_request(command),
+            Commands::Token { command } => Ok(token_request(command)),
             Commands::Worker { command } => Ok(worker_request(command)),
             Commands::Usage {
                 from,
@@ -5674,14 +5674,14 @@ fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
     }
 }
 
-fn token_request(command: &TokenCommand) -> Result<ApiRequest, CliError> {
+fn token_request(command: &TokenCommand) -> ApiRequest {
     match command {
-        TokenCommand::List => Ok(ApiRequest::get("/admin/tokens")),
-        TokenCommand::Revoke { id } => Ok(ApiRequest {
+        TokenCommand::List => ApiRequest::get("/admin/tokens"),
+        TokenCommand::Revoke { id } => ApiRequest {
             method: ApiMethod::Delete,
             path: format!("/admin/tokens/{}", path_segment(id)),
             body: None,
-        }),
+        },
         TokenCommand::Create {
             name,
             scope,
@@ -5694,7 +5694,7 @@ fn token_request(command: &TokenCommand) -> Result<ApiRequest, CliError> {
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
             }
-            Ok(ApiRequest::post("/admin/tokens", Some(body)))
+            ApiRequest::post("/admin/tokens", Some(body))
         }
         // Rotation has no dedicated server route: the CLI mints a replacement via
         // the create route. The old token is revoked as a documented second step.
@@ -5710,7 +5710,7 @@ fn token_request(command: &TokenCommand) -> Result<ApiRequest, CliError> {
             if let Some(exp) = expires_at {
                 body["expires_at"] = serde_json::json!(exp);
             }
-            Ok(ApiRequest::post("/admin/tokens", Some(body)))
+            ApiRequest::post("/admin/tokens", Some(body))
         }
     }
 }

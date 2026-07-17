@@ -1427,7 +1427,7 @@ mod tests {
         assert!(
             ALL_MUTATION_ROUTES
                 .iter()
-                .any(|(r, op)| *r == "GET /admin/tokens" && *op == None),
+                .any(|(r, op)| *r == "GET /admin/tokens" && op.is_none()),
             "list-tokens route is a read — must map to None in ALL_MUTATION_ROUTES (issue #942)"
         );
         assert!(
