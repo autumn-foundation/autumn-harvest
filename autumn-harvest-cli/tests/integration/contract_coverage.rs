@@ -679,6 +679,8 @@ fn workflow_start_body_fields_are_documented() {
         "30",
         "--reuse-policy",
         "reject_duplicate",
+        "--conflict-policy",
+        "use_existing",
     ]);
 }
 

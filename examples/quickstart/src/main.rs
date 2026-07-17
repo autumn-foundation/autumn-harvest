@@ -134,6 +134,7 @@ async fn greet(
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,

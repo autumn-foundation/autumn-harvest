@@ -679,6 +679,42 @@
       "idempotency": "Fully idempotent; read-only."
     },
     {
+      "method": "GET",
+      "path": "/workflows/{id}/stream",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect — a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq — a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 — end-users stream their own workflows). If no api_with_auth middleware is configured the route is open — embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) — exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 503,
+          "description": "Progress streaming is unavailable server-side (retriable): either the LISTEN/NOTIFY notification URL is not configured, or that notification database is unreachable (LISTEN connect failed)."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
       "method": "POST",
       "path": "/workflows/{workflow_name}/start",
       "category": "workflow",
@@ -735,7 +771,12 @@
           {
             "name": "reuse_policy",
             "required": false,
-            "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+            "description": "Duplicate-id policy for a TERMINAL prior run: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running. Orthogonal to conflict_policy (issue #685), which governs an ACTIVE prior."
+          },
+          {
+            "name": "conflict_policy",
+            "required": false,
+            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
           },
           {
             "name": "start_at",
@@ -776,7 +817,7 @@
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 when conflict_policy=use_existing attaches to an ACTIVE (RUNNING/PAUSED) prior (issue #685); returns 201 when conflict_policy=terminate_existing cancels the active prior and starts fresh. When the request sends a conflict_policy field (even 'unspecified'), the response includes started_fresh (true = created a new run, false = attached to the existing run); omitting conflict_policy omits started_fresh so the response is byte-for-byte identical to today. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -797,11 +838,15 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, or when idempotency_key is combined with a throttle/debounce/batch policy (issue #808)."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, or when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685)."
+        },
+        {
+          "status": 401,
+          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior — i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations — e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail — cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
         },
         {
           "status": 409,
-          "description": "Duplicate workflow_id with conflicting reuse policy."
+          "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
         },
         {
           "status": 503,

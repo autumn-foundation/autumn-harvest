@@ -24,7 +24,10 @@ use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_signals, harvest_workflow_executions};
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
-use crate::types::{ExecutionId, ParentClosePolicy, Priority, StartSource, WorkflowIdReusePolicy};
+use crate::types::{
+    ExecutionId, ParentClosePolicy, Priority, StartSource, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy,
+};
 
 /// Parameters for starting a workflow execution.
 ///
@@ -49,6 +52,11 @@ pub struct StartWorkflowParams<'a> {
     /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
     /// Defaults to [`WorkflowIdReusePolicy::AllowDuplicate`].
     pub reuse_policy: WorkflowIdReusePolicy,
+    /// How to handle a collision with a currently-active (RUNNING/PAUSED) prior
+    /// (issue #685). Orthogonal to [`Self::reuse_policy`]. Default
+    /// [`WorkflowIdConflictPolicy::Unspecified`] preserves the reuse policy's
+    /// native active behavior.
+    pub conflict_policy: WorkflowIdConflictPolicy,
     /// W3C trace context captured at the call site (e.g., from the HTTP handler's
     /// `harvest.workflow.schedule` span) and stored on the task row so the worker
     /// can stitch the trace across the queue boundary (ADR-0001 §3).
@@ -160,6 +168,34 @@ pub const ORIGIN_SCHEDULED: &str = "scheduled";
 pub const ORIGIN_BACKFILL: &str = "backfill";
 /// Origin marker for an ad-hoc operator `trigger-now` fire of a schedule (issue #534).
 pub const ORIGIN_MANUAL_TRIGGER: &str = "manual_trigger";
+
+/// Bounded retry cap for the active-conflict seal-race load (issue #685 review,
+/// Codex P2). Each retry's `FOR UPDATE` naturally blocks on whichever concurrent
+/// contender currently holds the row lock, so this caps the number of distinct
+/// serialized winners a single loser will wait behind before falling back to the
+/// pre-existing `NotFound`.
+///
+/// N concurrent replace-type starts (e.g. `terminate_existing`) against one key
+/// serialize: each seals the current survivor before inserting its own, so the
+/// LAST loser can wait behind up to N-1 winners and needs up to N-1 retries to
+/// see the final survivor. Convergence is therefore guaranteed once the cap
+/// exceeds the concurrent-burst size (there are only ever N fixed contenders, so
+/// after at most N seals the last survivor is never sealed again and stays
+/// RUNNING). This cap is set generously above realistic concurrent-delivery
+/// bursts; because a retry BLOCKS on a real lock holder (forward progress, not a
+/// busy-loop), a high cap costs nothing in the common case — it only bounds the
+/// truly-stuck pathological case (a burst larger than the cap, or a prior sealed
+/// WITHOUT a replacement, e.g. a concurrent reset), which falls back to the
+/// pre-existing terminal `NotFound`.
+const SEAL_RACE_MAX_LOAD_RETRIES: u32 = 64;
+
+/// Small fixed backoff (milliseconds) between seal-race load retries. In the
+/// contended case the re-issued `FOR UPDATE` already blocks on the current lock
+/// holder (so the winner is committed and this sleep is negligible); the backoff
+/// only prevents a tight busy-loop in the pathological "sealed without a
+/// replacement" case, where the re-issued load returns `None` immediately with no
+/// lock holder to block on.
+const SEAL_RACE_LOAD_BACKOFF_MS: u64 = 1;
 
 impl StartWorkflowParams<'_> {
     /// Shard derived from the encoded `exec_id`, used to populate the row's
@@ -450,14 +486,31 @@ pub async fn start_or_load_workflow_execution_collect(
     let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
     let mut pre_check_cancel_metrics: Vec<(String, String)> = Vec::new();
 
-    // POINT 1 (issue #618, PR #1014): TerminateIfRunning ALWAYS creates a
+    // Effective active-prior behavior from the two orthogonal axes (issue #685).
+    // `terminate_via_pre_check` is the ONE case whose create-vs-attach decision is
+    // state-independent (`reuse == TerminateIfRunning` creates for BOTH active and
+    // terminal priors) AND resolves to Terminate — so it can use the unlocked
+    // POINT-1 gate + the two-transaction pre-check cancel. For `Unspecified` this is
+    // exactly `reuse == TerminateIfRunning`, so all four legacy reuse policies keep
+    // their pre-#685 admission/pre-check behavior byte-for-byte. Every other
+    // conflict-driven Terminate (e.g. `AllowDuplicate` + `TerminateExisting`) is
+    // handled atomically INSIDE the start transaction (the active branch's
+    // `inline_cancel` + `replace_execution`), where the create-vs-attach decision is
+    // made on the locked prior state — never via a pre-check cancel that would then
+    // route the just-cancelled prior through a reuse-policy attach branch.
+    let effective_conflict =
+        effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy);
+    let terminate_via_pre_check = request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+        && effective_conflict == ActiveConflictBehavior::Terminate;
+
+    // POINT 1 (issue #618, PR #1014): `terminate_via_pre_check` ALWAYS creates a
     // replacement (state-independent), so its `will_create` is a constant `true`
     // — the gate decision needs no lock. Apply it BEFORE the pre-check
-    // cancellation below so a blocked TerminateIfRunning start never cancels the
-    // prior run first (cancel-then-block). A block records the count once and
-    // returns without touching the DB.
+    // cancellation below so a blocked start never cancels the prior run first
+    // (cancel-then-block). A block records the count once and returns without
+    // touching the DB.
     if let Some(mode) = gate
-        && request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+        && terminate_via_pre_check
         && !reject_fresh_if_debounced
         && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
             mode,
@@ -471,7 +524,7 @@ pub async fn start_or_load_workflow_execution_collect(
         return Err(HarvestError::AdmissionBlocked { gate_id, reason });
     }
 
-    if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+    if terminate_via_pre_check
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
@@ -618,8 +671,21 @@ pub async fn start_or_load_workflow_execution_collect(
                 // lock is reused by the INSERT / `..._by_key_for_update` load
                 // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
                 // this never runs on the debounce path.
+                // Recompute the fast-path predicate from the (cloned) request:
+                // POINT 1 + the pre-check already applied the unlocked gate for the
+                // state-independent `terminate_via_pre_check` case, so skip it here.
+                // Every other policy (incl. conflict-driven Terminate with a
+                // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
+                // `UseExisting`/`Fail`) takes the locked read and keys the gate on
+                // the create-vs-attach decision for the LOCKED prior state.
+                let terminate_via_pre_check = request.reuse_policy
+                    == WorkflowIdReusePolicy::TerminateIfRunning
+                    && effective_active_conflict_behavior(
+                        request.reuse_policy,
+                        request.conflict_policy,
+                    ) == ActiveConflictBehavior::Terminate;
                 if let Some(mode) = gate
-                    && request.reuse_policy != WorkflowIdReusePolicy::TerminateIfRunning
+                    && !terminate_via_pre_check
                     && !reject_fresh_if_debounced
                 {
                     let prior = try_load_active_execution_for_update(
@@ -631,6 +697,7 @@ pub async fn start_or_load_workflow_execution_collect(
                     if start_will_create_new_execution(
                         prior.as_ref().map(|e| e.state.as_str()),
                         request.reuse_policy,
+                        request.conflict_policy,
                     ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
                         mode,
                         request.workflow_name,
@@ -721,99 +788,218 @@ pub async fn start_or_load_workflow_execution_collect(
                     ));
                 }
 
-                // INSERT was a no-op: a prior execution exists. Lock the row to
-                // prevent concurrent state changes while we decide what to do.
-                let existing = load_workflow_execution_by_key_for_update(
-                    conn,
-                    request.workflow_name,
-                    request.workflow_id,
-                )
-                .await?;
-
-                match request.reuse_policy {
-                    WorkflowIdReusePolicy::AllowDuplicate => Ok((
-                        StartedWorkflowExecution::from_row(existing, false),
-                        Vec::new(),
-                        tx_deferred_checks,
-                        Vec::new(),
-                    )),
-
-                    WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
-                        existing_exec_id: ExecutionId::from_uuid(existing.id),
-                        existing_state: existing.state,
-                    }),
-
-                    WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                        match existing.state.as_str() {
-                            "FAILED" | "CANCELLED" => {
-                                // Replacing a terminal prior is a fresh start.
-                                if reject_fresh_if_debounced {
-                                    return Err(HarvestError::DebounceFreshStart {
-                                        workflow_name: request.workflow_name.to_string(),
-                                        workflow_id: request.workflow_id.to_string(),
-                                    });
-                                }
-                                // Only these two explicitly abnormal states start fresh.
-                                let (started_wf, deferred) = replace_execution(
-                                    conn, existing, &row, &enqueue, exec_id, &request, now,
-                                )
-                                .await?;
-                                Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
+                // INSERT was a no-op: a NON-SEALED prior existed at INSERT time
+                // (the active-uniqueness partial index only covers non-sealed
+                // states). Lock that prior row to decide what to do.
+                //
+                // Seal-race retry (issue #685 review, Codex P2): under concurrent
+                // `terminate_existing` (or any replace-type) starts of the same
+                // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
+                // a concurrent winner has sealed the prior it locked
+                // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
+                // non-sealed filter) and inserted a fresh RUNNING replacement. The
+                // loser's first `FOR UPDATE` SELECT took its statement snapshot
+                // before the winner committed, blocks on the prior's row lock, and
+                // -- on the winner's commit -- sees the prior filtered out via
+                // EvalPlanQual while the winner's freshly-inserted row is invisible
+                // to that same statement's snapshot, so the load returns `None`.
+                //
+                // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
+                // so re-issuing the load after the winner has committed picks up the
+                // replacement RUNNING row and the start CONVERGES (last-writer-wins)
+                // instead of surfacing a transient `NotFound`. The loser holds no
+                // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
+                // never locks the conflicting row, and a `None` `FOR UPDATE` locks
+                // nothing -- so the retry is safe. Once a row IS found and
+                // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
+                // `replace_execution` cannot be sealed out from under us (a rival
+                // must first take the same lock, which blocks until we commit). Each
+                // retry's `FOR UPDATE` naturally blocks on the current lock holder,
+                // so this is not a busy-loop; the small backoff only guards the
+                // pathological "sealed without a replacement" case (e.g. a
+                // concurrent reset), where the cap falls back to the pre-existing
+                // `NotFound`.
+                //
+                // Non-racing requests never reach a `None` here (the prior is still
+                // non-sealed under the lock), so this is transparent to the common
+                // path across every reuse/conflict policy.
+                let existing = {
+                    let mut existing: Option<WorkflowExecution> = None;
+                    for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
+                        match load_workflow_execution_by_key_for_update(
+                            conn,
+                            request.workflow_name,
+                            request.workflow_id,
+                        )
+                        .await
+                        {
+                            Ok(row) => {
+                                existing = Some(row);
+                                break;
                             }
-                            _ => {
-                                // RUNNING, COMPLETED, TIMED_OUT, or any other state:
-                                // return the existing execution unchanged.
-                                Ok((
-                                    StartedWorkflowExecution::from_row(existing, false),
-                                    Vec::new(),
-                                    tx_deferred_checks,
-                                    Vec::new(),
+                            // Seal race: retry with a fresh statement snapshot until
+                            // the winner's replacement row is visible or the cap is
+                            // exhausted (then fall through to the terminal NotFound).
+                            Err(HarvestError::NotFound(_))
+                                if attempt < SEAL_RACE_MAX_LOAD_RETRIES =>
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    SEAL_RACE_LOAD_BACKOFF_MS,
                                 ))
+                                .await;
                             }
+                            Err(e) => return Err(e),
                         }
                     }
-
-                    WorkflowIdReusePolicy::TerminateIfRunning => {
-                        // TerminateIfRunning always starts fresh (cancel + replace).
-                        // Gate it before cancelling anything so a debounced workflow
-                        // is routed to admission instead.
-                        if reject_fresh_if_debounced {
-                            return Err(HarvestError::DebounceFreshStart {
-                                workflow_name: request.workflow_name.to_string(),
-                                workflow_id: request.workflow_id.to_string(),
-                            });
+                    match existing {
+                        Some(row) => row,
+                        None => {
+                            return Err(HarvestError::NotFound(format!(
+                                "workflow execution {}/{}",
+                                request.workflow_name, request.workflow_id
+                            )));
                         }
-                        // The pre-check above cancelled any active prior execution
-                        // (Transaction 1). By the time we reach this point the prior
-                        // execution's state is CANCELLED, FAILED, COMPLETED, or —
-                        // under extreme concurrency — still active (RUNNING/PAUSED).
-                        // All cases start fresh; for the still-active race we inline
-                        // the cancel here so the new start is not silently blocked
-                        // and the prior run's parked task is failed (PAUSED is active
-                        // and occupies the uniqueness slot, so it must be cancelled
-                        // before replace_execution seals it; issue #383).
-                        let mut tx_cancel_metrics = Vec::new();
-                        let mut deferred =
-                            if matches!(existing.state.as_str(), "RUNNING" | "PAUSED") {
-                                tx_cancel_metrics.push((
-                                    existing.workflow_name.clone(),
-                                    existing.queue_name.clone(),
-                                ));
-                                inline_cancel(
-                                    conn,
-                                    ExecutionId::from_uuid(existing.id),
-                                    &mut tx_deferred_checks,
-                                )
-                                .await?
-                            } else {
-                                Vec::new()
-                            };
-                        let (started_wf, mut extra_deferred) = replace_execution(
-                            conn, existing, &row, &enqueue, exec_id, &request, now,
-                        )
-                        .await?;
-                        deferred.append(&mut extra_deferred);
-                        Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
+                    }
+                };
+
+                // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
+                // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
+                // axis; a terminal non-sealed prior is governed by the reuse axis
+                // exactly as before (the conflict axis has no effect there).
+                if is_active_conflict_state(&existing.state) {
+                    match effective_active_conflict_behavior(
+                        request.reuse_policy,
+                        request.conflict_policy,
+                    ) {
+                        // Return the existing running/paused execution unchanged —
+                        // no new WorkflowStarted event, no task enqueued, no cancel.
+                        ActiveConflictBehavior::Attach => Ok((
+                            StartedWorkflowExecution::from_row(existing, false),
+                            Vec::new(),
+                            tx_deferred_checks,
+                            Vec::new(),
+                        )),
+
+                        ActiveConflictBehavior::Fail => Err(HarvestError::AlreadyExists {
+                            existing_exec_id: ExecutionId::from_uuid(existing.id),
+                            existing_state: existing.state,
+                        }),
+
+                        // Cancel the active prior and start fresh (this is exactly
+                        // the pre-#685 `TerminateIfRunning` active branch). Gate it
+                        // before cancelling anything so a debounced workflow is
+                        // routed to admission instead. PAUSED is active and occupies
+                        // the uniqueness slot, so it must be cancelled before
+                        // `replace_execution` seals it (issue #383). Reaching this
+                        // point after the two-transaction pre-check cancel is the
+                        // extreme-concurrency race where the prior is still active
+                        // under the lock; we inline the cancel here so the new start
+                        // is not silently blocked.
+                        //
+                        // Concurrency note (issue #685 review, FIX 4 + Codex P2):
+                        // concurrent `terminate_existing` starts of the SAME
+                        // `(workflow_name, workflow_id)` against one live prior are
+                        // last-writer-wins and CONVERGE to a single surviving run.
+                        // `terminate_existing` has no pre-check, so more contenders
+                        // reach this inline branch than the pre-#685
+                        // `TerminateIfRunning` path did; a loser that observed the
+                        // winner seal the prior row it locked is retried internally
+                        // by the seal-race loop around the load above (a fresh READ
+                        // COMMITTED snapshot picks up the winner's replacement RUNNING
+                        // row), so no transient `NotFound` is surfaced. It does NOT
+                        // corrupt data, deadlock, or double-run (the seal + insert is
+                        // transactional; `use_existing` never enters this branch).
+                        ActiveConflictBehavior::Terminate => {
+                            if reject_fresh_if_debounced {
+                                return Err(HarvestError::DebounceFreshStart {
+                                    workflow_name: request.workflow_name.to_string(),
+                                    workflow_id: request.workflow_id.to_string(),
+                                });
+                            }
+                            let tx_cancel_metrics =
+                                vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
+                            let mut deferred = inline_cancel(
+                                conn,
+                                ExecutionId::from_uuid(existing.id),
+                                &mut tx_deferred_checks,
+                            )
+                            .await?;
+                            let (started_wf, mut extra_deferred) = replace_execution(
+                                conn, existing, &row, &enqueue, exec_id, &request, now,
+                            )
+                            .await?;
+                            deferred.append(&mut extra_deferred);
+                            Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
+                        }
+                    }
+                } else {
+                    // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/
+                    // TIMED_OUT/SUSPENDED): reuse axis only, byte-for-byte identical
+                    // to the pre-#685 behavior.
+                    match request.reuse_policy {
+                        WorkflowIdReusePolicy::AllowDuplicate => Ok((
+                            StartedWorkflowExecution::from_row(existing, false),
+                            Vec::new(),
+                            tx_deferred_checks,
+                            Vec::new(),
+                        )),
+
+                        WorkflowIdReusePolicy::RejectDuplicate => {
+                            Err(HarvestError::AlreadyExists {
+                                existing_exec_id: ExecutionId::from_uuid(existing.id),
+                                existing_state: existing.state,
+                            })
+                        }
+
+                        WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                            match existing.state.as_str() {
+                                "FAILED" | "CANCELLED" => {
+                                    // Replacing a terminal prior is a fresh start.
+                                    if reject_fresh_if_debounced {
+                                        return Err(HarvestError::DebounceFreshStart {
+                                            workflow_name: request.workflow_name.to_string(),
+                                            workflow_id: request.workflow_id.to_string(),
+                                        });
+                                    }
+                                    // Only these two explicitly abnormal states start fresh.
+                                    let (started_wf, deferred) = replace_execution(
+                                        conn, existing, &row, &enqueue, exec_id, &request, now,
+                                    )
+                                    .await?;
+                                    Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
+                                }
+                                _ => {
+                                    // COMPLETED, TIMED_OUT, SUSPENDED, or any other
+                                    // terminal state: return the existing execution
+                                    // unchanged.
+                                    Ok((
+                                        StartedWorkflowExecution::from_row(existing, false),
+                                        Vec::new(),
+                                        tx_deferred_checks,
+                                        Vec::new(),
+                                    ))
+                                }
+                            }
+                        }
+
+                        WorkflowIdReusePolicy::TerminateIfRunning => {
+                            // TerminateIfRunning always starts fresh (replace). Gate
+                            // it before replacing so a debounced workflow is routed
+                            // to admission instead. The prior is terminal here (an
+                            // active prior takes the branch above), so no inline
+                            // cancel is needed.
+                            if reject_fresh_if_debounced {
+                                return Err(HarvestError::DebounceFreshStart {
+                                    workflow_name: request.workflow_name.to_string(),
+                                    workflow_id: request.workflow_id.to_string(),
+                                });
+                            }
+                            let (started_wf, extra_deferred) = replace_execution(
+                                conn, existing, &row, &enqueue, exec_id, &request, now,
+                            )
+                            .await?;
+                            Ok((started_wf, extra_deferred, tx_deferred_checks, Vec::new()))
+                        }
                     }
                 }
             }
@@ -1115,30 +1301,107 @@ pub async fn start_or_load_workflow_execution_idempotent(
 ///   (`replace_execution`); any other non-sealed state → ATTACH.
 /// - `TerminateIfRunning` + any non-sealed prior → CREATE (`replace_execution`,
 ///   always; the live-prior pre-check cancels first, then it replaces).
+///
+/// The `conflict_policy` axis (issue #685) overrides the behavior for an
+/// *active* (RUNNING/PAUSED) prior: `Fail`/`UseExisting` never create a fresh
+/// run; `TerminateExisting` always does; `Unspecified` defers to the reuse
+/// policy's native active behavior (so the matrix above is preserved exactly).
 #[must_use]
 pub fn start_will_create_new_execution(
     prior_state: Option<&str>,
     reuse_policy: WorkflowIdReusePolicy,
+    conflict_policy: WorkflowIdConflictPolicy,
 ) -> bool {
     // `None` = no non-sealed prior occupies the uniqueness slot → the INSERT
     // succeeds → a fresh execution is created (covers "no prior" and "sealed prior").
-    prior_state.is_none_or(|state| match reuse_policy {
-        // AllowDuplicate ATTACHES to the existing run (any non-sealed state);
-        // RejectDuplicate errors AlreadyExists — neither creates a new execution.
-        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::RejectDuplicate => false,
-        // Replace only a FAILED/CANCELLED prior; otherwise attach.
-        WorkflowIdReusePolicy::AllowDuplicateFailedOnly => matches!(state, "FAILED" | "CANCELLED"),
-        // Always replaces (cancel-if-live, then replace) → fresh create.
-        WorkflowIdReusePolicy::TerminateIfRunning => true,
+    prior_state.is_none_or(|state| {
+        if is_active_conflict_state(state) {
+            // Active prior: the conflict axis decides. Only a Terminate resolution
+            // creates a fresh run (cancel-if-live, then replace).
+            matches!(
+                effective_active_conflict_behavior(reuse_policy, conflict_policy),
+                ActiveConflictBehavior::Terminate
+            )
+        } else {
+            // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/TIMED_OUT/
+            // SUSPENDED): the reuse axis decides, unchanged from today. The
+            // conflict axis has no effect on a terminal prior.
+            match reuse_policy {
+                // AllowDuplicate ATTACHES; RejectDuplicate errors AlreadyExists —
+                // neither creates a new execution.
+                WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::RejectDuplicate => {
+                    false
+                }
+                // Replace only a FAILED/CANCELLED prior; otherwise attach.
+                WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                    matches!(state, "FAILED" | "CANCELLED")
+                }
+                // Always replaces (cancel-if-live, then replace) → fresh create.
+                WorkflowIdReusePolicy::TerminateIfRunning => true,
+            }
+        }
     })
+}
+
+/// The three possible resolutions of an ACTIVE-prior collision (issue #685).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveConflictBehavior {
+    /// Return `Err(AlreadyExists)`.
+    Fail,
+    /// Return the existing running/paused execution's handle (`created == false`).
+    Attach,
+    /// Cancel the active prior and start a fresh run.
+    Terminate,
+}
+
+/// True for the states that count as "active" for conflict purposes: RUNNING,
+/// PAUSED (issue #685). Matches how `TerminateIfRunning`'s pre-check already
+/// treats them. SUSPENDED is not a persisted state.
+#[must_use]
+pub fn is_active_conflict_state(state: &str) -> bool {
+    matches!(state, "RUNNING" | "PAUSED")
+}
+
+/// Resolve the effective active-prior behavior from the two orthogonal axes
+/// (issue #685).
+///
+/// With `WorkflowIdConflictPolicy::Unspecified`, each reuse policy maps to its
+/// documented native active behavior, so no existing caller changes.
+#[must_use]
+pub const fn effective_active_conflict_behavior(
+    reuse: WorkflowIdReusePolicy,
+    conflict: WorkflowIdConflictPolicy,
+) -> ActiveConflictBehavior {
+    match conflict {
+        WorkflowIdConflictPolicy::Fail => ActiveConflictBehavior::Fail,
+        WorkflowIdConflictPolicy::UseExisting => ActiveConflictBehavior::Attach,
+        WorkflowIdConflictPolicy::TerminateExisting => ActiveConflictBehavior::Terminate,
+        WorkflowIdConflictPolicy::Unspecified => match reuse {
+            // NATIVE active behaviors of the 4 existing reuse policies. AllowDuplicate
+            // and AllowDuplicateFailedOnly both natively attach to an active prior.
+            WorkflowIdReusePolicy::AllowDuplicate
+            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly => ActiveConflictBehavior::Attach,
+            WorkflowIdReusePolicy::RejectDuplicate => ActiveConflictBehavior::Fail,
+            WorkflowIdReusePolicy::TerminateIfRunning => ActiveConflictBehavior::Terminate,
+        },
+    }
 }
 
 #[cfg(test)]
 mod start_will_create_tests {
-    use super::start_will_create_new_execution as will_create;
+    use super::start_will_create_new_execution as will_create_impl;
+    use crate::types::WorkflowIdConflictPolicy;
+    use crate::types::WorkflowIdConflictPolicy::Unspecified;
     use crate::types::WorkflowIdReusePolicy::{
         AllowDuplicate, AllowDuplicateFailedOnly, RejectDuplicate, TerminateIfRunning,
     };
+
+    // Thin shim preserving the pre-#685 2-arg call shape for the legacy cases
+    // (conflict = Unspecified). The new active-conflict axis is exercised by the
+    // sibling `active_conflict_tests` module.
+    fn will_create(prior: Option<&str>, reuse: crate::types::WorkflowIdReusePolicy) -> bool {
+        will_create_impl(prior, reuse, WorkflowIdConflictPolicy::Unspecified)
+    }
 
     // The four non-sealed terminal states + the three non-sealed active states that
     // can occupy the uniqueness index (CONTINUED_AS_NEW/TERMINATED are excluded by
@@ -1207,6 +1470,200 @@ mod start_will_create_tests {
                 "TerminateIfRunning replaces (create) for prior state {state}"
             );
         }
+    }
+
+    // ---- issue #685: WorkflowIdConflictPolicy active-prior axis ----
+
+    /// The pre-#685 truth table for `start_will_create_new_execution`, encoded
+    /// explicitly. Any (reuse × state) with `conflict = Unspecified` MUST equal
+    /// this value — the AC-6 no-regression guarantee.
+    fn legacy_will_create(state: &str, reuse: crate::types::WorkflowIdReusePolicy) -> bool {
+        match reuse {
+            AllowDuplicate | RejectDuplicate => false,
+            AllowDuplicateFailedOnly => matches!(state, "FAILED" | "CANCELLED"),
+            TerminateIfRunning => true,
+        }
+    }
+
+    #[test]
+    fn unspecified_matches_today_for_every_state_and_reuse() {
+        let states = [
+            "RUNNING",
+            "PAUSED",
+            "SUSPENDED",
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+        ];
+        for reuse in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            for state in states {
+                assert_eq!(
+                    will_create_impl(Some(state), reuse, Unspecified),
+                    legacy_will_create(state, reuse),
+                    "Unspecified must equal legacy behavior for ({reuse:?}, {state})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_prior_use_existing_never_creates() {
+        for reuse in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            for state in ["RUNNING", "PAUSED"] {
+                assert!(
+                    !will_create_impl(Some(state), reuse, WorkflowIdConflictPolicy::UseExisting),
+                    "UseExisting attaches (no create) for active prior ({reuse:?}, {state})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_prior_fail_never_creates() {
+        for reuse in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            for state in ["RUNNING", "PAUSED"] {
+                assert!(
+                    !will_create_impl(Some(state), reuse, WorkflowIdConflictPolicy::Fail),
+                    "Fail errors (no create) for active prior ({reuse:?}, {state})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_prior_terminate_existing_always_creates() {
+        for reuse in [
+            AllowDuplicate,
+            RejectDuplicate,
+            AllowDuplicateFailedOnly,
+            TerminateIfRunning,
+        ] {
+            for state in ["RUNNING", "PAUSED"] {
+                assert!(
+                    will_create_impl(
+                        Some(state),
+                        reuse,
+                        WorkflowIdConflictPolicy::TerminateExisting
+                    ),
+                    "TerminateExisting cancels + starts fresh for active prior ({reuse:?}, {state})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conflict_axis_has_no_effect_on_a_terminal_prior() {
+        // The conflict axis governs ONLY active priors; a terminal prior is
+        // decided entirely by the reuse axis regardless of conflict.
+        for conflict in [
+            WorkflowIdConflictPolicy::Unspecified,
+            WorkflowIdConflictPolicy::Fail,
+            WorkflowIdConflictPolicy::UseExisting,
+            WorkflowIdConflictPolicy::TerminateExisting,
+        ] {
+            for reuse in [
+                AllowDuplicate,
+                RejectDuplicate,
+                AllowDuplicateFailedOnly,
+                TerminateIfRunning,
+            ] {
+                for state in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"] {
+                    assert_eq!(
+                        will_create_impl(Some(state), reuse, conflict),
+                        legacy_will_create(state, reuse),
+                        "terminal prior ({state}) must ignore conflict {conflict:?} ({reuse:?})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod active_conflict_tests {
+    use super::{
+        ActiveConflictBehavior, effective_active_conflict_behavior, is_active_conflict_state,
+    };
+    use crate::types::WorkflowIdConflictPolicy as C;
+    use crate::types::WorkflowIdReusePolicy as R;
+
+    #[test]
+    fn active_states_are_running_and_paused_only() {
+        assert!(is_active_conflict_state("RUNNING"));
+        assert!(is_active_conflict_state("PAUSED"));
+        for other in [
+            "SUSPENDED",
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ] {
+            assert!(
+                !is_active_conflict_state(other),
+                "{other} is not an active-conflict state"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_conflict_overrides_every_reuse_policy() {
+        for reuse in [
+            R::AllowDuplicate,
+            R::RejectDuplicate,
+            R::AllowDuplicateFailedOnly,
+            R::TerminateIfRunning,
+        ] {
+            assert_eq!(
+                effective_active_conflict_behavior(reuse, C::Fail),
+                ActiveConflictBehavior::Fail
+            );
+            assert_eq!(
+                effective_active_conflict_behavior(reuse, C::UseExisting),
+                ActiveConflictBehavior::Attach
+            );
+            assert_eq!(
+                effective_active_conflict_behavior(reuse, C::TerminateExisting),
+                ActiveConflictBehavior::Terminate
+            );
+        }
+    }
+
+    #[test]
+    fn unspecified_maps_to_native_active_behavior() {
+        assert_eq!(
+            effective_active_conflict_behavior(R::AllowDuplicate, C::Unspecified),
+            ActiveConflictBehavior::Attach
+        );
+        assert_eq!(
+            effective_active_conflict_behavior(R::RejectDuplicate, C::Unspecified),
+            ActiveConflictBehavior::Fail
+        );
+        assert_eq!(
+            effective_active_conflict_behavior(R::AllowDuplicateFailedOnly, C::Unspecified),
+            ActiveConflictBehavior::Attach
+        );
+        assert_eq!(
+            effective_active_conflict_behavior(R::TerminateIfRunning, C::Unspecified),
+            ActiveConflictBehavior::Terminate
+        );
     }
 }
 
@@ -3501,6 +3958,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         memo: request.memo.clone(),
                         search_attrs: request.search_attrs.clone(),
                         reuse_policy: policy,
+                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: request.trace_context.clone(),
                         max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
                         concurrency_key: request.concurrency_key.clone(),
@@ -4082,6 +4540,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         memo: request.memo.clone(),
                         search_attrs: request.search_attrs.clone(),
                         reuse_policy: policy,
+                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: request.trace_context.clone(),
                         max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
                         concurrency_key: request.concurrency_key.clone(),

@@ -1379,9 +1379,13 @@ impl SqliteRuntime {
                 // already-scheduled activity the worker pass completes;
                 // `SetCurrentDetails` is an operator status breadcrumb (issue #593)
                 // the core actively encourages — hard-erroring it would wedge an
-                // otherwise fully in-subset workflow.
+                // otherwise fully in-subset workflow. `PublishProgress` (issue #791)
+                // is an ephemeral live-output side channel delivered over Postgres
+                // LISTEN/NOTIFY, which this single-writer backend has no equivalent
+                // for — so it is a benign NO-OP here (streaming is Postgres-only).
                 WorkflowCommand::WaitForActivity { .. }
-                | WorkflowCommand::SetCurrentDetails { .. } => {}
+                | WorkflowCommand::SetCurrentDetails { .. }
+                | WorkflowCommand::PublishProgress { .. } => {}
                 // Bookkeeping commands that carry an event MUST be persisted, even
                 // when they ride in the same batch as a suspending command: a
                 // dropped `SideEffectRecorded`/`MarkerRecorded` would make the next
@@ -1919,8 +1923,11 @@ fn persist_terminal_pending_commands(
                 apply_cancel_race_losers(conn, exec, activities, children, timers)?;
             }
             // Benign bookkeeping — appends no event, gates no control flow.
-            WorkflowCommand::WaitForActivity { .. } | WorkflowCommand::SetCurrentDetails { .. } => {
-            }
+            // `PublishProgress` (issue #791) is an ephemeral Postgres-only
+            // LISTEN/NOTIFY side channel — a benign NO-OP on this backend.
+            WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. } => {}
             // Cancellable durable timers (issue #768) — a v0.1 non-goal — can also
             // be drained in the terminal cycle (e.g. `ctx.start_timer(...)` right
             // before `Ok(..)`). Reject by NAME with the same actionable message as
@@ -2078,6 +2085,7 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
+        WorkflowCommand::PublishProgress { .. } => "PublishProgress",
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",
         WorkflowCommand::CancelTimer { .. } => "CancelTimer",

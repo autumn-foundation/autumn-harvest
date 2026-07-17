@@ -4039,6 +4039,9 @@ impl WorkflowTestEnv {
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
+            // Ephemeral progress (issue #791): a bookkeeping no-op in the test
+            // harness — appends no event, changes no history, drives no wait.
+            | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::ScheduleExternalActivity { .. }
             | WorkflowCommand::Complete { .. }
             | WorkflowCommand::Fail { .. }

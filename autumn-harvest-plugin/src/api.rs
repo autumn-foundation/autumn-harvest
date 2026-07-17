@@ -109,7 +109,8 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
 use autumn_harvest::types::{
-    ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
+    ExecutionId, ExternalActivityToken, Priority, ShardId, UpdateId, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
@@ -2184,6 +2185,15 @@ pub(crate) struct StartWorkflowRequest {
     /// An unknown string value returns `400 Bad Request` with the offending value
     /// echoed in the response body.
     reuse_policy: Option<String>,
+    /// How to handle a collision with a currently-active (RUNNING/PAUSED) prior
+    /// (issue #685). Orthogonal to `reuse_policy` (which governs *terminal*
+    /// priors). Omitted or `null` → `unspecified` (each reuse policy's native
+    /// active behavior, byte-for-byte identical to today). One of:
+    /// `unspecified`, `fail`, `use_existing`, `terminate_existing`. An unknown
+    /// value returns `400 Bad Request`. Not supported combined with a throttle /
+    /// debounce / batch policy (the start is deferred and has no active prior to
+    /// resolve at request time) — returns `400`.
+    conflict_policy: Option<String>,
     #[serde(default)]
     start_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
@@ -2242,6 +2252,7 @@ impl StartWorkflowRequest {
             execution_timeout_secs: None,
             sla_secs: None,
             reuse_policy: None,
+            conflict_policy: None,
             start_at: None,
             delay: None,
             batch_key: None,
@@ -2283,6 +2294,7 @@ impl StartWorkflowRequest {
             execution_timeout_secs: None,
             sla_secs: None,
             reuse_policy: None,
+            conflict_policy: None,
             start_at: None,
             delay: None,
             batch_key: None,
@@ -4067,6 +4079,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         .route("/workflows/{id}/run-chain", get(get_run_chain))
+        // Ephemeral workflow progress SSE stream (issue #791). Deliberately NOT
+        // admin-gated — an app's end-users stream their own workflows (AC5). It
+        // inherits the general management API auth middleware (api_with_auth)
+        // like the other non-admin `/workflows/{id}/…` read routes.
+        .route("/workflows/{id}/stream", get(stream_workflow_progress))
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -5010,6 +5027,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
         ("GET", "/workflows/{id}/run-chain"),
+        // Ephemeral workflow progress SSE stream (issue #791). Read-only,
+        // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
+        ("GET", "/workflows/{id}/stream"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -5221,6 +5241,7 @@ pub const fn management_api_request_fields()
                 "execution_timeout_secs",
                 "sla_secs",
                 "reuse_policy",
+                "conflict_policy",
                 "start_at",
                 "delay",
                 "batch_key",
@@ -5688,6 +5709,10 @@ pub const fn management_api_response_fields()
             "/workflows/{id}/run-chain",
             Some(&["head_unknown", "workflow_id", "runs"]),
         ),
+        // Ephemeral workflow progress SSE stream (issue #791): text/event-stream,
+        // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
+        // monotonic seq), a terminal `event: end`, or `event: error`.
+        ("GET", "/workflows/{id}/stream", None),
         (
             "POST",
             "/workflows/{workflow_name}/start",
@@ -10751,14 +10776,16 @@ pub(crate) async fn start_workflow(
         .unwrap_or(autumn_harvest::StartSource::Api);
     let effective_start_source_ref = request.start_source_ref_override.clone();
 
-    if matches!(
-        request.reuse_policy.as_deref(),
-        Some("terminate_if_running")
-    ) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
-        .await
-    {
-        return AutumnError::unauthorized_msg("authentication required").into_response();
-    }
+    // A start that can forcibly cancel a live prior requires admin auth. The
+    // gate is NARROWED (issue #685 review) to the precise "can cancel a live
+    // run" capability — the resolved active-prior behavior being `Terminate` —
+    // rather than a raw-string match on the reuse/conflict wire values. This is
+    // computed AFTER both policies are parsed (below), because the flagship
+    // non-admin idempotent-starter shape `reuse = terminate_if_running` +
+    // `conflict = use_existing` resolves to `Attach` (return the existing
+    // handle) and provably CANNOT cancel a live run — gating it on the raw
+    // `terminate_if_running` string would wrongly force admin and defeat the
+    // non-admin webhook/cron user story. See the gate below the two parses.
 
     let runtime = match api_state.runtime() {
         Ok(r) => r,
@@ -10941,11 +10968,13 @@ pub(crate) async fn start_workflow(
     // is even computed; those apply only to a genuine fresh keyed start (a probe
     // miss). Only genuine prerequisites run above it: key validation, the
     // registry/DAG 404/400 existence check, and workflow_id + shard resolution
-    // (needed to know which shard to probe). The `terminate_if_running` admin
-    // gate at the very top of the handler is an authorization boundary (not a
-    // fresh-start validation) and deliberately stays ahead of the probe — a
-    // non-admin must never be able to invoke that capability, and a legitimate
-    // idempotent retry comes from the same authorized caller anyway.
+    // (needed to know which shard to probe). The capability-precise admin gate
+    // (issue #685 review) is computed from the PARSED reuse+conflict policies, so
+    // it runs after them and hence after this probe. That is safe: a committed
+    // replay returns the already-committed run and performs no NEW cancel, and a
+    // non-admin can never commit a `Terminate` start in the first place (the
+    // fresh-start path always gates before creating one), so there is never a
+    // committed replay for a non-admin to bypass the gate through.
     //
     // We probe the keyed claim read-only on the same key-derived `shard` the
     // reserve below uses (so we observe the claim the original delivery wrote),
@@ -11005,6 +11034,66 @@ pub(crate) async fn start_workflow(
             return e.into_response();
         }
     };
+
+    // Fresh-start-only validation: parse the active-prior conflict policy
+    // (issue #685). Runs AFTER the committed-replay probe (like `reuse_policy`
+    // above) so a retry of an already-successful keyed start with a now-invalid
+    // `conflict_policy` string returns the `200` no-op rather than a `400`. The
+    // parsed `conflict_policy` is threaded into the `StartWorkflowParams` built
+    // below (both the plain and the #808 keyed paths) and consulted by the
+    // throttle admission-gate bypass; it governs a RUNNING/PAUSED prior only.
+    let conflict_policy = match parse_conflict_policy(request.conflict_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid conflict policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
+    };
+
+    // Capability-precise admin gate (issue #685 review). Admin is required iff
+    // this request could cancel a currently-active (RUNNING/PAUSED) prior — i.e.
+    // the resolved active-prior behavior is `Terminate`. `Terminate` is the ONLY
+    // active-prior resolution that cancels live work; the other two (`Attach` →
+    // return the existing handle, `Fail` → `Err(AlreadyExists)`) touch nothing.
+    // Reachable Terminate combos (all admin-gated here): `conflict =
+    // terminate_existing` (any reuse), or `reuse = terminate_if_running` with the
+    // default/omitted conflict (`Unspecified` falls back to the reuse policy's
+    // native `Terminate`). Deliberately NON-admin (the fix): `reuse =
+    // terminate_if_running` + `conflict = use_existing` (→ Attach) or `+ fail`
+    // (→ Fail) — the flagship non-admin idempotent-starter, which cannot cancel a
+    // live run. A `terminate_if_running` + `use_existing` start over a TERMINAL
+    // prior does a fresh-replace of an already-dead run (no live work touched) —
+    // equivalent to the already-non-admin `allow_duplicate_failed_only` replace
+    // path — so it is correctly not admin-gated. This runs after both parses (an
+    // invalid value now returns `400` before reaching the gate, which is more
+    // correct); for a keyed start it also runs after the #808 committed-replay
+    // probe, which is safe because a replay returns the already-committed run and
+    // never performs a NEW cancel, and a non-admin can never commit a Terminate
+    // start in the first place (the fresh path always gates).
+    if autumn_harvest::execution::effective_active_conflict_behavior(reuse_policy, conflict_policy)
+        == autumn_harvest::execution::ActiveConflictBehavior::Terminate
+        && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+            .await
+    {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
@@ -11119,6 +11208,32 @@ pub(crate) async fn start_workflow(
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "idempotency_key cannot be combined with throttle/debounce/batch start"
+            })),
+        )
+            .into_response();
+    }
+
+    // issue #685: a non-default `conflict_policy` resolves a collision with an
+    // *active* (RUNNING/PAUSED) prior at request time (attach / fail / cancel +
+    // start fresh). Throttle / debounce / batch all DEFER the start — no start
+    // happens synchronously and there is no active prior to resolve at request
+    // time — so a `use_existing` / `fail` / `terminate_existing` decision is
+    // undefined combined with them. Reject the combination (mirrors the
+    // `idempotency_key`-vs-deferred-start mutual-exclusion above). `unspecified`
+    // (the default) is unaffected, so a throttled/debounced/batched workflow
+    // that omits the field — or sends `unspecified` — is byte-for-byte
+    // unchanged (AC-6/AC-7). `conflict_policy` combined with `idempotency_key`
+    // is allowed — those compose (the keyed path still resolves an active-prior
+    // collision under the reservation transaction).
+    if conflict_policy != WorkflowIdConflictPolicy::Unspecified
+        && (throttle_applies || is_debounced_start || has_batch_policy)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "conflict_policy is not supported for a throttled, debounced, or batched \
+                          workflow; the start is deferred and has no active prior to resolve at \
+                          request time"
             })),
         )
             .into_response();
@@ -12268,10 +12383,17 @@ pub(crate) async fn start_workflow(
                 // create-on-retry policy (`AllowDuplicateFailedOnly` +
                 // FAILED/CANCELLED prior, `TerminateIfRunning`), returns `true`
                 // here, so `attaches_to_existing` is `false` and the gate blocks.
+                // Pass the request's `conflict_policy` so the create-vs-attach
+                // decision matches the authoritative core gate exactly (issue
+                // #685). In practice this is always `Unspecified` on the throttle
+                // path — the mutual-exclusion guard above rejects a non-default
+                // `conflict_policy` combined with a throttle — but threading it
+                // keeps this predicate byte-identical to the core one.
                 let attaches_to_existing =
                     !autumn_harvest::execution::start_will_create_new_execution(
                         prior_state.as_deref(),
                         reuse_policy,
+                        conflict_policy,
                     );
                 attaches_to_existing
                     || autumn_harvest::throttle::has_pending_throttle_for_workflow_id(
@@ -12483,6 +12605,7 @@ pub(crate) async fn start_workflow(
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
                 reuse_policy,
+                conflict_policy,
                 trace_context: trace_ctx,
                 max_execution_timeout_ceiling: api_state
                     .max_workflow_execution_timeout()
@@ -12705,6 +12828,7 @@ pub(crate) async fn start_workflow(
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         reuse_policy,
+        conflict_policy,
         trace_context: trace_ctx,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
@@ -12885,9 +13009,18 @@ pub(crate) async fn start_workflow(
                     workflow_name: start.workflow_name,
                     workflow_id: start.workflow_id,
                     state: start.state,
-                    // No-key path: omit the #808 flags so the response is
-                    // byte-for-byte identical to a pre-#808 build.
-                    started_fresh: None,
+                    // issue #685 (AC-4/AC-7): surface `started_fresh` — the
+                    // attach-vs-fresh distinguisher — ONLY when the caller opted
+                    // into the conflict axis by sending a `conflict_policy` field
+                    // (even `"unspecified"`). Omitting the field keeps the
+                    // response byte-for-byte identical to a pre-#685/#808 build
+                    // (both #808 flags omitted via `skip_serializing_if`).
+                    started_fresh: if request.conflict_policy.is_some() {
+                        Some(start.created)
+                    } else {
+                        None
+                    },
+                    // No-key path never sets `deduplicated` (idempotency-key only).
                     deduplicated: None,
                 }),
             )
@@ -13228,6 +13361,7 @@ async fn batch_start_workflows(
                                 !autumn_harvest::execution::start_will_create_new_execution(
                                     prior_state.as_deref(),
                                     WorkflowIdReusePolicy::AllowDuplicate,
+                                    autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                                 );
                             attaches_to_existing
                                 || (workflow_resolving_throttle(
@@ -13714,6 +13848,7 @@ async fn batch_start_workflows(
                     memo: None,
                     search_attrs: item.search_attributes.clone(),
                     reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                    conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: trace_ctx,
                     max_execution_timeout_ceiling: max_exec_timeout_ceiling,
                     concurrency_key,
@@ -21083,6 +21218,7 @@ async fn trigger_schedule_now(
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
@@ -22465,6 +22601,8 @@ async fn schedule_backfill(
                         memo: None,
                         search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+                        conflict_policy:
+                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
@@ -22778,6 +22916,8 @@ async fn schedule_backfill(
                         memo: None,
                         search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
+                        conflict_policy:
+                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
                         concurrency_key: None,
@@ -26904,6 +27044,24 @@ fn parse_reuse_policy(raw: Option<&str>) -> Result<WorkflowIdReusePolicy, Autumn
     }
 }
 
+/// Parse the active-prior conflict policy (issue #685). Mirrors
+/// [`parse_reuse_policy`]. Omitted / empty / `unspecified` → `Unspecified`
+/// (each reuse policy's native active behavior, byte-for-byte identical to
+/// today). An unknown value returns `400 Bad Request` with the offending value
+/// echoed, never a silent fallback.
+fn parse_conflict_policy(raw: Option<&str>) -> Result<WorkflowIdConflictPolicy, AutumnError> {
+    match raw {
+        None | Some("" | "unspecified") => Ok(WorkflowIdConflictPolicy::Unspecified),
+        Some("fail") => Ok(WorkflowIdConflictPolicy::Fail),
+        Some("use_existing") => Ok(WorkflowIdConflictPolicy::UseExisting),
+        Some("terminate_existing") => Ok(WorkflowIdConflictPolicy::TerminateExisting),
+        Some(other) => Err(AutumnError::bad_request_msg(format!(
+            "unknown conflict_policy '{other}'; expected one of: unspecified, fail, use_existing, \
+             terminate_existing"
+        ))),
+    }
+}
+
 fn parse_workflow_result_wait_query(
     pairs: &[(String, String)],
     max_wait: Duration,
@@ -27187,6 +27345,10 @@ async fn stream_execution_events(
 
     // Resolve the LISTEN/NOTIFY database URL for this execution's shard
     let shard = exec_id.shard();
+    // NOTE: a not-configured URL here is `HarvestError::Config` → 400 via
+    // `map_error`. That latent misclassification (server misconfig should be
+    // 503) is a pre-existing #324 behavior and out of scope for #791 — the
+    // sibling progress stream below returns 503 for the same case.
     let notification_url = match api_state.sse_notification_url(shard) {
         Ok(url) => url,
         Err(e) => return map_error(e).into_response(),
@@ -27574,6 +27736,275 @@ async fn stream_execution_events(
     // comments every keepalive_interval so proxies don't idle the connection.
     Sse::new(rx)
         .keep_alive(KeepAlive::new().interval(keepalive_interval).text("ping"))
+        .into_response()
+}
+
+/// Terminal-close poll cadence / keepalive ceiling for the workflow progress SSE
+/// stream (issue #791). Bounds how long after a workflow reaches a terminal
+/// state the final `event: end` frame is emitted (there is no terminal *chunk*,
+/// so the close is driven by a periodic terminal-state poll on the idle tick).
+/// Capped by the configured `sse_keepalive_interval` so operators (and tests)
+/// can shorten it; a modest default keeps close latency bounded.
+const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounded producer→SSE channel capacity for the progress stream. Progress is a
+/// best-effort side channel: chunks are sent non-blocking (`try_send`), so a
+/// slow client that fills this buffer causes the *excess* chunks to be DROPPED
+/// (never buffered unboundedly, and — critically — never back-pressured into the
+/// shared Postgres async NOTIFY queue). The monotonic `seq` lets the client
+/// detect the resulting gap. A disconnected receiver ends the stream.
+const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
+
+/// Short, non-zero grace window used to drain any progress chunk still in flight
+/// in the LISTEN driver's internal buffer *before* emitting the terminal
+/// `event: end` frame.
+///
+/// The terminal close is driven by an idle keepalive tick that polls terminal
+/// state. When that tick fires, the workflow's FINAL published chunk may have
+/// been delivered on the listener socket but not yet forwarded by the driver
+/// task. A `Duration::ZERO` poll would race and drop it; a short non-zero grace
+/// gives the driver time to forward a just-delivered notification, so the last
+/// chunk is not lost on close.
+const PROGRESS_STREAM_FINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(75);
+
+/// Poll the execution's terminal state for the progress stream's close check.
+///
+/// Returns `Some(reason)` when the stream should end — the execution reached a
+/// terminal state, or its row was retention-deleted (which only happens once an
+/// execution is already terminal) — and `None` to keep waiting (still running,
+/// or a transient DB/pool error the next idle tick retries).
+async fn progress_stream_end_reason(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    let mut conn = db_conn_for_execution(api_state, exec_id).await.ok()?;
+    let state: Option<String> = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .optional()
+        .ok()?;
+    match state {
+        // Row gone: retention only deletes terminal executions, so end the stream.
+        None => Some("deleted".to_string()),
+        Some(s) if is_terminal_state(&s) => Some(s.to_lowercase().replace('_', "-")),
+        // Still running — keep the live loop open.
+        Some(_) => None,
+    }
+}
+
+/// `GET /workflows/{id}/stream`
+///
+/// Ephemeral, best-effort **live-output side channel** (issue #791). Streams the
+/// ordered progress chunks a running workflow publishes via
+/// [`WorkflowContext::publish_progress`](autumn_harvest::context::WorkflowContext::publish_progress)
+/// over Postgres LISTEN/NOTIFY, with sub-second delivery and no DB connection
+/// held between chunks.
+///
+/// **Auth**: this route inherits the management API's configured auth middleware
+/// (`HarvestPlugin::api_with_auth`); it is deliberately **NOT** admin-gated
+/// (issue #791 AC5 — an app's end-users stream their own workflows). If no
+/// middleware is configured the route is open — embedders exposing streams to
+/// untrusted end-users should configure `api_with_auth` or front it with their
+/// own auth.
+///
+/// SSE wire format:
+/// ```text
+/// id: <seq>            (monotonic, epoch-prefixed; a gap ⇒ missed chunk)
+/// event: progress
+/// data: <chunk JSON>   (compact, single-line)
+///
+/// ```
+/// A final `event: end` frame is emitted when the execution reaches a terminal
+/// state and the stream then closes; `event: error` is sent if the LISTEN
+/// connection drops. Keepalive `: ping` comments (axum `KeepAlive`) keep proxies
+/// from idling the connection.
+///
+/// **Progress chunks are EPHEMERAL**: never recorded in `harvest_events`, never
+/// replayed, and there is **no backfill** on (re)connect. A subscriber that
+/// connects after a chunk was published will not see it — deliberate, since
+/// chunk content may be non-deterministic precisely because it is never stored.
+///
+/// **Authorization**: this route only checks that the execution exists (→ 404
+/// otherwise). `exec_id` is effectively a bearer capability for this run's live
+/// chunk *content*; embedders exposing sensitive workflow output MUST add their
+/// own per-execution authorization on top. `exec_id` is a random `UUIDv4` (not
+/// enumerable), which mitigates blind probing but is not an access-control
+/// substitute. Each subscriber also holds one dedicated (non-pooled) Postgres
+/// `LISTEN` connection for the stream's lifetime, so embedders should rate-limit
+/// and/or cap concurrent streams per user to avoid DB connection exhaustion.
+///
+/// Responses: `404` if the execution does not exist; `503` if the LISTEN/NOTIFY
+/// database URL is not configured or the notification database is unreachable
+/// (both server-side conditions, retriable); a single `event: end` frame (then
+/// close) if the execution is already terminal at connect.
+#[allow(clippy::too_many_lines)]
+async fn stream_workflow_progress(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+) -> axum::response::Response {
+    use autumn_harvest::notify::{ProgressWaitOutcome, WorkflowProgressListener};
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+
+    // Parse execution ID (400 on malformed).
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // Resolve the LISTEN/NOTIFY database URL for this execution's shard.
+    //
+    // No LISTEN/NOTIFY URL configured is a *server* misconfiguration, not a
+    // client error: return 503 (retriable once configured), matching the handler
+    // contract and docs/api-contract.json. A DB-unreachable failure on `connect`
+    // below is likewise 503 (via `map_error`'s `HarvestError::Database` arm), so
+    // both "not configured" and "unreachable" surface as 503, never a 400.
+    let shard = exec_id.shard();
+    let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+        return AutumnError::service_unavailable_msg(
+            "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+        )
+        .into_response();
+    };
+
+    // Establish LISTEN before verifying the execution so a chunk published in
+    // the window between the existence check and LISTEN setup is not missed.
+    // A connect failure is `HarvestError::Database` → 503 via `map_error`
+    // (LISTEN/NOTIFY database unreachable), consistent with the not-configured
+    // case above.
+    let listener =
+        match WorkflowProgressListener::connect(&notification_url, exec_id.as_uuid()).await {
+            Ok(l) => l,
+            Err(e) => return map_error(e).into_response(),
+        };
+
+    // Verify the execution exists (404 otherwise) and capture its terminal state.
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(e) => e,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let already_terminal = is_terminal_state(&execution.state);
+    let terminal_reason = execution.state.to_lowercase().replace('_', "-");
+    // Release the pooled DB connection — SSE streams must not hold connections.
+    drop(conn);
+
+    // Terminal-close poll cadence, bounded by a modest default and shortenable
+    // via the shared SSE keepalive config.
+    let keepalive = api_state
+        .sse_keepalive_interval()
+        .min(PROGRESS_STREAM_KEEPALIVE);
+
+    // Bounded channel: chunks are pushed non-blocking (`try_send`) so a slow
+    // client can only ever cause chunk DROPS (best-effort), never unbounded
+    // buffering and never back-pressure into Postgres' NOTIFY queue. A dropped
+    // receiver (client disconnect) ends the producer cleanly.
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        PROGRESS_STREAM_CHANNEL_CAPACITY,
+    );
+
+    if already_terminal {
+        // No chunks will come — emit a single end frame and close immediately.
+        let end_data = serde_json::json!({ "reason": terminal_reason }).to_string();
+        let _ = tx.try_send(Ok(Event::default().event("end").data(end_data)));
+    } else {
+        let api_clone = api_state.clone();
+        // Producer task: runs independently of the HTTP handler after we return.
+        tokio::spawn(async move {
+            // Emit a progress chunk NON-BLOCKING. Returns `false` when the
+            // receiver has been dropped (client disconnected) so the caller
+            // ends the stream; a full channel (slow consumer) DROPS the chunk
+            // and returns `true` (keep going — the monotonic seq lets the
+            // client detect the gap). A blocking `send().await` here would
+            // back-pressure a slow client into the shared Postgres NOTIFY queue
+            // and stall the terminal-close poll below, so it must not block.
+            let emit_chunk = |tx: &mut futures::channel::mpsc::Sender<
+                Result<Event, std::convert::Infallible>,
+            >,
+                              payload: autumn_harvest::notify::ProgressNotifyPayload|
+             -> bool {
+                // `chunk` is already an inner JSON value — serialize it compactly
+                // (single line) and DO NOT re-wrap it in the adjacently-tagged
+                // envelope; `id:` carries the seq.
+                let event = Event::default()
+                    .id(payload.seq.to_string())
+                    .event("progress")
+                    .data(payload.chunk.to_string());
+                match tx.try_send(Ok(event)) {
+                    Ok(()) => true,
+                    // Slow consumer: drop this chunk, keep the stream alive.
+                    Err(e) if e.is_full() => true,
+                    // Receiver dropped (client disconnected): end the stream.
+                    Err(_) => false,
+                }
+            };
+
+            let mut listener = listener;
+            loop {
+                match listener.wait_for_progress_timeout(keepalive).await {
+                    Ok(ProgressWaitOutcome::Chunk(payload)) => {
+                        if !emit_chunk(&mut tx, payload) {
+                            break; // client disconnected
+                        }
+                    }
+                    Ok(ProgressWaitOutcome::TimedOut) => {
+                        // Detect a client that disconnected while idle (send /
+                        // try_send only observe a drop on a write attempt); the
+                        // axum KeepAlive wrapper emits the `: ping` comment.
+                        if tx.is_closed() {
+                            break;
+                        }
+                        // Periodic terminal-state poll: there is no terminal
+                        // chunk, so this bounds close latency to one keepalive.
+                        if let Some(reason) = progress_stream_end_reason(&api_clone, exec_id).await
+                        {
+                            // Bounded final-chunk drain: the workflow's LAST
+                            // published chunk may have arrived on the listener
+                            // socket but not yet been forwarded by the driver
+                            // task when this idle tick fired. Drain (non-blocking)
+                            // with a short grace so the primary "here's your
+                            // answer" frame is not dropped on close. A non-Chunk
+                            // outcome (no more chunks in flight, timeout, or the
+                            // listener dropped) exits the drain and proceeds to
+                            // close.
+                            while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
+                                .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
+                                .await
+                            {
+                                if !emit_chunk(&mut tx, payload) {
+                                    return; // client disconnected mid-drain
+                                }
+                            }
+                            let end_data = serde_json::json!({ "reason": reason }).to_string();
+                            let _ = tx
+                                .send(Ok(Event::default().event("end").data(end_data)))
+                                .await;
+                            break;
+                        }
+                    }
+                    Ok(ProgressWaitOutcome::ChannelClosed) => {
+                        // LISTEN connection dropped; end with an error frame
+                        // rather than hanging (mirrors #597 watch robustness).
+                        let err_data =
+                            serde_json::json!({ "error": "listen_connection_closed" }).to_string();
+                        let _ = tx
+                            .send(Ok(Event::default().event("error").data(err_data)))
+                            .await;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
         .into_response()
 }
 
@@ -33233,6 +33664,61 @@ mod tests {
         );
     }
 
+    // -- conflict_policy parsing (issue #685) --
+
+    #[test]
+    fn parse_conflict_policy_none_and_empty_and_unspecified_default_to_unspecified() {
+        for raw in [None, Some(""), Some("unspecified")] {
+            assert_eq!(
+                parse_conflict_policy(raw).unwrap(),
+                WorkflowIdConflictPolicy::Unspecified,
+                "failed for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_conflict_policy_accepts_all_known_values() {
+        use WorkflowIdConflictPolicy::{Fail, TerminateExisting, Unspecified, UseExisting};
+        let cases = [
+            ("unspecified", Unspecified),
+            ("fail", Fail),
+            ("use_existing", UseExisting),
+            ("terminate_existing", TerminateExisting),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_conflict_policy(Some(input)).unwrap(),
+                expected,
+                "failed for '{input}'"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_conflict_policy_unknown_value_returns_400_error() {
+        let err =
+            parse_conflict_policy(Some("bogus_conflict")).expect_err("unknown value must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus_conflict"),
+            "offending value must be echoed in error: {msg}"
+        );
+        assert!(
+            msg.contains("unknown conflict_policy"),
+            "error must mention unknown conflict_policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_conflict_policy_unknown_value_is_not_silent_fallback() {
+        // Wrong-case must be rejected, not silently coerced to Unspecified.
+        assert!(
+            parse_conflict_policy(Some("USE_EXISTING")).is_err(),
+            "wrong case must not silently fall back"
+        );
+    }
+
     // -- Worker filter parsing via API wrapper --
 
     #[test]
@@ -33422,6 +33908,7 @@ mod tests {
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
@@ -33506,6 +33993,7 @@ mod tests {
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,
@@ -33598,6 +34086,7 @@ mod tests {
     /// an unvalidated/uncapped payload. Reproduce that exact state and assert
     /// `signal_workflow` fails closed instead, mirroring `admit_update` above.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // #685: required conflict_policy field tips this pre-existing literal-heavy test to 101 lines
     async fn signal_workflow_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
         #[derive(diesel::QueryableByName)]
         struct CountRow {
@@ -33627,6 +34116,7 @@ mod tests {
                 memo: None,
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
                 concurrency_key: None,

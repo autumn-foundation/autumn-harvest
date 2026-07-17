@@ -235,6 +235,10 @@ pub enum QueryReplayOutcome {
 /// - [`UpsertSearchAttributes`](WorkflowCommand::UpsertSearchAttributes) and
 ///   [`SetCurrentDetails`](WorkflowCommand::SetCurrentDetails): operator-facing
 ///   metadata, never part of the deterministic command stream.
+/// - [`PublishProgress`](WorkflowCommand::PublishProgress): an ephemeral,
+///   best-effort live-output side channel (issue #791) that appends nothing to
+///   `harvest_events` and is suppressed during replay — replay-neutral by
+///   construction.
 /// - [`CancelRaceLosers`](WorkflowCommand::CancelRaceLosers): for the
 ///   timer+signal race shape (issue #600) this is a pure, deterministic function
 ///   of already-resolved history (the winner is fixed by recorded order), so it
@@ -258,6 +262,7 @@ pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool
         cmd,
         WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
     )
 }
