@@ -1366,9 +1366,12 @@ fn get_bearer(uri: &str, bearer: &str) -> Request<Body> {
 #[tokio::test]
 async fn token_layer_passes_through_absent_bearer() {
     // AC7: no bearer → the token layer is a pass-through (embedder/session
-    // governs). A read route stays reachable.
+    // governs). A read route stays reachable. `/health` is used (not
+    // `/workflows`) because the no-pool test rig makes `/workflows` fail-closed
+    // to 503 downstream (issue #756), which is orthogonal to — and would mask —
+    // the token layer's pass-through behavior under test.
     let app = token_layer_app();
-    let res = app.oneshot(get("/workflows")).await.unwrap();
+    let res = app.oneshot(get("/health")).await.unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
     assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1377,10 +1380,11 @@ async fn token_layer_passes_through_absent_bearer() {
 #[tokio::test]
 async fn token_layer_passes_through_non_hvst_bearer() {
     // AC7: a bearer that is not a harvest token is ignored — the embedder's own
-    // JWT still governs. The token layer must not 401 it.
+    // JWT still governs. The token layer must not 401 it. `/health` is used for
+    // the same rig reason as above (the no-pool `/workflows` 503 is downstream).
     let app = token_layer_app();
     let res = app
-        .oneshot(get_bearer("/workflows", "eyJhbGciOiJIUzI1NiJ9.embedder.jwt"))
+        .oneshot(get_bearer("/health", "eyJhbGciOiJIUzI1NiJ9.embedder.jwt"))
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
@@ -1421,9 +1425,12 @@ async fn embedder_only_router_has_no_token_layer() {
     // AC7: the default router (no `enable_api_tokens`) is byte-identical to
     // trunk. A hvst_-looking bearer is meaningless to it — it is passed through
     // untouched (no token layer to interpret it), reaching the handler.
+    // `/health` is used (not `/workflows`) because the no-pool test rig makes
+    // `/workflows` fail-closed to 503 downstream (issue #756), independent of
+    // the token layer whose absence is what this test asserts.
     let app = unauthenticated_app();
     let res = app
-        .oneshot(get_bearer("/workflows", "hvst_ignored_here"))
+        .oneshot(get_bearer("/health", "hvst_ignored_here"))
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
