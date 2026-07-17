@@ -10,9 +10,9 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_admission_gates, harvest_audit_log, harvest_backfill_log, harvest_batch_jobs,
-    harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
-    harvest_completion_deliveries, harvest_completion_trigger_fires,
+    harvest_admission_gates, harvest_api_tokens, harvest_audit_log, harvest_backfill_log,
+    harvest_batch_jobs, harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions,
+    harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_payload_refs,
     harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,
@@ -869,6 +869,56 @@ pub struct NewAuditRecord<'a> {
     pub error_summary: Option<&'a str>,
     pub shard_id: Option<i32>,
     pub source: &'a str,
+}
+
+// ── ApiToken ──────────────────────────────────────────────────────────────────
+
+/// A single scoped API token for the management API (issue #942).
+///
+/// **Never serialized as an API response.** This struct holds `token_hash`; the
+/// management API responds with the metadata-only `TokenView` DTO
+/// (`autumn-harvest-plugin`), which structurally cannot hold the hash or the
+/// plaintext secret. `Debug` is derived but the hash is a non-reversible
+/// SHA-256, not the secret.
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = harvest_api_tokens)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ApiToken {
+    pub id: Uuid,
+    pub name: String,
+    pub token_hash: String,
+    pub scope: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_by: String,
+}
+
+/// Insert struct for minting a new API token (issue #942).
+///
+/// A manual `Debug` impl redacts `token_hash` so a mint site logging this
+/// struct cannot leak the lookup key.
+#[derive(Insertable)]
+#[diesel(table_name = harvest_api_tokens)]
+pub struct NewApiToken<'a> {
+    pub name: &'a str,
+    pub token_hash: &'a str,
+    pub scope: &'a str,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_by: &'a str,
+}
+
+impl std::fmt::Debug for NewApiToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewApiToken")
+            .field("name", &self.name)
+            .field("token_hash", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .field("created_by", &self.created_by)
+            .finish()
+    }
 }
 
 // ── BuildPolicy ───────────────────────────────────────────────────────────────

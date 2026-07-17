@@ -489,6 +489,24 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Scoped API tokens for the management API (issue #942). Control-plane
+    /// config state — no `shard_id`; verified on the default shard.
+    harvest_api_tokens (id) {
+        id -> Uuid,
+        name -> Text,
+        token_hash -> Text,
+        scope -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+        last_used_at -> Nullable<Timestamptz>,
+        revoked_at -> Nullable<Timestamptz>,
+        created_by -> Text,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     harvest_backfill_log (id) {
         id -> Uuid,
         schedule_id -> Uuid,
@@ -857,6 +875,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_workers,
     harvest_batch_jobs,
     harvest_audit_log,
+    harvest_api_tokens,
     harvest_build_policies,
     harvest_build_compat,
     harvest_backfill_log,

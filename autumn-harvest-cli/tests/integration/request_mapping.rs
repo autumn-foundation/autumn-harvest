@@ -2226,3 +2226,93 @@ fn legal_hold_release_maps_to_post_with_no_body() {
     assert_eq!(request.path, "/workflows/exec-1/legal-hold/release");
     assert_eq!(request.body, None);
 }
+
+// ── Scoped API tokens (issue #942) ────────────────────────────────────────────
+
+#[test]
+fn token_create_maps_to_post() {
+    let cli = Cli::try_parse_from(["harvest", "token", "create", "ci-bot", "--scope", "read"])
+        .expect("token create args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/tokens");
+    assert_eq!(
+        request.body,
+        Some(json!({ "name": "ci-bot", "scope": "read" }))
+    );
+}
+
+#[test]
+fn token_create_with_expiry_includes_expires_at() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "token",
+        "create",
+        "dash",
+        "--scope",
+        "mutate",
+        "--expires-at",
+        "2027-01-01T00:00:00Z",
+    ])
+    .expect("token create args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/tokens");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "name": "dash",
+            "scope": "mutate",
+            "expires_at": "2027-01-01T00:00:00Z",
+        }))
+    );
+}
+
+#[test]
+fn token_create_defaults_scope_to_read() {
+    let cli = Cli::try_parse_from(["harvest", "token", "create", "reader"])
+        .expect("token create args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/tokens");
+    assert_eq!(
+        request.body,
+        Some(json!({ "name": "reader", "scope": "read" }))
+    );
+}
+
+#[test]
+fn token_list_maps_to_get() {
+    let cli = Cli::try_parse_from(["harvest", "token", "list"]).expect("token list should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/tokens");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn token_revoke_maps_to_delete() {
+    let cli = Cli::try_parse_from(["harvest", "token", "revoke", "abc-123"])
+        .expect("token revoke should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Delete);
+    assert_eq!(request.path, "/admin/tokens/abc-123");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn token_rotate_maps_to_post_create_replacement() {
+    // AC8 convenience: rotate mints a replacement via the create route (no
+    // dedicated server route). The old token is revoked as a documented second
+    // step; the CLI maps rotate → POST /admin/tokens.
+    let cli = Cli::try_parse_from(["harvest", "token", "rotate", "old-id", "--scope", "mutate"])
+        .expect("token rotate should parse");
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/tokens");
+}

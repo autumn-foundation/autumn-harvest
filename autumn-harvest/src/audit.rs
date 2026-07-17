@@ -157,6 +157,10 @@ pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
 /// `CLASSIFIED_ROUTES`/`ALL_MUTATION_ROUTES` change: no route mutates and no
 /// new route exists.
 pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
+/// Audit operation: minted a scoped API token (issue #942).
+pub const OP_TOKEN_CREATE: &str = "token.create";
+/// Audit operation: revoked a scoped API token (issue #942).
+pub const OP_TOKEN_REVOKE: &str = "token.revoke";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -179,6 +183,8 @@ pub const TARGET_RATE_LIMIT: &str = "rate_limit";
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 /// Audit target type for completion-callback delivery operations (issue #605).
 pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
+/// Audit target type for scoped API token operations (issue #942).
+pub const TARGET_TOKEN: &str = "token";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -367,6 +373,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/gates", RouteClass::ReadOnly),
     ("POST /admin/gates", RouteClass::Mutating),
     ("DELETE /admin/gates/{id}", RouteClass::Mutating),
+    // Scoped API tokens (issue #942).
+    ("GET /admin/tokens", RouteClass::ReadOnly),
+    ("POST /admin/tokens", RouteClass::Mutating),
+    ("DELETE /admin/tokens/{id}", RouteClass::Mutating),
     ("GET /admin/schedules", RouteClass::ReadOnly),
     ("GET /admin/rate-limits", RouteClass::ReadOnly),
     ("GET /admin/audit", RouteClass::ReadOnly),
@@ -694,6 +704,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_RETRY,
     OP_CIRCUIT_FORCE_OPEN,
     OP_CIRCUIT_FORCE_CLOSE,
+    // Scoped API tokens (issue #942)
+    OP_TOKEN_CREATE,
+    OP_TOKEN_REVOKE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -762,6 +775,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /admin/build-routing/retire",
     // Admission gate list is read-only.
     "GET /admin/gates",
+    // Scoped API token list is read-only (issue #942).
+    "GET /admin/tokens",
     // Business-id ("latest run") read-only variants (issue #805). Each mirrors
     // its exec-id counterpart's EXCLUDED_ROUTES membership exactly. Note the
     // `.../result` variant is deliberately absent — its exec-id counterpart
@@ -971,6 +986,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/gates", None),
     ("POST /admin/gates", Some(OP_GATE_CREATE)),
     ("DELETE /admin/gates/{id}", Some(OP_GATE_LIFT)),
+    // Scoped API tokens (issue #942)
+    ("GET /admin/tokens", None),
+    ("POST /admin/tokens", Some(OP_TOKEN_CREATE)),
+    ("DELETE /admin/tokens/{id}", Some(OP_TOKEN_REVOKE)),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", Some(OP_TASK_REPRIORITIZE)),
     // PII erasure (issue #495)
@@ -1371,6 +1390,59 @@ mod tests {
         );
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_SET));
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_RELEASE));
+    }
+
+    #[test]
+    fn token_routes_are_classified_and_audited() {
+        // Scoped API tokens (issue #942): create + revoke are admin-only
+        // mutations; list is a read. This dedicated pin — not just the general
+        // exhaustiveness guards, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other — is what catches a route
+        // dropped from BOTH lists (the recurring gap the codebase pins
+        // per-route).
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "POST /admin/tokens" && *c == RouteClass::Mutating),
+            "POST /admin/tokens must be classified RouteClass::Mutating (issue #942)"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/tokens" && *c == RouteClass::ReadOnly),
+            "GET /admin/tokens must be classified RouteClass::ReadOnly (issue #942)"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "DELETE /admin/tokens/{id}" && *c == RouteClass::Mutating),
+            "DELETE /admin/tokens/{{id}} must be classified RouteClass::Mutating (issue #942)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "POST /admin/tokens" && *op == Some(OP_TOKEN_CREATE)),
+            "create-token route must map to OP_TOKEN_CREATE (issue #942)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/tokens" && op.is_none()),
+            "list-tokens route is a read — must map to None in ALL_MUTATION_ROUTES (issue #942)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "DELETE /admin/tokens/{id}" && *op == Some(OP_TOKEN_REVOKE)),
+            "revoke-token route must map to OP_TOKEN_REVOKE (issue #942)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_TOKEN_CREATE));
+        assert!(AUDITED_OPERATIONS.contains(&OP_TOKEN_REVOKE));
+        // The list read is explicitly excluded from audit.
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /admin/tokens"),
+            "GET /admin/tokens must be in EXCLUDED_ROUTES (read, no audit) (issue #942)"
+        );
     }
 
     #[test]
