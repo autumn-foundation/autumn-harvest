@@ -104,6 +104,8 @@ pub mod dag_linter;
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
+#[cfg(any(test, feature = "testing"))]
+pub mod dag_stochastic;
 /// Debounced workflow starts — collapse trigger bursts into one run (issue #499).
 pub mod debounce;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
@@ -310,6 +312,8 @@ pub use dag_linter::{
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
+#[cfg(any(test, feature = "testing"))]
+pub use dag_stochastic::{DagMonteCarlo, DurationDistribution, MonteCarloProfile};
 pub use det_check::{
     DetCheckReport, DetFinding, DetLocation, DetSeverity, DetSuppression, check_dir, check_file,
     check_paths, check_source,
