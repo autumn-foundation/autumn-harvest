@@ -22,7 +22,7 @@
       "Adding a new read-only route",
       "Narrowing an existing error response to be more specific"
     ],
-    "conditional_shape_note": "Issue #756 partial-availability carve-out to \"Changing the type of a response field\": the cross-shard list read endpoints GET /workflows (non-paginated), GET /workers, GET /admin/schedules, GET /dead-letters, and GET /dags return a CONDITIONAL 200 shape — a bare JSON array when every expected shard is reachable (status == complete), or a degraded object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } when a shard is unavailable. This is NOT a breaking change to any currently-successful response: the all-reachable array is byte-for-byte identical to the pre-#756 shape, and the object form only replaces what was previously a whole-request 500 (a failed, non-successful response), so no client that received a successful response before can observe a changed type. The paginated GET /workflows object shape and the aggregate/health object endpoints (GET /dead-letters/aggregate, GET /workers/health) instead gain status/unavailable_shards as always-present ADDITIVE fields (a non-breaking change)."
+    "conditional_shape_note": "Issue #756 partial-availability carve-out to \"Changing the type of a response field\": the cross-shard list read endpoints GET /workflows (non-paginated), GET /workers, GET /admin/schedules, GET /dead-letters, and GET /dags return a CONDITIONAL 200 shape \u2014 a bare JSON array when every expected shard is reachable (status == complete), or a degraded object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } when a shard is unavailable. This is NOT a breaking change to any currently-successful response: the all-reachable array is byte-for-byte identical to the pre-#756 shape, and the object form only replaces what was previously a whole-request 500 (a failed, non-successful response), so no client that received a successful response before can observe a changed type. The paginated GET /workflows object shape and the aggregate/health object endpoints (GET /dead-letters/aggregate, GET /workers/health) instead gain status/unavailable_shards as always-present ADDITIVE fields (a non-breaking change)."
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
@@ -131,7 +131,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged."
+        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} \u2014 for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged."
       },
       "error_responses": [
         {
@@ -683,7 +683,7 @@
       "path": "/workflows/{id}/stream",
       "category": "workflow",
       "read_only": true,
-      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect — a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq — a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 — end-users stream their own workflows). If no api_with_auth middleware is configured the route is open — embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) — exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
+      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect \u2014 a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq \u2014 a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 \u2014 end-users stream their own workflows). If no api_with_auth middleware is configured the route is open \u2014 embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) \u2014 exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
       "params": [
         {
           "name": "id",
@@ -695,7 +695,7 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
+        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks \u2014 the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) \u2014 the monotonic seq lets the client detect the resulting gap.",
         "free_form": true
       },
       "error_responses": [
@@ -776,7 +776,7 @@
           {
             "name": "conflict_policy",
             "required": false,
-            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
+            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default \u2014 each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not \u2014 except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy \u2014 the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
           },
           {
             "name": "start_at",
@@ -842,7 +842,7 @@
         },
         {
           "status": 401,
-          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior — i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations — e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail — cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
+          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior \u2014 i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations \u2014 e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail \u2014 cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
         },
         {
           "status": 409,
@@ -3263,6 +3263,11 @@
             "name": "created_by",
             "required": false,
             "description": "Optional caller identity for audit."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, resolve the filter across all shards and return a read-only 200 preview of the blast radius (matched_count, per_shard, sample) instead of submitting a job. Performs zero writes and no audit row (issue #769)."
           }
         ]
       },
@@ -3270,7 +3275,8 @@
         "status": 202,
         "fields": [
           "batch_job_id"
-        ]
+        ],
+        "notes": "202 Accepted with {batch_job_id} on a real submit (dry_run false/omitted). When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter, matched_count (exact total across shards), per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} across all shards), sample_cap (100), sample_truncated}. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
       },
       "error_responses": [
         {
@@ -6231,7 +6237,7 @@
       "path": "/admin/gates",
       "category": "admission_gates",
       "read_only": true,
-      "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and — since issue #1053 — the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
+      "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and \u2014 since issue #1053 \u2014 the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": {
@@ -6360,7 +6366,7 @@
       "path": "/admin/tokens",
       "category": "api_tokens",
       "read_only": true,
-      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
+      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned \u2014 only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": {

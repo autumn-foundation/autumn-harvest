@@ -54,7 +54,7 @@ use autumn_harvest::audit::{
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
-    BatchSubmission,
+    BatchSubmission, BatchTargetSample,
 };
 use autumn_harvest::batch_start::{
     BATCH_START_BODY_HARD_LIMIT, BatchStartConfig, BatchStartItem, BatchStartItemResult,
@@ -5664,6 +5664,7 @@ pub const fn management_api_request_fields()
                 "signal_payload",
                 "idempotency_key",
                 "created_by",
+                "dry_run",
             ]),
         ),
         // ── admin ─────────────────────────────────────────────────────────────
@@ -6373,7 +6374,24 @@ pub const fn management_api_response_fields()
         ),
         // ── batch operations ──────────────────────────────────────────────────
         ("GET", "/batch-operations", None), // Vec<BatchJobView> (external model)
-        ("POST", "/batch-operations", Some(&["batch_job_id"])),
+        // Polymorphic: 202 `{batch_job_id}` (real submit) or 200 preview
+        // (`dry_run: true`, issue #769). per_shard/sample are arrays of objects
+        // documented under the contract's success_response.notes.
+        (
+            "POST",
+            "/batch-operations",
+            Some(&[
+                "batch_job_id",
+                "dry_run",
+                "action",
+                "filter",
+                "matched_count",
+                "per_shard",
+                "sample",
+                "sample_cap",
+                "sample_truncated",
+            ]),
+        ),
         ("GET", "/batch-operations/{id}", None), // BatchJobView (external model)
         // ── health & admin ────────────────────────────────────────────────────
         (
@@ -7005,11 +7023,48 @@ struct SubmitBatchOperationRequest {
     /// Optional caller identity (e.g. the on-call handle) for audit.
     #[serde(default)]
     created_by: Option<String>,
+    /// When `true`, resolve the filter and return a read-only preview (200)
+    /// with the exact blast radius instead of submitting a job (issue #769).
+    /// Omitting it (`false`) submits a real batch, byte-for-byte unchanged.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct SubmitBatchOperationResponse {
     batch_job_id: String,
+}
+
+/// Global cap on the dry-run preview sample size across all shards (issue #769).
+const BATCH_DRY_RUN_SAMPLE_CAP: usize = 100;
+
+/// Per-shard matched-count breakdown in a dry-run preview (issue #769).
+#[derive(Debug, Serialize)]
+struct ShardMatchCount {
+    shard_id: i32,
+    matched_count: usize,
+}
+
+/// Read-only dry-run preview of a batch operation's blast radius (issue #769).
+#[derive(Debug, Serialize)]
+struct BatchOperationPreview {
+    /// Always `true` — echoes that this was a preview, not a submission.
+    dry_run: bool,
+    /// The resolved action (`Cancel`/`Terminate`/`Signal`).
+    action: String,
+    /// The normalized filter echoed back.
+    filter: BatchFilter,
+    /// Exact total number of matched executions across all shards.
+    matched_count: usize,
+    /// Per-shard matched-count breakdown; the counts sum to `matched_count`.
+    per_shard: Vec<ShardMatchCount>,
+    /// A bounded sample (≤ `sample_cap`, global across shards) of matched
+    /// executions.
+    sample: Vec<BatchTargetSample>,
+    /// The global sample cap (constant, 100).
+    sample_cap: usize,
+    /// `true` when `matched_count > sample.len()` — the sample is truncated.
+    sample_truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7024,7 +7079,7 @@ async fn submit_batch_operation(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<SubmitBatchOperationRequest>,
-) -> Result<(axum::http::StatusCode, Json<SubmitBatchOperationResponse>), AutumnError> {
+) -> Result<axum::response::Response, AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /batch-operations";
     let idempotency_key = request.idempotency_key.clone();
@@ -7032,15 +7087,19 @@ async fn submit_batch_operation(
     let action: BatchAction = match request.action.parse() {
         Ok(a) => a,
         Err(err_msg) => {
-            batch_submit_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                idempotency_key.as_deref(),
-                &err_msg,
-            )
-            .await;
+            // A dry-run is a read-only preview and writes NO audit row for any
+            // outcome, including a rejected request (issue #769).
+            if !request.dry_run {
+                batch_submit_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    idempotency_key.as_deref(),
+                    &err_msg,
+                )
+                .await;
+            }
             return Err(AutumnError::bad_request_msg(err_msg));
         }
     };
@@ -7051,17 +7110,76 @@ async fn submit_batch_operation(
     for state in &request.filter.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
             let err_msg = format!("unknown workflow state '{state}' in batch filter");
-            batch_submit_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                idempotency_key.as_deref(),
-                &err_msg,
-            )
-            .await;
+            if !request.dry_run {
+                batch_submit_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    idempotency_key.as_deref(),
+                    &err_msg,
+                )
+                .await;
+            }
             return Err(AutumnError::bad_request_msg(err_msg));
         }
+    }
+
+    // Dry-run preview (issue #769): resolve the SAME filter across every shard
+    // via the shared `apply_batch_filters` predicate the real submit uses, and
+    // return a 200 preview with an exact matched_count, a per-shard breakdown,
+    // and a bounded sample. Performs ZERO writes — no job row, no transitions,
+    // no signals, and (per the read-only contract) no audit row. Deliberately
+    // skips the Signal `signal_name` requirement and the signal-payload cap:
+    // the preview reports blast radius, not signal validity.
+    if request.dry_run {
+        if request.filter.is_empty() {
+            return Err(AutumnError::bad_request_msg(batch::BATCH_EMPTY_FILTER_ERR));
+        }
+
+        let pool = api_state.storage_pool().map_err(map_error)?;
+        let mut matched_count: usize = 0;
+        let mut per_shard: Vec<ShardMatchCount> = Vec::new();
+        let mut sample: Vec<BatchTargetSample> = Vec::new();
+
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            let mut conn = acquire_conn(shard_pool).await?;
+            let shard_count = batch::count_targets_on_shard(&mut conn, action, &request.filter)
+                .await
+                .map_err(map_error)?;
+            matched_count += shard_count;
+            per_shard.push(ShardMatchCount {
+                shard_id: shard_id.as_i32(),
+                matched_count: shard_count,
+            });
+            // Global cap: only pull enough to fill the sample to the cap
+            // across ALL shards, not per shard.
+            let remaining = BATCH_DRY_RUN_SAMPLE_CAP.saturating_sub(sample.len());
+            if remaining > 0 {
+                let mut shard_sample = batch::sample_targets_on_shard(
+                    &mut conn,
+                    action,
+                    &request.filter,
+                    i64::try_from(remaining).unwrap_or(i64::MAX),
+                )
+                .await
+                .map_err(map_error)?;
+                sample.append(&mut shard_sample);
+            }
+        }
+
+        let sample_truncated = matched_count > sample.len();
+        let preview = BatchOperationPreview {
+            dry_run: true,
+            action: action.as_str().to_string(),
+            filter: request.filter,
+            matched_count,
+            per_shard,
+            sample,
+            sample_cap: BATCH_DRY_RUN_SAMPLE_CAP,
+            sample_truncated,
+        };
+        return Ok((axum::http::StatusCode::OK, Json(preview)).into_response());
     }
 
     // Enforce the signal payload cap at submission so oversized payloads are
@@ -7135,7 +7253,8 @@ async fn submit_batch_operation(
                 Json(SubmitBatchOperationResponse {
                     batch_job_id: job_id_str,
                 }),
-            ))
+            )
+                .into_response())
         }
     }
 }

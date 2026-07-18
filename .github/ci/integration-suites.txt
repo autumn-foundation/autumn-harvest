@@ -72,6 +72,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
+linux        autumn-harvest-plugin  batch_operations_integration     -                          -
 linux        autumn-harvest-plugin  build_ramp_integration           -                          -
 linux        autumn-harvest-plugin  by_id_integration                -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -

@@ -38,23 +38,67 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-fn init_sql() -> Vec<u8> {
-    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
-}
-
 type HarvestApiApp = axum::Router;
 
-async fn setup_database() -> (String, ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_init_sql(init_sql())
-        .with_tag("16")
-        .start()
+/// Swap the database-name path segment of a Postgres URL, preserving any query
+/// string (so a fresh per-test database can be addressed off an admin URL).
+fn replace_db_name(url: &str, db: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let prefix = base.rsplit_once('/').map_or(base, |(p, _)| p);
+    query.map_or_else(
+        || format!("{prefix}/{db}"),
+        |q| format!("{prefix}/{db}?{q}"),
+    )
+}
+
+/// Provision a pristine, migrated Postgres database for one test.
+///
+/// When `HARVEST_TEST_DATABASE_URL` is set it is treated as an admin base URL:
+/// a fresh, uniquely-named database is created on that server and migrated, so
+/// the exact-count assertions are never contaminated by a sibling test on a
+/// shared server. Otherwise a throwaway testcontainers Postgres is booted
+/// (requires Docker) and the fresh database is created on it. The returned
+/// container (when present) keeps the server alive for the test's duration.
+async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
+    let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        (url, None)
+    } else {
+        let container = Postgres::default()
+            .with_tag("16")
+            .start()
+            .await
+            .expect("postgres container should start");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        (
+            format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+            Some(container),
+        )
+    };
+
+    let fresh_db = format!("harvest_batch_test_{}", uuid::Uuid::new_v4().simple());
+    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
         .await
-        .expect("postgres container should start");
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, container)
+        .expect("connect to admin database");
+    diesel::sql_query(format!("CREATE DATABASE {fresh_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("create fresh test database");
+
+    let db_url = replace_db_name(&admin_url, &fresh_db);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&db_url)
+        .await
+        .expect("connect to fresh test database");
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut conn,
+        autumn_harvest::full_migrations_sql(),
+    )
+    .await
+    .expect("apply migrations to fresh test database");
+
+    (db_url, container)
 }
 
 fn build_pool(url: &str) -> DbPool {
@@ -889,7 +933,7 @@ async fn count_rows_i64(conn: &mut AsyncPgConnection, url: &str) -> (i64, i64, i
     (jobs, tasks, signals)
 }
 
-/// AC2: dry_run returns exact matched_count + per-shard breakdown + a bounded,
+/// AC2: `dry_run` returns exact `matched_count` + per-shard breakdown + a bounded,
 /// truncated sample.
 #[tokio::test]
 async fn dry_run_returns_matched_count_and_sample_capped() {
@@ -1003,7 +1047,7 @@ async fn dry_run_sample_below_cap_not_truncated() {
     assert_eq!(body["sample_cap"].as_u64(), Some(100), "body: {body}");
 }
 
-/// AC3: dry_run performs zero mutations — no job row, no task-queue rows, no
+/// AC3: `dry_run` performs zero mutations — no job row, no task-queue rows, no
 /// signals, no state transitions, no audit rows.
 #[tokio::test]
 async fn dry_run_performs_zero_writes() {
@@ -1080,7 +1124,7 @@ async fn dry_run_performs_zero_writes() {
     );
 }
 
-/// AC2 anti-drift: dry_run matched_count must equal the real submit's resolved
+/// AC2 anti-drift: `dry_run` `matched_count` must equal the real submit's resolved
 /// target count (`total`) for the SAME filter — proving both paths share one
 /// predicate builder.
 #[tokio::test]
@@ -1135,7 +1179,7 @@ async fn dry_run_matches_real_submit_target_count() {
     );
 }
 
-/// AC5: an empty/criteria-less filter is rejected in dry_run mode with the same
+/// AC5: an empty/criteria-less filter is rejected in `dry_run` mode with the same
 /// 400 guard the real submit uses, and writes NO audit row.
 #[tokio::test]
 async fn dry_run_empty_filter_rejected_400() {
@@ -1195,7 +1239,7 @@ async fn dry_run_empty_filter_rejected_400() {
 }
 
 /// AC2 per-action default parity: Terminate with no states must target
-/// state NOT IN (CANCELLED, TERMINATED), same as resolve_targets_on_shard.
+/// state NOT IN (CANCELLED, TERMINATED), same as `resolve_targets_on_shard`.
 #[tokio::test]
 async fn dry_run_terminate_default_excludes_terminal() {
     let (url, _container) = setup_database().await;
@@ -1222,7 +1266,7 @@ async fn dry_run_terminate_default_excludes_terminal() {
     );
 }
 
-/// AC6: a real submit (dry_run omitted) is unchanged — 202 + batch_job_id + a
+/// AC6: a real submit (`dry_run` omitted) is unchanged — 202 + `batch_job_id` + a
 /// persisted job row.
 #[tokio::test]
 async fn real_submit_still_works_and_writes_job() {
