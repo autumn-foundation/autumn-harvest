@@ -54,7 +54,7 @@ use autumn_harvest::audit::{
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
-    BatchSubmission,
+    BatchSubmission, BatchTargetSample,
 };
 use autumn_harvest::batch_start::{
     BATCH_START_BODY_HARD_LIMIT, BatchStartConfig, BatchStartItem, BatchStartItemResult,
@@ -5664,6 +5664,7 @@ pub const fn management_api_request_fields()
                 "signal_payload",
                 "idempotency_key",
                 "created_by",
+                "dry_run",
             ]),
         ),
         // ── admin ─────────────────────────────────────────────────────────────
@@ -6373,7 +6374,30 @@ pub const fn management_api_response_fields()
         ),
         // ── batch operations ──────────────────────────────────────────────────
         ("GET", "/batch-operations", None), // Vec<BatchJobView> (external model)
-        ("POST", "/batch-operations", Some(&["batch_job_id"])),
+        // Polymorphic: 202 `{batch_job_id}` (real submit) or 200 preview
+        // (`dry_run: true`, issue #769). Following the GET /workflows/{id}/stack
+        // and GET /admin/build-routing precedent, every TOP-LEVEL field of both
+        // response shapes is enumerated here AND in the contract's
+        // success_response.fields (the two must match exactly); `notes` is
+        // reserved for the 202-vs-200 polymorphism and the NESTED per_shard /
+        // sample / unavailable_shards object shapes.
+        (
+            "POST",
+            "/batch-operations",
+            Some(&[
+                "batch_job_id",
+                "dry_run",
+                "action",
+                "filter",
+                "matched_count",
+                "per_shard",
+                "sample",
+                "sample_cap",
+                "sample_truncated",
+                "status",
+                "unavailable_shards",
+            ]),
+        ),
         ("GET", "/batch-operations/{id}", None), // BatchJobView (external model)
         // ── health & admin ────────────────────────────────────────────────────
         (
@@ -7005,11 +7029,146 @@ struct SubmitBatchOperationRequest {
     /// Optional caller identity (e.g. the on-call handle) for audit.
     #[serde(default)]
     created_by: Option<String>,
+    /// When `true`, resolve the filter and return a read-only preview (200)
+    /// with the exact blast radius instead of submitting a job (issue #769).
+    /// Omitting it (`false`) submits a real batch, byte-for-byte unchanged.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct SubmitBatchOperationResponse {
     batch_job_id: String,
+}
+
+/// Global cap on the dry-run preview sample size across all shards (issue #769).
+const BATCH_DRY_RUN_SAMPLE_CAP: usize = 100;
+
+/// Per-shard matched-count breakdown in a dry-run preview (issue #769).
+#[derive(Debug, Serialize)]
+struct ShardMatchCount {
+    shard_id: i32,
+    matched_count: usize,
+}
+
+/// Read-only dry-run preview of a batch operation's blast radius (issue #769).
+#[derive(Debug, Serialize)]
+struct BatchOperationPreview {
+    /// Always `true` — echoes that this was a preview, not a submission.
+    dry_run: bool,
+    /// The resolved action (`Cancel`/`Terminate`/`Signal`).
+    action: String,
+    /// The normalized filter echoed back.
+    filter: BatchFilter,
+    /// Total number of matched executions across all REACHABLE shards. When
+    /// `status == "partial"` this is a LOWER BOUND — matches on an unavailable
+    /// shard are not counted.
+    matched_count: usize,
+    /// Per-shard matched-count breakdown for reachable shards; the counts sum
+    /// to `matched_count`.
+    per_shard: Vec<ShardMatchCount>,
+    /// A bounded sample (≤ `sample_cap`, global across shards) of matched
+    /// executions.
+    sample: Vec<BatchTargetSample>,
+    /// The global sample cap (constant, 100).
+    sample_cap: usize,
+    /// `true` when `matched_count > sample.len()` — the sample is truncated.
+    sample_truncated: bool,
+    /// `"complete"` when every shard was reachable, `"partial"` when at least
+    /// one shard could not be queried (mirrors `POST /workflows/batch_reset`).
+    status: &'static str,
+    /// Shards that could not be queried, named with a reason. Empty (and
+    /// omitted from the JSON) on the happy path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unavailable_shards: Vec<UnavailableShard>,
+}
+
+/// One shard's contribution to a dry-run preview (issue #769) — either an
+/// exact count with a (possibly empty) sample, or an unavailable shard with a
+/// reason. The plugin handler builds a `Vec` of these while doing the DB I/O
+/// (skipping the sample query once the global cap is filled) and hands it to
+/// the pure [`fold_batch_shard_previews`] for cross-shard accumulation.
+#[derive(Debug)]
+enum ShardPreviewOutcome {
+    /// A reachable shard: exact `count` of matched executions plus up to the
+    /// remaining global cap of sample rows.
+    Counted {
+        shard_id: i32,
+        count: usize,
+        sample_rows: Vec<BatchTargetSample>,
+    },
+    /// A shard that could not be queried (connection or query failure).
+    Unavailable { shard_id: i32, reason: String },
+}
+
+/// The cross-shard-accumulated parts of a dry-run preview (issue #769),
+/// produced purely (no DB) from per-shard [`ShardPreviewOutcome`]s so the
+/// multi-shard sum / global-sample-cap / partial-degradation logic is unit
+/// testable without a multi-shard database.
+#[derive(Debug)]
+struct FoldedBatchPreview {
+    matched_count: usize,
+    per_shard: Vec<ShardMatchCount>,
+    sample: Vec<BatchTargetSample>,
+    sample_truncated: bool,
+    status: &'static str,
+    unavailable_shards: Vec<UnavailableShard>,
+}
+
+/// Fold per-shard preview outcomes into the cross-shard preview parts
+/// (issue #769): sum the exact counts of reachable shards, fill the GLOBAL
+/// `sample_cap` across shards (NOT per shard), compute `sample_truncated`, and
+/// degrade to `status = "partial"` naming any unavailable shard (mirroring
+/// `POST /workflows/batch_reset`). `matched_count` covers reachable shards
+/// only — a lower bound when any shard is unavailable.
+fn fold_batch_shard_previews(
+    outcomes: Vec<ShardPreviewOutcome>,
+    sample_cap: usize,
+) -> FoldedBatchPreview {
+    let mut matched_count: usize = 0;
+    let mut per_shard: Vec<ShardMatchCount> = Vec::new();
+    let mut sample: Vec<BatchTargetSample> = Vec::new();
+    let mut unavailable_shards: Vec<UnavailableShard> = Vec::new();
+
+    for outcome in outcomes {
+        match outcome {
+            ShardPreviewOutcome::Counted {
+                shard_id,
+                count,
+                sample_rows,
+            } => {
+                matched_count += count;
+                per_shard.push(ShardMatchCount {
+                    shard_id,
+                    matched_count: count,
+                });
+                let remaining = sample_cap.saturating_sub(sample.len());
+                if remaining > 0 {
+                    sample.extend(sample_rows.into_iter().take(remaining));
+                }
+            }
+            ShardPreviewOutcome::Unavailable { shard_id, reason } => {
+                unavailable_shards.push(UnavailableShard { shard_id, reason });
+            }
+        }
+    }
+
+    unavailable_shards.sort_by_key(|s| s.shard_id);
+    let status = if unavailable_shards.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
+    let sample_truncated = matched_count > sample.len();
+
+    FoldedBatchPreview {
+        matched_count,
+        per_shard,
+        sample,
+        sample_truncated,
+        status,
+        unavailable_shards,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -7024,7 +7183,7 @@ async fn submit_batch_operation(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<SubmitBatchOperationRequest>,
-) -> Result<(axum::http::StatusCode, Json<SubmitBatchOperationResponse>), AutumnError> {
+) -> Result<axum::response::Response, AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /batch-operations";
     let idempotency_key = request.idempotency_key.clone();
@@ -7032,15 +7191,19 @@ async fn submit_batch_operation(
     let action: BatchAction = match request.action.parse() {
         Ok(a) => a,
         Err(err_msg) => {
-            batch_submit_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                idempotency_key.as_deref(),
-                &err_msg,
-            )
-            .await;
+            // A dry-run is a read-only preview and writes NO audit row for any
+            // outcome, including a rejected request (issue #769).
+            if !request.dry_run {
+                batch_submit_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    idempotency_key.as_deref(),
+                    &err_msg,
+                )
+                .await;
+            }
             return Err(AutumnError::bad_request_msg(err_msg));
         }
     };
@@ -7051,17 +7214,137 @@ async fn submit_batch_operation(
     for state in &request.filter.states {
         if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
             let err_msg = format!("unknown workflow state '{state}' in batch filter");
-            batch_submit_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                idempotency_key.as_deref(),
-                &err_msg,
-            )
-            .await;
+            if !request.dry_run {
+                batch_submit_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    idempotency_key.as_deref(),
+                    &err_msg,
+                )
+                .await;
+            }
             return Err(AutumnError::bad_request_msg(err_msg));
         }
+    }
+
+    // Dry-run preview (issue #769): resolve the SAME filter across every shard
+    // via the shared `apply_batch_filters` predicate the real submit uses, and
+    // return a 200 preview with an exact matched_count, a per-shard breakdown,
+    // and a bounded sample. Performs ZERO writes — no job row, no transitions,
+    // no signals, and (per the read-only contract) no audit row. Deliberately
+    // skips the Signal `signal_name` requirement and the signal-payload cap:
+    // the preview reports blast radius, not signal validity.
+    if request.dry_run {
+        if request.filter.is_empty() {
+            return Err(AutumnError::bad_request_msg(batch::BATCH_EMPTY_FILTER_ERR));
+        }
+
+        // Fail-closed: a totally-unconfigured storage layer is an honest error,
+        // not a partial-200 (mirrors `observe_shards`). `pools_by_shard` below
+        // returns the live per-shard pools; we still guard here so a boot-window
+        // / misconfigured storage returns the storage error rather than an empty
+        // fan-out.
+        let _pool = api_state.storage_pool().map_err(map_error)?;
+        // Fan out across the ROUTER-KNOWN shard set — every shard with a live
+        // pool AND every shard the router advertises via
+        // `readable_shards`/`default_shard`. A shard mid a shard-add rollout
+        // that this process has no pool for yet is folded into
+        // `unavailable_shards` (→ `status = "partial"`) rather than silently
+        // omitted, which would let `status` read `complete` even though that
+        // shard was never queried (issue #769 review; mirrors
+        // `observe_shards`/`workflow_count`).
+        let pools = crate::shard_fanout::pools_by_shard(&api_state);
+        let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
+        // Track how many sample rows we've already pulled so we can SKIP the
+        // sample query on a shard once the global cap is filled (count-only
+        // continuation). An unreachable shard degrades this preview to
+        // `status = "partial"` instead of failing the whole request with a 500
+        // (mirrors `POST /workflows/batch_reset`).
+        let mut outcomes: Vec<ShardPreviewOutcome> = Vec::new();
+        let mut sample_pulled: usize = 0;
+
+        for (sid, maybe_pool) in resolve_expected_shard_pools(&expected, &pools) {
+            // A shard the router advertises but this process has no pool for yet
+            // (mid a shard-add rollout) is reported unavailable here — never
+            // resolved through a default-shard fallback, which would query the
+            // wrong DB and falsely read `complete`.
+            let Some(shard_pool) = maybe_pool else {
+                outcomes.push(ShardPreviewOutcome::Unavailable {
+                    shard_id: sid,
+                    reason: format!("shard {sid} has no configured storage pool"),
+                });
+                continue;
+            };
+            let mut conn = match acquire_conn(shard_pool).await {
+                Ok(c) => c,
+                Err(e) => {
+                    outcomes.push(ShardPreviewOutcome::Unavailable {
+                        shard_id: sid,
+                        reason: format!("connection unavailable: {e}"),
+                    });
+                    continue;
+                }
+            };
+            let shard_count =
+                match batch::count_targets_on_shard(&mut conn, action, &request.filter).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        outcomes.push(ShardPreviewOutcome::Unavailable {
+                            shard_id: sid,
+                            reason: format!("count query failed: {e}"),
+                        });
+                        continue;
+                    }
+                };
+            // Global cap: only pull enough to fill the sample to the cap across
+            // ALL shards, not per shard — and skip the query entirely once
+            // full.
+            let remaining = BATCH_DRY_RUN_SAMPLE_CAP.saturating_sub(sample_pulled);
+            let sample_rows = if remaining > 0 {
+                match batch::sample_targets_on_shard(
+                    &mut conn,
+                    action,
+                    &request.filter,
+                    i64::try_from(remaining).unwrap_or(i64::MAX),
+                )
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        outcomes.push(ShardPreviewOutcome::Unavailable {
+                            shard_id: sid,
+                            reason: format!("sample query failed: {e}"),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            sample_pulled += sample_rows.len();
+            outcomes.push(ShardPreviewOutcome::Counted {
+                shard_id: sid,
+                count: shard_count,
+                sample_rows,
+            });
+        }
+
+        let folded = fold_batch_shard_previews(outcomes, BATCH_DRY_RUN_SAMPLE_CAP);
+        let preview = BatchOperationPreview {
+            dry_run: true,
+            action: action.as_str().to_string(),
+            filter: request.filter,
+            matched_count: folded.matched_count,
+            per_shard: folded.per_shard,
+            sample: folded.sample,
+            sample_cap: BATCH_DRY_RUN_SAMPLE_CAP,
+            sample_truncated: folded.sample_truncated,
+            status: folded.status,
+            unavailable_shards: folded.unavailable_shards,
+        };
+        return Ok((axum::http::StatusCode::OK, Json(preview)).into_response());
     }
 
     // Enforce the signal payload cap at submission so oversized payloads are
@@ -7135,7 +7418,8 @@ async fn submit_batch_operation(
                 Json(SubmitBatchOperationResponse {
                     batch_job_id: job_id_str,
                 }),
-            ))
+            )
+                .into_response())
         }
     }
 }
@@ -32608,6 +32892,121 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    // ── #769 dry-run preview cross-shard fold (pure, no DB) ────────────────
+    fn sample_rows(n: usize) -> Vec<BatchTargetSample> {
+        (0..n)
+            .map(|i| BatchTargetSample {
+                execution_id: format!("e{i}"),
+                workflow_name: "wf".to_string(),
+                state: "RUNNING".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fold_sums_counts_across_shards() {
+        let outcomes = vec![
+            ShardPreviewOutcome::Counted {
+                shard_id: 0,
+                count: 30,
+                sample_rows: sample_rows(30),
+            },
+            ShardPreviewOutcome::Counted {
+                shard_id: 1,
+                count: 12,
+                sample_rows: sample_rows(12),
+            },
+        ];
+        let f = fold_batch_shard_previews(outcomes, 100);
+        assert_eq!(f.matched_count, 42, "counts sum across shards");
+        assert_eq!(f.per_shard.len(), 2);
+        let per_sum: usize = f.per_shard.iter().map(|s| s.matched_count).sum();
+        assert_eq!(per_sum, 42, "per_shard counts sum to matched_count");
+        assert_eq!(f.status, "complete");
+        assert!(f.unavailable_shards.is_empty());
+        assert!(!f.sample_truncated, "42 matched / 42 sampled -> false");
+        assert_eq!(f.sample.len(), 42);
+    }
+
+    #[test]
+    fn fold_sample_cap_is_global_not_per_shard() {
+        // Two shards each with >100 matches AND 100 sample rows each: the
+        // GLOBAL sample cap is 100, not 100/shard. (The fold enforces the cap
+        // defensively even when the handler's per-shard limiting is bypassed.)
+        let outcomes = vec![
+            ShardPreviewOutcome::Counted {
+                shard_id: 0,
+                count: 150,
+                sample_rows: sample_rows(100),
+            },
+            ShardPreviewOutcome::Counted {
+                shard_id: 1,
+                count: 200,
+                sample_rows: sample_rows(100),
+            },
+        ];
+        let f = fold_batch_shard_previews(outcomes, 100);
+        assert_eq!(f.matched_count, 350);
+        assert_eq!(f.sample.len(), 100, "global cap of 100, not 200");
+        assert!(f.sample_truncated);
+    }
+
+    #[test]
+    fn fold_sample_truncated_boundary() {
+        // Exactly cap matched and cap sampled -> NOT truncated.
+        let at_cap = vec![ShardPreviewOutcome::Counted {
+            shard_id: 0,
+            count: 100,
+            sample_rows: sample_rows(100),
+        }];
+        let f = fold_batch_shard_previews(at_cap, 100);
+        assert_eq!(f.matched_count, 100);
+        assert_eq!(f.sample.len(), 100);
+        assert!(!f.sample_truncated, "100 matched / 100 sampled -> false");
+
+        // One over cap -> truncated.
+        let over = vec![ShardPreviewOutcome::Counted {
+            shard_id: 0,
+            count: 101,
+            sample_rows: sample_rows(100),
+        }];
+        let f = fold_batch_shard_previews(over, 100);
+        assert_eq!(f.matched_count, 101);
+        assert_eq!(f.sample.len(), 100);
+        assert!(f.sample_truncated, "101 matched / 100 sampled -> true");
+    }
+
+    #[test]
+    fn fold_partial_shard_excludes_and_names_unavailable() {
+        let outcomes = vec![
+            ShardPreviewOutcome::Counted {
+                shard_id: 0,
+                count: 20,
+                sample_rows: sample_rows(20),
+            },
+            ShardPreviewOutcome::Unavailable {
+                shard_id: 1,
+                reason: "connection unavailable: boom".to_string(),
+            },
+        ];
+        let f = fold_batch_shard_previews(outcomes, 100);
+        assert_eq!(f.status, "partial");
+        assert_eq!(
+            f.matched_count, 20,
+            "matched_count is a lower bound excluding the unavailable shard"
+        );
+        assert_eq!(f.unavailable_shards.len(), 1);
+        assert_eq!(f.unavailable_shards[0].shard_id, 1);
+        assert!(
+            f.unavailable_shards[0]
+                .reason
+                .contains("connection unavailable")
+        );
+        // per_shard lists only the reachable shard.
+        assert_eq!(f.per_shard.len(), 1);
+        assert_eq!(f.per_shard[0].shard_id, 0);
     }
 
     // P13 (issue #957): the extracted DagRetryFailure carries enough to render a

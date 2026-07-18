@@ -1620,8 +1620,12 @@ enum BatchCommand {
         /// File containing JSON filter definition. Use `-` for stdin.
         #[arg(long, value_name = "PATH", conflicts_with = "filter_json")]
         filter_file: Option<PathBuf>,
-        /// Name of the signal (required if action is Signal).
-        #[arg(long, required_if_eq("action", "Signal"))]
+        /// Name of the signal (required for action Signal unless --dry-run).
+        ///
+        /// Enforced manually in `batch_request` (not via `required_if_eq`) so a
+        /// `Signal --dry-run` preview — which reports blast radius, not signal
+        /// validity — can omit it (issue #769).
+        #[arg(long)]
         signal_name: Option<String>,
         /// Inline JSON signal payload.
         #[arg(long, conflicts_with = "signal_payload_file")]
@@ -1629,6 +1633,12 @@ enum BatchCommand {
         /// File containing JSON signal payload. Use `-` for stdin.
         #[arg(long, value_name = "PATH", conflicts_with = "signal_payload_json")]
         signal_payload_file: Option<PathBuf>,
+        /// Preview the blast radius (count + sample) without submitting a job.
+        #[arg(long)]
+        dry_run: bool,
+        /// With --dry-run, print the raw JSON preview instead of a table.
+        #[arg(long, requires = "dry_run")]
+        json: bool,
     },
 }
 
@@ -2674,6 +2684,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if run_chain_wants_table(cli) {
         return Ok(format_run_chain_table(value));
     }
+    if batch_preview_wants_table(cli) {
+        return Ok(format_batch_preview_table(value));
+    }
     if handoff_wants_table(cli) {
         return Ok(format_handoff_table(value));
     }
@@ -2705,6 +2718,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     let output = if workflow_children_wants_raw_json(cli)
         || workflow_summaries_wants_raw_json(cli)
         || run_chain_wants_raw_json(cli)
+        || batch_preview_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
@@ -3579,6 +3593,97 @@ fn workflow_reachability_request(command: &WorkflowTypesCommand) -> ApiRequest {
 
 const fn workflow_reachability_should_gate(cli: &Cli) -> bool {
     matches!(&cli.command, Commands::WorkflowTypes { .. })
+}
+
+/// `batch submit --dry-run` renders the preview as a table by default (#769).
+///
+/// Pass `--json` for the raw preview body. A real submit (no `--dry-run`) falls
+/// through to the default JSON renderer, so its `{batch_job_id}` output is
+/// unchanged.
+fn batch_preview_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Batch {
+            command: BatchCommand::Submit {
+                dry_run: true,
+                json: false,
+                ..
+            }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn batch_preview_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Batch {
+            command: BatchCommand::Submit {
+                dry_run: true,
+                json: true,
+                ..
+            }
+        }
+    )
+}
+
+/// Render a #769 dry-run batch preview as a human-readable table.
+fn format_batch_preview_table(value: &Value) -> String {
+    use std::fmt::Write as _;
+
+    let action = cell_str(value.get("action"));
+    let matched = cell_number(value.get("matched_count"));
+    let truncated = value
+        .get("sample_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut out = String::new();
+    out.push_str("DRY RUN — no changes made\n");
+    let _ = writeln!(out, "action:        {action}");
+    let _ = writeln!(out, "matched_count: {matched}");
+
+    if let Some(per_shard) = value.get("per_shard").and_then(Value::as_array)
+        && !per_shard.is_empty()
+    {
+        out.push_str("per_shard:\n");
+        for s in per_shard {
+            let _ = writeln!(
+                out,
+                "  shard {:<4} {}",
+                cell_number(s.get("shard_id")),
+                cell_number(s.get("matched_count"))
+            );
+        }
+    }
+
+    let sample = value
+        .get("sample")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let _ = writeln!(out, "sample ({} shown):", sample.len());
+    let _ = writeln!(
+        out,
+        "  {:<38} {:<24} STATE",
+        "EXECUTION_ID", "WORKFLOW_NAME"
+    );
+    for row in &sample {
+        let _ = writeln!(
+            out,
+            "  {:<38} {:<24} {}",
+            cell_str(row.get("execution_id")),
+            cell_str(row.get("workflow_name")),
+            cell_str(row.get("state")),
+        );
+    }
+    if truncated {
+        let _ = writeln!(
+            out,
+            "(sample truncated: {} of {matched} shown)",
+            sample.len()
+        );
+    }
+    out
 }
 
 fn workflow_reachability_wants_table(cli: &Cli) -> bool {
@@ -5318,7 +5423,17 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
             signal_name,
             signal_payload_json,
             signal_payload_file,
+            dry_run,
+            json: _,
         } => {
+            // A non-dry-run Signal submit requires signal_name (enforced here
+            // rather than via clap's `required_if_eq`, so a `Signal --dry-run`
+            // preview — blast radius only, not signal validity — may omit it).
+            if action == "Signal" && signal_name.is_none() && !*dry_run {
+                return Err(CliError::InvalidInput(
+                    "--signal-name is required for action Signal (unless --dry-run)".to_string(),
+                ));
+            }
             let filter = parse_json_source(
                 filter_json.as_deref(),
                 filter_file.as_deref(),
@@ -5337,6 +5452,11 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
                 "signal payload JSON",
             )? {
                 body.insert("signal_payload".to_string(), payload);
+            }
+            // Only add the key when set, so a real-submit body stays
+            // byte-identical to a pre-#769 client (issue #769).
+            if *dry_run {
+                body.insert("dry_run".to_string(), json!(true));
             }
             Ok(ApiRequest::post(
                 "/batch-operations",
@@ -8664,5 +8784,117 @@ mod token_bootstrap_tests {
             token.insert_sql
         );
         assert!(!token.insert_sql.contains(&token.secret));
+    }
+
+    #[test]
+    fn batch_preview_table_renders_count_sample_and_truncation() {
+        let payload = serde_json::json!({
+            "dry_run": true,
+            "action": "Cancel",
+            "matched_count": 150,
+            "per_shard": [{ "shard_id": 0, "matched_count": 150 }],
+            "sample": [
+                { "execution_id": "e1", "workflow_name": "onboarding", "state": "RUNNING" },
+                { "execution_id": "e2", "workflow_name": "onboarding", "state": "RUNNING" }
+            ],
+            "sample_cap": 100,
+            "sample_truncated": true
+        });
+        let out = format_batch_preview_table(&payload);
+        assert!(out.contains("DRY RUN"), "table: {out}");
+        assert!(out.contains("matched_count: 150"), "table: {out}");
+        assert!(out.contains("onboarding"), "sample rendered: {out}");
+        assert!(
+            out.contains("e1") && out.contains("e2"),
+            "ids rendered: {out}"
+        );
+        // N2: the per_shard breakdown block renders.
+        assert!(out.contains("shard"), "per_shard block rendered: {out}");
+        assert!(
+            out.contains("truncated: 2 of 150 shown"),
+            "truncation note: {out}"
+        );
+    }
+
+    /// M5: `batch submit --dry-run --json` renders the RAW compact preview body
+    /// (no table header / `DRY RUN` banner), so `--json` output is pipeable.
+    #[test]
+    fn batch_preview_dry_run_json_renders_compact_body() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "harvest",
+            "batch",
+            "submit",
+            "Cancel",
+            "--filter-json",
+            r#"{"workflow_name":"x"}"#,
+            "--dry-run",
+            "--json",
+        ])
+        .expect("CLI should parse");
+        let value = serde_json::json!({
+            "dry_run": true,
+            "action": "Cancel",
+            "matched_count": 42,
+            "per_shard": [{ "shard_id": 0, "matched_count": 42 }],
+            "sample": [],
+            "sample_cap": 100,
+            "sample_truncated": false,
+            "status": "complete"
+        });
+        let out = render_response(&cli, &value).expect("render");
+        assert!(out.contains("\"matched_count\""), "raw JSON body: {out}");
+        assert!(!out.contains("DRY RUN"), "no table banner in --json: {out}");
+        // Compact (not pretty): no multi-space indentation.
+        assert!(!out.contains("\n  "), "compact, not pretty-printed: {out}");
+    }
+
+    /// N1: `--json` without `--dry-run` is rejected at clap parse time
+    /// (`requires = "dry_run"`).
+    #[test]
+    fn batch_submit_json_without_dry_run_rejected() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "harvest",
+            "batch",
+            "submit",
+            "Cancel",
+            "--filter-json",
+            r#"{"workflow_name":"x"}"#,
+            "--json",
+        ]);
+        assert!(
+            result.is_err(),
+            "--json without --dry-run must be a clap parse error"
+        );
+    }
+
+    #[test]
+    fn batch_preview_wants_table_only_with_dry_run() {
+        fn parse_cli(args: &[&str]) -> Cli {
+            <Cli as clap::Parser>::try_parse_from(
+                std::iter::once("harvest").chain(args.iter().copied()),
+            )
+            .expect("CLI should parse")
+        }
+        let base = &[
+            "batch",
+            "submit",
+            "Cancel",
+            "--filter-json",
+            r#"{"workflow_name":"x"}"#,
+        ];
+
+        let with_dry = parse_cli(&[base.as_slice(), &["--dry-run"]].concat());
+        assert!(batch_preview_wants_table(&with_dry));
+        assert!(!batch_preview_wants_raw_json(&with_dry));
+
+        let dry_json = parse_cli(&[base.as_slice(), &["--dry-run", "--json"]].concat());
+        assert!(!batch_preview_wants_table(&dry_json));
+        assert!(batch_preview_wants_raw_json(&dry_json));
+
+        let real = parse_cli(base);
+        assert!(
+            !batch_preview_wants_table(&real),
+            "real submit must not table-render"
+        );
     }
 }

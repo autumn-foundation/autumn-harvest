@@ -3263,14 +3263,30 @@
             "name": "created_by",
             "required": false,
             "description": "Optional caller identity for audit."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, resolve the filter across all shards and return a read-only 200 preview of the blast radius (matched_count, per_shard, sample) instead of submitting a job. Performs zero writes and no audit row (issue #769)."
           }
         ]
       },
       "success_response": {
         "status": 202,
         "fields": [
-          "batch_job_id"
-        ]
+          "batch_job_id",
+          "dry_run",
+          "action",
+          "filter",
+          "matched_count",
+          "per_shard",
+          "sample",
+          "sample_cap",
+          "sample_truncated",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Polymorphic response. A real submit (dry_run false/omitted) returns 202 Accepted with {batch_job_id}. When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter (the normalized filter echoed back), matched_count, per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} rows ordered by id ascending, global across all shards), sample_cap (100), sample_truncated (matched_count > sample.len()), status ('complete'|'partial'), unavailable_shards (array of {shard_id, reason}, omitted when empty)}. Partial-shard degradation (mirrors POST /workflows/batch_reset): when a shard is unreachable the preview returns 200 with status='partial' naming the unavailable shard instead of failing with a 500 — and matched_count is then a LOWER BOUND over reachable shards only. A dry_run is admin-only (this route is Mutating) and does NOT validate signal_name/payload — the real submit may still 400. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
       },
       "error_responses": [
         {

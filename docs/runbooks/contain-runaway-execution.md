@@ -293,6 +293,77 @@ events appending) and — for a run with deadlines — that `deadline_at` (and
 `sla_deadline_at`, if it was still ahead when the pause began) moved forward
 by roughly `pause_duration_secs`.
 
+## Fleet-wide batch: preview before you commit (#769)
+
+Pause/cancel/terminate above act on a **single** execution. To act on *every*
+workflow matching a filter — cancel everything triggered by a bad release,
+signal every in-flight onboarding onto a fallback path, terminate runaway DAG
+runs from a misconfigured schedule — use the batch API
+(`POST /api/harvest/batch-operations`, actions `Cancel`/`Terminate`/`Signal`).
+It is the single most destructive engine surface: it fans out across **all
+shards** and acts on the entire match set at once.
+
+**Always preview the blast radius first.** A `dry_run: true` request resolves
+the exact same filter — the same per-action state defaults, the same
+`workflow_name`/`search_attrs` predicates — as a real submit (they share one
+predicate builder, so the preview can never drift from what a real submit would
+act on), and returns a read-only `200` with an exact `matched_count`, a
+per-shard breakdown, and a bounded sample. It performs **zero** writes: no
+workflow transitions, no signals, no task-queue rows, no job row, and no audit
+row.
+
+```bash
+# 1. Preview — read-only, no changes. Confirm matched_count and the sample.
+harvest batch submit Cancel --filter-json '{"workflow_name":"onboarding","states":["RUNNING"]}' --dry-run
+
+#    (or over HTTP:)
+curl -sS -X POST "$HARVEST/api/harvest/batch-operations" \
+  -H 'content-type: application/json' \
+  -d '{"action":"Cancel","filter":{"workflow_name":"onboarding","states":["RUNNING"]},"dry_run":true}'
+# -> 200 { "dry_run": true, "action": "Cancel", "filter": {...},
+#          "matched_count": 4231, "per_shard": [{"shard_id":0,"matched_count":4231}],
+#          "sample": [{"execution_id":"…","workflow_name":"onboarding","state":"RUNNING"}, …],
+#          "sample_cap": 100, "sample_truncated": true }
+
+# 2. Only when the count and sample match your intent, re-run WITHOUT --dry-run
+#    to commit. This is the byte-for-byte real submit (202 + batch_job_id).
+harvest batch submit Cancel --filter-json '{"workflow_name":"onboarding","states":["RUNNING"]}'
+```
+
+`sample` is capped at 100 rows globally across shards (ordered by `id`
+ascending, so repeated previews of the same filter are reproducible);
+`sample_truncated` is `true` when `matched_count` exceeds what the sample shows.
+An empty / criteria-less filter is rejected `400` with the same guard as a real
+submit, so a preview can never resolve to "act on everything". Because the
+preview writes nothing (not even an audit row), running it as often as you like
+during an incident is free — make it a required step before any batch mutation.
+
+**Caveats — read before you trust a preview:**
+
+- **The preview is admin-only.** `POST /batch-operations` is a `Mutating`
+  route (the DLQ bulk-operation precedent), so a read-only principal cannot run
+  a `dry_run` preview. Use an admin credential.
+- **A `Signal` preview does NOT validate `signal_name` or the payload.** It
+  reports blast radius only — you can (and, from the CLI, may) omit
+  `--signal-name` entirely for a `Signal --dry-run`. The real submit still
+  enforces the `signal_name` requirement and the signal-payload cap, so a
+  preview that shows a clean match set can still `400` on submit. Confirm the
+  signal name separately.
+- **On `status: "partial"`, `matched_count` is a LOWER BOUND.** If a shard is
+  unreachable the preview degrades to `200` with `status: "partial"` and names
+  the shard in `unavailable_shards` (mirroring `POST /workflows/batch_reset`)
+  instead of failing the whole request with a `500`. The reported
+  `matched_count` and `per_shard` then cover reachable shards only — the true
+  blast radius is at least that large. Re-run once every shard is reachable
+  (`status: "complete"`) before committing a batch you sized off a partial
+  preview.
+- **On a single large shard, the count is a full sequential scan.** The
+  `<1s`-ish preview latency assumes a sharded fleet. A state-only-default filter
+  (e.g. `Cancel` with no explicit `states`, matching `state IN
+  ('RUNNING','PAUSED')`) on one large shard is an unindexed `COUNT(*)`
+  sequential scan and can be slow at high execution volume — narrow the filter
+  (add a `workflow_name`) when previewing against a big single-shard database.
+
 ## Related
 
 - `docs/operations/admission-gate-producers.md` — pause/cancel/terminate act on

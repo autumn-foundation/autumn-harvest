@@ -152,6 +152,26 @@ pub struct BatchTargetError {
 /// Default cap on concurrent per-target operations dispatched by the executor.
 pub const DEFAULT_BATCH_CONCURRENCY: u32 = 32;
 
+/// Guard message returned when a batch filter has no narrowing criterion.
+///
+/// Shared verbatim by the real-submit path ([`db::submit_batch_job`]) and the
+/// dry-run preview branch in the plugin so both reject an "act on everything"
+/// filter with an identical `400` (issue #769).
+pub const BATCH_EMPTY_FILTER_ERR: &str =
+    "batch filter must specify at least one criterion: state, workflow_name, or search_attrs";
+
+/// One row of the dry-run preview sample (issue #769): a single matched
+/// execution rendered for operator inspection before committing a batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchTargetSample {
+    /// The matched execution's id (UUID string).
+    pub execution_id: String,
+    /// The matched execution's `workflow_name`.
+    pub workflow_name: String,
+    /// The matched execution's current `state`.
+    pub state: String,
+}
+
 #[cfg(feature = "db")]
 #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 mod db {
@@ -202,7 +222,7 @@ mod db {
         }
         if request.filter.is_empty() {
             return Err(HarvestError::Config(
-                "batch filter must specify at least one criterion: state, workflow_name, or search_attrs".to_string(),
+                super::BATCH_EMPTY_FILTER_ERR.to_string(),
             ));
         }
 
@@ -531,15 +551,23 @@ mod db {
     /// (excludes `CANCELLED` and `TERMINATED`) because its whole purpose is to
     /// seal stuck live rows as `TERMINATED` (already-terminal rows are
     /// idempotent no-ops).
-    async fn resolve_targets_on_shard(
-        conn: &mut AsyncPgConnection,
+    /// Apply the per-action state defaults, `workflow_name`, and each
+    /// `search_attrs @> $jsonb` containment predicate onto a boxed
+    /// `harvest_workflow_executions` query.
+    ///
+    /// This is the SINGLE predicate builder shared by [`resolve_targets_on_shard`]
+    /// (the real submit), [`count_targets_on_shard`], and
+    /// [`sample_targets_on_shard`] (both the dry-run preview, issue #769). Any
+    /// change to the matching logic lands in exactly one place, so a dry-run
+    /// preview can never drift from what a real submit would act on.
+    fn apply_batch_filters<'a>(
+        mut query: crate::schema::harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
         action: BatchAction,
         filter: &BatchFilter,
-    ) -> HarvestResult<Vec<ExecutionId>> {
+    ) -> crate::schema::harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
         use diesel::dsl::sql;
         use diesel::sql_types::{Bool, Jsonb};
 
-        let mut query = harvest_workflow_executions::table.into_boxed();
         if filter.states.is_empty() {
             match action {
                 BatchAction::Terminate => {
@@ -565,14 +593,86 @@ mod db {
             query =
                 query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate.clone()));
         }
-        let rows: Vec<WorkflowExecution> = query
-            .select(WorkflowExecution::as_select())
-            .load(conn)
-            .await
-            .map_err(database_error)?;
+        query
+    }
+
+    async fn resolve_targets_on_shard(
+        conn: &mut AsyncPgConnection,
+        action: BatchAction,
+        filter: &BatchFilter,
+    ) -> HarvestResult<Vec<ExecutionId>> {
+        let rows: Vec<WorkflowExecution> = apply_batch_filters(
+            harvest_workflow_executions::table.into_boxed(),
+            action,
+            filter,
+        )
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
         Ok(rows
             .into_iter()
             .map(|row| ExecutionId::from_uuid(row.id))
+            .collect())
+    }
+
+    /// Count the exact number of executions a batch would act on for `filter`
+    /// on this shard (issue #769).
+    ///
+    /// Shares [`apply_batch_filters`] with the real submit so the dry-run
+    /// `matched_count` can never drift from the resolved target set. No row cap.
+    pub async fn count_targets_on_shard(
+        conn: &mut AsyncPgConnection,
+        action: BatchAction,
+        filter: &BatchFilter,
+    ) -> HarvestResult<usize> {
+        let count: i64 = apply_batch_filters(
+            harvest_workflow_executions::table.into_boxed(),
+            action,
+            filter,
+        )
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Return up to `limit` matched executions for `filter` on this shard as
+    /// [`BatchTargetSample`] rows for the dry-run preview (issue #769).
+    ///
+    /// Shares [`apply_batch_filters`] with the real submit and the count so the
+    /// sample reflects exactly the executions the batch would act on. Ordered
+    /// by `id` ascending so the preview sample is deterministic and reproducible
+    /// across repeated dry-runs of the same filter.
+    pub async fn sample_targets_on_shard(
+        conn: &mut AsyncPgConnection,
+        action: BatchAction,
+        filter: &BatchFilter,
+        limit: i64,
+    ) -> HarvestResult<Vec<super::BatchTargetSample>> {
+        let rows: Vec<(Uuid, String, String)> = apply_batch_filters(
+            harvest_workflow_executions::table.into_boxed(),
+            action,
+            filter,
+        )
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::state,
+        ))
+        .order(harvest_workflow_executions::id.asc())
+        .limit(limit)
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, workflow_name, state)| super::BatchTargetSample {
+                execution_id: ExecutionId::from_uuid(id).to_string(),
+                workflow_name,
+                state,
+            })
             .collect())
     }
 
@@ -812,9 +912,9 @@ mod db {
 
 #[cfg(feature = "db")]
 pub use db::{
-    BatchExecutorConfig, BatchJobView, BatchSubmission, ListFilters, get_batch_job,
-    list_batch_jobs, mark_completed, mark_failed, mark_running, open_jobs, record_progress,
-    run_executor_once, submit_batch_job,
+    BatchExecutorConfig, BatchJobView, BatchSubmission, ListFilters, count_targets_on_shard,
+    get_batch_job, list_batch_jobs, mark_completed, mark_failed, mark_running, open_jobs,
+    record_progress, run_executor_once, sample_targets_on_shard, submit_batch_job,
 };
 
 #[cfg(test)]
