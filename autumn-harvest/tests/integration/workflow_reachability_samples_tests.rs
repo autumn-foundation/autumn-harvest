@@ -163,3 +163,56 @@ async fn non_terminal_counts_return_bounded_execution_id_samples() {
         );
     }
 }
+
+#[tokio::test]
+async fn non_terminal_counts_samples_are_oldest_first() {
+    // AC2 ordering: the per-shard sample is `started_at ASC, id ASC` — the
+    // oldest (most likely stuck) runs, in order. Seed 6 non-terminal runs whose
+    // `started_at` order is the REVERSE of insertion order, so a sample ordered
+    // by insertion/id (rather than `started_at`) would fail this assertion.
+    let (url, _container) = setup_db().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+
+    diesel::sql_query(
+        "DELETE FROM harvest_workflow_executions WHERE workflow_name = 'reach_order'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("scrub");
+
+    let base: chrono::DateTime<chrono::Utc> = Utc::now();
+    // (started_at, id) for each seeded run. started_at = base - n minutes, so a
+    // later-inserted row is OLDER — insertion order and started_at order diverge.
+    let mut by_started: Vec<(chrono::DateTime<chrono::Utc>, uuid::Uuid)> = Vec::new();
+    for n in 0..6 {
+        let id = insert_execution(&mut conn, "reach_order", &format!("ord-{n}"), "RUNNING").await;
+        let started_at = base - chrono::Duration::minutes(i64::from(n));
+        diesel::update(
+            autumn_harvest::schema::harvest_workflow_executions::table.find(id.as_uuid()),
+        )
+        .set(autumn_harvest::schema::harvest_workflow_executions::started_at.eq(started_at))
+        .execute(&mut conn)
+        .await
+        .expect("set started_at");
+        by_started.push((started_at, id.as_uuid()));
+    }
+
+    // The 5 oldest by (started_at ASC, id ASC) — the exact SQL ordering.
+    by_started.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let expected_oldest_5: Vec<uuid::Uuid> = by_started
+        .iter()
+        .take(REACHABILITY_SAMPLE_CAP)
+        .map(|(_, id)| *id)
+        .collect();
+
+    let rows = non_terminal_counts_by_workflow_name(&mut conn, Some(0), Some("reach_order"))
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1, "exactly one type row");
+    let row = &rows[0];
+    assert_eq!(row.non_terminal_count, 6);
+    assert_eq!(
+        row.sample_execution_ids, expected_oldest_5,
+        "samples must be exactly the 5 oldest by started_at, in ascending order"
+    );
+}
