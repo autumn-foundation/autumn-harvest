@@ -577,7 +577,13 @@ async fn completed_run_matching_handler_is_clean() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    let (input, events) = progress_history(&["a", "b"], false);
+    let (input, mut events) = progress_history(&["a", "b"], false);
+    // A real COMPLETED run always seals its history with `WorkflowCompleted`;
+    // the seal-gate (issue #614) 410s a terminal execution whose history is
+    // truncated before its seal, so seed the realistic terminal history.
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    });
     let exec = seed_execution(&pool, "progress_wf", "COMPLETED", input, events, false).await;
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
@@ -594,7 +600,15 @@ async fn history_diverging_from_handler_is_diverged() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    let (input, events) = diverging_history();
+    let (input, mut events) = diverging_history();
+    // A real COMPLETED run (recorded under old code that scheduled
+    // `renamed_activity`) seals with `WorkflowCompleted`; the divergence is
+    // detected at event index 1, well before this trailing seal, so the
+    // `diverged` verdict is unchanged while the seal-gate (issue #614) is
+    // satisfied.
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    });
     let exec = seed_execution(&pool, "progress_wf", "COMPLETED", input, events, false).await;
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
@@ -626,7 +640,16 @@ async fn failed_run_is_diagnosable_retroactively() {
     // should_fail=true → the handler returns Err after processing all items, so a
     // faithful replay reports `workflow_failed` (AC4: retroactive forensics on a
     // terminal FAILED run, still a 200).
-    let (input, events) = progress_history(&["a"], true);
+    let (input, mut events) = progress_history(&["a"], true);
+    // A real FAILED run always seals its history with `WorkflowFailed`; the
+    // seal-gate (issue #614) 410s a terminal execution truncated before its
+    // seal, so seed the realistic terminal history.
+    events.push(WorkflowEvent::WorkflowFailed {
+        error: "activity failed after processing all items".into(),
+        error_type: None,
+        details: None,
+        non_retryable: None,
+    });
     let exec = seed_execution(&pool, "progress_wf", "FAILED", input, events, false).await;
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
@@ -701,13 +724,58 @@ async fn erased_history_returns_410() {
     assert_eq!(status, StatusCode::GONE);
 }
 
+/// Issue #614 seal-gate (Codex review): a TERMINAL execution whose recorded
+/// event rows are truncated BEFORE its terminal lifecycle event (pruned by
+/// retention / released on reset — incomplete, not PII-erased) replays only to
+/// a frontier suspension, which canary would report as `clean` — falsely
+/// implying "no divergence, safe to rule out" for a run whose real seal we can
+/// no longer see. Refuse it with 410, mirroring the #612 terminal-query path
+/// (`classify_terminal_query` maps a terminal execution with no seal to
+/// `HistoryUnavailable`). Here the state is `TIMED_OUT` (terminal) but the
+/// seeded history has NO `WorkflowExecutionTimedOut` seal.
+#[tokio::test]
+async fn terminal_run_with_truncated_history_returns_410() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let input = json!({ "items": ["a"], "should_fail": false });
+    let activity_id = ActivityExecId::new();
+    // Seal-less prefix: WorkflowStarted + ActivityScheduled, NO terminal
+    // lifecycle event.
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "process_item".into(),
+            input: json!("a"),
+            queue: "default".into(),
+        },
+    ];
+    let exec = seed_execution(&pool, "progress_wf", "TIMED_OUT", input, events, false).await;
+
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+}
+
 #[tokio::test]
 async fn diagnosis_performs_no_writes() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    let (input, events) = progress_history(&["a", "b", "c"], false);
+    let (input, mut events) = progress_history(&["a", "b", "c"], false);
+    // A real COMPLETED run always seals its history with `WorkflowCompleted`
+    // (issue #614 seal-gate); seed the realistic terminal history.
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    });
     let exec = seed_execution(&pool, "progress_wf", "COMPLETED", input, events, false).await;
 
     let before_events = count_events(&pool, exec).await;

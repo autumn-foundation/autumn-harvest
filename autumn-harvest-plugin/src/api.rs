@@ -25951,12 +25951,16 @@ async fn run_replay_canary_handler(
 ///     replays to its verdict regardless of wall-clock duration, bounded only by
 ///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
 ///     replay budget, issue #135).
-///   * `410` — history unavailable: pruned by retention, released on reset, or
-///     PII-erased (issue #495).
+///   * `410` — history unavailable: a terminal execution whose recorded history
+///     is incomplete (truncated before its terminal seal — pruned by retention
+///     or released on reset), or a terminal execution whose payloads were
+///     PII-erased (issue #495). Both would yield a misleading verdict, so they
+///     are refused, mirroring the #612 terminal-query path.
 ///
 /// Read-only (AC3): the DB connection is dropped before user code is driven, and
 /// the replay itself is pure in-memory replay that appends no events and performs
 /// no writes. No audit row is written.
+#[allow(clippy::too_many_lines)]
 async fn replay_diagnosis(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -26052,6 +26056,28 @@ async fn replay_diagnosis(
     // is moved into the snapshot (issue #614 FIX 3).
     let history_reached_seal = history_reached_terminal_seal(&history.events);
     let terminal_state = is_terminal_state(&state);
+
+    // 410 — a TERMINAL execution whose recorded event rows are truncated BEFORE
+    // the terminal lifecycle event (pruned by retention / released on reset /
+    // otherwise incomplete). Such a prefix-only history replays to a frontier
+    // suspension, which canary treats as `clean` — falsely implying "no
+    // divergence, safe to rule out" for a run whose real seal we can no longer
+    // see. Refuse it exactly as the #612 sibling terminal-query path does
+    // (`classify_terminal_query` maps a terminal execution with no seal to
+    // `HistoryUnavailable`), rather than serving a misleading verdict.
+    //
+    // Gate ONLY terminal executions: a seal-less prefix is the NORMAL, expected
+    // shape of a healthy in-flight RUNNING/PAUSED/SUSPENDED run (the endpoint's
+    // headline case) — those must still proceed to the canary replay and report
+    // `clean`/`diverged`. Ordered after the O(1) erased-guard (which already
+    // 410s the terminal-erased subset before history is even loaded), so this
+    // catches the remaining truncated-but-not-erased terminal histories.
+    if terminal_state && !history_reached_seal {
+        return Err(map_error(HarvestError::HistoryUnavailable {
+            exec_id,
+            reason: "terminal execution history is incomplete (no terminal seal)".to_string(),
+        }));
+    }
 
     // Thread the execution row's own execution_timeout / deadline_at / parent id /
     // workflow_id / context headers into the snapshot (issues #772, #698, #481) —

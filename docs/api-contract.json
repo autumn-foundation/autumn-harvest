@@ -728,7 +728,7 @@
         },
         {
           "status": 410,
-          "description": "History unavailable: pruned by retention, released on reset, or PII-erased (issue #495)."
+          "description": "History unavailable (terminal executions only): the recorded history is truncated before its terminal seal (pruned by retention or released on reset), or the payloads were PII-erased (issue #495). Both would yield a misleading verdict, so they are refused, mirroring the #612 terminal-query path."
         },
         {
           "status": 500,

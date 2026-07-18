@@ -20,8 +20,14 @@ the replay path). The AC5 `not_registered`/`not_replayable_dag` verdicts are res
 pre-check (`runtime.registry.workflows.contains_key` then `runtime.is_registered_dag`) BEFORE any
 history is loaded. Non-`200` statuses are reserved for the resource itself: `400` (malformed id),
 `404` (unknown execution), `408` (replay exceeded the `WorkerConfig::query_timeout` budget), `410`
-(history unavailable — pruned by retention, released on reset, or PII-erased per issue #495, gated
-by the terminal-only O(1) `erase::execution_input_is_erased` row check, mirroring #612).
+(history unavailable, on either of two terminal-only gates mirroring the #612 terminal-query path:
+a terminal execution whose recorded history is truncated BEFORE its terminal seal — pruned by
+retention or released on reset — gated by `executor::history_reached_terminal_seal` since such a
+prefix-only history replays to a frontier suspension that canary would falsely report as `clean`
+(Codex review); or a terminal execution whose payloads were PII-erased per issue #495, gated by
+the terminal-only O(1) `erase::execution_input_is_erased` row check). Both gate ONLY terminal
+executions — a seal-less prefix is the NORMAL shape of a healthy in-flight RUNNING/PAUSED/SUSPENDED
+run, which still replays to a real `clean`/`diverged` verdict.
 
 **Read-only / zero-writes (AC3).** New pure plugin module `autumn-harvest-plugin/src/replay_diagnosis.rs`
 owns the serializable DTOs (`ReplayDiagnosisResponse`, `DiagnosisVerdict`, `DivergenceDetail`,
@@ -32,7 +38,9 @@ discipline: load the execution (shard-routed via `db_conn_for_execution`), run t
 AC5 pre-checks, load the history (via `store::load_history_inflated` with the runtime's own
 `PayloadCodecs` + registry offloader, so an encrypted (#608) or offloaded (#524) history replays as
 the live worker sees it — the default no-codec/no-offloader path is byte-identical to `load_history`),
-**drop the DB connection**, then build a `HistorySnapshot` from the execution row + history
+**drop the DB connection**, apply the terminal-only truncated-history seal-gate/410 (Codex review;
+`executor::history_reached_terminal_seal` — a terminal execution with no seal is refused before
+replay, mirroring #612), then build a `HistorySnapshot` from the execution row + history
 (threading its own `execution_timeout`/`deadline_at`/`parent_id`/`workflow_id`/`context_headers` per
 #772/#698/#481 so a deadline-/parent-/header-aware run replays cleanly instead of false-reporting
 non-determinism) and replay via `WorkflowReplayer::replay_canary_snapshot` (drop-first, so no pool
