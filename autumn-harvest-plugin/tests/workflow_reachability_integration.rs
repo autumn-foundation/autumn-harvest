@@ -4,6 +4,7 @@
 //! `?workflow_type=` filter, cross-shard aggregation with an unreachable shard
 //! reported as `partial`, and the admin auth boundary.
 
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,8 +24,8 @@ use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
 use autumn_harvest_plugin::workflow_reachability::{
-    StartupOrphanDecision, WorkflowReachabilityQuery, build_workflow_reachability_report,
-    startup_orphan_decision,
+    StartupOrphanDecision, WorkflowReachabilityQuery, build_reachability_report_single_shard,
+    build_workflow_reachability_report, startup_orphan_decision,
 };
 use autumn_web::reexports::axum;
 use axum::body::Body;
@@ -697,4 +698,155 @@ async fn boot_gate_fail_action_allows_clean_boot() {
         StartupOrphanDecision::Continue,
         "fail with zero orphans must allow boot",
     );
+}
+
+// -------------------------------------------------------------------------
+// Issue #700 AC4 (P1 fix): the boot-time orphan gate runs BEFORE workers spawn.
+//
+// The production race (a worker claiming/failing an orphaned run in the boot
+// window before an after-the-fact abort) cannot be booted from a test — the
+// only entry point, the private `start_harvest_runtime`, is pool/migration/
+// full-app coupled. These two tests prove the fix structurally and behaviorally:
+// (1) the gate core needs NO started runtime (so it can precede the runner),
+// and (2) running the core + decision is side-effect-free (a seeded orphan's
+// claimable task row and execution are untouched, and no `WorkflowFailed` event
+// is appended) — the deterministic analogue of "no worker touched the task."
+// -------------------------------------------------------------------------
+
+/// The boot-gate core resolves the abort decision from just a `registered` set
+/// and a shard pool — with NO `HarvestApiState`/runtime constructed. That is
+/// the compile-time + runtime evidence that the gate can run before
+/// `HarvestRunner::start` spawns any worker (the whole point of the P1 fix).
+#[tokio::test]
+async fn gate_report_core_needs_no_runtime() {
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let orphan_type = "gate_core_no_runtime_orphan";
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        orphan_type,
+        &format!("gcnr-{}", uuid::Uuid::new_v4()),
+        "RUNNING",
+    )
+    .await;
+
+    // Deliberately construct NO HarvestApiState: registered is derived directly
+    // (as the plugin does from the owned `BuiltHarvest` before the runner starts).
+    let registered: BTreeSet<String> = BTreeSet::new();
+    let pool = build_test_pool(&database_url);
+
+    let report =
+        build_reachability_report_single_shard(&registered, &pool, Some(orphan_type.to_string()))
+            .await;
+
+    assert!(
+        report.orphaned,
+        "seeded unregistered orphan must set orphaned"
+    );
+    assert!(report.total_orphaned_executions >= 1);
+    assert_eq!(
+        startup_orphan_decision(OrphanStartupAction::Fail, report.orphaned, report.status),
+        StartupOrphanDecision::Abort,
+        "fail + orphan + complete single-shard report must abort boot",
+    );
+}
+
+/// Running the pre-runner gate core + decision does NOT mutate the seeded
+/// orphan: its claimable pending task-queue row stays `PENDING`, its execution
+/// stays `RUNNING`, and no `WorkflowFailed` event is appended. This is the
+/// deterministic analogue of the production guarantee "no worker claimed or
+/// failed the orphaned run" — the gate is a pure read that precedes any worker.
+#[tokio::test]
+async fn gate_is_side_effect_free_orphan_task_untouched() {
+    use autumn_harvest::schema::{harvest_events, harvest_task_queue};
+
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let orphan_type = "gate_side_effect_free_orphan";
+    let exec_id = insert_execution(
+        &database_url,
+        ShardId::new(0),
+        orphan_type,
+        &format!("gsef-{}", uuid::Uuid::new_v4()),
+        "RUNNING",
+    )
+    .await;
+
+    // Seed a claimable pending workflow task for the orphan (state defaults to
+    // PENDING; scheduled_at in the past = immediately eligible).
+    let task_id = uuid::Uuid::new_v4();
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect to seed task");
+        diesel::insert_into(harvest_task_queue::table)
+            .values((
+                harvest_task_queue::id.eq(task_id),
+                harvest_task_queue::queue_name.eq("default"),
+                harvest_task_queue::task_type.eq("workflow"),
+                harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())),
+                harvest_task_queue::input.eq(json!({})),
+                harvest_task_queue::max_attempts.eq(1),
+                harvest_task_queue::scheduled_at.eq(Utc::now() - chrono::Duration::seconds(5)),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("seed pending workflow task");
+    }
+
+    // Run the pre-runner gate core + decision (as `start_harvest_runtime` now
+    // does before spawning any worker).
+    let registered: BTreeSet<String> = BTreeSet::new();
+    let pool = build_test_pool(&database_url);
+    let report =
+        build_reachability_report_single_shard(&registered, &pool, Some(orphan_type.to_string()))
+            .await;
+    assert_eq!(
+        startup_orphan_decision(OrphanStartupAction::Fail, report.orphaned, report.status),
+        StartupOrphanDecision::Abort,
+        "the seeded orphan must resolve to Abort",
+    );
+
+    // Re-query: the gate touched nothing.
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to verify");
+
+    let task_state: String = harvest_task_queue::table
+        .find(task_id)
+        .select(harvest_task_queue::state)
+        .first(&mut conn)
+        .await
+        .expect("task row still present");
+    assert_eq!(
+        task_state, "PENDING",
+        "the orphan task must remain claimable"
+    );
+
+    let task_worker: Option<String> = harvest_task_queue::table
+        .find(task_id)
+        .select(harvest_task_queue::worker_id)
+        .first(&mut conn)
+        .await
+        .expect("task row still present");
+    assert!(task_worker.is_none(), "the orphan task must be unclaimed");
+
+    let exec_state: String = autumn_harvest::schema::harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::schema::harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .expect("execution row still present");
+    assert_eq!(
+        exec_state, "RUNNING",
+        "the orphan execution must stay RUNNING"
+    );
+
+    let failed_events: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_type.eq("WorkflowFailed"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count events");
+    assert_eq!(failed_events, 0, "the gate must not append WorkflowFailed");
 }

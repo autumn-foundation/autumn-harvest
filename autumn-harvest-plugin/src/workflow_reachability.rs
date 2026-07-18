@@ -279,6 +279,41 @@ pub async fn build_workflow_reachability_report(
     ))
 }
 
+/// Build a reachability report against a single shard's pool **without** a
+/// started [`HarvestApiState`]/runtime — the boot-time gate core (issue #700
+/// AC4).
+///
+/// [`build_workflow_reachability_report`] resolves `registered` from the
+/// installed handler registry and fans out across shards, so it can only run
+/// *after* `HarvestRunner::start` has spawned the worker poll loop. That is too
+/// late for the `fail` action: a worker could claim and terminally fail an
+/// orphaned-type execution during the boot window before the abort tears the
+/// runner down. This entry point takes `registered` (derived directly from the
+/// owned `BuiltHarvest`) and a single shard pool, so the gate can run *before*
+/// any worker spawns.
+///
+/// The plugin is single-shard-only (multi-shard configs are rejected upstream),
+/// so a single-shard query reads the identical rows the started-runtime
+/// cross-shard fan-out would. It reuses the same [`observe_shard`] and
+/// [`build_report_from_observations`] helpers as
+/// [`build_workflow_reachability_report`], so the two cannot drift.
+///
+/// Infallible by construction: a DB read failure is encoded as an unreachable
+/// shard (`status == Unavailable`) inside the report rather than an `Err`, so
+/// the caller never blocks boot on the check's own failure — combined with
+/// [`startup_orphan_decision`]'s crash-loop rule (`Fail` + incomplete report →
+/// `Warn`, never `Abort`), a transient DB outage at boot can never hard-fail
+/// startup.
+pub async fn build_reachability_report_single_shard(
+    registered: &BTreeSet<String>,
+    pool: &DbPool,
+    filter: Option<String>,
+) -> WorkflowReachabilityReport {
+    let observed_at = Utc::now();
+    let observation = observe_shard(0, Some(pool.clone()), filter.clone()).await;
+    build_report_from_observations(observed_at, filter, registered, vec![observation])
+}
+
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
