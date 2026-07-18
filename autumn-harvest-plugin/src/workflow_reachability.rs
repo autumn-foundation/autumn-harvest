@@ -212,9 +212,9 @@ impl ReachabilityAccumulator {
             .reduce(std::cmp::min)
     }
 
-    /// The cross-shard sample union, truncated to `cap`. A single shard produces
-    /// at most one row per type, so `samples` is already deduped across shards
-    /// by construction (distinct execution ids per shard).
+    /// The cross-shard sample union, truncated to `cap`. Execution ids are
+    /// globally unique and each execution lives on exactly one shard, so the
+    /// shard-concatenated union is duplicate-free by construction.
     fn samples(&self, cap: usize) -> Vec<uuid::Uuid> {
         self.samples.iter().take(cap).copied().collect()
     }
@@ -472,7 +472,7 @@ pub fn startup_orphan_decision(
         return StartupOrphanDecision::Continue;
     }
     match action {
-        OrphanStartupAction::Fail if status == FanoutStatus::Complete => {
+        OrphanStartupAction::Fail if status == ReachabilityReportStatus::Complete => {
             StartupOrphanDecision::Abort
         }
         // Warn, or Fail on an incomplete report (crash-loop safety).
