@@ -26080,7 +26080,15 @@ async fn replay_diagnosis(
     // a genuine mid-history divergence still surfaces (it resolves synchronously
     // during the drive, not as a frontier suspension). Bound by `query_timeout`
     // (the #612 contract): on the timer winning, return 408.
+    // Thread the runtime registry's shared state into the diagnosis replay so it
+    // sees the SAME typed state the live worker's replay path sees
+    // (`registry.shared_state()`, `worker.rs`). Without this the replayer defaults
+    // to `empty_shared_state()`, so a workflow that reads `ctx.state::<T>()` during
+    // replay would find nothing under diagnosis and spuriously report
+    // `workflow_failed`/`diverged` for state-registering deployments — even though
+    // the same execution replays cleanly on the worker (Codex review, PR #1107).
     let replayer = autumn_harvest::testing::WorkflowReplayer::new()
+        .with_shared_state(runtime.registry().shared_state())
         .register_fn(execution.workflow_name.clone(), handler);
     let report = match tokio::time::timeout(
         api_state.query_timeout(),

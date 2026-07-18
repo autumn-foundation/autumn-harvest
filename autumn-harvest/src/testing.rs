@@ -579,13 +579,22 @@ impl WorkflowReplayer {
         self
     }
 
-    /// Replace the shared state with a pre-built `SharedState` arc.
+    /// Replace the shared state with a pre-built [`SharedState`] arc.
+    ///
+    /// Prefer [`with_state`](Self::with_state) for constructing state from typed
+    /// values. This lower-level variant forwards an *already-built* container so
+    /// the replay sees exactly the same shared state as another execution path.
     ///
     /// Used internally by [`TestRunOutcome::replay_check`] to forward the test
-    /// environment's state to the replayer so the workflow sees the same typed
-    /// state it saw during the original run.
+    /// environment's state to the replayer, and by the replay-diagnosis endpoint
+    /// to thread the **live worker's** registry shared state
+    /// (`registry.shared_state()`) into the diagnosis replay so a workflow that
+    /// reads typed state via `ctx.state::<T>()` during replay sees the same state
+    /// the worker's replay path sees — otherwise the per-execution verdict would
+    /// spuriously report `workflow_failed`/`diverged` for state-registering
+    /// deployments even when the execution replays cleanly on the worker.
     #[must_use]
-    fn with_existing_state(mut self, state: SharedState) -> Self {
+    pub fn with_shared_state(mut self, state: SharedState) -> Self {
         self.state = state;
         self
     }
@@ -2824,7 +2833,7 @@ impl TestRunOutcome {
             },
         };
         let mut replayer = WorkflowReplayer::new()
-            .with_existing_state(self.state.clone())
+            .with_shared_state(self.state.clone())
             // Register under the SAME name carried on the snapshot above so the
             // replayer's handler lookup (keyed by `snapshot.workflow_name`)
             // resolves — consistently changed together with the snapshot name.

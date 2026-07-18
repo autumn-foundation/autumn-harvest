@@ -129,6 +129,55 @@ fn progress_info() -> WorkflowInfo {
     }
 }
 
+/// Typed shared state injected on the registry (issue #614/#1107 regression):
+/// modelled after a real deployment that registers config via
+/// `HarvestBuilder::state(...)` and reads it during replay with `ctx.state::<T>()`.
+struct DiagConfig {
+    greeting: String,
+}
+
+/// Reads typed shared state via `ctx.state::<DiagConfig>()` and returns it as the
+/// output; when the state is absent it returns `Err`. This is the regression
+/// probe for PR #1107: the live worker replays with `registry.shared_state()`, so
+/// a faithful diagnosis replay MUST see the same state — otherwise `ctx.state`
+/// returns `None` under diagnosis and this workflow spuriously fails, yielding a
+/// `workflow_failed` verdict for a run that replays cleanly on the worker.
+fn state_reading_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.state::<DiagConfig>().map_or_else(
+            || Err("shared state DiagConfig not available during replay".to_string()),
+            |cfg| Ok(json!({ "greeting": cfg.greeting.clone() })),
+        )
+    })
+}
+
+fn state_reading_info() -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name: "state_reading_wf",
+        module: "tests",
+        handler: state_reading_workflow,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
 // ── Harness ──────────────────────────────────────────────────────────────────
 
 type HarvestApiApp = axum::Router;
@@ -179,6 +228,43 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         ShardRouter::default(),
     )
     .with_registered_dag_names(["classic_dag".to_string()]);
+    api_state.install(runtime);
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Like [`build_app`] but registers `state_reading_wf` on a registry carrying a
+/// typed `DiagConfig` shared-state value — mirroring a deployment that injects
+/// config via `HarvestBuilder::state(...)`. Used by the PR #1107 regression test
+/// to prove the diagnosis replay threads `registry.shared_state()` into the
+/// replayer exactly as the live worker does.
+fn build_app_with_state(pool: &DbPool) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+
+    let mut state_map: autumn_harvest::context::SharedStateMap = std::collections::HashMap::new();
+    state_map.insert(
+        std::any::TypeId::of::<DiagConfig>(),
+        Box::new(DiagConfig {
+            greeting: "hello".to_string(),
+        }),
+    );
+    let shared_state: autumn_harvest::context::SharedState = Arc::new(state_map);
+
+    let runtime = HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::with_state(
+            vec![state_reading_info()],
+            vec![],
+            shared_state,
+        )),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("replay-diagnosis-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    );
     api_state.install(runtime);
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
@@ -745,4 +831,44 @@ async fn timed_out_run_sealed_awaiting_second_activity_is_clean() {
     assert_eq!(body["message"], json!("no divergence under current code"));
     assert_eq!(body["state"], json!("TIMED_OUT"));
     assert!(body.get("divergence").is_none(), "reclassified to clean");
+}
+
+/// PR #1107 (Codex review): the diagnosis replay must thread the runtime
+/// registry's shared state into `WorkflowReplayer`, exactly as the live worker
+/// replays with `registry.shared_state()`. `state_reading_wf` reads
+/// `ctx.state::<DiagConfig>()` and completes cleanly only when that state is
+/// present; its recorded history is a clean `WorkflowStarted + WorkflowCompleted`.
+///
+/// WITH the fix the diagnosis replayer receives the registry's `DiagConfig`, so
+/// `ctx.state` returns `Some` → the workflow completes matching history → `clean`.
+/// WITHOUT the fix the replayer defaults to `empty_shared_state()`, so
+/// `ctx.state` returns `None` → the workflow returns `Err` → a spurious
+/// `workflow_failed` verdict, and this assertion fails. It therefore fails
+/// against the pre-fix code and passes against the fix.
+#[tokio::test]
+async fn state_registering_workflow_diagnoses_clean_with_registry_shared_state() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with_state(&pool);
+
+    let input = json!({});
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: json!({ "greeting": "hello" }),
+        },
+    ];
+    let exec = seed_execution(&pool, "state_reading_wf", "COMPLETED", input, events, false).await;
+
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["diagnosis"], json!("clean"), "body={body}");
+    assert!(body.get("divergence").is_none(), "clean has no divergence");
+    assert!(body.get("failure").is_none(), "clean has no failure");
 }
