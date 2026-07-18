@@ -23,6 +23,7 @@ use autumn_harvest_plugin::OrphanStartupAction;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
+use autumn_harvest_plugin::runner::resolve_runtime_storage_pool;
 use autumn_harvest_plugin::workflow_reachability::{
     StartupOrphanDecision, WorkflowReachabilityQuery, build_reachability_report_single_shard,
     build_workflow_reachability_report, startup_orphan_decision,
@@ -849,4 +850,62 @@ async fn gate_is_side_effect_free_orphan_task_untouched() {
         .await
         .expect("count events");
     assert_eq!(failed_events, 0, "the gate must not append WorkflowFailed");
+}
+
+/// Issue #700 P2: the boot-gate must query the SAME storage pool the runner will
+/// run the workers against. `PreparedHarvestRuntime::build` gives
+/// `WorkerConfig::with_sharded_pool` PRECEDENCE over `harvest_pool`, so a
+/// `HarvestBuilder::with_sharded_pool` deployment must have the gate query the
+/// sharded pool's database — not `harvest_pool`. Both call the shared
+/// `resolve_runtime_storage_pool`, so they agree by construction.
+///
+/// Here `harvest_pool` is a deliberately UNCONNECTABLE pool and the sharded pool
+/// is the real env database (where the orphan is seeded). If the gate wrongly
+/// queried `harvest_pool` the report would be `Unavailable` (connection failure)
+/// → `Warn` (crash-loop safety), never seeing the orphan. Because the shared
+/// resolver picks the sharded pool, the report is `Complete` with the orphan
+/// present → `Abort`. The decision being `Abort` can ONLY happen if the resolver
+/// read the sharded (env) DB, so it pins the fix behaviorally.
+#[tokio::test]
+async fn gate_resolves_sharded_pool_not_config_pool() {
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let orphan_type = "gate_resolves_sharded_pool_orphan";
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        orphan_type,
+        &format!("grsp-{}", uuid::Uuid::new_v4()),
+        "RUNNING",
+    )
+    .await;
+
+    // harvest_pool -> an unconnectable database; the sharded pool -> the real
+    // env DB. This mirrors a `HarvestBuilder::with_sharded_pool` deployment
+    // whose sharded pool points at a different database than the plugin's
+    // resolved `harvest_pool`.
+    let harvest_pool = build_test_pool("postgres://unused@127.0.0.1:1/none");
+    let sharded_env = ShardedDbPool::single(build_test_pool(&database_url));
+
+    // Resolve exactly as the gate does for the with_sharded_pool case (the
+    // runner-level override is None — the plugin never sets it).
+    let resolved = resolve_runtime_storage_pool(None, Some(sharded_env), harvest_pool);
+    let gate_pool = resolved.clone_inner();
+
+    let registered: BTreeSet<String> = BTreeSet::new();
+    let report = build_reachability_report_single_shard(
+        &registered,
+        &gate_pool,
+        Some(orphan_type.to_string()),
+    )
+    .await;
+
+    assert!(
+        report.orphaned,
+        "the gate must read the sharded pool's DB, where the orphan lives",
+    );
+    assert_eq!(
+        startup_orphan_decision(OrphanStartupAction::Fail, report.orphaned, report.status),
+        StartupOrphanDecision::Abort,
+        "querying harvest_pool instead would be Unavailable -> Warn, not Abort",
+    );
 }

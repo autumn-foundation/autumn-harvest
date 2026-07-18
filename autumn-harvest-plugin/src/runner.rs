@@ -99,6 +99,50 @@ impl HarvestRunnerResources {
         self.sharded_pool = Some(pool);
         self
     }
+
+    /// The explicit runner-level sharded-pool override, if set.
+    ///
+    /// Used by the plugin's boot-time orphaned-workflow gate (issue #700 P2) to
+    /// resolve the same storage pool `HarvestRunner::start` will, by feeding
+    /// this into [`resolve_runtime_storage_pool`] with the exact inputs `build`
+    /// uses — so the gate queries the database the workers actually poll rather
+    /// than assuming `harvest_pool`.
+    #[must_use]
+    pub(crate) fn sharded_pool_override(&self) -> Option<ShardedDbPool> {
+        self.sharded_pool.clone()
+    }
+}
+
+/// Resolve the storage pool the runtime will run against, applying the fixed
+/// precedence: an explicit runner-level `resources.sharded_pool` override wins,
+/// then a `WorkerConfig::with_sharded_pool` carried on the build, then a
+/// single-shard wrapper of the default `harvest_pool`.
+///
+/// This is the **single source of truth** for that precedence (issue #700 P2):
+/// `PreparedHarvestRuntime::build` and the plugin's boot-time orphaned-workflow
+/// gate both call it, so the gate queries the exact database the workers will
+/// poll and the `sharded_pool`-over-`harvest_pool` precedence can never drift
+/// between them. Without this, a `HarvestBuilder::with_sharded_pool` deployment
+/// could have the gate validate `harvest_pool` while the workers poll the
+/// sharded pool's (different) database — missing an orphan the worker then
+/// claims and fails.
+///
+/// Exposed (`pub`) so the boot-gate's agreement with the runner can be pinned
+/// by a behavioral test that resolves the same pool and observes the same
+/// database.
+#[must_use]
+pub fn resolve_runtime_storage_pool(
+    resources_sharded_pool: Option<ShardedDbPool>,
+    worker_config_sharded_pool: Option<ShardedDbPool>,
+    harvest_pool: DbPool,
+) -> HarvestDbPool {
+    if let Some(sp) = resources_sharded_pool {
+        HarvestDbPool::sharded(sp)
+    } else if let Some(sp) = worker_config_sharded_pool {
+        HarvestDbPool::sharded(sp)
+    } else {
+        HarvestDbPool::from(harvest_pool)
+    }
 }
 
 struct PreparedHarvestRuntime {
@@ -215,13 +259,16 @@ impl PreparedHarvestRuntime {
         // the effective-config snapshot must report the resolved runtime pool's
         // sharded-ness, not solely the `WorkerConfig` field (issue #695 review).
         let resources_sharded_pool = resources.sharded_pool.is_some();
-        let storage_pool = if let Some(sp) = resources.sharded_pool {
-            HarvestDbPool::sharded(sp)
-        } else if let Some(sp) = built.worker_config().sharded_pool.clone() {
-            HarvestDbPool::sharded(sp)
-        } else {
-            HarvestDbPool::from(resources.harvest_pool)
-        };
+        // Single source of truth for the pool-resolution precedence (issue #700
+        // P2): the plugin's boot-time orphan gate calls the very same
+        // `resolve_runtime_storage_pool` so it queries the exact database the
+        // workers will poll, and the `sharded_pool`-over-`harvest_pool`
+        // precedence can never drift between the two.
+        let storage_pool = resolve_runtime_storage_pool(
+            resources.sharded_pool,
+            built.worker_config().sharded_pool.clone(),
+            resources.harvest_pool,
+        );
         // Reject a misconfigured router-vs-pool pair before any I/O.
         // `pool_for()` falls back to the default shard without warning, so a
         // missing pool for shard N silently writes shard-N `ExecutionId`s into
@@ -663,4 +710,70 @@ pub(crate) fn injected_runtime_state(
     state.insert(TypeId::of::<HarvestDbPool>(), Box::new(harvest_pool));
     state.insert(TypeId::of::<ShardRouter>(), Box::new(shard_router));
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_runtime_storage_pool;
+    use autumn_harvest::shard::ShardedDbPool;
+    use autumn_harvest::worker::DbPool;
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+    /// Build a pool tagged by its `max_size` (readable without connecting) so
+    /// two pools are distinguishable in a DB-free test.
+    fn tagged_pool(max_size: usize) -> DbPool {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://unused@127.0.0.1:1/none",
+        );
+        deadpool::managed::Pool::builder(manager)
+            .max_size(max_size)
+            .build()
+            .expect("build tagged pool")
+    }
+
+    /// The single source of truth for the runtime pool-resolution precedence
+    /// (issue #700 P2). A `WorkerConfig::with_sharded_pool` MUST win over
+    /// `harvest_pool` — otherwise the boot-gate (which calls this exact
+    /// function) would validate `harvest_pool` while the workers poll the
+    /// sharded pool's database. The `max_size` tag identifies which pool was
+    /// resolved without opening a connection.
+    #[test]
+    fn resolve_runtime_storage_pool_precedence() {
+        let harvest = tagged_pool(3);
+        let worker_config_sharded = ShardedDbPool::single(tagged_pool(7));
+        let resources_override = ShardedDbPool::single(tagged_pool(11));
+
+        // WorkerConfig's sharded pool wins over harvest_pool (the P2 case).
+        let resolved = resolve_runtime_storage_pool(
+            None,
+            Some(worker_config_sharded.clone()),
+            harvest.clone(),
+        );
+        assert_eq!(
+            resolved.clone_inner().status().max_size,
+            7,
+            "WorkerConfig::with_sharded_pool must win over harvest_pool",
+        );
+
+        // An explicit runner-level override wins over WorkerConfig's pool.
+        let resolved = resolve_runtime_storage_pool(
+            Some(resources_override),
+            Some(worker_config_sharded),
+            harvest.clone(),
+        );
+        assert_eq!(
+            resolved.clone_inner().status().max_size,
+            11,
+            "runner-level sharded_pool override must win over WorkerConfig",
+        );
+
+        // No sharded pool configured -> single-shard wrapper of harvest_pool.
+        let resolved = resolve_runtime_storage_pool(None, None, harvest);
+        assert_eq!(
+            resolved.clone_inner().status().max_size,
+            3,
+            "with no sharded pool the resolver must fall back to harvest_pool",
+        );
+    }
 }

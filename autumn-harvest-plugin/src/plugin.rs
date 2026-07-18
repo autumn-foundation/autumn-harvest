@@ -1077,6 +1077,24 @@ async fn start_harvest_runtime(
                 )
                 .collect();
 
+            // Resolve the SAME storage pool `HarvestRunner::start` will run the
+            // workers against (issue #700 P2). `PreparedHarvestRuntime::build`
+            // gives `WorkerConfig::with_sharded_pool` PRECEDENCE over
+            // `harvest_pool`, so a `HarvestBuilder::with_sharded_pool` deployment
+            // would otherwise have the gate query `harvest_pool` while the
+            // workers poll a DIFFERENT database — the gate could validate the
+            // wrong DB, miss an orphan, and the worker would then start
+            // polling+failing it. Calling the shared `resolve_runtime_storage_pool`
+            // with the exact inputs `build` uses (the runner-resources override,
+            // which the plugin never sets; WorkerConfig's sharded pool; the
+            // harvest_pool clone) makes the two agree by construction.
+            // `clone_inner()` is the same default-shard pool the workers poll.
+            let resolved_storage = crate::runner::resolve_runtime_storage_pool(
+                runner_resources.sharded_pool_override(),
+                built.worker_config().sharded_pool.clone(),
+                gate_pool,
+            );
+            let gate_pool = resolved_storage.clone_inner();
             let report =
                 build_reachability_report_single_shard(&registered, &gate_pool, None).await;
             let orphaned_types: Vec<&str> = report
