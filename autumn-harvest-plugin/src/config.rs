@@ -775,6 +775,29 @@ orphaned_workflows = "warn"
         );
     }
 
+    #[test]
+    fn startup_orphaned_workflows_rejects_unknown_value_from_toml() {
+        // Sibling of the env-path test above: the TOML path must also reject an
+        // unknown value (serde deserialization error), never silently default.
+        let dir = unique_temp_dir("harvest-config-startup-toml-reject");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "explode"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("unknown orphaned_workflows TOML value must fail to load");
+        let message = error.to_string();
+        assert!(
+            message.contains("explode") || message.contains("orphaned_workflows"),
+            "expected the TOML deserialization error to reference the bad value \
+             or the field, got {error}"
+        );
+    }
+
     fn unique_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "autumn-harvest-plugin-{label}-{}",
