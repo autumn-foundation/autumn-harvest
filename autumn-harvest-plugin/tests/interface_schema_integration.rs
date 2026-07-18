@@ -32,6 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use autumn_harvest::admission_gate::{AdmissionGate, AdmissionGateId, GateScope};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
@@ -376,6 +377,13 @@ fn build_pool(url: &str) -> DbPool {
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
+    build_app_with_state(pool).0
+}
+
+/// Like [`build_app`] but also returns the `HarvestApiState` the router reads,
+/// so a test can reach into `api_state.gate_cache()` to raise an admission gate
+/// (the route consults the state's own per-instance cache, not the global one).
+fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
@@ -391,7 +399,9 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    let app =
+        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+    (app, api_state)
 }
 
 async fn get(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -1172,6 +1182,78 @@ async fn signal_with_start_accepts_valid_payload() {
 // #1092 (plain signal route). A probe MISS falls through to the untouched
 // authoritative in-lock path, which stays the source of truth.
 
+// P1 symmetry (PR #1105 review): the signal-with-start probe already precedes
+// the #377 admission gate; lock that in against regression. A committed keyed
+// signal-with-start replay must dedup to 200 even while a `WorkflowName` gate is
+// raised for the workflow — a retry that delivers no new signal must not be
+// blocked by an operator-raised gate. No second signal row is enqueued.
+#[tokio::test]
+async fn sws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, api_state) = build_app_with_state(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "RUNNING").await;
+    let wid = exec_id.to_string();
+
+    let committed_key = "k-sws-gated-run";
+    seed_signal_row(
+        &pool,
+        exec_id,
+        "approve",
+        json!({ "reason": "ok" }),
+        committed_key,
+    )
+    .await;
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "precondition: exactly one committed signal row"
+    );
+
+    // Raise an admission gate for this workflow on the router's own cache.
+    api_state.gate_cache().refresh(vec![AdmissionGate {
+        id: AdmissionGateId(uuid::Uuid::new_v4()),
+        scope: GateScope::WorkflowName("iface_wf".to_string()),
+        reason: "p1-sws-gate-incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: Utc::now(),
+        expires_at: None,
+    }]);
+
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/signal-with-start",
+        json!({
+            "workflow_id": wid,
+            "signal_name": "approve",
+            "signal_payload": { "reason": "ok" },
+            "idempotency_key": committed_key
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "committed keyed signal-with-start replay must NOT be blocked by a raised admission gate: {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed replay must dedup to 200 even under a raised gate: {body}"
+    );
+    assert_eq!(
+        body["signal_delivered"],
+        json!(false),
+        "committed replay must report signal_delivered: false: {body}"
+    );
+    assert_eq!(
+        count_signal_rows(&pool, exec_id, committed_key).await,
+        1,
+        "committed replay must NOT enqueue a second signal row"
+    );
+}
+
 /// AC1: a committed keyed signal-with-start that ATTACHED to a live (RUNNING)
 /// run replays to `200 signal_delivered: false` even when the retry payload is
 /// now schema-invalid — the committed-replay probe short-circuits before the
@@ -1341,6 +1423,87 @@ async fn uws_committed_keyed_replay_after_running_short_circuits_before_validati
         body["started_fresh"],
         json!(false),
         "committed replay must report started_fresh: false: {body}"
+    );
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "committed replay must NOT append a second UpdateAdmitted event"
+    );
+}
+
+// P1 (PR #1105 review): a committed keyed update-with-start replay must short-
+// circuit BEFORE the #377 admission gate, mirroring signal-with-start (whose
+// probe already precedes the gate). Seeded against a RUNNING run with a
+// committed `UpdateAdmitted` event; a `WorkflowName` admission gate is then
+// raised for `iface_wf` on the router's own cache. The retry of the same key
+// must return the cached admission (200, started_fresh: false), NOT a 503 — a
+// retry that admits no new update must not be blocked by an operator-raised gate
+// (the #808 invariant: a committed replay precedes ALL fresh-start-only
+// rejections, including the admission gate). No second `UpdateAdmitted` event.
+#[tokio::test]
+async fn uws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, api_state) = build_app_with_state(&pool);
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "RUNNING").await;
+    let wid = exec_id.to_string();
+
+    let committed_key = "k-uws-gated-run";
+    let update_id = derive_uws_update_id(committed_key);
+    seed_update_admitted_event(&pool, exec_id, update_id, "set_priority").await;
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "precondition: exactly one committed UpdateAdmitted event"
+    );
+
+    // Raise an admission gate for this workflow on the router's own cache. On a
+    // FRESH keyed start this would 503; the committed replay must bypass it.
+    api_state.gate_cache().refresh(vec![AdmissionGate {
+        id: AdmissionGateId(uuid::Uuid::new_v4()),
+        scope: GateScope::WorkflowName("iface_wf".to_string()),
+        reason: "p1-gate-incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: Utc::now(),
+        expires_at: None,
+    }]);
+
+    // Valid args — the ONLY potential blocker under test is the raised gate.
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": wid,
+            "update_name": "set_priority",
+            "update_args": { "priority": 7 },
+            "idempotency_key": committed_key,
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "committed keyed update-with-start replay must NOT be blocked by a raised admission gate: {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed replay must return the cached admission (200) even under a raised gate: {body}"
+    );
+    // `update_admitted: false` is the internal outcome marker; on the wire it
+    // surfaces as `started_fresh: false` (the response omits `update_admitted`),
+    // matching the sibling committed-replay tests.
+    assert_eq!(
+        body["started_fresh"],
+        json!(false),
+        "committed replay must report started_fresh: false: {body}"
+    );
+    assert_eq!(
+        body["update_id"],
+        json!(update_id.to_string()),
+        "committed replay must return the derived update_id (cache-hit evidence): {body}"
     );
     assert_eq!(
         count_update_admitted_events(&pool, exec_id).await,

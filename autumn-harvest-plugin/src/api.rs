@@ -15650,6 +15650,42 @@ async fn update_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let update_args = request.update_args.unwrap_or(Value::Null);
 
+    // Derive update_id — deterministic from idempotency_key if provided. Hoisted
+    // here (mirroring the signal-with-start probe placement) so the committed-
+    // replay probe below can run BEFORE the #377 admission gate and the
+    // found-shard scan, as well as before the #373/#610/#684 validation blocks.
+    let update_id = request
+        .idempotency_key
+        .as_ref()
+        .map_or_else(UpdateId::new, |key| {
+            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+                .expect("static namespace UUID is valid");
+            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+        });
+
+    // INVARIANT (this PR + #377): keyed committed-replay short-circuit. A retry of
+    // an already-committed keyed update-with-start must replay to its cached
+    // admission BEFORE any fresh-start-only rejection — the #373 start_input schema
+    // gate, the #610 update-arg schema gate + #684 validator further down, AND the
+    // #377 admission gate below. This mirrors both the signal-with-start route
+    // (whose probe likewise precedes the found-shard scan and the admission gate)
+    // and the #808 invariant that a committed replay precedes ALL fresh-start-only
+    // rejections, INCLUDING a raised admission gate: otherwise a retry that admits
+    // no new update — but hits an operator-raised gate or a schema/validator
+    // tightened since the original delivery — would wrongly return 503/400/422.
+    // Keyed-only; a miss (`None`) falls through to the untouched authoritative
+    // in-lock path (`update_with_start_workflow_execution_with_metrics`), which
+    // reserves the exactly-once update and remains the source of truth. On a hit
+    // the outcome flows through the existing `Ok` arm (which polls for the cached
+    // update result and writes the SUCCEEDED audit), giving a committed replay the
+    // SAME behavior as a fresh admission. Mirrors #808 (plain start) and #1092
+    // (plain signal route).
+    let probe_outcome = if request.idempotency_key.is_some() {
+        probe_committed_uws_replay(&api_state, &workflow_name, &workflow_id, update_id).await
+    } else {
+        None
+    };
+
     // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
     // primitive to reject only a *fresh start* under its lock so an attach /
     // idempotent update-with-start to a live run still succeeds (issue #499).
@@ -15732,8 +15768,15 @@ async fn update_with_start_workflow(
         (shard, conn, ExecutionId::new_for_shard(shard))
     };
 
-    // Admission gate check (unconditional — same rationale as signal-with-start).
-    {
+    // issue #377: admission gate. Skipped on a committed-replay hit
+    // (`probe_outcome.is_some()`): a retry admits no new update, so — per the #808
+    // invariant, mirroring the fresh-start-only validation gates below — a
+    // committed replay must return its cached admission even while an operator has
+    // raised a gate, rather than a spurious 503. On a miss the gate runs
+    // unconditionally for genuinely-fresh work (same rationale as
+    // signal-with-start: the pre-scan is unlocked, so the resolver may still
+    // create fresh even when we observed an existing RUNNING execution).
+    if probe_outcome.is_none() {
         let wf_owner = runtime
             .registry
             .workflows
@@ -15780,38 +15823,6 @@ async fn update_with_start_workflow(
                 .into_response();
         }
     }
-
-    // Derive update_id — deterministic from idempotency_key if provided.
-    // Hoisted ABOVE the #373/#610/#684 validation blocks so the committed-replay
-    // probe below can key on it.
-    let update_id = request
-        .idempotency_key
-        .as_ref()
-        .map_or_else(UpdateId::new, |key| {
-            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-                .expect("static namespace UUID is valid");
-            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
-        });
-
-    // INVARIANT (this PR): keyed committed-replay short-circuit. A retry of an
-    // already-committed keyed update-with-start must replay to its cached
-    // admission BEFORE any fresh-start-only validation (the #373 start_input
-    // schema gate immediately below, and the #610 update-arg schema gate + #684
-    // validator further down). Otherwise a schema tightened — or a validator that
-    // would now reject the same args — between the original delivery and the
-    // retry would wrongly reject a retry that admits no new update. Keyed-only; a
-    // miss (`None`) falls through to the untouched authoritative in-lock path
-    // (`update_with_start_workflow_execution_with_metrics`), which reserves the
-    // exactly-once update and remains the source of truth. On a hit the outcome
-    // flows through the existing `Ok` arm (which polls for the cached update
-    // result and writes the SUCCEEDED audit), giving a committed replay the SAME
-    // behavior as a fresh admission. Mirrors #808 (plain start) and #1092 (plain
-    // signal route).
-    let probe_outcome = if request.idempotency_key.is_some() {
-        probe_committed_uws_replay(&api_state, &workflow_name, &workflow_id, update_id).await
-    } else {
-        None
-    };
 
     // issue #373: start_input schema validation (fresh-start-only; skipped on a
     // committed-replay hit).
