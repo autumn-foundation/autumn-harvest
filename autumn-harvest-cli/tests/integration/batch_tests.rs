@@ -165,3 +165,55 @@ fn start_batch_items_json_atomic() {
     let body = req.body.unwrap();
     assert_eq!(body["atomic"], true);
 }
+
+// #769 — dry-run preview flag on `batch submit`.
+
+/// RED: `--dry-run` is not yet a recognized clap arg on `batch submit`, so
+/// `parse()`'s `.expect("CLI should parse successfully")` panics. Once green,
+/// the flag maps to `body["dry_run"] == true`.
+#[test]
+fn batch_submit_dry_run_sets_body_flag() {
+    let req = parse(&[
+        "batch",
+        "submit",
+        "Cancel",
+        "--filter-json",
+        r#"{"workflow_name": "onboarding"}"#,
+        "--dry-run",
+    ])
+    .api_request()
+    .unwrap();
+
+    assert_eq!(req.method, ApiMethod::Post);
+    assert_eq!(req.path, "/batch-operations");
+
+    let body = req.body.unwrap();
+    assert_eq!(body["action"], "Cancel");
+    assert_eq!(
+        body["dry_run"],
+        serde_json::json!(true),
+        "--dry-run must set body dry_run=true, got body: {body}"
+    );
+}
+
+/// Regression guard (AC6 byte-for-byte real submit): without `--dry-run`, the
+/// request body must NOT carry a `dry_run` key at all, so a real submit is
+/// byte-identical to a pre-#769 client. (Passes now and after green.)
+#[test]
+fn batch_submit_without_dry_run_flag_defaults_false() {
+    let req = parse(&[
+        "batch",
+        "submit",
+        "Cancel",
+        "--filter-json",
+        r#"{"workflow_name": "onboarding"}"#,
+    ])
+    .api_request()
+    .unwrap();
+
+    let body = req.body.unwrap();
+    assert!(
+        body.get("dry_run").is_none(),
+        "omitting --dry-run must not add a dry_run key (real-submit body stays byte-identical), got body: {body}"
+    );
+}

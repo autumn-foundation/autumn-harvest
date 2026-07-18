@@ -831,3 +831,437 @@ async fn batch_signal_resume_excludes_processed_ids_not_offset() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #769 — dry-run preview for batch operations.
+//
+// These are RED (issue #769 is unimplemented): today `SubmitBatchOperationRequest`
+// has no `deny_unknown_fields`, so a `dry_run` field is silently ignored and the
+// request runs as a REAL submit -> 202 + a job row. The assertions below pin the
+// desired 200 + preview body + zero-writes behavior and therefore fail on trunk.
+// (Testcontainers-based; compile-checked only in sandboxes without Docker, run
+// Docker-backed in CI — per the #543/#544/#601 precedent.)
+// ---------------------------------------------------------------------------
+
+use autumn_harvest::schema::{
+    harvest_audit_log, harvest_batch_jobs, harvest_signals, harvest_task_queue,
+};
+
+/// Set `count` of the seeded `wf-{i}` executions (from the front) to `state`.
+async fn set_states(
+    database_url: &str,
+    ids: &[ExecutionId],
+    indices: std::ops::Range<usize>,
+    state: &str,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for set_states");
+    for i in indices {
+        diesel::update(
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq(ids[i].as_uuid())),
+        )
+        .set(harvest_workflow_executions::state.eq(state))
+        .execute(&mut conn)
+        .await
+        .expect("update state");
+    }
+}
+
+async fn count_rows_i64(conn: &mut AsyncPgConnection, url: &str) -> (i64, i64, i64) {
+    let _ = url;
+    let jobs: i64 = harvest_batch_jobs::table
+        .count()
+        .get_result(conn)
+        .await
+        .unwrap();
+    let tasks: i64 = harvest_task_queue::table
+        .count()
+        .get_result(conn)
+        .await
+        .unwrap();
+    let signals: i64 = harvest_signals::table
+        .count()
+        .get_result(conn)
+        .await
+        .unwrap();
+    (jobs, tasks, signals)
+}
+
+/// AC2: dry_run returns exact matched_count + per-shard breakdown + a bounded,
+/// truncated sample.
+#[tokio::test]
+async fn dry_run_returns_matched_count_and_sample_capped() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let seeded = 150usize;
+    seed_workflows(&url, "onboarding", seeded).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "onboarding", "states": ["RUNNING"] },
+            "dry_run": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "dry_run must return 200: {body}");
+    assert_eq!(body["dry_run"], json!(true), "body: {body}");
+    assert_eq!(body["action"], "Cancel", "echoed action: {body}");
+    assert_eq!(
+        body["filter"]["workflow_name"], "onboarding",
+        "echoed filter: {body}"
+    );
+    assert_eq!(
+        body["matched_count"].as_u64(),
+        Some(seeded as u64),
+        "exact matched_count across shards: {body}"
+    );
+    assert_eq!(
+        body["sample_cap"].as_u64(),
+        Some(100),
+        "sample_cap constant: {body}"
+    );
+    assert_eq!(
+        body["sample_truncated"],
+        json!(true),
+        "150 > 100 -> truncated: {body}"
+    );
+
+    // per_shard: non-empty array whose matched_counts sum to matched_count.
+    let per_shard = body["per_shard"].as_array().expect("per_shard is an array");
+    assert!(!per_shard.is_empty(), "per_shard non-empty: {body}");
+    let per_shard_sum: u64 = per_shard
+        .iter()
+        .map(|s| {
+            assert!(
+                s.get("shard_id").is_some(),
+                "per_shard elem has shard_id: {s}"
+            );
+            s["matched_count"]
+                .as_u64()
+                .expect("per-shard matched_count is a number")
+        })
+        .sum();
+    assert_eq!(
+        per_shard_sum,
+        body["matched_count"].as_u64().unwrap(),
+        "per_shard counts sum to matched_count: {body}"
+    );
+
+    // sample: global cap of 100, each elem {execution_id, workflow_name, state}.
+    let sample = body["sample"].as_array().expect("sample is an array");
+    assert_eq!(sample.len(), 100, "sample capped at global 100: {body}");
+    for elem in sample {
+        assert!(
+            elem.get("execution_id").is_some(),
+            "sample elem has execution_id: {elem}"
+        );
+        assert_eq!(
+            elem["workflow_name"], "onboarding",
+            "sample workflow_name: {elem}"
+        );
+        assert_eq!(elem["state"], "RUNNING", "sample state: {elem}");
+    }
+}
+
+/// AC2: sample below cap is not truncated and count is exact.
+#[tokio::test]
+async fn dry_run_sample_below_cap_not_truncated() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    seed_workflows(&url, "billing", 5).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "billing" },
+            "dry_run": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["matched_count"].as_u64(), Some(5), "body: {body}");
+    let sample = body["sample"].as_array().expect("sample array");
+    assert_eq!(sample.len(), 5, "sample len == matched: {body}");
+    assert_eq!(
+        body["sample_truncated"],
+        json!(false),
+        "5 <= 100 -> not truncated: {body}"
+    );
+    assert_eq!(body["sample_cap"].as_u64(), Some(100), "body: {body}");
+}
+
+/// AC3: dry_run performs zero mutations — no job row, no task-queue rows, no
+/// signals, no state transitions, no audit rows.
+#[tokio::test]
+async fn dry_run_performs_zero_writes() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    seed_workflows(&url, "onboarding", 20).await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+    let (jobs_before, tasks_before, signals_before) = count_rows_i64(&mut conn, &url).await;
+    let audit_before: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    let states_before: Vec<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("onboarding"))
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "onboarding" },
+            "dry_run": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "dry_run 200: {body}");
+
+    let (jobs_after, tasks_after, signals_after) = count_rows_i64(&mut conn, &url).await;
+    let audit_after: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    let states_after: Vec<String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("onboarding"))
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        jobs_before, jobs_after,
+        "dry_run must create NO harvest_batch_jobs row"
+    );
+    assert_eq!(
+        tasks_before, tasks_after,
+        "dry_run must touch NO harvest_task_queue row"
+    );
+    assert_eq!(
+        signals_before, signals_after,
+        "dry_run must enqueue NO harvest_signals row"
+    );
+    assert_eq!(
+        audit_before, audit_after,
+        "dry_run must write NO harvest_audit_log row"
+    );
+    assert_eq!(
+        states_before, states_after,
+        "dry_run must not transition any workflow"
+    );
+    assert!(
+        states_after.iter().all(|s| s == "RUNNING"),
+        "all workflows stay RUNNING after dry_run: {states_after:?}"
+    );
+}
+
+/// AC2 anti-drift: dry_run matched_count must equal the real submit's resolved
+/// target count (`total`) for the SAME filter — proving both paths share one
+/// predicate builder.
+#[tokio::test]
+async fn dry_run_matches_real_submit_target_count() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let ids = seed_workflows(&url, "reporting", 30).await;
+    // Mix in some terminal rows so the default (Cancel -> RUNNING/PAUSED) filter
+    // must actually exclude them: 10 -> COMPLETED, leaving 20 RUNNING.
+    set_states(&url, &ids, 0..10, "COMPLETED").await;
+
+    // Dry-run: no explicit states -> Cancel default RUNNING/PAUSED.
+    let (status, dry) = post_json(
+        &app,
+        "/batch-operations",
+        json!({ "action": "Cancel", "filter": { "workflow_name": "reporting" }, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "dry_run body: {dry}");
+    let dry_matched = dry["matched_count"].as_u64().expect("matched_count");
+    assert_eq!(
+        dry_matched, 20,
+        "Cancel default excludes the 10 COMPLETED: {dry}"
+    );
+
+    // Real submit, same filter, then drive the executor to completion.
+    let (status, sub) = post_json(
+        &app,
+        "/batch-operations",
+        json!({ "action": "Cancel", "filter": { "workflow_name": "reporting" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "real submit: {sub}");
+    let job_id = sub["batch_job_id"]
+        .as_str()
+        .expect("batch_job_id")
+        .to_string();
+
+    let sharded_pool = HarvestDbPool::from(pool.clone());
+    run_executor_once(sharded_pool.sharded_pool(), &BatchExecutorConfig::default())
+        .await
+        .expect("executor tick");
+
+    let (status, view) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK, "job view: {view}");
+    assert_eq!(
+        view["total"].as_u64(),
+        Some(dry_matched),
+        "real job target count (total) must equal dry-run matched_count: dry={dry_matched} view={view}"
+    );
+}
+
+/// AC5: an empty/criteria-less filter is rejected in dry_run mode with the same
+/// 400 guard the real submit uses, and writes NO audit row.
+#[tokio::test]
+async fn dry_run_empty_filter_rejected_400() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+    let audit_before: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    let jobs_before: i64 = harvest_batch_jobs::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({ "action": "Cancel", "filter": {}, "dry_run": true }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "empty-filter dry_run must 400: {body}"
+    );
+    assert!(
+        body.to_string().contains("at least one criterion"),
+        "same guard message as real submit, got: {body}"
+    );
+
+    let audit_after: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    let jobs_after: i64 = harvest_batch_jobs::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_before, audit_after,
+        "rejected dry_run writes NO audit row"
+    );
+    assert_eq!(
+        jobs_before, jobs_after,
+        "rejected dry_run writes NO job row"
+    );
+}
+
+/// AC2 per-action default parity: Terminate with no states must target
+/// state NOT IN (CANCELLED, TERMINATED), same as resolve_targets_on_shard.
+#[tokio::test]
+async fn dry_run_terminate_default_excludes_terminal() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let ids = seed_workflows(&url, "cleanup", 25).await;
+    // 8 -> CANCELLED (must be excluded by Terminate default), leaving 17 RUNNING.
+    set_states(&url, &ids, 0..8, "CANCELLED").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({ "action": "Terminate", "filter": { "workflow_name": "cleanup" }, "dry_run": true }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["action"], "Terminate", "body: {body}");
+    assert_eq!(
+        body["matched_count"].as_u64(),
+        Some(17),
+        "Terminate default excludes the 8 CANCELLED: {body}"
+    );
+}
+
+/// AC6: a real submit (dry_run omitted) is unchanged — 202 + batch_job_id + a
+/// persisted job row.
+#[tokio::test]
+async fn real_submit_still_works_and_writes_job() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    seed_workflows(&url, "onboarding", 10).await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+    let jobs_before: i64 = harvest_batch_jobs::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({ "action": "Cancel", "filter": { "workflow_name": "onboarding" } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED, "real submit 202: {body}");
+    assert!(
+        body["batch_job_id"].as_str().is_some(),
+        "batch_job_id present: {body}"
+    );
+
+    let jobs_after: i64 = harvest_batch_jobs::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs_after,
+        jobs_before + 1,
+        "real submit persists exactly one job row"
+    );
+}
