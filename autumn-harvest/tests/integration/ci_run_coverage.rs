@@ -247,22 +247,19 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "plugin:workflow_history_pagination_integration",
         ALLOWLIST_DEBT_REASON,
     ),
-    (
-        "plugin:workflow_reachability_integration",
-        ALLOWLIST_DEBT_REASON,
-    ),
     ("plugin:workflow_reset_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:workflow_result_integration", ALLOWLIST_DEBT_REASON),
 ];
 
 /// Soft ratchet: the allowlist may shrink but must never silently grow. Bump
 /// this ONLY with a deliberate justification (it should trend toward zero).
-/// 74 = the prior 77 minus the three now wired to covering `linux` manifest
-/// rows (each was a test-harness bug, now fixed, so the whole module runs
-/// green): `core:workflow_retry_tests` (its `::workflow_typed` sub-filter is
-/// replaced by a whole-module row), `core:completion_callback_tests`, and
-/// `core:event_batch_tests`.
-const ALLOWLIST_MAX_LEN: usize = 74;
+/// 74 = the prior 77 minus the three wired to covering `linux` manifest rows
+/// (each was a test-harness bug, now fixed, so the whole module runs green):
+/// `core:workflow_retry_tests` (its `::workflow_typed` sub-filter is replaced by
+/// a whole-module row), `core:completion_callback_tests`, and
+/// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
+/// now wired to a covering `linux` manifest row (issue #700).
+const ALLOWLIST_MAX_LEN: usize = 73;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
