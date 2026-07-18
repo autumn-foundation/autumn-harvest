@@ -400,6 +400,21 @@ mod tests {
             workflow_name: workflow_name.to_string(),
             non_terminal_count: count,
             oldest_started_at: at(oldest),
+            sample_execution_ids: Vec::new(),
+        }
+    }
+
+    fn row_with_samples(
+        workflow_name: &str,
+        count: i64,
+        oldest: i64,
+        samples: &[uuid::Uuid],
+    ) -> WorkflowTypeNonTerminalCount {
+        WorkflowTypeNonTerminalCount {
+            workflow_name: workflow_name.to_string(),
+            non_terminal_count: count,
+            oldest_started_at: at(oldest),
+            sample_execution_ids: samples.to_vec(),
         }
     }
 
@@ -597,5 +612,218 @@ mod tests {
             item(&report, "onboarding").verdict,
             ReachabilityVerdict::SafeToRemove
         );
+    }
+
+    // ── AC2: bounded execution-id samples per group ─────────────────────────
+
+    #[test]
+    fn samples_are_capped_and_bounded_per_type() {
+        // Two shards each contribute the per-shard SQL cap (5) of samples; the
+        // cross-shard union (10) must be capped back down to
+        // REACHABILITY_SAMPLE_CAP (5), and every returned id must be drawn from
+        // the seeded set.
+        let shard0: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+        let shard1: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+        let all: BTreeSet<uuid::Uuid> = shard0.iter().chain(shard1.iter()).copied().collect();
+
+        let report = build_report_from_observations(
+            at(1000),
+            None,
+            &registered(&["batch"]),
+            vec![
+                obs(0, vec![row_with_samples("batch", 40, 100, &shard0)], None),
+                obs(1, vec![row_with_samples("batch", 30, 200, &shard1)], None),
+            ],
+        );
+
+        let batch = item(&report, "batch");
+        assert_eq!(batch.non_terminal_count, 70);
+        assert_eq!(
+            batch.sample_execution_ids.len(),
+            autumn_harvest::execution::REACHABILITY_SAMPLE_CAP,
+            "the cross-shard sample union must be capped at REACHABILITY_SAMPLE_CAP"
+        );
+        for id in &batch.sample_execution_ids {
+            assert!(
+                all.contains(id),
+                "every sample must be a seeded execution id"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_to_remove_type_has_empty_samples() {
+        let report = build_report_from_observations(
+            at(1000),
+            None,
+            &registered(&["onboarding"]),
+            vec![obs(0, Vec::new(), None)],
+        );
+        let onboarding = item(&report, "onboarding");
+        assert_eq!(onboarding.verdict, ReachabilityVerdict::SafeToRemove);
+        assert!(
+            onboarding.sample_execution_ids.is_empty(),
+            "a type with no non-terminal executions has no samples"
+        );
+    }
+
+    #[test]
+    fn samples_merge_across_shards() {
+        // When the union fits under the cap, every shard's samples appear.
+        let a: Vec<uuid::Uuid> = (0..2).map(|_| uuid::Uuid::new_v4()).collect();
+        let b: Vec<uuid::Uuid> = (0..2).map(|_| uuid::Uuid::new_v4()).collect();
+        let report = build_report_from_observations(
+            at(1000),
+            None,
+            &registered(&["flow"]),
+            vec![
+                obs(0, vec![row_with_samples("flow", 2, 100, &a)], None),
+                obs(1, vec![row_with_samples("flow", 2, 200, &b)], None),
+            ],
+        );
+        let flow = item(&report, "flow");
+        let got: BTreeSet<uuid::Uuid> = flow.sample_execution_ids.iter().copied().collect();
+        for id in a.iter().chain(b.iter()) {
+            assert!(got.contains(id), "merged samples must include both shards");
+        }
+        assert_eq!(flow.sample_execution_ids.len(), 4);
+    }
+
+    // ── AC3: top-level orphaned summary for a single-field CI gate ──────────
+
+    #[test]
+    fn report_reports_orphaned_true_and_total_when_orphan_present() {
+        let report = build_report_from_observations(
+            at(1000),
+            None,
+            &registered(&[]),
+            vec![obs(0, vec![row("legacy_flow", 3, 0)], None)],
+        );
+        assert!(report.orphaned);
+        assert_eq!(report.total_orphaned_executions, 3);
+    }
+
+    #[test]
+    fn report_orphaned_false_and_zero_total_when_no_orphans() {
+        // subscription is in_use, onboarding is safe_to_remove — neither orphaned.
+        let report = build_report_from_observations(
+            at(1000),
+            None,
+            &registered(&["onboarding", "subscription"]),
+            vec![obs(0, vec![row("subscription", 4, 100)], None)],
+        );
+        assert!(!report.orphaned);
+        assert_eq!(report.total_orphaned_executions, 0);
+    }
+
+    #[test]
+    fn total_orphaned_sums_across_multiple_orphaned_types_and_shards() {
+        // legacy_a (2 + 5) and legacy_b (3) are both unregistered -> orphaned.
+        // subscription is registered -> in_use and must NOT be counted.
+        let report = build_report_from_observations(
+            at(1000),
+            None,
+            &registered(&["subscription"]),
+            vec![
+                obs(
+                    0,
+                    vec![row("legacy_a", 2, 0), row("subscription", 9, 0)],
+                    None,
+                ),
+                obs(1, vec![row("legacy_a", 5, 0), row("legacy_b", 3, 0)], None),
+            ],
+        );
+        assert!(report.orphaned);
+        // 2 + 5 (legacy_a) + 3 (legacy_b) = 10; subscription (9) excluded.
+        assert_eq!(report.total_orphaned_executions, 10);
+    }
+
+    // ── AC4: pure boot-time fail-fast decision ──────────────────────────────
+
+    #[test]
+    fn fail_aborts_only_on_orphaned_and_complete() {
+        use crate::config::OrphanStartupAction;
+        // The one and only Abort case.
+        assert_eq!(
+            startup_orphan_decision(
+                OrphanStartupAction::Fail,
+                true,
+                ReachabilityReportStatus::Complete
+            ),
+            StartupOrphanDecision::Abort
+        );
+        // No orphans -> Continue even under Fail (a clean boot must not warn).
+        assert_eq!(
+            startup_orphan_decision(
+                OrphanStartupAction::Fail,
+                false,
+                ReachabilityReportStatus::Complete
+            ),
+            StartupOrphanDecision::Continue
+        );
+    }
+
+    #[test]
+    fn fail_warns_not_aborts_on_partial_status() {
+        use crate::config::OrphanStartupAction;
+        // Crash-loop safety: a transient partial/unavailable shard must never
+        // hard-fail boot, even when orphans are observed on the reachable shards.
+        for status in [
+            ReachabilityReportStatus::Partial,
+            ReachabilityReportStatus::Unavailable,
+        ] {
+            assert_eq!(
+                startup_orphan_decision(OrphanStartupAction::Fail, true, status),
+                StartupOrphanDecision::Warn,
+                "Fail must degrade to Warn on an incomplete report"
+            );
+        }
+    }
+
+    #[test]
+    fn warn_never_aborts() {
+        use crate::config::OrphanStartupAction;
+        assert_eq!(
+            startup_orphan_decision(
+                OrphanStartupAction::Warn,
+                true,
+                ReachabilityReportStatus::Complete
+            ),
+            StartupOrphanDecision::Warn
+        );
+        assert_eq!(
+            startup_orphan_decision(
+                OrphanStartupAction::Warn,
+                false,
+                ReachabilityReportStatus::Complete
+            ),
+            StartupOrphanDecision::Continue
+        );
+        assert_eq!(
+            startup_orphan_decision(
+                OrphanStartupAction::Warn,
+                true,
+                ReachabilityReportStatus::Partial
+            ),
+            StartupOrphanDecision::Warn
+        );
+    }
+
+    #[test]
+    fn off_skips_entirely() {
+        use crate::config::OrphanStartupAction;
+        for orphaned in [true, false] {
+            for status in [
+                ReachabilityReportStatus::Complete,
+                ReachabilityReportStatus::Partial,
+                ReachabilityReportStatus::Unavailable,
+            ] {
+                assert_eq!(
+                    startup_orphan_decision(OrphanStartupAction::Off, orphaned, status),
+                    StartupOrphanDecision::Continue,
+                    "Off must always Continue"
+                );
+            }
+        }
     }
 }

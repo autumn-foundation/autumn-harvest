@@ -662,6 +662,56 @@ require_shard_readiness = false
         assert!(config.readiness.require_shard_readiness);
     }
 
+    #[test]
+    fn startup_orphaned_workflows_defaults_to_warn() {
+        let env = MockEnv::new();
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+        assert_eq!(config.startup.orphaned_workflows, OrphanStartupAction::Warn);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_from_toml() {
+        let dir = unique_temp_dir("harvest-config-startup-toml");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+        assert_eq!(config.startup.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_from_env() {
+        let dir = unique_temp_dir("harvest-config-startup-env");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "warn"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "off");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+        assert_eq!(config.startup.orphaned_workflows, OrphanStartupAction::Off);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_rejects_unknown_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "explode");
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("unknown orphaned_workflows value must fail validation");
+        assert!(
+            error.to_string().contains("orphaned_workflows"),
+            "expected orphaned_workflows validation error, got {error}"
+        );
+    }
+
     fn unique_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "autumn-harvest-plugin-{label}-{}",

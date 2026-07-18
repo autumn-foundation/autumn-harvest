@@ -412,6 +412,106 @@ async fn reachability_aggregates_across_shards_and_reports_unavailable_shard() {
 }
 
 #[tokio::test]
+async fn orphaned_group_surfaces_bounded_execution_id_samples() {
+    // AC2: an orphaned group carries a bounded set of representative
+    // non-terminal execution ids (cap 5), all drawn from the live runs.
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let mut seeded = std::collections::BTreeSet::new();
+    for n in 0..7 {
+        let exec_id = insert_execution(
+            &database_url,
+            ShardId::new(0),
+            "legacy_export",
+            &format!("leg-{n}"),
+            "RUNNING",
+        )
+        .await;
+        seeded.insert(exec_id.as_uuid());
+    }
+    // A terminal run of the same type must NOT appear among the samples.
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        "legacy_export",
+        "leg-done",
+        "COMPLETED",
+    )
+    .await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+        vec![], // legacy_export is unregistered -> orphaned
+    );
+
+    let (status, report) = get_json(&app, "/admin/workflow-types/reachability").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let legacy = item(&report, "legacy_export");
+    assert_eq!(
+        legacy.get("verdict").and_then(Value::as_str),
+        Some("orphaned")
+    );
+    assert_eq!(legacy.get("non_terminal_count"), Some(&json!(7)));
+
+    let samples = legacy
+        .get("sample_execution_ids")
+        .and_then(Value::as_array)
+        .expect("sample_execution_ids array");
+    assert_eq!(samples.len(), 5, "samples must be capped at 5");
+    for sample in samples {
+        let id: uuid::Uuid = sample
+            .as_str()
+            .expect("sample id is a string")
+            .parse()
+            .expect("sample id is a uuid");
+        assert!(
+            seeded.contains(&id),
+            "every sample must be one of the seeded non-terminal runs"
+        );
+    }
+}
+
+#[tokio::test]
+async fn endpoint_exposes_top_level_orphaned_and_total() {
+    // AC3: a single top-level `orphaned` bool + `total_orphaned_executions`
+    // count so a CI/CD gate asserts "zero orphans" without walking items[].
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    // subscription is registered with a live run -> in_use (NOT counted).
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        "subscription",
+        "sub-1",
+        "RUNNING",
+    )
+    .await;
+    // legacy_export is unregistered with two live runs -> orphaned (counted).
+    for n in 0..2 {
+        insert_execution(
+            &database_url,
+            ShardId::new(0),
+            "legacy_export",
+            &format!("leg-{n}"),
+            "RUNNING",
+        )
+        .await;
+    }
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+        vec!["subscription"],
+    );
+
+    let (status, report) = get_json(&app, "/admin/workflow-types/reachability").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report.get("orphaned"), Some(&json!(true)));
+    // Only the orphaned executions are counted; the in_use subscription run is not.
+    assert_eq!(report.get("total_orphaned_executions"), Some(&json!(2)));
+}
+
+#[tokio::test]
 async fn reachability_requires_admin_auth() {
     // No admin boundary set -> the shared `/admin/*` guard must reject.
     let app =

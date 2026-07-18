@@ -138,6 +138,8 @@ mod worker_session_tests;
 mod workflow_handle_tests;
 mod workflow_logger_tests;
 mod workflow_mutation_tests;
+#[cfg(feature = "db")]
+mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;
 mod workflow_task_timeout_tests;
 #[cfg(feature = "testing")]
