@@ -95,6 +95,7 @@ async fn handle_webhook_after(
             trace_context: None,
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
+            start_source_override: None,
             concurrency_limit: None,
             signal_name: "stripe.subscription_created",
             signal_payload: payload,

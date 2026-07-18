@@ -13741,7 +13741,14 @@ impl Worker {
             .await;
         heartbeat_cancel.cancel();
 
-        self.shutdown_and_cleanup(heartbeat_handle, monitors).await;
+        if let Err(error) = heartbeat_handle.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "worker heartbeat task failed during shutdown"
+            );
+        }
+        self.shutdown_and_cleanup_monitors(monitors).await;
 
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }
@@ -14266,129 +14273,6 @@ impl Worker {
     // repetitive rather than complex; splitting it up would just move the
     // line count into a helper with an equally uninteresting signature.
     #[allow(clippy::too_many_lines)]
-    async fn shutdown_and_cleanup(
-        &self,
-        heartbeat_handle: tokio::task::JoinHandle<()>,
-        monitors: WorkerMonitoringHandles,
-    ) {
-        if let Err(error) = heartbeat_handle.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "worker heartbeat task failed during shutdown"
-            );
-        }
-        for handle in monitors.timeout_checkers {
-            if let Err(error) = handle.await {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "timeout checker task failed during shutdown"
-                );
-            }
-        }
-        for handle in monitors.poison_pill_reclaimers {
-            if let Err(error) = handle.await {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "poison-pill reclaimer task failed during shutdown"
-                );
-            }
-        }
-        for handle in monitors.session_slot_reconcilers {
-            if let Err(error) = handle.await {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "session slot reconciler task failed during shutdown"
-                );
-            }
-        }
-        for handle in monitors.pause_auto_resumers {
-            if let Err(error) = handle.await {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "pause auto-resume scanner failed during shutdown"
-                );
-            }
-        }
-        if let Err(error) = monitors.queue_depth_sampler.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "queue depth sampler failed during shutdown"
-            );
-        }
-        if let Err(error) = monitors.concurrency_sampler.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "concurrency sampler failed during shutdown"
-            );
-        }
-        if let Err(error) = monitors.rate_limit_sampler.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "rate limit sampler failed during shutdown"
-            );
-        }
-        for sampler in monitors.dlq_depth_samplers {
-            if let Err(error) = sampler.await {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "dlq depth sampler failed during shutdown"
-                );
-            }
-        }
-        if let Err(error) = monitors.history_oversized_sampler.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "history oversized sampler failed during shutdown"
-            );
-        }
-        if let Some(handle) = monitors.worker_slot_sampler
-            && let Err(error) = handle.await
-        {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "worker slot sampler failed during shutdown"
-            );
-        }
-        if let Some(handle) = monitors.stranded_work_sampler
-            && let Err(error) = handle.await
-        {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "stranded-work sampler failed during shutdown"
-            );
-        }
-        if let Some(handle) = monitors.schedule_overdue_sampler
-            && let Err(error) = handle.await
-        {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "schedule overdue sampler failed during shutdown"
-            );
-        }
-        for handle in monitors.slot_tuners {
-            if let Err(error) = handle.await {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "slot tuner loop failed during shutdown"
-                );
-            }
-        }
-    }
-
     /// Register or re-register this worker in the fleet table.
     async fn register_in_fleet(&self, pool: &DbPool) {
         let shard_ids: Vec<i32> = self
