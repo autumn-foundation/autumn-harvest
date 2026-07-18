@@ -25924,8 +25924,8 @@ async fn run_replay_canary_handler(
 /// Loads ONE execution's recorded history from its owning shard and replays it
 /// against the currently-registered `#[workflow]` handler via
 /// [`WorkflowReplayer`](autumn_harvest::testing::WorkflowReplayer), returning a
-/// structured verdict (clean / diverged / workflow_failed / not_registered /
-/// not_replayable_dag). This is the operator's on-demand answer to "will — or
+/// structured verdict (clean / diverged / `workflow_failed` / `not_registered` /
+/// `not_replayable_dag`). This is the operator's on-demand answer to "will — or
 /// did — this specific run diverge under the code I have deployed right now?" —
 /// the same question the #480/#603 non-determinism-block incident signal raises
 /// fleet-wide, but scoped to one execution: a PAUSED or nd-blocked RUNNING run
@@ -25941,9 +25941,16 @@ async fn run_replay_canary_handler(
 ///   * `400` — malformed execution id.
 ///   * `404` — unknown execution.
 ///   * `408` — replay exceeded the bounded budget (`WorkerConfig::query_timeout`).
-///     The deadline bounds async-yielding replays; a synchronous busy-loop
-///     workflow is out of scope here (it blocks a worker thread rather than
-///     yielding) and is instead caught by the #494 workflow-task timeout.
+///     The `query_timeout` bound applies to async-yielding replays; a workflow
+///     function that busy-loops synchronously without ever `.await`-ing is out of
+///     scope, exactly as for the live executor. A large but healthy history is
+///     not at risk: `SUSPENSION_TIMEOUT` (the executor's per-cycle 100 ms
+///     suspension heuristic) only fires when the handler future is genuinely
+///     *pending* on an unresolved oneshot at the replay frontier — it never cuts
+///     off a CPU-bound replay consuming recorded events, so a completed history
+///     replays to its verdict regardless of wall-clock duration, bounded only by
+///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
+///     replay budget, issue #135).
 ///   * `410` — history unavailable: pruned by retention, released on reset, or
 ///     PII-erased (issue #495).
 ///
@@ -26014,20 +26021,37 @@ async fn replay_diagnosis(
         .expect("workflow presence just checked above")
         .handler;
 
-    // Load the recorded history, then DROP the DB connection before driving user
-    // code — WorkflowReplayer::replay_from_snapshot needs no DB, and holding a pool
-    // slot for the whole replay would starve other management/worker DB operations
-    // (the #612 pool-slot discipline).
+    // Load the recorded history exactly as the live worker loads it for replay:
+    // decode with the runtime's own codecs (#608) and inflate offloaded payloads
+    // via the registry's offloader (#524), so an encrypted or offloaded history
+    // replays faithfully rather than hard-500ing on ciphertext / false-diverging
+    // on an offload reference envelope. When neither is configured (the default),
+    // `load_history_inflated` with a `None` offloader + identity codecs is
+    // behaviorally identical to `load_history`. Then DROP the DB connection before
+    // driving user code — WorkflowReplayer needs no DB, and holding a pool slot
+    // for the whole replay would starve other management/worker DB operations (the
+    // #612 pool-slot discipline).
     //
     // Design choice: build a HistorySnapshot from the already-loaded execution row
-    // + this history and replay via `replay_from_snapshot` (drop-first), rather
+    // + this history and replay via `replay_canary_snapshot` (drop-first), rather
     // than `WorkflowReplayer::replay_from_db`, which reloads history + meta and
     // holds its connection across the whole replay. Both are correct; drop-first
     // keeps the pool slot free for the ~bounded replay duration.
-    let history = store::load_history(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
+    let history = store::load_history_inflated(
+        &mut conn,
+        exec_id,
+        &api_state.payload_codecs(),
+        runtime.registry.payload_offloader(),
+    )
+    .await
+    .map_err(map_error)?;
     drop(conn);
+
+    // Whether the recorded history reached its terminal seal — needed by the
+    // sealed-mid-await reclassification below, computed before `history.events`
+    // is moved into the snapshot (issue #614 FIX 3).
+    let history_reached_seal = history_reached_terminal_seal(&history.events);
+    let terminal_state = is_terminal_state(&state);
 
     // Thread the execution row's own execution_timeout / deadline_at / parent id /
     // workflow_id / context headers into the snapshot (issues #772, #698, #481) —
@@ -26048,13 +26072,19 @@ async fn replay_diagnosis(
         workflow_id: Some(execution.workflow_id.clone()),
     };
 
-    // Register ONLY the target handler and replay. Bound the replay by
-    // `query_timeout` (the #612 contract): on the timer winning, return 408.
+    // Register ONLY the target handler and replay in CANARY mode. Canary — not
+    // strict — is required: strict replay classifies a frontier suspension (every
+    // healthy in-flight RUNNING/SUSPENDED/PAUSED run parked mid-flight, the
+    // endpoint's headline use case) as `NonDeterminismDetected`, a false
+    // `diverged`. Canary excepts exactly that frontier suspension → `clean`, while
+    // a genuine mid-history divergence still surfaces (it resolves synchronously
+    // during the drive, not as a frontier suspension). Bound by `query_timeout`
+    // (the #612 contract): on the timer winning, return 408.
     let replayer = autumn_harvest::testing::WorkflowReplayer::new()
         .register_fn(execution.workflow_name.clone(), handler);
     let report = match tokio::time::timeout(
         api_state.query_timeout(),
-        replayer.replay_from_snapshot(snapshot),
+        replayer.replay_canary_snapshot(snapshot),
     )
     .await
     {
@@ -26068,12 +26098,21 @@ async fn replay_diagnosis(
         }
     };
 
-    Ok(Json(crate::replay_diagnosis::report_to_response(
-        exec_id,
-        workflow_name,
-        state,
-        report,
-    )))
+    // Reclassify a false `diverged` on a terminal run that was externally sealed
+    // mid-await (TIMED_OUT / externally-cancelled / terminated) into `clean`
+    // (issue #614 FIX 3): the workflow replayed its recorded history faithfully
+    // and then issued the next command exactly where the external terminal seal
+    // sits — no code divergence, the run was killed by an outside force. A genuine
+    // mid-history divergence, or new code that does MORE work than a COMPLETED /
+    // FAILED run, is never masked (the divergence's `actual` names a real command
+    // event or the workflow's own outcome seal, not an external seal — see
+    // `reclassify_sealed_mid_await`).
+    let response = crate::replay_diagnosis::reclassify_sealed_mid_await(
+        crate::replay_diagnosis::report_to_response(exec_id, workflow_name, state, report),
+        terminal_state,
+        history_reached_seal,
+    );
+    Ok(Json(response))
 }
 
 async fn concurrency_status(

@@ -23,6 +23,12 @@
 //!        unchanged before and after a diagnosis.
 //!   (10) The headline: an nd-blocked `RUNNING` run diagnoses its divergence →
 //!        200 `diverged`.
+//!   (11) A healthy in-flight `RUNNING` run parked mid-activity (frontier
+//!        suspension) → 200 `clean` (canary replay mode, FIX 2).
+//!   (12) A `TIMED_OUT` run sealed mid-await (single-activity in-progress) → 200
+//!        `clean` (frontier suspension, FIX 3).
+//!   (13) A `TIMED_OUT` run sealed awaiting a second activity → 200 `clean`
+//!        (sealed-mid-await reclassification, FIX 3).
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to an already-migrated Postgres to
 //! run against it directly (no Docker); otherwise a testcontainer is started with
@@ -304,6 +310,46 @@ fn diverging_history() -> (Value, Vec<WorkflowEvent>) {
     (input, events)
 }
 
+/// A history with a CLEAN PREFIX (one matching `process_item` activity) followed
+/// by a divergence: the SECOND recorded activity is `renamed_activity`, which the
+/// registered `progress_wf` handler (scheduling `process_item` for both items)
+/// does not schedule — so replay matches item 1, then diverges at event index 3.
+fn diverging_history_with_clean_prefix() -> (Value, Vec<WorkflowEvent>) {
+    let input = json!({ "items": ["a", "b"], "should_fail": false });
+    let a = ActivityExecId::new();
+    let b = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: a,
+            name: "process_item".into(),
+            input: json!("a"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: a,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: b,
+            name: "renamed_activity".into(),
+            input: json!("b"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: b,
+            output: Value::Null,
+        },
+    ];
+    (input, events)
+}
+
 async fn count_events(pool: &DbPool, exec_id: ExecutionId) -> i64 {
     use diesel::sql_types::BigInt;
     #[derive(diesel::QueryableByName)]
@@ -318,6 +364,24 @@ async fn count_events(pool: &DbPool, exec_id: ExecutionId) -> i64 {
             .load(&mut conn)
             .await
             .expect("count events");
+    rows.into_iter().next().map_or(0, |c| c.n)
+}
+
+async fn count_tasks(pool: &DbPool, exec_id: ExecutionId) -> i64 {
+    use diesel::sql_types::BigInt;
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let mut conn = pool.get().await.expect("pooled conn");
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_task_queue WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("count tasks");
     rows.into_iter().next().map_or(0, |c| c.n)
 }
 
@@ -373,10 +437,18 @@ async fn history_diverging_from_handler_is_diverged() {
     assert_eq!(body["diagnosis"], json!("diverged"));
     let div = &body["divergence"];
     assert_eq!(div["kind"], json!("ActivityScheduleMismatch"));
-    assert!(div["event_index"].is_number());
-    assert!(
-        div["expected"].as_str().is_some() && div["actual"].as_str().is_some(),
-        "expected/actual populated: {div}"
+    // The divergence is at the first (and only) activity, event index 1 (AC2:
+    // exact fields, not just "some string").
+    assert_eq!(div["event_index"], json!(1), "div={div}");
+    assert_eq!(
+        div["expected"],
+        json!("ActivityScheduled(process_item)"),
+        "handler schedules process_item"
+    );
+    assert_eq!(
+        div["actual"],
+        json!("ActivityScheduled(renamed_activity)"),
+        "history recorded renamed_activity"
     );
 }
 
@@ -475,14 +547,22 @@ async fn diagnosis_performs_no_writes() {
 
     let before_events = count_events(&pool, exec).await;
     let before_state = row_state(&pool, exec).await;
+    let before_tasks = count_tasks(&pool, exec).await;
 
     let (status, _body) = post_diagnosis(&app, &exec.to_string()).await;
     assert_eq!(status, StatusCode::OK);
 
     let after_events = count_events(&pool, exec).await;
     let after_state = row_state(&pool, exec).await;
+    let after_tasks = count_tasks(&pool, exec).await;
     assert_eq!(before_events, after_events, "diagnosis appended events");
     assert_eq!(before_state, after_state, "diagnosis mutated the row state");
+    // AC3: the replay executes no activities/signals — a diagnosis must never
+    // enqueue a task-queue row (a spurious enqueue is exactly what a bug causes).
+    assert_eq!(
+        before_tasks, after_tasks,
+        "diagnosis enqueued a task-queue row"
+    );
 }
 
 #[tokio::test]
@@ -491,10 +571,13 @@ async fn nd_blocked_running_run_diagnoses_its_divergence() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // A non-determinism-blocked run stays RUNNING (issue #603). Its clean prefix
-    // history diverges under the current (changed) handler. The endpoint replays
-    // it and reports the divergence — the headline diagnosability use case.
-    let (input, events) = diverging_history();
+    // A non-determinism-blocked run stays RUNNING (issue #603). Its history has a
+    // CLEAN PREFIX (item 1 replays cleanly) and then diverges under the current
+    // handler (item 2 was recorded as `renamed_activity`). The endpoint replays it
+    // and reports the divergence AT the point it actually occurs — the headline
+    // diagnosability use case. The nd_block_* columns are cosmetic here (the
+    // endpoint does not read them); they model the real incident shape.
+    let (input, events) = diverging_history_with_clean_prefix();
     let exec = seed_execution(&pool, "progress_wf", "RUNNING", input, events, false).await;
     // Mark it nd-blocked to model the real incident shape.
     {
@@ -514,8 +597,152 @@ async fn nd_blocked_running_run_diagnoses_its_divergence() {
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["diagnosis"], json!("diverged"));
     assert_eq!(body["state"], json!("RUNNING"));
-    assert_eq!(
-        body["divergence"]["kind"],
-        json!("ActivityScheduleMismatch")
-    );
+    let div = &body["divergence"];
+    assert_eq!(div["kind"], json!("ActivityScheduleMismatch"));
+    // The clean prefix (item 1: WorkflowStarted + scheduled + completed) replays,
+    // then the divergence lands at the SECOND scheduled activity — event index 3.
+    assert_eq!(div["event_index"], json!(3), "div={div}");
+    assert_eq!(div["expected"], json!("ActivityScheduled(process_item)"));
+    assert_eq!(div["actual"], json!("ActivityScheduled(renamed_activity)"));
+}
+
+/// FIX 2 (canary replay mode): a healthy in-flight RUNNING run parked mid-flight
+/// — its recorded history stops after the first activity, with no trailing
+/// terminal event and no divergence. Under STRICT replay the workflow's next
+/// command (schedule item 2) at the frontier is classified as a non-determinism
+/// suspension → a FALSE `diverged`. Under CANARY replay (the fix) that frontier
+/// suspension is `clean`. This is the endpoint's headline use case and the
+/// falsifiable proof of FIX 2 (it fails under strict, passes under canary).
+#[tokio::test]
+async fn running_healthy_run_parked_mid_activity_is_clean() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Input drives TWO items, but only item 1 has been scheduled + completed:
+    // WorkflowStarted + ActivityScheduled(process_item, a) + ActivityCompleted(a).
+    // The workflow is parked about to schedule item 2 (the live frontier).
+    let input = json!({ "items": ["a", "b"], "should_fail": false });
+    let a = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: a,
+            name: "process_item".into(),
+            input: json!("a"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: a,
+            output: Value::Null,
+        },
+    ];
+    let exec = seed_execution(&pool, "progress_wf", "RUNNING", input, events, false).await;
+
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["diagnosis"], json!("clean"), "body={body}");
+    assert_eq!(body["message"], json!("no divergence under current code"));
+    assert_eq!(body["state"], json!("RUNNING"));
+    assert!(body.get("divergence").is_none(), "clean has no divergence");
+}
+
+/// FIX 3 (sealed-mid-await terminal, single-activity shape): a `TIMED_OUT` run
+/// whose recorded history is `WorkflowStarted + ActivityScheduled(a) +
+/// WorkflowExecutionTimedOut` — the activity was scheduled but never completed
+/// before the execution-timeout scanner sealed the run. The workflow replays its
+/// one recorded command faithfully and then *suspends* awaiting the in-progress
+/// activity's (unrecorded) result, which canary replay reports as `clean`. The
+/// run replayed faithfully up to where it was externally sealed — there is no
+/// code divergence.
+#[tokio::test]
+async fn timed_out_run_sealed_mid_activity() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let input = json!({ "items": ["a"], "should_fail": false });
+    let a = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: a,
+            name: "process_item".into(),
+            input: json!("a"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: Utc::now(),
+            timed_out_at: Utc::now(),
+        },
+    ];
+    let exec = seed_execution(&pool, "progress_wf", "TIMED_OUT", input, events, false).await;
+
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["diagnosis"], json!("clean"), "body={body}");
+    assert_eq!(body["state"], json!("TIMED_OUT"));
+    assert!(body.get("divergence").is_none());
+}
+
+/// FIX 3 (sealed-mid-await terminal, multi-activity shape): a `TIMED_OUT` run whose
+/// recorded history is `WorkflowStarted + ActivityScheduled(a) +
+/// ActivityCompleted(a) + WorkflowExecutionTimedOut` — item 1 completed, then the
+/// run was sealed while awaiting item 2. On replay the workflow consumes item 1
+/// and issues the NEXT command (schedule item 2), which lands exactly on the
+/// external `WorkflowExecutionTimedOut` seal → a raw `diverged{actual:
+/// "WorkflowExecutionTimedOut"}`. The handler's `reclassify_sealed_mid_await`
+/// rewrites this false positive to `clean` (terminal state + seal reached +
+/// external-seal actual). Proves the reclassification wiring fires end-to-end.
+#[tokio::test]
+async fn timed_out_run_sealed_awaiting_second_activity_is_clean() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let input = json!({ "items": ["a", "b"], "should_fail": false });
+    let a = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: a,
+            name: "process_item".into(),
+            input: json!("a"),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: a,
+            output: Value::Null,
+        },
+        WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: Utc::now(),
+            timed_out_at: Utc::now(),
+        },
+    ];
+    let exec = seed_execution(&pool, "progress_wf", "TIMED_OUT", input, events, false).await;
+
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["diagnosis"], json!("clean"), "body={body}");
+    assert_eq!(body["message"], json!("no divergence under current code"));
+    assert_eq!(body["state"], json!("TIMED_OUT"));
+    assert!(body.get("divergence").is_none(), "reclassified to clean");
 }

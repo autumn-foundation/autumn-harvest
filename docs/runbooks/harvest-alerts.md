@@ -897,8 +897,15 @@ per-execution operator action**. Full playbook:
    - `actual` (the event recorded in the history)
    - `event_index` (index where the divergence occurred)
    - `build_id` (the build ID of the worker that observed the divergence)
-3. Check recent deployment history to see if a new release was shipped without proper version gating or routing protection.
-4. Run replay tests on the workflow using the exported history to reproduce the non-determinism error.
+3. Diagnose one specific execution on demand against the **currently-deployed**
+   code with `POST /api/harvest/workflows/{id}/replay-diagnosis` (issue #614) —
+   it returns the same `{kind, event_index, expected, actual}` vocabulary and,
+   after a candidate rollback/fix is deployed, a `clean` verdict confirms the
+   run will resume. See the **"Diagnose the divergence"** section of
+   [`docs/runbooks/nondeterminism-block.md`](nondeterminism-block.md#diagnose-the-divergence-issue-614)
+   for the curl and the confirm-a-fix workflow.
+4. Check recent deployment history to see if a new release was shipped without proper version gating or routing protection.
+5. Run replay tests on the workflow using the exported history to reproduce the non-determinism error.
 
 ### Likely causes
 

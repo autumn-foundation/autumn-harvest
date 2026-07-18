@@ -96,10 +96,26 @@ the recorded history holds), so you can cross-check the block diagnostic against
 a live replay. Use it to (a) confirm a candidate rollback build makes the run
 `clean` (replay the same execution again after deploying the fix — a `clean`
 verdict means that build can resume it), and (b) pinpoint the divergence
-`event_index` for a reset (below). Verdict caveats: `410` = the run's history is
-unavailable (pruned by retention, released on reset, or PII-erased); `408` = the
-replay exceeded the bounded budget (a synchronous busy-loop workflow, out of
-scope here and caught instead by the #494 workflow-task timeout).
+`event_index` for a reset (below).
+
+The replay runs in **canary** mode, so a *healthy* in-flight run that is simply
+parked mid-flight (a `PAUSED`/`RUNNING` run at the frontier of its history, with
+no divergence under the current code) correctly returns `clean`, not a false
+`diverged` — only a genuine mid-history mismatch reports `diverged`. A terminal
+run that was externally sealed *mid-await* (`TIMED_OUT`, or operator
+cancel/terminate) likewise returns `clean`: the run replayed its recorded history
+faithfully and was killed by an outside force, not by a code divergence. On an
+encrypted (#608) or offloaded (#524) deployment the history is decoded/inflated
+with the runtime's own codecs before replay, so the diagnosis is accurate rather
+than a false `diverged`/`500`.
+
+Verdict caveats: `410` = the run's history is unavailable (pruned by retention,
+released on reset, or PII-erased); `408` = the replay exceeded the bounded
+`query_timeout` budget — the bound applies to async-yielding replays, and a
+workflow that busy-loops synchronously without ever `.await`-ing is out of scope,
+exactly as for the live executor (a large but healthy history is not at risk:
+the executor's 100 ms per-cycle suspension heuristic only fires at a genuine
+frontier suspension, never on a CPU-bound replay of recorded events).
 
 ## Roll back
 

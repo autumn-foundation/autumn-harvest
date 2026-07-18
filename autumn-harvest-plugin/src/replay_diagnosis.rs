@@ -11,8 +11,8 @@
 //!
 //! The endpoint is **read-only** — it appends no events and performs no writes
 //! (issue #614 AC3). It returns a structured `200` verdict for every reachable
-//! outcome (clean / diverged / workflow_failed / not_registered /
-//! not_replayable_dag), reserving non-`200` statuses for the resource itself:
+//! outcome (clean / diverged / `workflow_failed` / `not_registered` /
+//! `not_replayable_dag`), reserving non-`200` statuses for the resource itself:
 //! `400` (malformed id), `404` (unknown execution), `408` (replay exceeded the
 //! bounded budget), `410` (history unavailable — pruned by retention, released on
 //! reset, or PII-erased per issue #495).
@@ -47,10 +47,11 @@ pub enum DiagnosisVerdict {
 }
 
 /// The classified non-determinism divergence for a [`DiagnosisVerdict::Diverged`]
-/// verdict. Mirrors the fields the #480/#603 non-determinism-block incident
-/// signal records (`failure_cause=non_determinism`, `expected`, `actual`,
-/// `event_index`) so an operator triaging an nd-blocked run reads the same
-/// vocabulary here.
+/// verdict.
+///
+/// Mirrors the fields the #480/#603 non-determinism-block incident signal records
+/// (`failure_cause=non_determinism`, `expected`, `actual`, `event_index`) so an
+/// operator triaging an nd-blocked run reads the same vocabulary here.
 #[derive(Debug, Clone, Serialize)]
 pub struct DivergenceDetail {
     /// The category of mismatch (activity/timer/signal/child/side-effect/...).
@@ -75,7 +76,7 @@ pub struct FailureDetail {
 /// The structured verdict returned by
 /// `POST /api/harvest/workflows/{id}/replay-diagnosis`.
 ///
-/// Serialized snake_case. `divergence`, `failure`, and `summary` are omitted
+/// Serialized `snake_case`. `divergence`, `failure`, and `summary` are omitted
 /// when absent so a clean verdict carries no null clutter.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayDiagnosisResponse {
@@ -162,6 +163,81 @@ pub fn report_to_response(
             message: "workflow returned an error during replay".to_string(),
         },
     }
+}
+
+/// Returns `true` when `actual` names a terminal-lifecycle event that represents
+/// an **external** seal — the run was sealed mid-flight by an outside force
+/// (execution timeout #243, operator cancel/terminate #504, reset #148), NOT by
+/// the workflow's own return path.
+///
+/// Deliberately excludes `WorkflowCompleted` / `WorkflowFailed`: those are the
+/// workflow's OWN outcomes, so a replay that lands on one means new code wants to
+/// do MORE work than the old run did — a genuine divergence that must stay
+/// `diverged`, not be masked as clean.
+fn is_external_seal_event(actual: &str) -> bool {
+    matches!(
+        actual,
+        "WorkflowExecutionTimedOut" | "WorkflowCancelled" | "WorkflowResetTerminated"
+    )
+}
+
+/// Reclassify a false `diverged` verdict to `clean` when it is caused by an
+/// execution that was **externally sealed mid-await** (issue #614 FIX 3).
+///
+/// A run sealed mid-flight by execution timeout (#243), operator cancel/terminate
+/// (#504), or reset (#148) has its terminal-lifecycle seal recorded where the
+/// next command would go. When the current (unchanged) workflow code replays such
+/// a history, it faithfully consumes every recorded command and then issues the
+/// *next* command — which lands exactly on the external seal, so
+/// [`HistoryMatcher::match_activity`](autumn_harvest) reports a divergence whose
+/// `actual` is the seal event. That is not a code divergence: the run replayed
+/// cleanly and was killed by an outside force.
+///
+/// Reclassifies to `clean` **only** when ALL hold, so a genuine divergence is
+/// never masked:
+///   * the verdict is `diverged`, AND
+///   * the execution's DB state is terminal, AND
+///   * the recorded history reached a terminal seal, AND
+///   * the divergence's `actual` names an EXTERNAL-seal terminal event (see
+///     [`is_external_seal_event`]).
+///
+/// The load-bearing condition is the last one. A genuine mid-history divergence
+/// (an activity rename) has `actual` naming a real command event; new code that
+/// does MORE work than a COMPLETED / FAILED run has `actual` = `WorkflowCompleted`
+/// / `WorkflowFailed` — neither is an external seal, so both correctly stay
+/// `diverged`. The terminal-state and seal-reached conditions are belt-and-braces
+/// (a RUNNING nd-blocked run has no terminal seal, and a redriven RUNNING run —
+/// whose mid-history `WorkflowFailed` would satisfy the seal scan — is excluded by
+/// the terminal-state gate).
+///
+/// Note the common single-activity sealed-mid-await shape
+/// (`WorkflowStarted + ActivityScheduled(a) + WorkflowExecutionTimedOut`, the
+/// activity never completed) never reaches this reclassification: the workflow
+/// *suspends* awaiting the in-progress activity's unrecorded result, which canary
+/// replay already reports as `clean` (a frontier suspension). This function
+/// handles the multi-activity shape, where the workflow consumes a completed
+/// activity and then issues a NEXT command that lands on the seal.
+#[must_use]
+pub fn reclassify_sealed_mid_await(
+    mut resp: ReplayDiagnosisResponse,
+    terminal_state: bool,
+    history_reached_terminal_seal: bool,
+) -> ReplayDiagnosisResponse {
+    let is_external_seal_divergence = resp
+        .divergence
+        .as_ref()
+        .is_some_and(|d| is_external_seal_event(&d.actual));
+    if resp.diagnosis == DiagnosisVerdict::Diverged
+        && terminal_state
+        && history_reached_terminal_seal
+        && is_external_seal_divergence
+    {
+        resp.diagnosis = DiagnosisVerdict::Clean;
+        resp.divergence = None;
+        resp.summary = None;
+        resp.message = "no divergence under current code".to_string();
+    }
+    resp
 }
 
 /// Build the `not_registered` verdict (issue #614 AC5): the execution's workflow
@@ -313,6 +389,117 @@ mod tests {
         assert_eq!(resp.diagnosis, DiagnosisVerdict::NotReplayableDag);
         assert_eq!(resp.events_replayed, 0);
         assert!(resp.message.contains("classic DAG"));
+    }
+
+    fn diverged_with_actual(actual: &str) -> ReplayDiagnosisResponse {
+        let id = exec();
+        let report = ReplayReport {
+            execution_id: id,
+            events_replayed: 3,
+            status: ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ActivityScheduleMismatch,
+                expected: "ActivityScheduled(process_item)".to_string(),
+                actual: actual.to_string(),
+                event_index: 3,
+            },
+            mismatched_command_summary: Some("s".to_string()),
+        };
+        report_to_response(id, "wf".to_string(), "TIMED_OUT".to_string(), report)
+    }
+
+    #[test]
+    fn reclassifies_external_seal_divergence_to_clean() {
+        for seal in [
+            "WorkflowExecutionTimedOut",
+            "WorkflowCancelled",
+            "WorkflowResetTerminated",
+        ] {
+            let resp = diverged_with_actual(seal);
+            let out = reclassify_sealed_mid_await(resp, true, true);
+            assert_eq!(
+                out.diagnosis,
+                DiagnosisVerdict::Clean,
+                "actual={seal} must reclassify to clean"
+            );
+            assert!(out.divergence.is_none());
+            assert!(out.summary.is_none());
+            assert_eq!(out.message, "no divergence under current code");
+        }
+    }
+
+    #[test]
+    fn does_not_reclassify_genuine_command_divergence() {
+        // A real activity-name divergence: `actual` names a command event, not a
+        // seal — must stay diverged even on a terminal, sealed run.
+        let resp = diverged_with_actual("ActivityScheduled(other_activity)");
+        let out = reclassify_sealed_mid_await(resp, true, true);
+        assert_eq!(out.diagnosis, DiagnosisVerdict::Diverged);
+        assert!(out.divergence.is_some());
+    }
+
+    #[test]
+    fn does_not_reclassify_own_outcome_seal_divergence() {
+        // New code doing MORE work than a COMPLETED / FAILED run lands on the
+        // workflow's OWN outcome seal — a genuine divergence, never masked.
+        for own in ["WorkflowCompleted", "WorkflowFailed"] {
+            let resp = diverged_with_actual(own);
+            let out = reclassify_sealed_mid_await(resp, true, true);
+            assert_eq!(
+                out.diagnosis,
+                DiagnosisVerdict::Diverged,
+                "actual={own} must stay diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_reclassify_when_not_terminal_or_not_sealed() {
+        // External-seal actual, but the run is not terminal (e.g. a redriven
+        // RUNNING run whose mid-history WorkflowFailed satisfies the seal scan) —
+        // gated out by the terminal-state condition.
+        let resp = diverged_with_actual("WorkflowCancelled");
+        let out = reclassify_sealed_mid_await(resp, false, true);
+        assert_eq!(out.diagnosis, DiagnosisVerdict::Diverged);
+        // External-seal actual + terminal, but the history reached no seal — gated
+        // out by the seal-reached condition.
+        let resp = diverged_with_actual("WorkflowCancelled");
+        let out = reclassify_sealed_mid_await(resp, true, false);
+        assert_eq!(out.diagnosis, DiagnosisVerdict::Diverged);
+    }
+
+    #[test]
+    fn reclassify_leaves_clean_and_failed_verdicts_untouched() {
+        let id = exec();
+        let clean = report_to_response(
+            id,
+            "wf".to_string(),
+            "COMPLETED".to_string(),
+            ReplayReport {
+                execution_id: id,
+                events_replayed: 2,
+                status: ReplayStatus::ReplaySucceeded,
+                mismatched_command_summary: None,
+            },
+        );
+        let out = reclassify_sealed_mid_await(clean, true, true);
+        assert_eq!(out.diagnosis, DiagnosisVerdict::Clean);
+
+        let failed = report_to_response(
+            id,
+            "wf".to_string(),
+            "FAILED".to_string(),
+            ReplayReport {
+                execution_id: id,
+                events_replayed: 2,
+                status: ReplayStatus::WorkflowFailed {
+                    error: "boom".to_string(),
+                    event_index: 2,
+                },
+                mismatched_command_summary: None,
+            },
+        );
+        let out = reclassify_sealed_mid_await(failed, true, true);
+        assert_eq!(out.diagnosis, DiagnosisVerdict::WorkflowFailed);
     }
 
     #[test]
