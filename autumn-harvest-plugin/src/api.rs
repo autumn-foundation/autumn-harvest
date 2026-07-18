@@ -15767,71 +15767,102 @@ async fn update_with_start_workflow(
             per_wf.max(runtime.registry.max_workflow_input_bytes)
         });
 
-    // Multi-shard scan: find any existing non-terminal execution for
-    // (workflow_name, workflow_id) to determine the target shard and exec_id.
+    // `pool` is needed by BOTH paths: the fresh/miss multi-shard scan below and
+    // the `Ok`-arm long-poll (`poll_update_result`), which routes by exec_id.
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
-    for (candidate_shard, shard_pool) in pool.iter_shards() {
-        let mut shard_conn = match acquire_conn(shard_pool).await {
-            Ok(c) => c,
-            Err(e) => return e.into_response(),
-        };
-        let hit = match harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
-            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
-            .select((
-                harvest_workflow_executions::id,
-                harvest_workflow_executions::state,
-            ))
-            .first::<(uuid::Uuid, String)>(&mut shard_conn)
-            .await
-            .optional()
-        {
-            Ok(hit) => hit,
-            Err(e) => {
-                return AutumnError::service_unavailable_msg(format!(
-                    "shard {} lookup failed: {e}",
-                    candidate_shard.as_i32()
-                ))
-                .into_response();
-            }
-        };
-        if let Some((existing_uuid, existing_state)) = hit {
-            // Reuse the execution UUID only when attaching to a live RUNNING or
-            // SUSPENDED run under a non-rejecting policy. All other paths (terminal
-            // prior, PAUSED, TerminateIfRunning) go through replace_execution and
-            // need a fresh exec_id to avoid a primary-key conflict.
-            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
-                && matches!(
-                    reuse_policy,
-                    WorkflowIdReusePolicy::AllowDuplicate
-                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                );
-            let exec_id = if will_attach {
-                ExecutionId::from_uuid(existing_uuid)
-            } else {
-                ExecutionId::new_for_shard(candidate_shard)
-            };
-            found_shard = Some((candidate_shard, shard_conn, exec_id));
-            break;
-        }
-    }
 
-    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
-        tuple
-    } else {
-        let shard = runtime
-            .router
-            .pick_for_new_workflow(&workflow_name, &workflow_id);
-        let conn = match db_conn_for_shard(&api_state, shard).await {
+    // Resolve the `(shard, conn, exec_id)` the rest of the handler consumes.
+    //
+    // On a committed-replay HIT (`probe_outcome.is_some()`) there is NO
+    // fresh-start work, so a committed replay needs no fresh-start routing:
+    // audit + polling run on the hit execution's OWN shard, resolvable O(1) from
+    // `outcome.exec_id`. Acquire ONLY that shard's connection and SKIP the
+    // multi-shard scan, the admission gate, and `pick_for_new_workflow` entirely.
+    // This closes a residual undoing of the earlier admission-gate hoist: a
+    // fresh-shard partial outage — a shard-scan `Err`, or `pick_for_new_workflow`
+    // selecting an unavailable shard (multi-shard partial outage / terminal-prior
+    // case) — could otherwise still return 503 on a dedupe hit that does no fresh
+    // work (Codex P2 / #808 invariant: a committed replay is never rejected by
+    // fresh-start-only infrastructure).
+    //
+    // On a MISS the full fresh-start routing runs exactly as before
+    // (byte-identical): find any existing non-terminal execution for
+    // (workflow_name, workflow_id) to determine the target shard and exec_id,
+    // else `pick_for_new_workflow`.
+    let (shard, mut conn, exec_id) = if let Some(outcome) = probe_outcome.as_ref() {
+        let hit_exec_id = outcome.exec_id;
+        let conn = match db_conn_for_execution(&api_state, hit_exec_id).await {
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        (shard, conn, ExecutionId::new_for_shard(shard))
+        (hit_exec_id.shard(), conn, hit_exec_id)
+    } else {
+        let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        for (candidate_shard, shard_pool) in pool.iter_shards() {
+            let mut shard_conn = match acquire_conn(shard_pool).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let hit = match harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                .filter(
+                    harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                )
+                .select((
+                    harvest_workflow_executions::id,
+                    harvest_workflow_executions::state,
+                ))
+                .first::<(uuid::Uuid, String)>(&mut shard_conn)
+                .await
+                .optional()
+            {
+                Ok(hit) => hit,
+                Err(e) => {
+                    return AutumnError::service_unavailable_msg(format!(
+                        "shard {} lookup failed: {e}",
+                        candidate_shard.as_i32()
+                    ))
+                    .into_response();
+                }
+            };
+            if let Some((existing_uuid, existing_state)) = hit {
+                // Reuse the execution UUID only when attaching to a live RUNNING or
+                // SUSPENDED run under a non-rejecting policy. All other paths
+                // (terminal prior, PAUSED, TerminateIfRunning) go through
+                // replace_execution and need a fresh exec_id to avoid a
+                // primary-key conflict.
+                let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+                    && matches!(
+                        reuse_policy,
+                        WorkflowIdReusePolicy::AllowDuplicate
+                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                    );
+                let exec_id = if will_attach {
+                    ExecutionId::from_uuid(existing_uuid)
+                } else {
+                    ExecutionId::new_for_shard(candidate_shard)
+                };
+                found_shard = Some((candidate_shard, shard_conn, exec_id));
+                break;
+            }
+        }
+
+        if let Some(tuple) = found_shard {
+            tuple
+        } else {
+            let shard = runtime
+                .router
+                .pick_for_new_workflow(&workflow_name, &workflow_id);
+            let conn = match db_conn_for_shard(&api_state, shard).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            (shard, conn, ExecutionId::new_for_shard(shard))
+        }
     };
 
     // issue #377: admission gate. Skipped on a committed-replay hit

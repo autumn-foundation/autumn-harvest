@@ -37,9 +37,9 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
-use autumn_harvest::types::{ExecutionId, UpdateId};
+use autumn_harvest::types::{ExecutionId, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
@@ -402,6 +402,44 @@ fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
     let app =
         harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
     (app, api_state)
+}
+
+/// Build the interface-schema app on a TWO-shard pool: shard 0 is the live test
+/// DB, shard 1 points at an unreachable URL (connection refused). Mirrors the
+/// partial-outage harness in `workflow_reachability_integration.rs`. Used to
+/// prove the committed-replay HIT path never touches fresh-start shard routing:
+/// the pre-fix `found_shard` scan / `pick_for_new_workflow` would reach the dead
+/// shard and 503, whereas a dedupe hit resolves audit + polling on its own
+/// (live) shard via `db_conn_for_execution`.
+fn build_app_two_shard_dead_second(live_pool: &DbPool) -> HarvestApiApp {
+    let mut shard_pools = std::collections::BTreeMap::new();
+    shard_pools.insert(ShardId::new(0), live_pool.clone());
+    shard_pools.insert(
+        ShardId::new(1),
+        build_pool("postgres://postgres:postgres@127.0.0.1:1/nonexistent"),
+    );
+    let storage = HarvestDbPool::sharded(ShardedDbPool::from_map(shard_pools, ShardId::new(0)));
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(storage);
+    let registry = HandlerRegistry::new(vec![iface_info(), plain_info(), empty_info()], vec![])
+        .with_handler_infos(query_handlers(), update_handlers(), signal_handlers());
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("iface-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 async fn get(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -1504,6 +1542,83 @@ async fn uws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
         body["update_id"],
         json!(update_id.to_string()),
         "committed replay must return the derived update_id (cache-hit evidence): {body}"
+    );
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "committed replay must NOT append a second UpdateAdmitted event"
+    );
+}
+
+// P2 (PR #1105 review, Codex): a committed keyed update-with-start replay HIT
+// must NOT be rejected by fresh-start-only shard routing. Pre-fix, on a hit the
+// handler still ran the multi-shard `found_shard` scan / `pick_for_new_workflow`
+// before the `match probe_outcome`, so a dead fresh-start shard returned a
+// spurious 503 even though the dedupe hit was already found and no fresh work is
+// needed — partially undoing the admission-gate hoist via fresh-start infra.
+//
+// Reproduction (the "terminal prior" case Codex named): a TERMINATED prior on
+// the live shard 0 with a committed `UpdateAdmitted` event. The read-only probe
+// (no state filter) resolves the hit on shard 0; the `found_shard` scan EXCLUDES
+// `TERMINATED`, so pre-fix it finds nothing on shard 0 and proceeds to the dead
+// shard 1 (connection refused) → 503. Post-fix the hit path acquires ONLY the
+// hit execution's own (live) shard via `db_conn_for_execution` and skips the
+// scan entirely → 200 with the cached admission (`started_fresh: false`). This
+// is the #808 invariant: a committed replay is never rejected by fresh-start-only
+// infrastructure. `signal-with-start` is already clean here (its probe returns a
+// finished response before the routing scan), so this guard is uws-only.
+#[tokio::test]
+async fn uws_committed_keyed_replay_hit_never_503s_on_dead_fresh_start_shard() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    // TERMINATED prior on the live shard: the read-only probe still resolves it
+    // (no state filter), but the fresh-start `found_shard` scan excludes it,
+    // forcing the pre-fix path onward to the dead shard.
+    let exec_id = seed_execution_in_state(&pool, "iface_wf", "TERMINATED").await;
+    let wid = exec_id.to_string();
+    let committed_key = "k-uws-dead-shard";
+    let update_id = derive_uws_update_id(committed_key);
+    seed_update_admitted_event(&pool, exec_id, update_id, "set_priority").await;
+    assert_eq!(
+        count_update_admitted_events(&pool, exec_id).await,
+        1,
+        "precondition: exactly one committed UpdateAdmitted event"
+    );
+
+    // The app's storage pool has a live shard 0 (holding the seeded execution)
+    // and a dead shard 1. On a HIT the handler must resolve everything on shard 0.
+    let app = build_app_two_shard_dead_second(&pool);
+    let (status, body) = post_json(
+        &app,
+        "/workflows/iface_wf/update-with-start",
+        json!({
+            "workflow_id": wid,
+            "update_name": "set_priority",
+            "update_args": { "priority": 3 },
+            "idempotency_key": committed_key,
+            "wait_for_stage": "admitted"
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "committed keyed replay HIT must NOT 503 on a dead fresh-start shard: {body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "committed keyed replay HIT must return the cached admission (200): {body}"
+    );
+    assert_eq!(
+        body["update_id"],
+        json!(update_id.to_string()),
+        "committed replay must return the derived update_id (cache-hit evidence): {body}"
+    );
+    assert_eq!(
+        body["started_fresh"],
+        json!(false),
+        "committed replay must report started_fresh: false: {body}"
     );
     assert_eq!(
         count_update_admitted_events(&pool, exec_id).await,

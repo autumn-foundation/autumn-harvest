@@ -60,6 +60,35 @@ signal route).
   more conservative than #808's plain-start probe — the sibling found-shard scan
   in both handlers already fails closed on the same error class, and fail-closed
   preserves the never-reject invariant; a keyed client retries `503` idempotently.
+- **Committed uws replay skips fresh-start shard routing (P2 review finding)**:
+  after the admission-gate hoist above, the `update-with-start` handler still ran
+  the storage-pool lookup, the multi-shard `found_shard` scan, AND
+  `pick_for_new_workflow` on a committed-replay HIT before the later
+  `match probe_outcome` — so a dedupe hit could STILL return `503` (a shard-scan
+  `Err`, or `pick_for_new_workflow` selecting an unavailable shard, in a
+  multi-shard partial outage or terminal-prior case), partially undoing the
+  admission-gate hoist via fresh-start infrastructure. The `(shard, conn, exec_id)`
+  resolution now branches on `probe_outcome.as_ref()`: on a HIT it acquires ONLY
+  the hit execution's OWN shard connection (O(1) from `outcome.exec_id` via
+  `db_conn_for_execution`) for the `Ok` arm's audit + result poll, skipping the
+  scan / admission gate / `pick_for_new_workflow` entirely; on a MISS the full
+  fresh-start routing runs byte-identically. A fresh-shard partial outage can now
+  never `503` a dedupe hit (the #808 invariant: a committed replay is never
+  rejected by fresh-start-only infrastructure). `signal-with-start` was already
+  clean here — its probe returns a finished `Response` and `return`s before the
+  routing scan, so this fix is uws-only. New RED→GREEN proof
+  `uws_committed_keyed_replay_hit_never_503s_on_dead_fresh_start_shard`
+  (`interface_schema_integration.rs`) builds a TWO-shard app (shard 0 live, shard 1
+  an unreachable URL — mirroring the `workflow_reachability_integration.rs`
+  partial-outage harness) and seeds a TERMINATED prior + committed `UpdateAdmitted`
+  on shard 0: the read-only probe (no state filter) resolves the hit on shard 0,
+  but the fresh-start `found_shard` scan EXCLUDES `TERMINATED`, so pre-fix it
+  reaches the dead shard 1 and returns `503`; post-fix the hit path resolves audit
+  + polling on shard 0 via `db_conn_for_execution` and returns `200`
+  (`started_fresh: false`, no second `UpdateAdmitted`). The rest of the
+  `interface_schema_integration` suite (every existing uws committed-replay hit
+  test — attach / running / validator-not-rerun / gate-bypass) stays green,
+  proving the hit-shard audit + polling path is unchanged.
 
 **No new `WorkflowEvent` variant, no migration, no route/contract change.** The
 in-lock exactly-once machinery is untouched — the probe is an additive read-only
