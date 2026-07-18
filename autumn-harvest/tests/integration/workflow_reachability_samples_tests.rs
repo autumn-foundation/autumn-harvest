@@ -118,6 +118,13 @@ async fn non_terminal_counts_return_bounded_execution_id_samples() {
     let (url, _container) = setup_db().await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
 
+    // Idempotent on a persistent HARVEST_TEST_DATABASE_URL (a no-op on a fresh
+    // testcontainers DB): drop any leftover rows for this test's workflow type.
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE workflow_name = 'reach_type'")
+        .execute(&mut conn)
+        .await
+        .expect("scrub");
+
     // 7 non-terminal (RUNNING) of one type — exceeds the cap of 5.
     let mut running: BTreeSet<uuid::Uuid> = BTreeSet::new();
     for n in 0..7 {
