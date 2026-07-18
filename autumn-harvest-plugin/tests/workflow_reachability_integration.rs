@@ -18,8 +18,13 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
+use autumn_harvest_plugin::OrphanStartupAction;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
+};
+use autumn_harvest_plugin::workflow_reachability::{
+    StartupOrphanDecision, WorkflowReachabilityQuery, build_workflow_reachability_report,
+    startup_orphan_decision,
 };
 use autumn_web::reexports::axum;
 use axum::body::Body;
@@ -113,11 +118,11 @@ fn two_shard_router() -> ShardRouter {
     )
 }
 
-fn build_api_app(
+fn build_api_state(
     pool: HarvestDbPool,
     router: ShardRouter,
     registered: Vec<&'static str>,
-) -> HarvestApiApp {
+) -> HarvestApiState {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(pool);
@@ -132,7 +137,16 @@ fn build_api_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
+    api_state
+}
+
+fn build_api_app(
+    pool: HarvestDbPool,
+    router: ShardRouter,
+    registered: Vec<&'static str>,
+) -> HarvestApiApp {
+    harvest_api_router(build_api_state(pool, router, registered))
+        .with_state(autumn_web::AppState::for_test())
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {
@@ -518,4 +532,169 @@ async fn reachability_requires_admin_auth() {
         harvest_api_router(HarvestApiState::new()).with_state(autumn_web::AppState::for_test());
     let (status, _) = get_json(&app, "/admin/workflow-types/reachability").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Boot-time orphaned-workflow reachability gate (issue #700 AC4).
+// ---------------------------------------------------------------------------
+//
+// `start_harvest_runtime` is a private, config-file/migration/pool-coupled
+// `async fn` that spawns background tasks — it is not integration-callable, and
+// on the abort path it tears those tasks down and returns `Err` *before*
+// autumn-web reacts to a failed `on_startup` hook. What that abort decision
+// depends on is a two-step composition of PUBLIC building blocks:
+//
+//   1. `build_workflow_reachability_report(api_state, ..)` — the cross-shard DB
+//      fan-out (the riskiest new code), and
+//   2. `startup_orphan_decision(action, report.orphaned, report.status)` — the
+//      pure gate rule.
+//
+// These tests drive that exact decision path against a seeded database, so they
+// exercise the real report builder end-to-end and confirm the Abort / Warn /
+// Continue verdict the boot gate would produce. They deliberately do NOT boot a
+// full autumn-web app (the only way to invoke the private `start_harvest_runtime`
+// shell), which is thin task-teardown glue over this decision.
+//
+// Each test filters the report to a UNIQUE workflow-type name, which narrows
+// `report.orphaned` / `total_orphaned_executions` to just that type — isolating
+// it from leftover or concurrently-seeded rows on a shared database with no
+// global scrub (so the tests are re-runnable and race-free).
+
+/// Env-URL (local Postgres, no Docker) when `HARVEST_TEST_DATABASE_URL` is set,
+/// otherwise a fresh testcontainer. Mirrors the core-crate DB-test precedent
+/// (e.g. `retention_summary_tests`): the env URL is assumed to point at an
+/// already-migrated database, so no migrations are run on that path.
+async fn setup_db_env_or_container() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_database_url_with_migrations().await;
+    (url, Some(container))
+}
+
+#[tokio::test]
+async fn boot_gate_fail_action_aborts_on_seeded_orphan() {
+    // `fail` + a seeded orphan (unregistered type with a live run) + a complete
+    // report -> the gate aborts. This is exactly the decision that makes
+    // `start_harvest_runtime` return `Err` and refuse boot.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let orphan_type = "boot_gate_fail_orphan";
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        orphan_type,
+        &format!("bg-fail-{}", uuid::Uuid::new_v4()),
+        "RUNNING",
+    )
+    .await;
+
+    let api_state = build_api_state(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+        vec![], // orphan_type is unregistered -> orphaned
+    );
+
+    let report = build_workflow_reachability_report(
+        &api_state,
+        WorkflowReachabilityQuery {
+            workflow_type: Some(orphan_type.to_string()),
+        },
+    )
+    .await
+    .expect("reachability report builds");
+
+    assert!(report.orphaned, "seeded orphan must set report.orphaned");
+    assert!(report.total_orphaned_executions >= 1);
+    assert_eq!(
+        startup_orphan_decision(OrphanStartupAction::Fail, report.orphaned, report.status),
+        StartupOrphanDecision::Abort,
+        "fail + orphan + complete report must abort boot",
+    );
+}
+
+#[tokio::test]
+async fn boot_gate_warn_action_allows_boot_with_orphan() {
+    // Same seeded orphan, but `warn` -> the gate warns and boot continues (never
+    // Abort), so `start_harvest_runtime` returns `Ok`.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let orphan_type = "boot_gate_warn_orphan";
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        orphan_type,
+        &format!("bg-warn-{}", uuid::Uuid::new_v4()),
+        "RUNNING",
+    )
+    .await;
+
+    let api_state = build_api_state(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+        vec![], // unregistered -> orphaned
+    );
+
+    let report = build_workflow_reachability_report(
+        &api_state,
+        WorkflowReachabilityQuery {
+            workflow_type: Some(orphan_type.to_string()),
+        },
+    )
+    .await
+    .expect("reachability report builds");
+
+    assert!(report.orphaned);
+    let decision =
+        startup_orphan_decision(OrphanStartupAction::Warn, report.orphaned, report.status);
+    assert_eq!(
+        decision,
+        StartupOrphanDecision::Warn,
+        "warn + orphan must warn, not abort",
+    );
+    assert_ne!(
+        decision,
+        StartupOrphanDecision::Abort,
+        "boot must not be refused under warn",
+    );
+}
+
+#[tokio::test]
+async fn boot_gate_fail_action_allows_clean_boot() {
+    // `fail` with NO orphan (only a registered type with a live run -> in_use)
+    // -> the gate continues, so a clean fleet boots even under the strict action.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    let registered_type = "boot_gate_clean_registered";
+    insert_execution(
+        &database_url,
+        ShardId::new(0),
+        registered_type,
+        &format!("bg-clean-{}", uuid::Uuid::new_v4()),
+        "RUNNING",
+    )
+    .await;
+
+    let api_state = build_api_state(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+        vec![registered_type], // registered -> in_use, NOT orphaned
+    );
+
+    let report = build_workflow_reachability_report(
+        &api_state,
+        WorkflowReachabilityQuery {
+            workflow_type: Some(registered_type.to_string()),
+        },
+    )
+    .await
+    .expect("reachability report builds");
+
+    assert!(
+        !report.orphaned,
+        "a registered in-use type is not an orphan"
+    );
+    assert_eq!(report.total_orphaned_executions, 0);
+    assert_eq!(
+        startup_orphan_decision(OrphanStartupAction::Fail, report.orphaned, report.status),
+        StartupOrphanDecision::Continue,
+        "fail with zero orphans must allow boot",
+    );
 }
