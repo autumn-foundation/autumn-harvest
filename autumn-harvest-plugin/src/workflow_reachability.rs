@@ -489,31 +489,42 @@ pub enum StartupOrphanDecision {
 ///
 /// Rules:
 /// - `Off` → always `Continue` (the check is disabled).
-/// - No orphans (`orphaned == false`) → `Continue` for every action; a clean
-///   boot never warns.
-/// - `Warn` + orphaned → `Warn`.
-/// - `Fail` + orphaned + `status == Complete` → `Abort` (the one refuse case).
-/// - `Fail` + orphaned + `Partial`/`Unavailable` → `Warn`. **Crash-loop
-///   safety:** a boot loop has no human in the loop, so a transient unreachable
-///   shard must never hard-fail startup (asymmetric with the CLI gate, which
-///   fails *closed* on a partial report because a human reads its exit code).
+/// - `Warn`/`Fail` + **incomplete report** (`Partial`/`Unavailable`) → `Warn`,
+///   regardless of `orphaned`. An incomplete report means orphan detection did
+///   NOT fully run (e.g. a startup DB blip returns a successful report with
+///   `status == Unavailable` and no rows, so `orphaned == false`); the operator
+///   must be warned that detection was skipped rather than silently continued.
+///   **Crash-loop safety:** it is `Warn`, never `Abort` — a boot loop has no
+///   human in the loop, so a transient unreachable shard must never hard-fail
+///   startup (asymmetric with the CLI gate, which fails *closed* on a partial
+///   report because a human reads its exit code).
+/// - `Warn`/`Fail` + **complete report** + no orphans → `Continue`; a
+///   CONFIRMED clean boot never warns (this deviation applies only to a
+///   `Complete` report — an incomplete one always warns, above).
+/// - `Warn` + complete + orphaned → `Warn`.
+/// - `Fail` + complete + orphaned → `Abort` (the one refuse case).
 #[must_use]
 pub fn startup_orphan_decision(
     action: OrphanStartupAction,
     orphaned: bool,
     status: ReachabilityReportStatus,
 ) -> StartupOrphanDecision {
-    if action == OrphanStartupAction::Off || !orphaned {
+    if action == OrphanStartupAction::Off {
+        return StartupOrphanDecision::Continue;
+    }
+    // An incomplete/untrustworthy report always warns (never aborts —
+    // crash-loop safety), regardless of `orphaned`: detection did not fully run.
+    if status != ReachabilityReportStatus::Complete {
+        return StartupOrphanDecision::Warn;
+    }
+    // Complete report: a confirmed clean fleet never warns.
+    if !orphaned {
         return StartupOrphanDecision::Continue;
     }
     match action {
-        OrphanStartupAction::Fail if status == ReachabilityReportStatus::Complete => {
-            StartupOrphanDecision::Abort
-        }
-        // Warn, or Fail on an incomplete report (crash-loop safety).
-        OrphanStartupAction::Warn | OrphanStartupAction::Fail => StartupOrphanDecision::Warn,
-        // Unreachable: Off + orphaned handled by the early return above.
-        OrphanStartupAction::Off => StartupOrphanDecision::Continue,
+        OrphanStartupAction::Fail => StartupOrphanDecision::Abort,
+        // Warn action (Off + incomplete + clean handled above).
+        OrphanStartupAction::Warn | OrphanStartupAction::Off => StartupOrphanDecision::Warn,
     }
 }
 
@@ -954,6 +965,32 @@ mod tests {
                     StartupOrphanDecision::Continue,
                     "Off must always Continue"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_report_warns_not_silently_continues() {
+        use crate::config::OrphanStartupAction;
+        // A startup DB blip surfaces as a SUCCESSFUL report with
+        // `status == Unavailable` and no rows, so `orphaned == false`. Orphan
+        // detection did NOT run, so the operator must be warned — the gate must
+        // not silently continue. Applies to BOTH warn and fail, regardless of
+        // orphaned, for Unavailable AND Partial (never Abort — crash-loop safe).
+        for action in [OrphanStartupAction::Warn, OrphanStartupAction::Fail] {
+            for status in [
+                ReachabilityReportStatus::Unavailable,
+                ReachabilityReportStatus::Partial,
+            ] {
+                for orphaned in [false, true] {
+                    assert_eq!(
+                        startup_orphan_decision(action, orphaned, status),
+                        StartupOrphanDecision::Warn,
+                        "an incomplete report must warn (never silently continue, \
+                         never abort) for action={action:?}, status={status:?}, \
+                         orphaned={orphaned}"
+                    );
+                }
             }
         }
     }
