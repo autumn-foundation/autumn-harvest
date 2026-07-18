@@ -88,6 +88,7 @@ fn cancel_order(_ctx: &WorkflowContext, _req: CancelRequest) {}
     workflow = "order_workflow",
     description = "Read the order's current progress"
 )]
+#[allow(clippy::unnecessary_wraps)]
 fn order_status(_ctx: &WorkflowContext, req: StatusRequest) -> Result<StatusResponse, String> {
     Ok(StatusResponse {
         state: if req.verbose {

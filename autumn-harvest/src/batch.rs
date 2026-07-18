@@ -991,4 +991,24 @@ mod tests {
         let back: BatchTargetError = serde_json::from_value(value).unwrap();
         assert_eq!(back, err);
     }
+
+    #[test]
+    fn batch_job_status_from_str_roundtrips() {
+        for status in [
+            BatchJobStatus::Pending,
+            BatchJobStatus::Running,
+            BatchJobStatus::Completed,
+            BatchJobStatus::Failed,
+        ] {
+            let s = status.as_str();
+            let parsed: BatchJobStatus = s.parse().expect("known status must parse");
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn batch_job_status_from_str_rejects_unknown() {
+        let err = BatchJobStatus::from_str("Unknown").expect_err("unknown status must fail");
+        assert!(err.contains("unknown batch job status"));
+    }
 }

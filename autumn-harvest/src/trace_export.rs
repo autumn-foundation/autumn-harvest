@@ -81,4 +81,36 @@ mod tests {
         assert_eq!(event["ts"], 1_000_000);
         assert_eq!(event["dur"], 2_000_000);
     }
+
+    #[test]
+    fn test_export_chrome_trace_unmatched_start() {
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(5),
+            peak_concurrency: 1,
+            timeline: vec![ProfilerEvent {
+                time: Duration::from_secs(1),
+                kind: ProfilerEventKind::TaskStarted(0, "activity_a".to_string()),
+            }],
+        };
+
+        let trace = export_chrome_trace(&profile);
+        let arr = trace.as_array().expect("Expected JSON array");
+        assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn test_export_chrome_trace_unmatched_end() {
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(5),
+            peak_concurrency: 1,
+            timeline: vec![ProfilerEvent {
+                time: Duration::from_secs(1),
+                kind: ProfilerEventKind::TaskCompleted(0, "activity_a".to_string()),
+            }],
+        };
+
+        let trace = export_chrome_trace(&profile);
+        let arr = trace.as_array().expect("Expected JSON array");
+        assert_eq!(arr.len(), 0);
+    }
 }

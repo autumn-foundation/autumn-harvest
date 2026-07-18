@@ -80,6 +80,7 @@ async fn handle_webhook_after(
     let outcome = signal_with_start_workflow_execution(
         conn,
         SignalWithStartParams {
+            start_source_override: None,
             workflow_name: "onboarding",
             workflow_id: &customer_id,
             exec_id,
