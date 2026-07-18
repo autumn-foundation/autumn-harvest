@@ -311,6 +311,12 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
     ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
     ("GET /workflows/{id}/run-chain", RouteClass::ReadOnly),
+    // Single-execution replay diagnosis (issue #614): POST for the replay action
+    // but read-only (appends no events, performs no writes, no audit trail).
+    (
+        "POST /workflows/{id}/replay-diagnosis",
+        RouteClass::ReadOnly,
+    ),
     (
         "GET /workflows/{id}/query/{query_name}",
         RouteClass::ReadOnly,
@@ -723,6 +729,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows/{id}/stack",
     "GET /workflows/{id}/timeline",
     "GET /workflows/{id}/run-chain",
+    "POST /workflows/{id}/replay-diagnosis",
     "GET /workflows/{id}/query/{query_name}",
     "POST /workflows/{id}/query/{query_name}",
     "GET /workflows/{id}/queries",
@@ -844,6 +851,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/stack", None),
     ("GET /workflows/{id}/timeline", None),
     ("GET /workflows/{id}/run-chain", None),
+    // Issue #614: read-only, no audit operation.
+    ("POST /workflows/{id}/replay-diagnosis", None),
     (
         "POST /workflows/{workflow_name}/start",
         Some(OP_WORKFLOW_START),
@@ -1508,6 +1517,35 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn replay_diagnosis_route_is_classified_read_only() {
+        // The single-execution replay-diagnosis endpoint (issue #614) loads one
+        // execution's recorded history and replays it against the currently
+        // registered handler, returning a structured verdict. It is read-only
+        // (appends no events, performs no writes) and writes no audit rows. This
+        // pinned test — not just the general exhaustiveness guards below, which
+        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other rather than against the live router — is what actually catches
+        // the route being dropped from BOTH lists at once.
+        let route = "POST /workflows/{id}/replay-diagnosis";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #614)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #614)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #614)"
         );
     }
 

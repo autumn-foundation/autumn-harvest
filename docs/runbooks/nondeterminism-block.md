@@ -60,6 +60,47 @@ For any blocked row, read `search_attrs`:
 `nd_block_reason` / `nd_block_count` / `nd_blocked_at` on the embedded
 execution object.
 
+## Diagnose the divergence (issue #614)
+
+To confirm — on demand, for one specific execution — exactly how the
+**currently deployed** code diverges from a run's recorded history, replay that
+one execution against the registered handler:
+
+```bash
+curl -X POST -H 'x-harvest-admin: true' \
+  http://<host>/api/harvest/workflows/{execution_id}/replay-diagnosis
+```
+
+This is read-only (it appends no events and performs no writes) and admin-gated.
+The response verdict is one of `clean` / `diverged` / `workflow_failed` /
+`not_registered` / `not_replayable_dag` (all `200`; the diagnosis, not the HTTP
+status, carries the answer). For a blocked run the verdict is `diverged`, with a
+`divergence` object using the **same vocabulary as the block diagnostic** above:
+
+```json
+{
+  "diagnosis": "diverged",
+  "divergence": {
+    "kind": "ActivityScheduleMismatch",
+    "event_index": 12,
+    "expected": "ActivityScheduled(send_email)",
+    "actual": "ActivityScheduled(charge_card)"
+  },
+  "message": "replay diverged from recorded history under current code"
+}
+```
+
+`expected`/`actual` here mirror the `search_attrs` `expected`/`actual` block
+fields (`expected` = what the currently deployed code asked for; `actual` = what
+the recorded history holds), so you can cross-check the block diagnostic against
+a live replay. Use it to (a) confirm a candidate rollback build makes the run
+`clean` (replay the same execution again after deploying the fix — a `clean`
+verdict means that build can resume it), and (b) pinpoint the divergence
+`event_index` for a reset (below). Verdict caveats: `410` = the run's history is
+unavailable (pruned by retention, released on reset, or PII-erased); `408` = the
+replay exceeded the bounded budget (a synchronous busy-loop workflow, out of
+scope here and caught instead by the #494 workflow-task timeout).
+
 ## Roll back
 
 Roll the identified `build_id` back to the last known-good version (or ship a

@@ -89,6 +89,7 @@ linux        autumn-harvest-plugin  progress_stream_integration      -          
 linux        autumn-harvest-plugin  query_integration                -                          -
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
+linux        autumn-harvest-plugin  replay_diagnosis_integration     -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
 linux        autumn-harvest-plugin  start_idempotency_integration    -                          -

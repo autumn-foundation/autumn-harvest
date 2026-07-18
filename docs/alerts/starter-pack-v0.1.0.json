@@ -656,6 +656,11 @@
           "ref": "#603",
           "status": "shipped",
           "surface": "METRIC_WORKFLOW_ND_BLOCKED / harvest.workflow.nondeterministic_block + GET /workflows?nd_blocked=true"
+        },
+        {
+          "ref": "#614",
+          "status": "shipped",
+          "surface": "POST /workflows/{id}/replay-diagnosis (per-execution on-demand divergence verdict; recommended next step after listing nd_blocked runs)"
         }
       ],
       "prometheus": {
@@ -674,6 +679,7 @@
       },
       "management_checks": [
         "GET /api/harvest/workflows?nd_blocked=true",
+        "POST /api/harvest/workflows/{id}/replay-diagnosis (issue #614 — confirm the precise per-execution divergence {kind, event_index, expected, actual}, and re-run after a candidate fix to confirm a 'clean' verdict)",
         "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism (pre-#603 terminally-failed rows only)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism"
