@@ -564,23 +564,27 @@ curl -s '.../api/harvest/admin/workflow-types/reachability?workflow_type=legacy_
 
 If a type is still `in_use` (registered) that is normal; only an `orphaned` verdict (live runs, **no** registered handler) blocks the cutover — drain or wait for those runs, or keep the handler until they finish.
 
-## Optional boot-time gate
+## Boot-time gate (on by default)
 
-The plugin can also run this check at startup, so a mis-sequenced deploy is caught before it serves traffic:
+The plugin runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
 
 ```toml
 [harvest.startup]
-# off  — skip the check.
-# warn — (default) log the orphaned types and continue. Non-breaking: a mixed
-#        fleet mid-rollout must not crash-loop just because an old handler was
-#        removed on one node.
-# fail — refuse startup when orphaned types are present.
+# off  — skip the check entirely (the only zero-cost setting).
+# warn — (default) run the check, log the orphaned types, and continue.
+#        Non-breaking: a mixed fleet mid-rollout must not crash-loop just
+#        because an old handler was removed on one node.
+# fail — run the check and refuse startup when orphaned types are present.
 orphaned_workflows = "warn"
 ```
 
 (Env override: `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail`.)
 
+**Boot cost:** the check is a single bounded cross-shard `GROUP BY … COUNT(*) … ARRAY_AGG` aggregate (never a per-execution row load), and the per-group sample slice is bounded (drop-in `LATERAL (SELECT … ORDER BY started_at LIMIT n)` fallback keeps memory bounded even on a huge group). It runs by default under `warn`; a deployment concerned about boot latency on a very large non-terminal backlog can set `orphaned_workflows = "off"` to make boot zero-cost.
+
 **Crash-loop safety:** `fail` aborts boot **only** when orphaned types are present **and** the cross-shard report is *complete*. A `partial`/`unavailable` report — a transient shard outage — degrades to `warn` and boots anyway, because a boot loop has no human in the loop to read an exit code. This is deliberately **asymmetric** with the CLI gate above, which fails *closed* on a partial report (a human is reading its exit code, so "uncertain = unsafe" is the safe default there).
+
+**Enable `fail` only after confirming zero orphans** with the CLI gate above. A persistent orphan (a removed handler with still-live runs) will refuse boot **fleet-wide** — every node running `fail` aborts on every restart until those orphaned runs drain. That is the intended gate behavior, but the blast radius means you should **drain first**: keep the old handler registered (or let the runs finish) until the CLI gate reports `orphaned == false`, then flip `fail` on.
 
 This is the **type-level** reachability question. It is distinct from **build-id** reachability ("can I retire this worker *build*", `GET /admin/build-routing`) and from the **`ctx.version()`** gate-retirement check ("can I remove this version branch *inside* a handler"). See [safe-handler-removal.md](safe-handler-removal.md) for the three-way distinction.
 
