@@ -958,9 +958,15 @@ async fn dry_run_returns_matched_count_and_sample_capped() {
     assert_eq!(status, StatusCode::OK, "dry_run must return 200: {body}");
     assert_eq!(body["dry_run"], json!(true), "body: {body}");
     assert_eq!(body["action"], "Cancel", "echoed action: {body}");
+    // M4/AC4: the FULL filter is echoed back (workflow_name AND states).
     assert_eq!(
         body["filter"]["workflow_name"], "onboarding",
-        "echoed filter: {body}"
+        "echoed filter workflow_name: {body}"
+    );
+    assert_eq!(
+        body["filter"]["states"],
+        json!(["RUNNING"]),
+        "echoed filter states: {body}"
     );
     assert_eq!(
         body["matched_count"].as_u64(),
@@ -977,6 +983,8 @@ async fn dry_run_returns_matched_count_and_sample_capped() {
         json!(true),
         "150 > 100 -> truncated: {body}"
     );
+    // Single reachable shard -> complete.
+    assert_eq!(body["status"], "complete", "all shards reachable: {body}");
 
     // per_shard: non-empty array whose matched_counts sum to matched_count.
     let per_shard = body["per_shard"].as_array().expect("per_shard is an array");
@@ -1003,9 +1011,14 @@ async fn dry_run_returns_matched_count_and_sample_capped() {
     let sample = body["sample"].as_array().expect("sample is an array");
     assert_eq!(sample.len(), 100, "sample capped at global 100: {body}");
     for elem in sample {
+        // N3: execution_id is a non-empty, UUID-parseable string.
+        let exec_id = elem["execution_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sample elem execution_id is a string: {elem}"));
+        assert!(!exec_id.is_empty(), "execution_id non-empty: {elem}");
         assert!(
-            elem.get("execution_id").is_some(),
-            "sample elem has execution_id: {elem}"
+            exec_id.parse::<ExecutionId>().is_ok(),
+            "execution_id is a parseable UUID: {elem}"
         );
         assert_eq!(
             elem["workflow_name"], "onboarding",
@@ -1284,6 +1297,11 @@ async fn real_submit_still_works_and_writes_job() {
         .get_result(&mut conn)
         .await
         .unwrap();
+    let audit_before: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
 
     let (status, body) = post_json(
         &app,
@@ -1293,10 +1311,10 @@ async fn real_submit_still_works_and_writes_job() {
     .await;
 
     assert_eq!(status, StatusCode::ACCEPTED, "real submit 202: {body}");
-    assert!(
-        body["batch_job_id"].as_str().is_some(),
-        "batch_job_id present: {body}"
-    );
+    let job_id = body["batch_job_id"]
+        .as_str()
+        .expect("batch_job_id present")
+        .to_string();
 
     let jobs_after: i64 = harvest_batch_jobs::table
         .count()
@@ -1307,5 +1325,156 @@ async fn real_submit_still_works_and_writes_job() {
         jobs_after,
         jobs_before + 1,
         "real submit persists exactly one job row"
+    );
+
+    // AC6/M2: exactly one new audit row, correlated to the batch_job_id.
+    let audit_after: i64 = harvest_audit_log::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_after,
+        audit_before + 1,
+        "real submit writes exactly one audit row"
+    );
+    let (op, ar_status, target_id): (String, String, Option<String>) = harvest_audit_log::table
+        .filter(harvest_audit_log::target_id.eq(job_id.as_str()))
+        .select((
+            harvest_audit_log::operation,
+            harvest_audit_log::status,
+            harvest_audit_log::target_id,
+        ))
+        .first(&mut conn)
+        .await
+        .expect("audit row correlated by batch_job_id exists");
+    assert_eq!(op, "batch.submit", "audit operation is OP_BATCH_SUBMIT");
+    assert_eq!(ar_status, "succeeded", "audit status is STATUS_SUCCEEDED");
+    assert_eq!(
+        target_id.as_deref(),
+        Some(job_id.as_str()),
+        "audit target_id correlates to the batch_job_id"
+    );
+}
+
+/// N4: exactly `sample_cap` matches -> `sample_truncated == false` (boundary).
+#[tokio::test]
+async fn dry_run_matched_count_equals_cap_not_truncated() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Seed exactly the global cap of 100.
+    seed_workflows(&url, "boundary", 100).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({ "action": "Cancel", "filter": { "workflow_name": "boundary" }, "dry_run": true }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["matched_count"].as_u64(), Some(100), "body: {body}");
+    let sample = body["sample"].as_array().expect("sample array");
+    assert_eq!(sample.len(), 100, "sample len == matched == cap: {body}");
+    assert_eq!(
+        body["sample_truncated"],
+        json!(false),
+        "100 matched / 100 sampled -> NOT truncated: {body}"
+    );
+}
+
+/// M4/AC4: a `search_attrs` filter is echoed back in the preview `filter` and
+/// narrows the matched set.
+#[tokio::test]
+async fn dry_run_echoes_search_attrs_filter() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // seed_workflows stamps search_attrs {"tenant": "acme"} on every row.
+    seed_workflows(&url, "billing", 7).await;
+    seed_workflows(&url, "other", 3).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "search_attrs": [ { "tenant": "acme" } ] },
+            "dry_run": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // Echoed back verbatim.
+    assert_eq!(
+        body["filter"]["search_attrs"],
+        json!([ { "tenant": "acme" } ]),
+        "search_attrs echoed: {body}"
+    );
+    // All 10 seeded rows carry tenant=acme.
+    assert_eq!(
+        body["matched_count"].as_u64(),
+        Some(10),
+        "search_attrs containment matches all acme rows: {body}"
+    );
+}
+
+/// #769 (Signal relaxation): a `dry_run` `Signal` WITHOUT `signal_name` returns
+/// 200 with the exact blast radius and enqueues ZERO signals — the preview
+/// reports blast radius, not signal validity.
+#[tokio::test]
+async fn dry_run_signal_without_signal_name_returns_200() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    seed_workflows(&url, "approvals", 12).await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .unwrap();
+    let signals_before: i64 = harvest_signals::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(signals_before, 0, "no signals seeded");
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Signal",
+            "filter": { "workflow_name": "approvals" },
+            "dry_run": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Signal dry_run without signal_name must 200 (blast radius only): {body}"
+    );
+    assert_eq!(body["action"], "Signal", "echoed action: {body}");
+    assert_eq!(
+        body["matched_count"].as_u64(),
+        Some(12),
+        "exact matched_count: {body}"
+    );
+
+    // Non-vacuous: the Signal preview path enqueues NO harvest_signals rows.
+    let signals_after: i64 = harvest_signals::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        signals_after, 0,
+        "Signal dry_run must enqueue ZERO signals (before==after==0)"
     );
 }

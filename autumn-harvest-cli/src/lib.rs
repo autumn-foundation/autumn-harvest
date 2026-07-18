@@ -1620,8 +1620,12 @@ enum BatchCommand {
         /// File containing JSON filter definition. Use `-` for stdin.
         #[arg(long, value_name = "PATH", conflicts_with = "filter_json")]
         filter_file: Option<PathBuf>,
-        /// Name of the signal (required if action is Signal).
-        #[arg(long, required_if_eq("action", "Signal"))]
+        /// Name of the signal (required for action Signal unless --dry-run).
+        ///
+        /// Enforced manually in `batch_request` (not via `required_if_eq`) so a
+        /// `Signal --dry-run` preview — which reports blast radius, not signal
+        /// validity — can omit it (issue #769).
+        #[arg(long)]
         signal_name: Option<String>,
         /// Inline JSON signal payload.
         #[arg(long, conflicts_with = "signal_payload_file")]
@@ -1633,7 +1637,7 @@ enum BatchCommand {
         #[arg(long)]
         dry_run: bool,
         /// With --dry-run, print the raw JSON preview instead of a table.
-        #[arg(long)]
+        #[arg(long, requires = "dry_run")]
         json: bool,
     },
 }
@@ -5422,6 +5426,14 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
             dry_run,
             json: _,
         } => {
+            // A non-dry-run Signal submit requires signal_name (enforced here
+            // rather than via clap's `required_if_eq`, so a `Signal --dry-run`
+            // preview — blast radius only, not signal validity — may omit it).
+            if action == "Signal" && signal_name.is_none() && !*dry_run {
+                return Err(CliError::InvalidInput(
+                    "--signal-name is required for action Signal (unless --dry-run)".to_string(),
+                ));
+            }
             let filter = parse_json_source(
                 filter_json.as_deref(),
                 filter_file.as_deref(),
@@ -8796,9 +8808,62 @@ mod token_bootstrap_tests {
             out.contains("e1") && out.contains("e2"),
             "ids rendered: {out}"
         );
+        // N2: the per_shard breakdown block renders.
+        assert!(out.contains("shard"), "per_shard block rendered: {out}");
         assert!(
             out.contains("truncated: 2 of 150 shown"),
             "truncation note: {out}"
+        );
+    }
+
+    /// M5: `batch submit --dry-run --json` renders the RAW compact preview body
+    /// (no table header / `DRY RUN` banner), so `--json` output is pipeable.
+    #[test]
+    fn batch_preview_dry_run_json_renders_compact_body() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "harvest",
+            "batch",
+            "submit",
+            "Cancel",
+            "--filter-json",
+            r#"{"workflow_name":"x"}"#,
+            "--dry-run",
+            "--json",
+        ])
+        .expect("CLI should parse");
+        let value = serde_json::json!({
+            "dry_run": true,
+            "action": "Cancel",
+            "matched_count": 42,
+            "per_shard": [{ "shard_id": 0, "matched_count": 42 }],
+            "sample": [],
+            "sample_cap": 100,
+            "sample_truncated": false,
+            "status": "complete"
+        });
+        let out = render_response(&cli, &value).expect("render");
+        assert!(out.contains("\"matched_count\""), "raw JSON body: {out}");
+        assert!(!out.contains("DRY RUN"), "no table banner in --json: {out}");
+        // Compact (not pretty): no multi-space indentation.
+        assert!(!out.contains("\n  "), "compact, not pretty-printed: {out}");
+    }
+
+    /// N1: `--json` without `--dry-run` is rejected at clap parse time
+    /// (`requires = "dry_run"`).
+    #[test]
+    fn batch_submit_json_without_dry_run_rejected() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "harvest",
+            "batch",
+            "submit",
+            "Cancel",
+            "--filter-json",
+            r#"{"workflow_name":"x"}"#,
+            "--json",
+        ]);
+        assert!(
+            result.is_err(),
+            "--json without --dry-run must be a clap parse error"
         );
     }
 

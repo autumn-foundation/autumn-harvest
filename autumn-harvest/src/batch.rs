@@ -642,7 +642,9 @@ mod db {
     /// [`BatchTargetSample`] rows for the dry-run preview (issue #769).
     ///
     /// Shares [`apply_batch_filters`] with the real submit and the count so the
-    /// sample reflects exactly the executions the batch would act on.
+    /// sample reflects exactly the executions the batch would act on. Ordered
+    /// by `id` ascending so the preview sample is deterministic and reproducible
+    /// across repeated dry-runs of the same filter.
     pub async fn sample_targets_on_shard(
         conn: &mut AsyncPgConnection,
         action: BatchAction,
@@ -659,6 +661,7 @@ mod db {
             harvest_workflow_executions::workflow_name,
             harvest_workflow_executions::state,
         ))
+        .order(harvest_workflow_executions::id.asc())
         .limit(limit)
         .load(conn)
         .await
