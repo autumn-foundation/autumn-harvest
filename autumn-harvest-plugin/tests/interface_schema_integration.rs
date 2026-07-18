@@ -508,12 +508,13 @@ async fn seed_execution_in_state(pool: &DbPool, workflow_name: &str, state: &str
 }
 
 // Reproduce the deterministic update_id the update-with-start handler derives
-// from an idempotency key (UUIDv5 over the OID namespace), so a test can seed a
+// from an idempotency key (UUIDv5 over the DNS namespace), so a test can seed a
 // matching UpdateAdmitted event that the committed-replay probe will find.
 fn derive_uws_update_id(key: &str) -> UpdateId {
-    let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-        .expect("static namespace UUID is valid");
-    UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+    UpdateId::from_uuid(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        key.as_bytes(),
+    ))
 }
 
 /// Seed an `UpdateAdmitted` event for `(exec_id, update_id)` directly, simulating
