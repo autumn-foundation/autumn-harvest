@@ -5216,9 +5216,11 @@ pub async fn schedule_run_state_summary(
 /// workflow type by [`non_terminal_counts_by_workflow_name`] (issue #700 AC2).
 ///
 /// A bounded sample lets an operator drill straight into stuck runs of an
-/// orphaned type without paginating `GET /workflows`. The per-shard SQL
-/// `ARRAY_AGG(...)[1:REACHABILITY_SAMPLE_CAP]` already caps each shard's
-/// contribution; the plugin caps the cross-shard union to the same value.
+/// orphaned type without paginating `GET /workflows`. The per-shard SQL caps
+/// each shard's contribution with a hardcoded `ARRAY_AGG(...)[1:5]` slice
+/// (Diesel `sql_query` cannot interpolate this const — the literal `5` is kept
+/// in sync with `REACHABILITY_SAMPLE_CAP` by a guard unit test); the plugin
+/// caps the cross-shard union to the same value.
 pub const REACHABILITY_SAMPLE_CAP: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5273,6 +5275,7 @@ SELECT
     workflow_name::TEXT AS workflow_name,
     COUNT(*)::BIGINT AS non_terminal_count,
     MIN(started_at) AS oldest_started_at,
+    -- [1:5] MUST stay in sync with REACHABILITY_SAMPLE_CAP (guarded by a unit test)
     (ARRAY_AGG(id ORDER BY started_at ASC, id ASC))[1:5] AS sample_execution_ids
 FROM harvest_workflow_executions
 WHERE state NOT IN (
@@ -5674,8 +5677,22 @@ pub async fn check_and_report_unfinished_handlers(
 
 #[cfg(test)]
 mod non_terminal_sql_tests {
-    use super::NON_TERMINAL_COUNTS_SQL;
+    use super::{NON_TERMINAL_COUNTS_SQL, REACHABILITY_SAMPLE_CAP};
     use crate::erase::is_terminal_state;
+
+    /// Diesel `sql_query` cannot interpolate a Rust const into the SQL string,
+    /// so the per-shard sample slice is a hardcoded `[1:5]` literal. This guard
+    /// binds that literal to `REACHABILITY_SAMPLE_CAP`: if either the SQL slice
+    /// or the const changes without the other, this test fails.
+    #[test]
+    fn sql_sample_slice_matches_reachability_sample_cap() {
+        assert!(
+            NON_TERMINAL_COUNTS_SQL.contains(&format!("[1:{REACHABILITY_SAMPLE_CAP}]")),
+            "SQL sample-slice cap drifted from REACHABILITY_SAMPLE_CAP \
+             ({REACHABILITY_SAMPLE_CAP}); the hardcoded [1:N] literal in \
+             NON_TERMINAL_COUNTS_SQL must equal it"
+        );
+    }
 
     /// The `NOT IN (...)` state list in `NON_TERMINAL_COUNTS_SQL` must be the
     /// exact complement of `erase::is_terminal_state`. If a new terminal state is
