@@ -7241,7 +7241,22 @@ async fn submit_batch_operation(
             return Err(AutumnError::bad_request_msg(batch::BATCH_EMPTY_FILTER_ERR));
         }
 
-        let pool = api_state.storage_pool().map_err(map_error)?;
+        // Fail-closed: a totally-unconfigured storage layer is an honest error,
+        // not a partial-200 (mirrors `observe_shards`). `pools_by_shard` below
+        // returns the live per-shard pools; we still guard here so a boot-window
+        // / misconfigured storage returns the storage error rather than an empty
+        // fan-out.
+        let _pool = api_state.storage_pool().map_err(map_error)?;
+        // Fan out across the ROUTER-KNOWN shard set — every shard with a live
+        // pool AND every shard the router advertises via
+        // `readable_shards`/`default_shard`. A shard mid a shard-add rollout
+        // that this process has no pool for yet is folded into
+        // `unavailable_shards` (→ `status = "partial"`) rather than silently
+        // omitted, which would let `status` read `complete` even though that
+        // shard was never queried (issue #769 review; mirrors
+        // `observe_shards`/`workflow_count`).
+        let pools = crate::shard_fanout::pools_by_shard(&api_state);
+        let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
         // Track how many sample rows we've already pulled so we can SKIP the
         // sample query on a shard once the global cap is filled (count-only
         // continuation). An unreachable shard degrades this preview to
@@ -7250,8 +7265,18 @@ async fn submit_batch_operation(
         let mut outcomes: Vec<ShardPreviewOutcome> = Vec::new();
         let mut sample_pulled: usize = 0;
 
-        for (shard_id, shard_pool) in pool.iter_shards() {
-            let sid = shard_id.as_i32();
+        for (sid, maybe_pool) in resolve_expected_shard_pools(&expected, &pools) {
+            // A shard the router advertises but this process has no pool for yet
+            // (mid a shard-add rollout) is reported unavailable here — never
+            // resolved through a default-shard fallback, which would query the
+            // wrong DB and falsely read `complete`.
+            let Some(shard_pool) = maybe_pool else {
+                outcomes.push(ShardPreviewOutcome::Unavailable {
+                    shard_id: sid,
+                    reason: format!("shard {sid} has no configured storage pool"),
+                });
+                continue;
+            };
             let mut conn = match acquire_conn(shard_pool).await {
                 Ok(c) => c,
                 Err(e) => {

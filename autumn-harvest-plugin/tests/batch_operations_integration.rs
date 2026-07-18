@@ -114,6 +114,14 @@ fn test_app_state() -> AppState {
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
+    build_app_with_router(pool, ShardRouter::default())
+}
+
+/// Like [`build_app`] but with a caller-supplied [`ShardRouter`], so a test can
+/// advertise a shard the single-shard storage pool has no pool for yet
+/// (mid a shard-add rollout) and exercise the poolless-router-known-shard
+/// partial-degradation path (issue #769 review).
+fn build_app_with_router(pool: &DbPool, router: ShardRouter) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
@@ -125,7 +133,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::default(),
+        router,
     ));
     harvest_api_router(api_state).with_state(test_app_state())
 }
@@ -1477,4 +1485,79 @@ async fn dry_run_signal_without_signal_name_returns_200() {
         signals_after, 0,
         "Signal dry_run must enqueue ZERO signals (before==after==0)"
     );
+}
+
+/// #769 review (Codex P2): a shard the router advertises via
+/// `readable_shards` for which THIS process has no pool yet (mid a shard-add
+/// rollout) must be folded into `unavailable_shards` → `status = "partial"`,
+/// NOT silently omitted (which would let `status` read `complete` while a
+/// known shard was never queried). The single-shard storage pool holds only
+/// shard 0; the router advertises shard 1 as readable (writable stays shard 0,
+/// i.e. shard 1 is read-only mid-rollout). This is distinct from a *down*
+/// shard (a pool pointing at a broken DB): here there is no pool at all, so the
+/// `acquire_conn` error path never runs — only the poolless-resolution path.
+#[tokio::test]
+async fn dry_run_router_known_poolless_shard_is_partial() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    // Router advertises shards 0 AND 1 as readable; storage pool has only 0.
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0)],
+        ShardId::new(0),
+    );
+    let app = build_app_with_router(&pool, router);
+
+    let seeded = 4usize;
+    seed_workflows(&url, "onboarding", seeded).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/batch-operations",
+        json!({
+            "action": "Cancel",
+            "filter": { "workflow_name": "onboarding", "states": ["RUNNING"] },
+            "dry_run": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a router-known poolless shard must NOT 500: {body}"
+    );
+    assert_eq!(body["dry_run"], json!(true), "body: {body}");
+    assert_eq!(
+        body["status"], "partial",
+        "a router-known shard with no pool degrades to partial, never complete: {body}"
+    );
+    // matched_count covers only the reachable shard (a lower bound).
+    assert_eq!(
+        body["matched_count"].as_u64(),
+        Some(seeded as u64),
+        "matched_count covers only reachable shard 0: {body}"
+    );
+    // The poolless shard is NAMED (not silently omitted).
+    let unavailable = body["unavailable_shards"]
+        .as_array()
+        .expect("unavailable_shards is an array");
+    assert_eq!(
+        unavailable.len(),
+        1,
+        "exactly the poolless shard 1 is named: {body}"
+    );
+    assert_eq!(unavailable[0]["shard_id"], 1, "shard 1 named: {body}");
+    assert!(
+        !unavailable[0]["reason"].as_str().unwrap().is_empty(),
+        "poolless shard carries a non-empty reason: {body}"
+    );
+    // per_shard lists only the reachable shard.
+    let per_shard = body["per_shard"].as_array().expect("per_shard array");
+    assert_eq!(
+        per_shard.len(),
+        1,
+        "per_shard has only reachable shard 0: {body}"
+    );
+    assert_eq!(per_shard[0]["shard_id"], 0, "reachable shard is 0: {body}");
 }
