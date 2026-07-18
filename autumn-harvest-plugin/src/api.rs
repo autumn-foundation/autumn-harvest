@@ -11170,6 +11170,201 @@ async fn probe_committed_start_replay(
     )
 }
 
+/// Read-only committed-replay probe for `signal-with-start` (keyed requests only).
+///
+/// INVARIANT (mirrors the plain `start_workflow` probe, issue #808, and the
+/// plain signal route, PR #1092): a retry of an already-committed keyed
+/// signal-with-start must replay to its documented `200 signal_delivered: false`
+/// no-op BEFORE any fresh-start-only validation runs (the #610 signal-payload
+/// schema gate, the #373 `start_input` schema gate, the #252 cap). Otherwise a
+/// tightened schema/cap between the original delivery and the retry would
+/// wrongly reject a retry that creates no new work. This probe runs only when an
+/// `idempotency_key` is present; on a miss the caller falls through to the
+/// untouched authoritative in-lock path (which reserves the exactly-once row and
+/// remains the source of truth for the concurrent-first-delivery race). It never
+/// starts, attaches, or enqueues anything — it is a read-only fast path.
+///
+/// Fans out across shards using the SAME `lookup_idempotent_signal_dedupe` the
+/// in-lock authoritative dedup uses, so the two can never drift. On the first
+/// hit it writes a best-effort SUCCEEDED audit (intentional asymmetry with the
+/// fresh-start arm's 503-on-audit-failure: the original start was already
+/// audited, so a failed dedup audit is a no-op read that never fails the reply)
+/// and returns the documented `200` response.
+#[allow(clippy::too_many_arguments)]
+async fn probe_committed_sws_replay(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    workflow_id: &str,
+    key: &str,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    route: &'static str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let pool = api_state.storage_pool().ok()?;
+    // Fail CLOSED on an inconclusive shard error (three-state: hit / clean-miss /
+    // inconclusive). A transient conn-acquire or lookup failure on the shard that
+    // owns a committed key must NOT masquerade as a dedup miss — that would fall
+    // through to fresh-start validation and could wrongly reject THIS PR's core
+    // invariant (a committed replay is never rejected by tightened validation)
+    // under a transient error. Deliberately MORE conservative than #808's
+    // plain-start probe (which swallows): (a) the sibling `found_shard` scan in
+    // this handler already fails closed (503) on the same error class, and (b)
+    // fail-closed preserves the never-reject invariant even under a transient
+    // owning-shard error; a keyed client retries 503 idempotently. Keep scanning
+    // the remaining shards first — a later shard may hold the hit — and only 503
+    // when the whole fan-out found no hit at all.
+    let mut had_error = false;
+    for (shard, shard_pool) in pool.iter_shards() {
+        let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
+            had_error = true;
+            continue;
+        };
+        let existing = match autumn_harvest::execution::lookup_idempotent_signal_dedupe(
+            &mut probe_conn,
+            workflow_name,
+            workflow_id,
+            key,
+        )
+        .await
+        {
+            Ok(Some(existing)) => existing,
+            Ok(None) => continue,
+            Err(_) => {
+                had_error = true;
+                continue;
+            }
+        };
+        let outcome = SignalWithStartOutcome {
+            exec_id: ExecutionId::from_uuid(existing.id),
+            workflow_name: existing.workflow_name,
+            workflow_id: existing.workflow_id,
+            state: existing.state,
+            started_fresh: false,
+            signal_delivered: false,
+        };
+        let exec_id_str = outcome.exec_id.to_string();
+        let ar = NewAuditRecord {
+            actor,
+            operation: OP_WORKFLOW_SIGNAL_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(exec_id_str.as_str()),
+            route_or_command: route,
+            request_id,
+            idempotency_key: Some(key),
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: Some(shard.as_i32()),
+            source,
+        };
+        let _ = audit::insert_audit(&mut probe_conn, &ar).await;
+        return Some(
+            (
+                axum::http::StatusCode::OK,
+                Json(SignalWithStartResponse::from_outcome(outcome)),
+            )
+                .into_response(),
+        );
+    }
+    // No hit. If any shard was inconclusive (conn/lookup error), fail closed with
+    // a 503 rather than let a committed replay fall through to (possibly tightened)
+    // fresh-start validation. A clean all-shard miss returns `None` so the caller
+    // runs the authoritative in-lock path.
+    if had_error {
+        return Some(
+            AutumnError::service_unavailable_msg(
+                "signal-with-start committed-replay probe: shard lookup failed; retry",
+            )
+            .into_response(),
+        );
+    }
+    None
+}
+
+/// Read-only committed-replay probe for `update-with-start` (keyed requests only).
+///
+/// INVARIANT (mirrors [`probe_committed_sws_replay`]): a retry of an
+/// already-committed keyed update-with-start must replay to its cached admission
+/// BEFORE any fresh-start-only validation runs (the #373 `start_input` schema
+/// gate, the #610 update-arg schema gate, the #684 semantic validator).
+/// Otherwise a tightened schema — or a validator that would now reject the same
+/// args — would wrongly reject a retry that admits no new update. Keyed-only; a
+/// miss falls through to the authoritative in-lock path.
+///
+/// Unlike the signal probe it returns the resolved [`UpdateWithStartOutcome`]
+/// (not a full response) so the outcome flows through the handler's existing
+/// `Ok` arm — which polls for the cached update result under `wait_for_stage =
+/// "completed"` and writes the SUCCEEDED audit — giving a committed replay the
+/// SAME behavior as a fresh admission. `update_admitted: false` marks the cache
+/// hit.
+///
+/// Three-state result: `Ok(Some(outcome))` = committed-replay HIT (flows through
+/// the handler's `Ok` arm); `Ok(None)` = a genuine clean all-shard MISS (falls
+/// through to the authoritative in-lock path); `Err(resp)` = an INCONCLUSIVE
+/// shard error (fail closed with a 503). Failing closed on a transient conn/lookup
+/// error is deliberately MORE conservative than #808's plain-start probe (which
+/// swallows): (a) the sibling `found_shard` scan in this handler already fails
+/// closed (503) on the same error class, and (b) fail-closed preserves THIS PR's
+/// core invariant — a committed replay is never rejected by tightened validation —
+/// even under a transient owning-shard error; a keyed client retries 503
+/// idempotently.
+async fn probe_committed_uws_replay(
+    api_state: &HarvestApiState,
+    workflow_name: &str,
+    workflow_id: &str,
+    update_id: UpdateId,
+) -> Result<Option<UpdateWithStartOutcome>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let Ok(pool) = api_state.storage_pool() else {
+        // No storage pool at all → clean miss; the handler's own `storage_pool()`
+        // call fails closed for genuinely-fresh work.
+        return Ok(None);
+    };
+    let mut had_error = false;
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
+            had_error = true;
+            continue;
+        };
+        let row = match autumn_harvest::execution::lookup_idempotent_update_dedupe(
+            &mut probe_conn,
+            workflow_name,
+            workflow_id,
+            &update_id,
+        )
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(_) => {
+                had_error = true;
+                continue;
+            }
+        };
+        return Ok(Some(UpdateWithStartOutcome {
+            exec_id: row.exec_id,
+            workflow_name: row.workflow_name,
+            workflow_id: row.workflow_id,
+            state: row.state,
+            started_fresh: false,
+            update_id,
+            update_admitted: false,
+        }));
+    }
+    // No hit. If any shard was inconclusive (conn/lookup error), fail closed with a
+    // 503 rather than let a committed replay fall through to (possibly tightened)
+    // fresh-start validation. A clean all-shard miss returns `Ok(None)` so the
+    // caller runs the authoritative in-lock path.
+    if had_error {
+        return Err(AutumnError::service_unavailable_msg(
+            "update-with-start committed-replay probe: shard lookup failed; retry",
+        )
+        .into_response());
+    }
+    Ok(None)
+}
+
 /// Handle a `start_workflow` request whose JSON body failed to deserialize
 /// (issue #808, Codex P2). axum rejects a malformed `Json<T>` body before the
 /// handler runs, but a retry that carries its exactly-once key in the
@@ -15204,6 +15399,35 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // INVARIANT (this PR): keyed committed-replay short-circuit. A retry of an
+    // already-committed keyed signal-with-start must replay to its documented
+    // `200 signal_delivered: false` no-op BEFORE any fresh-start-only validation
+    // (the #610 signal-payload schema gate immediately below, the #252 cap, and
+    // the #373 start_input schema enforced inside the core primitive). Otherwise
+    // a schema/cap tightened between the original delivery and the retry would
+    // wrongly reject a retry that creates no new work. Keyed-only; a miss falls
+    // through to the untouched authoritative in-lock path
+    // (`signal_with_start_workflow_execution_with_metrics`), which reserves the
+    // exactly-once signal row and remains the source of truth for the
+    // concurrent-first-delivery race — this probe is an additive fast path for
+    // COMMITTED replays only, never a replacement. Mirrors #808 (plain start)
+    // and #1092 (plain signal route).
+    if let Some(key) = request.idempotency_key.as_deref()
+        && let Some(resp) = probe_committed_sws_replay(
+            &api_state,
+            &workflow_name,
+            &workflow_id,
+            key,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            route,
+        )
+        .await
+    {
+        return resp;
+    }
+
     // issue #610: structural schema validation of the signal payload against
     // the signal handler's published `arg_schema` (if any). Runs before any
     // durable start/attach so a malformed signal is rejected at the edge with a
@@ -15769,6 +15993,49 @@ async fn update_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let update_args = request.update_args.unwrap_or(Value::Null);
 
+    // Derive update_id — deterministic from idempotency_key if provided. Hoisted
+    // here (mirroring the signal-with-start probe placement) so the committed-
+    // replay probe below can run BEFORE the #377 admission gate and the
+    // found-shard scan, as well as before the #373/#610/#684 validation blocks.
+    let update_id = request
+        .idempotency_key
+        .as_ref()
+        .map_or_else(UpdateId::new, |key| {
+            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+                .expect("static namespace UUID is valid");
+            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+        });
+
+    // INVARIANT (this PR + #377): keyed committed-replay short-circuit. A retry of
+    // an already-committed keyed update-with-start must replay to its cached
+    // admission BEFORE any fresh-start-only rejection — the #373 start_input schema
+    // gate, the #610 update-arg schema gate + #684 validator further down, AND the
+    // #377 admission gate below. This mirrors both the signal-with-start route
+    // (whose probe likewise precedes the found-shard scan and the admission gate)
+    // and the #808 invariant that a committed replay precedes ALL fresh-start-only
+    // rejections, INCLUDING a raised admission gate: otherwise a retry that admits
+    // no new update — but hits an operator-raised gate or a schema/validator
+    // tightened since the original delivery — would wrongly return 503/400/422.
+    // Keyed-only; a miss (`None`) falls through to the untouched authoritative
+    // in-lock path (`update_with_start_workflow_execution_with_metrics`), which
+    // reserves the exactly-once update and remains the source of truth. On a hit
+    // the outcome flows through the existing `Ok` arm (which polls for the cached
+    // update result and writes the SUCCEEDED audit), giving a committed replay the
+    // SAME behavior as a fresh admission. Mirrors #808 (plain start) and #1092
+    // (plain signal route).
+    let probe_outcome = if request.idempotency_key.is_some() {
+        // `Err(resp)` = an inconclusive shard error → fail closed (503) rather than
+        // risk a spurious fresh-start rejection of a committed replay; `Ok(outcome)`
+        // = hit (Some) or clean miss (None).
+        match probe_committed_uws_replay(&api_state, &workflow_name, &workflow_id, update_id).await
+        {
+            Ok(outcome) => outcome,
+            Err(resp) => return resp,
+        }
+    } else {
+        None
+    };
+
     // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
     // primitive to reject only a *fresh start* under its lock so an attach /
     // idempotent update-with-start to a live run still succeeds (issue #499).
@@ -15784,75 +16051,113 @@ async fn update_with_start_workflow(
             per_wf.max(runtime.registry.max_workflow_input_bytes)
         });
 
-    // Multi-shard scan: find any existing non-terminal execution for
-    // (workflow_name, workflow_id) to determine the target shard and exec_id.
+    // `pool` is needed by BOTH paths: the fresh/miss multi-shard scan below and
+    // the `Ok`-arm long-poll (`poll_update_result`), which routes by exec_id.
     let pool = match api_state.storage_pool() {
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
-    for (candidate_shard, shard_pool) in pool.iter_shards() {
-        let mut shard_conn = match acquire_conn(shard_pool).await {
-            Ok(c) => c,
-            Err(e) => return e.into_response(),
-        };
-        let hit = match harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
-            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
-            .select((
-                harvest_workflow_executions::id,
-                harvest_workflow_executions::state,
-            ))
-            .first::<(uuid::Uuid, String)>(&mut shard_conn)
-            .await
-            .optional()
-        {
-            Ok(hit) => hit,
-            Err(e) => {
-                return AutumnError::service_unavailable_msg(format!(
-                    "shard {} lookup failed: {e}",
-                    candidate_shard.as_i32()
-                ))
-                .into_response();
-            }
-        };
-        if let Some((existing_uuid, existing_state)) = hit {
-            // Reuse the execution UUID only when attaching to a live RUNNING or
-            // SUSPENDED run under a non-rejecting policy. All other paths (terminal
-            // prior, PAUSED, TerminateIfRunning) go through replace_execution and
-            // need a fresh exec_id to avoid a primary-key conflict.
-            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
-                && matches!(
-                    reuse_policy,
-                    WorkflowIdReusePolicy::AllowDuplicate
-                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                );
-            let exec_id = if will_attach {
-                ExecutionId::from_uuid(existing_uuid)
-            } else {
-                ExecutionId::new_for_shard(candidate_shard)
-            };
-            found_shard = Some((candidate_shard, shard_conn, exec_id));
-            break;
-        }
-    }
 
-    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
-        tuple
-    } else {
-        let shard = runtime
-            .router
-            .pick_for_new_workflow(&workflow_name, &workflow_id);
-        let conn = match db_conn_for_shard(&api_state, shard).await {
+    // Resolve the `(shard, conn, exec_id)` the rest of the handler consumes.
+    //
+    // On a committed-replay HIT (`probe_outcome.is_some()`) there is NO
+    // fresh-start work, so a committed replay needs no fresh-start routing:
+    // audit + polling run on the hit execution's OWN shard, resolvable O(1) from
+    // `outcome.exec_id`. Acquire ONLY that shard's connection and SKIP the
+    // multi-shard scan, the admission gate, and `pick_for_new_workflow` entirely.
+    // This closes a residual undoing of the earlier admission-gate hoist: a
+    // fresh-shard partial outage — a shard-scan `Err`, or `pick_for_new_workflow`
+    // selecting an unavailable shard (multi-shard partial outage / terminal-prior
+    // case) — could otherwise still return 503 on a dedupe hit that does no fresh
+    // work (Codex P2 / #808 invariant: a committed replay is never rejected by
+    // fresh-start-only infrastructure).
+    //
+    // On a MISS the full fresh-start routing runs exactly as before
+    // (byte-identical): find any existing non-terminal execution for
+    // (workflow_name, workflow_id) to determine the target shard and exec_id,
+    // else `pick_for_new_workflow`.
+    let (shard, mut conn, exec_id) = if let Some(outcome) = probe_outcome.as_ref() {
+        let hit_exec_id = outcome.exec_id;
+        let conn = match db_conn_for_execution(&api_state, hit_exec_id).await {
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        (shard, conn, ExecutionId::new_for_shard(shard))
+        (hit_exec_id.shard(), conn, hit_exec_id)
+    } else {
+        let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+        for (candidate_shard, shard_pool) in pool.iter_shards() {
+            let mut shard_conn = match acquire_conn(shard_pool).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            let hit = match harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+                .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                .filter(
+                    harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                )
+                .select((
+                    harvest_workflow_executions::id,
+                    harvest_workflow_executions::state,
+                ))
+                .first::<(uuid::Uuid, String)>(&mut shard_conn)
+                .await
+                .optional()
+            {
+                Ok(hit) => hit,
+                Err(e) => {
+                    return AutumnError::service_unavailable_msg(format!(
+                        "shard {} lookup failed: {e}",
+                        candidate_shard.as_i32()
+                    ))
+                    .into_response();
+                }
+            };
+            if let Some((existing_uuid, existing_state)) = hit {
+                // Reuse the execution UUID only when attaching to a live RUNNING or
+                // SUSPENDED run under a non-rejecting policy. All other paths
+                // (terminal prior, PAUSED, TerminateIfRunning) go through
+                // replace_execution and need a fresh exec_id to avoid a
+                // primary-key conflict.
+                let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+                    && matches!(
+                        reuse_policy,
+                        WorkflowIdReusePolicy::AllowDuplicate
+                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                    );
+                let exec_id = if will_attach {
+                    ExecutionId::from_uuid(existing_uuid)
+                } else {
+                    ExecutionId::new_for_shard(candidate_shard)
+                };
+                found_shard = Some((candidate_shard, shard_conn, exec_id));
+                break;
+            }
+        }
+
+        if let Some(tuple) = found_shard {
+            tuple
+        } else {
+            let shard = runtime
+                .router
+                .pick_for_new_workflow(&workflow_name, &workflow_id);
+            let conn = match db_conn_for_shard(&api_state, shard).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            (shard, conn, ExecutionId::new_for_shard(shard))
+        }
     };
 
-    // Admission gate check (unconditional — same rationale as signal-with-start).
-    {
+    // issue #377: admission gate. Skipped on a committed-replay hit
+    // (`probe_outcome.is_some()`): a retry admits no new update, so — per the #808
+    // invariant, mirroring the fresh-start-only validation gates below — a
+    // committed replay must return its cached admission even while an operator has
+    // raised a gate, rather than a spurious 503. On a miss the gate runs
+    // unconditionally for genuinely-fresh work (same rationale as
+    // signal-with-start: the pre-scan is unlocked, so the resolver may still
+    // create fresh even when we observed an existing RUNNING execution).
+    if probe_outcome.is_none() {
         let wf_owner = runtime
             .registry
             .workflows
@@ -15900,8 +16205,10 @@ async fn update_with_start_workflow(
         }
     }
 
-    // Validate start_input against the workflow's published JSON Schema (if any).
-    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
+    // issue #373: start_input schema validation (fresh-start-only; skipped on a
+    // committed-replay hit).
+    if probe_outcome.is_none()
+        && let Some(info) = runtime.registry.workflows.get(&workflow_name)
         && let Err(violations) = info.validate_input(&start_input)
     {
         let ar = NewAuditRecord {
@@ -15927,16 +16234,6 @@ async fn update_with_start_workflow(
         )
             .into_response();
     }
-
-    // Derive update_id — deterministic from idempotency_key if provided.
-    let update_id = request
-        .idempotency_key
-        .as_ref()
-        .map_or_else(UpdateId::new, |key| {
-            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-                .expect("static namespace UUID is valid");
-            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
-        });
 
     let trace_ctx = tracing::info_span!(
         "harvest.workflow.schedule",
@@ -15980,11 +16277,14 @@ async fn update_with_start_workflow(
     // Resolve the registered update handler once and reuse it for both the
     // #610 schema-400 check and the #684 validator-422 check, mirroring the
     // plain `admit_update` route so the two entry points stay consistent.
-    if let Some(update_info) = runtime
-        .registry
-        .update_handlers
-        .iter()
-        .find(|h| h.workflow == workflow_name && h.name == request.update_name)
+    // Skipped entirely on a committed-replay hit (`probe_outcome.is_some()`):
+    // both gates are fresh-start-only, and a retry admits no new update.
+    if probe_outcome.is_none()
+        && let Some(update_info) = runtime
+            .registry
+            .update_handlers
+            .iter()
+            .find(|h| h.workflow == workflow_name && h.name == request.update_name)
     {
         // issue #610: structural schema validation of the update argument
         // against the handler's published `arg_schema` (if any). Runs *before*
@@ -16081,17 +16381,28 @@ async fn update_with_start_workflow(
         reject_fresh_if_debounced,
     };
 
-    let result = update_with_start_workflow_execution_with_metrics(
-        &mut conn,
-        params,
-        Some(runtime.registry.telemetry().metrics.as_ref()),
-        // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
-        // primitive's lock (see the sibling comment on the signal-with-start
-        // route). Closes the residual pre-check→locked-create TOCTOU; a pre-check
-        // block short-circuits before this call, so no double-count.
-        Some(autumn_harvest::admission_gate::GateMode::Check),
-    )
-    .await;
+    // A committed-replay hit short-circuits the authoritative in-lock call and
+    // feeds the cached outcome straight through the shared result match below
+    // (whose `Ok` arm polls for the cached update result and audits). A miss runs
+    // the authoritative path, which reserves the exactly-once update and stays
+    // the source of truth for the concurrent-first-delivery race.
+    let result = match probe_outcome {
+        Some(outcome) => Ok(outcome),
+        None => {
+            update_with_start_workflow_execution_with_metrics(
+                &mut conn,
+                params,
+                Some(runtime.registry.telemetry().metrics.as_ref()),
+                // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under
+                // the primitive's lock (see the sibling comment on the
+                // signal-with-start route). Closes the residual pre-check→locked-
+                // create TOCTOU; a pre-check block short-circuits before this call,
+                // so no double-count.
+                Some(autumn_harvest::admission_gate::GateMode::Check),
+            )
+            .await
+        }
+    };
 
     if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
         // Failed-start audit (parity with the match arms below).

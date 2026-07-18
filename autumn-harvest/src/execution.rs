@@ -4250,7 +4250,13 @@ async fn try_load_active_execution_for_update(
 /// logical workflow so a webhook retry that arrives after the prior signal
 /// drove its execution to a terminal state is recognised as a duplicate and
 /// short-circuited before any fresh start / replacement happens.
-async fn lookup_idempotent_signal_dedupe(
+/// Read-only shared committed-replay lookup for `signal_with_start`
+/// idempotency, scoped `(workflow_name, workflow_id, idempotency_key)`, joining
+/// `harvest_signals` → `harvest_workflow_executions` (no state filter, newest
+/// signal first). Used by BOTH the in-lock authoritative dedup and the
+/// read-only handler-edge fast-path probe — single source of truth so the two
+/// can never drift.
+pub async fn lookup_idempotent_signal_dedupe(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
@@ -4775,12 +4781,22 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     Ok(outcome)
 }
 
-/// Minimal row returned by the idempotency dedupe query.
-struct UpdateDedupeRow {
-    exec_id: ExecutionId,
-    workflow_name: String,
-    workflow_id: String,
-    state: String,
+/// Minimal row returned by the `update_with_start` idempotency dedupe query.
+///
+/// Public so the plugin's read-only handler-edge committed-replay probe can
+/// build an [`UpdateWithStartOutcome`] from a dedupe hit, sharing the exact
+/// lookup ([`lookup_idempotent_update_dedupe`]) the in-lock authoritative path
+/// uses — single source of truth so the two can never drift.
+#[derive(Debug, Clone)]
+pub struct UpdateDedupeRow {
+    /// The execution that already admitted the update for this key.
+    pub exec_id: ExecutionId,
+    /// The owning workflow type.
+    pub workflow_name: String,
+    /// The owning `workflow_id`.
+    pub workflow_id: String,
+    /// The execution's current state string.
+    pub state: String,
 }
 
 /// Cross-execution idempotency dedupe for `update_with_start`.
@@ -4792,7 +4808,11 @@ struct UpdateDedupeRow {
 ///
 /// The lookup uses JSON operators on `event_data` (Postgres JSONB). This is a
 /// cold-path read (retries only) so index coverage is not critical.
-async fn lookup_idempotent_update_dedupe(
+///
+/// Public so the plugin's read-only handler-edge committed-replay probe shares
+/// the exact lookup the in-lock authoritative dedup uses — single source of
+/// truth so the two can never drift.
+pub async fn lookup_idempotent_update_dedupe(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
