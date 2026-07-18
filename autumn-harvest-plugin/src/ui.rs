@@ -2449,17 +2449,20 @@ async fn list_workers_ui(
 fn parse_worker_ui_filters(
     params: &WorkerListParams,
 ) -> Result<(Option<&'static str>, bool), AutumnError> {
+    // We use `eq_ignore_ascii_case` here instead of `to_lowercase().as_str()`
+    // to avoid allocating a new String on the heap during case-insensitive comparison.
     let status_filter = match params.status.as_deref().map(str::trim) {
         None | Some("") => None,
-        Some(s) => Some(match s.to_lowercase().as_str() {
-            "active" => "Active",
-            "draining" => "Draining",
-            "stopped" => "Stopped",
-            other => {
-                return Err(AutumnError::bad_request_msg(format!(
-                    "unknown status '{other}'; expected one of Active, Draining, Stopped"
-                )));
-            }
+        Some(s) => Some(if s.eq_ignore_ascii_case("active") {
+            "Active"
+        } else if s.eq_ignore_ascii_case("draining") {
+            "Draining"
+        } else if s.eq_ignore_ascii_case("stopped") {
+            "Stopped"
+        } else {
+            return Err(AutumnError::bad_request_msg(format!(
+                "unknown status '{s}'; expected one of Active, Draining, Stopped"
+            )));
         }),
     };
     let stale_only = match params.stale.as_deref().map(str::trim) {
@@ -4291,12 +4294,18 @@ fn render_workflow_detail(
                     }
                 }
                 @if let Some(ref sev) = execution.severity {
-                    @let sev_class = match sev.to_lowercase().as_str() {
-                        "sev1" => "badge-sev-sev1",
-                        "sev2" => "badge-sev-sev2",
-                        "sev3" => "badge-sev-sev3",
-                        "sev4" => "badge-sev-sev4",
-                        _ => "",
+                    // Use `eq_ignore_ascii_case` instead of `to_lowercase().as_str()`
+                    // to prevent a heap allocation per execution rendered.
+                    @let sev_class = if sev.eq_ignore_ascii_case("sev1") {
+                        "badge-sev-sev1"
+                    } else if sev.eq_ignore_ascii_case("sev2") {
+                        "badge-sev-sev2"
+                    } else if sev.eq_ignore_ascii_case("sev3") {
+                        "badge-sev-sev3"
+                    } else if sev.eq_ignore_ascii_case("sev4") {
+                        "badge-sev-sev4"
+                    } else {
+                        ""
                     };
                     div.k { "Severity" }
                     div.v {
