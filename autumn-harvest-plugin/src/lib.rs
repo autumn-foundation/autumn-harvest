@@ -51,7 +51,7 @@ pub use api::{
 };
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
-    HarvestReadinessConfig, HarvestRuntimeConfig,
+    HarvestReadinessConfig, HarvestRuntimeConfig, HarvestStartupConfig, OrphanStartupAction,
 };
 pub use outbox::{
     WorkflowStartRequest, drain_workflow_start_outbox_once, enqueue_workflow_start_outbox,

@@ -1348,6 +1348,95 @@ async fn start_harvest_runtime(
     });
     api_state.install(runner.api_runtime());
 
+    // Issue #700 AC4: boot-time orphaned-workflow-type reachability gate. This is
+    // the earliest point at which BOTH the handler registry (installed just above)
+    // and the storage pool (installed earlier) are available, so
+    // `build_workflow_reachability_report` can resolve the `registered` flag and
+    // fan out across shards. `off` skips the check entirely; the default `warn`
+    // never blocks boot. Architecture note: the check lives here in the plugin
+    // (not on `HarvestBuilder`) because the cross-shard fan-out is plugin
+    // territory; `build_workflow_reachability_report` IS the programmatic
+    // embedder access the AC's "e.g. a HarvestBuilder method" refers to.
+    {
+        use crate::config::OrphanStartupAction;
+        use crate::workflow_reachability::{
+            ReachabilityVerdict, StartupOrphanDecision, WorkflowReachabilityQuery,
+            build_workflow_reachability_report, startup_orphan_decision,
+        };
+
+        let orphan_action = harvest_config.startup.orphaned_workflows;
+        if orphan_action != OrphanStartupAction::Off {
+            match build_workflow_reachability_report(
+                api_state,
+                WorkflowReachabilityQuery::default(),
+            )
+            .await
+            {
+                Ok(report) => {
+                    let orphaned_types: Vec<&str> = report
+                        .items
+                        .iter()
+                        .filter(|item| item.verdict == ReachabilityVerdict::Orphaned)
+                        .map(|item| item.workflow_type.as_str())
+                        .collect();
+                    match startup_orphan_decision(orphan_action, report.orphaned, report.status) {
+                        StartupOrphanDecision::Continue => {}
+                        StartupOrphanDecision::Warn => {
+                            tracing::warn!(
+                                orphaned_types = ?orphaned_types,
+                                total_orphaned_executions = report.total_orphaned_executions,
+                                status = ?report.status,
+                                "orphaned workflow types detected at startup: their #[workflow] \
+                                 handlers are no longer registered and in-flight runs would wedge \
+                                 on replay. See docs/runbooks/safe-deploy.md \
+                                 (Pre-cutover handler-coverage gate) and safe-handler-removal.md."
+                            );
+                        }
+                        StartupOrphanDecision::Abort => {
+                            tracing::error!(
+                                orphaned_types = ?orphaned_types,
+                                total_orphaned_executions = report.total_orphaned_executions,
+                                "refusing startup (harvest.startup.orphaned_workflows = fail): \
+                                 orphaned workflow types have in-flight runs but no registered \
+                                 handler, so those runs would wedge on replay."
+                            );
+                            // Tear down the tasks HarvestRunner::start and the
+                            // outbox/gate-refresh spawners already launched, so
+                            // aborting boot leaves no orphaned background tasks.
+                            // The admission_guard (not yet committed) rolls back
+                            // the published gate cache + metrics on return.
+                            if let Some(gate_refresh) = gate_refresh {
+                                gate_refresh.shutdown.cancel();
+                                let _ = gate_refresh.handle.await;
+                            }
+                            if let Some(outbox) = outbox {
+                                outbox.shutdown.cancel();
+                                let _ = outbox.handle.await;
+                            }
+                            runner.stop().await;
+                            return Err(AutumnError::service_unavailable_msg(format!(
+                                "refusing startup: {} orphaned workflow type(s) with in-flight \
+                                 runs have no registered handler ({} stranded executions): {:?}",
+                                orphaned_types.len(),
+                                report.total_orphaned_executions,
+                                orphaned_types,
+                            )));
+                        }
+                    }
+                }
+                Err(error) => {
+                    // Never block boot on the check's OWN failure (e.g. a
+                    // transient read error): warn and continue.
+                    tracing::warn!(
+                        error = %error,
+                        "workflow-type reachability check failed at startup; continuing \
+                         (the check never blocks boot on its own error)"
+                    );
+                }
+            }
+        }
+    }
+
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");
         guard.runtime = Some(HarvestRuntime {

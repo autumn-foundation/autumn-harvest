@@ -216,6 +216,7 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -374,6 +375,7 @@ async fn archival_hook_fires_for_override_deleted_row() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -486,6 +488,7 @@ async fn archival_hook_times_out_and_preserves_execution() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -571,6 +574,7 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -775,6 +779,7 @@ async fn retention_reclaims_an_orphaned_delivered_completion_delivery() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
