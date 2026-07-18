@@ -566,7 +566,7 @@ If a type is still `in_use` (registered) that is normal; only an `orphaned` verd
 
 ## Boot-time gate (on by default)
 
-The plugin runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
+The plugin runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **The gate runs before the worker poll loop and schedulers are spawned** — so under `fail` a boot is refused *before any task can be claimed*, and a worker can never claim and terminally fail an orphaned-type run in the boot window. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
 
 ```toml
 [harvest.startup]
