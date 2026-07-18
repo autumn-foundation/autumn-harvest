@@ -2012,6 +2012,7 @@ mod tests {
                 outbox: HarvestOutboxConfig::default(),
                 batch: crate::config::HarvestBatchConfig::default(),
                 readiness: crate::config::HarvestReadinessConfig::default(),
+                startup: crate::config::HarvestStartupConfig::default(),
             },
             HarvestRunnerResources::new(pool),
         )
@@ -2119,6 +2120,7 @@ mod tests {
             outbox: HarvestOutboxConfig::default(),
             batch: crate::config::HarvestBatchConfig::default(),
             readiness: crate::config::HarvestReadinessConfig::default(),
+            startup: crate::config::HarvestStartupConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

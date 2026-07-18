@@ -46,6 +46,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
+use crate::config::OrphanStartupAction;
 use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 
 /// Query string accepted by `GET /admin/workflow-types/reachability`.
@@ -100,6 +101,16 @@ pub struct WorkflowReachabilityReport {
     pub observed_at: DateTime<Utc>,
     /// Echo of the `workflow_type` filter, if any.
     pub filter: Option<String>,
+    /// Top-level summary (issue #700 AC3): `true` when any type has an
+    /// `orphaned` verdict, so a CI/CD gate asserts "zero orphans" against a
+    /// single boolean instead of walking `items`. Note this reflects **only**
+    /// the inspected shards; when `status` is `partial`/`unavailable` an
+    /// unreachable shard could still host an orphaned type.
+    pub orphaned: bool,
+    /// Total count of stranded **executions** (not types) across every
+    /// `orphaned`-verdict type — the single number a "zero orphans" gate
+    /// compares against.
+    pub total_orphaned_executions: i64,
     /// One entry per workflow type that is either registered or has ≥1
     /// non-terminal execution on any inspected shard. Sorted by `workflow_type`.
     pub items: Vec<WorkflowTypeReachability>,
@@ -121,6 +132,13 @@ pub struct WorkflowTypeReachability {
     pub oldest_non_terminal_age_secs: Option<i64>,
     /// Safe-removal verdict for this type.
     pub verdict: ReachabilityVerdict,
+    /// A bounded (`REACHABILITY_SAMPLE_CAP`) set of representative non-terminal
+    /// execution ids so an operator can drill into stuck runs (issue #700 AC2).
+    /// Empty for `safe_to_remove` types. These are **representative and
+    /// bounded** — NOT a guaranteed global-oldest-across-shards set: each shard
+    /// pre-orders its own contribution oldest-first, and the cross-shard union
+    /// is capped in shard-iteration (ascending `shard_id`) order.
+    pub sample_execution_ids: Vec<uuid::Uuid>,
     /// Per-shard counts (only shards with ≥1 non-terminal execution of this
     /// type appear). Sorted by `shard_id`.
     pub shard_breakdown: Vec<ReachabilityShardCount>,
@@ -150,17 +168,24 @@ pub struct ReachabilityShardInspection {
 
 /// Per-workflow-type accumulator: aggregates counts across shards.
 ///
-/// Only `per_shard` is stored; the total count and oldest start time are
-/// derived on demand so there is no redundant state to drift.
+/// `per_shard` drives the total count and oldest start time (derived on demand
+/// so there is no redundant state to drift). `samples` is a flat, shard-ordered
+/// concatenation of each shard's already-bounded, oldest-first sample ids —
+/// capped to the plugin cap on read (see [`Self::samples`]).
 #[derive(Debug)]
 struct ReachabilityAccumulator {
     per_shard: BTreeMap<i32, (i64, DateTime<Utc>)>,
+    /// Sample execution ids, appended per contributing shard in ascending
+    /// `shard_id` order (observations are iterated in sorted-shard order), so a
+    /// truncation favours lower shard ids — representative, not global-oldest.
+    samples: Vec<uuid::Uuid>,
 }
 
 impl ReachabilityAccumulator {
     const fn empty() -> Self {
         Self {
             per_shard: BTreeMap::new(),
+            samples: Vec::new(),
         }
     }
 
@@ -172,6 +197,8 @@ impl ReachabilityAccumulator {
                 *oldest = (*oldest).min(row.oldest_started_at);
             })
             .or_insert((row.non_terminal_count, row.oldest_started_at));
+        self.samples
+            .extend(row.sample_execution_ids.iter().copied());
     }
 
     fn non_terminal_count(&self) -> i64 {
@@ -183,6 +210,13 @@ impl ReachabilityAccumulator {
             .values()
             .map(|(_, oldest)| *oldest)
             .reduce(std::cmp::min)
+    }
+
+    /// The cross-shard sample union, truncated to `cap`. A single shard produces
+    /// at most one row per type, so `samples` is already deduped across shards
+    /// by construction (distinct execution ids per shard).
+    fn samples(&self, cap: usize) -> Vec<uuid::Uuid> {
+        self.samples.iter().take(cap).copied().collect()
     }
 }
 
@@ -342,16 +376,32 @@ fn build_report_from_observations(
                     })
                     .collect()
             });
+            let sample_execution_ids = acc.map_or_else(Vec::new, |a| {
+                a.samples(autumn_harvest::execution::REACHABILITY_SAMPLE_CAP)
+            });
             WorkflowTypeReachability {
                 workflow_type,
                 registered: is_registered,
                 non_terminal_count,
                 oldest_non_terminal_age_secs,
                 verdict: compute_verdict(non_terminal_count, is_registered),
+                sample_execution_ids,
                 shard_breakdown,
             }
         })
         .collect::<Vec<_>>();
+
+    // AC3 top-level summary: `orphaned` gates a "zero orphans" CI check, and
+    // `total_orphaned_executions` sums the stranded *executions* (not types)
+    // across every orphaned-verdict type.
+    let orphaned = items
+        .iter()
+        .any(|item| item.verdict == ReachabilityVerdict::Orphaned);
+    let total_orphaned_executions = items
+        .iter()
+        .filter(|item| item.verdict == ReachabilityVerdict::Orphaned)
+        .map(|item| item.non_terminal_count)
+        .sum();
 
     let mut shards = observations
         .into_iter()
@@ -371,6 +421,8 @@ fn build_report_from_observations(
         status: FanoutStatus::from_counts(inspected_shards, unavailable_shards),
         observed_at,
         filter,
+        orphaned,
+        total_orphaned_executions,
         items,
         shards,
     }
@@ -383,6 +435,50 @@ const fn compute_verdict(non_terminal_count: i64, registered: bool) -> Reachabil
         ReachabilityVerdict::InUse
     } else {
         ReachabilityVerdict::Orphaned
+    }
+}
+
+/// The action to take at boot after evaluating workflow-type reachability
+/// (issue #700 AC4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupOrphanDecision {
+    /// Boot normally — no orphaned types, or the check is disabled.
+    Continue,
+    /// Log a warning naming the orphaned types, then boot.
+    Warn,
+    /// Refuse to start (the caller returns an error before committing startup).
+    Abort,
+}
+
+/// Pure, DB-free decision for the boot-time orphaned-workflow gate.
+///
+/// Rules:
+/// - `Off` → always `Continue` (the check is disabled).
+/// - No orphans (`orphaned == false`) → `Continue` for every action; a clean
+///   boot never warns.
+/// - `Warn` + orphaned → `Warn`.
+/// - `Fail` + orphaned + `status == Complete` → `Abort` (the one refuse case).
+/// - `Fail` + orphaned + `Partial`/`Unavailable` → `Warn`. **Crash-loop
+///   safety:** a boot loop has no human in the loop, so a transient unreachable
+///   shard must never hard-fail startup (asymmetric with the CLI gate, which
+///   fails *closed* on a partial report because a human reads its exit code).
+#[must_use]
+pub fn startup_orphan_decision(
+    action: OrphanStartupAction,
+    orphaned: bool,
+    status: ReachabilityReportStatus,
+) -> StartupOrphanDecision {
+    if action == OrphanStartupAction::Off || !orphaned {
+        return StartupOrphanDecision::Continue;
+    }
+    match action {
+        OrphanStartupAction::Fail if status == FanoutStatus::Complete => {
+            StartupOrphanDecision::Abort
+        }
+        // Warn, or Fail on an incomplete report (crash-loop safety).
+        OrphanStartupAction::Warn | OrphanStartupAction::Fail => StartupOrphanDecision::Warn,
+        // Unreachable: Off + orphaned handled by the early return above.
+        OrphanStartupAction::Off => StartupOrphanDecision::Continue,
     }
 }
 
