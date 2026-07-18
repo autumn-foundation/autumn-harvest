@@ -73,6 +73,7 @@ mod payload_offload_db_tests;
 mod payload_offload_replay_tests;
 mod poison_pill_tests;
 mod priority_tests;
+#[cfg(feature = "testing")]
 mod publish_progress_tests;
 mod query_deadlock;
 mod query_terminal_tests;
