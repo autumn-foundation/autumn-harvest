@@ -24,7 +24,7 @@ findings sink it:
    near-zero, plausibly negative on expansion. Last `watt` crates.io release: **0.5.0, 2023-09-13**
    (~2.8 years stale).
 
-No prototype was built — see [Recommendation](#9-recommendation).
+No prototype was built — see [Recommendation](#7-recommendation).
 
 ---
 
@@ -66,12 +66,12 @@ Deliberately inverting the question surfaced the real cost surface:
 - **Maintenance risk.** Depending on a dep whose last release is 2.8 years old, with the fixes we'd
   need living only in unreleased git.
 - **CI complexity.** A rebuild-and-compare check to keep the blob honest is fragile by design
-  (see §7).
+  (see §5).
 
 ### Six Thinking Hats
 
 - **White (facts):** 36 crates force `syn` anyway; ~2.3s / ~118s ≈ 2% ceiling; our crate starts at
-  16.5s, ~14s *after* `syn` finished at 2.4s; last watt release 2023-09-13. (Tables in §5–§7.)
+  16.5s, ~14s *after* `syn` finished at 2.4s; last watt release 2023-09-13. (Tables in §4 and §6.)
 - **Red (gut):** Committing an opaque binary blob into an auditable OSS library feels wrong, and the
   instinct is well-founded — reproducibility is admitted future-work.
 - **Black (risks):** the entire reverse-brainstorm list above — unverifiable blob, interpreter
@@ -79,7 +79,7 @@ Deliberately inverting the question surfaced the real cost surface:
 - **Yellow (best case):** ~2.3s of one-time downstream compile removed, plus the genuine benefit
   that downstream never compiles our macro crate's source at all.
 - **Green (alternatives):** CI build caching and `syn` feature trimming capture the goal far more
-  cheaply and safely (see §8).
+  cheaply and safely (see §6).
 - **Blue (process/decision):** DECLINE now; revisit only if first-class sandboxed/precompiled
   proc-macros land in rustc/Cargo with a central reproducibility verifier.
 
