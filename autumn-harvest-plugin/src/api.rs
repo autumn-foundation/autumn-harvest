@@ -10919,23 +10919,38 @@ async fn probe_committed_sws_replay(
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
+    // Fail CLOSED on an inconclusive shard error (three-state: hit / clean-miss /
+    // inconclusive). A transient conn-acquire or lookup failure on the shard that
+    // owns a committed key must NOT masquerade as a dedup miss — that would fall
+    // through to fresh-start validation and could wrongly reject THIS PR's core
+    // invariant (a committed replay is never rejected by tightened validation)
+    // under a transient error. Deliberately MORE conservative than #808's
+    // plain-start probe (which swallows): (a) the sibling `found_shard` scan in
+    // this handler already fails closed (503) on the same error class, and (b)
+    // fail-closed preserves the never-reject invariant even under a transient
+    // owning-shard error; a keyed client retries 503 idempotently. Keep scanning
+    // the remaining shards first — a later shard may hold the hit — and only 503
+    // when the whole fan-out found no hit at all.
+    let mut had_error = false;
     for (shard, shard_pool) in pool.iter_shards() {
-        // A transient probe-connection failure must not masquerade as a dedup
-        // miss (which would fall through to a fresh start); skip this shard and
-        // let a genuine all-shard miss fall through instead.
         let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
+            had_error = true;
             continue;
         };
-        let Some(existing) = autumn_harvest::execution::lookup_idempotent_signal_dedupe(
+        let existing = match autumn_harvest::execution::lookup_idempotent_signal_dedupe(
             &mut probe_conn,
             workflow_name,
             workflow_id,
             key,
         )
         .await
-        .ok()
-        .flatten() else {
-            continue;
+        {
+            Ok(Some(existing)) => existing,
+            Ok(None) => continue,
+            Err(_) => {
+                had_error = true;
+                continue;
+            }
         };
         let outcome = SignalWithStartOutcome {
             exec_id: ExecutionId::from_uuid(existing.id),
@@ -10968,6 +10983,18 @@ async fn probe_committed_sws_replay(
                 .into_response(),
         );
     }
+    // No hit. If any shard was inconclusive (conn/lookup error), fail closed with
+    // a 503 rather than let a committed replay fall through to (possibly tightened)
+    // fresh-start validation. A clean all-shard miss returns `None` so the caller
+    // runs the authoritative in-lock path.
+    if had_error {
+        return Some(
+            AutumnError::service_unavailable_msg(
+                "signal-with-start committed-replay probe: shard lookup failed; retry",
+            )
+            .into_response(),
+        );
+    }
     None
 }
 
@@ -10987,29 +11014,51 @@ async fn probe_committed_sws_replay(
 /// "completed"` and writes the SUCCEEDED audit — giving a committed replay the
 /// SAME behavior as a fresh admission. `update_admitted: false` marks the cache
 /// hit.
+///
+/// Three-state result: `Ok(Some(outcome))` = committed-replay HIT (flows through
+/// the handler's `Ok` arm); `Ok(None)` = a genuine clean all-shard MISS (falls
+/// through to the authoritative in-lock path); `Err(resp)` = an INCONCLUSIVE
+/// shard error (fail closed with a 503). Failing closed on a transient conn/lookup
+/// error is deliberately MORE conservative than #808's plain-start probe (which
+/// swallows): (a) the sibling `found_shard` scan in this handler already fails
+/// closed (503) on the same error class, and (b) fail-closed preserves THIS PR's
+/// core invariant — a committed replay is never rejected by tightened validation —
+/// even under a transient owning-shard error; a keyed client retries 503
+/// idempotently.
 async fn probe_committed_uws_replay(
     api_state: &HarvestApiState,
     workflow_name: &str,
     workflow_id: &str,
     update_id: UpdateId,
-) -> Option<UpdateWithStartOutcome> {
-    let pool = api_state.storage_pool().ok()?;
+) -> Result<Option<UpdateWithStartOutcome>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let Ok(pool) = api_state.storage_pool() else {
+        // No storage pool at all → clean miss; the handler's own `storage_pool()`
+        // call fails closed for genuinely-fresh work.
+        return Ok(None);
+    };
+    let mut had_error = false;
     for (_shard, shard_pool) in pool.iter_shards() {
         let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
+            had_error = true;
             continue;
         };
-        let Some(row) = autumn_harvest::execution::lookup_idempotent_update_dedupe(
+        let row = match autumn_harvest::execution::lookup_idempotent_update_dedupe(
             &mut probe_conn,
             workflow_name,
             workflow_id,
             &update_id,
         )
         .await
-        .ok()
-        .flatten() else {
-            continue;
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(_) => {
+                had_error = true;
+                continue;
+            }
         };
-        return Some(UpdateWithStartOutcome {
+        return Ok(Some(UpdateWithStartOutcome {
             exec_id: row.exec_id,
             workflow_name: row.workflow_name,
             workflow_id: row.workflow_id,
@@ -11017,9 +11066,19 @@ async fn probe_committed_uws_replay(
             started_fresh: false,
             update_id,
             update_admitted: false,
-        });
+        }));
     }
-    None
+    // No hit. If any shard was inconclusive (conn/lookup error), fail closed with a
+    // 503 rather than let a committed replay fall through to (possibly tightened)
+    // fresh-start validation. A clean all-shard miss returns `Ok(None)` so the
+    // caller runs the authoritative in-lock path.
+    if had_error {
+        return Err(AutumnError::service_unavailable_msg(
+            "update-with-start committed-replay probe: shard lookup failed; retry",
+        )
+        .into_response());
+    }
+    Ok(None)
 }
 
 /// Handle a `start_workflow` request whose JSON body failed to deserialize
@@ -15681,7 +15740,14 @@ async fn update_with_start_workflow(
     // SAME behavior as a fresh admission. Mirrors #808 (plain start) and #1092
     // (plain signal route).
     let probe_outcome = if request.idempotency_key.is_some() {
-        probe_committed_uws_replay(&api_state, &workflow_name, &workflow_id, update_id).await
+        // `Err(resp)` = an inconclusive shard error → fail closed (503) rather than
+        // risk a spurious fresh-start rejection of a committed replay; `Ok(outcome)`
+        // = hit (Some) or clean miss (None).
+        match probe_committed_uws_replay(&api_state, &workflow_name, &workflow_id, update_id).await
+        {
+            Ok(outcome) => outcome,
+            Err(resp) => return resp,
+        }
     } else {
         None
     };
