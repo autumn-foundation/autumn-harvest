@@ -43,6 +43,7 @@ allos        autumn-harvest         integration                      testing,met
 allos        autumn-harvest         property                         db                         -
 allos        autumn-harvest-plugin  contract_regression              -                          -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
+allos        autumn-harvest-plugin  gate_no_global_install           -                          -
 allos        autumn-harvest-plugin  security                         -                          -
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
@@ -66,6 +67,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
+linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    nd_block
 linux        autumn-harvest         integration                      testing                    worker_session_tests
@@ -99,4 +101,5 @@ linux        autumn-harvest-plugin  timeline_integration             -          
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -

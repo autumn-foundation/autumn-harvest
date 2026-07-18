@@ -5212,6 +5212,17 @@ pub async fn schedule_run_state_summary(
 /// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/`TERMINATED`)
 /// — i.e. a `RUNNING`, `SUSPENDED`, or `PAUSED` run whose next replay still
 /// requires the `#[workflow]` handler named by `workflow_name`.
+/// Maximum number of representative non-terminal execution ids returned per
+/// workflow type by [`non_terminal_counts_by_workflow_name`] (issue #700 AC2).
+///
+/// A bounded sample lets an operator drill straight into stuck runs of an
+/// orphaned type without paginating `GET /workflows`. The per-shard SQL caps
+/// each shard's contribution with a hardcoded `ARRAY_AGG(...)[1:5]` slice
+/// (Diesel `sql_query` cannot interpolate this const — the literal `5` is kept
+/// in sync with `REACHABILITY_SAMPLE_CAP` by a guard unit test); the plugin
+/// caps the cross-shard union to the same value.
+pub const REACHABILITY_SAMPLE_CAP: usize = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowTypeNonTerminalCount {
     /// Workflow type name — the handler its non-terminal executions replay against.
@@ -5220,6 +5231,12 @@ pub struct WorkflowTypeNonTerminalCount {
     pub non_terminal_count: i64,
     /// Start time of the oldest non-terminal execution of this type on the shard.
     pub oldest_started_at: chrono::DateTime<Utc>,
+    /// A bounded (`REACHABILITY_SAMPLE_CAP`) set of representative non-terminal
+    /// execution ids of this type on the shard, ordered oldest-first
+    /// (`started_at ASC, id ASC`). Empty is impossible here — a row only exists
+    /// when `non_terminal_count >= 1` — but the aggregating plugin returns an
+    /// empty vec for `safe_to_remove` types with no rows at all.
+    pub sample_execution_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, diesel::QueryableByName)]
@@ -5230,6 +5247,8 @@ struct WorkflowTypeNonTerminalSqlRow {
     non_terminal_count: i64,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     oldest_started_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+    sample_execution_ids: Vec<Uuid>,
 }
 
 /// SQL for [`non_terminal_counts_by_workflow_name`].
@@ -5242,11 +5261,22 @@ struct WorkflowTypeNonTerminalSqlRow {
 /// sharing the same Postgres database are never double-counted). Both params
 /// are nullable — `NULL` means "no filter". Side-effect-free: no claims, no
 /// writes, no events appended.
+///
+/// `sample_execution_ids` (issue #700 AC2) is a bounded, oldest-first sample of
+/// the group's non-terminal execution ids. `ARRAY_AGG(id ORDER BY started_at
+/// ASC, id ASC)` materialises the full ordered id array for the group before
+/// the `[1:5]` (`REACHABILITY_SAMPLE_CAP`) slice keeps only the first few —
+/// transient memory proportional to group size, acceptable at the target scale
+/// (well under the < 2 s / 100k-execution budget). If a very large group's
+/// full-array materialisation ever becomes a concern, the drop-in fallback is a
+/// `LATERAL (SELECT ... ORDER BY started_at LIMIT n)` per group.
 const NON_TERMINAL_COUNTS_SQL: &str = r"
 SELECT
     workflow_name::TEXT AS workflow_name,
     COUNT(*)::BIGINT AS non_terminal_count,
-    MIN(started_at) AS oldest_started_at
+    MIN(started_at) AS oldest_started_at,
+    -- [1:5] MUST stay in sync with REACHABILITY_SAMPLE_CAP (guarded by a unit test)
+    (ARRAY_AGG(id ORDER BY started_at ASC, id ASC))[1:5] AS sample_execution_ids
 FROM harvest_workflow_executions
 WHERE state NOT IN (
         'COMPLETED',
@@ -5303,6 +5333,7 @@ pub async fn non_terminal_counts_by_workflow_name(
             workflow_name: row.workflow_name,
             non_terminal_count: row.non_terminal_count,
             oldest_started_at: row.oldest_started_at,
+            sample_execution_ids: row.sample_execution_ids,
         })
         .collect())
 }
@@ -5646,8 +5677,22 @@ pub async fn check_and_report_unfinished_handlers(
 
 #[cfg(test)]
 mod non_terminal_sql_tests {
-    use super::NON_TERMINAL_COUNTS_SQL;
+    use super::{NON_TERMINAL_COUNTS_SQL, REACHABILITY_SAMPLE_CAP};
     use crate::erase::is_terminal_state;
+
+    /// Diesel `sql_query` cannot interpolate a Rust const into the SQL string,
+    /// so the per-shard sample slice is a hardcoded `[1:5]` literal. This guard
+    /// binds that literal to `REACHABILITY_SAMPLE_CAP`: if either the SQL slice
+    /// or the const changes without the other, this test fails.
+    #[test]
+    fn sql_sample_slice_matches_reachability_sample_cap() {
+        assert!(
+            NON_TERMINAL_COUNTS_SQL.contains(&format!("[1:{REACHABILITY_SAMPLE_CAP}]")),
+            "SQL sample-slice cap drifted from REACHABILITY_SAMPLE_CAP \
+             ({REACHABILITY_SAMPLE_CAP}); the hardcoded [1:N] literal in \
+             NON_TERMINAL_COUNTS_SQL must equal it"
+        );
+    }
 
     /// The `NOT IN (...)` state list in `NON_TERMINAL_COUNTS_SQL` must be the
     /// exact complement of `erase::is_terminal_state`. If a new terminal state is

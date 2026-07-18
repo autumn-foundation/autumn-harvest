@@ -876,6 +876,18 @@ impl BuiltHarvest {
         &self.dags
     }
 
+    /// Registered workflow metadata.
+    ///
+    /// Used by the boot-time orphaned-workflow-type reachability gate
+    /// (issue #700 AC4) to resolve the registered-name set from the owned
+    /// `BuiltHarvest` **before** `HarvestRunner::start` spawns the worker poll
+    /// loop — so the gate can refuse boot before any worker can claim and
+    /// terminally fail an orphaned-type execution.
+    #[must_use]
+    pub fn workflow_infos(&self) -> &[WorkflowInfo] {
+        &self.workflows
+    }
+
     /// Declarative query handlers collected via `.queries(queries![…])`.
     #[must_use]
     pub fn query_handlers(&self) -> &[QueryHandlerInfo] {

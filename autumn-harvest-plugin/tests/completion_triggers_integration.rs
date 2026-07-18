@@ -2440,6 +2440,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(bad_pool),
     )

@@ -6465,7 +6465,19 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/admin/workflow-types/reachability",
-            Some(&["status", "observed_at", "filter", "items", "shards"]),
+            // `sample_execution_ids` (issue #700 AC2) is nested inside items[]
+            // and is documented in the contract description, not listed here —
+            // this list is top-level fields only (precedent: next_retry_at/input
+            // on /stack).
+            Some(&[
+                "status",
+                "observed_at",
+                "filter",
+                "orphaned",
+                "total_orphaned_executions",
+                "items",
+                "shards",
+            ]),
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),

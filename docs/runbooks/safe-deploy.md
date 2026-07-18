@@ -534,6 +534,62 @@ Response fields:
 
 ---
 
+# Runbook: Pre-cutover handler-coverage gate
+
+Before cutting a **default (non-build-routed)** deployment over to code that has **deleted or renamed a `#[workflow]` handler**, confirm no in-flight run still needs that handler. A non-terminal execution's `workflow_name` names the handler its next replay requires — removing it strands those runs in permanent `HandlerNotFound` replay failure, surfacing only later as a timeout/DLQ entry.
+
+**Where this sits in the deploy ladder:** worker drain (#386) → **this pre-cutover handler-coverage gate** → [Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) → non-determinism block (#480) → history reset/redrive (#614) → reset-from-history (#538 / #510). Run this gate **before** the replay canary: the canary replays runs of handlers that still exist; this gate catches runs whose handler is about to disappear entirely.
+
+## CI/CD gate — one field asserts "zero orphans"
+
+```bash
+# Fails the pipeline (exit 2) on any orphaned type OR a partial/unavailable
+# report OR a transport/auth error (fail-closed: uncertain = unsafe).
+harvest workflow-types reachability
+```
+
+Or drive the API directly and gate on a single field:
+
+```bash
+# orphaned == false AND status == "complete" ⇒ safe to cut over.
+curl -s .../api/harvest/admin/workflow-types/reachability | jq '{orphaned, total_orphaned_executions, status}'
+```
+
+`orphaned` (bool) and `total_orphaned_executions` (count of stranded **executions**, not types) are the single-field CI gate. Each `items[]` entry additionally carries `sample_execution_ids` — a bounded set (cap 5) of representative non-terminal execution ids so you can drill straight into a stuck run:
+
+```bash
+curl -s '.../api/harvest/admin/workflow-types/reachability?workflow_type=legacy_export' \
+  | jq '.items[0] | {verdict, non_terminal_count, sample_execution_ids}'
+```
+
+If a type is still `in_use` (registered) that is normal; only an `orphaned` verdict (live runs, **no** registered handler) blocks the cutover — drain or wait for those runs, or keep the handler until they finish.
+
+## Boot-time gate (on by default)
+
+The plugin runs this same check at startup, so a mis-sequenced deploy is caught before it serves traffic. **The gate runs before the worker poll loop and schedulers are spawned** — so under `fail` a boot is refused *before any task can be claimed*, and a worker can never claim and terminally fail an orphaned-type run in the boot window. **It runs by default** — the default `warn` action still executes the reachability check on every boot; only `off` skips it entirely:
+
+```toml
+[harvest.startup]
+# off  — skip the check entirely (the only zero-cost setting).
+# warn — (default) run the check, log the orphaned types, and continue.
+#        Non-breaking: a mixed fleet mid-rollout must not crash-loop just
+#        because an old handler was removed on one node.
+# fail — run the check and refuse startup when orphaned types are present.
+orphaned_workflows = "warn"
+```
+
+(Env override: `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail`.)
+
+**Boot cost:** the check is a single bounded cross-shard `GROUP BY … COUNT(*) … ARRAY_AGG` aggregate (never a per-execution row load), and the per-group sample slice is bounded (drop-in `LATERAL (SELECT … ORDER BY started_at LIMIT n)` fallback keeps memory bounded even on a huge group). It runs by default under `warn`; a deployment concerned about boot latency on a very large non-terminal backlog can set `orphaned_workflows = "off"` to make boot zero-cost.
+
+**Crash-loop safety:** `fail` aborts boot **only** when orphaned types are present **and** the cross-shard report is *complete*. An `incomplete` report — `partial`/`unavailable`, e.g. a transient shard/DB outage — means orphan detection did **not** fully run, so it **always warns** (even when no orphans were detected on the reachable shards) rather than silently continuing, but it never aborts: a boot loop has no human in the loop to read an exit code. A *complete* report with no orphans is the only case that boots silently. This is deliberately **asymmetric** with the CLI gate above, which fails *closed* on a partial report (a human is reading its exit code, so "uncertain = unsafe" is the safe default there).
+
+**Enable `fail` only after confirming zero orphans** with the CLI gate above. A persistent orphan (a removed handler with still-live runs) will refuse boot **fleet-wide** — every node running `fail` aborts on every restart until those orphaned runs drain. That is the intended gate behavior, but the blast radius means you should **drain first**: keep the old handler registered (or let the runs finish) until the CLI gate reports `orphaned == false`, then flip `fail` on.
+
+This is the **type-level** reachability question. It is distinct from **build-id** reachability ("can I retire this worker *build*", `GET /admin/build-routing`) and from the **`ctx.version()`** gate-retirement check ("can I remove this version branch *inside* a handler"). See [safe-handler-removal.md](safe-handler-removal.md) for the three-way distinction.
+
+---
+
 # Runbook: Pre-Deploy Replay Canary
 
 Use the deploy-time replay canary to verify that a candidate build is compatible with currently running executions before advancing the build policy or declaring compatibility.

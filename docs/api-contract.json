@@ -3963,7 +3963,7 @@
       "path": "/admin/workflow-types/reachability",
       "category": "admin",
       "read_only": true,
-      "description": "Report per-workflow-type handler reachability so an operator can gate safe handler removal (issue #520). Counts non-terminal executions per workflow type across all shards and joins against the in-memory handler registry to assign each type a verdict of safe_to_remove, in_use, or orphaned.",
+      "description": "Report per-workflow-type handler reachability so an operator can gate safe handler removal (issue #520). Counts non-terminal executions per workflow type across all shards and joins against the in-memory handler registry to assign each type a verdict of safe_to_remove, in_use, or orphaned. Each item carries a bounded sample_execution_ids array (issue #700, cap 5) of representative non-terminal execution ids so an operator can drill into stuck runs. Two top-level fields orphaned (bool) and total_orphaned_executions (count of stranded executions across orphaned-verdict types) let a CI/CD gate assert 'zero orphans' against a single field.",
       "params": [
         {
           "name": "workflow_type",
@@ -3979,6 +3979,8 @@
           "status",
           "observed_at",
           "filter",
+          "orphaned",
+          "total_orphaned_executions",
           "items",
           "shards"
         ]
