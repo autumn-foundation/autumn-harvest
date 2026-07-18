@@ -392,6 +392,15 @@ pub struct WorkflowReplayer {
     /// real id and ignore this global. `None` (the default) mints a fresh id, so
     /// existing raw-events fixtures are unaffected.
     execution_id: Option<ExecutionId>,
+    /// History policy threaded into the replayed `WorkflowContext` (issue #614).
+    /// Defaults to [`WorkflowHistoryPolicy::default`]; the replay-diagnosis
+    /// endpoint sets it to the runtime registry's own policy
+    /// (`registry.history_policy()`) so a workflow that branches command-affecting
+    /// control flow on [`WorkflowContext::should_continue_as_new`] — which reads
+    /// the policy's `continue_as_new_threshold` /
+    /// `continue_as_new_deadline_fraction` — replays byte-faithfully to the live
+    /// worker instead of surfacing false non-determinism.
+    history_policy: crate::context::WorkflowHistoryPolicy,
 }
 
 impl Default for WorkflowReplayer {
@@ -437,7 +446,29 @@ impl WorkflowReplayer {
             parent_execution_id: None,
             workflow_id: None,
             execution_id: None,
+            history_policy: crate::context::WorkflowHistoryPolicy::default(),
         }
+    }
+
+    /// Set the history policy threaded into the replayed `WorkflowContext`
+    /// (issue #614).
+    ///
+    /// Defaults to [`WorkflowHistoryPolicy::default`]. The replay-diagnosis
+    /// endpoint threads the runtime registry's own policy
+    /// (`registry.history_policy()`) so a workflow that branches command-affecting
+    /// control flow on [`WorkflowContext::should_continue_as_new`] — which reads
+    /// the policy's `continue_as_new_threshold` /
+    /// `continue_as_new_deadline_fraction` — replays byte-faithfully to the live
+    /// worker rather than under the default policy, which would surface a false
+    /// `diverged` / `workflow_failed` verdict for deployments that configure a
+    /// non-default policy.
+    #[must_use]
+    pub const fn with_history_policy(
+        mut self,
+        history_policy: crate::context::WorkflowHistoryPolicy,
+    ) -> Self {
+        self.history_policy = history_policy;
+        self
     }
 
     /// Set the effective `execution_timeout` budget threaded into the replayed
@@ -866,6 +897,10 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_name,
             workflow_id,
+            // Issue #614: thread the replayer's history policy so a canary replay
+            // of a `should_continue_as_new`-branching workflow stays faithful to
+            // the live worker (which uses `registry.history_policy()`).
+            self.history_policy,
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -2534,6 +2569,9 @@ async fn replay_fixture_file(
         // `replay_from_snapshot`, which always sources `execution_id` from the
         // snapshot (a required field); no raw-events global override applies.
         execution_id: None,
+        // Issue #614: the directory-fixture path carries no history-policy field,
+        // so it replays under the default policy (unchanged pre-#614 behavior).
+        history_policy: crate::context::WorkflowHistoryPolicy::default(),
     };
 
     let replay_result =

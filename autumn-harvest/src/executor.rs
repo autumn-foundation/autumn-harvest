@@ -1054,6 +1054,12 @@ pub(crate) async fn run_workflow_canary(
     // non-determinism in the deploy replay canary.
     workflow_name: String,
     workflow_id: Option<String>,
+    // Issue #614: the runtime registry's history policy
+    // (`registry.history_policy()`, threaded by the worker), so a canary/diagnosis
+    // replay of a workflow that branches on `ctx.should_continue_as_new()` stays
+    // byte-faithful to the live worker rather than silently using the default
+    // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
+    history_policy: WorkflowHistoryPolicy,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
@@ -1062,6 +1068,7 @@ pub(crate) async fn run_workflow_canary(
         .with_parent_execution_id(parent_execution_id)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
+        .with_history_policy(history_policy)
         .with_metrics(metrics);
 
     let span = tracing::info_span!(

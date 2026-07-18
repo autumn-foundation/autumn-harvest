@@ -26087,8 +26087,19 @@ async fn replay_diagnosis(
     // replay would find nothing under diagnosis and spuriously report
     // `workflow_failed`/`diverged` for state-registering deployments — even though
     // the same execution replays cleanly on the worker (Codex review, PR #1107).
+    // Thread the runtime registry's history policy so the diagnosis replay uses
+    // the SAME `continue_as_new_threshold` / `continue_as_new_deadline_fraction`
+    // the live worker's replay uses (`registry.history_policy()`, worker.rs).
+    // Without this the canary replay defaults to `WorkflowHistoryPolicy::default()`,
+    // so a workflow that branches command-affecting control flow on
+    // `ctx.should_continue_as_new()` would emit a different command set under
+    // diagnosis than it did live and spuriously report `diverged` /
+    // `workflow_failed` for deployments that configure a non-default policy —
+    // even though the same execution replays cleanly on the worker (Codex review,
+    // PR #1107).
     let replayer = autumn_harvest::testing::WorkflowReplayer::new()
         .with_shared_state(runtime.registry().shared_state())
+        .with_history_policy(runtime.registry().history_policy())
         .register_fn(execution.workflow_name.clone(), handler);
     let report = match tokio::time::timeout(
         api_state.query_timeout(),

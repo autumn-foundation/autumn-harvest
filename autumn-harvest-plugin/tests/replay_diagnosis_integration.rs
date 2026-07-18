@@ -178,6 +178,56 @@ fn state_reading_info() -> WorkflowInfo {
     }
 }
 
+/// Branches its command set on `ctx.should_continue_as_new()` (issue #614/#1107
+/// regression): schedules `checkpoint` when the history-size trigger has fired,
+/// else `keep_going`. Because `should_continue_as_new()` reads the history
+/// policy's `continue_as_new_threshold`, this workflow's replay is faithful only
+/// when the SAME policy the live worker uses (`registry.history_policy()`) is
+/// threaded into the diagnosis replay. Under the default policy (large
+/// threshold) the trigger never fires for a small history, so the diagnosis
+/// would schedule `keep_going` and diverge from a history recorded under a
+/// low-threshold deployment that scheduled `checkpoint`.
+fn policy_branch_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = if ctx.should_continue_as_new() {
+            "checkpoint"
+        } else {
+            "keep_going"
+        };
+        ctx.execute_activity_raw(activity, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+fn policy_branch_info() -> WorkflowInfo {
+    WorkflowInfo {
+        mcp: false,
+        name: "policy_branch_wf",
+        module: "tests",
+        handler: policy_branch_workflow,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
 // ── Harness ──────────────────────────────────────────────────────────────────
 
 type HarvestApiApp = axum::Router;
@@ -228,6 +278,35 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         ShardRouter::default(),
     )
     .with_registered_dag_names(["classic_dag".to_string()]);
+    api_state.install(runtime);
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Like [`build_app`] but registers `policy_branch_wf` on a registry carrying a
+/// NON-default history policy (`continue_as_new_threshold = 2`) — mirroring a
+/// deployment that tunes `HarvestBuilder::history_policy(...)`. Used by the
+/// issue #614 regression test to prove the diagnosis replay threads
+/// `registry.history_policy()` into the replayer exactly as the live worker does,
+/// so a `should_continue_as_new`-branching workflow replays under the same policy.
+fn build_app_with_history_policy(pool: &DbPool) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+
+    let policy =
+        autumn_harvest::context::WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+    let runtime = HarvestApiRuntime::new(
+        Arc::new(
+            HandlerRegistry::new(vec![policy_branch_info()], vec![]).with_history_policy(policy),
+        ),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("replay-diagnosis-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    );
     api_state.install(runtime);
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
@@ -865,6 +944,63 @@ async fn state_registering_workflow_diagnoses_clean_with_registry_shared_state()
         },
     ];
     let exec = seed_execution(&pool, "state_reading_wf", "COMPLETED", input, events, false).await;
+
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["diagnosis"], json!("clean"), "body={body}");
+    assert!(body.get("divergence").is_none(), "clean has no divergence");
+    assert!(body.get("failure").is_none(), "clean has no failure");
+}
+
+/// Issue #614 regression: the diagnosis replay must thread the runtime registry's
+/// history policy (`registry.history_policy()`) into the replayer, exactly as the
+/// live worker does. `policy_branch_wf` schedules `checkpoint` when
+/// `ctx.should_continue_as_new()` fires and `keep_going` otherwise; the trigger
+/// reads the policy's `continue_as_new_threshold`. This deployment tunes the
+/// threshold to 2, and the seeded 4-event history (> 2) was recorded by the
+/// `checkpoint` branch. A faithful diagnosis replay under the SAME policy trips
+/// the trigger and schedules `checkpoint`, matching history → `clean`.
+///
+/// WITHOUT the fix the replayer defaults to `WorkflowHistoryPolicy::default()`
+/// (a large threshold the 4-event history never exceeds), so
+/// `should_continue_as_new()` returns `false` → the workflow schedules
+/// `keep_going` → the replay diverges from the recorded `checkpoint` at event
+/// index 1 → a spurious `diverged` verdict, and this assertion fails. It
+/// therefore fails against the pre-fix code and passes against the fix.
+#[tokio::test]
+async fn policy_branching_workflow_diagnoses_clean_with_registry_history_policy() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with_history_policy(&pool);
+
+    // 4 recorded events (> the configured threshold of 2), recorded by the
+    // `checkpoint` branch: WorkflowStarted, ActivityScheduled(checkpoint),
+    // ActivityCompleted, WorkflowCompleted.
+    let input = json!({});
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "checkpoint".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    let exec = seed_execution(&pool, "policy_branch_wf", "COMPLETED", input, events, false).await;
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
