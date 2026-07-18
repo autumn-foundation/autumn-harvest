@@ -43,6 +43,7 @@ allos        autumn-harvest         integration                      testing,met
 allos        autumn-harvest         property                         db                         -
 allos        autumn-harvest-plugin  contract_regression              -                          -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
+allos        autumn-harvest-plugin  gate_no_global_install           -                          -
 allos        autumn-harvest-plugin  security                         -                          -
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
