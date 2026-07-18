@@ -4247,6 +4247,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         .route("/workflows/{id}/run-chain", get(get_run_chain))
+        // Single-execution replay diagnosis (issue #614): admin-gated, read-only.
+        // POST (not GET) because it drives a replay of the workflow handler, but
+        // classified ReadOnly (RouteClass::ReadOnly / read_only:true +
+        // post_for_body_only) since it appends no events and performs no writes.
+        .route(
+            "/workflows/{id}/replay-diagnosis",
+            post(replay_diagnosis).route_layer(require_admin.clone()),
+        )
         // Ephemeral workflow progress SSE stream (issue #791). Deliberately NOT
         // admin-gated — an app's end-users stream their own workflows (AC5). It
         // inherits the general management API auth middleware (api_with_auth)
@@ -5223,6 +5231,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
         ("GET", "/workflows/{id}/run-chain"),
+        // Single-execution replay diagnosis (issue #614): admin-gated, read-only
+        // POST (post_for_body_only). See docs/api-contract.json.
+        ("POST", "/workflows/{id}/replay-diagnosis"),
         // Ephemeral workflow progress SSE stream (issue #791). Read-only,
         // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
         ("GET", "/workflows/{id}/stream"),
@@ -5504,6 +5515,9 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
+        // Issue #614: bodyless POST (the execution id is the path param). Listed
+        // with an empty field set, matching the resume/retry-now precedent.
+        ("POST", "/workflows/{id}/replay-diagnosis", Some(&[])),
         ("POST", "/workflows/{id}/erase-payloads", Some(&["reason"])),
         (
             "POST",
@@ -5916,6 +5930,24 @@ pub const fn management_api_response_fields()
             "GET",
             "/workflows/{id}/run-chain",
             Some(&["head_unknown", "workflow_id", "runs"]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/replay-diagnosis",
+            // Issue #614. `divergence`, `failure`, and `summary` are omitted when
+            // absent (skip_serializing_if) but are declared here so the registry
+            // ↔ contract cross-check covers them.
+            Some(&[
+                "execution_id",
+                "workflow_name",
+                "state",
+                "diagnosis",
+                "events_replayed",
+                "divergence",
+                "failure",
+                "summary",
+                "message",
+            ]),
         ),
         // Ephemeral workflow progress SSE stream (issue #791): text/event-stream,
         // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
@@ -25896,6 +25928,248 @@ async fn run_replay_canary_handler(
             Err(map_error(e))
         }
     }
+}
+
+/// `POST /workflows/{id}/replay-diagnosis` (issue #614) — read-only, single-
+/// execution replay diagnosis.
+///
+/// Loads ONE execution's recorded history from its owning shard and replays it
+/// against the currently-registered `#[workflow]` handler via
+/// [`WorkflowReplayer`](autumn_harvest::testing::WorkflowReplayer), returning a
+/// structured verdict (clean / diverged / `workflow_failed` / `not_registered` /
+/// `not_replayable_dag`). This is the operator's on-demand answer to "will — or
+/// did — this specific run diverge under the code I have deployed right now?" —
+/// the same question the #480/#603 non-determinism-block incident signal raises
+/// fleet-wide, but scoped to one execution: a PAUSED or nd-blocked RUNNING run
+/// (the headline diagnosability use case), or a terminal FAILED run for
+/// retroactive forensics (AC4). The `divergence` object mirrors the #603 block
+/// diagnostic vocabulary (`kind` / `event_index` / `expected` / `actual`) so an
+/// operator can compare it directly against a blocked run's `search_attrs`.
+///
+/// Status contract:
+///   * `200` — a structured verdict for EVERY reachable diagnosis, including the
+///     two "not replayable on this node" verdicts (AC5). The diagnosis, not the
+///     HTTP status, carries the answer.
+///   * `400` — malformed execution id.
+///   * `404` — unknown execution.
+///   * `408` — replay exceeded the bounded budget (`WorkerConfig::query_timeout`).
+///     The `query_timeout` bound applies to async-yielding replays; a workflow
+///     function that busy-loops synchronously without ever `.await`-ing is out of
+///     scope, exactly as for the live executor. A large but healthy history is
+///     not at risk: `SUSPENSION_TIMEOUT` (the executor's per-cycle 100 ms
+///     suspension heuristic) only fires when the handler future is genuinely
+///     *pending* on an unresolved oneshot at the replay frontier — it never cuts
+///     off a CPU-bound replay consuming recorded events, so a completed history
+///     replays to its verdict regardless of wall-clock duration, bounded only by
+///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
+///     replay budget, issue #135).
+///   * `410` — history unavailable: a terminal execution whose recorded history
+///     is incomplete (truncated before its terminal seal — pruned by retention
+///     or released on reset), or a terminal execution whose payloads were
+///     PII-erased (issue #495). Both would yield a misleading verdict, so they
+///     are refused, mirroring the #612 terminal-query path.
+///
+/// Read-only (AC3): the DB connection is dropped before user code is driven, and
+/// the replay itself is pure in-memory replay that appends no events and performs
+/// no writes. No audit row is written.
+#[allow(clippy::too_many_lines)]
+async fn replay_diagnosis(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::replay_diagnosis::ReplayDiagnosisResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(e) => e,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    let workflow_name = execution.workflow_name.clone();
+    let state = execution.state.clone();
+
+    // 410 — a PII-erased terminal execution (issue #495) replays structurally but
+    // over `{"_harvest_erased": true}` payload tombstones, so any verdict would be
+    // computed against scrubbed inputs and be misleading. Erasure is terminal-only
+    // and always tombstones the row's own `input` column, so this O(1) check is
+    // authoritative. Mirrors hydrate_ctx_for_query (#612).
+    if is_terminal_state(&execution.state) && erase::execution_input_is_erased(&execution.input) {
+        return Err(map_error(HarvestError::HistoryUnavailable {
+            exec_id,
+            reason: "payloads erased".to_string(),
+        }));
+    }
+
+    // AC5 registration pre-check, BEFORE loading history / replaying. A workflow
+    // type not registered on this node has no handler to replay against; a classic
+    // (non-unified) DAG is not on the replay path. Both are 200 verdicts ("this
+    // node cannot answer"), never errors.
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&execution.workflow_name)
+    {
+        if runtime.is_registered_dag(&execution.workflow_name) {
+            return Ok(Json(crate::replay_diagnosis::not_replayable_dag_response(
+                exec_id,
+                workflow_name,
+                state,
+            )));
+        }
+        return Ok(Json(crate::replay_diagnosis::not_registered_response(
+            exec_id,
+            workflow_name,
+            state,
+        )));
+    }
+
+    // The registered handler to replay against.
+    let handler = runtime
+        .registry
+        .workflows
+        .get(&execution.workflow_name)
+        .expect("workflow presence just checked above")
+        .handler;
+
+    // Load the recorded history exactly as the live worker loads it for replay:
+    // decode with the runtime's own codecs (#608) and inflate offloaded payloads
+    // via the registry's offloader (#524), so an encrypted or offloaded history
+    // replays faithfully rather than hard-500ing on ciphertext / false-diverging
+    // on an offload reference envelope. When neither is configured (the default),
+    // `load_history_inflated` with a `None` offloader + identity codecs is
+    // behaviorally identical to `load_history`. Then DROP the DB connection before
+    // driving user code — WorkflowReplayer needs no DB, and holding a pool slot
+    // for the whole replay would starve other management/worker DB operations (the
+    // #612 pool-slot discipline).
+    //
+    // Design choice: build a HistorySnapshot from the already-loaded execution row
+    // + this history and replay via `replay_canary_snapshot` (drop-first), rather
+    // than `WorkflowReplayer::replay_from_db`, which reloads history + meta and
+    // holds its connection across the whole replay. Both are correct; drop-first
+    // keeps the pool slot free for the ~bounded replay duration.
+    let history = store::load_history_inflated(
+        &mut conn,
+        exec_id,
+        &api_state.payload_codecs(),
+        runtime.registry.payload_offloader(),
+    )
+    .await
+    .map_err(map_error)?;
+    drop(conn);
+
+    // Whether the recorded history reached its terminal seal — needed by the
+    // sealed-mid-await reclassification below, computed before `history.events`
+    // is moved into the snapshot (issue #614 FIX 3).
+    let history_reached_seal = history_reached_terminal_seal(&history.events);
+    let terminal_state = is_terminal_state(&state);
+
+    // 410 — a TERMINAL execution whose recorded event rows are truncated BEFORE
+    // the terminal lifecycle event (pruned by retention / released on reset /
+    // otherwise incomplete). Such a prefix-only history replays to a frontier
+    // suspension, which canary treats as `clean` — falsely implying "no
+    // divergence, safe to rule out" for a run whose real seal we can no longer
+    // see. Refuse it exactly as the #612 sibling terminal-query path does
+    // (`classify_terminal_query` maps a terminal execution with no seal to
+    // `HistoryUnavailable`), rather than serving a misleading verdict.
+    //
+    // Gate ONLY terminal executions: a seal-less prefix is the NORMAL, expected
+    // shape of a healthy in-flight RUNNING/PAUSED/SUSPENDED run (the endpoint's
+    // headline case) — those must still proceed to the canary replay and report
+    // `clean`/`diverged`. Ordered after the O(1) erased-guard (which already
+    // 410s the terminal-erased subset before history is even loaded), so this
+    // catches the remaining truncated-but-not-erased terminal histories.
+    if terminal_state && !history_reached_seal {
+        return Err(map_error(HarvestError::HistoryUnavailable {
+            exec_id,
+            reason: "terminal execution history is incomplete (no terminal seal)".to_string(),
+        }));
+    }
+
+    // Thread the execution row's own execution_timeout / deadline_at / parent id /
+    // workflow_id / context headers into the snapshot (issues #772, #698, #481) —
+    // exactly the values hydrate_ctx_for_query threads for the query path — so a
+    // deadline-aware, parent-aware, or header-branching run replays cleanly instead
+    // of surfacing FALSE non-determinism.
+    let context_headers = execution.context_headers.as_ref().and_then(|v| {
+        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+    });
+    let snapshot = autumn_harvest::testing::HistorySnapshot {
+        workflow_name: execution.workflow_name.clone(),
+        execution_id: exec_id,
+        events: history.events,
+        context_headers,
+        execution_timeout: execution.execution_timeout,
+        deadline_at: execution.deadline_at,
+        parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
+        workflow_id: Some(execution.workflow_id.clone()),
+    };
+
+    // Register ONLY the target handler and replay in CANARY mode. Canary — not
+    // strict — is required: strict replay classifies a frontier suspension (every
+    // healthy in-flight RUNNING/SUSPENDED/PAUSED run parked mid-flight, the
+    // endpoint's headline use case) as `NonDeterminismDetected`, a false
+    // `diverged`. Canary excepts exactly that frontier suspension → `clean`, while
+    // a genuine mid-history divergence still surfaces (it resolves synchronously
+    // during the drive, not as a frontier suspension). Bound by `query_timeout`
+    // (the #612 contract): on the timer winning, return 408.
+    // Thread the runtime registry's shared state into the diagnosis replay so it
+    // sees the SAME typed state the live worker's replay path sees
+    // (`registry.shared_state()`, `worker.rs`). Without this the replayer defaults
+    // to `empty_shared_state()`, so a workflow that reads `ctx.state::<T>()` during
+    // replay would find nothing under diagnosis and spuriously report
+    // `workflow_failed`/`diverged` for state-registering deployments — even though
+    // the same execution replays cleanly on the worker (Codex review, PR #1107).
+    // Thread the runtime registry's history policy so the diagnosis replay uses
+    // the SAME `continue_as_new_threshold` / `continue_as_new_deadline_fraction`
+    // the live worker's replay uses (`registry.history_policy()`, worker.rs).
+    // Without this the canary replay defaults to `WorkflowHistoryPolicy::default()`,
+    // so a workflow that branches command-affecting control flow on
+    // `ctx.should_continue_as_new()` would emit a different command set under
+    // diagnosis than it did live and spuriously report `diverged` /
+    // `workflow_failed` for deployments that configure a non-default policy —
+    // even though the same execution replays cleanly on the worker (Codex review,
+    // PR #1107).
+    let replayer = autumn_harvest::testing::WorkflowReplayer::new()
+        .with_shared_state(runtime.registry().shared_state())
+        .with_history_policy(runtime.registry().history_policy())
+        .register_fn(execution.workflow_name.clone(), handler);
+    let report = match tokio::time::timeout(
+        api_state.query_timeout(),
+        replayer.replay_canary_snapshot(snapshot),
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(_elapsed) => {
+            return Err(map_error(HarvestError::QueryTimedOut {
+                query_name: "replay-diagnosis".to_string(),
+                timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
+                    .unwrap_or(u64::MAX),
+            }));
+        }
+    };
+
+    // Reclassify a false `diverged` on a terminal run that was externally sealed
+    // mid-await (TIMED_OUT / externally-cancelled / terminated) into `clean`
+    // (issue #614 FIX 3): the workflow replayed its recorded history faithfully
+    // and then issued the next command exactly where the external terminal seal
+    // sits — no code divergence, the run was killed by an outside force. A genuine
+    // mid-history divergence, or new code that does MORE work than a COMPLETED /
+    // FAILED run, is never masked (the divergence's `actual` names a real command
+    // event or the workflow's own outcome seal, not an external seal — see
+    // `reclassify_sealed_mid_await`).
+    let response = crate::replay_diagnosis::reclassify_sealed_mid_await(
+        crate::replay_diagnosis::report_to_response(exec_id, workflow_name, state, report),
+        terminal_state,
+        history_reached_seal,
+    );
+    Ok(Json(response))
 }
 
 async fn concurrency_status(

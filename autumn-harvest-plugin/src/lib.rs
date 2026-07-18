@@ -15,6 +15,7 @@ pub mod outbox;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
+pub mod replay_diagnosis;
 pub mod runner;
 pub mod schedule_runs;
 pub mod shard_fanout;

@@ -270,6 +270,15 @@ fn workflow_timeline_is_covered() {
 }
 
 #[test]
+fn workflow_replay_diagnosis_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "replay-diagnosis",
+        "00000000-0000-0000-0000-000000000001",
+    ]);
+}
+
+#[test]
 fn workflow_run_chain_is_covered() {
     assert_covered(&[
         "workflow",

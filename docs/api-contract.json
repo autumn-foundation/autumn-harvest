@@ -679,6 +679,64 @@
       "idempotency": "Fully idempotent; read-only."
     },
     {
+      "method": "POST",
+      "path": "/workflows/{id}/replay-diagnosis",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Replay ONE execution's recorded history against the currently-registered #[workflow] handler on this node and return a structured determinism verdict (issue #614). POST is used instead of GET because it drives a replay of the workflow function; this route never writes workflow events and performs no writes (read-only, admin-gated). The DB connection is dropped before user code is driven, and the replay is pure in-memory replay. Answers 'will — or did — this run diverge under the code deployed right now?': useful for a PAUSED or non-determinism-blocked RUNNING run (the divergence object mirrors the #603 block diagnostic: kind/event_index/expected/actual), or a terminal FAILED run for retroactive forensics. The verdict is one of: clean (message 'no divergence under current code'), diverged (with a divergence object), workflow_failed (with a failure object), not_registered (the workflow type is not registered on this node), or not_replayable_dag (a classic DAG is not on the replay path). All five verdicts return 200 — the diagnosis, not the HTTP status, carries the answer. The replay runs in canary mode, so a healthy in-flight run parked mid-flight (a PAUSED/RUNNING frontier suspension) is correctly reported clean rather than a false diverged; a terminal run externally sealed mid-await (TIMED_OUT/cancelled/terminated) is likewise clean. The replay is bounded by WorkerConfig::query_timeout; the query_timeout bound applies to async-yielding replays, and a workflow that busy-loops synchronously without ever awaiting is out of scope, exactly as for the live executor.",
+      "idempotency": "Read-only (no events written, no state recomputed); safe to retry.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_name",
+          "state",
+          "diagnosis",
+          "events_replayed",
+          "divergence",
+          "failure",
+          "summary",
+          "message"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 408,
+          "description": "Replay exceeded the bounded budget (WorkerConfig::query_timeout)."
+        },
+        {
+          "status": 410,
+          "description": "History unavailable (terminal executions only): the recorded history is truncated before its terminal seal (pruned by retention or released on reset), or the payloads were PII-erased (issue #495). Both would yield a misleading verdict, so they are refused, mirroring the #612 terminal-query path."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/workflows/{id}/stream",
       "category": "workflow",

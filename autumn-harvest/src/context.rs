@@ -2730,6 +2730,23 @@ impl WorkflowContext {
         self
     }
 
+    /// Override the history policy this context replays under.
+    ///
+    /// The canary/replay constructors default to
+    /// [`WorkflowHistoryPolicy::default`], but the live worker threads the
+    /// runtime registry's own policy (`registry.history_policy()`). A workflow
+    /// that branches command-affecting control flow on
+    /// [`should_continue_as_new`](Self::should_continue_as_new) — which reads the
+    /// policy's `continue_as_new_threshold` / `continue_as_new_deadline_fraction`
+    /// — therefore replays faithfully only when the same policy is threaded in.
+    /// Used by the deploy replay canary and the replay-diagnosis endpoint to stay
+    /// byte-faithful to the live worker's replay.
+    #[must_use]
+    pub const fn with_history_policy(mut self, history_policy: WorkflowHistoryPolicy) -> Self {
+        self.history_policy = history_policy;
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// The task queue this workflow execution runs on.

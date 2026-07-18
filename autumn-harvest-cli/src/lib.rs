@@ -965,6 +965,13 @@ enum WorkflowCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Replay a single execution's recorded history against the currently
+    /// registered workflow handler and report a structured determinism verdict
+    /// (clean, diverged, failed, not-registered, or not-replayable).
+    ReplayDiagnosis {
+        /// Workflow execution ID to diagnose.
+        execution_id: String,
+    },
     /// List child workflow executions for a parent execution.
     Children {
         /// Parent workflow execution ID.
@@ -4537,6 +4544,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/run-chain",
             path_segment(execution_id)
         ))),
+        WorkflowCommand::ReplayDiagnosis { execution_id } => Ok(ApiRequest::post(
+            format!("/workflows/{}/replay-diagnosis", path_segment(execution_id)),
+            None,
+        )),
         WorkflowCommand::Children {
             execution_id,
             status,
