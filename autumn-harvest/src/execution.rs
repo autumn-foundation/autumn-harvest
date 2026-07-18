@@ -5212,6 +5212,15 @@ pub async fn schedule_run_state_summary(
 /// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/`TERMINATED`)
 /// — i.e. a `RUNNING`, `SUSPENDED`, or `PAUSED` run whose next replay still
 /// requires the `#[workflow]` handler named by `workflow_name`.
+/// Maximum number of representative non-terminal execution ids returned per
+/// workflow type by [`non_terminal_counts_by_workflow_name`] (issue #700 AC2).
+///
+/// A bounded sample lets an operator drill straight into stuck runs of an
+/// orphaned type without paginating `GET /workflows`. The per-shard SQL
+/// `ARRAY_AGG(...)[1:REACHABILITY_SAMPLE_CAP]` already caps each shard's
+/// contribution; the plugin caps the cross-shard union to the same value.
+pub const REACHABILITY_SAMPLE_CAP: usize = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowTypeNonTerminalCount {
     /// Workflow type name — the handler its non-terminal executions replay against.
@@ -5220,6 +5229,12 @@ pub struct WorkflowTypeNonTerminalCount {
     pub non_terminal_count: i64,
     /// Start time of the oldest non-terminal execution of this type on the shard.
     pub oldest_started_at: chrono::DateTime<Utc>,
+    /// A bounded (`REACHABILITY_SAMPLE_CAP`) set of representative non-terminal
+    /// execution ids of this type on the shard, ordered oldest-first
+    /// (`started_at ASC, id ASC`). Empty is impossible here — a row only exists
+    /// when `non_terminal_count >= 1` — but the aggregating plugin returns an
+    /// empty vec for `safe_to_remove` types with no rows at all.
+    pub sample_execution_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, diesel::QueryableByName)]
@@ -5230,6 +5245,8 @@ struct WorkflowTypeNonTerminalSqlRow {
     non_terminal_count: i64,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     oldest_started_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+    sample_execution_ids: Vec<Uuid>,
 }
 
 /// SQL for [`non_terminal_counts_by_workflow_name`].
@@ -5242,11 +5259,21 @@ struct WorkflowTypeNonTerminalSqlRow {
 /// sharing the same Postgres database are never double-counted). Both params
 /// are nullable — `NULL` means "no filter". Side-effect-free: no claims, no
 /// writes, no events appended.
+///
+/// `sample_execution_ids` (issue #700 AC2) is a bounded, oldest-first sample of
+/// the group's non-terminal execution ids. `ARRAY_AGG(id ORDER BY started_at
+/// ASC, id ASC)` materialises the full ordered id array for the group before
+/// the `[1:5]` (`REACHABILITY_SAMPLE_CAP`) slice keeps only the first few —
+/// transient memory proportional to group size, acceptable at the target scale
+/// (well under the < 2 s / 100k-execution budget). If a very large group's
+/// full-array materialisation ever becomes a concern, the drop-in fallback is a
+/// `LATERAL (SELECT ... ORDER BY started_at LIMIT n)` per group.
 const NON_TERMINAL_COUNTS_SQL: &str = r"
 SELECT
     workflow_name::TEXT AS workflow_name,
     COUNT(*)::BIGINT AS non_terminal_count,
-    MIN(started_at) AS oldest_started_at
+    MIN(started_at) AS oldest_started_at,
+    (ARRAY_AGG(id ORDER BY started_at ASC, id ASC))[1:5] AS sample_execution_ids
 FROM harvest_workflow_executions
 WHERE state NOT IN (
         'COMPLETED',
@@ -5303,6 +5330,7 @@ pub async fn non_terminal_counts_by_workflow_name(
             workflow_name: row.workflow_name,
             non_terminal_count: row.non_terminal_count,
             oldest_started_at: row.oldest_started_at,
+            sample_execution_ids: row.sample_execution_ids,
         })
         .collect())
 }
