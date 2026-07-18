@@ -23,7 +23,7 @@ use autumn_harvest_plugin::OrphanStartupAction;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_harvest_plugin::runner::resolve_runtime_storage_pool;
+use autumn_harvest_plugin::runner::select_runtime_shard0_pool;
 use autumn_harvest_plugin::workflow_reachability::{
     StartupOrphanDecision, WorkflowReachabilityQuery, build_reachability_report_single_shard,
     build_workflow_reachability_report, startup_orphan_decision,
@@ -886,10 +886,10 @@ async fn gate_resolves_sharded_pool_not_config_pool() {
     let harvest_pool = build_test_pool("postgres://unused@127.0.0.1:1/none");
     let sharded_env = ShardedDbPool::single(build_test_pool(&database_url));
 
-    // Resolve exactly as the gate does for the with_sharded_pool case (the
-    // runner-level override is None — the plugin never sets it).
-    let resolved = resolve_runtime_storage_pool(None, Some(sharded_env), harvest_pool);
-    let gate_pool = resolved.clone_inner();
+    // Select exactly as the gate does for the with_sharded_pool case (the
+    // runner-level override is None — the plugin never sets it). The read-only
+    // selector returns shard 0 of the sharded pool (the env DB).
+    let gate_pool = select_runtime_shard0_pool(None, Some(&sharded_env), &harvest_pool);
 
     let registered: BTreeSet<String> = BTreeSet::new();
     let report = build_reachability_report_single_shard(

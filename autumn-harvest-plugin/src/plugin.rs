@@ -1077,26 +1077,30 @@ async fn start_harvest_runtime(
                 )
                 .collect();
 
-            // Resolve the SAME storage pool `HarvestRunner::start` will run the
-            // workers against (issue #700 P2). `PreparedHarvestRuntime::build`
+            // Select the SAME shard-0 storage pool `HarvestRunner::start` will
+            // run the workers against (issue #700 P2). `PreparedHarvestRuntime::build`
             // gives `WorkerConfig::with_sharded_pool` PRECEDENCE over
             // `harvest_pool`, so a `HarvestBuilder::with_sharded_pool` deployment
             // would otherwise have the gate query `harvest_pool` while the
             // workers poll a DIFFERENT database — the gate could validate the
             // wrong DB, miss an orphan, and the worker would then start
-            // polling+failing it. Calling the shared `resolve_runtime_storage_pool`
-            // with the exact inputs `build` uses (the runner-resources override,
-            // which the plugin never sets; WorkerConfig's sharded pool; the
-            // harvest_pool clone) makes the two agree by construction.
-            // `clone_inner()` is the same default-shard pool the workers poll.
-            let resolved_storage = crate::runner::resolve_runtime_storage_pool(
+            // polling+failing it. `select_runtime_shard0_pool` shares the exact
+            // precedence `build` uses (the runner-resources override, which the
+            // plugin never sets; WorkerConfig's sharded pool; the harvest_pool
+            // clone) via `pick_runtime_pool_source`, so gate and runner agree by
+            // construction. Critically it is READ-ONLY (issue #700 P4): it reads
+            // shard 0 from an already-constructed `ShardedDbPool`, or returns the
+            // `harvest_pool` handle directly, and never calls
+            // `ShardedDbPool::single`/`from_map` — so an aborting gate installs
+            // no `GLOBAL_SHARDED_POOL` and stays side-effect-free (the real
+            // global install happens later in `HarvestRunner::start`, unchanged).
+            let gate_shard0_pool = crate::runner::select_runtime_shard0_pool(
                 runner_resources.sharded_pool_override(),
-                built.worker_config().sharded_pool.clone(),
-                gate_pool,
+                built.worker_config().sharded_pool.as_ref(),
+                &gate_pool,
             );
-            let gate_pool = resolved_storage.clone_inner();
             let report =
-                build_reachability_report_single_shard(&registered, &gate_pool, None).await;
+                build_reachability_report_single_shard(&registered, &gate_shard0_pool, None).await;
             let orphaned_types: Vec<&str> = report
                 .items
                 .iter()
