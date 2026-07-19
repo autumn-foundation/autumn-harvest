@@ -1088,8 +1088,15 @@ fn required_queues(
             // See the matching comment in `preflight::required_queues`: the
             // two reserved worker-session internal activities dispatch on
             // the caller-supplied session queue, never `default_queue`.
+            // Synthetic liveness canary (issue #796): the built-in canary
+            // activity has `default_queue: None` but is dispatched on the
+            // probe's target queue (from the workflow input), never
+            // `default_queue` — counting it would inject a phantom `"default"`
+            // required queue and flip a healthy deployment to a missing-worker
+            // readiness failure. See `preflight::required_queues`.
             if !activity.is_local
                 && !autumn_harvest::is_reserved_session_activity_name(activity.name)
+                && !autumn_harvest::canary::is_reserved_canary_name(activity.name)
             {
                 queues.insert(activity.default_queue.unwrap_or("default").to_string());
             }
