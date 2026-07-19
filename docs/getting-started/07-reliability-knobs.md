@@ -249,13 +249,26 @@ both *caps* any workflow-declared `chain_execution_timeout` **and** acts as a
 **fleet-wide default**: a workflow that declares no chain cap still inherits the
 ceiling as its chain deadline. (This differs from
 `max_workflow_execution_timeout`, which only caps a *specified* per-run timeout.)
-So one builder call caps every chain — even ones that under-specify:
+So one builder call caps chains fleet-wide — even ones that under-specify:
 
 ```rust
 HarvestBuilder::new()
     .max_workflow_chain_timeout(Duration::from_secs(30 * 24 * 3600)) // no chain outlives 30d, fleet-wide
     .build();
 ```
+
+The ceiling-as-default is applied at every **origin** start path — the plain
+HTTP `POST /workflows/{name}/start`, signal-with-start, update-with-start, batch
+start, trigger-now, workflow backfill, the scheduler tick, and
+debounce/throttle/batch deferred starts. (It is deliberately not applied on the
+CAN/retry/reset paths, which carry or re-anchor the chain deadline by their own
+rules above.) A few non-primary start paths currently pass no chain cap and are
+therefore uncapped by the fleet-wide default: the completion-trigger / cross-shard
+outbox start paths, the Vantage UI manual schedule trigger, and the **typed Rust
+client stub's** `signal_with_start` / `update_with_start` (its `start` /
+`start_with_options` methods do apply the cap). For those, declare the cap on the
+workflow type with `#[workflow(chain_execution_timeout = "…")]`, or trigger via
+the HTTP route.
 
 **Absolute wall-clock — not shifted by pause.** Unlike `deadline_at` /
 `sla_deadline_at` (which resume pushes forward by the paused span),
@@ -264,6 +277,16 @@ extended by pause/resume. The chain cap is enforced by the timeout scanner only;
 it is deliberately **not** exposed to `ctx.deadline()` /
 `should_continue_as_new()` (which stay bound to the per-run deadline), so a
 continuing loop cannot read it and route around it.
+
+> **Operator callout — a long pause can kill a chain on resume.** Because
+> `chain_deadline_at` is absolute and is *not* shifted forward by the paused
+> span, a run **paused past its chain deadline** is timed out on the **first
+> timeout-scanner tick after resume** (the paused execution is skipped while
+> `PAUSED`, then caught the moment it returns to `RUNNING`). A long
+> compliance/investigation pause can therefore immediately terminate a chain the
+> instant it resumes. If you need a run to survive a pause that outlasts its
+> chain budget, cancel/terminate and restart with a fresh chain origin rather
+> than pausing.
 
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.patched()` — the recommended default for the

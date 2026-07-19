@@ -538,6 +538,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ),
                                 trace_context: opts.trace_context,
                                 max_execution_timeout_ceiling,
+                                // Chain-scoped lifetime cap (issue #617): the typed-stub
+                                // update-with-start does NOT thread the chain cap; it is
+                                // resolved on the HTTP update-with-start route and the
+                                // typed stub's own `start`/`start_with_options` path.
+                                chain_execution_timeout: ::std::option::Option::None,
+                                max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                                 concurrency_key,
                                 concurrency_limit,
                                 update_id,

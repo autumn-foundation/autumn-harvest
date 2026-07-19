@@ -17,16 +17,28 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::execution::{
+    SignalWithStartParams, StartWorkflowParams, pause_workflow_execution,
+    resume_workflow_execution, signal_with_start_workflow_execution_with_metrics,
+    start_or_load_workflow_execution,
+};
+use autumn_harvest::info::WorkflowHandlerFn;
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::scheduler::{
+    SchedulerMonitor, compile_dag_catalog, register_workflow_schedules, tick_once,
+};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
-use autumn_harvest::telemetry::MetricsRecorder;
+use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 use autumn_harvest::timeout;
 use autumn_harvest::types::{
     ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::HandlerRegistry;
-use autumn_harvest::{WorkflowContext, WorkflowInfo};
+use autumn_harvest::{
+    ResetSignalReapplyPolicy, WorkflowContext, WorkflowInfo, WorkflowResetRequest,
+    reset_workflow_execution,
+};
 use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -578,5 +590,558 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
     assert!(
         dl < Utc::now() + ChronoDuration::days(1),
         "a re-anchored (now + 7d) deadline would be days out; verbatim is ~6h"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review-fix test pins (issue #617 code review): T1–T4, plus the FIX 2 fleet-wide
+// ceiling tests for signal-with-start and the scheduler tick.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Leak a UNIQUE `&'static str` workflow name so a worker-driven CAN chain and
+/// the GLOBAL timeout scanner's metric spy can be isolated to this test's rows.
+fn leaked_name(prefix: &str) -> &'static str {
+    Box::leak(format!("{prefix}_{}", Uuid::new_v4().simple()).into_boxed_str())
+}
+
+/// Build a `HandlerRegistry` for a single workflow with a caller-chosen name.
+fn named_registry(name: &'static str, handler: WorkflowHandlerFn) -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            mcp: false,
+            name,
+            module: "chain_timeout_tests",
+            handler,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+    ))
+}
+
+/// A workflow that continues-as-new until `count == 3`, then COMPLETES.
+fn chain_can_3hop_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let count = input
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if count < 3 {
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"count": count + 1}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        Ok(input)
+    })
+}
+
+/// A workflow that continues-as-new until `count == 3`, then BLOCKS on a long
+/// durable timer so the final successor stays RUNNING (never completes / CANs).
+fn chain_can_3hop_block_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let count = input
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if count < 3 {
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"count": count + 1}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        // count == 3: park on a 1-hour durable timer (never fires in the test)
+        // so this run stays RUNNING and is the "current" successor the chain
+        // scanner can fire against.
+        let _ = ctx.timer("chain_block", 3600).await;
+        Ok(input)
+    })
+}
+
+/// Walk one continue-as-new hop: wait for `exec_id` to reach `CONTINUED_AS_NEW`,
+/// then return the successor recorded in its `WorkflowContinuedAsNew` event.
+async fn walk_can_successor(url: &str, exec_id: ExecutionId) -> ExecutionId {
+    let _ = wait_for_execution_state(url, exec_id, "CONTINUED_AS_NEW").await;
+    let history = load_history_from_url(url, exec_id).await;
+    history
+        .events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("history must contain WorkflowContinuedAsNew")
+}
+
+// ── T1: pause/resume shifts the per-run `deadline_at` by the pause span but must
+//    LEAVE `chain_deadline_at` UNCHANGED (absolute wall-clock; not suspended by
+//    pause). A mutant adding `chain_deadline_at + pause_span` to resume fails this.
+#[tokio::test]
+async fn pause_resume_shifts_run_deadline_but_not_chain_deadline() {
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    // A RUNNING execution with BOTH a per-run deadline and a chain deadline.
+    let wf_name = format!("chain_pause_{}", Uuid::new_v4().simple());
+    let exec_id = insert_named_running(&mut conn, &wf_name, "wf-1").await;
+
+    let now = Utc::now();
+    let run_deadline_before = now + ChronoDuration::minutes(30);
+    let chain_deadline_before = now + ChronoDuration::days(7);
+    diesel::update(e::table.find(exec_id.as_uuid()))
+        .set(e::deadline_at.eq(Some(run_deadline_before)))
+        .execute(&mut conn)
+        .await
+        .expect("set per-run deadline");
+    set_chain_columns(
+        &mut conn,
+        exec_id,
+        Some(ChronoDuration::days(7)),
+        Some(chain_deadline_before),
+    )
+    .await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    // Backdate `paused_at` 30 minutes so resume computes a deterministic span.
+    let paused_at = now - ChronoDuration::minutes(30);
+    diesel::update(e::table.find(exec_id.as_uuid()))
+        .set(e::paused_at.eq(Some(paused_at)))
+        .execute(&mut conn)
+        .await
+        .expect("backdate paused_at");
+
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+
+    // Per-run deadline advanced by ~30 min pause span.
+    let run_after: Option<chrono::DateTime<Utc>> = e::table
+        .find(exec_id.as_uuid())
+        .select(e::deadline_at)
+        .first(&mut conn)
+        .await
+        .expect("load deadline_at");
+    let run_after = run_after.expect("per-run deadline must remain set");
+    let expected = run_deadline_before + ChronoDuration::minutes(30);
+    assert!(
+        (run_after - expected).num_seconds().abs() <= 5,
+        "per-run deadline_at must advance by the pause span: after={run_after}, expected≈{expected}"
+    );
+
+    // Chain deadline UNCHANGED (absolute; not shifted by pause).
+    let (_chain_timeout, chain_after) = load_chain_columns(&mut conn, exec_id).await;
+    let chain_after = chain_after.expect("chain_deadline_at must remain set");
+    assert!(
+        (chain_after - chain_deadline_before)
+            .num_milliseconds()
+            .abs()
+            < 10,
+        "chain_deadline_at must NOT be shifted by pause/resume: after={chain_after}, \
+         before={chain_deadline_before}"
+    );
+}
+
+// ── T2: a reset FORK starts a fresh chain origin — `chain_deadline_at` is
+//    RE-ANCHORED to the fork's own start (now + chain_execution_timeout), NOT
+//    carried from the source's (already-past) value.
+#[tokio::test]
+async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = ExecutionId::new();
+    let wid = format!("chain-reset-{}", Uuid::new_v4());
+    // Source has a 7d chain cap whose deadline is already 3h in the PAST.
+    let mut params = default_params(exec_id, &wid);
+    params.chain_execution_timeout = Some(ChronoDuration::days(7));
+    start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("start source");
+    set_chain_columns(
+        &mut conn,
+        exec_id,
+        Some(ChronoDuration::days(7)),
+        Some(Utc::now() - ChronoDuration::hours(3)),
+    )
+    .await;
+
+    let before = Utc::now();
+    let res = reset_workflow_execution(
+        &mut conn,
+        exec_id,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "operator reset".to_string(),
+            operator_id: "test-operator".to_string(),
+            signal_reapply: ResetSignalReapplyPolicy::default(),
+            allow_terminal_source: false,
+        },
+        None,
+    )
+    .await
+    .expect("reset should succeed");
+
+    let (fork_timeout, fork_deadline) = load_chain_columns(&mut conn, res.new_exec_id).await;
+    assert_eq!(
+        fork_timeout,
+        Some(ChronoDuration::days(7)),
+        "fork carries the chain-cap DURATION"
+    );
+    let dl = fork_deadline.expect("fork chain deadline must be set");
+    // Fresh anchor: ≈ now + 7d, definitely > now + 6d and in the FUTURE — NOT the
+    // source's 3-hours-ago value (which a carry-instead-of-reanchor mutant yields).
+    assert!(
+        dl > before + ChronoDuration::days(6),
+        "reset must RE-ANCHOR the chain deadline to the fork start (now + 7d), \
+         not carry the source's past value: got {dl}"
+    );
+    assert!(
+        dl > Utc::now(),
+        "re-anchored fork deadline must be in the future"
+    );
+}
+
+// ── FIX 2 (AC4): a signal-with-start of a workflow with NO chain attr but a
+//    fleet-wide ceiling gets `chain_deadline_at ≈ start + ceiling`.
+#[tokio::test]
+async fn signal_with_start_applies_fleet_wide_chain_ceiling() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf_name = format!("sws_chain_{}", Uuid::new_v4().simple());
+    let wid = format!("sws-chain-{}", Uuid::new_v4());
+    let exec_id = ExecutionId::new();
+    let before = Utc::now();
+    let outcome = signal_with_start_workflow_execution_with_metrics(
+        &mut conn,
+        SignalWithStartParams {
+            workflow_name: &wf_name,
+            workflow_id: &wid,
+            exec_id,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            // No workflow-declared chain cap, only the fleet-wide ceiling.
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: Some(ChronoDuration::days(3)),
+            concurrency_key: None,
+            concurrency_limit: None,
+            signal_name: "kick",
+            signal_payload: serde_json::json!({"v": 1}),
+            idempotency_key: None,
+            max_workflow_input_bytes: 0,
+            max_signal_payload_bytes: 0,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            reject_fresh_if_debounced: false,
+            workflow_retry_policy: None,
+            max_workflow_attempts_ceiling: None,
+            workflow_info: None,
+            start_source_override: None,
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("signal-with-start should succeed");
+    assert!(outcome.started_fresh, "must be a fresh start");
+
+    let (chain_timeout, chain_deadline) = load_chain_columns(&mut conn, outcome.exec_id).await;
+    assert_eq!(
+        chain_timeout,
+        Some(ChronoDuration::days(3)),
+        "the fleet-wide ceiling becomes the effective chain cap (fleet-wide default)"
+    );
+    let dl = chain_deadline.expect("ceiling-derived chain deadline");
+    assert!(
+        dl >= before + ChronoDuration::days(3) - ChronoDuration::seconds(5),
+        "chain_deadline_at ≈ start + ceiling: got {dl}"
+    );
+}
+
+// ── FIX 2 (AC4): a scheduler-tick fire of a workflow with NO chain attr inherits
+//    the fleet-wide chain ceiling threaded through the HandlerRegistry.
+#[tokio::test]
+async fn scheduler_tick_applies_fleet_wide_chain_ceiling() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    // Unique workflow name so the fired execution is unambiguous.
+    let wf_name = leaked_name("sched_chain");
+
+    // Registry with the fleet-wide chain ceiling set (workflow declares no attr).
+    let registry = Arc::new(
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                mcp: false,
+                name: wf_name,
+                module: "chain_timeout_tests",
+                handler: chain_can_3hop_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![],
+        )
+        .with_max_workflow_chain_timeout(Some(std::time::Duration::from_secs(3 * 24 * 3600))),
+    );
+
+    // Register a due interval schedule for this workflow.
+    let schedule = WorkflowSchedule::new(
+        wf_name,
+        Schedule::Interval(std::time::Duration::from_secs(3600)),
+    )
+    .with_input(serde_json::json!({"count": 0}));
+    register_workflow_schedules(&mut conn, std::slice::from_ref(&schedule))
+        .await
+        .expect("register schedule");
+    // Force the schedule due.
+    diesel::update(
+        autumn_harvest::schema::harvest_schedules::table
+            .filter(autumn_harvest::schema::harvest_schedules::workflow_name.eq(wf_name)),
+    )
+    .set(
+        autumn_harvest::schema::harvest_schedules::next_run_at
+            .eq(Some(Utc::now() - ChronoDuration::seconds(1))),
+    )
+    .execute(&mut conn)
+    .await
+    .expect("force due");
+
+    let pool = build_test_pool(&url);
+    let before = Utc::now();
+    tick_once(
+        pool,
+        Arc::clone(&registry),
+        Arc::new(compile_dag_catalog(vec![]).expect("empty dag catalog")),
+        Arc::new(vec![schedule]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("scheduler tick should succeed");
+
+    // Find the fired execution for this unique workflow name.
+    let row: Option<(Uuid, Option<ChronoDuration>, Option<chrono::DateTime<Utc>>)> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
+            .select((
+                harvest_workflow_executions::id,
+                harvest_workflow_executions::chain_execution_timeout,
+                harvest_workflow_executions::chain_deadline_at,
+            ))
+            .first(&mut conn)
+            .await
+            .optional()
+            .expect("query fired execution");
+    let (_id, chain_timeout, chain_deadline) =
+        row.expect("scheduler tick must have fired an execution for this workflow");
+    assert_eq!(
+        chain_timeout,
+        Some(ChronoDuration::days(3)),
+        "scheduled run inherits the fleet-wide chain ceiling as its effective cap"
+    );
+    let dl = chain_deadline.expect("scheduled run chain deadline");
+    assert!(
+        dl >= before + ChronoDuration::days(3) - ChronoDuration::seconds(10),
+        "scheduled run chain_deadline_at ≈ start + ceiling: got {dl}"
+    );
+}
+
+// ── T4(a) (AC7): a worker drives ≥3 real continue-as-new hops; the 3rd successor
+//    carries `chain_deadline_at` VERBATIM (across all 3 hops), NOT re-anchored.
+#[tokio::test]
+async fn three_hop_continue_as_new_carries_chain_deadline_verbatim() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf_name = leaked_name("chain_can3");
+    let origin = insert_named_running(&mut conn, wf_name, "chain-can3-1").await;
+    // A FUTURE chain deadline so the hops complete without timing out.
+    let frozen_chain_deadline = Utc::now() + ChronoDuration::hours(6);
+    set_chain_columns(
+        &mut conn,
+        origin,
+        Some(ChronoDuration::days(7)),
+        Some(frozen_chain_deadline),
+    )
+    .await;
+    enqueue_started_workflow_task(&mut conn, origin, serde_json::json!({"count": 0})).await;
+
+    let worker = build_runtime_worker(
+        "worker-chain-can3",
+        2,
+        1,
+        named_registry(wf_name, chain_can_3hop_workflow),
+    );
+    let pool = build_test_pool(&url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Walk three real continue-as-new hops.
+    let succ1 = walk_can_successor(&url, origin).await;
+    let succ2 = walk_can_successor(&url, succ1).await;
+    let succ3 = walk_can_successor(&url, succ2).await;
+    let _done = wait_for_execution_state(&url, succ3, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let (succ_timeout, succ_deadline) = load_chain_columns(&mut conn, succ3).await;
+    assert_eq!(
+        succ_timeout,
+        Some(ChronoDuration::days(7)),
+        "3rd successor carries the chain-cap DURATION verbatim"
+    );
+    let dl = succ_deadline.expect("3rd successor chain deadline");
+    let delta = (dl - frozen_chain_deadline).num_milliseconds().abs();
+    assert!(
+        delta < 1000,
+        "3rd successor chain_deadline_at must equal the origin's absolute value \
+         (carried verbatim across 3 hops, NOT recomputed): got {dl}, expected {frozen_chain_deadline}"
+    );
+    // Falsify a re-anchor: now+7d would be days out; verbatim is ~6h from origin.
+    assert!(
+        dl < Utc::now() + ChronoDuration::days(1),
+        "a re-anchored (now + 7d) deadline would be days out; verbatim is ~6h"
+    );
+}
+
+// ── T4(b) (AC7 behavioral): with a SHORT per-run cap (re-anchored every hop, never
+//    fires) and a chain deadline crossed after ≥3 hops, the CURRENT RUNNING
+//    successor (not the origin) times out; the CHAIN counter fires, the RUN
+//    counter does not.
+#[tokio::test]
+async fn chain_cap_fires_on_a_can_successor_not_the_origin() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let wf_name = leaked_name("chain_can3b");
+    let origin = insert_named_running(&mut conn, wf_name, "chain-can3b-1").await;
+    // A FUTURE chain deadline so the 3 hops occur without timing out mid-drive.
+    set_chain_columns(
+        &mut conn,
+        origin,
+        Some(ChronoDuration::days(7)),
+        Some(Utc::now() + ChronoDuration::hours(6)),
+    )
+    .await;
+    enqueue_started_workflow_task(&mut conn, origin, serde_json::json!({"count": 0})).await;
+
+    let worker = build_runtime_worker(
+        "worker-chain-can3b",
+        2,
+        1,
+        named_registry(wf_name, chain_can_3hop_block_workflow),
+    );
+    let pool = build_test_pool(&url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let succ1 = walk_can_successor(&url, origin).await;
+    let succ2 = walk_can_successor(&url, succ1).await;
+    let succ3 = walk_can_successor(&url, succ2).await;
+    // succ3 blocks at count==3 → stays RUNNING (the "current successor").
+    let _ = wait_for_execution_state(&url, succ3, "RUNNING").await;
+
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    // Cross the chain deadline for succ3, keep its per-run deadline in the FUTURE
+    // (so a per-run cap alone would NOT fire) — exactly the "chain fires where a
+    // per-run cap re-anchors" scenario.
+    set_chain_columns(
+        &mut conn,
+        succ3,
+        Some(ChronoDuration::days(7)),
+        Some(Utc::now() - ChronoDuration::seconds(5)),
+    )
+    .await;
+    diesel::update(harvest_workflow_executions::table.find(succ3.as_uuid()))
+        .set(
+            harvest_workflow_executions::deadline_at
+                .eq(Some(Utc::now() + ChronoDuration::hours(1))),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("set future per-run deadline on succ3");
+
+    let spy = TimeoutSpy::default();
+    timeout::enforce_workflow_execution_timeouts(&mut conn, &spy)
+        .await
+        .expect("scan");
+
+    // The CURRENT successor timed out — not the origin (which is CONTINUED_AS_NEW).
+    assert_eq!(load_state(&mut conn, succ3).await, "TIMED_OUT");
+    assert_eq!(
+        load_state(&mut conn, origin).await,
+        "CONTINUED_AS_NEW",
+        "the origin must stay CONTINUED_AS_NEW; only the current successor fires"
+    );
+    let history = store::load_history(&mut conn, succ3)
+        .await
+        .expect("history");
+    assert!(
+        history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowExecutionTimedOut { .. })),
+        "successor must append WorkflowExecutionTimedOut"
+    );
+    // AC6: the CHAIN counter fired for this unique workflow, the RUN counter did not.
+    assert_eq!(
+        spy.chain_count_for(wf_name),
+        1,
+        "chain counter fires once for the successor"
+    );
+    assert_eq!(
+        spy.run_count_for(wf_name),
+        0,
+        "the per-run timeout counter must NOT fire for a chain timeout"
     );
 }
