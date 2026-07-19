@@ -10374,3 +10374,280 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
         "exactly one saga_compensated marker in history"
     );
 }
+
+// ===========================================================================
+// Bounded / windowed activity fan-out (issue #750) — DB e2e success metric
+// ===========================================================================
+
+/// Windowed activity fan-out over 20 inputs with window 5. Reads `n`/`w` from
+/// input so the same handler is reusable, but this test fixes n=20, w=5.
+fn windowed_fanout_e2e_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["n"].as_u64().unwrap_or(20)).unwrap_or(20);
+        let w = usize::try_from(input["w"].as_u64().unwrap_or(5)).unwrap_or(5);
+        let activities: Vec<_> = (0..n)
+            .map(|i| ("slow_double".to_string(), serde_json::json!(i), "default".to_string()))
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw_windowed(activities, w)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+/// Unbounded control fan-out over the same inputs — same activity shape.
+fn unbounded_fanout_e2e_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["n"].as_u64().unwrap_or(20)).unwrap_or(20);
+        let activities: Vec<_> = (0..n)
+            .map(|i| ("slow_double".to_string(), serde_json::json!(i), "default".to_string()))
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw(activities)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+/// Modestly-slow activity: doubles its numeric input after a short real sleep,
+/// so multiple in-flight activities are observable by a concurrent DB poller.
+/// (A `tokio::time::sleep` is fine here — this runs on the activity dispatch
+/// path, not inside the workflow poll's 100ms suspension window.)
+fn slow_double_activity<'a>(
+    _ctx: &'a ActivityContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let v = input.as_u64().unwrap_or(0);
+        Ok(serde_json::json!(v * 2))
+    })
+}
+
+fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
+    let make_wf = |name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn| WorkflowInfo {
+        mcp: false,
+        name,
+        module: "integration_e2e",
+        handler,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    };
+    Arc::new(HandlerRegistry::new(
+        vec![
+            make_wf("windowed_fanout_e2e", windowed_fanout_e2e_workflow),
+            make_wf("unbounded_fanout_e2e", unbounded_fanout_e2e_workflow),
+        ],
+        vec![ActivityInfo {
+            name: "slow_double",
+            module: "integration_e2e",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: slow_double_activity,
+        }],
+    ))
+}
+
+/// Insert a RUNNING execution row for `(workflow_name, workflow_id)`.
+async fn insert_named_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    workflow_id: &'static str,
+    input: serde_json::Value,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input,
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert named workflow execution");
+    exec_id
+}
+
+/// Count `harvest_task_queue` rows in `RUNNING`/`PENDING` state that are
+/// activity tasks attributable to a specific workflow execution.
+async fn count_active_activity_rows(database_url: &str, exec_id: ExecutionId) -> i64 {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for activity-row count");
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .filter(harvest_task_queue::state.eq_any(["RUNNING", "PENDING"]))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count active activity rows")
+}
+
+/// Success metric (issue #750): a windowed fan-out (N=20, W=5) never has more
+/// than W=5 of its activities in `RUNNING`/`PENDING` at once, completes with
+/// byte-identical results to an unbounded fan-out over the same inputs, and
+/// records exactly N=20 `ActivityScheduled` events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let windowed_exec = insert_named_execution(
+        &mut conn,
+        "windowed_fanout_e2e",
+        "win-1",
+        serde_json::json!({ "n": 20, "w": 5 }),
+    )
+    .await;
+    enqueue_started_workflow_task(&mut conn, windowed_exec, serde_json::json!({ "n": 20, "w": 5 }))
+        .await;
+
+    let registry = windowed_fanout_e2e_registry();
+    let worker = build_runtime_worker("worker-e2e-windowed-fanout", 4, 30, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Background peak tracker: poll the windowed exec's active activity rows.
+    let peak = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let url = database_url.clone();
+        let peak = Arc::clone(&peak);
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            while !std::sync::atomic::AtomicBool::load(&done, Ordering::SeqCst) {
+                let n = count_active_activity_rows(&url, windowed_exec).await;
+                let n = usize::try_from(n).unwrap_or(0);
+                AtomicUsize::fetch_max(&peak, n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let windowed_execution =
+        wait_for_execution_state_with_timeout(&database_url, windowed_exec, "COMPLETED", Duration::from_secs(30))
+            .await;
+    std::sync::atomic::AtomicBool::store(&done, true, Ordering::SeqCst);
+    poller.await.expect("poller task should join");
+
+    let peak_observed = AtomicUsize::load(&peak, Ordering::SeqCst);
+    assert!(
+        peak_observed <= 5,
+        "windowed fan-out (W=5) peaked at {peak_observed} concurrent activity rows; must stay <= 5"
+    );
+    assert!(
+        peak_observed > 0,
+        "peak tracker should have observed at least one in-flight activity row"
+    );
+
+    // Now run the unbounded control over the same inputs and compare results.
+    let unbounded_exec = insert_named_execution(
+        &mut conn,
+        "unbounded_fanout_e2e",
+        "unb-1",
+        serde_json::json!({ "n": 20 }),
+    )
+    .await;
+    enqueue_started_workflow_task(&mut conn, unbounded_exec, serde_json::json!({ "n": 20 })).await;
+    let unbounded_execution =
+        wait_for_execution_state_with_timeout(&database_url, unbounded_exec, "COMPLETED", Duration::from_secs(30))
+            .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let expected: Vec<serde_json::Value> = (0..20u64).map(|i| serde_json::json!(i * 2)).collect();
+    assert_eq!(
+        windowed_execution.output,
+        Some(serde_json::json!({ "results": expected.clone() })),
+        "windowed output must be the doubled inputs in order"
+    );
+    assert_eq!(
+        windowed_execution.output, unbounded_execution.output,
+        "windowed fan-out must be byte-identical to the unbounded fan-out"
+    );
+
+    // Exactly N=20 activities were scheduled by the windowed run.
+    let history = load_history_from_url(&database_url, windowed_exec).await;
+    let scheduled = history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+        .count();
+    assert_eq!(scheduled, 20, "windowed fan-out must schedule all 20 inputs exactly once");
+    let markers = history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:")))
+        .count();
+    assert_eq!(markers, 1, "exactly one fan_out marker recorded");
+}

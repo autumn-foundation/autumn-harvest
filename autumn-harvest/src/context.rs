@@ -8029,6 +8029,240 @@ impl WorkflowContext {
         Ok(typed)
     }
 
+    // ── Bounded / windowed activity fan-out (issue #750) ─────────────────
+
+    /// Execute N activities in parallel with a bounded number **in flight at a
+    /// time** (fail-fast variant).
+    ///
+    /// This is the durable, replay-safe equivalent of
+    /// [`futures::stream::StreamExt::buffer_unordered`]: all `N` inputs are
+    /// processed, at most `max_in_flight` of *this call's* activities are ever
+    /// scheduled-but-not-completed simultaneously, and results are returned in
+    /// **input order** — identical to
+    /// [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw)
+    /// except for the added backpressure.
+    ///
+    /// # Window semantics
+    ///
+    /// The window is a **live-dispatch scheduling** concern only — it never
+    /// appears in recorded history. `max_in_flight == 0` (or `< 1`) is clamped
+    /// **up to 1** (a defined, documented outcome — never a panic, hang, or
+    /// silent no-op). `max_in_flight >= N` produces behavior and history
+    /// **identical** to the unbounded
+    /// [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw).
+    ///
+    /// Inputs are processed in **input order** in successive waves of at most
+    /// `max_in_flight`; because activities are dispatched in input order, the
+    /// `ActivityScheduled` events are recorded globally in input order `0..N`,
+    /// which is what makes replay **window-independent** — the same recorded
+    /// history replays to identical results regardless of the window the
+    /// replaying code is configured with.
+    ///
+    /// Fail-fast: the **first** activity failure aborts the call and later
+    /// waves are **never dispatched** (a deliberate backpressure semantic — a
+    /// bounded fail-fast may process fewer items than the unbounded path would).
+    ///
+    /// # Replay safety
+    ///
+    /// Records the **same** `MarkerRecorded { name: "fan_out:{n}", details: N }`
+    /// event and per-input activity events as the unbounded path — the window
+    /// `W` is **never** recorded. The recorded count is `N`; a mismatch between
+    /// recorded `N` and current-code `N` still surfaces
+    /// [`HarvestError::NonDeterministic`], exactly as the unbounded path does.
+    ///
+    /// # Cancellation
+    ///
+    /// `is_cancelled()` is checked **before each wave**. Returns
+    /// [`HarvestError::Cancelled`] when the workflow has been cancelled.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs from
+    ///   the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    /// - [`HarvestError::ActivityFailed`] (or other activity error) on the
+    ///   first failure in the group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_fan_out_raw_windowed(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        max_in_flight: usize,
+    ) -> HarvestResult<Vec<Value>> {
+        self.fan_out_raw_windowed_impl(activities, max_in_flight, None, None)
+            .await
+    }
+
+    async fn fan_out_raw_windowed_impl(
+        &self,
+        _activities: Vec<(String, Value, String)>,
+        _max_in_flight: usize,
+        _retry: Option<crate::policy::RetryPolicy>,
+        _timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<Vec<Value>> {
+        unimplemented!("fan_out_raw_windowed_impl — RED phase stub")
+    }
+
+    /// Execute N activities in parallel with a bounded number **in flight at a
+    /// time** (collect-all variant).
+    ///
+    /// Like
+    /// [`execute_activity_fan_out_raw_windowed`](Self::execute_activity_fan_out_raw_windowed)
+    /// but **all** `N` inputs run to completion regardless of per-slot failures
+    /// — per-slot errors are captured in the returned `Err` variants rather
+    /// than aborting the fan-out early. Because per-slot failures do not
+    /// short-circuit, every wave is dispatched and all `N` inputs are processed.
+    ///
+    /// See
+    /// [`execute_activity_fan_out_raw_windowed`](Self::execute_activity_fan_out_raw_windowed)
+    /// for the window semantics, replay-safety, and `max_in_flight == 0` clamp.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `activities.len()` differs from
+    ///   the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// Individual per-slot failures are returned as `Err(String)` inside the
+    /// `Vec`; the outer `Result` only fails for engine-level errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn execute_activity_fan_out_collect_raw_windowed(
+        &self,
+        activities: Vec<(String, Value, String)>,
+        max_in_flight: usize,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.fan_out_collect_raw_windowed_impl(activities, max_in_flight, None, None)
+            .await
+    }
+
+    async fn fan_out_collect_raw_windowed_impl(
+        &self,
+        _activities: Vec<(String, Value, String)>,
+        _max_in_flight: usize,
+        _retry: Option<crate::policy::RetryPolicy>,
+        _timeout: Option<std::time::Duration>,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
+        unimplemented!("fan_out_collect_raw_windowed_impl — RED phase stub")
+    }
+
+    /// Typed bounded fail-fast fan-out: run the same activity for every input in
+    /// `inputs`, at most `max_in_flight` in flight at a time, returning the
+    /// outputs in input order.
+    ///
+    /// Typed sibling of
+    /// [`execute_activity_fan_out_raw_windowed`](Self::execute_activity_fan_out_raw_windowed);
+    /// all slots share the same `ActivityInfo` (name, queue, retry defaults).
+    /// See it for window semantics, the `max_in_flight == 0` clamp, and replay
+    /// safety.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates all errors from
+    /// [`execute_activity_fan_out_raw_windowed`](Self::execute_activity_fan_out_raw_windowed).
+    pub async fn execute_activity_fan_out_windowed<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+        max_in_flight: usize,
+    ) -> HarvestResult<Vec<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self
+            .fan_out_raw_windowed_impl(
+                activities,
+                max_in_flight,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        raw_results
+            .into_iter()
+            .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
+            .collect()
+    }
+
+    /// Typed bounded collect-all fan-out: run the same activity for every input
+    /// in `inputs`, at most `max_in_flight` in flight at a time, returning
+    /// per-slot `Result<O, String>` in input order.
+    ///
+    /// Typed sibling of
+    /// [`execute_activity_fan_out_collect_raw_windowed`](Self::execute_activity_fan_out_collect_raw_windowed);
+    /// all slots share the same `ActivityInfo`. See it for window semantics, the
+    /// `max_in_flight == 0` clamp, and replay safety.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates engine-level errors from
+    /// [`execute_activity_fan_out_collect_raw_windowed`](Self::execute_activity_fan_out_collect_raw_windowed).
+    pub async fn execute_activity_fan_out_collect_windowed<I, O>(
+        &self,
+        info: &crate::info::ActivityInfo,
+        inputs: Vec<I>,
+        max_in_flight: usize,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        if info.is_local {
+            return Err(HarvestError::Config(format!(
+                "activity '{}' is marked local = true; fan-out requires remote activities",
+                info.name
+            )));
+        }
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        let activities = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input, queue.clone()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self
+            .fan_out_collect_raw_windowed_impl(
+                activities,
+                max_in_flight,
+                info.default_retry_policy.clone(),
+                info.default_start_to_close,
+            )
+            .await?;
+        let typed: Vec<Result<O, String>> = raw_results
+            .into_iter()
+            .map(|slot| match slot {
+                Ok(v) => serde_json::from_value::<O>(v)
+                    .map(Ok)
+                    .map_err(HarvestError::Serialization),
+                Err(e) => Ok(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(typed)
+    }
+
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────
 
     /// Validate every child's serialized input against the payload cap

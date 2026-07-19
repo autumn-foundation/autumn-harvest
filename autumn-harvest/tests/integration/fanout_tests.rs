@@ -895,3 +895,527 @@ async fn fan_out_two_groups_in_same_workflow() {
         other => panic!("expected Completed, got {other:?}"),
     }
 }
+
+// ===========================================================================
+// Bounded / windowed activity fan-out (issue #750)
+// ===========================================================================
+
+use autumn_harvest::context::WorkflowCommand;
+use autumn_harvest::info::WorkflowHandlerFn;
+
+/// Windowed raw fan-out handler. Reads `{ "n": <count>, "w": <window> }` from
+/// the workflow input (recorded state), builds `n` distinct activities each
+/// with input `json!(i)`, and fans out with window `w`.
+fn windowed_raw_handler<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["n"].as_u64().unwrap_or(0)).unwrap_or(0);
+        let w = usize::try_from(input["w"].as_u64().unwrap_or(1)).unwrap_or(1);
+        let activities: Vec<_> = (0..n)
+            .map(|i| (format!("task_{i}"), json!(i), "default".to_string()))
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw_windowed(activities, w)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "results": results }))
+    })
+}
+
+/// Windowed collect-all raw fan-out handler.
+fn windowed_collect_handler<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["n"].as_u64().unwrap_or(0)).unwrap_or(0);
+        let w = usize::try_from(input["w"].as_u64().unwrap_or(1)).unwrap_or(1);
+        let activities: Vec<_> = (0..n)
+            .map(|i| (format!("task_{i}"), json!(i), "default".to_string()))
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_collect_raw_windowed(activities, w)
+            .await
+            .map_err(|e| e.to_string())?;
+        let serialized: Vec<Value> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => json!({ "ok": v }),
+                Err(e) => json!({ "err": e }),
+            })
+            .collect();
+        Ok(json!({ "results": serialized }))
+    })
+}
+
+/// Drive a workflow through repeated `run_workflow` cycles, feeding each
+/// suspension's `ScheduleActivity` commands back as recorded
+/// `ActivityScheduled` + `ActivityCompleted`/`ActivityFailed` events until the
+/// workflow reaches a terminal outcome.
+///
+/// `output_fn(name, input) -> Ok(output) | Err(error)` decides each activity's
+/// recorded result. Returns `(outcome, max_scheduled_per_suspension,
+/// total_scheduled, history)`.
+async fn drive_windowed<F>(
+    handler: WorkflowHandlerFn,
+    input: Value,
+    output_fn: F,
+) -> (WorkflowOutcome, usize, usize, Vec<WorkflowEvent>)
+where
+    F: Fn(&str, &Value) -> Result<Value, String>,
+{
+    let exec_id = ExecutionId::new();
+    let mut history = vec![WorkflowEvent::WorkflowStarted {
+        input: input.clone(),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+
+    let mut max_per_suspension = 0usize;
+    let mut total_scheduled = 0usize;
+
+    for _guard in 0..1000 {
+        let outcome = run_workflow(exec_id, history.clone(), handler, input.clone()).await;
+        match outcome {
+            WorkflowOutcome::Suspended { commands } => {
+                let sched_this_wave = commands
+                    .iter()
+                    .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                    .count();
+                max_per_suspension = max_per_suspension.max(sched_this_wave);
+
+                for cmd in &commands {
+                    match cmd {
+                        WorkflowCommand::RecordMarker { name, details } => {
+                            history.push(WorkflowEvent::MarkerRecorded {
+                                name: name.clone(),
+                                details: details.clone(),
+                            });
+                        }
+                        WorkflowCommand::ScheduleActivity {
+                            activity_id,
+                            name,
+                            input,
+                            queue,
+                            ..
+                        } => {
+                            history.push(WorkflowEvent::ActivityScheduled {
+                                activity_id: *activity_id,
+                                name: name.clone(),
+                                input: input.clone(),
+                                queue: queue.clone(),
+                            });
+                            total_scheduled += 1;
+                            match output_fn(name, input) {
+                                Ok(output) => history.push(WorkflowEvent::ActivityCompleted {
+                                    activity_id: *activity_id,
+                                    output,
+                                }),
+                                Err(error) => history.push(WorkflowEvent::ActivityFailed {
+                                    activity_id: *activity_id,
+                                    error,
+                                    attempt: 1,
+                                    error_type: "Error".into(),
+                                    non_retryable: false,
+                                    details: None,
+                                }),
+                            }
+                        }
+                        other => panic!("unexpected command in windowed fan-out drive: {other:?}"),
+                    }
+                }
+            }
+            terminal => return (terminal, max_per_suspension, total_scheduled, history),
+        }
+    }
+    panic!("windowed fan-out drive did not terminate within 1000 cycles");
+}
+
+/// AC2 (first wave): W=2 over 5 inputs — a single `run_workflow` cycle from a
+/// bare `WorkflowStarted` suspends with exactly 2 `ScheduleActivity` and a
+/// `fan_out:` marker recording N=5 (never W).
+#[tokio::test]
+async fn windowed_fan_out_first_wave_schedules_at_most_window() {
+    let exec_id = ExecutionId::new();
+    let history = vec![WorkflowEvent::WorkflowStarted {
+        input: json!({ "n": 5, "w": 2 }),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+
+    let outcome = run_workflow(exec_id, history, windowed_raw_handler, json!({ "n": 5, "w": 2 })).await;
+
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let schedule_count = commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                .count();
+            assert_eq!(schedule_count, 2, "first wave must schedule exactly W=2; got {commands:?}");
+
+            let marker = commands.iter().find_map(|c| match c {
+                WorkflowCommand::RecordMarker { name, details } if name.starts_with("fan_out:") => {
+                    Some(details.clone())
+                }
+                _ => None,
+            });
+            assert_eq!(marker, Some(json!(5u64)), "marker must record N=5, never W");
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+}
+
+/// AC2 (core): W=3 over 10 inputs — EVERY suspension schedules at most W=3
+/// activities, and all 10 inputs are ultimately processed in input order.
+#[tokio::test]
+async fn windowed_fan_out_at_most_window_in_flight_every_wave() {
+    let (outcome, max_per_suspension, total_scheduled, _history) =
+        drive_windowed(windowed_raw_handler, json!({ "n": 10, "w": 3 }), |_name, input| {
+            Ok(json!(format!("done_{input}")))
+        })
+        .await;
+
+    assert!(
+        max_per_suspension <= 3,
+        "no suspension may schedule more than W=3; peak was {max_per_suspension}"
+    );
+    assert_eq!(total_scheduled, 10, "all 10 inputs must be scheduled exactly once");
+
+    match outcome {
+        WorkflowOutcome::Completed { output, .. } => {
+            let results = output["results"].as_array().unwrap();
+            assert_eq!(results.len(), 10);
+            for (i, r) in results.iter().enumerate() {
+                assert_eq!(*r, json!(format!("done_{i}")), "slot {i} out of order");
+            }
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// AC3: results are returned in input order (W=2 over [1..5], activity doubles).
+#[tokio::test]
+async fn windowed_fan_out_processes_all_inputs_in_order() {
+    let (outcome, _max, total, _history) =
+        drive_windowed(windowed_raw_handler, json!({ "n": 5, "w": 2 }), |_name, input| {
+            let v = input.as_u64().unwrap();
+            Ok(json!(v * 2))
+        })
+        .await;
+
+    assert_eq!(total, 5);
+    match outcome {
+        WorkflowOutcome::Completed { output, .. } => {
+            let results = output["results"].as_array().unwrap();
+            assert_eq!(results, &vec![json!(0), json!(2), json!(4), json!(6), json!(8)]);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// Project a command list to a comparable representation that ignores random
+/// `activity_id`s and non-comparable `result_tx` channels.
+fn project_commands(commands: &[WorkflowCommand]) -> Vec<String> {
+    commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::RecordMarker { name, details } => {
+                Some(format!("marker:{name}:{details}"))
+            }
+            WorkflowCommand::ScheduleActivity {
+                name, input, queue, ..
+            } => Some(format!("schedule:{name}:{input}:{queue}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AC4: `W >= N` produces command history **identical** to the unbounded path.
+#[tokio::test]
+async fn windowed_window_ge_count_identical_history_to_unbounded() {
+    let exec_id = ExecutionId::new();
+    let started = |input: Value| {
+        vec![WorkflowEvent::WorkflowStarted {
+            input,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }]
+    };
+
+    // Unbounded fan-out over 4 inputs.
+    let unbounded_out = run_workflow(
+        exec_id,
+        started(Value::Null),
+        fan_out_three_parallel_n4,
+        Value::Null,
+    )
+    .await;
+    // Windowed(W=100 >= N=4) over the same 4 inputs.
+    let windowed_out = run_workflow(
+        exec_id,
+        started(json!({ "n": 4, "w": 100 })),
+        windowed_raw_handler,
+        json!({ "n": 4, "w": 100 }),
+    )
+    .await;
+
+    let unbounded_cmds = match unbounded_out {
+        WorkflowOutcome::Suspended { commands } => project_commands(&commands),
+        other => panic!("unbounded expected Suspended, got {other:?}"),
+    };
+    let windowed_cmds = match windowed_out {
+        WorkflowOutcome::Suspended { commands } => project_commands(&commands),
+        other => panic!("windowed expected Suspended, got {other:?}"),
+    };
+
+    assert_eq!(
+        unbounded_cmds, windowed_cmds,
+        "W>=N must emit identical marker + N ScheduleActivity commands in the same order"
+    );
+}
+
+/// Unbounded raw fan-out over 4 inputs named `task_{i}` with input `json!(i)`,
+/// matching `windowed_raw_handler`'s activity shape so the two are comparable.
+fn fan_out_three_parallel_n4<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activities: Vec<_> = (0..4)
+            .map(|i| (format!("task_{i}"), json!(i), "default".to_string()))
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw(activities)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "results": results }))
+    })
+}
+
+/// AC5: `W == 0` clamps to 1 — never panics, hangs, or no-ops. Each suspension
+/// schedules at most 1, all inputs processed.
+#[tokio::test]
+async fn windowed_fan_out_w_zero_clamps_to_one() {
+    let (outcome, max_per_suspension, total, _history) =
+        drive_windowed(windowed_raw_handler, json!({ "n": 3, "w": 0 }), |_name, input| {
+            Ok(json!(format!("done_{input}")))
+        })
+        .await;
+
+    assert!(
+        max_per_suspension <= 1,
+        "W=0 must clamp to 1; peak scheduled was {max_per_suspension}"
+    );
+    assert_eq!(total, 3, "all 3 inputs must still be processed");
+    assert!(matches!(outcome, WorkflowOutcome::Completed { .. }));
+}
+
+/// Collect-all: W=2 over 4, slot 1 fails — returns 4 per-slot results (slot 1 =
+/// Err) and wave 2 IS dispatched (all 4 scheduled).
+#[tokio::test]
+async fn windowed_fan_out_collect_all_processes_every_input_despite_failure() {
+    let (outcome, _max, total, _history) =
+        drive_windowed(windowed_collect_handler, json!({ "n": 4, "w": 2 }), |_name, input| {
+            if *input == json!(1u64) {
+                Err("slot_1_failed".into())
+            } else {
+                Ok(json!(format!("ok_{input}")))
+            }
+        })
+        .await;
+
+    assert_eq!(total, 4, "collect-all must dispatch every wave (all 4 inputs)");
+    match outcome {
+        WorkflowOutcome::Completed { output, .. } => {
+            let results = output["results"].as_array().unwrap();
+            assert_eq!(results.len(), 4);
+            assert!(results[0].get("ok").is_some());
+            assert!(results[1].get("err").is_some());
+            assert!(results[1]["err"].as_str().unwrap().contains("slot_1_failed"));
+            assert!(results[2].get("ok").is_some());
+            assert!(results[3].get("ok").is_some());
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// Fail-fast: W=2 over 4, a wave-1 slot fails — returns Err and wave 2 is
+/// NEVER dispatched (only 2 scheduled). Pins the fail-fast backpressure.
+#[tokio::test]
+async fn windowed_fan_out_fail_fast_stops_launching_after_wave_failure() {
+    let (outcome, _max, total, _history) =
+        drive_windowed(windowed_raw_handler, json!({ "n": 4, "w": 2 }), |_name, input| {
+            if *input == json!(1u64) {
+                Err("boom".into())
+            } else {
+                Ok(json!("ok"))
+            }
+        })
+        .await;
+
+    assert_eq!(
+        total, 2,
+        "fail-fast must not dispatch wave 2 after a wave-1 failure; scheduled {total}"
+    );
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(error.contains("boom"), "error should mention boom; got {error}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// Shared seq counter: a windowed fan-out then an unbounded fan-out → markers
+/// `fan_out:1`, `fan_out:2`.
+#[tokio::test]
+async fn windowed_fan_out_shares_seq_counter() {
+    fn windowed_then_unbounded<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let b1 = ctx
+                .execute_activity_fan_out_raw_windowed(
+                    vec![("w1".to_string(), json!(0), "default".to_string())],
+                    2,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let b2 = ctx
+                .execute_activity_fan_out_raw(vec![("u1".to_string(), json!(1), "default".to_string())])
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "b1": b1, "b2": b2 }))
+        })
+    }
+
+    let (outcome, _max, _total, history) =
+        drive_windowed(windowed_then_unbounded, Value::Null, |_name, _input| Ok(json!("r"))).await;
+
+    assert!(matches!(outcome, WorkflowOutcome::Completed { .. }));
+    let markers: Vec<String> = history
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:") => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(markers, vec!["fan_out:1".to_string(), "fan_out:2".to_string()]);
+}
+
+/// Empty windowed fan-out records `marker(count=0)` then returns empty (AC:
+/// preserve empty-input ordering — marker recorded BEFORE the empty check).
+#[tokio::test]
+async fn windowed_fan_out_empty_records_marker_and_returns_empty() {
+    let exec_id = ExecutionId::new();
+    let history = vec![WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }];
+    let ctx = WorkflowContext::for_replay(exec_id, history);
+
+    let results = ctx
+        .execute_activity_fan_out_raw_windowed(vec![], 2)
+        .await
+        .expect("empty windowed fan-out should succeed");
+    assert!(results.is_empty(), "empty fan-out returns empty vec");
+
+    let commands = ctx.drain_commands();
+    let marker = commands.iter().find_map(|c| match c {
+        WorkflowCommand::RecordMarker { name, details } if name.starts_with("fan_out:") => {
+            Some(details.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(marker, Some(json!(0u64)), "empty fan-out must record marker(count=0)");
+}
+
+/// Count mismatch: history recorded marker(count=3) but code (windowed) supplies
+/// 2 → non-deterministic failure, same as unbounded.
+#[tokio::test]
+async fn windowed_fan_out_count_mismatch_non_deterministic() {
+    let exec_id = ExecutionId::new();
+    let ids: Vec<ActivityExecId> = (0..3).map(|_| ActivityExecId::new()).collect();
+
+    let mut history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: json!({ "n": 2, "w": 2 }),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64), // recorded 3
+        },
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        history.push(WorkflowEvent::ActivityScheduled {
+            activity_id: *id,
+            name: format!("task_{i}"),
+            input: json!(i),
+            queue: "default".into(),
+        });
+    }
+    for (i, id) in ids.iter().enumerate() {
+        history.push(WorkflowEvent::ActivityCompleted {
+            activity_id: *id,
+            output: json!(format!("r{i}")),
+        });
+    }
+
+    // Code now supplies only 2 (windowed).
+    let outcome = run_workflow(exec_id, history, windowed_raw_handler, json!({ "n": 2, "w": 2 })).await;
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            let e = error.to_lowercase();
+            assert!(
+                e.contains("non-deterministic") || e.contains("fan_out") || e.contains("count"),
+                "error should mention non-determinism/fan_out/count; got {error}"
+            );
+        }
+        other => panic!("expected Failed (non-determinism), got {other:?}"),
+    }
+}
+
+/// Cancellation: a cancelled ctx → `HarvestError::Cancelled` before dispatch.
+#[tokio::test]
+async fn windowed_fan_out_cancellation_returns_cancelled() {
+    let exec_id = ExecutionId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: json!({ "n": 3, "w": 2 }),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowCancelled {
+            reason: "user_requested".into(),
+        },
+    ];
+    let outcome = run_workflow(exec_id, history, windowed_raw_handler, json!({ "n": 3, "w": 2 })).await;
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(
+                error.contains("cancel"),
+                "cancelled windowed fan-out should report cancellation; got {error}"
+            );
+        }
+        other => panic!("expected Failed (Cancelled), got {other:?}"),
+    }
+}
