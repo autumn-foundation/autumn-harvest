@@ -5,6 +5,8 @@
 //! 1. Fail-fast fan-out: N items processed in parallel; returns on first failure.
 //! 2. Collect-all fan-out: N items processed in parallel; per-slot success/failure.
 //! 3. Dynamic fan-out derived from a prior activity's output.
+//! 4. Bounded / windowed fan-out: process a collection larger than the window,
+//!    keeping at most `W` activities in flight at a time (issue #750).
 //!
 //! The input collection MUST be derived from already-recorded state (workflow
 //! input, prior activity outputs, signals) — never from non-deterministic
@@ -150,6 +152,36 @@ pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<Ba
     Ok(BatchResult { succeeded, failed })
 }
 
+/// Bounded / windowed fan-out (issue #750): process a large collection with at
+/// most `W` activities in flight at a time, applying natural backpressure to
+/// workers and downstreams instead of scheduling all `N` at once.
+///
+/// The entire windowed step is a single method call — replacing the ~30-line
+/// manual "loop / slice / call fan-out per chunk / stitch results" idiom:
+/// ```rust,ignore
+/// let results = ctx
+///     .execute_activity_fan_out_windowed(&process_item_info(), input.items, 10)
+///     .await.map_err(|e| e.to_string())?;
+/// ```
+#[workflow]
+pub async fn windowed_batch(
+    ctx: &WorkflowContext,
+    input: BatchInput,
+) -> Result<Vec<ItemResult>, String> {
+    // `input.items` may be far larger than the window (10); at most 10 of these
+    // activities are ever scheduled-but-not-completed at once, yet every item is
+    // processed and the results come back in input order.
+    let results = ctx
+        .execute_activity_fan_out_windowed(&process_item_info(), input.items, 10)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "[Workflow] windowed_batch: all {} items processed, <= 10 in flight at a time",
+        results.len()
+    );
+    Ok(results)
+}
+
 fn main() {
     println!("fanout_batch example loaded successfully!");
     println!();
@@ -157,9 +189,59 @@ fn main() {
     println!("  fail_fast_batch   — parallel fan-out, stops on first failure");
     println!("  collect_all_batch — parallel fan-out, collects per-slot results");
     println!("  dynamic_fan_out   — N derived from a prior activity's output");
+    println!("  windowed_batch    — bounded fan-out, <= W activities in flight at a time");
     println!();
     println!(
-        "Register on a HarvestBuilder:\n  .workflows(workflows![fail_fast_batch, collect_all_batch, dynamic_fan_out])"
+        "Register on a HarvestBuilder:\n  .workflows(workflows![fail_fast_batch, collect_all_batch, dynamic_fan_out, windowed_batch])"
     );
     println!("  .activities(activities![process_item, fetch_items])");
+}
+
+// Embedded tests exercise the windowed fan-out with the in-process
+// `WorkflowTestEnv` harness (requires the `testing` feature):
+//   cargo test -p autumn-harvest --features testing --example fanout_batch
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::*;
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::testing::WorkflowTestEnv;
+    use serde_json::json;
+
+    /// A windowed fan-out over 12 items (window 10) processes every item in
+    /// input order and records all 12 activity events — the harness drives the
+    /// two waves (10 + 2) to completion without any manual batching glue.
+    #[tokio::test]
+    async fn windowed_batch_processes_a_collection_larger_than_the_window() {
+        let items: Vec<String> = (0..12).map(|i| format!("item_{i}")).collect();
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("process_item", |input| {
+                let item = input.as_str().unwrap_or_default().to_string();
+                Ok(json!({ "item": item, "processed": true }))
+            })
+            .run(
+                windowed_batch_info().handler,
+                json!({ "items": items.clone() }),
+            )
+            .await;
+
+        let result: Vec<ItemResult> = serde_json::from_value(
+            outcome
+                .result
+                .clone()
+                .expect("windowed_batch should succeed"),
+        )
+        .expect("result should deserialize");
+        assert_eq!(result.len(), 12, "every item processed");
+        for (i, r) in result.iter().enumerate() {
+            assert_eq!(r.item, format!("item_{i}"), "results in input order");
+            assert!(r.processed);
+        }
+
+        let scheduled = outcome
+            .events()
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "process_item"))
+            .count();
+        assert_eq!(scheduled, 12, "all 12 activities scheduled exactly once");
+    }
 }
