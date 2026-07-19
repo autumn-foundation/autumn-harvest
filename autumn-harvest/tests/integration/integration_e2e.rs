@@ -10549,16 +10549,20 @@ async fn insert_named_execution(
 
 /// Count `harvest_task_queue` rows in `RUNNING`/`PENDING` state that are
 /// activity tasks attributable to a specific workflow execution.
-async fn count_active_activity_rows(database_url: &str, exec_id: ExecutionId) -> i64 {
-    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect for activity-row count");
+///
+/// Takes a caller-owned connection so a polling loop can reuse ONE connection
+/// across all polls rather than establishing (and dropping) a fresh connection
+/// on every sample.
+async fn count_active_activity_rows(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> i64 {
     harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .filter(harvest_task_queue::state.eq_any(["RUNNING", "PENDING"]))
         .count()
-        .get_result(&mut conn)
+        .get_result(conn)
         .await
         .expect("failed to count active activity rows")
 }
@@ -10601,8 +10605,14 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
         let peak = Arc::clone(&peak);
         let done = Arc::clone(&done);
         tokio::spawn(async move {
+            // Open ONE connection for the whole poll loop instead of establishing
+            // (and dropping) a fresh connection on every 5ms sample.
+            let mut poll_conn =
+                <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&url)
+                    .await
+                    .expect("failed to connect for activity-row polling");
             while !std::sync::atomic::AtomicBool::load(&done, Ordering::SeqCst) {
-                let n = count_active_activity_rows(&url, windowed_exec).await;
+                let n = count_active_activity_rows(&mut poll_conn, windowed_exec).await;
                 let n = usize::try_from(n).unwrap_or(0);
                 AtomicUsize::fetch_max(&peak, n, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(5)).await;

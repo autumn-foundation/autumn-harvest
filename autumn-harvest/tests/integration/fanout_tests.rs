@@ -1786,3 +1786,272 @@ async fn windowed_fan_out_resumes_under_decreased_window() {
         "resuming under a decreased window must still produce input-order results"
     );
 }
+
+/// Build a full-replay windowed collect history: `marker(count=N)` + N
+/// `ActivityScheduled` (input order, all named `activity_name`) + a terminal
+/// event per slot as decided by `slot(i) -> Ok(output) | Err(error)`.
+fn windowed_collect_full_history<S>(
+    activity_name: &str,
+    n: usize,
+    slot: S,
+) -> (ExecutionId, Vec<WorkflowEvent>)
+where
+    S: Fn(usize) -> Result<Value, String>,
+{
+    let exec_id = ExecutionId::new();
+    let ids: Vec<ActivityExecId> = (0..n).map(|_| ActivityExecId::new()).collect();
+    let mut history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(n as u64),
+        },
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        history.push(WorkflowEvent::ActivityScheduled {
+            activity_id: *id,
+            name: activity_name.into(),
+            input: json!(i),
+            queue: "default".into(),
+        });
+    }
+    for (i, id) in ids.iter().enumerate() {
+        match slot(i) {
+            Ok(output) => history.push(WorkflowEvent::ActivityCompleted {
+                activity_id: *id,
+                output,
+            }),
+            Err(error) => history.push(WorkflowEvent::ActivityFailed {
+                activity_id: *id,
+                error,
+                attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
+            }),
+        }
+    }
+    (exec_id, history)
+}
+
+/// An `ActivityInfo` for a remote (non-local) activity that echoes its input.
+fn windowed_test_activity_info(name: &'static str) -> autumn_harvest::info::ActivityInfo {
+    autumn_harvest::info::ActivityInfo {
+        name,
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("default"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        requires: None,
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    }
+}
+
+/// MAJOR-1: typed windowed collect-all (`execute_activity_fan_out_collect_windowed`)
+/// over N=3 > W=2 where slot 1 fails — the `Vec<Result<i64, String>>` carries
+/// correctly-deserialized `Ok(typed)` slots and the `Err(String)` slot in input
+/// order. (This method had ZERO coverage before.)
+#[tokio::test]
+async fn windowed_typed_collect_returns_typed_ok_and_err_slots_in_order() {
+    let info = windowed_test_activity_info("dbl");
+    let (exec_id, history) = windowed_collect_full_history("dbl", 3, |i| match i {
+        1 => Err("slot_1_boom".to_string()),
+        _ => Ok(json!((i as i64) * 10)),
+    });
+    let ctx = WorkflowContext::for_replay(exec_id, history);
+
+    let results: Vec<Result<i64, String>> = ctx
+        .execute_activity_fan_out_collect_windowed(&info, vec![0i64, 1, 2], 2)
+        .await
+        .expect("collect windowed should not fail at the engine level");
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0], Ok(0), "slot 0 typed output");
+    assert!(results[1].is_err(), "slot 1 should carry the per-slot error");
+    assert!(
+        results[1].as_ref().unwrap_err().contains("slot_1_boom"),
+        "slot 1 error preserved: {:?}",
+        results[1]
+    );
+    assert_eq!(results[2], Ok(20), "slot 2 typed output");
+}
+
+/// MAJOR-1: typed windowed collect-all where a SUCCESSFUL slot returns JSON that
+/// cannot deserialize into `O` — the outer `Result` fails with
+/// `HarvestError::Serialization` (the per-slot `Ok` is not swallowed).
+#[tokio::test]
+async fn windowed_typed_collect_surfaces_deserialization_error() {
+    use autumn_harvest::error::HarvestError;
+
+    let info = windowed_test_activity_info("dbl");
+    // Slot 0 succeeds but returns a string that is not a valid `i64`.
+    let (exec_id, history) = windowed_collect_full_history("dbl", 2, |i| match i {
+        0 => Ok(json!("not_a_number")),
+        _ => Ok(json!(20)),
+    });
+    let ctx = WorkflowContext::for_replay(exec_id, history);
+
+    let results: Result<Vec<Result<i64, String>>, HarvestError> = ctx
+        .execute_activity_fan_out_collect_windowed::<i64, i64>(&info, vec![0, 1], 1)
+        .await;
+
+    assert!(
+        matches!(results, Err(HarvestError::Serialization(_))),
+        "a successful slot with un-deserializable output must surface \
+         HarvestError::Serialization at the outer level; got {results:?}"
+    );
+}
+
+/// MINOR: mid-multi-wave cancellation — a fan-out whose reconstructed context is
+/// cancelled after wave 1 completed short-circuits at the top before dispatching
+/// wave 2. The run fails with a cancellation (never Suspended with fresh
+/// ScheduleActivity commands for wave 2).
+#[tokio::test]
+async fn windowed_fan_out_mid_wave_cancellation_does_not_dispatch_next_wave() {
+    let exec_id = ExecutionId::new();
+    let id0 = ActivityExecId::new();
+    let id1 = ActivityExecId::new();
+    let input = json!({ "n": 4, "w": 2 });
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(4u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id0,
+            name: "task_0".into(),
+            input: json!(0),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "task_1".into(),
+            input: json!(1),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id0,
+            output: json!("r0"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: json!("r1"),
+        },
+        WorkflowEvent::WorkflowCancelled {
+            reason: "user_requested".into(),
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, windowed_raw_handler, input).await;
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(
+                error.contains("cancel"),
+                "a cancelled mid-wave fan-out must report cancellation; got {error}"
+            );
+        }
+        // Anything other than Failed(Cancelled) — in particular a Suspended
+        // batch carrying wave-2 ScheduleActivity commands — is the bug.
+        other => panic!("expected Failed (Cancelled), not a wave-2 dispatch; got {other:?}"),
+    }
+}
+
+/// MINOR: collect-all where an ENTIRE wave fails — W=2, N=4, both slot 0 and
+/// slot 1 fail — the next wave is still dispatched and all 4 inputs processed
+/// (results `[Err, Err, Ok, Ok]`).
+#[tokio::test]
+async fn windowed_collect_all_whole_wave_failure_still_dispatches_next_wave() {
+    let (outcome, _max, total, _history) = drive_windowed(
+        windowed_collect_handler,
+        json!({ "n": 4, "w": 2 }),
+        |_name, input| {
+            let i = input.as_u64().unwrap_or(u64::MAX);
+            if i == 0 || i == 1 {
+                Err(format!("wave1_fail_{i}"))
+            } else {
+                Ok(json!(format!("ok_{i}")))
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(
+        total, 4,
+        "collect-all must dispatch wave 2 even when wave 1 fails entirely; scheduled {total}"
+    );
+    match outcome {
+        WorkflowOutcome::Completed { output, .. } => {
+            let results = output["results"].as_array().unwrap();
+            assert_eq!(results.len(), 4);
+            assert!(results[0].get("err").is_some(), "slot 0 err");
+            assert!(results[1].get("err").is_some(), "slot 1 err");
+            assert!(results[2].get("ok").is_some(), "slot 2 ok");
+            assert!(results[3].get("ok").is_some(), "slot 3 ok");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// MINOR: the windowed TYPED methods reject `is_local = true` activities with
+/// `HarvestError::Config`, mirroring the unbounded typed methods.
+#[tokio::test]
+async fn windowed_typed_methods_reject_local_activities() {
+    use autumn_harvest::error::HarvestError;
+
+    let mut info = windowed_test_activity_info("local_thing");
+    info.is_local = true;
+
+    let exec_id = ExecutionId::new();
+    let ctx = WorkflowContext::for_replay(
+        exec_id,
+        vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+    );
+
+    let fail_fast: Result<Vec<Value>, HarvestError> = ctx
+        .execute_activity_fan_out_windowed(&info, vec![json!(1)], 2)
+        .await;
+    assert!(
+        matches!(fail_fast, Err(HarvestError::Config(_))),
+        "windowed fail-fast must reject local activities; got {fail_fast:?}"
+    );
+
+    let collect: Result<Vec<Result<Value, String>>, HarvestError> = ctx
+        .execute_activity_fan_out_collect_windowed(&info, vec![json!(1)], 2)
+        .await;
+    assert!(
+        matches!(collect, Err(HarvestError::Config(_))),
+        "windowed collect must reject local activities; got {collect:?}"
+    );
+}

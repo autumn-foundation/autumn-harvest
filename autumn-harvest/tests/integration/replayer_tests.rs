@@ -9132,6 +9132,20 @@ async fn replayer_windowed_fan_out_randomized_completion_order() {
         v
     }
 
+    // Guard against a vacuous pass: if `perm` were ever refactored to the
+    // identity, the "randomized order" claim would be silently false. Require at
+    // least two DISTINCT non-identity permutations across the seeds.
+    let identity = vec![0usize, 1, 2, 3];
+    let non_identity: std::collections::BTreeSet<Vec<usize>> = (0..30)
+        .map(perm)
+        .filter(|o| *o != identity)
+        .collect();
+    assert!(
+        non_identity.len() >= 2,
+        "the completion-order generator must produce >=2 distinct non-input orderings; \
+         got {non_identity:?}"
+    );
+
     for seed in 0..30 {
         let order = perm(seed);
         let (exec_id, events) = windowed_fan_out_history(&order);
@@ -9161,5 +9175,176 @@ async fn replayer_windowed_fan_out_randomized_completion_order() {
             }
             other => panic!("seed {seed}: expected Completed, got {other:?}"),
         }
+    }
+}
+
+/// Build a genuinely WINDOWED-SHAPED recorded history (the shape a `W=2`
+/// fan-out actually records): `marker(count=4)` then, per wave, all of that
+/// wave's `ActivityScheduled` followed by that wave's `ActivityCompleted` —
+/// `Sched0, Sched1, Comp0, Comp1, Sched2, Sched3, Comp2, Comp3`. This differs
+/// from [`windowed_fan_out_history`], which records the unbounded shape (all 4
+/// scheduled up front, then all completions).
+fn windowed_shaped_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let ids: Vec<ActivityExecId> = (0..4).map(|_| ActivityExecId::new()).collect();
+    let mut events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: serde_json::json!(4u64),
+        },
+    ];
+    // Two waves of two, each scheduled-then-completed before the next wave.
+    for wave in [[0usize, 1], [2, 3]] {
+        for &i in &wave {
+            events.push(WorkflowEvent::ActivityScheduled {
+                activity_id: ids[i],
+                name: format!("task_{i}"),
+                input: serde_json::json!(i),
+                queue: "default".into(),
+            });
+        }
+        for &i in &wave {
+            events.push(WorkflowEvent::ActivityCompleted {
+                activity_id: ids[i],
+                output: serde_json::json!(format!("done_{i}")),
+            });
+        }
+    }
+    (exec_id, events)
+}
+
+/// MAJOR-2 / AC6: a genuinely windowed-SHAPED recorded history (scheduled +
+/// completed wave-by-wave, `W=2`) replays clean under DIFFERENT windows (`W=1`,
+/// `W=4`, and the unbounded path) and produces byte-identical input-order
+/// results — proving the two-phase resume walks a windowed-shaped history
+/// correctly regardless of the replaying code's window. The pre-existing
+/// window-independence fixtures only exercise the unbounded-shaped history.
+#[tokio::test]
+async fn replayer_windowed_shaped_history_replays_under_any_window() {
+    let (exec_id, events) = windowed_shaped_fan_out_history();
+
+    for (name, handler) in [
+        ("windowed_replay_w1", windowed_replay_w1 as WorkflowHandlerFn),
+        ("windowed_replay_w4", windowed_replay_w4 as WorkflowHandlerFn),
+        ("unbounded_replay_4", unbounded_replay_4 as WorkflowHandlerFn),
+    ] {
+        let report = WorkflowReplayer::new()
+            .register_fn(name, handler)
+            .replay_from_snapshot(make_snapshot(name, exec_id, events.clone()))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{name} must replay a windowed-shaped history clean: {report}"
+        );
+
+        let outcome =
+            autumn_harvest::executor::run_workflow(exec_id, events.clone(), handler, Value::Null)
+                .await;
+        match outcome {
+            autumn_harvest::executor::WorkflowOutcome::Completed { output, .. } => {
+                assert_eq!(
+                    output,
+                    serde_json::json!({ "results": ["done_0", "done_1", "done_2", "done_3"] }),
+                    "{name}: windowed-shaped history must yield input-order results"
+                );
+            }
+            other => panic!("{name}: expected Completed, got {other:?}"),
+        }
+    }
+}
+
+/// A `W=4`-configured windowed replay handler (sibling of the `w1`/`w2`/`w100`
+/// handlers above) for the windowed-shaped-history coverage.
+fn windowed_replay_w4<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    windowed_replay_body(ctx, 4)
+}
+
+/// MINOR: a fail-fast bounded fan-out history — `marker(count=4)`, a partial
+/// wave scheduled (`W=2` → slots 0,1 only), slot 1 `ActivityFailed`, terminal
+/// `WorkflowFailed` — replays **cleanly** (deterministically reproduces the
+/// failure), i.e. `ReplayStatus::WorkflowFailed`, never
+/// `NonDeterminismDetected`.
+///
+/// Note: for a workflow that legitimately FAILS, "replays cleanly" surfaces as
+/// `WorkflowFailed` (the deterministic reproduction of the recorded failure) —
+/// `ReplaySucceeded` is reserved for a workflow that COMPLETES. This mirrors
+/// `replay_typed_workflow_failed_round_trips_with_identical_typed_fields`.
+#[tokio::test]
+async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministically() {
+    let exec_id = ExecutionId::new();
+    let ids: Vec<ActivityExecId> = (0..2).map(|_| ActivityExecId::new()).collect();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        // Marker records the FULL count (4), even though fail-fast only ever
+        // scheduled the first wave [0,1] before the failure aborted the fan-out.
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: serde_json::json!(4u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ids[0],
+            name: "task_0".into(),
+            input: serde_json::json!(0),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ids[1],
+            name: "task_1".into(),
+            input: serde_json::json!(1),
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: ids[0],
+            output: serde_json::json!("done_0"),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: ids[1],
+            error: "task_1_boom".into(),
+            attempt: 1,
+            error_type: "Error".into(),
+            non_retryable: false,
+            details: None,
+        },
+        WorkflowEvent::WorkflowFailed {
+            error: "task_1_boom".into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("windowed_replay_w2", windowed_replay_w2)
+        .replay_from_snapshot(make_snapshot("windowed_replay_w2", exec_id, events))
+        .await;
+
+    assert!(
+        !matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "a fail-fast bounded history must NOT surface false non-determinism: {report}"
+    );
+    match report.status {
+        ReplayStatus::WorkflowFailed { ref error, .. } => {
+            assert!(
+                error.contains("task_1_boom"),
+                "reproduced failure must carry the recorded activity error: {report}"
+            );
+        }
+        other => panic!("expected WorkflowFailed (clean reproduction), got {other:?}"),
     }
 }
