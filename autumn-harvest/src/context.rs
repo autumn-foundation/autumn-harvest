@@ -10222,6 +10222,63 @@ pub struct ActivityContext {
     /// worker reads afterward, so no `Arc` is required.
     #[cfg(feature = "db")]
     transactional_commit_occurred: std::sync::atomic::AtomicBool,
+    /// Cross-retry heartbeat timeout configured for this activity (issue #682).
+    ///
+    /// Required by [`Self::start_auto_heartbeat`] /
+    /// [`Self::start_auto_heartbeat_default`]: an auto-heartbeat whose liveness
+    /// pings are never checked by the timeout scanner would be a silent no-op,
+    /// so those methods reject when this is `None`. Set by the worker from the
+    /// task row's `heartbeat_timeout`; `None` for test / local / no-flusher
+    /// contexts unless [`Self::with_heartbeat_timeout`] is called.
+    heartbeat_timeout: Option<std::time::Duration>,
+    /// Shared last-heartbeat payload cell for the auto-heartbeat ticker
+    /// (issue #682).
+    ///
+    /// [`Self::heartbeat`] writes the most recent serialized payload here;
+    /// the background ticker started by [`Self::start_auto_heartbeat`] reads
+    /// it so a liveness ping re-sends the current checkpoint (last-write-wins)
+    /// rather than clobbering `harvest_task_queue.heartbeat_details` with a
+    /// sentinel. Seeded from the previous attempt's resume snapshot where one
+    /// is available, so the first liveness ping (before any manual heartbeat)
+    /// preserves the durable checkpoint (issue #151).
+    last_heartbeat_payload: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+/// RAII guard returned by [`ActivityContext::start_auto_heartbeat`] /
+/// [`ActivityContext::start_auto_heartbeat_default`] (issue #682).
+///
+/// Owns the background ticker task that periodically re-sends the activity's
+/// last heartbeat payload so a *progressing but not manually pinging* activity
+/// is not spuriously reclaimed by the heartbeat-timeout scanner. Dropping the
+/// guard (typically when the activity handler returns) stops the ticker; the
+/// activity's own cancellation token is a *parent* of the ticker's token, so
+/// cancelling the activity also stops the ticker without the guard swallowing
+/// the cancellation (the handler still observes it through
+/// [`ActivityContext::is_cancelled`] / [`ActivityContext::check_cancellation`]).
+#[must_use = "binding the guard to `_` drops it immediately and stops the auto-heartbeat; bind it to a named local like `let _guard = ...`"]
+pub struct AutoHeartbeatGuard {
+    /// Child of the activity's cancellation token; cancelled on drop.
+    stop: tokio_util::sync::CancellationToken,
+    /// The spawned ticker task.
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AutoHeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.handle.abort();
+    }
+}
+
+impl AutoHeartbeatGuard {
+    /// Test-only: whether the ticker task has terminated (used to prove the
+    /// ticker exits cleanly via `break` — never a panic — once the heartbeat
+    /// channel is closed).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn is_ticker_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
 }
 
 impl ActivityContext {
@@ -10256,6 +10313,8 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_timeout: None,
+            last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -10272,6 +10331,12 @@ impl ActivityContext {
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
             .then_some(NO_HEARTBEAT_FLUSHER_REASON);
+
+        // Seed the auto-heartbeat cell from the resume snapshot so the first
+        // liveness ping re-sends the existing checkpoint instead of clobbering
+        // it (issue #151 preservation, issue #682).
+        let last_heartbeat_payload =
+            std::sync::Arc::new(std::sync::Mutex::new(heartbeat_details.clone()));
 
         Self {
             state,
@@ -10293,6 +10358,8 @@ impl ActivityContext {
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_timeout: None,
+            last_heartbeat_payload,
         }
     }
 
@@ -10320,6 +10387,8 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_timeout: None,
+            last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -10355,6 +10424,31 @@ impl ActivityContext {
         headers: std::sync::Arc<HashMap<String, String>>,
     ) -> Self {
         self.context_headers = headers;
+        self
+    }
+
+    // ── Auto-heartbeat (issue #682) ───────────────────────────────────────────
+
+    /// Attach the activity's configured heartbeat timeout to this context.
+    ///
+    /// Required by [`Self::start_auto_heartbeat`] /
+    /// [`Self::start_auto_heartbeat_default`]. The worker sets this
+    /// automatically from the task row; you only need it when constructing a
+    /// context manually in tests.
+    #[must_use]
+    pub const fn with_heartbeat_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
+        self
+    }
+
+    /// Attach an optional heartbeat timeout (worker convenience — passes a
+    /// task row's `Option` straight through without a conditional rebind).
+    #[must_use]
+    pub(crate) const fn with_heartbeat_timeout_opt(
+        mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
+        self.heartbeat_timeout = timeout;
         self
     }
 
@@ -10676,6 +10770,15 @@ impl ActivityContext {
 
         let payload = serde_json::to_value(details)?;
 
+        // Record the latest payload in the shared cell so the auto-heartbeat
+        // ticker (issue #682) re-sends it as a liveness ping (last-write-wins),
+        // regardless of whether an auto-heartbeat guard is active. The std
+        // Mutex is never held across the `.await` below.
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+
         let Some(ref tx) = self.heartbeat_tx else {
             return Ok(());
         };
@@ -10684,6 +10787,163 @@ impl ActivityContext {
         })?;
 
         Ok(())
+    }
+
+    /// Start a background auto-heartbeat that keeps this activity alive without
+    /// manual `ctx.heartbeat(...)` calls (issue #682).
+    ///
+    /// Spawns a ticker that, every `interval`, re-sends the activity's most
+    /// recent heartbeat payload (or a `null` liveness ping if none was sent
+    /// yet) so a long-running-but-progressing activity is not spuriously
+    /// reclaimed by the heartbeat-timeout scanner. The returned
+    /// [`AutoHeartbeatGuard`] **must be bound to a named local** — binding it to
+    /// `_` drops it immediately and stops the ticker:
+    ///
+    /// ```rust,ignore
+    /// #[activity(heartbeat_timeout = "30s")]
+    /// async fn crunch(ctx: &ActivityContext, job: Job) -> Result<Report, String> {
+    ///     let _guard = ctx.start_auto_heartbeat(std::time::Duration::from_secs(10))
+    ///         .map_err(|e| e.to_string())?;
+    ///     // ... long CPU/IO work; no manual heartbeat needed ...
+    ///     Ok(report)
+    /// }
+    /// ```
+    ///
+    /// The ticker stops when the guard is dropped (typically when the handler
+    /// returns), when the activity's cancellation token fires (the ticker's
+    /// token is a *child* of it), or when the heartbeat channel closes. Because
+    /// the guard cancels only its own child token, cancelling the activity is
+    /// still observable to the handler via [`Self::is_cancelled`] /
+    /// [`Self::check_cancellation`] — the guard never swallows it.
+    ///
+    /// The re-sent payload is last-write-wins: whatever you last passed to
+    /// [`Self::heartbeat`] (or the previous attempt's durable checkpoint) is
+    /// what the liveness ping carries, so an auto-heartbeat never clobbers a
+    /// checkpoint used by [`Self::heartbeat_details`] on a later retry.
+    ///
+    /// # Liveness tradeoff
+    ///
+    /// Auto-heartbeat keeps a *progressing-but-not-manually-pinging* activity
+    /// alive, but it necessarily weakens heartbeat-based wedge detection: a
+    /// live-but-deadlocked future will keep emitting liveness pings too. The
+    /// independent `start_to_close` / `schedule_to_close` timeouts remain the
+    /// hard wedge ceiling and are unaffected by heartbeats, so pair
+    /// auto-heartbeat with a `start_to_close` when you need a guaranteed upper
+    /// bound on activity runtime.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] if this context does not support heartbeats
+    ///   (a local activity, or a context with no heartbeat flusher attached).
+    /// - [`HarvestError::Config`] if no `heartbeat_timeout` is configured for
+    ///   the activity: the liveness pings would never be checked by the timeout
+    ///   scanner, so an auto-heartbeat would be a silent no-op. Configure
+    ///   `#[activity(heartbeat_timeout = "..")]` (or remove the auto-heartbeat
+    ///   call).
+    pub fn start_auto_heartbeat(
+        &self,
+        interval: std::time::Duration,
+    ) -> crate::HarvestResult<AutoHeartbeatGuard> {
+        // Reject on local / no-flusher contexts up front (covers both the local
+        // activity reason and the missing-flusher reason).
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
+        }
+
+        if self.heartbeat_timeout.is_none() {
+            return Err(HarvestError::Config(
+                "start_auto_heartbeat requires the activity to have a heartbeat_timeout \
+                 configured; without one the liveness pings are never checked. Configure \
+                 #[activity(heartbeat_timeout = \"..\")] or remove the auto-heartbeat call."
+                    .into(),
+            ));
+        }
+
+        // A zero-period `tokio::time::interval` panics; clamp defensively.
+        let interval = interval.max(std::time::Duration::from_millis(1));
+
+        // The unsupported-reason gate above guarantees a flusher is attached;
+        // guard defensively regardless.
+        let Some(tx) = self.heartbeat_tx.clone() else {
+            return Err(HarvestError::Config(NO_HEARTBEAT_FLUSHER_REASON.into()));
+        };
+
+        let cell = std::sync::Arc::clone(&self.last_heartbeat_payload);
+        let stop = self.cancel.child_token();
+        let ticker_stop = stop.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first `tick()` completes immediately; an early liveness ping
+            // is harmless.
+            loop {
+                tokio::select! {
+                    biased;
+                    () = ticker_stop.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let payload = {
+                            let guard = cell
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard.clone().unwrap_or(serde_json::Value::Null)
+                        };
+                        // Channel closed => the flusher is gone; stop silently
+                        // (never panic).
+                        if tx.send(payload).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(AutoHeartbeatGuard { stop, handle })
+    }
+
+    /// Start a background auto-heartbeat whose tick interval is derived from the
+    /// activity's configured `heartbeat_timeout` (issue #682).
+    ///
+    /// Uses `heartbeat_timeout / 3` as the interval — frequent enough that a
+    /// single missed flush never trips the timeout, without excessive writes.
+    /// Equivalent to `ctx.start_auto_heartbeat(heartbeat_timeout / 3)`; see
+    /// [`Self::start_auto_heartbeat`] for the full contract (cancellation,
+    /// last-write-wins, and the liveness/`start_to_close` tradeoff).
+    ///
+    /// ```rust,ignore
+    /// #[activity(heartbeat_timeout = "30s")]
+    /// async fn crunch(ctx: &ActivityContext, job: Job) -> Result<Report, String> {
+    ///     let _guard = ctx.start_auto_heartbeat_default().map_err(|e| e.to_string())?;
+    ///     // ... long work; heartbeats happen automatically every ~10s ...
+    ///     Ok(report)
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] if this context does not support heartbeats
+    ///   (a local activity, or a context with no heartbeat flusher attached).
+    /// - [`HarvestError::Config`] if no `heartbeat_timeout` is configured, so
+    ///   there is nothing to derive the interval from. Use
+    ///   [`Self::start_auto_heartbeat`] with an explicit interval, or configure
+    ///   `#[activity(heartbeat_timeout = "..")]`.
+    pub fn start_auto_heartbeat_default(&self) -> crate::HarvestResult<AutoHeartbeatGuard> {
+        // Reject local / no-flusher contexts first, so the message matches the
+        // heartbeat-unsupported reason rather than the missing-timeout reason.
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
+        }
+
+        let Some(timeout) = self.heartbeat_timeout else {
+            return Err(HarvestError::Config(
+                "start_auto_heartbeat_default requires a configured heartbeat_timeout to \
+                 derive the tick interval; none is set. Use start_auto_heartbeat(interval) \
+                 with an explicit interval, or configure #[activity(heartbeat_timeout=\"..\")]."
+                    .into(),
+            ));
+        };
+
+        let interval = (timeout / 3).max(std::time::Duration::from_millis(1));
+        self.start_auto_heartbeat(interval)
     }
 
     /// Check whether the owning workflow has been cancelled.

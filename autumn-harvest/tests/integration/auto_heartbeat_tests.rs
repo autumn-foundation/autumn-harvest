@@ -33,7 +33,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::timeout::{self, TimeoutReason, find_timed_out_tasks};
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -297,7 +297,10 @@ fn long_auto_hb_activity(
     })
 }
 
-fn workflow_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+fn workflow_info(
+    name: &'static str,
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+) -> WorkflowInfo {
     WorkflowInfo {
         mcp: false,
         name,
@@ -393,8 +396,13 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
                     let mut c = scanner_pool.get().await.expect("scanner conn");
                     let _ = timeout::enforce_timeouts_once(
                         &mut c,
-                        &[ShardId::new(0)],
                         &NoOpMetrics,
+                        Duration::from_secs(60),
+                        &None,
+                        &[ShardId::new(0)],
+                        None,
+                        None,
+                        60,
                     )
                     .await;
                 }
@@ -457,15 +465,15 @@ async fn seed_running_activity(
     let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("wedge_activity".to_string());
-    params.heartbeat_timeout = heartbeat_timeout;
-    params.start_to_close = start_to_close;
-    let task_id = queue::enqueue(conn, &params).await.expect("enqueue activity");
+    params.heartbeat_timeout =
+        heartbeat_timeout.map(|d| chrono::Duration::from_std(d).expect("hb interval"));
+    params.start_to_close =
+        start_to_close.map(|d| chrono::Duration::from_std(d).expect("s2c interval"));
+    let task_id = queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue activity");
 
-    let hb_sql = if fresh_heartbeat {
-        "NOW()"
-    } else {
-        "NULL"
-    };
+    let hb_sql = if fresh_heartbeat { "NOW()" } else { "NULL" };
     diesel::sql_query(format!(
         "UPDATE harvest_task_queue \
          SET state = 'RUNNING', worker_id = 'w-1', \
@@ -483,7 +491,7 @@ async fn seed_running_activity(
 }
 
 fn reason_for(tasks: &[(TaskQueueItem, TimeoutReason)], id: Uuid) -> Option<TimeoutReason> {
-    tasks.iter().find(|(t, _)| t.id == id).map(|(_, r)| *r)
+    tasks.iter().find(|(t, _)| t.id == id).map(|(_, r)| r.clone())
 }
 
 #[tokio::test]
