@@ -46,17 +46,18 @@ use metrics::{Key, Label, counter, gauge, histogram};
 use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED,
     METRIC_ACTIVITY_PANIC, METRIC_ACTIVITY_RETRIES, METRIC_ADMISSION_BLOCKED,
-    METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_CIRCUIT_CLOSED,
-    METRIC_CIRCUIT_TRIPPED, METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
-    METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT,
-    METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
-    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
-    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
-    METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON,
-    METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
-    METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
-    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
-    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_ADMISSION_BYPASSED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_CANARY_FAILURE,
+    METRIC_CANARY_ROUNDTRIP, METRIC_CANARY_SUCCESS, METRIC_CIRCUIT_CLOSED, METRIC_CIRCUIT_TRIPPED,
+    METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED, METRIC_DEBOUNCE_FIRED,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
+    METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
+    METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER,
+    METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
+    METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATUS,
+    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_PAYLOAD_BYTES,
+    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
+    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE,
     METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED,
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_AUTO_PAUSED,
@@ -814,6 +815,33 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_canary_success(&self, queue: &str, shard: u16) {
+        counter!(
+            METRIC_CANARY_SUCCESS,
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
+    fn record_canary_failure(&self, queue: &str, shard: u16) {
+        counter!(
+            METRIC_CANARY_FAILURE,
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
+    fn record_canary_roundtrip(&self, queue: &str, shard: u16, duration_secs: f64) {
+        histogram!(
+            METRIC_CANARY_ROUNDTRIP,
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .record(duration_secs);
+    }
+
     fn record_signal_received(&self, workflow_name: &str, queue: &str) {
         // Issue #684 (Codex P2): no `name` label — signal names come from the
         // free-form send route and have no declared registry to bound them.
@@ -1047,6 +1075,17 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_summary_deleted("onboarding", 5);
         rec.record_summary_deleted("nightly_report", 0);
+    }
+
+    #[test]
+    fn record_canary_metrics_do_not_panic() {
+        // Synthetic liveness-canary bridges (issue #796). Two counters + one
+        // histogram, labeled `queue`,`shard`. Must not panic with no global
+        // recorder installed. Distinct from the #512 replay canary.
+        let rec = MetricsRsRecorder;
+        rec.record_canary_success("default", 0);
+        rec.record_canary_failure("email", 2);
+        rec.record_canary_roundtrip("default", 0, 0.42);
     }
 
     #[test]
