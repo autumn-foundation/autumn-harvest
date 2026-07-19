@@ -246,6 +246,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_ACTIVITY_RETRIES`  | `harvest.activity.retries`    | Counter      | `activity` (bounded), `queue` (bounded)       | `execution.id`, `activity.id` |
 | `METRIC_TIMER_STARTED`     | `harvest.timer.started`       | Counter      | _(none)_                                      |                       |
 | `METRIC_QUEUE_DEPTH`       | `harvest.queue.depth`         | Gauge        | `queue` (bounded)                             | `execution.id`        |
+| `METRIC_WORKFLOW_ACTIVE`   | `harvest.workflow.active`     | Gauge        | `workflow` (bounded), `state` (2 values: running/paused) | `execution.id` |
 | `METRIC_DLQ_ENTRIES`       | `harvest.dlq.entries`         | Gauge        | `shard` (≤ 256)                               |                       |
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |

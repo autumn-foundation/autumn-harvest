@@ -169,6 +169,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_schedule_overdue",
     "harvest_admission_gates_active",
     "harvest_workflow_history_oversized",
+    "harvest_workflow_active",
     "harvest_rate_limit_tokens_available",
     "harvest_rate_limit_refill_rate",
     "harvest_concurrency_in_flight",
@@ -220,6 +221,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_workflow_debounce_fired", &["workflow", "queue"]),
     ("harvest_workflow_start_throttled", &["workflow"]),
     ("harvest_workflow_history_oversized", &["workflow"]),
+    ("harvest_workflow_active", &["workflow", "state"]),
     ("harvest_saga_compensated", &["workflow", "queue"]),
     ("harvest_saga_compensation_failed", &["workflow", "queue"]),
     // Synthetic liveness canary (issue #796) — distinct from #512 replay canary.

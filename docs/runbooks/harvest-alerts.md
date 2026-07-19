@@ -1279,3 +1279,74 @@ to the caller's owning team when the source is a caller sending an unexpected
 signal. Page only if the dropped signal is on a critical control path (e.g. a
 cancel/approval the run must observe) and business-critical runs are visibly
 diverging.
+
+## harvest_workflow_population_leak
+
+**What to do when a workflow type's active population keeps growing:** the
+`harvest.workflow.active` gauge (issue #770) reports the live count of
+currently-active executions per workflow type, split by lifecycle state
+(`running` / `paused`). This alert fires when a type's active population rises
+steadily over an hour while its terminal completion rate (`harvest.workflow.terminal`)
+stays effectively flat — i.e. starts are outpacing completions and executions
+are accumulating rather than draining. That is the signature of a leak or a
+backlog, not a healthy burst that later drains. `PAUSED` runs count under
+`state="paused"`; nd-blocked runs (issue #603) stay `RUNNING` and count under
+`state="running"`. The gauge is summed across every shard.
+
+### Triage steps
+
+1. Read the `workflow` and `state` labels to identify which type is growing and
+   whether the growth is in `running` or `paused` executions.
+2. List the active runs to see how long they have been in flight:
+   `harvest workflow list --state RUNNING --limit 25` (or
+   `GET /api/harvest/workflows?state=RUNNING`). A large paused population instead
+   points at forgotten operator pauses (issue #383) — list `state=PAUSED`.
+3. Compare the start rate against the terminal rate for the type
+   (`harvest.workflow.started` vs `harvest.workflow.terminal`): a sustained gap
+   confirms the imbalance.
+4. Inspect a long-running instance with
+   `GET /api/harvest/workflows/{execution_id}/stack` to see what it is blocked on
+   (a slow/failing activity, an unfired timer, an unreceived signal, a stuck
+   child workflow).
+5. Check worker slot saturation (issue #531, `harvest.worker.slots_in_use` vs
+   `slots_available`) and queue depth — a starved fleet lets active runs pile up
+   even when each is healthy.
+
+### Likely causes
+
+- Workers are saturated or under-provisioned, so runs start faster than they can
+  be driven to completion (a backlog, not a bug).
+- A downstream dependency an activity calls is slow or failing, so runs park mid-
+  flight and never finish.
+- A workflow bug that leaves runs waiting forever (a signal that never arrives, a
+  timer that is never set, an unbounded loop that never continues-as-new).
+- A large batch of operator pauses that were never resumed (growth concentrated
+  in `state="paused"`).
+
+### False positives
+
+A legitimate traffic surge (a scheduled batch, a marketing event) briefly raises
+the active population and then drains as the runs complete — the terminal rate
+rises alongside it, so the `and … terminal rate < 0.01` clause keeps the alert
+quiet. Alert on population growth *paired with a flat terminal rate*, and tune
+the `> 50` growth threshold to the workflow type's expected concurrency; a
+high-throughput type may legitimately sit at thousands of active runs.
+
+### Safe actions
+
+1. If workers are saturated, scale the worker fleet (add replicas / raise
+   `max_concurrent_workflows`) so the backlog drains.
+2. If a downstream dependency is the bottleneck, remediate it; parked runs
+   resume automatically once activities succeed.
+3. If runs are genuinely stuck on a workflow bug, inspect one via `stack`, fix
+   and redeploy the handler (in-flight runs replay deterministically), or
+   cancel/terminate individual wedged runs.
+4. If the growth is forgotten pauses, resume them
+   (`POST /api/harvest/workflows/{execution_id}/resume`).
+
+### Escalation criteria
+
+Ticket the workflow owner with the type name and the current active count.
+Escalate to page if the population growth is unbounded and accelerating, the
+worker fleet is already at capacity, and business-critical runs are visibly
+stalled (their `stack` shows no forward progress across successive checks).

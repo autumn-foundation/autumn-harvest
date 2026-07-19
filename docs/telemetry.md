@@ -320,6 +320,7 @@ metric is emitted in the source code.
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
 | `harvest.worker.slots_in_use` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, periodic (5 s default). Pure in-memory read of the workflow/activity dispatch `Semaphore`s against their configured maxima — no DB access (issue #531) |
 | `harvest.worker.slots_available` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, alongside `slots_in_use`. Invariant: `slots_in_use + slots_available == configured_max` per `slot_type` within one sampler interval (issue #531) |
+| `harvest.workflow.active` | Gauge | `worker.rs` — `spawn_workflow_active_sampler`, periodic (`poll_interval`, 5 s default). Shard-local `COUNT(*) … GROUP BY (workflow_name, state) WHERE state IN ('RUNNING','PAUSED')`, aggregated **across all shards** of the worker's `ShardedDbPool` (summed per `(workflow, state)`) so the population is fleet-wide, not default-shard-only. A read failure skips the whole tick so an outage never false-clears the gauge; drained `(workflow, state)` pairs are zero-filled (issue #770) |
 | `harvest.worker.slot_target` | Gauge | `slot_tuner.rs` — `spawn_slot_tuner_loop`, periodic (`poll_interval`). The adaptive slot tuner's current band-clamped resize target for one slot type; only emitted when `WorkerConfig::with_slot_tuner` is configured (issue #548) |
 | `harvest.worker.tuner_decisions` | Counter | `slot_tuner.rs` — `spawn_slot_tuner_loop`, once per control-loop tick, with the decision that actually took effect after band clamping (issue #548) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
@@ -365,6 +366,7 @@ metric is emitted in the source code.
 | `harvest.worker.slots_in_use` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slots_available` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slot_target` | `slot_type` (`workflow\|activity`) |
+| `harvest.workflow.active` | `workflow`, `state` (`running\|paused`) |
 | `harvest.worker.tuner_decisions` | `slot_type` (`workflow\|activity`), `decision` (`grow\|shrink\|hold`) |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
