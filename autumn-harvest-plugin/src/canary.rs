@@ -289,6 +289,85 @@ pub fn canary_activity_info() -> ActivityInfo {
     }
 }
 
+/// Register the built-in synthetic liveness canary onto a [`HarvestBuilder`]
+/// (issue #796).
+///
+/// Pure and unit-testable — it mutates and returns the builder without starting
+/// a runtime. For each configured probe queue it:
+///
+/// - registers the reserved canary activity (once, for all queues);
+/// - registers a per-queue probe workflow named `{PREFIX}__{queue}`;
+/// - ensures a worker drains that queue;
+/// - schedules the probe on `cfg.interval()` across **every writable shard**
+///   (AC4), with [`OverlapPolicy::Skip`] so probes never pile up (AC6) and a
+///   per-run `execution_timeout` so a wedged probe times out (AC6); and
+/// - registers an aggressive self-cleaning retention override for the probe
+///   workflow (AC9), which — since an overrides-only [`RetentionConfig`] still
+///   runs the janitor and resolves the override age via `effective_max_age` —
+///   causes the canary's own history to be purged shortly after each run even
+///   when no global retention `max_age` is configured.
+#[must_use]
+pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> HarvestBuilder {
+    use autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX;
+
+    // Register the reserved canary activity once (shared by every queue's probe).
+    builder = builder.activities(vec![canary_activity_info()]);
+
+    let per_probe_timeout = cfg.per_probe_timeout();
+    let retention_age = cfg.effective_retention();
+
+    // Dedupe queues (a user may double-add via with_queue) while preserving
+    // order, so we never register two probes for the same queue.
+    let mut seen: Vec<String> = Vec::new();
+    let mut wf_names: Vec<String> = Vec::new();
+    for queue in cfg.queues() {
+        if seen.iter().any(|q| q == queue) {
+            continue;
+        }
+        seen.push(queue.clone());
+
+        let wf_name = format!("{CANARY_WORKFLOW_NAME_PREFIX}__{queue}");
+
+        // Register the per-queue probe workflow.
+        builder = builder.workflows(vec![canary_workflow_info(
+            wf_name.clone(),
+            per_probe_timeout,
+        )]);
+
+        // Ensure the probe's queue is drained by a worker.
+        if !builder
+            .worker_config_mut()
+            .queues
+            .iter()
+            .any(|q| q == queue)
+        {
+            builder.worker_config_mut().queues.push(queue.clone());
+        }
+
+        // Schedule the probe across every writable shard (AC4), never piling
+        // up (AC6), with a per-run deadline (AC6). The input carries the queue
+        // so the probe workflow dispatches its activity there.
+        let ws = WorkflowSchedule::new(wf_name.clone(), Schedule::Interval(cfg.interval()))
+            .with_queue_name(queue.clone())
+            .with_overlap_policy(OverlapPolicy::Skip)
+            .with_execution_timeout(per_probe_timeout)
+            .with_all_writable_shards()
+            .with_input(serde_json::json!({ "queue": queue }));
+        builder = builder.workflow_schedule(ws);
+
+        wf_names.push(wf_name);
+    }
+
+    // Aggressive self-cleaning retention override per canary workflow (AC9).
+    let mut retention = builder.retention_config().clone();
+    for wf_name in wf_names {
+        retention = retention.with_workflow_override(wf_name, retention_age);
+    }
+    builder = builder.retention(retention);
+
+    builder
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +445,155 @@ mod tests {
         // An explicit zero retention is floored to a valid (>= 1s) value.
         let cfg = CanaryConfig::new(Duration::from_secs(30)).with_retention(Duration::ZERO);
         assert!(cfg.effective_retention() >= Duration::from_secs(1));
+    }
+
+    fn canary_schedule<'a>(
+        builder: &'a HarvestBuilder,
+        wf_name: &str,
+    ) -> &'a autumn_harvest::WorkflowSchedule {
+        builder
+            .workflow_schedules()
+            .iter()
+            .find(|s| s.workflow_name == wf_name)
+            .unwrap_or_else(|| panic!("expected a schedule for {wf_name}"))
+    }
+
+    #[test]
+    fn register_canary_single_queue() {
+        let cfg = CanaryConfig::new(Duration::from_secs(30));
+        let builder = register_canary(HarvestBuilder::default(), &cfg);
+
+        // Exactly one canary workflow, named for the default queue.
+        let canary_wfs: Vec<&str> = builder
+            .workflow_infos()
+            .iter()
+            .map(|w| w.name)
+            .filter(|n| autumn_harvest::canary::is_canary_workflow(n))
+            .collect();
+        assert_eq!(canary_wfs, vec!["__harvest_canary_probe__default"]);
+
+        // The reserved activity is registered exactly once.
+        let activity_count = builder
+            .activity_infos()
+            .iter()
+            .filter(|a| a.name == autumn_harvest::canary::CANARY_ACTIVITY_NAME)
+            .count();
+        assert_eq!(activity_count, 1);
+
+        // Exactly one schedule, per-writable-shard, Skip overlap, timeout,
+        // queue routed.
+        let canary_sched_count = builder
+            .workflow_schedules()
+            .iter()
+            .filter(|s| autumn_harvest::canary::is_canary_workflow(&s.workflow_name))
+            .count();
+        assert_eq!(canary_sched_count, 1);
+        let s = canary_schedule(&builder, "__harvest_canary_probe__default");
+        assert!(s.all_writable_shards, "AC4: per-writable-shard coverage");
+        assert!(matches!(s.overlap_policy, OverlapPolicy::Skip), "AC6");
+        assert_eq!(s.execution_timeout, Some(cfg.per_probe_timeout()));
+        assert_eq!(s.queue_name, "default");
+
+        // The probe queue is present in the worker's queue set.
+        assert!(
+            builder
+                .worker_config()
+                .queues
+                .iter()
+                .any(|q| q == "default")
+        );
+
+        // A retention override exists for the canary workflow (AC9).
+        assert!(
+            builder
+                .retention_config()
+                .workflow_overrides()
+                .contains_key("__harvest_canary_probe__default")
+        );
+    }
+
+    #[test]
+    fn register_canary_multi_queue() {
+        let cfg = CanaryConfig::new(Duration::from_secs(30))
+            .with_queues(vec!["default".to_string(), "email".to_string()]);
+        let builder = register_canary(HarvestBuilder::default(), &cfg);
+
+        let mut canary_wfs: Vec<&str> = builder
+            .workflow_infos()
+            .iter()
+            .map(|w| w.name)
+            .filter(|n| autumn_harvest::canary::is_canary_workflow(n))
+            .collect();
+        canary_wfs.sort_unstable();
+        assert_eq!(
+            canary_wfs,
+            vec![
+                "__harvest_canary_probe__default",
+                "__harvest_canary_probe__email"
+            ]
+        );
+
+        // Two schedules, one per queue, each per-writable-shard.
+        let canary_scheds: Vec<&autumn_harvest::WorkflowSchedule> = builder
+            .workflow_schedules()
+            .iter()
+            .filter(|s| autumn_harvest::canary::is_canary_workflow(&s.workflow_name))
+            .collect();
+        assert_eq!(canary_scheds.len(), 2);
+        assert!(canary_scheds.iter().all(|s| s.all_writable_shards));
+
+        // Both queues in the worker queue set.
+        assert!(
+            builder
+                .worker_config()
+                .queues
+                .iter()
+                .any(|q| q == "default")
+        );
+        assert!(builder.worker_config().queues.iter().any(|q| q == "email"));
+
+        // Retention overrides for both.
+        let overrides = builder.retention_config().workflow_overrides();
+        assert!(overrides.contains_key("__harvest_canary_probe__default"));
+        assert!(overrides.contains_key("__harvest_canary_probe__email"));
+
+        // The activity is still registered exactly once across queues.
+        let activity_count = builder
+            .activity_infos()
+            .iter()
+            .filter(|a| a.name == autumn_harvest::canary::CANARY_ACTIVITY_NAME)
+            .count();
+        assert_eq!(activity_count, 1);
+    }
+
+    #[test]
+    fn register_canary_dedupes_repeated_queues() {
+        // A user double-adding the same queue must not register two probes.
+        let cfg = CanaryConfig::new(Duration::from_secs(30))
+            .with_queues(vec!["default".to_string()])
+            .with_queue("default".to_string());
+        let builder = register_canary(HarvestBuilder::default(), &cfg);
+        let canary_scheds = builder
+            .workflow_schedules()
+            .iter()
+            .filter(|s| autumn_harvest::canary::is_canary_workflow(&s.workflow_name))
+            .count();
+        assert_eq!(canary_scheds, 1);
+    }
+
+    #[test]
+    fn register_canary_output_passes_try_build() {
+        // The registered canary must produce a buildable configuration —
+        // schedule references a registered workflow, retention override names a
+        // registered workflow, and the retention age is within validator
+        // bounds (AC9 self-clean mechanism confirmed end to end).
+        let cfg = CanaryConfig::new(Duration::from_secs(30))
+            .with_queues(vec!["default".to_string(), "email".to_string()]);
+        let builder = register_canary(HarvestBuilder::default(), &cfg);
+        let built = builder.try_build();
+        assert!(
+            built.is_ok(),
+            "register_canary output must build: {built:?}"
+        );
     }
 }

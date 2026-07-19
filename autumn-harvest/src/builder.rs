@@ -888,16 +888,6 @@ impl BuiltHarvest {
         &self.workflows
     }
 
-    /// Registered activity metadata, in registration order.
-    ///
-    /// Pre-build counterpart used by the plugin's built-in synthetic liveness
-    /// canary (issue #796) to confirm the reserved canary activity is
-    /// registered exactly once before the runtime starts.
-    #[must_use]
-    pub fn activity_infos(&self) -> &[ActivityInfo] {
-        &self.activities
-    }
-
     /// Declarative query handlers collected via `.queries(queries![…])`.
     #[must_use]
     pub fn query_handlers(&self) -> &[QueryHandlerInfo] {
@@ -1168,6 +1158,46 @@ impl HarvestBuilder {
     #[must_use]
     pub fn workflow_infos(&self) -> &[WorkflowInfo] {
         &self.workflows
+    }
+
+    /// Registered activity metadata, in registration order.
+    ///
+    /// Pre-build accessor used by the plugin's built-in synthetic liveness
+    /// canary (issue #796) to confirm the reserved canary activity is
+    /// registered exactly once before the runtime starts.
+    #[must_use]
+    pub fn activity_infos(&self) -> &[ActivityInfo] {
+        &self.activities
+    }
+
+    /// Registered workflow schedules, in registration order.
+    ///
+    /// Pre-build accessor used by the plugin's built-in synthetic liveness
+    /// canary (issue #796) to assert the per-writable-shard probe schedule was
+    /// registered.
+    #[must_use]
+    pub fn workflow_schedules(&self) -> &[WorkflowSchedule] {
+        &self.workflow_schedules
+    }
+
+    /// Read access to the worker configuration.
+    ///
+    /// Pre-build counterpart of [`Self::worker_config_mut`], used by the
+    /// synthetic liveness canary (issue #796) to confirm a probe queue is in
+    /// the worker's drained-queue set.
+    #[must_use]
+    pub const fn worker_config(&self) -> &WorkerConfig {
+        &self.worker_config
+    }
+
+    /// Read access to the retention configuration.
+    ///
+    /// Pre-build counterpart of the consuming [`Self::retention`] setter, used
+    /// by the synthetic liveness canary (issue #796) to add per-workflow
+    /// self-cleaning retention overrides while preserving any existing config.
+    #[must_use]
+    pub const fn retention_config(&self) -> &RetentionConfig {
+        &self.retention
     }
 
     /// Registered DAG metadata, in registration order.

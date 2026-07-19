@@ -919,6 +919,13 @@ async fn start_harvest_runtime(
         }
     }
 
+    // Issue #796: register the built-in synthetic liveness canary when enabled.
+    // `None` (the default) leaves the builder untouched, so a deployment that
+    // never calls `synthetic_canary` is byte-for-byte identical (AC1).
+    if let Some(cfg) = api_state.canary_config() {
+        builder = crate::canary::register_canary(builder, &cfg);
+    }
+
     let mut built = builder
         .try_build()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
