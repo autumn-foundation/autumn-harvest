@@ -10843,6 +10843,22 @@ impl ActivityContext {
     /// what the liveness ping carries, so an auto-heartbeat never clobbers a
     /// checkpoint used by [`Self::heartbeat_details`] on a later retry.
     ///
+    /// Choose an `interval` **strictly less than** the configured
+    /// `heartbeat_timeout` — an `interval >= heartbeat_timeout` lets the window
+    /// elapse between pings and silently fails to protect the activity. Prefer
+    /// [`Self::start_auto_heartbeat_default`], which derives a safe
+    /// `heartbeat_timeout / 3`.
+    ///
+    /// Calling this more than once on the same context spawns multiple
+    /// independent tickers; that is harmless (the extra pings are redundant,
+    /// idempotent liveness signals) and each returned guard stops only its own
+    /// ticker.
+    ///
+    /// Even a leaked or forgotten guard cannot outlive the activity dispatch:
+    /// the ticker runs on a *child* of the activity's cancellation token, so the
+    /// worker's own activity-completion cancellation stops it regardless of
+    /// whether the guard was dropped.
+    ///
     /// # Liveness tradeoff
     ///
     /// Auto-heartbeat keeps a *progressing-but-not-manually-pinging* activity
@@ -10929,7 +10945,9 @@ impl ActivityContext {
     /// single missed flush never trips the timeout, without excessive writes.
     /// Equivalent to `ctx.start_auto_heartbeat(heartbeat_timeout / 3)`; see
     /// [`Self::start_auto_heartbeat`] for the full contract (cancellation,
-    /// last-write-wins, and the liveness/`start_to_close` tradeoff).
+    /// last-write-wins, and the [`Liveness tradeoff`](Self::start_auto_heartbeat#liveness-tradeoff)
+    /// — auto-heartbeat weakens heartbeat-based wedge detection, so pair it with
+    /// a `start_to_close` ceiling for a guaranteed runtime upper bound).
     ///
     /// ```rust,ignore
     /// #[activity(heartbeat_timeout = "30s")]
