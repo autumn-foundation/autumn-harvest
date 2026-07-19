@@ -8117,17 +8117,49 @@ impl WorkflowContext {
         // never recorded in history.
         let window = max_in_flight.max(1);
 
+        // Number of this fan-out's slots ALREADY scheduled in recorded history:
+        // a contiguous input-order prefix `[0..scheduled_prefix)` (the fan-out
+        // dispatches strictly in input order, and the count marker was just
+        // consumed, so the cursor sits on slot 0). `count` caps the read so a
+        // fully-completed fan-out's continuation cannot let a later, unrelated
+        // activity inflate the prefix.
+        let scheduled_prefix = self.match_history(|m| m.count_pending_scheduled_activities(count));
+
+        let mut activities = activities;
         let mut results = Vec::with_capacity(count);
-        let mut iter = activities.into_iter();
-        loop {
-            let wave: Vec<_> = iter.by_ref().take(window).collect();
-            if wave.is_empty() {
-                break;
-            }
-            // Cancellation is checked before each wave, so a fan-out cancelled
-            // mid-drain stops launching further waves.
+
+        // ── Phase 1: RESUME the already-scheduled prefix as ONE homogeneous
+        // batch. Every slot in `[0..scheduled_prefix)` is in history, so each
+        // future resolves to `Matched` (pushes nothing) or `ActivityInProgress`
+        // (pushes only `WaitForActivity`) — never `ScheduleActivity`. This is
+        // what keeps a mid-flight window CHANGE from regrouping an in-flight
+        // slot together with never-scheduled fresh slots into a mixed
+        // `[WaitForActivity + ScheduleActivity]` suspension batch the worker
+        // cannot persist (issue #750). If any prefix slot is still in flight the
+        // `try_join_all` below stays pending, so phase 2 is never reached this
+        // cycle and no fresh dispatch is co-mingled with the resume.
+        if scheduled_prefix > 0 {
             self.check_cancellation()?;
-            let wave_futs = wave.into_iter().map(|(name, input, queue)| {
+            let prefix_futs = activities.drain(..scheduled_prefix).map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                }
+            });
+            let prefix_results = futures::future::try_join_all(prefix_futs).await?;
+            results.extend(prefix_results);
+        }
+
+        // ── Phase 2: DISPATCH the fresh remainder `[scheduled_prefix..count)` in
+        // `window`-sized waves. Every wave here is all-`ScheduleActivity` (fresh,
+        // never in history yet), so it is homogeneous by construction.
+        while !activities.is_empty() {
+            // Cancellation is honored at the start of every drive cycle, before
+            // dispatching any further wave.
+            self.check_cancellation()?;
+            let take = window.min(activities.len());
+            let wave_futs = activities.drain(..take).map(|(name, input, queue)| {
                 let retry = retry.clone();
                 async move {
                     self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
@@ -8194,36 +8226,63 @@ impl WorkflowContext {
             return Ok(Vec::new());
         }
 
-        // See `fan_out_raw_windowed_impl` for the `max_in_flight == 0` clamp.
+        // See `fan_out_raw_windowed_impl` for the `max_in_flight == 0` clamp and
+        // the two-phase resume-then-dispatch structure.
         let window = max_in_flight.max(1);
 
-        let mut results = Vec::with_capacity(count);
-        let mut iter = activities.into_iter();
-        loop {
-            let wave: Vec<_> = iter.by_ref().take(window).collect();
-            if wave.is_empty() {
-                break;
+        // Already-scheduled input-order prefix (see `fan_out_raw_windowed_impl`).
+        let scheduled_prefix = self.match_history(|m| m.count_pending_scheduled_activities(count));
+
+        // Per-slot classification shared by both phases: engine errors abort the
+        // fan-out (`Err`); an activity failure/timeout is captured in the slot
+        // (`Ok(Err(..))`) so `try_join_all` never short-circuits.
+        let classify = |slot: HarvestResult<Value>| match slot {
+            Ok(v) => Ok(Ok(v)),
+            Err(e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
+                Ok(Err(e.to_string()))
             }
+            Err(e) => Err(e),
+        };
+
+        let mut activities = activities;
+        let mut results = Vec::with_capacity(count);
+
+        // ── Phase 1: RESUME the already-scheduled prefix as ONE homogeneous
+        // batch (see `fan_out_raw_windowed_impl` for why this is what keeps a
+        // mid-flight window change from forming a mixed suspension batch).
+        if scheduled_prefix > 0 {
             self.check_cancellation()?;
-            let wave_futs = wave.into_iter().map(|(name, input, queue)| {
+            let prefix_futs = activities.drain(..scheduled_prefix).map(|(name, input, queue)| {
                 let retry = retry.clone();
                 async move {
-                    match self
-                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
-                        .await
-                    {
-                        Ok(v) => Ok(Ok(v)),
-                        Err(
-                            e
-                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
-                        ) => Ok(Err(e.to_string())),
-                        Err(e) => Err(e),
-                    }
+                    classify(
+                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                            .await,
+                    )
                 }
             });
-            // Per-slot failures are `Ok(Err(..))`, so `try_join_all` does not
-            // short-circuit — every wave is dispatched and all N inputs are
-            // processed. Only an engine-level error aborts the fan-out.
+            let prefix_results = futures::future::try_join_all(prefix_futs).await?;
+            results.extend(prefix_results);
+        }
+
+        // ── Phase 2: DISPATCH the fresh remainder in `window`-sized waves.
+        // Per-slot failures are `Ok(Err(..))`, so `try_join_all` does not
+        // short-circuit — every wave is dispatched and all N inputs are
+        // processed. Only an engine-level error aborts the fan-out.
+        while !activities.is_empty() {
+            // Cancellation is honored at the start of every drive cycle, before
+            // dispatching any further wave.
+            self.check_cancellation()?;
+            let take = window.min(activities.len());
+            let wave_futs = activities.drain(..take).map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    classify(
+                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                            .await,
+                    )
+                }
+            });
             let wave_results = futures::future::try_join_all(wave_futs).await?;
             results.extend(wave_results);
         }
