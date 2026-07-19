@@ -83,6 +83,11 @@ pub mod cache;
 /// Calendar-aware schedule filtering: named exclusion sets, skip policies, and
 /// schedule preview generation (issue #337).
 pub mod calendar;
+/// Built-in synthetic liveness canary (issue #796).
+///
+/// Reserved names + predicates for the throwaway workflow that probes the live
+/// execution path. Distinct from the #512 replay canary.
+pub mod canary;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;
@@ -282,6 +287,9 @@ pub use calendar::{
 };
 pub use calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
+pub use canary::{
+    CANARY_ACTIVITY_NAME, CANARY_WORKFLOW_NAME_PREFIX, is_canary_workflow, is_reserved_canary_name,
 };
 pub use completion_trigger::{
     CompletionTrigger, ConditionGate, InputMapping, MAX_CONDITION_DEPTH, MAX_CONDITION_IN_VALUES,
