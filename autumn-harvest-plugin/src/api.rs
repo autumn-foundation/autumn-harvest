@@ -27058,6 +27058,45 @@ fn apply_search_attr_filters<'a>(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Whether the default `GET /workflows` list should hide synthetic liveness
+/// canary runs (issue #796, AC8).
+///
+/// Canary rows are excluded by default; a caller that explicitly filters to a
+/// canary `workflow_name` (i.e. one that [`autumn_harvest::canary::is_canary_workflow`]
+/// matches) opts back in and sees them.
+fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
+    !workflow_name.is_some_and(autumn_harvest::canary::is_canary_workflow)
+}
+
+/// Apply the synthetic liveness canary list exclusion to a workflow-list query
+/// (issue #796, AC8).
+///
+/// When [`exclude_canary_from_list`] is true, filters out rows whose
+/// `workflow_name` starts with the reserved canary prefix, so canary runs never
+/// pollute operator views or success-rate dashboards. Uses Postgres
+/// `starts_with` on the qualified column so it matches the prefix exactly (no
+/// LIKE wildcard ambiguity) and works inside the stalled loader's
+/// correlated-subquery context. The prefix is always a *bound* `Text` param,
+/// never interpolated.
+fn apply_canary_list_exclusion<'a>(
+    query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
+    workflow_name: Option<&str>,
+) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Text};
+
+    if exclude_canary_from_list(workflow_name) {
+        query.filter(
+            sql::<Bool>("NOT starts_with(harvest_workflow_executions.workflow_name, ")
+                .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
+                .sql(")"),
+        )
+    } else {
+        query
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
     filters: &WorkflowFilters,
@@ -27117,6 +27156,9 @@ pub(crate) async fn load_workflows(
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
     }
+    // Issue #796 (AC8): hide synthetic liveness canary runs from the default
+    // list unless the caller explicitly filters to a canary workflow name.
+    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -36943,6 +36985,27 @@ mod tests {
             !filters.paginated,
             "no pagination params → paginated must be false"
         );
+    }
+
+    // ── Synthetic liveness canary list exclusion (issue #796, AC8) ───────────
+
+    #[test]
+    fn exclude_canary_from_list_hides_canaries_by_default() {
+        // No workflow_name filter → canary rows are hidden.
+        assert!(exclude_canary_from_list(None));
+        // An ordinary workflow_name filter → canary rows stay hidden.
+        assert!(exclude_canary_from_list(Some("onboarding")));
+    }
+
+    #[test]
+    fn exclude_canary_from_list_includes_canaries_when_explicitly_filtered() {
+        // Explicitly filtering to a canary workflow name opts back in.
+        assert!(!exclude_canary_from_list(Some(
+            "__harvest_canary_probe__default"
+        )));
+        assert!(!exclude_canary_from_list(Some(
+            "__harvest_canary_probe__email"
+        )));
     }
 
     // ── Read-path payload decoding (issue #608) ──────────────────────────────
