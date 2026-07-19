@@ -854,6 +854,12 @@ pub struct WorkflowSchedule {
     /// schedule. `None` = no deadline enforced (today's behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_timeout: Option<std::time::Duration>,
+    /// Chain-scoped lifetime cap propagated to every workflow started by this
+    /// schedule (issue #617). Distinct from [`execution_timeout`](Self::execution_timeout):
+    /// anchored at the first run's start and carried verbatim across every
+    /// continue-as-new. `None` = no chain cap default from this schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_execution_timeout: Option<std::time::Duration>,
     /// Optional named calendar to consult before each firing.
     ///
     /// When `Some("us-federal-holidays")`, the scheduler looks up the
@@ -973,6 +979,7 @@ impl WorkflowSchedule {
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
             execution_timeout: None,
+            chain_execution_timeout: None,
             calendar: None,
             skip_policy: SkipPolicy::Skip,
             consecutive_failure_limit: None,
@@ -1004,6 +1011,18 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_execution_timeout(mut self, timeout: Duration) -> Self {
         self.execution_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the chain-scoped lifetime cap default for this schedule (issue #617).
+    ///
+    /// Every workflow started by this schedule inherits this chain cap unless the
+    /// workflow type declares its own; the chain deadline is anchored at the first
+    /// run's start and carried verbatim across every continue-as-new. `None`
+    /// disables the chain-cap default from this schedule.
+    #[must_use]
+    pub const fn with_chain_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.chain_execution_timeout = Some(timeout);
         self
     }
 

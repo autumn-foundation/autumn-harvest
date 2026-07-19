@@ -3960,6 +3960,13 @@ async fn persist_workflow_failure(
                         conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        // Workflow-level retry (issue #523) is the same logical run
+                        // continuing, so the chain-scoped lifetime cap (issue #617)
+                        // is inherited verbatim: carry the origin's absolute
+                        // `chain_deadline_at` forward rather than re-anchoring it.
+                        chain_execution_timeout: exec_ref.chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling: None,
+                        inherited_chain_deadline_at: exec_ref.chain_deadline_at,
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
                         priority,
@@ -5732,14 +5739,16 @@ async fn persist_all_started_child_workflows(
                         severity,
                         child_sla,
                         child_execution_timeout,
+                        child_chain_execution_timeout,
                         child_retry_policy,
-                    ) = child_wf_info.map_or((None, None, None, None, None, None), |w| {
+                    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
                         (
                             w.owner,
                             w.runbook_url,
                             w.severity,
                             w.sla,
                             w.execution_timeout,
+                            w.chain_execution_timeout,
                             w.retry_policy.clone(),
                         )
                     });
@@ -5748,9 +5757,21 @@ async fn persist_all_started_child_workflows(
                     let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
                     let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
                     let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+                    // A child is its own logical workflow → fresh chain origin
+                    // (issue #617). Resolve the child's OWN `chain_execution_timeout`
+                    // exactly like its per-run timeout above and anchor the chain
+                    // deadline at the child's start. No builder ceiling is threaded
+                    // into the spawn path, matching how `execution_timeout` is
+                    // resolved here.
+                    let child_chain_execution_timeout = child_chain_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok());
+                    let child_chain_deadline_at =
+                        child_chain_execution_timeout.map(|d| chrono::Utc::now() + d);
                     let child_row = NewWorkflowExecution {
                         continued_from_exec_id: None,
                         first_exec_id: None,
+                        chain_execution_timeout: child_chain_execution_timeout,
+                        chain_deadline_at: child_chain_deadline_at,
                         id: child.child_id.as_uuid(),
                         workflow_name: &child.workflow_name,
                         workflow_id: &child_workflow_id,
@@ -5906,25 +5927,39 @@ async fn insert_awaited_child_execution(
     // Provenance ref for the child is the parent execution id (issue #740).
     let parent_exec_id_str = parent_exec_id.to_string();
     let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-    let (owner, runbook_url, severity, child_sla, child_execution_timeout, child_retry_policy) =
-        child_wf_info.map_or((None, None, None, None, None, None), |w| {
-            (
-                w.owner,
-                w.runbook_url,
-                w.severity,
-                w.sla,
-                w.execution_timeout,
-                w.retry_policy.clone(),
-            )
-        });
+    let (
+        owner,
+        runbook_url,
+        severity,
+        child_sla,
+        child_execution_timeout,
+        child_chain_execution_timeout,
+        child_retry_policy,
+    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
+        (
+            w.owner,
+            w.runbook_url,
+            w.severity,
+            w.sla,
+            w.execution_timeout,
+            w.chain_execution_timeout,
+            w.retry_policy.clone(),
+        )
+    });
     let child_execution_timeout =
         child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
     let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
     let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
     let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+    // Child = its own logical workflow → fresh chain origin (issue #617).
+    let child_chain_execution_timeout =
+        child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    let child_chain_deadline_at = child_chain_execution_timeout.map(|d| chrono::Utc::now() + d);
     let child_row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
+        chain_execution_timeout: child_chain_execution_timeout,
+        chain_deadline_at: child_chain_deadline_at,
         id: child.child_id.as_uuid(),
         workflow_name: &child.workflow_name,
         workflow_id: &child_workflow_id,
@@ -6991,6 +7026,11 @@ async fn create_detached_child_executions(
         let child_row = NewWorkflowExecution {
             continued_from_exec_id: None,
             first_exec_id: None,
+            // Detached children do not resolve `execution_timeout` at spawn
+            // (`None` above), so the chain cap is `None` too — matching the
+            // existing per-run pattern precisely (issue #617).
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
             workflow_id: &child_workflow_id,
@@ -9776,6 +9816,12 @@ async fn persist_workflow_continue_as_new(
     let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
     // Re-anchor soft SLA deadline per-run (issue #487).
     let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
+    // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM. Unlike
+    // the per-run `deadline_at`/`sla_deadline_at` above (re-anchored to `now`), the
+    // chain deadline is anchored at the FIRST run's start and must NOT be
+    // recomputed as `now + timeout` — copying the predecessor's absolute
+    // `chain_deadline_at` is what makes the whole continue-as-new chain share one
+    // lifetime cap, so a runaway loop cannot escape it by continuing-as-new.
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -9788,6 +9834,9 @@ async fn persist_workflow_continue_as_new(
         queue_name: &execution.queue_name,
         execution_timeout: execution.execution_timeout,
         deadline_at: new_deadline_at,
+        // Carried verbatim across continue-as-new (issue #617) — see comment above.
+        chain_execution_timeout: execution.chain_execution_timeout,
+        chain_deadline_at: execution.chain_deadline_at,
         sla: execution.sla,
         sla_deadline_at: new_sla_deadline_at,
         memo: execution.memo.clone(),
@@ -16599,6 +16648,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 

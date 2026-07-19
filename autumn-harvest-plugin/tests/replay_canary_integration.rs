@@ -106,6 +106,7 @@ fn activity_wf_info() -> autumn_harvest::info::WorkflowInfo {
             })
         },
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,

@@ -17,6 +17,7 @@ fn workflow_info_has_concurrency_fields() {
         module: "my_app::workflows",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
 
@@ -45,6 +46,7 @@ fn workflow_info_with_concurrency_policy() {
         module: "my_app::workflows",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: Some(ConcurrencyPolicy {
             key_expr: "input.tenant_id",

@@ -240,6 +240,8 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_WORKFLOW_STARTED`  | `harvest.workflow.started`    | Counter      | `workflow.name` (bounded), `queue` (bounded)  | `execution.id`        |
 | `METRIC_WORKFLOW_DURATION` | `harvest.workflow.duration`   | Histogram    | `workflow.name`, `queue`, `status`            | `execution.id`        |
 | `METRIC_WORKFLOW_TERMINAL` | `harvest.workflow.terminal`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue`, `outcome` (6 values: completed/failed/cancelled/timed_out/terminated/continued_as_new) | `execution.id` |
+| `METRIC_WORKFLOW_TIMEOUT`  | `harvest.workflow.timeout`    | Counter      | `workflow` (bounded), `queue` (bounded)       | `execution.id`        |
+| `METRIC_WORKFLOW_CHAIN_TIMEOUT` | `harvest.workflow.chain_timeout` | Counter | `workflow` (bounded), `queue` (bounded) — fires when a continue-as-new chain outlives its `chain_execution_timeout` cap (issue #617); distinct from `harvest.workflow.timeout` | `execution.id` |
 | `METRIC_ACTIVITY_DURATION` | `harvest.activity.duration`   | Histogram    | `activity.name` (bounded), `queue`, `status` (`completed\|failed`) | `execution.id`, `activity.id` |
 | `METRIC_ACTIVITY_FAILED`   | `harvest.activity.failed`     | Counter      | `activity` (bounded), `workflow.type`, `error.type` (low-cardinality), `non_retryable` | `execution.id`, `activity.id` |
 | `METRIC_ACTIVITY_ATTEMPTS` | `harvest.activity.attempts`   | Counter      | `activity` (bounded), `queue` (bounded), `outcome` (`completed\|failed`) | `execution.id`, `activity.id` |

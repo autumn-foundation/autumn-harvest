@@ -16,6 +16,8 @@ mod cache_delta_load_tests;
 #[cfg(feature = "db")]
 mod canary_tests;
 mod cancellation_tests;
+#[cfg(feature = "db")]
+mod chain_timeout_tests;
 mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]

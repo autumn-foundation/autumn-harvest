@@ -567,6 +567,7 @@ fn wf_info_with_schema(name: &'static str) -> WorkflowInfo {
         module: "signal_with_start_tests",
         handler: dummy_handler,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,

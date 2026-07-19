@@ -141,6 +141,7 @@ fn make_registry_for(
             module: "scheduler_carryover_tests",
             handler,
             execution_timeout: None,
+            chain_execution_timeout: None,
             concurrency: None,
 
             debounce: None,
@@ -361,6 +362,9 @@ async fn manual_start_has_no_carryover() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: autumn_harvest::types::Priority::default(),

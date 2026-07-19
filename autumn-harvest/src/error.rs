@@ -77,6 +77,11 @@ pub enum TimeoutType {
     /// Total wall-clock execution time from `WorkflowStarted` to terminal state
     /// exceeded the configured `execution_timeout` (issue #243).
     WorkflowExecution,
+    /// Total chain-scoped wall-clock lifetime — anchored at the FIRST run's start
+    /// and carried verbatim across every continue-as-new — exceeded the configured
+    /// `chain_execution_timeout` (issue #617). Distinct from
+    /// [`Self::WorkflowExecution`], which is per-run and re-anchored on each CAN.
+    WorkflowChain,
 }
 
 impl std::fmt::Display for TimeoutType {
@@ -87,6 +92,7 @@ impl std::fmt::Display for TimeoutType {
             Self::ScheduleToClose => write!(f, "ScheduleToClose"),
             Self::Heartbeat => write!(f, "Heartbeat"),
             Self::WorkflowExecution => write!(f, "WorkflowExecution"),
+            Self::WorkflowChain => write!(f, "workflow chain lifetime exceeded"),
         }
     }
 }

@@ -190,6 +190,9 @@ fn default_start_params(
         conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
         priority: autumn_harvest::types::Priority::default(),
@@ -245,6 +248,7 @@ async fn test_same_shard_live_cancel() {
         module: "cross_workflow_cancel_tests",
         handler: canceller_workflow,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
 
@@ -267,6 +271,7 @@ async fn test_same_shard_live_cancel() {
         module: "cross_workflow_cancel_tests",
         handler: long_running_target_workflow,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
 
@@ -390,6 +395,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -412,6 +418,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 module: "cross_workflow_cancel_tests",
                 handler: instant_complete_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -546,6 +553,7 @@ async fn test_grace_window_expiry_unknown_target() {
             module: "cross_workflow_cancel_tests",
             handler: canceller_expecting_failure,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -660,6 +668,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -682,6 +691,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 module: "cross_workflow_cancel_tests",
                 handler: long_running_target_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 

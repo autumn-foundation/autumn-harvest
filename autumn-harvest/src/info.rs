@@ -438,6 +438,15 @@ pub struct WorkflowInfo {
     /// (issue #243). `None` means no deadline enforced unless overridden at the
     /// `start_workflow` call site. Per-call overrides always win over this default.
     pub execution_timeout: Option<Duration>,
+    /// Chain-scoped lifetime cap for continue-as-new chains of this workflow type
+    /// (issue #617). Distinct from [`Self::execution_timeout`] (which is per-run
+    /// and re-anchored on every continue-as-new): the chain cap is anchored at the
+    /// FIRST run's start and carried verbatim across every continue-as-new, so a
+    /// runaway loop cannot escape it by continuing-as-new. Declared via
+    /// `#[workflow(chain_execution_timeout = "...")]`. `None` means no chain cap
+    /// unless the builder ceiling `max_workflow_chain_timeout` supplies a
+    /// fleet-wide default. Per-call overrides always win over this default.
+    pub chain_execution_timeout: Option<Duration>,
     /// Soft SLA budget for executions of this workflow type (issue #487).
     ///
     /// When set, `sla_deadline_at = started_at + sla` is persisted on the row.
@@ -596,6 +605,24 @@ impl WorkflowInfo {
     #[must_use]
     pub const fn with_description(mut self, desc: &'static str) -> Self {
         self.description = Some(desc);
+        self
+    }
+
+    /// Set the chain-scoped lifetime cap for continue-as-new chains of this
+    /// workflow type (issue #617). Distinct from the per-run
+    /// `execution_timeout`: the chain cap is anchored at the first run's start
+    /// and carried verbatim across every continue-as-new.
+    ///
+    /// Fluent builder method — call after the companion function:
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    /// .workflows(vec![
+    ///     poller_info().with_chain_execution_timeout(Duration::from_secs(7 * 24 * 3600)),
+    /// ])
+    /// ```
+    #[must_use]
+    pub const fn with_chain_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.chain_execution_timeout = Some(timeout);
         self
     }
 
@@ -1343,6 +1370,8 @@ impl DagInfo {
             overlap_policy: self.overlap_policy,
             buffer_all_max: self.buffer_all_max,
             execution_timeout: None,
+            // DAGs carry no chain-scoped lifetime cap (issue #617).
+            chain_execution_timeout: None,
             calendar: None,
             skip_policy: crate::policy::SkipPolicy::Skip,
             consecutive_failure_limit: None,
@@ -1366,6 +1395,8 @@ impl DagInfo {
             module: self.module,
             handler,
             execution_timeout: None,
+            // DAGs carry no chain-scoped lifetime cap (issue #617).
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1399,6 +1430,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("module", &self.module)
             .field("handler", &"<fn>")
             .field("execution_timeout", &self.execution_timeout)
+            .field("chain_execution_timeout", &self.chain_execution_timeout)
             .field("sla", &self.sla)
             .field("concurrency", &self.concurrency)
             .field("debounce", &self.debounce)
@@ -1515,6 +1547,7 @@ mod tests {
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1545,6 +1578,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1572,6 +1606,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: Some(std::time::Duration::from_secs(7_200)),
             concurrency: None,
 
@@ -1599,6 +1634,7 @@ mod tests {
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: Some(std::time::Duration::from_secs(86_400)),
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1631,6 +1667,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1661,6 +1698,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1708,6 +1746,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1747,6 +1786,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1783,6 +1823,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1827,6 +1868,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1864,6 +1906,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -1896,6 +1939,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -2128,6 +2172,7 @@ mod tests {
             module: "test_mod",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -2204,6 +2249,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
             debounce: None,

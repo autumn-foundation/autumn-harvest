@@ -74,7 +74,8 @@ use crate::telemetry::{
     METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
     METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES,
     METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
+    METRIC_WORKFLOW_CHAIN_TIMEOUT, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_TIMEOUT,
     METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SessionAcquisitionOutcome, SlotType,
     TunerDecision, WebhookOutcome, WorkflowStatus,
 };
@@ -658,6 +659,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_workflow_chain_timeout(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_CHAIN_TIMEOUT,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_workflow_pause_duration(&self, workflow_name: &str, queue: &str, duration_secs: f64) {
         histogram!(
             METRIC_WORKFLOW_PAUSE_DURATION,
@@ -1029,6 +1039,9 @@ mod tests {
         rec.record_queue_oldest_pending_age("q", 30.0);
         rec.record_completion_trigger_fired("trigger-uuid", "started");
         rec.record_completion_trigger_skipped("trigger-uuid", "condition_unmet");
+        // Issue #617: chain-timeout counter bridge.
+        rec.record_workflow_timeout("wf", "q");
+        rec.record_workflow_chain_timeout("wf", "q");
     }
 
     // -----------------------------------------------------------------------

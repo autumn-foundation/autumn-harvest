@@ -93,6 +93,14 @@ pub struct HarvestBuilder {
     /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap (issue #617).
+    ///
+    /// Unlike `max_workflow_execution_timeout` (which only caps a *specified*
+    /// per-run timeout), this ceiling ALSO acts as a fleet-wide DEFAULT: a
+    /// workflow that declares no chain cap still inherits this value as its chain
+    /// deadline, so an operator can cap every chain even when a workflow
+    /// under-specifies. `None` means no chain cap is applied fleet-wide.
+    max_workflow_chain_timeout: Option<Duration>,
     /// Optional hard ceiling on the number of durable events a RUNNING workflow
     /// execution may accumulate (issue #493). When a workflow's event count
     /// reaches or exceeds this value the execution is terminated with
@@ -177,6 +185,7 @@ impl Default for HarvestBuilder {
             payload_offload_threshold: DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
+            max_workflow_chain_timeout: None,
             max_workflow_history_events: None,
             max_activity_input_bytes: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
@@ -228,6 +237,10 @@ impl std::fmt::Debug for HarvestBuilder {
                 &self.max_workflow_execution_timeout,
             )
             .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
+            )
+            .field(
                 "max_workflow_history_events",
                 &self.max_workflow_history_events,
             )
@@ -277,6 +290,9 @@ pub struct BuiltHarvest {
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
     pub max_workflow_execution_timeout: Option<Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
+    /// default (issue #617). `None` = no chain cap applied fleet-wide.
+    pub max_workflow_chain_timeout: Option<Duration>,
     /// Hard ceiling on durable event count per execution (issue #493). `None` = no ceiling.
     pub max_workflow_history_events: Option<u64>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
@@ -352,6 +368,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field(
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
+            )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
             )
             .field(
                 "max_workflow_history_events",
@@ -893,6 +913,13 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn max_workflow_execution_timeout_ceiling(&self) -> Option<Duration> {
         self.max_workflow_execution_timeout
+    }
+
+    /// Server-side ceiling on the chain-scoped lifetime cap, doubling as a
+    /// fleet-wide chain default (issue #617). `None` = no chain cap fleet-wide.
+    #[must_use]
+    pub const fn max_workflow_chain_timeout_ceiling(&self) -> Option<Duration> {
+        self.max_workflow_chain_timeout
     }
 
     /// Registered DAG metadata.
@@ -1715,6 +1742,18 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set a server-side ceiling on the chain-scoped lifetime cap (issue #617).
+    ///
+    /// This ceiling caps any workflow-declared `chain_execution_timeout` AND acts
+    /// as a fleet-wide default: a workflow that declares no chain cap still
+    /// inherits this value as its chain deadline. `None` (the default) means no
+    /// chain cap is applied fleet-wide.
+    #[must_use]
+    pub const fn max_workflow_chain_timeout(mut self, ceiling: Duration) -> Self {
+        self.max_workflow_chain_timeout = Some(ceiling);
+        self
+    }
+
     /// Set a server-side ceiling on workflow retry attempts (issue #523).
     ///
     /// When set, `retry_policy.max_attempts` is clamped to `min(max_attempts, ceiling)`.
@@ -2005,6 +2044,7 @@ impl HarvestBuilder {
             payload_offloader,
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
+            max_workflow_chain_timeout: self.max_workflow_chain_timeout,
             max_workflow_history_events: self.max_workflow_history_events,
             max_activity_input_bytes: self.max_activity_input_bytes,
             max_activity_result_bytes: self.max_activity_result_bytes,
@@ -3403,6 +3443,7 @@ mod tests {
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -4089,6 +4130,7 @@ mod tests {
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
@@ -4130,6 +4172,7 @@ mod tests {
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
             debounce: None,
@@ -4240,6 +4283,7 @@ mod tests {
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",

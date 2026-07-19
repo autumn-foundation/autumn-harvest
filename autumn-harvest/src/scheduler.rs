@@ -840,6 +840,9 @@ pub async fn trigger_unified_dag(
             conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1672,6 +1675,8 @@ fn merge_schedule_patch(
             .unwrap_or_else(|| u32::try_from(existing.buffer_all_max).unwrap_or(0)),
         // Not persisted on harvest_schedules; nothing to preserve.
         execution_timeout: None,
+        // Not persisted on harvest_schedules; nothing to preserve (issue #617).
+        chain_execution_timeout: None,
         calendar: patch
             .calendar
             .as_ref()
@@ -3455,6 +3460,14 @@ async fn tick_one_workflow_schedule(
                 conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
+                // Chain-scoped lifetime cap (issue #617): mirror the per-run
+                // `execution_timeout` above — carry the workflow-type default so
+                // scheduled runs inherit the chain cap the same way.
+                chain_execution_timeout: wf_info
+                    .and_then(|info| info.chain_execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                max_workflow_chain_timeout_ceiling: None,
+                inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
                 priority: Priority::default(),
@@ -5025,6 +5038,11 @@ async fn drain_buffered_schedule_runs(
                     conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
+                    // Mirror the per-run `execution_timeout: None` at this buffered
+                    // fire site (issue #617).
+                    chain_execution_timeout: None,
+                    max_workflow_chain_timeout_ceiling: None,
+                    inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
                     priority: Priority::default(),

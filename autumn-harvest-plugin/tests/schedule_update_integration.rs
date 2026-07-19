@@ -259,6 +259,7 @@ fn etl_registry(wf_name: &'static str) -> Arc<HandlerRegistry> {
             module: "schedule_update_integration",
             handler: incremental_etl_handler,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
             debounce: None,

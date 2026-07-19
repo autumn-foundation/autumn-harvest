@@ -110,6 +110,12 @@ fn rate_per_period_count(s: &str) -> f64 {
 
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
+    /// Chain-scoped lifetime cap (issue #617). Parsed from
+    /// `#[workflow(chain_execution_timeout = "7d")]`. Stored as
+    /// `WorkflowInfo::chain_execution_timeout: Option<Duration>`. Distinct from
+    /// `execution_timeout`: anchored at the first run's start and carried verbatim
+    /// across every continue-as-new.
+    chain_execution_timeout: Option<String>,
     /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
     /// Stored as `WorkflowInfo::sla: Option<Duration>`.
     sla: Option<String>,
@@ -146,6 +152,7 @@ struct WorkflowAttrs {
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
     let mut result = WorkflowAttrs {
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,
@@ -165,6 +172,10 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         if meta.path.is_ident("execution_timeout") {
             let value: LitStr = meta.value()?.parse()?;
             result.execution_timeout = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("chain_execution_timeout") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.chain_execution_timeout = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("sla") {
             let value: LitStr = meta.value()?.parse()?;
@@ -435,7 +446,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `chain_execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `throttle`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -642,6 +653,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |s| quote! { ::autumn_harvest::task_duration(#s) },
     );
 
+    // Emit chain_execution_timeout as Option<Duration> (issue #617).
+    let chain_execution_timeout_expr = attrs.chain_execution_timeout.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
+
     // Emit sla as Option<Duration> (issue #487).
     let sla_expr = attrs.sla.as_deref().map_or_else(
         || quote! { None },
@@ -816,6 +833,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                 },
                 execution_timeout: #execution_timeout_expr,
+                chain_execution_timeout: #chain_execution_timeout_expr,
                 sla: #sla_expr,
                 concurrency: #concurrency_expr,
                 debounce: #debounce_expr,
@@ -998,6 +1016,28 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::std::option::Option::None => ::std::option::Option::None,
                     };
 
+                    // Chain-scoped lifetime cap (issue #617). Resolved from the
+                    // workflow-type default and the fleet-wide ceiling, at parity
+                    // with the per-run `execution_timeout` above.
+                    let chain_execution_timeout = match info.chain_execution_timeout {
+                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                            ::autumn_harvest::chrono::Duration::from_std(d)
+                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                    "chain_execution_timeout exceeds chrono duration range".to_string()
+                                ))?
+                        ),
+                        ::std::option::Option::None => ::std::option::Option::None,
+                    };
+                    let max_workflow_chain_timeout_ceiling = match client.max_workflow_chain_timeout() {
+                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                            ::autumn_harvest::chrono::Duration::from_std(d)
+                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                    "max_workflow_chain_timeout_ceiling exceeds chrono duration range".to_string()
+                                ))?
+                        ),
+                        ::std::option::Option::None => ::std::option::Option::None,
+                    };
+
                     let max_workflow_start_delay = {
                         let ceiling_chrono = ::autumn_harvest::chrono::Duration::from_std(client.max_workflow_start_delay())
                             .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
@@ -1021,6 +1061,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         conflict_policy: ::autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: opts.trace_context,
                         max_execution_timeout_ceiling,
+                        chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling,
+                        inherited_chain_deadline_at: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
                         priority: opts.priority.unwrap_or_default(),
@@ -1160,6 +1203,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         ::std::option::Option::None => ::std::option::Option::None,
                     };
+
+                    // Note (issue #617): `SignalWithStartParams` does not carry the
+                    // chain-scoped lifetime cap; a signal-with-start start inherits
+                    // only the workflow-type default via the core start path. Chain
+                    // resolution is threaded through `StartWorkflowParams`
+                    // (`start_with_options`) and the HTTP/scheduler start paths.
 
                     let payload = ::autumn_harvest::serde_json::to_value(&signal_payload)
                         .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
