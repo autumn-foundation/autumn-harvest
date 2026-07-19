@@ -1482,3 +1482,307 @@ async fn windowed_fan_out_cancellation_returns_cancelled() {
         other => panic!("expected Failed (Cancelled), got {other:?}"),
     }
 }
+
+/// Drive a workflow from an **arbitrary partial** `history` (not just a bare
+/// `WorkflowStarted`) through repeated `run_workflow` cycles until it reaches a
+/// terminal outcome. Unlike [`drive_windowed`], this also feeds back
+/// `WaitForActivity` commands by completing the referenced (already-scheduled)
+/// activity — so it can drive a fan-out that resumed an in-flight prefix under
+/// a changed window all the way to completion. Returns the terminal outcome.
+async fn drive_windowed_from<F>(
+    exec_id: ExecutionId,
+    mut history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    output_fn: F,
+) -> WorkflowOutcome
+where
+    F: Fn(&str, &Value) -> Result<Value, String>,
+{
+    // Record a terminal event for `activity_id` (found in the already-recorded
+    // `ActivityScheduled`), unless it already has one.
+    fn complete_activity<G>(
+        history: &mut Vec<WorkflowEvent>,
+        activity_id: ActivityExecId,
+        output_fn: &G,
+    ) where
+        G: Fn(&str, &Value) -> Result<Value, String>,
+    {
+        let already_terminal = history.iter().any(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ActivityCompleted { activity_id: a, .. }
+                | WorkflowEvent::ActivityFailed { activity_id: a, .. }
+                if *a == activity_id
+            )
+        });
+        if already_terminal {
+            return;
+        }
+        let (name, inp) = history
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a,
+                    name,
+                    input,
+                    ..
+                } if *a == activity_id => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("a waited-on activity must already be scheduled in history");
+        match output_fn(&name, &inp) {
+            Ok(output) => history.push(WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output,
+            }),
+            Err(error) => history.push(WorkflowEvent::ActivityFailed {
+                activity_id,
+                error,
+                attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
+            }),
+        }
+    }
+
+    for _guard in 0..1000 {
+        let outcome = run_workflow(exec_id, history.clone(), handler, input.clone()).await;
+        match outcome {
+            WorkflowOutcome::Suspended { commands } => {
+                for cmd in &commands {
+                    match cmd {
+                        WorkflowCommand::RecordMarker { name, details } => {
+                            history.push(WorkflowEvent::MarkerRecorded {
+                                name: name.clone(),
+                                details: details.clone(),
+                            });
+                        }
+                        WorkflowCommand::ScheduleActivity {
+                            activity_id,
+                            name,
+                            input,
+                            queue,
+                            ..
+                        } => {
+                            history.push(WorkflowEvent::ActivityScheduled {
+                                activity_id: *activity_id,
+                                name: name.clone(),
+                                input: input.clone(),
+                                queue: queue.clone(),
+                            });
+                            complete_activity(&mut history, *activity_id, &output_fn);
+                        }
+                        WorkflowCommand::WaitForActivity { activity_id, .. } => {
+                            complete_activity(&mut history, *activity_id, &output_fn);
+                        }
+                        other => {
+                            panic!("unexpected command in windowed fan-out resume drive: {other:?}")
+                        }
+                    }
+                }
+            }
+            terminal => return terminal,
+        }
+    }
+    panic!("windowed fan-out resume drive did not terminate within 1000 cycles");
+}
+
+/// FINDING 1 (determinism-critical): a fan-out whose window is **increased**
+/// across a partial suspension must **resume the already-scheduled in-flight
+/// prefix as a homogeneous batch** — never regroup an in-flight slot together
+/// with never-scheduled fresh slots into a mixed
+/// `[WaitForActivity + ScheduleActivity]` suspension batch (which the worker's
+/// `handle_suspended_workflow` cannot persist, terminally FAILING the run).
+///
+/// Recorded under `W1=1` (only slot 0 scheduled, still in-flight); re-driven
+/// under `W2=3`.
+#[tokio::test]
+async fn windowed_fan_out_resumes_under_increased_window() {
+    let exec_id = ExecutionId::new();
+    let id0 = ActivityExecId::new();
+    // The redeployed code is configured with the LARGER window W2=3.
+    let input = json!({ "n": 3, "w": 3 });
+    let partial = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        // Slot 0 scheduled but NOT completed — genuinely in-flight.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id0,
+            name: "task_0".into(),
+            input: json!(0),
+            queue: "default".into(),
+        },
+    ];
+
+    // Cycle 1 under the INCREASED window: the enlarged wave must NOT regroup the
+    // in-flight slot 0 with fresh slots 1,2. It must re-park on slot 0 ONLY.
+    let outcome = run_workflow(exec_id, partial.clone(), windowed_raw_handler, input.clone()).await;
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let waits = commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::WaitForActivity { .. }))
+                .count();
+            let scheds = commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                .count();
+            assert_eq!(
+                waits, 1,
+                "must re-park on the single in-flight slot; got {commands:?}"
+            );
+            assert_eq!(
+                scheds, 0,
+                "window-increase must NOT schedule fresh slots in the same batch as an \
+                 in-flight resume — a mixed [WaitForActivity + ScheduleActivity] batch \
+                 crashes the worker; got {commands:?}"
+            );
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+
+    // Slot 0 now completes.
+    let mut resumed = partial.clone();
+    resumed.push(WorkflowEvent::ActivityCompleted {
+        activity_id: id0,
+        output: json!("done_0"),
+    });
+
+    // Cycle 2: the fresh remainder [1,2] is dispatched as an all-ScheduleActivity
+    // batch (no lingering resume).
+    let outcome = run_workflow(exec_id, resumed, windowed_raw_handler, input.clone()).await;
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let scheds: Vec<String> = commands
+                .iter()
+                .filter_map(|c| match c {
+                    WorkflowCommand::ScheduleActivity { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let waits = commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::WaitForActivity { .. }))
+                .count();
+            assert_eq!(
+                scheds,
+                vec!["task_1".to_string(), "task_2".to_string()],
+                "fresh remainder must be scheduled in input order; got {commands:?}"
+            );
+            assert_eq!(waits, 0, "no in-flight resume should remain; got {commands:?}");
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+
+    // Full drive to completion FROM the partial (pre-completion) history — this
+    // exercises the WaitForActivity resume path end-to-end across the window
+    // change — must yield byte-identical, input-order results to an unbounded
+    // fan-out over the same 3 inputs.
+    let out_fn = |_name: &str, input: &Value| Ok(json!(format!("done_{input}")));
+    let windowed_out = drive_windowed_from(exec_id, partial, windowed_raw_handler, input, out_fn)
+        .await;
+    let (unbounded_out, _max, _total, _hist) =
+        drive_windowed(windowed_raw_handler, json!({ "n": 3, "w": 100 }), out_fn).await;
+
+    let windowed_output = match windowed_out {
+        WorkflowOutcome::Completed { output, .. } => output,
+        other => panic!("windowed full drive expected Completed, got {other:?}"),
+    };
+    let unbounded_output = match unbounded_out {
+        WorkflowOutcome::Completed { output, .. } => output,
+        other => panic!("unbounded drive expected Completed, got {other:?}"),
+    };
+    assert_eq!(
+        windowed_output,
+        json!({ "results": ["done_0", "done_1", "done_2"] }),
+        "windowed results must be in input order"
+    );
+    assert_eq!(
+        windowed_output, unbounded_output,
+        "resuming under an increased window must be byte-identical to the unbounded fan-out"
+    );
+}
+
+/// FINDING 1 (decrease direction): a fan-out re-driven under a **decreased**
+/// window must still resume the ENTIRE already-scheduled in-flight prefix (up
+/// to the old, larger window) as one homogeneous all-`WaitForActivity` batch —
+/// already-dispatched work cannot be un-dispatched, so the resume batch waits
+/// on all of it. Recorded under `W1=4` (all 4 scheduled, all in-flight);
+/// re-driven under `W2=2`.
+#[tokio::test]
+async fn windowed_fan_out_resumes_under_decreased_window() {
+    let exec_id = ExecutionId::new();
+    let ids: Vec<ActivityExecId> = (0..4).map(|_| ActivityExecId::new()).collect();
+    let input = json!({ "n": 4, "w": 2 }); // redeploy dropped the window to 2
+    let mut partial = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(4u64),
+        },
+    ];
+    // All 4 scheduled under the old W=4, none completed — all in-flight.
+    for (i, id) in ids.iter().enumerate() {
+        partial.push(WorkflowEvent::ActivityScheduled {
+            activity_id: *id,
+            name: format!("task_{i}"),
+            input: json!(i),
+            queue: "default".into(),
+        });
+    }
+
+    // Cycle 1 under the DECREASED window: phase 1 resumes the whole scheduled
+    // prefix (all 4), emitting an all-`WaitForActivity` batch — never a mixed
+    // batch, never a partial 2-of-4 resume.
+    let outcome = run_workflow(exec_id, partial.clone(), windowed_raw_handler, input.clone()).await;
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let waits = commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::WaitForActivity { .. }))
+                .count();
+            let scheds = commands
+                .iter()
+                .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                .count();
+            assert_eq!(
+                waits, 4,
+                "the whole already-scheduled in-flight prefix (all 4) must be resumed; \
+                 got {commands:?}"
+            );
+            assert_eq!(scheds, 0, "no fresh dispatch during resume; got {commands:?}");
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+
+    // Drive to completion under the decreased window — byte-identical results.
+    let out_fn = |_name: &str, input: &Value| Ok(json!(format!("done_{input}")));
+    let windowed_out =
+        drive_windowed_from(exec_id, partial, windowed_raw_handler, input, out_fn).await;
+    let windowed_output = match windowed_out {
+        WorkflowOutcome::Completed { output, .. } => output,
+        other => panic!("windowed full drive expected Completed, got {other:?}"),
+    };
+    assert_eq!(
+        windowed_output,
+        json!({ "results": ["done_0", "done_1", "done_2", "done_3"] }),
+        "resuming under a decreased window must still produce input-order results"
+    );
+}
