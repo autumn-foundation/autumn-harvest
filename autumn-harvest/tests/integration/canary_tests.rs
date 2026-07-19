@@ -4,14 +4,9 @@
 //! Exercises the *actual* recorder branch (not just the `is_canary_workflow`
 //! predicate) end to end against a real worker + timeout scanner:
 //!
-//! - AC5/AC8: a canary probe driven to COMPLETION emits `harvest.canary.success`
-//!   + `harvest.canary.roundtrip` and NO `harvest.workflow.terminal` /
-//!   `harvest.workflow.started` / `harvest.workflow.duration` for the probe.
-//! - AC6/AC8: a canary that exceeds its per-probe execution timeout emits
-//!   `harvest.canary.failure` and NO `harvest.workflow.terminal` /
-//!   `harvest.workflow.timeout`.
-//! - A NORMAL workflow still increments `harvest.workflow.terminal` (non-canary
-//!   behavior is byte-identical).
+//! - AC5/AC8: a completed canary probe emits `harvest.canary.success` + `harvest.canary.roundtrip` and none of `harvest.workflow.terminal`/`started`/`duration`.
+//! - AC6/AC8: a canary past its per-probe execution timeout emits `harvest.canary.failure` and none of `harvest.workflow.terminal`/`timeout`.
+//! - A NORMAL workflow still increments `harvest.workflow.terminal` (non-canary behavior is byte-identical).
 //!
 //! The probe workflow here is a faithful, hand-built copy of the plugin's
 //! built-in canary (which lives in `autumn-harvest-plugin` and so cannot be
@@ -62,13 +57,13 @@ struct RecordingMetrics {
     canary_success: Mutex<Vec<(String, u16)>>,
     canary_failure: Mutex<Vec<(String, u16)>>,
     canary_roundtrip: Mutex<Vec<(String, u16, f64)>>,
-    /// (workflow_name, queue, outcome)
+    /// (`workflow_name`, queue, outcome)
     terminal: Mutex<Vec<(String, String, String)>>,
-    /// workflow_name of each `record_workflow_started`
+    /// `workflow_name` of each `record_workflow_started`
     started: Mutex<Vec<String>>,
-    /// workflow_name of each `record_workflow_completed` (harvest.workflow.duration)
+    /// `workflow_name` of each `record_workflow_completed` (`harvest.workflow.duration`)
     completed_duration: Mutex<Vec<String>>,
-    /// (workflow_name, queue) of each `record_workflow_timeout`
+    /// (`workflow_name`, queue) of each `record_workflow_timeout`
     workflow_timeout: Mutex<Vec<(String, String)>>,
 }
 
