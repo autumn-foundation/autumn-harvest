@@ -5704,16 +5704,46 @@ pub async fn read_external_await_outcome(
                 ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
             }
             "FAILED" => {
-                let decoded = execution
-                    .error
-                    .as_deref()
-                    .map(crate::failure::decode_workflow_failure);
-                ExternalAwaitOutcome::Terminal {
-                    reason_code: "target_failed".to_string(),
-                    message: decoded.as_ref().map(|d| d.message.clone()),
-                    error_type: decoded.as_ref().and_then(|d| d.error_type.clone()),
-                    details: decoded.as_ref().and_then(|d| d.details.clone()),
-                    non_retryable: decoded.as_ref().and_then(|d| d.non_retryable),
+                // The typed failure cause (issue #767) lives in the terminal
+                // `WorkflowFailed` event's fields — the execution row's `error`
+                // column carries only the human message. Read the target's own
+                // history (undecoded: `error`/`error_type`/`non_retryable` are in
+                // the clear; `details` may be an opaque codec envelope on an
+                // encrypted deployment, matching the plugin chain-walk's approach)
+                // and extract the LAST `WorkflowFailed`.
+                let history = store::load_history_undecoded(conn, current).await?;
+                let typed = history.events.into_iter().rev().find_map(|event| {
+                    if let WorkflowEvent::WorkflowFailed {
+                        error,
+                        error_type,
+                        details,
+                        non_retryable,
+                    } = event
+                    {
+                        Some((error, error_type, details, non_retryable))
+                    } else {
+                        None
+                    }
+                });
+                match typed {
+                    Some((message, error_type, details, non_retryable)) => {
+                        ExternalAwaitOutcome::Terminal {
+                            reason_code: "target_failed".to_string(),
+                            message: Some(message),
+                            error_type,
+                            details,
+                            non_retryable,
+                        }
+                    }
+                    // No WorkflowFailed event (defensive) — fall back to the row's
+                    // human message.
+                    None => ExternalAwaitOutcome::Terminal {
+                        reason_code: "target_failed".to_string(),
+                        message: execution.error.clone(),
+                        error_type: None,
+                        details: None,
+                        non_retryable: None,
+                    },
                 }
             }
             "TIMED_OUT" => ExternalAwaitOutcome::Terminal {
