@@ -252,7 +252,8 @@ pub fn classify_workflow_timeout(
         )
     } else {
         (
-            deadline_at.expect("selected row without a fired chain deadline implies deadline_at < NOW()"),
+            deadline_at
+                .expect("selected row without a fired chain deadline implies deadline_at < NOW()"),
             TimeoutKind::Run,
         )
     }
@@ -1583,11 +1584,8 @@ pub async fn enforce_workflow_execution_timeouts(
         // Chain deadline takes precedence when both fired (issue #617). A
         // chain-only expiry has no per-run `deadline_at`, so classification must
         // not `.expect()` `deadline_at`.
-        let (deadline, timeout_kind) = classify_workflow_timeout(
-            execution.deadline_at,
-            execution.chain_deadline_at,
-            now,
-        );
+        let (deadline, timeout_kind) =
+            classify_workflow_timeout(execution.deadline_at, execution.chain_deadline_at, now);
         let timed_out_at = Utc::now();
 
         let timeout_event = WorkflowEvent::WorkflowExecutionTimedOut {

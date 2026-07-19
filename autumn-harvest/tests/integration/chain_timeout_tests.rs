@@ -22,8 +22,9 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::timeout;
-use autumn_harvest::types::{ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy};
+use autumn_harvest::types::{
+    ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{WorkflowContext, WorkflowInfo};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -34,16 +35,79 @@ use diesel_async::RunQueryDsl;
 use uuid::Uuid;
 
 use crate::integration_e2e::{
-    build_runtime_worker, build_test_pool, enqueue_started_workflow_task, insert_workflow_execution,
-    load_history_from_url, setup_test_database_url_or_env, spawn_test_worker,
-    wait_for_execution_state,
+    build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
+    insert_workflow_execution, load_history_from_url, setup_test_database_url_or_env,
+    spawn_test_worker, wait_for_execution_state,
 };
 
+/// Insert a RUNNING execution row with a caller-chosen UNIQUE `workflow_name` and
+/// `workflow_id`. The unique name lets scanner tests filter the metrics spy to
+/// exactly their own row, so the GLOBAL `enforce_workflow_execution_timeouts`
+/// scan — which times out every crossed-deadline RUNNING row in the shared CI
+/// database, not just this one — cannot make assertions flaky.
+async fn insert_named_running(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&autumn_harvest::models::NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            id: exec_id.as_uuid(),
+            workflow_name,
+            workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: serde_json::json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(conn)
+        .await
+        .expect("insert named running execution");
+    exec_id
+}
+
 /// Spy recorder counting both timeout counters so we can assert which one fired.
+/// Assertions filter by `workflow_name` because the scanner is a GLOBAL scan.
 #[derive(Default)]
 struct TimeoutSpy {
     chain: Mutex<Vec<(String, String)>>,
     run: Mutex<Vec<(String, String)>>,
+}
+impl TimeoutSpy {
+    fn chain_count_for(&self, name: &str) -> usize {
+        self.chain.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+    }
+    fn run_count_for(&self, name: &str) -> usize {
+        self.run.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+    }
 }
 impl MetricsRecorder for TimeoutSpy {
     fn record_workflow_chain_timeout(&self, workflow_name: &str, queue: &str) {
@@ -159,7 +223,9 @@ async fn chain_cap_fires_via_scanner_when_per_run_cap_would_not() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    let exec_id = insert_workflow_execution(&mut conn).await;
+    // Unique workflow_name so the GLOBAL scan's spy can be filtered to this row.
+    let wf_name = format!("chain_scan_{}", Uuid::new_v4().simple());
+    let exec_id = insert_named_running(&mut conn, &wf_name, "wf-1").await;
     // Per-run deadline is comfortably in the FUTURE (would never fire); chain
     // deadline already crossed. This models a run whose current attempt is fine
     // but whose whole continue-as-new chain has outlived its lifetime cap.
@@ -181,12 +247,14 @@ async fn chain_cap_fires_via_scanner_when_per_run_cap_would_not() {
     let n = timeout::enforce_workflow_execution_timeouts(&mut conn, &spy)
         .await
         .expect("scan");
-    assert_eq!(n, 1, "the chain-expired run must be timed out");
+    assert!(n >= 1, "at least the chain-expired run must be timed out");
 
     // State transitioned to TIMED_OUT.
     assert_eq!(load_state(&mut conn, exec_id).await, "TIMED_OUT");
     // WorkflowExecutionTimedOut appended (no new event variant — reuses #243's).
-    let history = store::load_history(&mut conn, exec_id).await.expect("history");
+    let history = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history");
     assert!(
         history
             .events
@@ -194,10 +262,15 @@ async fn chain_cap_fires_via_scanner_when_per_run_cap_would_not() {
             .any(|e| matches!(e, WorkflowEvent::WorkflowExecutionTimedOut { .. })),
         "must append WorkflowExecutionTimedOut"
     );
-    // AC6: the CHAIN counter fired, NOT the run counter.
-    assert_eq!(spy.chain.lock().unwrap().len(), 1, "chain counter fires once");
-    assert!(
-        spy.run.lock().unwrap().is_empty(),
+    // AC6: the CHAIN counter fired for THIS run, NOT the run counter.
+    assert_eq!(
+        spy.chain_count_for(&wf_name),
+        1,
+        "chain counter fires once for this run"
+    );
+    assert_eq!(
+        spy.run_count_for(&wf_name),
+        0,
         "the per-run timeout counter must NOT fire for a chain timeout"
     );
 }
@@ -209,7 +282,8 @@ async fn chain_only_expiry_times_out_without_panicking() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    let exec_id = insert_workflow_execution(&mut conn).await;
+    let wf_name = format!("chain_only_{}", Uuid::new_v4().simple());
+    let exec_id = insert_named_running(&mut conn, &wf_name, "wf-1").await;
     // deadline_at stays NULL (no per-run cap); only the chain deadline is set.
     set_chain_columns(
         &mut conn,
@@ -223,9 +297,9 @@ async fn chain_only_expiry_times_out_without_panicking() {
     let n = timeout::enforce_workflow_execution_timeouts(&mut conn, &spy)
         .await
         .expect("scan must not panic on a chain-only expiry");
-    assert_eq!(n, 1);
+    assert!(n >= 1);
     assert_eq!(load_state(&mut conn, exec_id).await, "TIMED_OUT");
-    assert_eq!(spy.chain.lock().unwrap().len(), 1);
+    assert_eq!(spy.chain_count_for(&wf_name), 1);
 }
 
 // ── AC6: a per-run timeout increments the RUN counter, not the chain counter.
@@ -234,9 +308,13 @@ async fn per_run_timeout_increments_run_counter_not_chain() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    let exec_id = insert_workflow_execution(&mut conn).await;
+    let wf_name = format!("per_run_{}", Uuid::new_v4().simple());
+    let exec_id = insert_named_running(&mut conn, &wf_name, "wf-1").await;
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::deadline_at.eq(Some(Utc::now() - ChronoDuration::seconds(1))))
+        .set(
+            harvest_workflow_executions::deadline_at
+                .eq(Some(Utc::now() - ChronoDuration::seconds(1))),
+        )
         .execute(&mut conn)
         .await
         .expect("set past per-run deadline");
@@ -246,9 +324,10 @@ async fn per_run_timeout_increments_run_counter_not_chain() {
     timeout::enforce_workflow_execution_timeouts(&mut conn, &spy)
         .await
         .expect("scan");
-    assert_eq!(spy.run.lock().unwrap().len(), 1, "run counter fires");
-    assert!(
-        spy.chain.lock().unwrap().is_empty(),
+    assert_eq!(spy.run_count_for(&wf_name), 1, "run counter fires for this run");
+    assert_eq!(
+        spy.chain_count_for(&wf_name),
+        0,
         "chain counter must not fire for a per-run timeout"
     );
 }
@@ -296,10 +375,19 @@ async fn inherited_chain_deadline_is_used_verbatim() {
         .expect("start");
 
     let (_timeout, chain_deadline) = load_chain_columns(&mut conn, exec_id).await;
-    assert_eq!(
-        chain_deadline,
-        Some(frozen),
-        "inherited chain deadline must be copied verbatim, not recomputed"
+    // TIMESTAMPTZ truncates sub-microsecond precision on the round-trip, so
+    // compare within a tiny tolerance rather than exact equality.
+    let dl = chain_deadline.expect("inherited chain deadline must be set");
+    assert!(
+        (dl - frozen).num_milliseconds().abs() < 10,
+        "inherited chain deadline must be copied verbatim, not recomputed: got \
+         {dl}, expected {frozen}"
+    );
+    // Falsify the re-anchor hypothesis: a re-anchored (now + 7d) deadline would be
+    // far in the future; the verbatim value is 3h in the PAST.
+    assert!(
+        dl < Utc::now(),
+        "a re-anchored now+7d deadline would be in the future; verbatim is 3h ago"
     );
 }
 
@@ -417,7 +505,10 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow')",
         "DELETE FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow'",
     ] {
-        diesel::sql_query(stmt).execute(&mut conn).await.expect("scrub");
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .await
+            .expect("scrub");
     }
 
     let origin = insert_workflow_execution(&mut conn).await;
