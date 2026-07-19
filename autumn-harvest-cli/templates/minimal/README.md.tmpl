@@ -1,0 +1,63 @@
+# {{crate_name}}
+
+A minimal, runnable [autumn-harvest](https://crates.io/crates/autumn-harvest)
+project: one `#[workflow]` (`{{workflow_fn}}`) calling one `#[activity]`
+(`{{activity_fn}}`), backed by Postgres.
+
+## Prerequisites
+
+- Stable Rust toolchain (`rustup default stable`)
+- Docker (for the Postgres defined in `compose.yaml`)
+
+## Run it — three commands to a durable execution
+
+1. Start Postgres:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. Start the app. `AUTUMN_PROFILE=dev` auto-applies the harvest migrations on
+   first run, so there is **no** manual `diesel migration run` step:
+
+   ```bash
+   AUTUMN_PROFILE=dev cargo run
+   ```
+
+   App: <http://localhost:3000> · Management API:
+   <http://localhost:3000/api/harvest> · Dashboard:
+   <http://localhost:3000/api/harvest/ui>
+
+3. Trigger a workflow execution. The response is JSON containing an
+   `execution_id` and a `state` (`RUNNING` immediately after the POST):
+
+   ```bash
+   curl -s -X POST http://localhost:3000/api/harvest/workflows/{{workflow_fn}}/start \
+     -H 'Content-Type: application/json' \
+     -d '{"workflow_id":"demo-1","input":"World"}'
+   ```
+
+## See the result
+
+The workflow runs asynchronously, so poll the execution until it reaches
+`COMPLETED` (replace `<execution_id>` with the value returned in step 3):
+
+```bash
+curl -s http://localhost:3000/api/harvest/workflows/<execution_id> | jq '.execution.state'
+```
+
+Or watch it live in the dashboard at
+<http://localhost:3000/api/harvest/ui>.
+
+If you have the harvest CLI installed (`cargo install autumn-harvest-cli`),
+the same query is:
+
+```bash
+harvest --base-url http://localhost:3000/api/harvest workflow get <execution_id>
+```
+
+## Tear down
+
+```bash
+docker compose down -v
+```

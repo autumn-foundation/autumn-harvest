@@ -1,0 +1,69 @@
+//! {{crate_name}} — a minimal, runnable autumn-harvest project.
+//!
+//! One `#[workflow]` calls one `#[activity]`, backed by Postgres. See README.md
+//! for the run steps (three commands to a durable execution).
+
+use std::time::Duration;
+
+use autumn_harvest::prelude::*;
+use autumn_harvest_plugin::HarvestPlugin;
+use autumn_web::prelude::*;
+
+/// Greets `name` by running the `{{activity_fn}}` activity, then returns the
+/// activity's message.
+#[workflow]
+async fn {{workflow_fn}}(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
+    // ctx.logger() is replay-aware: prefer it over tracing::info! inside a
+    // workflow body so the line fires exactly once across restarts/replays
+    // (guardrail HVG009).
+    ctx.logger().info("{{workflow_fn}} started");
+
+    let greeting: serde_json::Value = ctx
+        .execute_activity(&{{activity_fn}}_info(), serde_json::json!({ "name": name }))
+        .await?;
+
+    ctx.logger().info("{{workflow_fn}} completed");
+
+    Ok(greeting["message"]
+        .as_str()
+        .unwrap_or("hello from harvest")
+        .to_string())
+}
+
+/// Builds and returns a greeting message for the given `name`.
+#[activity(queue = "{{queue}}", start_to_close = "30s", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
+async fn {{activity_fn}}(
+    _ctx: &ActivityContext,
+    input: serde_json::Value,
+) -> HarvestResult<serde_json::Value> {
+    let name = input["name"].as_str().unwrap_or("world");
+    let message = format!("hello, {name}!");
+    tracing::info!(name, message, "greeting built");
+    Ok(serde_json::json!({ "message": message }))
+}
+
+/// A tiny landing route. autumn-web requires at least one HTTP route, so this
+/// gives the app one; the durable workflow lives behind the management API.
+#[get("/")]
+async fn index() -> &'static str {
+    "{{crate_name}} is running. Open the dashboard at /api/harvest/ui\n"
+}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .routes(routes![index])
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![{{workflow_fn}}])
+                .activities(activities![{{activity_fn}}])
+                // This worker polls the "{{queue}}" queue. A workflow start
+                // enqueues the workflow task on the worker's first queue, and
+                // the activity (queue = "{{queue}}") is enqueued there too — so
+                // this single queue services both.
+                .worker(WorkerConfig::default().with_queues(["{{queue}}"]))
+                .api("/api/harvest"),
+        )
+        .run()
+        .await;
+}
