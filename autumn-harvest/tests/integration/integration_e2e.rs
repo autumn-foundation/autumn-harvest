@@ -10553,10 +10553,7 @@ async fn insert_named_execution(
 /// Takes a caller-owned connection so a polling loop can reuse ONE connection
 /// across all polls rather than establishing (and dropping) a fresh connection
 /// on every sample.
-async fn count_active_activity_rows(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-) -> i64 {
+async fn count_active_activity_rows(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
     harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
         .filter(harvest_task_queue::task_type.eq("activity"))

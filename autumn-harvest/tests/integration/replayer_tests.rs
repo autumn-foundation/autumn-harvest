@@ -9136,10 +9136,8 @@ async fn replayer_windowed_fan_out_randomized_completion_order() {
     // identity, the "randomized order" claim would be silently false. Require at
     // least two DISTINCT non-identity permutations across the seeds.
     let identity = vec![0usize, 1, 2, 3];
-    let non_identity: std::collections::BTreeSet<Vec<usize>> = (0..30)
-        .map(perm)
-        .filter(|o| *o != identity)
-        .collect();
+    let non_identity: std::collections::BTreeSet<Vec<usize>> =
+        (0..30).map(perm).filter(|o| *o != identity).collect();
     assert!(
         non_identity.len() >= 2,
         "the completion-order generator must produce >=2 distinct non-input orderings; \
@@ -9231,9 +9229,18 @@ async fn replayer_windowed_shaped_history_replays_under_any_window() {
     let (exec_id, events) = windowed_shaped_fan_out_history();
 
     for (name, handler) in [
-        ("windowed_replay_w1", windowed_replay_w1 as WorkflowHandlerFn),
-        ("windowed_replay_w4", windowed_replay_w4 as WorkflowHandlerFn),
-        ("unbounded_replay_4", unbounded_replay_4 as WorkflowHandlerFn),
+        (
+            "windowed_replay_w1",
+            windowed_replay_w1 as WorkflowHandlerFn,
+        ),
+        (
+            "windowed_replay_w4",
+            windowed_replay_w4 as WorkflowHandlerFn,
+        ),
+        (
+            "unbounded_replay_4",
+            unbounded_replay_4 as WorkflowHandlerFn,
+        ),
     ] {
         let report = WorkflowReplayer::new()
             .register_fn(name, handler)

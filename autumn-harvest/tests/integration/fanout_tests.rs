@@ -1627,7 +1627,13 @@ async fn windowed_fan_out_resumes_under_increased_window() {
 
     // Cycle 1 under the INCREASED window: the enlarged wave must NOT regroup the
     // in-flight slot 0 with fresh slots 1,2. It must re-park on slot 0 ONLY.
-    let outcome = run_workflow(exec_id, partial.clone(), windowed_raw_handler, input.clone()).await;
+    let outcome = run_workflow(
+        exec_id,
+        partial.clone(),
+        windowed_raw_handler,
+        input.clone(),
+    )
+    .await;
     match outcome {
         WorkflowOutcome::Suspended { commands } => {
             let waits = commands
@@ -1680,7 +1686,10 @@ async fn windowed_fan_out_resumes_under_increased_window() {
                 vec!["task_1".to_string(), "task_2".to_string()],
                 "fresh remainder must be scheduled in input order; got {commands:?}"
             );
-            assert_eq!(waits, 0, "no in-flight resume should remain; got {commands:?}");
+            assert_eq!(
+                waits, 0,
+                "no in-flight resume should remain; got {commands:?}"
+            );
         }
         other => panic!("expected Suspended, got {other:?}"),
     }
@@ -1690,8 +1699,8 @@ async fn windowed_fan_out_resumes_under_increased_window() {
     // change — must yield byte-identical, input-order results to an unbounded
     // fan-out over the same 3 inputs.
     let out_fn = |_name: &str, input: &Value| Ok(json!(format!("done_{input}")));
-    let windowed_out = drive_windowed_from(exec_id, partial, windowed_raw_handler, input, out_fn)
-        .await;
+    let windowed_out =
+        drive_windowed_from(exec_id, partial, windowed_raw_handler, input, out_fn).await;
     let (unbounded_out, _max, _total, _hist) =
         drive_windowed(windowed_raw_handler, json!({ "n": 3, "w": 100 }), out_fn).await;
 
@@ -1751,7 +1760,13 @@ async fn windowed_fan_out_resumes_under_decreased_window() {
     // Cycle 1 under the DECREASED window: phase 1 resumes the whole scheduled
     // prefix (all 4), emitting an all-`WaitForActivity` batch — never a mixed
     // batch, never a partial 2-of-4 resume.
-    let outcome = run_workflow(exec_id, partial.clone(), windowed_raw_handler, input.clone()).await;
+    let outcome = run_workflow(
+        exec_id,
+        partial.clone(),
+        windowed_raw_handler,
+        input.clone(),
+    )
+    .await;
     match outcome {
         WorkflowOutcome::Suspended { commands } => {
             let waits = commands
@@ -1767,7 +1782,10 @@ async fn windowed_fan_out_resumes_under_decreased_window() {
                 "the whole already-scheduled in-flight prefix (all 4) must be resumed; \
                  got {commands:?}"
             );
-            assert_eq!(scheds, 0, "no fresh dispatch during resume; got {commands:?}");
+            assert_eq!(
+                scheds, 0,
+                "no fresh dispatch during resume; got {commands:?}"
+            );
         }
         other => panic!("expected Suspended, got {other:?}"),
     }
@@ -1886,7 +1904,10 @@ async fn windowed_typed_collect_returns_typed_ok_and_err_slots_in_order() {
 
     assert_eq!(results.len(), 3);
     assert_eq!(results[0], Ok(0), "slot 0 typed output");
-    assert!(results[1].is_err(), "slot 1 should carry the per-slot error");
+    assert!(
+        results[1].is_err(),
+        "slot 1 should carry the per-slot error"
+    );
     assert!(
         results[1].as_ref().unwrap_err().contains("slot_1_boom"),
         "slot 1 error preserved: {:?}",

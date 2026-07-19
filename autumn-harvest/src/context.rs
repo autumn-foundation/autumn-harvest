@@ -8156,13 +8156,15 @@ impl WorkflowContext {
         // cycle and no fresh dispatch is co-mingled with the resume.
         if scheduled_prefix > 0 {
             self.check_cancellation()?;
-            let prefix_futs = activities.drain(..scheduled_prefix).map(|(name, input, queue)| {
-                let retry = retry.clone();
-                async move {
-                    self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
-                        .await
-                }
-            });
+            let prefix_futs = activities
+                .drain(..scheduled_prefix)
+                .map(|(name, input, queue)| {
+                    let retry = retry.clone();
+                    async move {
+                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                            .await
+                    }
+                });
             let prefix_results = futures::future::try_join_all(prefix_futs).await?;
             results.extend(prefix_results);
         }
@@ -8268,15 +8270,19 @@ impl WorkflowContext {
         // mid-flight window change from forming a mixed suspension batch).
         if scheduled_prefix > 0 {
             self.check_cancellation()?;
-            let prefix_futs = activities.drain(..scheduled_prefix).map(|(name, input, queue)| {
-                let retry = retry.clone();
-                async move {
-                    classify(
-                        self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+            let prefix_futs = activities
+                .drain(..scheduled_prefix)
+                .map(|(name, input, queue)| {
+                    let retry = retry.clone();
+                    async move {
+                        classify(
+                            self.execute_activity_raw_with_opts(
+                                &name, input, &queue, retry, timeout,
+                            )
                             .await,
-                    )
-                }
-            });
+                        )
+                    }
+                });
             let prefix_results = futures::future::try_join_all(prefix_futs).await?;
             results.extend(prefix_results);
         }
