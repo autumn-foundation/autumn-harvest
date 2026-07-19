@@ -18,6 +18,7 @@ use std::pin::Pin;
 
 use autumn_harvest::ExecutionId;
 use autumn_harvest::context::{SessionOptions, WorkflowContext};
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
 use autumn_harvest::types::ParentClosePolicy;
@@ -3435,5 +3436,228 @@ async fn test_default_env_metadata_in_activity_input_replays_clean() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "a default WorkflowTestEnv recording ctx.info() into an activity input must replay \
          clean:\n{report}"
+    );
+}
+
+// ── await_external_workflow coverage (issue #757) ────────────────────────────
+
+/// Awaits an external target and returns its output verbatim.
+fn await_target_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(input["target"].as_str().ok_or("missing target")?)
+                .map_err(|e| e.to_string())?,
+        );
+        let out = ctx
+            .await_external_workflow_value(target)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Awaits an external target and surfaces the typed failure fields into its
+/// output so a test can assert the Err branch's typed cause.
+fn await_target_capturing_error_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(input["target"].as_str().ok_or("missing target")?)
+                .map_err(|e| e.to_string())?,
+        );
+        match ctx.await_external_workflow_value(target).await {
+            Ok(v) => Ok(json!({ "ok": v })),
+            Err(e) => Ok(json!({
+                "error_type": e.workflow_error_type(),
+                "message": e.to_string(),
+            })),
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_ok_branch() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_result(target, json!({ "tracking": "abc" }))
+        .run(
+            await_target_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    assert_eq!(outcome.result, Ok(json!({ "tracking": "abc" })));
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitRequested { .. })),
+        "expected ExternalAwaitRequested"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitResolved { .. })),
+        "expected ExternalAwaitResolved"
+    );
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_typed_err_branch() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_failure(
+            target,
+            "target_failed",
+            Some("card declined".to_string()),
+            Some("PaymentDeclined".to_string()),
+            None,
+            Some(true),
+        )
+        .run(
+            await_target_capturing_error_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    let result = outcome.result.clone().expect("workflow completes");
+    assert_eq!(result["error_type"], json!("PaymentDeclined"));
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("card declined"),
+        "message should carry the target's terminal cause: {result}"
+    );
+    // The typed failure is frozen into the awaiter's history.
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitFailed { .. })),
+        "expected ExternalAwaitFailed in history"
+    );
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_replays_deterministically() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_result(target, json!(42))
+        .run(
+            await_target_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    outcome.result.clone().expect("workflow completes");
+    let report = outcome.replay_check(await_target_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a workflow awaiting an external target must replay clean:\n{report}"
+    );
+}
+
+/// P2-a (issue #757 review): a non-`COMPLETED` terminal cause is programmatically
+/// branchable via `err.workflow_error_type()` — the reader stamps
+/// `error_type = Some(reason_code)` for `CANCELLED`/`TIMED_OUT`/`TERMINATED`. This runs
+/// the capturing workflow against a fixture that mirrors that reader output and
+/// asserts the coordinator can distinguish the three terminal causes without
+/// string-matching the message.
+async fn assert_terminal_cause_is_branchable(reason_code: &str) {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_failure(
+            target,
+            reason_code,
+            // The message is deliberately unhelpful — the branch decision must
+            // come from `workflow_error_type()`, not the message text.
+            Some("target reached a terminal state".to_string()),
+            Some(reason_code.to_string()),
+            None,
+            None,
+        )
+        .run(
+            await_target_capturing_error_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    let result = outcome.result.clone().expect("workflow completes");
+    assert_eq!(
+        result["error_type"],
+        json!(reason_code),
+        "workflow_error_type() must surface the terminal reason_code for a {reason_code} target: {result}"
+    );
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitFailed { .. })),
+        "expected ExternalAwaitFailed in history for a {reason_code} target"
+    );
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_cancelled_target_is_branchable() {
+    assert_terminal_cause_is_branchable("target_cancelled").await;
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_timed_out_target_is_branchable() {
+    assert_terminal_cause_is_branchable("target_timed_out").await;
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_terminated_target_is_branchable() {
+    assert_terminal_cause_is_branchable("target_terminated").await;
+}
+
+/// Awaits a target with the TYPED API and reports which `HarvestError` variant it
+/// surfaces, so a test can assert an undeserializable output yields
+/// `HarvestError::Serialization` (not a panic).
+fn await_typed_deser_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    #[derive(serde::Deserialize)]
+    struct TypedLeg {
+        #[allow(dead_code)]
+        amount: u64,
+    }
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(input["target"].as_str().ok_or("missing target")?)
+                .map_err(|e| e.to_string())?,
+        );
+        let kind = match ctx.await_external_workflow::<TypedLeg>(target).await {
+            Ok(_) => "ok",
+            Err(HarvestError::Serialization(_)) => "serialization",
+            Err(_) => "other",
+        };
+        Ok(json!({ "kind": kind }))
+    })
+}
+
+/// P2-e (issue #757 review): the typed `await_external_workflow::<T>` returns
+/// `HarvestError::Serialization` (never panics) when the target's output does not
+/// deserialize into `T`.
+#[tokio::test]
+async fn test_await_external_workflow_typed_deserialize_failure() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        // A shape that cannot deserialize into `TypedLeg { amount: u64 }`.
+        .with_external_await_result(target, json!({ "unexpected": "shape" }))
+        .run(
+            await_typed_deser_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    let result = outcome.result.expect("workflow completes cleanly");
+    assert_eq!(
+        result["kind"],
+        json!("serialization"),
+        "typed await of an undeserializable output must surface HarvestError::Serialization: {result}"
     );
 }

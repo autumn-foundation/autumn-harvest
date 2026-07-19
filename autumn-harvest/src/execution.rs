@@ -5651,6 +5651,189 @@ pub async fn load_execution(
         .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
+/// The terminal outcome of an awaited target workflow (issue #757), resolved by
+/// [`read_external_await_outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalAwaitOutcome {
+    /// Target reached `COMPLETED` — carries its recorded (inflated) output.
+    Completed(serde_json::Value),
+    /// Target reached a non-`COMPLETED` terminal state.
+    Terminal {
+        /// Machine-readable reason code
+        /// (`target_failed`/`target_timed_out`/`target_cancelled`/`target_terminated`).
+        reason_code: String,
+        /// Human-readable message from the target's terminal cause.
+        message: Option<String>,
+        /// Stable error-type name from a typed target failure.
+        error_type: Option<String>,
+        /// Structured details from a typed target failure.
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable flag from a typed target failure.
+        non_retryable: Option<bool>,
+    },
+}
+
+/// Upper bound on `WorkflowContinuedAsNew` chain hops the await-outcome reader
+/// follows before giving up (matches the plugin `/result` chain-walk bound).
+const AWAIT_OUTCOME_CHAIN_MAX_HOPS: usize = 128;
+
+/// Three-state result of [`read_external_await_outcome`] (issue #757).
+///
+/// Distinguishing "still running" from "not found" lets the outbox drive the
+/// grace window (`NotFound` + grace-expired → `target_unknown`) and the inline
+/// path decide re-park vs append, without a second existence probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalAwaitReadResult {
+    /// Target reached a terminal state — carries the resolved outcome.
+    Terminal(ExternalAwaitOutcome),
+    /// Target exists but is still non-terminal (`RUNNING`/`PAUSED`/…), or an
+    /// in-flight `CONTINUED_AS_NEW` successor is not yet visible.
+    NotYetTerminal,
+    /// No execution with this id was found (drives the outbox grace window).
+    NotFound,
+}
+
+/// Observe-only reader (issue #757): resolve the terminal outcome of `target`
+/// for `await_external_workflow`.
+///
+/// Returns [`ExternalAwaitReadResult::NotYetTerminal`] when the target is still
+/// `RUNNING`/`PAUSED`, [`ExternalAwaitReadResult::NotFound`] when no such
+/// execution exists (the outbox grace window — not this reader — converts a
+/// persistent `NotFound` into `target_unknown`), and
+/// [`ExternalAwaitReadResult::Terminal`] otherwise. A `CONTINUED_AS_NEW` target
+/// is followed through its successor chain (same-shard) to the true terminal.
+///
+/// **Never mutates the target or creates any linkage** — a pure read.
+pub async fn read_external_await_outcome(
+    conn: &mut AsyncPgConnection,
+    target: ExecutionId,
+) -> HarvestResult<ExternalAwaitReadResult> {
+    let mut current = target;
+    for hop in 0..AWAIT_OUTCOME_CHAIN_MAX_HOPS {
+        let execution = match load_execution(conn, current).await {
+            Ok(e) => e,
+            // The target itself (hop 0) is absent → drive the grace window.
+            // A later hop (a `CONTINUED_AS_NEW` successor not yet visible) is
+            // transient: the ORIGINAL target exists, so never report unknown —
+            // treat it as still-in-flight and let the outbox retry next tick.
+            Err(HarvestError::NotFound(_)) => {
+                return Ok(if hop == 0 {
+                    ExternalAwaitReadResult::NotFound
+                } else {
+                    ExternalAwaitReadResult::NotYetTerminal
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        let outcome = match execution.state.as_str() {
+            "COMPLETED" => {
+                // The target's `output` row column is read RAW. Core
+                // `append_events`/`load_history` use the identity codec (payload
+                // codecs are a plugin-layer concern), so on a codec-encrypting
+                // deployment this is the ciphertext envelope — the awaiter freezes
+                // it inflated into its own history, mirroring the `FAILED`-path
+                // `details` caveat below. A large output is copied inline without
+                // offloading (a documented future optimization — issue #757).
+                ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
+            }
+            "FAILED" => {
+                // The typed failure cause (issue #767) lives in the terminal
+                // `WorkflowFailed` event's fields — the execution row's `error`
+                // column carries only the human message. Read the target's own
+                // history (undecoded: `error`/`error_type`/`non_retryable` are in
+                // the clear; `details` may be an opaque codec envelope on an
+                // encrypted deployment, matching the plugin chain-walk's approach)
+                // and extract the LAST `WorkflowFailed`.
+                let history = store::load_history_undecoded(conn, current).await?;
+                let typed = history.events.into_iter().rev().find_map(|event| {
+                    if let WorkflowEvent::WorkflowFailed {
+                        error,
+                        error_type,
+                        details,
+                        non_retryable,
+                    } = event
+                    {
+                        Some((error, error_type, details, non_retryable))
+                    } else {
+                        None
+                    }
+                });
+                match typed {
+                    Some((message, error_type, details, non_retryable)) => {
+                        ExternalAwaitOutcome::Terminal {
+                            reason_code: "target_failed".to_string(),
+                            message: Some(message),
+                            error_type,
+                            details,
+                            non_retryable,
+                        }
+                    }
+                    // No WorkflowFailed event (defensive) — fall back to the row's
+                    // human message.
+                    None => ExternalAwaitOutcome::Terminal {
+                        reason_code: "target_failed".to_string(),
+                        message: execution.error.clone(),
+                        error_type: None,
+                        details: None,
+                        non_retryable: None,
+                    },
+                }
+            }
+            // Non-`COMPLETED` terminals carry `error_type = Some(reason_code)`
+            // (issue #757 review) so a coordinator can branch cancelled vs
+            // timed-out vs terminated via `err.workflow_error_type()` instead of
+            // string-matching the human message.
+            "TIMED_OUT" => ExternalAwaitOutcome::Terminal {
+                reason_code: "target_timed_out".to_string(),
+                message: execution.error.clone(),
+                error_type: Some("target_timed_out".to_string()),
+                details: None,
+                non_retryable: None,
+            },
+            "CANCELLED" => ExternalAwaitOutcome::Terminal {
+                reason_code: "target_cancelled".to_string(),
+                message: execution.error.clone(),
+                error_type: Some("target_cancelled".to_string()),
+                details: None,
+                non_retryable: None,
+            },
+            "TERMINATED" => ExternalAwaitOutcome::Terminal {
+                reason_code: "target_terminated".to_string(),
+                message: execution.error.clone(),
+                error_type: Some("target_terminated".to_string()),
+                details: None,
+                non_retryable: None,
+            },
+            "CONTINUED_AS_NEW" => {
+                // Follow the successor chain (same shard) to the true terminal.
+                let history = store::load_history_undecoded(conn, current).await?;
+                let successor = history.events.into_iter().find_map(|event| {
+                    if let WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } = event {
+                        Some(new_exec_id)
+                    } else {
+                        None
+                    }
+                });
+                match successor {
+                    Some(next) => {
+                        current = next;
+                        continue;
+                    }
+                    // No successor recorded yet — treat as still-in-flight.
+                    None => return Ok(ExternalAwaitReadResult::NotYetTerminal),
+                }
+            }
+            // RUNNING / PAUSED / SUSPENDED (or any non-terminal): still in flight.
+            _ => return Ok(ExternalAwaitReadResult::NotYetTerminal),
+        };
+        return Ok(ExternalAwaitReadResult::Terminal(outcome));
+    }
+    // Exceeded chain depth — treat as still in flight rather than fabricating a
+    // terminal (the outbox retries next tick).
+    Ok(ExternalAwaitReadResult::NotYetTerminal)
+}
+
 /// Scans workflow history for unresolved update handlers and records warning logs/metrics if any exist.
 pub async fn check_and_report_unfinished_handlers(
     conn: &mut AsyncPgConnection,

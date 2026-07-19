@@ -400,6 +400,92 @@ fn should_can_then_user_now_then_timer_workflow<'a>(
     })
 }
 
+/// Await an external workflow's terminal output (issue #757). Returns the
+/// awaited target's output verbatim.
+fn await_external_wf<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_str = input["target"].as_str().ok_or("missing target")?;
+        let target =
+            ExecutionId::from_uuid(uuid::Uuid::parse_str(target_str).map_err(|e| e.to_string())?);
+        let out = ctx
+            .await_external_workflow_value(target)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Await an external workflow and branch on its typed terminal cause (issue
+/// #757): the branch decision is made observable through replay determinism —
+/// a `PaymentDeclined` failure schedules `compensate`, any other outcome
+/// schedules `finalize`. A wrong branch would schedule the other activity and
+/// diverge.
+fn await_external_branch_wf<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_str = input["target"].as_str().ok_or("missing target")?;
+        let target =
+            ExecutionId::from_uuid(uuid::Uuid::parse_str(target_str).map_err(|e| e.to_string())?);
+        let activity = match ctx.await_external_workflow_value(target).await {
+            Err(e) if e.workflow_error_type() == Some("PaymentDeclined") => "compensate",
+            _ => "finalize",
+        };
+        ctx.execute_activity_raw(activity, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Await an external workflow concurrently with an activity (issue #757): both
+/// run in one `tokio::join!` batch. Regression fixture for the interleaved
+/// stash triplets across randomized re-drive orderings.
+fn await_external_concurrent_wf<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_str = input["target"].as_str().ok_or("missing target")?;
+        let target =
+            ExecutionId::from_uuid(uuid::Uuid::parse_str(target_str).map_err(|e| e.to_string())?);
+        let (act, awaited) = futures::join!(
+            ctx.execute_activity_raw("compute", Value::Null, "default"),
+            ctx.await_external_workflow_value(target),
+        );
+        act.map_err(|e| e.to_string())?;
+        let out = awaited.map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Await an external workflow concurrently with a durable timer (issue #757):
+/// both run in one `futures::join!` batch. Regression fixture proving the await
+/// stash triplets keep replay deterministic when `ExternalAwaitResolved` and
+/// `TimerFired` are recorded in EITHER order (mirrors the #476
+/// `receive_signal_timeout` concurrent-with-timer bar).
+fn await_external_concurrent_timer_wf<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_str = input["target"].as_str().ok_or("missing target")?;
+        let target =
+            ExecutionId::from_uuid(uuid::Uuid::parse_str(target_str).map_err(|e| e.to_string())?);
+        let (timer_res, awaited) = futures::join!(
+            ctx.timer("wake", 1),
+            ctx.await_external_workflow_value(target)
+        );
+        timer_res.map_err(|e| e.to_string())?;
+        let out = awaited.map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
 /// Cancellable durable timer (issue #768): arm, then await the outcome.
 fn cancellable_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1188,6 +1274,16 @@ fn build_replayer() -> WorkflowReplayer {
             "should_can_then_user_now_then_timer_workflow",
             should_can_then_user_now_then_timer_workflow,
         )
+        .register_fn("await_external_workflow", await_external_wf)
+        .register_fn("await_external_branch_workflow", await_external_branch_wf)
+        .register_fn(
+            "await_external_concurrent_workflow",
+            await_external_concurrent_wf,
+        )
+        .register_fn(
+            "await_external_concurrent_timer_workflow",
+            await_external_concurrent_timer_wf,
+        )
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -1519,6 +1615,365 @@ async fn replay_drain_n_signals_in_one_task_consumes_all() {
         "{n} buffered signals must be drained in one task execution (else leftover \
          unconsumed history flags non-determinism), got: {report}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (a2) ctx.await_external_workflow (issue #757) replays deterministically.
+// ---------------------------------------------------------------------------
+
+/// A recorded history for a workflow that awaited an external target which
+/// reached COMPLETED — `ExternalAwaitRequested` + `ExternalAwaitResolved`.
+fn await_resolved_history(target: ExecutionId, output: Value) -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let await_id = autumn_harvest::ExternalAwaitId::new();
+    let events = vec![
+        WorkflowEvent::workflow_started(
+            serde_json::json!({ "target": target.to_string() }),
+            Utc::now(),
+        ),
+        WorkflowEvent::ExternalAwaitRequested { await_id, target },
+        WorkflowEvent::ExternalAwaitResolved { await_id, output },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replayer_succeeds_for_await_external_workflow() {
+    let target = ExecutionId::new();
+    let (exec_id, events) =
+        await_resolved_history(target, serde_json::json!({ "tracking": "abc123" }));
+    let replayer = build_replayer();
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("await_external_workflow", exec_id, events))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a history awaiting an external target that COMPLETED must replay \
+         deterministically, got: {report}"
+    );
+}
+
+/// The falsifiable success metric (issue #757, mirroring the #476 1000-ordering
+/// bar): replay one representative await fixture across N = 1000 distinct
+/// fixtures (varying target id and output) — every pass must report
+/// `ReplaySucceeded` with zero divergences. Each fixture pins the recorded
+/// output through the workflow's own return value, so a broken match would
+/// diverge rather than pass.
+#[tokio::test]
+async fn replayer_await_external_workflow_1000_passes_deterministic() {
+    let replayer = build_replayer();
+    for i in 0..1000_usize {
+        let target = ExecutionId::new();
+        let output = serde_json::json!({ "seq": i, "target": target.to_string() });
+        let (exec_id, events) = await_resolved_history(target, output);
+        let report = replayer
+            .replay_from_snapshot(make_snapshot("await_external_workflow", exec_id, events))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "iteration {i}: await-external fixture must replay deterministically, got: {report}"
+        );
+    }
+}
+
+/// A concurrent await+activity history whose interleaving is derived from
+/// `ordering` (issue #757 review, P3-b): the schedule block (`ActivityScheduled`
+/// vs `ExternalAwaitRequested`) and the completion block (`ActivityCompleted` vs
+/// `ExternalAwaitResolved`) are each swapped by one bit of `ordering`, giving the
+/// four valid interleavings (schedules always precede completions, which the
+/// `futures::join!` batch guarantees). The `await_external_concurrent_workflow`
+/// handler consumes both via the stash triplets in every scan loop.
+fn await_concurrent_history(
+    target: ExecutionId,
+    output: Value,
+    act_output: Value,
+    ordering: usize,
+) -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let await_id = autumn_harvest::ExternalAwaitId::new();
+    let act_id = ActivityExecId::new();
+
+    let sched = WorkflowEvent::ActivityScheduled {
+        activity_id: act_id,
+        name: "compute".into(),
+        input: Value::Null,
+        queue: "default".into(),
+    };
+    let requested = WorkflowEvent::ExternalAwaitRequested { await_id, target };
+    let completed = WorkflowEvent::ActivityCompleted {
+        activity_id: act_id,
+        output: act_output,
+    };
+    let resolved = WorkflowEvent::ExternalAwaitResolved { await_id, output };
+
+    let mut events = vec![WorkflowEvent::workflow_started(
+        serde_json::json!({ "target": target.to_string() }),
+        Utc::now(),
+    )];
+    // Schedule block (bit 0).
+    if ordering & 1 == 0 {
+        events.push(sched);
+        events.push(requested);
+    } else {
+        events.push(requested);
+        events.push(sched);
+    }
+    // Completion block (bit 1).
+    if ordering & 2 == 0 {
+        events.push(completed);
+        events.push(resolved);
+    } else {
+        events.push(resolved);
+        events.push(completed);
+    }
+    (exec_id, events)
+}
+
+/// The falsifiable ORDERING bar (issue #757 review, P3-b, mirroring the #476
+/// 1000-ordering precedent): replay the concurrent await+activity fixture across
+/// N = 1000 passes, walking a deterministic index-derived permutation of the four
+/// valid interleavings of the await triplet relative to the activity's events
+/// (with varying data). Every pass must report `ReplaySucceeded` — a stash bug in
+/// any scan loop would diverge on the ordering it mishandles.
+#[tokio::test]
+async fn replayer_await_external_concurrent_1000_orderings_deterministic() {
+    let replayer = build_replayer();
+    let mut per_ordering = [0usize; 4];
+    for i in 0..1000_usize {
+        let ordering = i % 4;
+        per_ordering[ordering] += 1;
+        let target = ExecutionId::new();
+        let output = serde_json::json!({ "seq": i, "ok": true });
+        let act_output = serde_json::json!(i);
+        let (exec_id, events) = await_concurrent_history(target, output, act_output, ordering);
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "await_external_concurrent_workflow",
+                exec_id,
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "iteration {i} (ordering {ordering}): concurrent await+activity must replay \
+             deterministically across randomized interleavings, got: {report}"
+        );
+    }
+    // Every one of the four interleavings was genuinely exercised.
+    assert!(
+        per_ordering.iter().all(|&c| c > 0),
+        "all four interleavings must be covered: {per_ordering:?}"
+    );
+}
+
+#[tokio::test]
+async fn replayer_await_external_failed_target_branches_deterministically() {
+    // A target that reached FAILED with a typed PaymentDeclined cause: the
+    // awaiter's history recorded `ExternalAwaitFailed` + the compensation
+    // activity. Replay must recognize the typed cause and take the same branch.
+    let target = ExecutionId::new();
+    let exec_id = ExecutionId::new();
+    let await_id = autumn_harvest::ExternalAwaitId::new();
+    let compensate_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::workflow_started(
+            serde_json::json!({ "target": target.to_string() }),
+            Utc::now(),
+        ),
+        WorkflowEvent::ExternalAwaitRequested { await_id, target },
+        WorkflowEvent::ExternalAwaitFailed {
+            await_id,
+            reason_code: "target_failed".into(),
+            message: Some("card declined".into()),
+            error_type: Some("PaymentDeclined".into()),
+            details: None,
+            non_retryable: Some(true),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: compensate_id,
+            name: "compensate".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: compensate_id,
+            output: serde_json::json!("compensated"),
+        },
+    ];
+    let replayer = build_replayer();
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "await_external_branch_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a history awaiting a FAILED target must replay the typed-cause branch \
+         deterministically, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replayer_await_external_concurrent_with_activity_deterministic() {
+    // Await concurrent with an activity in one tokio::join! batch. Replay across
+    // both interleaved orderings of the recorded terminal events must succeed —
+    // the stash triplets in every scan loop keep neither from diverging.
+    let target = ExecutionId::new();
+    let await_id = autumn_harvest::ExternalAwaitId::new();
+    let act_id = ActivityExecId::new();
+    let output = serde_json::json!({ "ok": true });
+    // Ordering A: activity terminal before await terminal.
+    let events_a = vec![
+        WorkflowEvent::workflow_started(
+            serde_json::json!({ "target": target.to_string() }),
+            Utc::now(),
+        ),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "compute".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ExternalAwaitRequested { await_id, target },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!(7),
+        },
+        WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: output.clone(),
+        },
+    ];
+    // Ordering B: await terminal before activity terminal.
+    let events_b = vec![
+        WorkflowEvent::workflow_started(
+            serde_json::json!({ "target": target.to_string() }),
+            Utc::now(),
+        ),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: act_id,
+            name: "compute".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ExternalAwaitRequested { await_id, target },
+        WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: output.clone(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: act_id,
+            output: serde_json::json!(7),
+        },
+    ];
+    let replayer = build_replayer();
+    for (label, events) in [("A", events_a), ("B", events_b)] {
+        let exec_id = ExecutionId::new();
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "await_external_concurrent_workflow",
+                exec_id,
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "ordering {label}: concurrent await+activity must replay deterministically, got: {report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replayer_await_external_concurrent_with_timer_deterministic() {
+    // P2-e (issue #757 review): await concurrent with a durable timer in one
+    // `futures::join!` batch. Replay across BOTH interleaved orderings of the
+    // recorded terminal events (`TimerFired` vs `ExternalAwaitResolved`) must
+    // succeed — the await stash triplets threaded through `match_signal_or_timer`
+    // / `match_child_or_timer` keep the timer scan from diverging.
+    let target = ExecutionId::new();
+    let await_id = autumn_harvest::ExternalAwaitId::new();
+    let output = serde_json::json!({ "value": 7 });
+    let started = || {
+        WorkflowEvent::workflow_started(
+            serde_json::json!({ "target": target.to_string() }),
+            Utc::now(),
+        )
+    };
+    let timer_started = || WorkflowEvent::TimerStarted {
+        timer_id: TimerId::new("wake"),
+        duration_secs: 1,
+    };
+    let requested = || WorkflowEvent::ExternalAwaitRequested { await_id, target };
+    let timer_fired = || WorkflowEvent::TimerFired {
+        timer_id: TimerId::new("wake"),
+    };
+    let resolved = || WorkflowEvent::ExternalAwaitResolved {
+        await_id,
+        output: output.clone(),
+    };
+    // Ordering A: TimerFired before ExternalAwaitResolved.
+    let events_a = vec![
+        started(),
+        timer_started(),
+        requested(),
+        timer_fired(),
+        resolved(),
+    ];
+    // Ordering B: ExternalAwaitResolved before TimerFired.
+    let events_b = vec![
+        started(),
+        timer_started(),
+        requested(),
+        resolved(),
+        timer_fired(),
+    ];
+    let replayer = build_replayer();
+    for (label, events) in [("A", events_a), ("B", events_b)] {
+        let exec_id = ExecutionId::new();
+        let report = replayer
+            .replay_from_snapshot(make_snapshot(
+                "await_external_concurrent_timer_workflow",
+                exec_id,
+                events,
+            ))
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "ordering {label}: concurrent await+timer must replay deterministically, got: {report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replayer_detects_await_external_target_mismatch() {
+    // A history recorded awaiting target X, replayed by a workflow that awaits a
+    // DIFFERENT target Y (a non-deterministic code change) must be classified as
+    // ExternalAwaitMismatch, not swallowed.
+    let recorded_target = ExecutionId::new();
+    let (exec_id, events) =
+        await_resolved_history(recorded_target, serde_json::json!({ "ok": true }));
+    // The workflow input names a DIFFERENT target than what history recorded.
+    let different_target = ExecutionId::new();
+    let mut snap = make_snapshot("await_external_workflow", exec_id, events);
+    // Overwrite the WorkflowStarted input to name the different target.
+    if let Some(WorkflowEvent::WorkflowStarted { input, .. }) = snap.events.first_mut() {
+        *input = serde_json::json!({ "target": different_target.to_string() });
+    }
+    let replayer = build_replayer();
+    let report = replayer.replay_from_snapshot(snap).await;
+    let summary = report.to_string();
+    match &report.status {
+        ReplayStatus::NonDeterminismDetected { kind, .. } => {
+            assert_eq!(
+                *kind,
+                NonDeterminismKind::ExternalAwaitMismatch,
+                "a divergent awaited target must classify as ExternalAwaitMismatch, got: {summary}"
+            );
+        }
+        other => panic!("expected NonDeterminismDetected(ExternalAwaitMismatch), got: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
