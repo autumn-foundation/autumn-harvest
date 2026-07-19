@@ -250,32 +250,99 @@ jobs:
         run: cargo build -p quickstart
 
   scaffold-smoke:
-    name: Scaffold builds (harvest new)
+    name: Scaffold builds and runs (harvest new)
     needs: changes
     # Draft-skip (see lint) + docs-only skip via the `changes` guard.
     if: >-
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # A real Postgres so the scaffolded app can auto-migrate (AUTUMN_PROFILE=dev)
+    # and drive a workflow to a terminal state. User/password/db match the
+    # scaffold's generated `autumn.toml`
+    # (`postgres://demo_app:demo_app@localhost:5432/demo_app`), so the app's own
+    # config connects verbatim — the truest AC-2/AC-3 test.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: demo_app
+          POSTGRES_PASSWORD: demo_app
+          POSTGRES_DB: demo_app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U demo_app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
-      - name: Redirect deps to the in-workspace (unpublished) crates
-        # The scaffold pins crates.io `autumn-harvest = "0.4"`; the in-workspace
-        # crates are 0.4.0, so `[patch.crates-io]` applies cleanly and the build
-        # tests the UNPUBLISHED trunk-dev API (the honest scaffold-rot guard).
-        run: |
-          cat >> "${RUNNER_TEMP}/scaffold/Cargo.toml" <<EOF
-
-          [patch.crates-io]
-          autumn-harvest = { path = "${GITHUB_WORKSPACE}/autumn-harvest" }
-          autumn-harvest-plugin = { path = "${GITHUB_WORKSPACE}/autumn-harvest-plugin" }
-          EOF
-      - name: Build the scaffolded project
+      - name: Build the scaffolded project against published crates.io deps
+        # NO `[patch.crates-io]`: the scaffold pins `autumn-harvest = "0.4"`,
+        # `autumn-harvest-plugin = "0.4"`, `autumn-web = "0.5"`, all resolved
+        # from crates.io — exactly what a real user gets from `harvest new` +
+        # `cargo build`. This is the honest AC-2 guard (published API, not trunk).
         run: cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml"
+      - name: Run the scaffold and assert a workflow reaches COMPLETED
+        # Boots the generated app, triggers its workflow, and polls the execution
+        # to a terminal state — the literal AC-8 assertion ("generate, build, and
+        # assert a workflow reaches a terminal state").
+        env:
+          AUTUMN_PROFILE: dev
+          AUTUMN_MANIFEST_DIR: ${{ runner.temp }}/scaffold
+        run: |
+          set -uo pipefail
+          "${RUNNER_TEMP}/scaffold/target/debug/demo_app" &
+          APP_PID=$!
+          trap 'kill "${APP_PID}" 2>/dev/null || true' EXIT
+
+          # 1. Wait for the app to become healthy (fail fast if it exits early).
+          healthy=false
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:3000/api/harvest/health; then
+              echo "app healthy after ${i}s"; healthy=true; break
+            fi
+            if ! kill -0 "${APP_PID}" 2>/dev/null; then
+              echo "::error::scaffolded app exited before becoming healthy"; exit 1
+            fi
+            sleep 1
+          done
+          if [ "${healthy}" != "true" ]; then
+            echo "::error::scaffolded app never became healthy"; exit 1
+          fi
+
+          # 2. Trigger the workflow and capture its execution_id.
+          resp="$(curl -sf -X POST \
+            http://localhost:3000/api/harvest/workflows/demo_app_workflow/start \
+            -H 'Content-Type: application/json' \
+            -d '{"workflow_id":"ci-1","input":"World"}')" || {
+              echo "::error::start request failed"; exit 1; }
+          echo "start response: ${resp}"
+          eid="$(echo "${resp}" | jq -r '.execution_id // empty')"
+          if [ -z "${eid}" ]; then
+            echo "::error::no execution_id in start response"; exit 1
+          fi
+
+          # 3. Poll the execution until COMPLETED (fail the job if it never does).
+          for i in $(seq 1 60); do
+            state="$(curl -s "http://localhost:3000/api/harvest/workflows/${eid}" \
+              | jq -r '.execution.state // empty' 2>/dev/null || true)"
+            echo "t=${i}s state=${state:-<none>}"
+            case "${state}" in
+              COMPLETED)
+                echo "workflow reached COMPLETED — scaffold runs end to end"; exit 0 ;;
+              FAILED|TIMED_OUT|TERMINATED|CANCELLED)
+                echo "::error::workflow reached terminal-but-not-completed state: ${state}"
+                exit 1 ;;
+            esac
+            sleep 1
+          done
+          echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
 
   msrv:
     name: MSRV (1.88.0)
