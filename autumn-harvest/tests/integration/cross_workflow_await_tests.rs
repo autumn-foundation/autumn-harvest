@@ -941,3 +941,299 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
     let a = load_execution_from_url(&database_url, awaiter).await;
     assert_ne!(a.state, "FAILED", "the awaiter must not be failed");
 }
+
+// ── (i) Cancel a RUNNING target → awaiter surfaces target_cancelled (P2-a end-to-end) ─
+
+/// End-to-end validation of P2-a (issue #757 review): a running target that is
+/// CANCELLED resolves the awaiter's await as a typed `WorkflowFailed` whose
+/// `workflow_error_type()` is exactly `target_cancelled` — the reader (not a
+/// hand-written fixture) stamps the branchable error_type.
+#[tokio::test]
+async fn test_await_cancelled_target_surfaces_target_cancelled() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    truncate_all(&pool).await;
+
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let awaiter = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let worker = Arc::new(make_worker(
+        vec![
+            wf_info("awaiter_workflow", awaiter_workflow),
+            wf_info("long_running_target", long_running_target),
+        ],
+        "worker-await-cancelled",
+        None,
+    ));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            target,
+            "long_running_target",
+            "await-cancel-target",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            awaiter,
+            "awaiter_workflow",
+            "await-cancel-caller",
+            serde_json::json!({ "target": target.to_string() }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Cancel the running target — the awaiter's await must resolve to a typed
+    // WorkflowFailed(target_cancelled) via the outbox.
+    autumn_harvest::cancel_workflow_execution(
+        &mut conn,
+        target,
+        "operator cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .unwrap();
+
+    let a = wait_awaiter_completed(&database_url, awaiter).await;
+    assert_eq!(a.state, "COMPLETED");
+    let out = a.output.expect("awaiter output");
+    assert_eq!(out["status"], "err");
+    assert_eq!(
+        out["error_type"],
+        serde_json::json!("target_cancelled"),
+        "workflow_error_type() must be target_cancelled for a cancelled target: {out}"
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── (j) CONTINUED_AS_NEW target → chain-follow to the successor's output ────────
+
+/// The reader follows a `CONTINUED_AS_NEW` target through its successor chain to
+/// the true terminal (issue #757, AWAIT_OUTCOME_CHAIN_MAX_HOPS). The awaiter must
+/// receive the SUCCESSOR's COMPLETED output, not the CONTINUED_AS_NEW sentinel.
+#[tokio::test]
+async fn test_await_continued_as_new_target_follows_chain_to_successor() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    truncate_all(&pool).await;
+
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let successor = ExecutionId::new_for_shard(ShardId::new(0));
+    let awaiter = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let mut conn = pool.get().await.unwrap();
+
+    // Target: create, append WorkflowContinuedAsNew{successor}, mark CONTINUED_AS_NEW.
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            target,
+            "awaiter_workflow",
+            "await-can-target",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let thist = autumn_harvest::store::load_history(&mut conn, target)
+        .await
+        .unwrap();
+    autumn_harvest::store::append_events(
+        &mut conn,
+        target,
+        &[WorkflowEvent::WorkflowContinuedAsNew {
+            new_exec_id: successor,
+            input: serde_json::json!({}),
+        }],
+        thist.next_event_id,
+    )
+    .await
+    .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(target.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Successor: create and force COMPLETED with a known output.
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            successor,
+            "awaiter_workflow",
+            "await-can-successor",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(successor.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(serde_json::json!({ "final": 123 }))),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Now start the awaiter awaiting the CONTINUED_AS_NEW target — the reader
+    // follows the chain to the successor and resolves with its output.
+    let worker = Arc::new(make_worker(
+        vec![wf_info("awaiter_workflow", awaiter_workflow)],
+        "worker-await-can",
+        None,
+    ));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            awaiter,
+            "awaiter_workflow",
+            "await-can-caller",
+            serde_json::json!({ "target": target.to_string() }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let a = wait_awaiter_completed(&database_url, awaiter).await;
+    assert_eq!(a.state, "COMPLETED");
+    let out = a.output.expect("awaiter output");
+    assert_eq!(out["status"], "ok");
+    assert_eq!(
+        out["output"],
+        serde_json::json!({ "final": 123 }),
+        "awaiter must receive the successor's COMPLETED output, not the CAN sentinel: {out}"
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+// ── (k) PAUSED target parks the awaiter; resume+complete resolves it ────────────
+
+/// A PAUSED target is non-terminal → the reader returns `NotYetTerminal`, so the
+/// awaiter parks. Resuming and completing the target resolves the awaiter.
+#[tokio::test]
+async fn test_await_paused_target_parks_then_resolves_on_resume() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    truncate_all(&pool).await;
+
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let awaiter = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let worker = Arc::new(make_worker(
+        vec![
+            wf_info("awaiter_workflow", awaiter_workflow),
+            wf_info("long_running_target", long_running_target),
+        ],
+        "worker-await-paused",
+        None,
+    ));
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let mut conn = pool.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            target,
+            "long_running_target",
+            "await-paused-target",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Pause the (RUNNING) target before the awaiter observes it.
+    autumn_harvest::execution::pause_workflow_execution(
+        &mut conn,
+        target,
+        Some("investigation"),
+        "operator",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .unwrap();
+
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            awaiter,
+            "awaiter_workflow",
+            "await-paused-caller",
+            serde_json::json!({ "target": target.to_string() }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    // Give the outbox several poll intervals; the awaiter must stay parked while
+    // the target is PAUSED.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mid = load_execution_from_url(&database_url, awaiter).await;
+    assert_eq!(
+        mid.state, "RUNNING",
+        "awaiter must park while the target is PAUSED (NotYetTerminal), got {}",
+        mid.state
+    );
+
+    // Resume the target and complete it → the awaiter resolves.
+    autumn_harvest::execution::resume_workflow_execution(
+        &mut conn,
+        target,
+        "operator",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .unwrap();
+    autumn_harvest::signal::send_signal(&mut conn, target, "go", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let a = wait_awaiter_completed(&database_url, awaiter).await;
+    assert_eq!(a.state, "COMPLETED");
+    let out = a.output.expect("awaiter output");
+    assert_eq!(out["status"], "ok");
+    assert_eq!(out["output"], serde_json::json!({ "value": 7 }));
+
+    worker.shutdown();
+    let _ = handle.await;
+}
