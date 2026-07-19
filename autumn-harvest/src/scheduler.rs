@@ -491,8 +491,7 @@ async fn register_workflow_schedules_for_shard(
     shard: ShardId,
 ) -> HarvestResult<()> {
     for ws in schedules {
-        let owning_shard = workflow_schedule_shard(ws, router);
-        if owning_shard == shard {
+        if schedule_targets_shard(ws, router, shard) {
             crate::policy::validate_schedule(&ws.schedule)
                 .map_err(crate::error::HarvestError::Config)?;
             upsert_workflow_schedule(conn, ws).await?;
@@ -533,6 +532,56 @@ fn workflow_schedule_shard(schedule: &WorkflowSchedule, router: &ShardRouter) ->
         || router.default_shard(),
         |dag_name| router.pick_for_dag(dag_name),
     )
+}
+
+/// Decide whether `schedule` should be registered (upserted) on `shard`
+/// (issue #796).
+///
+/// Default (`all_writable_shards == false`): the schedule owns exactly one
+/// shard — [`router.default_shard()`](ShardRouter::default_shard) for a non-DAG
+/// schedule, its rendezvous shard for a DAG — so this returns `true` only for
+/// that shard, **byte-identical** to the pre-#796
+/// `workflow_schedule_shard(..) == shard` gate.
+///
+/// Opt-in (`all_writable_shards == true`): the schedule is registered on
+/// **every writable shard**, so a single dead/write-blocked shard surfaces as a
+/// failing/stale probe for that shard — the synthetic liveness canary's
+/// per-writable-shard coverage (AC4). Distinct from the #512 replay canary.
+fn schedule_targets_shard(
+    schedule: &WorkflowSchedule,
+    router: &ShardRouter,
+    shard: ShardId,
+) -> bool {
+    if schedule.all_writable_shards {
+        router.writable_shards().contains(&shard)
+    } else {
+        workflow_schedule_shard(schedule, router) == shard
+    }
+}
+
+/// Decide whether a scheduled fire on `current_shard` should mint a
+/// **shard-encoded** [`ExecutionId::new_for_shard`] rather than the default
+/// [`ExecutionId::new`] (which resolves to the router's default shard)
+/// (issue #796).
+///
+/// The fire path only sees the persisted `harvest_schedules` row, which carries
+/// no `all_writable_shards` flag (that flag is a registration-time signal, and
+/// issue #796 ships **no migration**). So a per-writable-shard schedule's fire
+/// is recognised the same two ways the row can be:
+///
+/// - `is_dag` — a DAG schedule already encodes its shard (unchanged, pre-#796).
+/// - [`canary::is_canary_workflow`](crate::canary::is_canary_workflow) — the
+///   built-in synthetic liveness canary is registered on every writable shard
+///   and each shard's fire must land an execution ON that shard so a
+///   dead/write-blocked shard surfaces as a failing/stale probe for it (AC4).
+///
+/// Every other schedule keeps minting `ExecutionId::new()` (UNENCODED → default
+/// shard), byte-identical to pre-#796 behaviour. A general (non-canary)
+/// `all_writable_shards` schedule would need a persisted marker (a future
+/// migration) for its fire to encode the shard; the canary works today because
+/// its reserved name is recognised. Distinct from the #512 replay canary.
+fn scheduled_fire_encodes_shard(wf_name: &str, is_dag: bool) -> bool {
+    is_dag || crate::canary::is_canary_workflow(wf_name)
 }
 
 /// Run one scheduler tick: dispatch due workflow-schedule runs.
@@ -1649,6 +1698,11 @@ fn merge_schedule_patch(
         ),
         catchup_policy: patch.catchup_policy.unwrap_or(existing_catchup_policy),
         retry_policy: merged_retry_policy,
+        // Not persisted on harvest_schedules — it is a registration-time signal
+        // consumed by `register_workflow_schedules_for_shard`, re-applied from
+        // the builder on every startup. A reloaded/patched row defaults to the
+        // single-shard behaviour (issue #796).
+        all_writable_shards: false,
     })
 }
 
@@ -3213,7 +3267,7 @@ async fn tick_one_workflow_schedule(
             break;
         }
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
-        let exec_id = if schedule.dag_name.is_some() {
+        let exec_id = if scheduled_fire_encodes_shard(wf_name, schedule.dag_name.is_some()) {
             ExecutionId::new_for_shard(current_shard)
         } else {
             ExecutionId::new()
@@ -6903,5 +6957,74 @@ mod tests {
                  next_run_at is a genuine stall and must be flagged"
             );
         }
+    }
+
+    // ── Per-writable-shard schedule targeting (issue #796, AC4) ───────────
+
+    #[test]
+    fn schedule_targets_shard_single_shard_is_identical_flag_on_or_off() {
+        // On a single-shard deployment the flag must not change anything:
+        // the schedule targets shard 0 whether or not it opts in.
+        let router = ShardRouter::single();
+        let shard0 = ShardId::new(0);
+        let plain = WorkflowSchedule::new("nightly", Schedule::Interval(Duration::from_secs(60)));
+        let canary = WorkflowSchedule::new(
+            "__harvest_canary_probe__default",
+            Schedule::Interval(Duration::from_secs(30)),
+        )
+        .with_all_writable_shards();
+        assert!(schedule_targets_shard(&plain, &router, shard0));
+        assert!(schedule_targets_shard(&canary, &router, shard0));
+    }
+
+    #[test]
+    fn schedule_targets_shard_flag_off_pins_to_default_shard_only() {
+        // Two writable shards; a non-DAG schedule without the flag lands ONLY
+        // on the default shard (byte-identical to the pre-#796 gate).
+        let s0 = ShardId::new(0);
+        let s1 = ShardId::new(1);
+        let router = ShardRouter::new(vec![s0, s1], vec![s0, s1], s0);
+        let plain = WorkflowSchedule::new("nightly", Schedule::Interval(Duration::from_secs(60)));
+        assert!(schedule_targets_shard(&plain, &router, s0));
+        assert!(!schedule_targets_shard(&plain, &router, s1));
+    }
+
+    #[test]
+    fn schedule_targets_shard_flag_on_covers_every_writable_shard() {
+        // With the flag, the schedule is registered on EVERY writable shard so
+        // a single dead shard surfaces as a failing probe for that shard.
+        let s0 = ShardId::new(0);
+        let s1 = ShardId::new(1);
+        let s2 = ShardId::new(2);
+        // s2 is readable but NOT writable — the flag targets writable only.
+        let router = ShardRouter::new(vec![s0, s1, s2], vec![s0, s1], s0);
+        let canary = WorkflowSchedule::new(
+            "__harvest_canary_probe__default",
+            Schedule::Interval(Duration::from_secs(30)),
+        )
+        .with_all_writable_shards();
+        assert!(schedule_targets_shard(&canary, &router, s0));
+        assert!(schedule_targets_shard(&canary, &router, s1));
+        assert!(
+            !schedule_targets_shard(&canary, &router, s2),
+            "a read-only shard is not a fire target"
+        );
+    }
+
+    #[test]
+    fn scheduled_fire_encodes_shard_selects_dag_and_canary() {
+        // DAGs already encode their shard; a canary must too (so each writable
+        // shard's fire lands an execution ON that shard, AC4). An ordinary
+        // non-DAG schedule keeps the UNENCODED (default-shard) exec id.
+        assert!(scheduled_fire_encodes_shard("any_dag", true));
+        assert!(scheduled_fire_encodes_shard(
+            "__harvest_canary_probe__default",
+            false
+        ));
+        assert!(scheduled_fire_encodes_shard(
+            crate::canary::CANARY_WORKFLOW_NAME_PREFIX,
+            false
+        ));
+        assert!(!scheduled_fire_encodes_shard("nightly_report", false));
     }
 }

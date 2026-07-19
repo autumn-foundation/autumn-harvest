@@ -915,6 +915,22 @@ pub struct WorkflowSchedule {
     /// a per-start override). `None` (the default) disables schedule-level retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
+    /// Register this schedule on **every writable shard** rather than the single
+    /// shard chosen by rendezvous hashing / the default shard (issue #796).
+    ///
+    /// `false` (the default) preserves today's behaviour exactly: a non-DAG
+    /// schedule is pinned to `router.default_shard()` and a DAG schedule to its
+    /// rendezvous shard. When `true`, the scheduler upserts one
+    /// `harvest_schedules` row per writable shard (one row per shard database,
+    /// so the `UNIQUE(workflow_name)` constraint is not violated) and each
+    /// shard's fire mints an execution on that shard.
+    ///
+    /// The built-in synthetic liveness canary (issue #796, AC4) sets this so a
+    /// single write-blocked/dead shard surfaces as a failing/stale probe for
+    /// that shard. General-purpose: any multi-shard schedule needing per-shard
+    /// coverage may opt in.
+    #[serde(default)]
+    pub all_writable_shards: bool,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -950,7 +966,21 @@ impl WorkflowSchedule {
             max_runs: None,
             catchup_policy: None,
             retry_policy: None,
+            all_writable_shards: false,
         }
+    }
+
+    /// Register this schedule on every writable shard (issue #796).
+    ///
+    /// Opt-in per-writable-shard coverage: the scheduler upserts one row per
+    /// writable shard and each shard's fire mints an execution on that shard.
+    /// The default (`false`) pins the schedule to a single shard exactly as
+    /// today. Used by the built-in synthetic liveness canary so a single
+    /// dead/write-blocked shard surfaces as a failing probe for that shard.
+    #[must_use]
+    pub const fn with_all_writable_shards(mut self) -> Self {
+        self.all_writable_shards = true;
+        self
     }
 
     /// Set the per-run execution timeout for this schedule.
@@ -1804,6 +1834,44 @@ mod tests {
     fn workflow_schedule_with_buffer_all_max_sets_field() {
         let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_buffer_all_max(50);
         assert_eq!(sched.buffer_all_max, 50);
+    }
+
+    #[test]
+    fn workflow_schedule_all_writable_shards_defaults_to_false() {
+        // AC1: opt-in only — the default preserves single-shard placement.
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert!(!sched.all_writable_shards);
+    }
+
+    #[test]
+    fn workflow_schedule_with_all_writable_shards_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_all_writable_shards();
+        assert!(sched.all_writable_shards);
+    }
+
+    #[test]
+    fn workflow_schedule_all_writable_shards_serde_back_compat() {
+        // #[serde(default)]: a schedule serialized before issue #796 (no
+        // `all_writable_shards` key) must deserialize to `false`.
+        let legacy = r#"{
+            "workflow_name": "my_wf",
+            "dag_name": null,
+            "schedule": "Manual",
+            "input": null,
+            "catchup": false,
+            "max_active_runs": 1,
+            "paused": false,
+            "queue_name": "default"
+        }"#;
+        let sched: WorkflowSchedule =
+            serde_json::from_str(legacy).expect("legacy schedule JSON must deserialize");
+        assert!(!sched.all_writable_shards);
+
+        // Round-trip preserves an opted-in schedule.
+        let opted = WorkflowSchedule::new("my_wf", Schedule::Manual).with_all_writable_shards();
+        let json = serde_json::to_string(&opted).expect("serialize");
+        let back: WorkflowSchedule = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.all_writable_shards);
     }
 
     #[test]

@@ -11545,13 +11545,38 @@ async fn process_workflow_task(
     // harvest.update.completed/failed — so it represents DURABLE terminal
     // outcomes only. This site (`record_workflow_terminal`, #519) keeps its own
     // pre-persist placement unchanged.
+    // Synthetic liveness canary (issue #796): a built-in throwaway probe
+    // workflow reports its health via the `harvest.canary.*` metrics and is
+    // EXCLUDED from `harvest.workflow.terminal` (and every other business SLO
+    // counter) so probes never pollute success-rate dashboards (AC8). This is
+    // DISTINCT from the #512 replay canary. Labels are `queue` + `shard` only.
+    let is_canary = crate::canary::is_canary_workflow(&prepared.execution.workflow_name);
+    let canary_shard = u16::try_from(prepared.execution.shard_id).unwrap_or(0);
     match &outcome {
         WorkflowOutcome::Completed { .. } => {
-            telemetry.metrics.record_workflow_terminal(
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                WorkflowStatus::Completed,
-            );
+            if is_canary {
+                // Round-trip = start-requested → completed wall-clock (AC5).
+                // Clamp a clock-skew negative delta to 0 (`.to_std()` errs on
+                // a negative chrono duration), mirroring the update-duration
+                // clamping precedent.
+                let roundtrip_secs = (chrono::Utc::now() - prepared.execution.started_at)
+                    .to_std()
+                    .map_or(0.0, |delta| delta.as_secs_f64());
+                telemetry
+                    .metrics
+                    .record_canary_success(&task.queue_name, canary_shard);
+                telemetry.metrics.record_canary_roundtrip(
+                    &task.queue_name,
+                    canary_shard,
+                    roundtrip_secs,
+                );
+            } else {
+                telemetry.metrics.record_workflow_terminal(
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    WorkflowStatus::Completed,
+                );
+            }
         }
         WorkflowOutcome::Failed {
             non_deterministic_details,
@@ -11573,17 +11598,30 @@ async fn process_workflow_task(
                     .metrics
                     .record_workflow_non_determinism(&prepared.execution.workflow_name, build_id);
             }
-            telemetry.metrics.record_workflow_terminal(
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                WorkflowStatus::Failed,
-            );
+            if is_canary {
+                telemetry
+                    .metrics
+                    .record_canary_failure(&task.queue_name, canary_shard);
+            } else {
+                telemetry.metrics.record_workflow_terminal(
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    WorkflowStatus::Failed,
+                );
+            }
         }
-        WorkflowOutcome::ContinuedAsNew { .. } => telemetry.metrics.record_workflow_terminal(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            WorkflowStatus::ContinuedAsNew,
-        ),
+        WorkflowOutcome::ContinuedAsNew { .. } => {
+            // A canary never continues-as-new, but never let one emit the
+            // business terminal counter either (AC8) — the guard is effectively
+            // unreachable for a canary.
+            if !is_canary {
+                telemetry.metrics.record_workflow_terminal(
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    WorkflowStatus::ContinuedAsNew,
+                );
+            }
+        }
         WorkflowOutcome::Suspended { .. } => {} // not terminal — no counter
     }
 

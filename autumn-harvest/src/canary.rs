@@ -120,4 +120,34 @@ mod tests {
         assert!(!is_reserved_canary_name("deliver_webhook"));
         assert!(!is_reserved_canary_name("__harvest_session_acquire"));
     }
+
+    /// The terminal-metric emission sites (`worker.rs::process_workflow_task`
+    /// and `timeout.rs::enforce_workflow_execution_timeouts`) route a run to
+    /// the `harvest.canary.*` metrics — and SKIP `harvest.workflow.terminal`
+    /// and the other business SLO counters (issue #796, AC8) — exactly when
+    /// [`is_canary_workflow`] returns `true` for the execution's
+    /// `workflow_name`. This pins that gate for the per-queue naming scheme a
+    /// real probe registration uses, and confirms an ordinary workflow still
+    /// takes the business-metric path.
+    #[test]
+    fn terminal_emission_gate_selects_canary_runs_by_workflow_name() {
+        // Probe runs (per-queue naming) → canary metrics, no terminal counter.
+        for probe in [
+            CANARY_WORKFLOW_NAME_PREFIX,
+            "__harvest_canary_probe__default",
+            "__harvest_canary_probe__email",
+        ] {
+            assert!(
+                is_canary_workflow(probe),
+                "`{probe}` must route to harvest.canary.* and skip harvest.workflow.terminal"
+            );
+        }
+        // Ordinary customer workflows → business terminal/SLO counters.
+        for business in ["onboarding", "nightly_report", "checkout"] {
+            assert!(
+                !is_canary_workflow(business),
+                "`{business}` must keep incrementing harvest.workflow.terminal"
+            );
+        }
+    }
 }

@@ -1602,12 +1602,23 @@ pub async fn enforce_workflow_execution_timeouts(
             "workflow execution timed out"
         );
 
-        metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
-        metrics.record_workflow_terminal(
-            &workflow_name,
-            &execution.queue_name,
-            crate::telemetry::WorkflowStatus::TimedOut,
-        );
+        // Synthetic liveness canary (issue #796, AC6): a probe that does not
+        // reach terminal completion within its per-probe timeout (its
+        // execution deadline) is a `harvest.canary.failure`, not a business
+        // timeout/terminal. Excluded from `harvest.workflow.timeout` and
+        // `harvest.workflow.terminal` (AC8). Distinct from the #512 replay
+        // canary. Labels: `queue` + `shard` only.
+        if crate::canary::is_canary_workflow(&workflow_name) {
+            let canary_shard = u16::try_from(execution.shard_id).unwrap_or(0);
+            metrics.record_canary_failure(&execution.queue_name, canary_shard);
+        } else {
+            metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
+            metrics.record_workflow_terminal(
+                &workflow_name,
+                &execution.queue_name,
+                crate::telemetry::WorkflowStatus::TimedOut,
+            );
+        }
 
         // Best-effort: count execution timeouts toward the auto-pause threshold.
         // `workflow_id` encodes the schedule UUID so the update is scoped to the

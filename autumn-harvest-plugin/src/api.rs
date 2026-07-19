@@ -20137,6 +20137,10 @@ async fn create_workflow_schedule(
         max_runs: request.max_runs.filter(|&n| n > 0),
         catchup_policy,
         retry_policy: request.retry_policy.clone(),
+        // Operator-created schedules keep single-shard placement; the
+        // per-writable-shard opt-in (issue #796) is set programmatically by the
+        // built-in synthetic liveness canary registration, not via this route.
+        all_writable_shards: false,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,

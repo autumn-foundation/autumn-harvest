@@ -5419,12 +5419,21 @@ pub struct WorkflowCountRow {
 /// by hand — a mismatch between them would silently produce a filter that
 /// works for some `group_by` combinations but not others, with no compiler
 /// check to catch the omission.
+// The trailing `starts_with(...)` clause UNCONDITIONALLY excludes built-in
+// synthetic liveness-canary runs (issue #796, AC8) so probe executions never
+// pollute fleet-count snapshots. The literal mirrors
+// `canary::CANARY_WORKFLOW_NAME_PREFIX` (kept in sync by
+// `count_where_clause_excludes_the_canary_prefix`). `starts_with` is used, not
+// `LIKE '…%'`, because `_` is a single-character wildcard in SQL `LIKE` and the
+// prefix is underscore-heavy — a `LIKE` form would over-match. Distinct from
+// the #512 replay canary.
 const COUNT_WHERE_CLAUSE: &str = r"
 WHERE shard_id = $1::INT4
   AND ($2::TEXT IS NULL OR workflow_name = $2::TEXT)
   AND ($3::TEXT[] IS NULL OR state = ANY($3::TEXT[]))
   AND ($4::TIMESTAMPTZ IS NULL OR started_at >= $4::TIMESTAMPTZ)
   AND ($5::TIMESTAMPTZ IS NULL OR started_at <= $5::TIMESTAMPTZ)
+  AND NOT starts_with(workflow_name, '__harvest_canary_probe')
 ";
 
 fn count_total_sql() -> String {
@@ -5633,6 +5642,28 @@ mod workflow_count_tests {
             WorkflowCountDimension::WorkflowName.as_wire(),
             "workflow_name"
         );
+    }
+
+    /// Synthetic liveness-canary runs (issue #796) must be excluded from every
+    /// fleet-count snapshot shape (AC8). All four SQL variants share
+    /// `COUNT_WHERE_CLAUSE`, so the exclusion appears in each; the literal
+    /// prefix must stay in sync with `canary::CANARY_WORKFLOW_NAME_PREFIX`.
+    #[test]
+    fn count_where_clause_excludes_the_canary_prefix() {
+        let prefix = crate::canary::CANARY_WORKFLOW_NAME_PREFIX;
+        let clause = format!("NOT starts_with(workflow_name, '{prefix}')");
+        for sql in [
+            super::count_total_sql(),
+            super::count_by_state_sql(),
+            super::count_by_workflow_name_sql(),
+            super::count_by_state_and_workflow_name_sql(),
+        ] {
+            assert!(
+                sql.contains(&clause),
+                "count SQL must exclude the canary prefix `{prefix}` from fleet \
+                 counts (AC8); missing `{clause}` in:\n{sql}"
+            );
+        }
     }
 }
 
