@@ -11083,6 +11083,7 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+    use std::time::Duration;
 
     // ── Signal handlers (issue #546) ────────────────────────────────────────
 
@@ -12875,6 +12876,246 @@ mod tests {
         assert!(
             matches!(result, Err(HarvestError::ActivityCancelled(_))),
             "check_cancellation should return ActivityCancelled when token is set"
+        );
+    }
+
+    // ── Auto-heartbeat guard (issue #682) ────────────────────────────────────
+
+    /// Build a live-channel activity context with a heartbeat timeout, plus its
+    /// receiver and cancellation token, for auto-heartbeat guard testing.
+    fn auto_heartbeat_ctx(
+        timeout: Duration,
+    ) -> (
+        ActivityContext,
+        tokio::sync::mpsc::Receiver<serde_json::Value>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel.clone())
+            .with_heartbeat_timeout(timeout);
+        (ctx, rx, cancel)
+    }
+
+    /// Deterministically fire `n` ticks of a paused-clock interval, yielding
+    /// after each advance so the spawned ticker task drains its send.
+    async fn advance_ticks(interval: Duration, n: usize) {
+        // The first `interval.tick()` is immediate; let it fire.
+        tokio::task::yield_now().await;
+        for _ in 0..n {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<serde_json::Value>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            out.push(v);
+        }
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_ticks_send_payloads() {
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(300);
+        let _guard = ctx
+            .start_auto_heartbeat(interval)
+            .expect("auto-heartbeat should start with a configured timeout");
+
+        advance_ticks(interval, 4).await;
+
+        let pings = drain(&mut rx);
+        assert!(
+            pings.len() >= 3,
+            "expected at least 3 auto-heartbeat pings, got {}",
+            pings.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_guard_drop_stops_ticker() {
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        advance_ticks(interval, 3).await;
+        assert!(!drain(&mut rx).is_empty(), "ticker should have sent pings");
+
+        // Drop stops the ticker (AC#7).
+        drop(guard);
+        tokio::task::yield_now().await;
+        let _ = drain(&mut rx); // clear anything in flight at drop
+
+        advance_ticks(interval, 5).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no pings should arrive after the guard is dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_stops_on_cancellation() {
+        let (ctx, mut rx, cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let _guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        advance_ticks(interval, 3).await;
+        let _ = drain(&mut rx);
+
+        // Cancelling the activity's own token (parent) auto-cancels the ticker's
+        // child token — the ticker stops, but the activity still sees the
+        // cancellation through is_cancelled() (not swallowed by the guard).
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        let _ = drain(&mut rx);
+
+        advance_ticks(interval, 5).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no pings should arrive after cancellation"
+        );
+        assert!(
+            ctx.is_cancelled(),
+            "the activity must still observe cancellation through is_cancelled()"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_closed_channel_no_panic() {
+        let (ctx, rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        // Close the channel: the flusher's receiver is gone.
+        drop(rx);
+
+        // The next tick's send fails; the ticker must break (never .unwrap()).
+        advance_ticks(interval, 3).await;
+
+        assert!(
+            guard.is_ticker_finished(),
+            "the ticker task must terminate (via break, not panic) once the \
+             heartbeat channel is closed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_last_write_wins() {
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+
+        // Seed the checkpoint, then drain the manual send so we observe only
+        // subsequent auto pings.
+        ctx.heartbeat(serde_json::json!({"a": 1}))
+            .await
+            .expect("manual heartbeat");
+        let _guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+        let _ = drain(&mut rx); // clear the manual {a:1}
+
+        advance_ticks(interval, 3).await;
+        let phase1 = drain(&mut rx);
+        assert!(!phase1.is_empty(), "auto pings should have arrived");
+        assert!(
+            phase1.iter().all(|v| v == &serde_json::json!({"a": 1})),
+            "auto pings must re-send the last heartbeat payload, got {phase1:?}"
+        );
+
+        // Update the checkpoint; auto pings must now reflect the new payload.
+        ctx.heartbeat(serde_json::json!({"b": 2}))
+            .await
+            .expect("manual heartbeat");
+        let _ = drain(&mut rx); // clear the manual {b:2}
+        advance_ticks(interval, 3).await;
+        let phase2 = drain(&mut rx);
+        assert!(!phase2.is_empty(), "auto pings should have arrived");
+        assert!(
+            phase2.iter().all(|v| v == &serde_json::json!({"b": 2})),
+            "auto pings must reflect the last-written payload, got {phase2:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_liveness_only_ping() {
+        // No manual heartbeat, no resume snapshot: the liveness ping sends the
+        // initial cell value (JSON null) without panicking.
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let _guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        advance_ticks(interval, 3).await;
+
+        let pings = drain(&mut rx);
+        assert!(!pings.is_empty(), "liveness pings should have arrived");
+        assert!(
+            pings.iter().all(|v| v == &serde_json::Value::Null),
+            "liveness-only pings should be JSON null, got {pings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_heartbeat_requires_heartbeat_timeout() {
+        // Live flusher, but NO heartbeat_timeout configured: both methods reject
+        // rather than silently spawning a ticker whose pings are never checked.
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel);
+
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat(Duration::from_millis(100)),
+                Err(HarvestError::Config(_))
+            ),
+            "start_auto_heartbeat must require a configured heartbeat_timeout"
+        );
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat_default(),
+                Err(HarvestError::Config(_))
+            ),
+            "start_auto_heartbeat_default must require a configured heartbeat_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_heartbeat_rejected_on_local() {
+        // Local activities cannot heartbeat at all — auto-heartbeat must reject
+        // with the unsupported reason, even if a timeout were somehow set.
+        let ctx = ActivityContext::new_local_activity(
+            empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_heartbeat_timeout(Duration::from_secs(3));
+
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat(Duration::from_millis(100)),
+                Err(HarvestError::Config(message)) if message.contains("local activities")
+            ),
+            "auto-heartbeat must be rejected for local activities"
+        );
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat_default(),
+                Err(HarvestError::Config(message)) if message.contains("local activities")
+            ),
+            "auto-heartbeat (default) must be rejected for local activities"
+        );
+
+        // A no-flusher context is likewise rejected.
+        let no_flusher = ActivityContext::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_heartbeat_timeout(Duration::from_secs(3));
+        assert!(
+            matches!(
+                no_flusher.start_auto_heartbeat_default(),
+                Err(HarvestError::Config(_))
+            ),
+            "auto-heartbeat must be rejected when no heartbeat flusher is attached"
         );
     }
 
