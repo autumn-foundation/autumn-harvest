@@ -1000,6 +1000,16 @@ impl WorkflowSchedule {
         self
     }
 
+    /// Set the task queue each scheduled run is dispatched onto.
+    ///
+    /// Defaults to `"default"`. Used by the built-in synthetic liveness canary
+    /// (issue #796) to route each per-queue probe onto the queue it exercises.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue: impl Into<String>) -> Self {
+        self.queue_name = queue.into();
+        self
+    }
+
     /// Enable or disable catchup for missed runs.
     #[must_use]
     pub const fn with_catchup(mut self, catchup: bool) -> Self {

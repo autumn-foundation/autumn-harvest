@@ -888,6 +888,16 @@ impl BuiltHarvest {
         &self.workflows
     }
 
+    /// Registered activity metadata, in registration order.
+    ///
+    /// Pre-build counterpart used by the plugin's built-in synthetic liveness
+    /// canary (issue #796) to confirm the reserved canary activity is
+    /// registered exactly once before the runtime starts.
+    #[must_use]
+    pub fn activity_infos(&self) -> &[ActivityInfo] {
+        &self.activities
+    }
+
     /// Declarative query handlers collected via `.queries(queries![…])`.
     #[must_use]
     pub fn query_handlers(&self) -> &[QueryHandlerInfo] {

@@ -8,6 +8,7 @@ pub mod api_token;
 /// Implements [`autumn_harvest::completion_callback::CompletionCallbackDeliverer`],
 /// auto-wired by [`crate::plugin::HarvestPlugin`].
 pub mod callback_deliverer;
+pub mod canary;
 pub mod config;
 pub mod dag_graph;
 pub mod dag_retry;
