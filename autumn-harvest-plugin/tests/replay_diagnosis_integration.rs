@@ -46,6 +46,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::erase;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
@@ -1075,4 +1076,223 @@ async fn policy_branching_workflow_diagnoses_clean_with_registry_history_policy(
     assert_eq!(body["diagnosis"], json!("clean"), "body={body}");
     assert!(body.get("divergence").is_none(), "clean has no divergence");
     assert!(body.get("failure").is_none(), "clean has no failure");
+}
+
+// ─── Issue #608 read-path decode gate (PR #1107 Codex review, finding #5) ─────
+//
+// The merged endpoint decoded history with the runtime's codecs UNCONDITIONALLY,
+// so on a non-identity-codec deployment it (a) decoded encrypted payloads even
+// with the operator's read-path decode gate OFF (surfacing plaintext via
+// failure/divergence fields) and (b) wrote no `payload.decode_read` audit row.
+// The fix gates the codec decode behind `read_path_decoder`
+// (`decode_payloads_on_read` + admin) and audits when it decodes. These tests
+// exercise a genuine non-identity codec + both decode-flag states. Identity
+// deployments (all the tests above) hit the decode-OFF identity-load branch and
+// are byte-identical to the merged behavior — confirmed by their unchanged pass.
+
+/// A trivial invertible non-identity codec (byte reversal). Encoding a payload
+/// produces a `_harvest_codec_envelope` with `codec_id = "test-reverse"`, so a
+/// history seeded with it is only decodable by a `PayloadCodecs` that has this
+/// codec registered — the identity default hard-errors `UnknownPayloadCodec`.
+#[derive(Clone, Copy)]
+struct ReverseCodec;
+
+impl PayloadCodec for ReverseCodec {
+    fn codec_id(&self) -> &'static str {
+        "test-reverse"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(raw.iter().rev().copied().collect())
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(encoded.iter().rev().copied().collect())
+    }
+}
+
+fn reverse_codecs() -> PayloadCodecs {
+    let mut codecs = PayloadCodecs::default();
+    codecs.set_default(Arc::new(ReverseCodec));
+    codecs
+}
+
+/// Like [`build_app`] but installs a non-identity codec registry and toggles the
+/// `decode_payloads_on_read` gate — the two levers finding #5 exercises.
+fn build_app_with_codecs(pool: &DbPool, decode_on: bool, codecs: PayloadCodecs) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.set_payload_codecs(codecs);
+    api_state.set_decode_payloads_on_read(decode_on);
+    let runtime = HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![progress_info()], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("replay-diagnosis-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    );
+    api_state.install(runtime);
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Seed an execution whose event payloads are codec-ENCODED (envelopes), using
+/// [`PayloadCodecs::encode_event`] — the same encoding the live write path
+/// produces for a non-identity deployment. The execution row `input` is left
+/// plaintext (the diagnosis reads `history.events`, not the row input, and the
+/// erased-guard only looks for the tombstone marker).
+async fn seed_encoded_execution(
+    pool: &DbPool,
+    workflow_name: &str,
+    state: &str,
+    input: Value,
+    events: Vec<WorkflowEvent>,
+    codecs: &PayloadCodecs,
+) -> ExecutionId {
+    let mut conn = pool.get().await.expect("pooled conn");
+    let exec_id = ExecutionId::new();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, queue_name, state) \
+         VALUES ($1, $2, $3, 0, $4, 'default', $5)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+    .bind::<diesel::sql_types::Jsonb, _>(input)
+    .bind::<diesel::sql_types::Text, _>(state)
+    .execute(&mut conn)
+    .await
+    .expect("seed execution");
+
+    for (i, event) in events.iter().enumerate() {
+        let encoded = codecs
+            .encode_event(event)
+            .expect("encode event into envelope");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let event_id = i as i32;
+        diesel::sql_query(
+            "INSERT INTO harvest_events \
+             (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+             VALUES ($1, $2, $3, $4, now())",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Integer, _>(event_id)
+        .bind::<diesel::sql_types::Text, _>(event.type_name())
+        .bind::<diesel::sql_types::Jsonb, _>(encoded)
+        .execute(&mut conn)
+        .await
+        .expect("seed encoded event");
+    }
+    exec_id
+}
+
+/// Count `payload.decode_read` audit rows recorded for an execution (issue #608
+/// AC8).
+async fn count_decode_audit_rows(pool: &DbPool, exec_id: ExecutionId) -> i64 {
+    use diesel::sql_types::BigInt;
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let mut conn = pool.get().await.expect("pooled conn");
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_audit_log \
+         WHERE operation = 'payload.decode_read' AND target_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+    .load(&mut conn)
+    .await
+    .expect("count audit rows");
+    rows.into_iter().next().map_or(0, |c| c.n)
+}
+
+#[tokio::test]
+async fn encrypted_history_decode_on_diagnoses_clean_and_writes_audit_row() {
+    // Encrypted deployment + decode-on-read ENABLED (admin): the endpoint decodes
+    // the codec-encoded history exactly as the live worker does, so it replays
+    // clean, AND writes a `payload.decode_read` audit row (issue #608 AC8).
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+
+    let (input, mut events) = progress_history(&["a"], false);
+    // A real COMPLETED run seals its history; the seal-gate (issue #614) 410s a
+    // terminal execution truncated before its seal, so seed the realistic
+    // terminal history (encoded, like every other event).
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    });
+    let exec = seed_encoded_execution(
+        &pool,
+        "progress_wf",
+        "COMPLETED",
+        input,
+        events,
+        &reverse_codecs(),
+    )
+    .await;
+
+    let app = build_app_with_codecs(&pool, true, reverse_codecs());
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["diagnosis"],
+        json!("clean"),
+        "an encrypted history must decode and replay clean under decode-on; body={body}"
+    );
+    assert!(
+        count_decode_audit_rows(&pool, exec).await >= 1,
+        "decode-on must write a payload.decode_read audit row (issue #608 AC8)"
+    );
+}
+
+#[tokio::test]
+async fn encrypted_history_decode_off_returns_honest_410_and_no_audit_row() {
+    // Encrypted deployment + decode-on-read DISABLED (the default): the endpoint
+    // must NOT decode. It loads with the identity codec (no gate), which
+    // hard-errors on the reverse envelopes, and returns an HONEST 410 pointing at
+    // decode-on-read — never leaking ciphertext into a verdict, never 503-ing —
+    // and writes NO `payload.decode_read` audit row.
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+
+    let (input, mut events) = progress_history(&["a"], false);
+    // A real COMPLETED run seals its history; the seal-gate (issue #614) 410s a
+    // terminal execution truncated before its seal, so seed the realistic
+    // terminal history (encoded, like every other event).
+    events.push(WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    });
+    let exec = seed_encoded_execution(
+        &pool,
+        "progress_wf",
+        "COMPLETED",
+        input,
+        events,
+        &reverse_codecs(),
+    )
+    .await;
+
+    // Codecs installed but the ONLY difference from the test above is the flag.
+    let app = build_app_with_codecs(&pool, false, reverse_codecs());
+    let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
+
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "encrypted + decode-off must be an honest 410, not a 503 or a leaked verdict; body={body}"
+    );
+    let text = body.to_string();
+    assert!(
+        text.contains("decode-on-read") || text.contains("decoding is required"),
+        "the 410 body must point the operator at decode-on-read; body={body}"
+    );
+    assert_eq!(
+        count_decode_audit_rows(&pool, exec).await,
+        0,
+        "decode-off must NOT write a payload.decode_read audit row"
+    );
 }

@@ -801,6 +801,10 @@ impl WorkflowReplayer {
                 parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #614: thread the replayer's history policy so a strict
+                // replay of a `should_continue_as_new`-branching workflow stays
+                // faithful to the live worker (which uses `registry.history_policy()`).
+                self.history_policy,
             )
             .await
         } else {
@@ -817,6 +821,10 @@ impl WorkflowReplayer {
                 parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #614: thread the replayer's history policy so a strict
+                // replay of a `should_continue_as_new`-branching workflow stays
+                // faithful to the live worker (which uses `registry.history_policy()`).
+                self.history_policy,
             )
             .await
         };
@@ -1014,6 +1022,10 @@ impl WorkflowReplayer {
                 self.parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #614: thread the replayer's history policy so a strict
+                // replay of a `should_continue_as_new`-branching workflow stays
+                // faithful to the live worker (which uses `registry.history_policy()`).
+                self.history_policy,
             )
             .await
         } else {
@@ -1030,6 +1042,10 @@ impl WorkflowReplayer {
                 self.parent_execution_id,
                 workflow_name,
                 workflow_id,
+                // Issue #614: thread the replayer's history policy so a strict
+                // replay of a `should_continue_as_new`-branching workflow stays
+                // faithful to the live worker (which uses `registry.history_policy()`).
+                self.history_policy,
             )
             .await
         };
