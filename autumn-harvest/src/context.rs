@@ -10696,6 +10696,11 @@ impl ActivityContext {
     /// sent by the current attempt become visible only to a later retry attempt,
     /// after the heartbeat flusher successfully writes them to Postgres.
     ///
+    /// A stored JSON `null` checkpoint is treated as no checkpoint (`Ok(None)`)
+    /// — a liveness-only auto-heartbeat (issue #682) that pings before any manual
+    /// `ctx.heartbeat(..)` persists `null`, and that must never mask or corrupt a
+    /// real checkpoint on a later retry (issue #151).
+    ///
     /// # Errors
     ///
     /// - [`HarvestError::Serialization`] if the stored payload does not
@@ -10709,11 +10714,12 @@ impl ActivityContext {
             return Err(HarvestError::Config(reason.into()));
         }
 
-        self.heartbeat_details
-            .clone()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(HarvestError::from)
+        match self.heartbeat_details.clone() {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v)
+                .map(Some)
+                .map_err(HarvestError::from),
+        }
     }
 
     /// Send a heartbeat to signal the activity is still running.
@@ -13040,6 +13046,27 @@ mod tests {
         let result = ctx.heartbeat_details::<TestHeartbeatDetails>();
 
         assert!(matches!(result, Err(HarvestError::Serialization(_))));
+    }
+
+    #[test]
+    fn heartbeat_details_treats_stored_null_as_absent() {
+        // A liveness-only auto-heartbeat (issue #682) persists JSON `null`; it
+        // must read back as no checkpoint (`Ok(None)`), never a hard
+        // deserialization error, preserving the issue #151 resume contract.
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::Value::Null));
+        let details = ctx
+            .heartbeat_details::<TestHeartbeatDetails>()
+            .expect("stored JSON null must read as Ok(None)");
+        assert_eq!(details, None);
+
+        // A real checkpoint still deserializes normally.
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::json!({
+            "progress": 7,
+        })));
+        let details = ctx
+            .heartbeat_details::<TestHeartbeatDetails>()
+            .expect("real checkpoint should deserialize");
+        assert_eq!(details, Some(TestHeartbeatDetails { progress: 7 }));
     }
 
     #[tokio::test]
