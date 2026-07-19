@@ -10,7 +10,7 @@
 
 use uuid::Uuid;
 
-use crate::types::{ExecutionId, ExternalCancelId, ExternalSignalId};
+use crate::types::{ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId};
 
 // ---------------------------------------------------------------------------
 // PayloadKind
@@ -480,6 +480,27 @@ pub enum HarvestError {
         reason_code: String,
     },
 
+    /// A `ctx.await_external_workflow(...)` call could not observe the target's
+    /// terminal outcome (issue #757) — a **transport** failure, distinct from a
+    /// target that reached a non-`COMPLETED` terminal state (which surfaces as a
+    /// typed [`WorkflowFailed`](HarvestError::WorkflowFailed) carrying the
+    /// target's own terminal cause).
+    ///
+    /// `reason_code` is one of:
+    /// - `"self_await"` — the target is the calling workflow's own `ExecutionId`.
+    /// - `"target_unknown"` — no execution matching `target` was found within
+    ///   the configured grace window.
+    #[error("external await of {target} failed: {reason_code} (await_id={await_id})")]
+    ExternalAwaitFailed {
+        /// The `ExternalAwaitId` recorded in the initiating event (nil UUID for
+        /// the immediate `self_await` rejection, which records no history).
+        await_id: ExternalAwaitId,
+        /// The target workflow execution ID.
+        target: ExecutionId,
+        /// Machine-readable failure reason (`"self_await"` or `"target_unknown"`).
+        reason_code: String,
+    },
+
     /// `ctx.create_session(...)` could not acquire a host worker within the
     /// configured acquisition timeout (issue #606).
     ///
@@ -707,6 +728,20 @@ impl HarvestError {
         match self {
             Self::WorkflowFailed { non_retryable, .. } => non_retryable.unwrap_or(false),
             _ => false,
+        }
+    }
+
+    /// If this is an [`ExternalAwaitFailed`](HarvestError::ExternalAwaitFailed)
+    /// **transport** failure (issue #757), return its machine-readable
+    /// `reason_code` (`"self_await"` or `"target_unknown"`). `None` for other
+    /// variants — a target that reached a non-`COMPLETED` terminal state
+    /// surfaces as a typed [`WorkflowFailed`](HarvestError::WorkflowFailed), not
+    /// this variant.
+    #[must_use]
+    pub fn external_await_reason_code(&self) -> Option<&str> {
+        match self {
+            Self::ExternalAwaitFailed { reason_code, .. } => Some(reason_code.as_str()),
+            _ => None,
         }
     }
 

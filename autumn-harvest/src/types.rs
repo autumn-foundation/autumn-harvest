@@ -557,6 +557,54 @@ impl FromStr for ExternalCancelId {
     }
 }
 
+/// Unique identifier for a single `await_external_workflow` invocation (issue #757).
+///
+/// Generated when the workflow calls `ctx.await_external_workflow(...)` and
+/// embedded in the `ExternalAwaitRequested`, `ExternalAwaitResolved`, and
+/// `ExternalAwaitFailed` events so the request can be correlated with its
+/// outcome during replay. Exact clone of [`ExternalCancelId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalAwaitId(Uuid);
+
+impl ExternalAwaitId {
+    /// Creates a new, random `ExternalAwaitId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalAwaitId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalAwaitId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalAwaitId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalAwaitId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Unique identifier for a worker session (issue #606).
 ///
 /// Recorded deterministically via the existing `MarkerRecorded` mechanism when
