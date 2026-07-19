@@ -1,4 +1,5 @@
-<!-- NOTE: placeholder PR number XXXX — rename to the real PR number on push. -->
+<!-- PR #1118 -->
+
 
 ## Phase 3.5x — Durable await of external workflows (`ctx.await_external_workflow`) (issue #757)
 
