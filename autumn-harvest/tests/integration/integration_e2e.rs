@@ -10569,6 +10569,7 @@ async fn count_active_activity_rows(conn: &mut AsyncPgConnection, exec_id: Execu
 /// byte-identical results to an unbounded fan-out over the same inputs, and
 /// records exactly N=20 `ActivityScheduled` events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
     let (database_url, _container) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

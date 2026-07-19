@@ -1599,6 +1599,7 @@ where
 /// Recorded under `W1=1` (only slot 0 scheduled, still in-flight); re-driven
 /// under `W2=3`.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn windowed_fan_out_resumes_under_increased_window() {
     let exec_id = ExecutionId::new();
     let id0 = ActivityExecId::new();
@@ -1893,7 +1894,7 @@ async fn windowed_typed_collect_returns_typed_ok_and_err_slots_in_order() {
     let info = windowed_test_activity_info("dbl");
     let (exec_id, history) = windowed_collect_full_history("dbl", 3, |i| match i {
         1 => Err("slot_1_boom".to_string()),
-        _ => Ok(json!((i as i64) * 10)),
+        _ => Ok(json!(i * 10)),
     });
     let ctx = WorkflowContext::for_replay(exec_id, history);
 
@@ -1944,8 +1945,8 @@ async fn windowed_typed_collect_surfaces_deserialization_error() {
 
 /// MINOR: mid-multi-wave cancellation — a fan-out whose reconstructed context is
 /// cancelled after wave 1 completed short-circuits at the top before dispatching
-/// wave 2. The run fails with a cancellation (never Suspended with fresh
-/// ScheduleActivity commands for wave 2).
+/// wave 2. The run fails with a cancellation (never `Suspended` with fresh
+/// `ScheduleActivity` commands for wave 2).
 #[tokio::test]
 async fn windowed_fan_out_mid_wave_cancellation_does_not_dispatch_next_wave() {
     let exec_id = ExecutionId::new();
