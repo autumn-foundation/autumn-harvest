@@ -3562,7 +3562,7 @@ async fn test_await_external_workflow_replays_deterministically() {
 
 /// P2-a (issue #757 review): a non-`COMPLETED` terminal cause is programmatically
 /// branchable via `err.workflow_error_type()` — the reader stamps
-/// `error_type = Some(reason_code)` for CANCELLED/TIMED_OUT/TERMINATED. This runs
+/// `error_type = Some(reason_code)` for `CANCELLED`/`TIMED_OUT`/`TERMINATED`. This runs
 /// the capturing workflow against a fixture that mirrors that reader output and
 /// asserts the coordinator can distinguish the three terminal causes without
 /// string-matching the message.
@@ -3654,7 +3654,7 @@ async fn test_await_external_workflow_typed_deserialize_failure() {
             json!({ "target": target.to_string() }),
         )
         .await;
-    let result = outcome.result.clone().expect("workflow completes cleanly");
+    let result = outcome.result.expect("workflow completes cleanly");
     assert_eq!(
         result["kind"],
         json!("serialization"),

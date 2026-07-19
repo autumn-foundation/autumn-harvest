@@ -813,6 +813,7 @@ async fn test_await_is_observe_only_target_unchanged() {
 /// `ExternalAwaitResolved`, then run the outbox and assert it neither appends a
 /// second terminal nor fails the awaiter.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
     let _guard = TEST_MUTEX.lock().await;
     let (database_url, _container) = setup_test_database_url().await;
@@ -947,7 +948,7 @@ async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
 /// End-to-end validation of P2-a (issue #757 review): a running target that is
 /// CANCELLED resolves the awaiter's await as a typed `WorkflowFailed` whose
 /// `workflow_error_type()` is exactly `target_cancelled` — the reader (not a
-/// hand-written fixture) stamps the branchable error_type.
+/// hand-written fixture) stamps the branchable `error_type`.
 #[tokio::test]
 async fn test_await_cancelled_target_surfaces_target_cancelled() {
     let _guard = TEST_MUTEX.lock().await;
@@ -1029,8 +1030,8 @@ async fn test_await_cancelled_target_surfaces_target_cancelled() {
 // ── (j) CONTINUED_AS_NEW target → chain-follow to the successor's output ────────
 
 /// The reader follows a `CONTINUED_AS_NEW` target through its successor chain to
-/// the true terminal (issue #757, AWAIT_OUTCOME_CHAIN_MAX_HOPS). The awaiter must
-/// receive the SUCCESSOR's COMPLETED output, not the CONTINUED_AS_NEW sentinel.
+/// the true terminal (issue #757, `AWAIT_OUTCOME_CHAIN_MAX_HOPS`). The awaiter must
+/// receive the SUCCESSOR's COMPLETED output, not the `CONTINUED_AS_NEW` sentinel.
 #[tokio::test]
 async fn test_await_continued_as_new_target_follows_chain_to_successor() {
     let _guard = TEST_MUTEX.lock().await;

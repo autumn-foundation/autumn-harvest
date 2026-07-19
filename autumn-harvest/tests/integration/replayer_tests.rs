@@ -467,7 +467,7 @@ fn await_external_concurrent_wf<'a>(
 /// both run in one `futures::join!` batch. Regression fixture proving the await
 /// stash triplets keep replay deterministic when `ExternalAwaitResolved` and
 /// `TimerFired` are recorded in EITHER order (mirrors the #476
-/// receive_signal_timeout concurrent-with-timer bar).
+/// `receive_signal_timeout` concurrent-with-timer bar).
 fn await_external_concurrent_timer_wf<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
