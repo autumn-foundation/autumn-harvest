@@ -512,7 +512,8 @@ mod scanner {
             // failure and timeout paths. Runs after the transaction commits so
             // a counter error can never abort the quarantine.
             if let Some((workflow_id, workflow_name, schedule_id, origin)) = failed_workflow {
-                metrics.record_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal(
+                    metrics,
                     &workflow_name,
                     &task.queue_name,
                     crate::telemetry::WorkflowStatus::Failed,

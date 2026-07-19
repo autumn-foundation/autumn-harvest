@@ -2362,6 +2362,41 @@ pub trait MetricsRecorder: Send + Sync {
     }
 }
 
+/// Emit the once-per-terminal-outcome business counter `harvest.workflow.terminal`
+/// (issue #519), **skipping synthetic-liveness-canary probe runs** (issue #796,
+/// AC8).
+///
+/// This is the single choke point through which every non-canary terminal
+/// transition routes its business SLO counter, so a canary probe (identified by
+/// [`crate::canary::is_canary_workflow`]) can never leak into
+/// `harvest.workflow.terminal` no matter which terminal path it reaches (worker
+/// completion/failure, execution timeout, poison-pill quarantine, batch/operator
+/// cancel/terminate, history-cap, race-loser cancel, …). The canary-skip
+/// decision lives in exactly one place — here.
+///
+/// A canary probe emits ONLY `harvest.canary.*`; it never contributes to
+/// `harvest.workflow.terminal` or any other `harvest.workflow.*` business
+/// counter. The two primary terminal sites (worker completion and
+/// execution-timeout) additionally emit the probe's own `harvest.canary.*`
+/// signal in their canary branch and route their non-canary terminal through
+/// this helper. A canary still contributes to `harvest.activity.*`/
+/// `harvest.queue.*`, which it legitimately exercises.
+///
+/// Generic over `M: MetricsRecorder + ?Sized` so it accepts `&dyn
+/// MetricsRecorder`, `&(dyn MetricsRecorder + Send + Sync)`, and `&*Arc<dyn
+/// MetricsRecorder>` uniformly.
+pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    queue: &str,
+    outcome: WorkflowStatus,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_workflow_terminal(workflow_name, queue, outcome);
+}
+
 /// Default metrics recorder that discards every sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoOpMetrics;
@@ -2820,6 +2855,59 @@ mod tests {
             6,
             "should emit once for each of the 6 terminal outcomes"
         );
+    }
+
+    #[test]
+    fn emit_workflow_terminal_skips_canary_and_records_business_workflows() {
+        // Issue #796 AC8: the single choke point routes a business workflow's
+        // terminal to `record_workflow_terminal` but skips a synthetic-liveness
+        // canary probe entirely, so a canary can never leak into
+        // `harvest.workflow.terminal` no matter which terminal path it reaches.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct TerminalCounter(AtomicUsize);
+        impl MetricsRecorder for TerminalCounter {
+            fn record_workflow_terminal(&self, _wf: &str, _q: &str, _outcome: WorkflowStatus) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(TerminalCounter::default());
+
+        // A canary probe (any per-queue name) records NOTHING.
+        for canary in [
+            crate::canary::CANARY_WORKFLOW_NAME_PREFIX,
+            "__harvest_canary_probe__default",
+            "__harvest_canary_probe__email",
+        ] {
+            emit_workflow_terminal(counter.as_ref(), canary, "default", WorkflowStatus::Failed);
+        }
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a canary probe must never increment harvest.workflow.terminal"
+        );
+
+        // An ordinary business workflow records once per call.
+        emit_workflow_terminal(
+            counter.as_ref(),
+            "onboarding",
+            "default",
+            WorkflowStatus::Completed,
+        );
+        emit_workflow_terminal(counter.as_ref(), "checkout", "q", WorkflowStatus::Cancelled);
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            2,
+            "business workflows must still increment harvest.workflow.terminal"
+        );
+
+        // Also works through a `&*Arc<dyn MetricsRecorder>` erased reference.
+        let erased: Arc<dyn MetricsRecorder> = counter.clone();
+        emit_workflow_terminal(&*erased, "billing", "default", WorkflowStatus::TimedOut);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 3);
     }
 
     #[test]

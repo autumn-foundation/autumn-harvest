@@ -1613,7 +1613,8 @@ pub async fn enforce_workflow_execution_timeouts(
             metrics.record_canary_failure(&execution.queue_name, canary_shard);
         } else {
             metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
-            metrics.record_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal(
+                metrics,
                 &workflow_name,
                 &execution.queue_name,
                 crate::telemetry::WorkflowStatus::TimedOut,
@@ -2240,7 +2241,8 @@ pub async fn enforce_external_cancels_outbox(
                     .await;
                 }
                 for (workflow_name, queue_name) in cancel_metrics {
-                    metrics.record_workflow_terminal(
+                    crate::telemetry::emit_workflow_terminal(
+                        metrics,
                         &workflow_name,
                         &queue_name,
                         crate::telemetry::WorkflowStatus::Cancelled,
@@ -2630,7 +2632,8 @@ pub async fn enforce_workflow_history_ceiling(
             "workflow execution terminated: history ceiling exceeded"
         );
 
-        metrics.record_workflow_terminal(
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
             &workflow_name,
             &queue_name,
             crate::telemetry::WorkflowStatus::Failed,

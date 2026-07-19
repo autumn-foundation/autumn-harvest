@@ -1046,7 +1046,8 @@ pub async fn start_or_load_workflow_execution_collect(
                 }
                 if let Some(m) = metrics {
                     for (wf_name, q_name) in cancel_metrics {
-                        m.record_workflow_terminal(
+                        crate::telemetry::emit_workflow_terminal(
+                            m,
                             &wf_name,
                             &q_name,
                             crate::telemetry::WorkflowStatus::Cancelled,
@@ -1122,7 +1123,8 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     }
     if let Some(m) = metrics {
         for (wf_name, q_name) in cancel_metrics {
-            m.record_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal(
+                m,
                 &wf_name,
                 &q_name,
                 crate::telemetry::WorkflowStatus::Cancelled,
@@ -1258,7 +1260,8 @@ pub async fn start_or_load_workflow_execution_idempotent(
     }
     if let Some(m) = metrics {
         for (wf_name, q_name) in cancel_metrics {
-            m.record_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal(
+                m,
                 &wf_name,
                 &q_name,
                 crate::telemetry::WorkflowStatus::Cancelled,
@@ -2266,7 +2269,8 @@ pub async fn cancel_workflow_execution(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
     }
     if let Some((workflow_name, queue_name)) = deferred_terminal {
-        metrics.record_workflow_terminal(
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
             &workflow_name,
             &queue_name,
             crate::telemetry::WorkflowStatus::Cancelled,
@@ -3445,7 +3449,8 @@ pub async fn terminate_workflow_execution(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
     }
     if let Some((workflow_name, queue_name)) = deferred_terminal {
-        metrics.record_workflow_terminal(
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
             &workflow_name,
             &queue_name,
             crate::telemetry::WorkflowStatus::Terminated,
@@ -4162,7 +4167,8 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
     }
     if let Some(m) = metrics {
         for (wf_name, q_name) in cancel_metrics {
-            m.record_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal(
+                m,
                 &wf_name,
                 &q_name,
                 crate::telemetry::WorkflowStatus::Cancelled,
@@ -4764,7 +4770,8 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     }
     if let Some(m) = metrics {
         for (wf_name, q_name) in cancel_metrics {
-            m.record_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal(
+                m,
                 &wf_name,
                 &q_name,
                 crate::telemetry::WorkflowStatus::Cancelled,

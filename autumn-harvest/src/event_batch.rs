@@ -374,7 +374,8 @@ pub async fn admit_batched_start(
             m.record_admission_bypassed(crate::admission_gate::StartProducer::EventBatch.as_str());
         }
         for (wf_name, q_name) in cancel_metrics {
-            m.record_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal(
+                m,
                 &wf_name,
                 &q_name,
                 crate::telemetry::WorkflowStatus::Cancelled,
@@ -501,7 +502,8 @@ async fn fire_due_on_conn(
                     crate::admission_gate::StartProducer::EventBatch.as_str(),
                 );
                 for (wf_name, q_name) in cancel_metrics {
-                    m.record_workflow_terminal(
+                    crate::telemetry::emit_workflow_terminal(
+                        m,
                         &wf_name,
                         &q_name,
                         crate::telemetry::WorkflowStatus::Cancelled,

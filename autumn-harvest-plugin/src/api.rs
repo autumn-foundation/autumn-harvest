@@ -14800,7 +14800,11 @@ async fn batch_start_workflows(
                     }
                     let m = runtime.registry.telemetry().metrics.as_ref();
                     for (wf_name, q_name) in cancel_metrics {
-                        m.record_workflow_terminal(
+                        // Route through the single choke point so a synthetic
+                        // liveness canary (issue #796, AC8) never leaks into
+                        // harvest.workflow.terminal via a batch cancel.
+                        autumn_harvest::telemetry::emit_workflow_terminal(
+                            m,
                             &wf_name,
                             &q_name,
                             autumn_harvest::telemetry::WorkflowStatus::Cancelled,
