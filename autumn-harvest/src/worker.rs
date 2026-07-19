@@ -1909,6 +1909,7 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
 /// mixed timer + external arm threads [`ResolvedExternalIds::default`] (empty),
 /// so their behaviour is byte-for-byte unchanged.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
 struct ResolvedExternalIds {
     signal_ids: Vec<crate::types::ExternalSignalId>,
     cancel_ids: Vec<crate::types::ExternalCancelId>,
@@ -2286,11 +2287,13 @@ async fn persist_external_signal_inline(
                                     details,
                                     non_retryable,
                                 }),
-                                Ok(None) => None,
                                 Err(HarvestError::Database(e)) => {
                                     return Err(HarvestError::Database(e));
                                 }
-                                Err(_) => None,
+                                // Still running/paused/not-found (None), or a
+                                // non-DB read error → leave the bare Requested and
+                                // let the outbox resolve it.
+                                Ok(None) | Err(_) => None,
                             };
 
                             if let Some(terminal) = terminal_opt {

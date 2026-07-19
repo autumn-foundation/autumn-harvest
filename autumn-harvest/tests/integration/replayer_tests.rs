@@ -432,9 +432,8 @@ fn await_external_branch_wf<'a>(
         let target =
             ExecutionId::from_uuid(uuid::Uuid::parse_str(target_str).map_err(|e| e.to_string())?);
         let activity = match ctx.await_external_workflow_value(target).await {
-            Ok(_) => "finalize",
             Err(e) if e.workflow_error_type() == Some("PaymentDeclined") => "compensate",
-            Err(_) => "finalize",
+            _ => "finalize",
         };
         ctx.execute_activity_raw(activity, Value::Null, "default")
             .await

@@ -738,7 +738,7 @@ impl HarvestError {
     /// surfaces as a typed [`WorkflowFailed`](HarvestError::WorkflowFailed), not
     /// this variant.
     #[must_use]
-    pub fn external_await_reason_code(&self) -> Option<&str> {
+    pub const fn external_await_reason_code(&self) -> Option<&str> {
         match self {
             Self::ExternalAwaitFailed { reason_code, .. } => Some(reason_code.as_str()),
             _ => None,

@@ -5653,7 +5653,7 @@ pub async fn load_execution(
 
 /// The terminal outcome of an awaited target workflow (issue #757), resolved by
 /// [`read_external_await_outcome`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalAwaitOutcome {
     /// Target reached `COMPLETED` — carries its recorded (inflated) output.
     Completed(serde_json::Value),

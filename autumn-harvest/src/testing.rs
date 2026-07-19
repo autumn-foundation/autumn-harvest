@@ -2989,17 +2989,18 @@ pub struct WorkflowTestEnv {
     /// the target's terminal cause (`reason_code`, message, typed fields). An
     /// awaited target present here resolves to the typed `Err` branch. Takes
     /// precedence over `external_await_results` if both are set for a target.
-    external_await_failures: HashMap<
-        ExecutionId,
-        (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<Value>,
-            Option<bool>,
-        ),
-    >,
+    external_await_failures: HashMap<ExecutionId, ExternalAwaitFailureFixture>,
 }
+
+/// A canned `await_external_workflow` failure outcome (issue #757):
+/// `(reason_code, message, error_type, details, non_retryable)`.
+type ExternalAwaitFailureFixture = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<Value>,
+    Option<bool>,
+);
 
 impl Default for WorkflowTestEnv {
     fn default() -> Self {
