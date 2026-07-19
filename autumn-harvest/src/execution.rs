@@ -5677,30 +5677,64 @@ pub enum ExternalAwaitOutcome {
 /// follows before giving up (matches the plugin `/result` chain-walk bound).
 const AWAIT_OUTCOME_CHAIN_MAX_HOPS: usize = 128;
 
+/// Three-state result of [`read_external_await_outcome`] (issue #757).
+///
+/// Distinguishing "still running" from "not found" lets the outbox drive the
+/// grace window (`NotFound` + grace-expired → `target_unknown`) and the inline
+/// path decide re-park vs append, without a second existence probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalAwaitReadResult {
+    /// Target reached a terminal state — carries the resolved outcome.
+    Terminal(ExternalAwaitOutcome),
+    /// Target exists but is still non-terminal (`RUNNING`/`PAUSED`/…), or an
+    /// in-flight `CONTINUED_AS_NEW` successor is not yet visible.
+    NotYetTerminal,
+    /// No execution with this id was found (drives the outbox grace window).
+    NotFound,
+}
+
 /// Observe-only reader (issue #757): resolve the terminal outcome of `target`
 /// for `await_external_workflow`.
 ///
-/// Returns `Ok(None)` when the target is still `RUNNING`/`PAUSED` **or** not
-/// found (the outbox grace window — not this reader — converts a persistent
-/// `NotFound` into `target_unknown`). A `CONTINUED_AS_NEW` target is followed
-/// through its successor chain (same-shard) to the true terminal.
+/// Returns [`ExternalAwaitReadResult::NotYetTerminal`] when the target is still
+/// `RUNNING`/`PAUSED`, [`ExternalAwaitReadResult::NotFound`] when no such
+/// execution exists (the outbox grace window — not this reader — converts a
+/// persistent `NotFound` into `target_unknown`), and
+/// [`ExternalAwaitReadResult::Terminal`] otherwise. A `CONTINUED_AS_NEW` target
+/// is followed through its successor chain (same-shard) to the true terminal.
 ///
 /// **Never mutates the target or creates any linkage** — a pure read.
 pub async fn read_external_await_outcome(
     conn: &mut AsyncPgConnection,
     target: ExecutionId,
-) -> HarvestResult<Option<ExternalAwaitOutcome>> {
+) -> HarvestResult<ExternalAwaitReadResult> {
     let mut current = target;
-    for _ in 0..AWAIT_OUTCOME_CHAIN_MAX_HOPS {
+    for hop in 0..AWAIT_OUTCOME_CHAIN_MAX_HOPS {
         let execution = match load_execution(conn, current).await {
             Ok(e) => e,
-            // Target not found: leave resolution to the outbox grace window.
-            Err(HarvestError::NotFound(_)) => return Ok(None),
+            // The target itself (hop 0) is absent → drive the grace window.
+            // A later hop (a `CONTINUED_AS_NEW` successor not yet visible) is
+            // transient: the ORIGINAL target exists, so never report unknown —
+            // treat it as still-in-flight and let the outbox retry next tick.
+            Err(HarvestError::NotFound(_)) => {
+                return Ok(if hop == 0 {
+                    ExternalAwaitReadResult::NotFound
+                } else {
+                    ExternalAwaitReadResult::NotYetTerminal
+                });
+            }
             Err(e) => return Err(e),
         };
 
         let outcome = match execution.state.as_str() {
             "COMPLETED" => {
+                // The target's `output` row column is read RAW. Core
+                // `append_events`/`load_history` use the identity codec (payload
+                // codecs are a plugin-layer concern), so on a codec-encrypting
+                // deployment this is the ciphertext envelope — the awaiter freezes
+                // it inflated into its own history, mirroring the `FAILED`-path
+                // `details` caveat below. A large output is copied inline without
+                // offloading (a documented future optimization — issue #757).
                 ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
             }
             "FAILED" => {
@@ -5746,24 +5780,28 @@ pub async fn read_external_await_outcome(
                     },
                 }
             }
+            // Non-`COMPLETED` terminals carry `error_type = Some(reason_code)`
+            // (issue #757 review) so a coordinator can branch cancelled vs
+            // timed-out vs terminated via `err.workflow_error_type()` instead of
+            // string-matching the human message.
             "TIMED_OUT" => ExternalAwaitOutcome::Terminal {
                 reason_code: "target_timed_out".to_string(),
                 message: execution.error.clone(),
-                error_type: None,
+                error_type: Some("target_timed_out".to_string()),
                 details: None,
                 non_retryable: None,
             },
             "CANCELLED" => ExternalAwaitOutcome::Terminal {
                 reason_code: "target_cancelled".to_string(),
                 message: execution.error.clone(),
-                error_type: None,
+                error_type: Some("target_cancelled".to_string()),
                 details: None,
                 non_retryable: None,
             },
             "TERMINATED" => ExternalAwaitOutcome::Terminal {
                 reason_code: "target_terminated".to_string(),
                 message: execution.error.clone(),
-                error_type: None,
+                error_type: Some("target_terminated".to_string()),
                 details: None,
                 non_retryable: None,
             },
@@ -5783,17 +5821,17 @@ pub async fn read_external_await_outcome(
                         continue;
                     }
                     // No successor recorded yet — treat as still-in-flight.
-                    None => return Ok(None),
+                    None => return Ok(ExternalAwaitReadResult::NotYetTerminal),
                 }
             }
             // RUNNING / PAUSED / SUSPENDED (or any non-terminal): still in flight.
-            _ => return Ok(None),
+            _ => return Ok(ExternalAwaitReadResult::NotYetTerminal),
         };
-        return Ok(Some(outcome));
+        return Ok(ExternalAwaitReadResult::Terminal(outcome));
     }
     // Exceeded chain depth — treat as still in flight rather than fabricating a
     // terminal (the outbox retries next tick).
-    Ok(None)
+    Ok(ExternalAwaitReadResult::NotYetTerminal)
 }
 
 /// Scans workflow history for unresolved update handlers and records warning logs/metrics if any exist.

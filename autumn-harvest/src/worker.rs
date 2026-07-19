@@ -1922,6 +1922,28 @@ impl ResolvedExternalIds {
     }
 }
 
+/// Find an already-recorded terminal (`ExternalAwaitResolved`/`ExternalAwaitFailed`)
+/// for `await_id` in `events` (issue #757 review).
+///
+/// Used inside [`persist_external_signal_inline`]'s awaiter-row-locked
+/// transaction to detect that a concurrent outbox sweep already resolved this
+/// await, so the inline path surfaces the recorded terminal to the caller
+/// instead of appending a duplicate (which would leave two terminals for one
+/// `await_id`).
+fn existing_external_await_terminal(
+    events: &[WorkflowEvent],
+    await_id: crate::types::ExternalAwaitId,
+) -> Option<WorkflowEvent> {
+    events
+        .iter()
+        .find(|e| match e {
+            WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
+            | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
+            _ => false,
+        })
+        .cloned()
+}
+
 /// Scan `new_events` — the events [`persist_external_signal_inline`] appended
 /// for THIS batch on this decision cycle — for the terminals that resolved each
 /// external op inline, returning their ids.
@@ -2061,6 +2083,26 @@ async fn persist_external_signal_inline(
 ) -> HarvestResult<Vec<WorkflowEvent>> {
     let start_next = *next_event_id;
 
+    // Does this batch contain an await? An await is the ONE external op that
+    // parks on a bare `Requested` (target running → outbox resolves it later),
+    // so it is the only op whose inline terminal append can race a concurrent
+    // outbox append and be numbered against a stale `next_event_id` (issue
+    // #757). Signal/cancel resolve their terminal in the same first-call
+    // transaction, so no outbox ever races their inline append.
+    //
+    // We therefore take the awaiter-row lock (the serialization point every
+    // external outbox uses before appending a terminal) ONLY when an await is
+    // present. Doing it unconditionally would make the cancel arm — which
+    // locks the TARGET row inside `cancel_workflow_execution_collect` — hold
+    // caller-row + target-row, introducing a mutual-cancel lock-ordering cycle
+    // (A locks A then B; B locks B then A) that does not exist today. The await
+    // arm reads its target with a plain SELECT (no target lock), so caller-lock
+    // + target-read has no cycle. A pure signal/cancel batch is thus byte-for-
+    // byte unchanged (no lock, no reload).
+    let has_await = items
+        .iter()
+        .any(|item| matches!(item, SignalBatchItem::Await(_)));
+
     // Persist the whole inline batch (request + delivery + terminal appends) in a
     // single transaction so a concurrently-running outbox sweep (on another
     // connection/worker) never observes an `External{Signal,Cancel}Requested`
@@ -2072,8 +2114,28 @@ async fn persist_external_signal_inline(
     let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = conn
         .transaction::<InlinePersistResult, HarvestError, _>(|conn| {
             async move {
+                // For await-bearing batches, take the awaiter row `FOR UPDATE`
+                // lock and read the TRUE `next_event_id` under it. Whichever of
+                // inline/outbox commits first, the other observes the terminal
+                // under this lock (and via `prior_events` / the outbox's own
+                // re-check) and skips the duplicate. `start_next` can lag a
+                // concurrent outbox terminal append; appending at a stale
+                // event_id violates `UNIQUE(workflow_exec_id, event_id)`, which
+                // for the await re-park path (the NORMAL long-lived-target case)
+                // would spuriously and permanently FAIL an await that in fact
+                // resolved correctly. (issue #757 review, P1)
+                let (prior_events, mut next) = if has_await {
+                    let locked =
+                        lock_workflow_execution_and_load_history(conn, exec_id).await?;
+                    debug_assert!(
+                        locked.next_event_id >= start_next,
+                        "locked next_event_id must not precede the pre-transaction snapshot"
+                    );
+                    (locked.events, locked.next_event_id)
+                } else {
+                    (Vec::new(), start_next)
+                };
                 let mut new_events: Vec<WorkflowEvent> = Vec::new();
-                let mut next = start_next;
                 // Completion-trigger / cascade follow-up starts produced by
                 // same-shard cancellations. These must be spawned only *after*
                 // this outer transaction commits, otherwise a later rollback
@@ -2256,30 +2318,44 @@ async fn persist_external_signal_inline(
                                 continue;
                             }
 
+                            // A concurrent outbox sweep may already have resolved
+                            // this await under the awaiter row lock we now hold
+                            // (issue #757 review): if its terminal is already
+                            // recorded, surface it to the caller so the resumed
+                            // drive resolves — but do NOT append a duplicate.
+                            if let Some(existing) =
+                                existing_external_await_terminal(&prior_events, run.await_id)
+                            {
+                                new_events.push(existing);
+                                continue;
+                            }
+
                             // Same-shard: observe the target's terminal outcome.
-                            // `None` (still running/paused or not-found) leaves the
-                            // bare Requested event so the caller re-parks and the
-                            // outbox resolves it later. The value/error is stored
-                            // INFLATED into the awaiter's own history (observe-only;
-                            // never touches the target).
+                            // `NotYetTerminal`/`NotFound` leaves the bare Requested
+                            // event so the caller re-parks and the outbox resolves
+                            // it later. The value/error is stored INFLATED into the
+                            // awaiter's own history (observe-only; never touches the
+                            // target).
                             let terminal_opt = match crate::execution::read_external_await_outcome(
                                 conn, run.target,
                             )
                             .await
                             {
-                                Ok(Some(crate::execution::ExternalAwaitOutcome::Completed(
-                                    output,
-                                ))) => Some(WorkflowEvent::ExternalAwaitResolved {
+                                Ok(crate::execution::ExternalAwaitReadResult::Terminal(
+                                    crate::execution::ExternalAwaitOutcome::Completed(output),
+                                )) => Some(WorkflowEvent::ExternalAwaitResolved {
                                     await_id: run.await_id,
                                     output,
                                 }),
-                                Ok(Some(crate::execution::ExternalAwaitOutcome::Terminal {
-                                    reason_code,
-                                    message,
-                                    error_type,
-                                    details,
-                                    non_retryable,
-                                })) => Some(WorkflowEvent::ExternalAwaitFailed {
+                                Ok(crate::execution::ExternalAwaitReadResult::Terminal(
+                                    crate::execution::ExternalAwaitOutcome::Terminal {
+                                        reason_code,
+                                        message,
+                                        error_type,
+                                        details,
+                                        non_retryable,
+                                    },
+                                )) => Some(WorkflowEvent::ExternalAwaitFailed {
                                     await_id: run.await_id,
                                     reason_code,
                                     message,
@@ -2290,10 +2366,14 @@ async fn persist_external_signal_inline(
                                 Err(HarvestError::Database(e)) => {
                                     return Err(HarvestError::Database(e));
                                 }
-                                // Still running/paused/not-found (None), or a
-                                // non-DB read error → leave the bare Requested and
-                                // let the outbox resolve it.
-                                Ok(None) | Err(_) => None,
+                                // Still running/paused or not-found, or a non-DB
+                                // read error → leave the bare Requested and let the
+                                // outbox resolve it.
+                                Ok(
+                                    crate::execution::ExternalAwaitReadResult::NotYetTerminal
+                                    | crate::execution::ExternalAwaitReadResult::NotFound,
+                                )
+                                | Err(_) => None,
                             };
 
                             if let Some(terminal) = terminal_opt {
@@ -16977,6 +17057,104 @@ mod tests {
     fn resolved_external_ids_empty_is_empty() {
         let resolved = resolved_external_ids(&[]);
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolved_external_ids_counts_await_terminals() {
+        let aid = crate::types::ExternalAwaitId::new();
+        let new_events = vec![
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: aid,
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: aid,
+                output: serde_json::json!("done"),
+            },
+        ];
+        let resolved = resolved_external_ids(&new_events);
+        assert_eq!(resolved.await_ids, vec![aid]);
+        assert!(resolved.signal_ids.is_empty());
+        assert!(resolved.cancel_ids.is_empty());
+    }
+
+    // ── inline-vs-outbox await terminal de-duplication (issue #757 review, P1) ──
+
+    #[test]
+    fn existing_external_await_terminal_finds_recorded_resolved() {
+        // The skip helper used inside the awaiter-row-locked inline transaction:
+        // a concurrent outbox sweep may have already resolved this await under
+        // the same lock, so the inline path must surface the recorded terminal
+        // (never append a duplicate).
+        let aid = crate::types::ExternalAwaitId::new();
+        let output = serde_json::json!({ "ok": true });
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: aid,
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: aid,
+                output: output.clone(),
+            },
+        ];
+        let found = existing_external_await_terminal(&events, aid);
+        match found {
+            Some(WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: o,
+            }) => {
+                assert_eq!(await_id, aid);
+                assert_eq!(o, output);
+            }
+            other => panic!("must return the recorded ExternalAwaitResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_external_await_terminal_finds_recorded_failed() {
+        let aid = crate::types::ExternalAwaitId::new();
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: aid,
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: aid,
+                reason_code: "target_cancelled".into(),
+                message: None,
+                error_type: Some("target_cancelled".into()),
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        assert!(
+            existing_external_await_terminal(&events, aid).is_some(),
+            "a recorded ExternalAwaitFailed must be detected as an existing terminal"
+        );
+    }
+
+    #[test]
+    fn existing_external_await_terminal_ignores_other_ids_and_bare_request() {
+        let aid = crate::types::ExternalAwaitId::new();
+        let other = crate::types::ExternalAwaitId::new();
+        // Only a bare Requested for `aid`, plus a resolved terminal for a
+        // DIFFERENT await id — no terminal for `aid`, so the inline path proceeds
+        // to observe the target and append (no skip).
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: aid,
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: other,
+                output: serde_json::json!(1),
+            },
+        ];
+        assert!(
+            existing_external_await_terminal(&events, aid).is_none(),
+            "a bare Requested (terminal only for a different await id) must not be treated as resolved"
+        );
     }
 
     // ── cancellable-timer event interleaving (issue #768, FINDING 1) ────────

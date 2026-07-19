@@ -54,39 +54,37 @@ pub struct LegResult {
     pub total: u64,
 }
 
-fn parse_target(s: &str) -> Result<ExecutionId, String> {
+fn parse_target(s: &str) -> HarvestResult<ExecutionId> {
     uuid::Uuid::parse_str(s)
         .map(ExecutionId::from_uuid)
-        .map_err(|e| format!("invalid exec id: {e}"))
+        .map_err(|e| HarvestError::Config(format!("invalid exec id: {e}")))
 }
 
 /// Fan-in coordinator: await three independently-started legs by id and
-/// aggregate their typed totals. Each await is one line; the whole aggregation
-/// is deterministic and replay-safe (each leg's output is frozen into the
+/// aggregate their typed totals. Each straightforward await is a single line
+/// (`?`), because the coordinator returns `Result<_, HarvestError>` — so the
+/// typed error from `await_external_workflow` propagates directly, with no
+/// `map_err(|e| e.to_string())` boilerplate. The whole aggregation is
+/// deterministic and replay-safe (each leg's output is frozen into the
 /// coordinator's own history).
 #[workflow]
-async fn fan_in_coordinator(ctx: &WorkflowContext, input: FanInInput) -> Result<u64, String> {
+async fn fan_in_coordinator(ctx: &WorkflowContext, input: FanInInput) -> Result<u64, HarvestError> {
     let leg_a = parse_target(&input.leg_a)?;
     let leg_b = parse_target(&input.leg_b)?;
     let leg_c = parse_target(&input.leg_c)?;
 
-    // Three one-line awaits by ExecutionId. Await OBSERVES the legs — it never
+    // Two one-line awaits by ExecutionId. Await OBSERVES the legs — it never
     // makes them children of the coordinator.
-    let a: LegResult = ctx
-        .await_external_workflow(leg_a)
-        .await
-        .map_err(|e| e.to_string())?;
-    let b: LegResult = ctx
-        .await_external_workflow(leg_b)
-        .await
-        .map_err(|e| e.to_string())?;
+    let a: LegResult = ctx.await_external_workflow(leg_a).await?;
+    let b: LegResult = ctx.await_external_workflow(leg_b).await?;
 
     // Branch on a leg's typed terminal cause: a `RegionUnavailable` failure is
-    // tolerated (contributes 0), any other failure aborts the coordinator.
+    // tolerated (contributes 0), any other failure aborts the coordinator (the
+    // typed error propagates unchanged).
     let c_total = match ctx.await_external_workflow::<LegResult>(leg_c).await {
         Ok(c) => c.total,
         Err(e) if e.workflow_error_type() == Some("RegionUnavailable") => 0,
-        Err(e) => return Err(format!("leg C failed fatally: {e}")),
+        Err(e) => return Err(e),
     };
 
     Ok(a.total + b.total + c_total)

@@ -503,14 +503,32 @@ async fn test_await_cross_shard_via_outbox() {
     truncate_all(&pool).await;
 
     // Both shards point to the same physical DB (logical sharding mock), mirroring
-    // the cross-shard cancel test.
+    // the cross-shard cancel test — but each shard gets a GENUINELY DISTINCT pool
+    // instance (not a `pool.clone()`), so the outbox's `same_pool` check
+    // (`std::ptr::eq` of the two shards' pools) yields distinct pointers and the
+    // real cross-pool `target_conn` acquisition branch is exercised, even though
+    // both logical shards resolve to one physical database (issue #757 review,
+    // P2-d). `ShardedDbPool::from_map` installs itself into `GLOBAL_SHARDED_POOL`,
+    // which is what the outbox reads (the worker itself carries no sharded pool).
+    let pool_shard1 = build_test_pool(&database_url);
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), pool.clone());
-    pools.insert(ShardId::new(1), pool.clone());
-    let _sharded = autumn_harvest::shard::ShardedDbPool::from_map(pools, ShardId::new(0));
+    pools.insert(ShardId::new(1), pool_shard1.clone());
+    let sharded = autumn_harvest::shard::ShardedDbPool::from_map(pools, ShardId::new(0));
 
     let awaiter = ExecutionId::new_for_shard(ShardId::new(0));
     let target = ExecutionId::new_for_shard(ShardId::new(1));
+
+    // Prove the cross-pool branch is genuinely reachable: the two shards' pools
+    // must be distinct pointers, so the outbox's `std::ptr::eq(t_pool, c_pool)`
+    // is `false` → `same_pool = false` → the separate-`target_conn` path runs.
+    let t_pool = sharded.exact_pool_for_execution(target).unwrap();
+    let c_pool = sharded.exact_pool_for_execution(awaiter).unwrap();
+    assert!(
+        !std::ptr::eq(t_pool, c_pool),
+        "cross-shard target/caller must resolve to distinct pools so the outbox \
+         exercises the cross-pool target_conn branch"
+    );
 
     let worker = Arc::new(make_worker(
         vec![
@@ -782,4 +800,144 @@ async fn test_await_is_observe_only_target_unchanged() {
 
     worker.shutdown();
     let _ = handle.await;
+}
+
+// ── (h) Inline/outbox terminal de-duplication idempotency (issue #757 review, P1) ─
+
+/// The awaiter-row lock is the serialization point between the inline re-park
+/// path and the outbox sweep: whichever appends the terminal first, the other
+/// observes it (inline via `existing_external_await_terminal` under the lock,
+/// outbox via its NOT EXISTS filter + a re-check under the same lock) and skips
+/// the duplicate. This exercises the AC "no duplicate event, no workflow
+/// failure" when a terminal already exists for the await id: pre-append an
+/// `ExternalAwaitResolved`, then run the outbox and assert it neither appends a
+/// second terminal nor fails the awaiter.
+#[tokio::test]
+async fn test_await_outbox_does_not_duplicate_a_present_terminal() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    truncate_all(&pool).await;
+
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let awaiter = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let mut conn = pool.get().await.unwrap();
+
+    // Awaiter: create (RUNNING + WorkflowStarted), then append a bare
+    // `ExternalAwaitRequested` (as if it parked awaiting a running target).
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            awaiter,
+            "awaiter_workflow",
+            "await-idem",
+            serde_json::json!({ "target": target.to_string() }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Target: create, then force COMPLETED with a known output (the reader reads
+    // the row's `output` column directly for a COMPLETED target).
+    start_or_load_workflow_execution(
+        &mut conn,
+        default_start_params(
+            target,
+            "awaiter_workflow",
+            "await-idem-target",
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(target.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(serde_json::json!({ "value": 7 }))),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let await_id = autumn_harvest::ExternalAwaitId::new();
+    let hist = autumn_harvest::store::load_history(&mut conn, awaiter)
+        .await
+        .unwrap();
+    autumn_harvest::store::append_events(
+        &mut conn,
+        awaiter,
+        &[WorkflowEvent::ExternalAwaitRequested { await_id, target }],
+        hist.next_event_id,
+    )
+    .await
+    .unwrap();
+
+    // Pre-append the terminal, simulating the inline path already having
+    // resolved this await under the awaiter row lock.
+    let hist2 = autumn_harvest::store::load_history(&mut conn, awaiter)
+        .await
+        .unwrap();
+    autumn_harvest::store::append_events(
+        &mut conn,
+        awaiter,
+        &[WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: serde_json::json!({ "value": 7 }),
+        }],
+        hist2.next_event_id,
+    )
+    .await
+    .unwrap();
+
+    // Run the outbox — with a terminal already present it must NOT append a
+    // second, and it must not fail the awaiter.
+    let processed = autumn_harvest::timeout::enforce_external_awaits_outbox(
+        &mut conn,
+        Duration::from_secs(30),
+        &None,
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        processed, 0,
+        "outbox must resolve nothing when the await terminal is already recorded"
+    );
+
+    // Running it again is likewise idempotent.
+    let processed_again = autumn_harvest::timeout::enforce_external_awaits_outbox(
+        &mut conn,
+        Duration::from_secs(30),
+        &None,
+        &[ShardId::new(0)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(processed_again, 0);
+
+    let final_hist = autumn_harvest::store::load_history(&mut conn, awaiter)
+        .await
+        .unwrap();
+    let resolved_count = final_hist
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ExternalAwaitResolved { .. }))
+        .count();
+    assert_eq!(
+        resolved_count, 1,
+        "exactly one ExternalAwaitResolved must exist (no duplicate)"
+    );
+    assert!(
+        !final_hist
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitFailed { .. })),
+        "no ExternalAwaitFailed must be appended"
+    );
+
+    let a = load_execution_from_url(&database_url, awaiter).await;
+    assert_ne!(a.state, "FAILED", "the awaiter must not be failed");
 }

@@ -30,10 +30,49 @@ fn init_sql() -> Vec<u8> {
     autumn_harvest::full_migrations_sql().as_bytes().to_vec()
 }
 
-async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
+/// Rewrite the database segment of a `postgres://…/db?query` URL, preserving the
+/// authority and any query string (mirrors the signal suite's helper).
+fn rewrite_pg_db(base: &str, db: &str) -> String {
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let rest = &base[after_scheme..];
+    let (authority, tail) = rest
+        .find('/')
+        .map_or((rest, ""), |i| (&rest[..i], &rest[i + 1..]));
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    format!("{}{}/{}{}", &base[..after_scheme], authority, db, query)
+}
+
+async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+
+    // Local-Postgres path (no Docker): when HARVEST_TEST_DATABASE_URL points at
+    // a live Postgres, create a fresh per-test database, apply the full
+    // migration bundle, and hand back its URL — fully isolated regardless of
+    // suite concurrency (matching the signal suite). CI leaves the env var unset
+    // and uses the testcontainers path below (the authoritative path).
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        use diesel_async::SimpleAsyncConnection;
+        // The per-test `harvest757c_<uuid>` database is intentionally NOT dropped:
+        // this local-dev-only path is env-gated, and CI leaves the env var unset.
+        let db_name = format!("harvest757c_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&base_url)
+            .await
+            .expect("failed to connect to HARVEST_TEST_DATABASE_URL base");
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .await
+            .expect("failed to create per-test database");
+        let new_url = rewrite_pg_db(&base_url, &db_name);
+        let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&new_url)
+            .await
+            .expect("failed to connect to per-test database");
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
+            .await
+            .expect("failed to apply migrations to per-test database");
+        return (new_url, None);
+    }
 
     let container = Postgres::default()
         .with_init_sql(init_sql())
@@ -52,7 +91,7 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
         .expect("failed to get container port");
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    (database_url, container)
+    (database_url, Some(container))
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {

@@ -2361,37 +2361,39 @@ pub async fn enforce_external_awaits_outbox(
                         }
                     });
 
-                    // Resolve the target's outcome and existence on the correct
-                    // connection (same pool → this connection; else a target
-                    // connection). Returns `(outcome, target_exists)`; the reader
-                    // returns `None` for both still-running and not-found, so we
-                    // probe existence separately to drive the grace window.
-                    let resolve = |outcome: Option<crate::execution::ExternalAwaitOutcome>,
-                                   exists: bool|
-                     -> Option<WorkflowEvent> {
-                        match outcome {
-                            Some(crate::execution::ExternalAwaitOutcome::Completed(output)) => {
-                                Some(WorkflowEvent::ExternalAwaitResolved { await_id, output })
-                            }
-                            Some(crate::execution::ExternalAwaitOutcome::Terminal {
-                                reason_code,
-                                message,
-                                error_type,
-                                details,
-                                non_retryable,
-                            }) => Some(WorkflowEvent::ExternalAwaitFailed {
-                                await_id,
-                                reason_code,
-                                message,
-                                error_type,
-                                details,
-                                non_retryable,
-                            }),
-                            // Still running/paused (exists) → pending. Unknown
-                            // (not exists) → target_unknown only after grace.
-                            None => {
-                                if !exists && grace_expired {
-                                    Some(WorkflowEvent::ExternalAwaitFailed {
+                    // Map the reader's 3-state result to the awaiter's terminal
+                    // event, if any. The reader distinguishes NotYetTerminal from
+                    // NotFound directly, so no separate existence probe is needed:
+                    // NotFound only becomes a permanent `target_unknown` once the
+                    // grace window elapses (matching the cancel outbox, issue #492).
+                    let resolve =
+                        |result: crate::execution::ExternalAwaitReadResult| -> Option<WorkflowEvent> {
+                            use crate::execution::{ExternalAwaitOutcome, ExternalAwaitReadResult};
+                            match result {
+                                ExternalAwaitReadResult::Terminal(
+                                    ExternalAwaitOutcome::Completed(output),
+                                ) => Some(WorkflowEvent::ExternalAwaitResolved { await_id, output }),
+                                ExternalAwaitReadResult::Terminal(
+                                    ExternalAwaitOutcome::Terminal {
+                                        reason_code,
+                                        message,
+                                        error_type,
+                                        details,
+                                        non_retryable,
+                                    },
+                                ) => Some(WorkflowEvent::ExternalAwaitFailed {
+                                    await_id,
+                                    reason_code,
+                                    message,
+                                    error_type,
+                                    details,
+                                    non_retryable,
+                                }),
+                                // Still running/paused → pending (retry next sweep).
+                                ExternalAwaitReadResult::NotYetTerminal => None,
+                                // Not found → `target_unknown` only after grace.
+                                ExternalAwaitReadResult::NotFound => {
+                                    grace_expired.then(|| WorkflowEvent::ExternalAwaitFailed {
                                         await_id,
                                         reason_code: "target_unknown".to_string(),
                                         message: None,
@@ -2399,19 +2401,26 @@ pub async fn enforce_external_awaits_outbox(
                                         details: None,
                                         non_retryable: None,
                                     })
-                                } else {
-                                    None
                                 }
                             }
-                        }
-                    };
+                        };
 
-                    let terminal_opt = if same_pool {
-                        let outcome =
-                            crate::execution::read_external_await_outcome(conn, target).await?;
-                        let exists = outcome.is_some()
-                            || crate::execution::load_execution(conn, target).await.is_ok();
-                        resolve(outcome, exists)
+                    // Read the target's outcome on the correct connection. A
+                    // transient DB read error must NOT propagate — that would
+                    // abort the whole `enforce_timeouts_once` sweep for this tick
+                    // (starving completion-triggers/debounce/throttle, which run
+                    // after this pass). Mirror the cancel outbox: log and leave
+                    // the row pending so the sweep continues and retries next
+                    // tick (issue #757 review, P2-b).
+                    let read_result = if same_pool {
+                        match crate::execution::read_external_await_outcome(conn, target).await {
+                            Ok(r) => r,
+                            Err(HarvestError::Database(e)) => {
+                                tracing::error!(error = %e, "await outbox sweep: db error reading target; leaving pending");
+                                return Ok(Some((false, Some(row.id))));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     } else {
                         let Some(pool) = active_sharded_pool
                             .as_ref()
@@ -2430,21 +2439,38 @@ pub async fn enforce_external_awaits_outbox(
                                 return Ok(Some((false, Some(row.id))));
                             }
                         };
-                        let outcome = crate::execution::read_external_await_outcome(
-                            &mut target_conn,
-                            target,
-                        )
-                        .await?;
-                        let exists = outcome.is_some()
-                            || crate::execution::load_execution(&mut target_conn, target)
-                                .await
-                                .is_ok();
-                        resolve(outcome, exists)
+                        match crate::execution::read_external_await_outcome(&mut target_conn, target)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(HarvestError::Database(e)) => {
+                                tracing::error!(error = %e, "await outbox sweep: db error reading target (remote shard); leaving pending");
+                                return Ok(Some((false, Some(row.id))));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     };
 
+                    let terminal_opt = resolve(read_result);
+
                     if let Some(terminal_event) = terminal_opt {
+                        // Take the awaiter row lock — the SAME serialization point
+                        // the inline path uses — then re-check history for a
+                        // terminal already recorded for this await_id (issue #757
+                        // review, P1): the inline re-park path may have resolved it
+                        // between our claim-time NOT EXISTS filter and this lock.
+                        // If present, skip the duplicate append (the inline path
+                        // owns the awaiter's own wake/resolution).
                         let history =
                             lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                        let already_resolved = history.events.iter().any(|e| match e {
+                            WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
+                            | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
+                            _ => false,
+                        });
+                        if already_resolved {
+                            return Ok(Some((false, Some(row.id))));
+                        }
                         store::append_events(
                             conn,
                             caller_exec_id,
