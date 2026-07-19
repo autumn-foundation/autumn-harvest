@@ -438,8 +438,8 @@ pub struct CanaryProbeStatus {
     pub last_roundtrip_ms: Option<i64>,
     /// Count of COMPLETED probe runs in the retained (rolling) window.
     pub success_count: i64,
-    /// Count of terminal non-completed probe runs (FAILED/TIMED_OUT/CANCELLED/
-    /// TERMINATED) in the retained window.
+    /// Count of terminal non-completed probe runs (`FAILED`/`TIMED_OUT`/
+    /// `CANCELLED`/`TERMINATED`) in the retained window.
     pub failure_count: i64,
     /// `true` when the last success is older than the staleness window (or there
     /// has been no success at all) — the alertable liveness signal (AC7).
@@ -466,7 +466,7 @@ impl CanaryReport {
     /// An empty, complete report — used when the canary is disabled (no config
     /// mirrored onto the runtime). The endpoint still answers `200`, it just
     /// reports nothing (AC1: disabled ⇒ no probes).
-    fn empty(as_of: DateTime<Utc>) -> Self {
+    const fn empty(as_of: DateTime<Utc>) -> Self {
         Self {
             status: FanoutStatus::Complete,
             as_of,
@@ -505,10 +505,11 @@ pub fn build_canary_report(
     now: DateTime<Utc>,
 ) -> CanaryReport {
     let (inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(observations);
-    let unreachable: BTreeSet<i32> = unavailable_shards.iter().map(|u| u.shard_id).collect();
 
     // Rows from every reachable shard (a shard with `error: None` was inspected,
-    // even if it returned zero rows).
+    // even if it returned zero rows). A shard with an error is absent from this
+    // map, so an expected probe on it falls through to `stale_probe` below —
+    // this map is the authoritative "was this shard inspected" signal.
     let mut rows_by_shard: BTreeMap<i32, &Vec<CanaryRow>> = BTreeMap::new();
     for observation in observations {
         if observation.error.is_none() {
@@ -520,7 +521,7 @@ pub fn build_canary_report(
     // are no longer configured but still have canary rows).
     let mut grid: BTreeSet<(String, i32)> = expected.iter().cloned().collect();
     for (shard, rows) in &rows_by_shard {
-        for row in rows.iter() {
+        for row in *rows {
             grid.insert((row.queue_name.clone(), *shard));
         }
     }
@@ -530,14 +531,12 @@ pub fn build_canary_report(
     let mut probes: Vec<CanaryProbeStatus> = grid
         .into_iter()
         .map(|(queue, shard)| {
-            // Unreachable, or a shard that was never inspected at all (e.g. a
-            // writable shard with no pool wired up yet): no data ⇒ stale.
+            // Unreachable (error observation), or a shard that was never
+            // inspected at all (e.g. a writable shard with no pool wired up
+            // yet): absent from `rows_by_shard` ⇒ no data ⇒ stale.
             let Some(rows) = rows_by_shard.get(&shard) else {
                 return stale_probe(queue, shard);
             };
-            if unreachable.contains(&shard) {
-                return stale_probe(queue, shard);
-            }
 
             let mut success_count = 0i64;
             let mut failure_count = 0i64;
@@ -558,9 +557,9 @@ pub fn build_canary_report(
                 }
             }
 
-            let (last_success_at, age, latency) = match last_success.and_then(|r| {
-                r.completed_at.map(|completed| (completed, r.started_at))
-            }) {
+            let (last_success_at, age, latency) = match last_success
+                .and_then(|r| r.completed_at.map(|completed| (completed, r.started_at)))
+            {
                 Some((completed, started)) => {
                     let age = shard_fanout::age_secs(now, completed);
                     let latency = completed
@@ -599,7 +598,7 @@ pub fn build_canary_report(
 
 /// A probe with no observed success — used for an unreachable or un-inspected
 /// `(queue, shard)`.
-fn stale_probe(queue: String, shard: i32) -> CanaryProbeStatus {
+const fn stale_probe(queue: String, shard: i32) -> CanaryProbeStatus {
     CanaryProbeStatus {
         queue,
         shard,
@@ -730,7 +729,11 @@ pub async fn build_canary_report_from_shards(api_state: &HarvestApiState) -> Can
         || vec![0],
         |runtime| {
             let router = runtime.router();
-            let shards: Vec<i32> = router.writable_shards().iter().map(|s| s.as_i32()).collect();
+            let shards: Vec<i32> = router
+                .writable_shards()
+                .iter()
+                .map(|s| s.as_i32())
+                .collect();
             if shards.is_empty() {
                 vec![router.default_shard().as_i32()]
             } else {
@@ -1000,12 +1003,7 @@ mod tests {
         Utc.timestamp_opt(seconds, 0).unwrap()
     }
 
-    fn row(
-        queue: &str,
-        state: &str,
-        started: i64,
-        completed: Option<i64>,
-    ) -> CanaryRow {
+    fn row(queue: &str, state: &str, started: i64, completed: Option<i64>) -> CanaryRow {
         CanaryRow {
             queue_name: queue.to_string(),
             state: state.to_string(),
@@ -1014,7 +1012,11 @@ mod tests {
         }
     }
 
-    fn obs(shard_id: i32, rows: Vec<CanaryRow>, error: Option<&str>) -> ShardObservation<CanaryRow> {
+    fn obs(
+        shard_id: i32,
+        rows: Vec<CanaryRow>,
+        error: Option<&str>,
+    ) -> ShardObservation<CanaryRow> {
         ShardObservation {
             shard_id,
             rows,
