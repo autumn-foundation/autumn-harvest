@@ -253,6 +253,33 @@ fn readme_documents_three_command_path() {
 }
 
 #[test]
+fn readme_observe_result_uses_correct_commands() {
+    let files = render("app");
+    let readme = file_content(&files, "README.md");
+    // The result-observing step must poll the real GET endpoint by execution_id
+    // (state RUNNING immediately after POST) or use the installed CLI's real
+    // `workflow get` subcommand.
+    assert!(
+        readme.contains("workflows/<execution_id>") || readme.contains(".execution.state"),
+        "readme must poll GET /workflows/<execution_id> for state: {readme}"
+    );
+    assert!(
+        readme.contains("workflow get"),
+        "readme must reference the real `workflow get` subcommand: {readme}"
+    );
+    // Must NOT reference the non-existent subcommand or a command that cannot
+    // resolve inside a standalone scaffolded project.
+    assert!(
+        !readme.contains("workflow describe"),
+        "`workflow describe` is not a real subcommand: {readme}"
+    );
+    assert!(
+        !readme.contains("cargo run -p autumn-harvest-cli"),
+        "cargo run -p autumn-harvest-cli does not resolve in a standalone project: {readme}"
+    );
+}
+
+#[test]
 fn scaffold_rot_wiring_parity_with_quickstart() {
     let files = render("app");
     let main = file_content(&files, "src/main.rs");

@@ -57,10 +57,11 @@ async fn main() {
             HarvestPlugin::new()
                 .workflows(workflows![{{workflow_fn}}])
                 .activities(activities![{{activity_fn}}])
-                // Poll both the activity queue and "default" so the workflow
-                // task (started on "default") and the activity task are both
-                // serviced by this worker.
-                .worker(WorkerConfig::default().with_queues(["{{queue}}", "default"]))
+                // This worker polls the "{{queue}}" queue. A workflow start
+                // enqueues the workflow task on the worker's first queue, and
+                // the activity (queue = "{{queue}}") is enqueued there too — so
+                // this single queue services both.
+                .worker(WorkerConfig::default().with_queues(["{{queue}}"]))
                 .api("/api/harvest"),
         )
         .run()
