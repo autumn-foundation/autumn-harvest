@@ -194,8 +194,13 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
-    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return (url, None);
+    // Local-PG runs: provision a fresh, uniquely-named, migrated database off the
+    // base URL per call (mirroring the testcontainers per-test isolation), so the
+    // suite is re-runnable against a persistent Postgres. These tests reuse fixed
+    // workflow_ids, so a shared database would let a prior run's terminal
+    // execution short-circuit a fresh start and starve the worker of the probe.
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (provision_ephemeral_db(&base_url).await, None);
     }
     let container = Postgres::default()
         .with_init_sql(init_sql())
@@ -207,6 +212,35 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     (url, Some(container))
+}
+
+/// Provision a fresh, uniquely-named, migrated database off `base_url`, giving
+/// each test the same per-test isolation the testcontainers path provides. The
+/// base role must be able to `CREATE DATABASE`.
+async fn provision_ephemeral_db(base_url: &str) -> String {
+    use diesel_async::SimpleAsyncConnection;
+
+    let db_name = format!("harvest_canary_core_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = AsyncPgConnection::establish(base_url)
+        .await
+        .expect("connect to base database");
+    diesel::sql_query(format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&mut admin)
+        .await
+        .expect("create ephemeral database");
+
+    let (prefix, _old_db) = base_url
+        .rsplit_once('/')
+        .expect("base url must carry a /<database> path segment");
+    let new_url = format!("{prefix}/{db_name}");
+
+    let mut conn = AsyncPgConnection::establish(&new_url)
+        .await
+        .expect("connect to ephemeral database");
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
+        .await
+        .expect("apply migration bundle to ephemeral database");
+    new_url
 }
 
 async fn connect(url: &str) -> AsyncPgConnection {
