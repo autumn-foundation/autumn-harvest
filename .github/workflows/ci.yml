@@ -249,6 +249,34 @@ jobs:
       - name: Build quickstart
         run: cargo build -p quickstart
 
+  scaffold-smoke:
+    name: Scaffold builds (harvest new)
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Scaffold a project with `harvest new`
+        run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
+      - name: Redirect deps to the in-workspace (unpublished) crates
+        # The scaffold pins crates.io `autumn-harvest = "0.4"`; the in-workspace
+        # crates are 0.4.0, so `[patch.crates-io]` applies cleanly and the build
+        # tests the UNPUBLISHED trunk-dev API (the honest scaffold-rot guard).
+        run: |
+          cat >> "${RUNNER_TEMP}/scaffold/Cargo.toml" <<EOF
+
+          [patch.crates-io]
+          autumn-harvest = { path = "${GITHUB_WORKSPACE}/autumn-harvest" }
+          autumn-harvest-plugin = { path = "${GITHUB_WORKSPACE}/autumn-harvest-plugin" }
+          EOF
+      - name: Build the scaffolded project
+        run: cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml"
+
   msrv:
     name: MSRV (1.88.0)
     needs: changes
