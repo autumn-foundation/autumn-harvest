@@ -809,6 +809,40 @@ let results = ctx.execute_activity_fan_out_raw(vec![
 
 See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all three shapes (static N, dynamic N from a prior activity, and collect-all with partial failure).
 
+### External Workflow Family — signal / cancel / await
+
+`WorkflowContext` exposes three verbs for a running workflow to interact with an **arbitrary, independently-started sibling** execution by `ExecutionId` (no parent/child linkage required). All three are deterministic and replay-safe, resolve same-shard inline (in the caller's persist transaction) or cross-shard via a background outbox (mirroring each other, no cross-shard transaction), and lower onto append-only `WorkflowEvent` variants (no migration):
+
+| Verb | Method | Already-terminal target | Payload | Effect on target |
+|---|---|---|---|---|
+| **signal** (#244) | `ctx.signal_external_workflow(target, name, payload)` | `ExternalSignalFailed { target_terminal }` (a terminal run can't receive) | Yes | Delivers a signal |
+| **cancel** (#492) | `ctx.request_cancel_external_workflow(target)` | **no-op success** (goal met) | No | Cancels the run |
+| **await** (#757) | `ctx.await_external_workflow::<T>(target)` / `await_external_workflow_value(target)` | resolves with the recorded **outcome** | No | **none** (observe-only) |
+
+**`await` (issue #757)** durably blocks until `target` reaches a terminal state, then hands back its typed result or terminal cause:
+
+```rust
+// Fan-in coordinator: await three independently-started legs by id (one line each).
+let a: LegResult = ctx.await_external_workflow(leg_a).await.map_err(|e| e.to_string())?;
+let b: LegResult = ctx.await_external_workflow(leg_b).await.map_err(|e| e.to_string())?;
+// Branch on a leg's TYPED terminal cause (an outcome, not a transport error):
+let c_total = match ctx.await_external_workflow::<LegResult>(leg_c).await {
+    Ok(c) => c.total,
+    Err(e) if e.workflow_error_type() == Some("RegionUnavailable") => 0,
+    Err(e) => return Err(format!("leg C failed fatally: {e}")),
+};
+```
+
+**Semantics** (the key differences from `cancel`):
+- Target `COMPLETED` → resolves with the **deserialized output** (`await_external_workflow_value` returns the raw `Value`).
+- Target `FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED` → returns a typed `Err` carrying the target's terminal cause as an **outcome** (not a transport error). A `FAILED` target surfaces as `HarvestError::WorkflowFailed { name: "external-workflow:{target}", .. }` — the SAME typed error a failed child surfaces as (issue #767), so `err.workflow_error_type()` / `workflow_details()` / `is_workflow_non_retryable()` are all readable. Other terminal states surface with `reason_code` = `target_timed_out`/`target_cancelled`/`target_terminated` in the message.
+- Target `RUNNING`/`PAUSED` → the caller parks durably and resolves within **one outbox poll interval** after the target reaches any terminal state.
+- **Self-await** (`target == own ExecutionId`) → immediate `HarvestError::ExternalAwaitFailed { reason_code: "self_await" }` — records no history (nil-UUID sentinel).
+- **Unknown target** still unknown after the configured grace window → `HarvestError::ExternalAwaitFailed { reason_code: "target_unknown" }` (transport failure, distinct from the terminal-cause outcomes above; `err.external_await_reason_code()` reads it).
+- **Observe-only**: awaiting NEVER establishes parent/child linkage, cancels, triggers `ParentClosePolicy`, or has any lifecycle effect on the target.
+
+**Determinism**: the resolved value/error is frozen into the AWAITER's own history via the three new append-only events `ExternalAwaitRequested` / `ExternalAwaitResolved { output }` / `ExternalAwaitFailed { reason_code, message?, error_type?, details?, non_retryable? }` (at the END of the enum — pre-upgrade histories deserialize/replay unchanged). `HistoryMatcher::match_external_await(target)` matches them (`Matched { output }` carries the real output value); a divergent target surfaces as `HarvestError::NonDeterministic` / `NonDeterminismKind::ExternalAwaitMismatch`. Implementation mirrors the cancel primitive: `ExternalAwaitId` newtype, `WorkflowCommand::AwaitExternalWorkflow` via `SignalBatchItem::Await`, `persist_external_signal_inline` Await arm (same-shard inline via `execution::read_external_await_outcome`, which follows a `CONTINUED_AS_NEW` chain to the true terminal), and `timeout::enforce_external_awaits_outbox` (cross-shard + still-running resolution). See `autumn-harvest/examples/await_external_workflow.rs`.
+
 ### Fan-out / Parallel Child Workflows
 
 `WorkflowContext` exposes the same fan-out shape for **child workflows** (issue #601) — the missing sibling to activity fan-out for sub-orchestrations that need their own durable history rather than a single unit of I/O work. All N children are scheduled (each gets its own `ExecutionId` on the parent's shard, per the existing child-spawn shard-pinning contract) before any is awaited — genuinely concurrent, not a sequential `spawn_child_workflow` loop.
