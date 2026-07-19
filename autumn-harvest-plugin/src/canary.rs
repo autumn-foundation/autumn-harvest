@@ -48,6 +48,27 @@ const MAX_DERIVED_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 365 *
 /// `GET /admin/canary` read can always see the last recorded success.
 const RETENTION_FLOOR: Duration = Duration::from_secs(60 * 60);
 
+/// Minimum wall-clock a *healthy* probe needs to reach terminal completion:
+/// one dispatched activity, a full `ctx.timer("probe", 1)` (a whole-second
+/// durable timer armed **after** the activity completes), plus two workflow-task
+/// wakeups and the activity dispatch. That floor is strictly greater than 1s, so
+/// a `per_probe_timeout` at or below it would deterministically time out a
+/// perfectly healthy pipeline and report a permanent `harvest.canary.failure`
+/// (issue #796, AC6). `PROBE_MIN_RUNTIME` is a safe floor above that cost, so
+/// `per_probe_timeout` is never allowed below it.
+const PROBE_MIN_RUNTIME: Duration = Duration::from_secs(5);
+
+/// Minimum probe interval (issue #796, AC6).
+///
+/// A valid probe needs `per_probe_timeout` in
+/// `[PROBE_MIN_RUNTIME, interval - 1s]` — strictly below the interval so a
+/// wedged probe times out before the next tick (AC6, non-blocking), yet at least
+/// `PROBE_MIN_RUNTIME` so a healthy probe never false-fails. That band is only
+/// non-empty when `interval >= PROBE_MIN_RUNTIME + 1s`; this adds a little margin
+/// above that hard minimum. Intervals below this are clamped up (with a warning)
+/// rather than silently producing a false-failing probe.
+const MIN_CANARY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Opt-in configuration for the built-in synthetic liveness canary (issue #796).
 ///
 /// Passed to [`crate::plugin::HarvestPlugin::synthetic_canary`]. Absent (the
@@ -55,9 +76,11 @@ const RETENTION_FLOOR: Duration = Duration::from_secs(60 * 60);
 /// identical (AC1).
 #[derive(Clone, Debug)]
 pub struct CanaryConfig {
-    /// How often each queue's probe fires. Should be comfortably larger than
-    /// the probe's own work (one dispatched activity + a 1s durable timer) —
-    /// a few seconds at minimum, tens of seconds recommended.
+    /// How often each queue's probe fires. Must be comfortably larger than the
+    /// probe's own minimum runtime (`PROBE_MIN_RUNTIME`, a dispatched activity +
+    /// a 1s durable timer + task wakeups). The hard minimum is
+    /// [`MIN_CANARY_INTERVAL`] (intervals below it are clamped up with a
+    /// warning); **30s is recommended**. See [`Self::new`].
     interval: Duration,
     /// Probe queues. Defaults to `["default"]`; one canary workflow +
     /// schedule is registered per queue so a single wedged worker pool is
@@ -65,8 +88,10 @@ pub struct CanaryConfig {
     queues: Vec<String>,
     /// Per-probe execution timeout (`execution_timeout` → `deadline_at`). A
     /// wedged probe times out before the next tick, so probes never block
-    /// (AC6). Defaults to a fraction of `interval`, strictly below it where
-    /// the granularity allows.
+    /// (AC6). Always kept in `[PROBE_MIN_RUNTIME, interval - 1s]` — above the
+    /// probe's own minimum runtime so a healthy probe never false-fails, and
+    /// strictly below `interval` so a wedged probe times out before the next
+    /// tick. Defaults to ~half the interval, clamped into that band.
     per_probe_timeout: Duration,
     /// Window after which a missing success is considered stale (AC7). `None`
     /// resolves to `2 × interval` via [`Self::effective_staleness_window`].
@@ -80,10 +105,27 @@ pub struct CanaryConfig {
 
 impl CanaryConfig {
     /// Create a canary config firing every `interval`, probing the `"default"`
-    /// queue, with a derived per-probe timeout strictly below `interval`
-    /// (clamped to at least 1s), and `None` (auto) staleness/retention.
+    /// queue, with a derived per-probe timeout in
+    /// `[PROBE_MIN_RUNTIME, interval - 1s]`, and `None` (auto)
+    /// staleness/retention.
+    ///
+    /// `interval` below [`MIN_CANARY_INTERVAL`] is **clamped up** (with a
+    /// warning) rather than accepted — a too-small interval would derive a
+    /// `per_probe_timeout` at or below the probe's own minimum runtime and
+    /// false-fail a healthy pipeline (issue #796, AC6). **30s is recommended.**
     #[must_use]
     pub fn new(interval: Duration) -> Self {
+        let interval = if interval < MIN_CANARY_INTERVAL {
+            tracing::warn!(
+                requested_secs = interval.as_secs(),
+                min_secs = MIN_CANARY_INTERVAL.as_secs(),
+                "synthetic liveness canary interval below the minimum; clamping up so a \
+                 healthy probe cannot false-fail its per-probe timeout (issue #796)"
+            );
+            MIN_CANARY_INTERVAL
+        } else {
+            interval
+        };
         Self {
             interval,
             queues: vec!["default".to_string()],
@@ -93,12 +135,23 @@ impl CanaryConfig {
         }
     }
 
-    /// Derive a per-probe timeout strictly below `interval` where the
-    /// whole-second granularity allows, clamped to at least 1s (AC6).
+    /// Clamp a per-probe timeout into the valid band `[PROBE_MIN_RUNTIME,
+    /// interval - 1s]`: strictly below `interval` so a wedged probe times out
+    /// before the next tick (AC6), yet at least `PROBE_MIN_RUNTIME` so a healthy
+    /// probe never false-fails. `interval` is always `>= MIN_CANARY_INTERVAL`
+    /// (clamped in [`Self::new`]), so `interval - 1s >= PROBE_MIN_RUNTIME` and
+    /// the band is never empty.
+    fn clamp_per_probe_timeout(interval: Duration, timeout: Duration) -> Duration {
+        let max = interval
+            .saturating_sub(Duration::from_secs(1))
+            .max(PROBE_MIN_RUNTIME);
+        timeout.clamp(PROBE_MIN_RUNTIME, max)
+    }
+
+    /// Derive a per-probe timeout at ~half the interval, clamped into the valid
+    /// `[PROBE_MIN_RUNTIME, interval - 1s]` band (AC6).
     fn derive_per_probe_timeout(interval: Duration) -> Duration {
-        (interval / 2)
-            .min(interval.saturating_sub(Duration::from_secs(1)))
-            .max(Duration::from_secs(1))
+        Self::clamp_per_probe_timeout(interval, interval / 2)
     }
 
     /// Replace the probe queue set (AC3).
@@ -116,9 +169,25 @@ impl CanaryConfig {
     }
 
     /// Override the per-probe execution timeout (AC6).
+    ///
+    /// Clamped into `[PROBE_MIN_RUNTIME, interval - 1s]` (with a warning when
+    /// out of range) so an operator cannot accidentally set a value that
+    /// false-fails a healthy probe (`< PROBE_MIN_RUNTIME`, e.g. `0`) or that is
+    /// at/above the interval (which would let a wedged probe block the next
+    /// tick — AC6).
     #[must_use]
-    pub const fn with_per_probe_timeout(mut self, timeout: Duration) -> Self {
-        self.per_probe_timeout = timeout;
+    pub fn with_per_probe_timeout(mut self, timeout: Duration) -> Self {
+        let clamped = Self::clamp_per_probe_timeout(self.interval, timeout);
+        if clamped != timeout {
+            tracing::warn!(
+                requested_secs = timeout.as_secs(),
+                clamped_secs = clamped.as_secs(),
+                interval_secs = self.interval.as_secs(),
+                "synthetic liveness canary per-probe timeout out of range; clamped into \
+                 [probe-min-runtime, interval - 1s] (issue #796)"
+            );
+        }
+        self.per_probe_timeout = clamped;
         self
     }
 
@@ -798,9 +867,10 @@ mod tests {
         // AC3: default probes the "default" queue.
         assert_eq!(cfg.queues(), &["default".to_string()]);
         assert_eq!(cfg.interval(), Duration::from_secs(30));
-        // AC6: per-probe timeout strictly below interval.
+        // AC6: per-probe timeout in [PROBE_MIN_RUNTIME, interval - 1s].
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(15));
         assert!(cfg.per_probe_timeout() < cfg.interval());
-        assert!(cfg.per_probe_timeout() >= Duration::from_secs(1));
+        assert!(cfg.per_probe_timeout() >= PROBE_MIN_RUNTIME);
         // AC7: default staleness window is 2 × interval.
         assert_eq!(cfg.effective_staleness_window(), Duration::from_secs(60));
         // AC9: retention floor must EXCEED the staleness window.
@@ -808,15 +878,43 @@ mod tests {
     }
 
     #[test]
-    fn per_probe_timeout_is_at_least_one_second_for_tiny_intervals() {
-        // A 1s interval cannot yield a strictly-smaller whole-second timeout;
-        // the floor is 1s.
-        let cfg = CanaryConfig::new(Duration::from_secs(1));
-        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(1));
-        // A 2s interval yields a strictly-smaller 1s timeout.
+    fn tiny_interval_is_clamped_up_and_yields_a_healthy_per_probe_timeout() {
+        // A 2s interval is below MIN_CANARY_INTERVAL, so it is clamped up. The
+        // derived per-probe timeout then lands in [PROBE_MIN_RUNTIME,
+        // interval - 1s] — never at/below the probe's own minimum runtime,
+        // which would false-fail a healthy pipeline (AC6).
         let cfg = CanaryConfig::new(Duration::from_secs(2));
-        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(1));
+        assert_eq!(cfg.interval(), MIN_CANARY_INTERVAL);
+        assert!(cfg.per_probe_timeout() >= PROBE_MIN_RUNTIME);
         assert!(cfg.per_probe_timeout() < cfg.interval());
+        assert!(cfg.per_probe_timeout() <= cfg.interval() - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn recommended_interval_yields_a_sensible_per_probe_timeout() {
+        // 30s (the recommended interval) yields ~half the interval, well within
+        // [PROBE_MIN_RUNTIME, interval - 1s] and strictly below the interval.
+        let cfg = CanaryConfig::new(Duration::from_secs(30));
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(15));
+        assert!(cfg.per_probe_timeout() < Duration::from_secs(30));
+        assert!(cfg.per_probe_timeout() >= PROBE_MIN_RUNTIME);
+    }
+
+    #[test]
+    fn with_per_probe_timeout_clamps_out_of_range_values() {
+        // Zero (would false-fail every probe) is floored to PROBE_MIN_RUNTIME.
+        let cfg = CanaryConfig::new(Duration::from_secs(30)).with_per_probe_timeout(Duration::ZERO);
+        assert_eq!(cfg.per_probe_timeout(), PROBE_MIN_RUNTIME);
+        // A value at/above the interval (would let a wedged probe block the next
+        // tick) is clamped strictly below the interval.
+        let cfg = CanaryConfig::new(Duration::from_secs(30))
+            .with_per_probe_timeout(Duration::from_secs(30));
+        assert!(cfg.per_probe_timeout() < Duration::from_secs(30));
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(29));
+        // An in-range value is preserved verbatim.
+        let cfg = CanaryConfig::new(Duration::from_secs(30))
+            .with_per_probe_timeout(Duration::from_secs(12));
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(12));
     }
 
     #[test]
@@ -824,11 +922,12 @@ mod tests {
         let cfg = CanaryConfig::new(Duration::from_secs(10))
             .with_queues(vec!["email".to_string(), "sms".to_string()])
             .with_queue("priority".to_string())
-            .with_per_probe_timeout(Duration::from_secs(4))
+            .with_per_probe_timeout(Duration::from_secs(6))
             .with_staleness_window(Duration::from_secs(120))
             .with_retention(Duration::from_secs(7200));
         assert_eq!(cfg.queues(), &["email", "sms", "priority"]);
-        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(4));
+        // 6s is within [PROBE_MIN_RUNTIME=5s, interval-1s=9s] for interval=10s.
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(6));
         assert_eq!(cfg.effective_staleness_window(), Duration::from_secs(120));
         assert_eq!(cfg.effective_retention(), Duration::from_secs(7200));
     }
