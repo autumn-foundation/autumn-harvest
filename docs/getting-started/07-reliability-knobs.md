@@ -257,18 +257,22 @@ HarvestBuilder::new()
     .build();
 ```
 
-The ceiling-as-default is applied at every **origin** start path — the plain
+The ceiling-as-default is applied at these **origin** start paths: the plain
 HTTP `POST /workflows/{name}/start`, signal-with-start, update-with-start, batch
-start, trigger-now, workflow backfill, the scheduler tick, and
-debounce/throttle/batch deferred starts. (It is deliberately not applied on the
-CAN/retry/reset paths, which carry or re-anchor the chain deadline by their own
-rules above.) A few non-primary start paths currently pass no chain cap and are
-therefore uncapped by the fleet-wide default: the completion-trigger / cross-shard
-outbox start paths, the Vantage UI manual schedule trigger, and the **typed Rust
-client stub's** `signal_with_start` / `update_with_start` (its `start` /
-`start_with_options` methods do apply the cap). For those, declare the cap on the
-workflow type with `#[workflow(chain_execution_timeout = "…")]`, or trigger via
-the HTTP route.
+start, trigger-now, workflow backfill, the scheduler tick (including its
+**buffered** overlap-policy fires), and debounce/throttle/batch deferred starts.
+(It is deliberately not applied on the CAN/retry/reset paths, which carry or
+re-anchor the chain deadline by their own rules above.)
+
+A few remaining origin start paths currently pass **no** chain cap and are
+therefore **not** covered by the fleet-wide default — a documented limitation,
+parity-consistent with their per-run `execution_timeout`-ceiling treatment (they
+thread neither ceiling): **completion-trigger** starts, the **Vantage UI manual
+schedule trigger**, the **webhook cross-shard outbox**, and **webhook-subscription**
+starts. The **typed Rust client stub's** `signal_with_start` / `update_with_start`
+are also uncovered (its `start` / `start_with_options` methods do apply the cap).
+For any of these, declare the cap on the workflow type with
+`#[workflow(chain_execution_timeout = "…")]`, or start via the HTTP route.
 
 **Absolute wall-clock — not shifted by pause.** Unlike `deadline_at` /
 `sla_deadline_at` (which resume pushes forward by the paused span),

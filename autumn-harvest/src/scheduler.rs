@@ -5069,10 +5069,19 @@ async fn drain_buffered_schedule_runs(
                     conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
-                    // Mirror the per-run `execution_timeout: None` at this buffered
-                    // fire site (issue #617).
-                    chain_execution_timeout: None,
-                    max_workflow_chain_timeout_ceiling: None,
+                    // Chain-scoped lifetime cap (issue #617): carry the
+                    // workflow-type default AND the fleet-wide chain ceiling (via
+                    // the registry, since the core scheduler has no api_state) so a
+                    // BUFFERED continue-as-new chain is capped even when the
+                    // workflow under-specifies (AC4) — IDENTICAL to the tick-direct
+                    // start path above, and consistent with this site's own
+                    // throttled sibling.
+                    chain_execution_timeout: wf_info
+                        .and_then(|info| info.chain_execution_timeout)
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    max_workflow_chain_timeout_ceiling: registry
+                        .max_workflow_chain_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
