@@ -11,8 +11,14 @@
 //! which validates code changes by replaying histories — this reports the
 //! running pipeline's liveness.
 //!
-//! These tests require Docker/testcontainers and are compile-checked in
+//! These tests use testcontainers by default, and are compile-checked in
 //! sandboxes without a Docker daemon (matching the #543/#544/#601 precedent).
+//! For a Docker-less run against a local Postgres, set
+//! `HARVEST_TEST_DATABASE_URL` to a base (migrated or empty) database whose role
+//! can `CREATE DATABASE`; each `setup_single_shard()` call then provisions a
+//! fresh, uniquely-named, migrated database, preserving the per-test isolation
+//! the testcontainers path gives (these tests assert on global `(queue, shard)`
+//! success/failure aggregates, so they cannot share a database).
 
 use std::time::Duration;
 
@@ -46,7 +52,10 @@ fn init_sql() -> Vec<u8> {
 
 type HarvestApiApp = axum::Router;
 
-async fn setup_single_shard() -> (String, ContainerAsync<Postgres>) {
+async fn setup_single_shard() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (provision_ephemeral_db(&base_url).await, None);
+    }
     let container = Postgres::default()
         .with_init_sql(init_sql())
         .with_tag("16")
@@ -56,7 +65,36 @@ async fn setup_single_shard() -> (String, ContainerAsync<Postgres>) {
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, container)
+    (url, Some(container))
+}
+
+/// Provision a fresh, uniquely-named, migrated database off `base_url`, giving
+/// each test the same per-test isolation the testcontainers path provides. The
+/// base role must be able to `CREATE DATABASE`.
+async fn provision_ephemeral_db(base_url: &str) -> String {
+    use diesel_async::SimpleAsyncConnection;
+
+    let db_name = format!("harvest_canary_{}", Uuid::new_v4().simple());
+    let mut admin = <AsyncPgConnection as AsyncConnection>::establish(base_url)
+        .await
+        .expect("connect to base database");
+    diesel::sql_query(format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&mut admin)
+        .await
+        .expect("create ephemeral database");
+
+    let (prefix, _old_db) = base_url
+        .rsplit_once('/')
+        .expect("base url must carry a /<database> path segment");
+    let new_url = format!("{prefix}/{db_name}");
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&new_url)
+        .await
+        .expect("connect to ephemeral database");
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
+        .await
+        .expect("apply migration bundle to ephemeral database");
+    new_url
 }
 
 fn build_pool(url: &str) -> DbPool {
