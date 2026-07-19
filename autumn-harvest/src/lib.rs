@@ -288,7 +288,7 @@ pub use completion_trigger::{
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
 };
 pub use context::{
-    ActivityContext, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
+    ActivityContext, AutoHeartbeatGuard, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
     DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder,
     RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand,
     WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,

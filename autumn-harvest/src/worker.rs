@@ -8003,6 +8003,9 @@ async fn process_activity_task(
     )
     .with_trace_context(trace_carrier.clone())
     .with_context_headers(activity_context_headers)
+    // Issue #682: surface the activity's heartbeat timeout so a handler can
+    // opt into `ctx.start_auto_heartbeat_default()`.
+    .with_heartbeat_timeout_opt(task.heartbeat_timeout.and_then(|d| d.to_std().ok()))
     .with_metrics(registry.telemetry().metrics.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task))
