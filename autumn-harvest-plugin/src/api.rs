@@ -4430,6 +4430,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(effective_config).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/canary",
+            get(admin_canary).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/version-gates/usage",
             get(version_usage).route_layer(require_admin.clone()),
         )
@@ -5385,6 +5389,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/shards/health"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
+        ("GET", "/admin/canary"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -6512,6 +6517,21 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/admin/canary",
+            // `probes[]` entries carry queue/shard/last_success_at/
+            // age_of_last_success_secs/last_roundtrip_ms/success_count/
+            // failure_count/stale — nested, documented in the contract
+            // description; this list is top-level fields only.
+            Some(&[
+                "status",
+                "as_of",
+                "staleness_window_secs",
+                "probes",
+                "unavailable_shards",
+            ]),
+        ),
+        (
+            "GET",
             "/admin/version-gates/usage",
             Some(&["status", "observed_at", "filters", "items", "shards"]),
         ),
@@ -7049,6 +7069,26 @@ async fn effective_config(
         ))
     })?;
     Ok(Json(view))
+}
+
+/// `GET /admin/canary` — synthetic liveness canary freshness report (issue #796).
+///
+/// Read-only and admin-gated. Reports, per `(queue, shard)`, the age of the
+/// most recent COMPLETED built-in probe run so an operator (or a staleness
+/// alert) can tell a live pipeline from a wedged one — a stale probe means
+/// workers on that queue/shard are polling but never completing, the scheduler
+/// tick stalled, or the shard is write-blocked. Fans out across every writable
+/// shard; an unreachable shard is named in `unavailable_shards` and drops
+/// `status` to `partial`/`unavailable` rather than failing the call wholesale.
+/// When the canary is disabled an empty `complete` report is returned.
+///
+/// **Distinct from the #512 replay canary** (`POST /admin/workflows/replay-canary`),
+/// which validates *code changes* by replaying histories — this reports the
+/// *running pipeline*'s liveness.
+async fn admin_canary(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Json<crate::canary::CanaryReport> {
+    Json(crate::canary::build_canary_report_from_shards(&api_state).await)
 }
 
 async fn version_usage(
