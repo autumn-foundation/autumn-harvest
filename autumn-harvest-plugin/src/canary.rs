@@ -253,17 +253,17 @@ impl CanaryConfig {
         let floor = staleness.saturating_mul(2).max(RETENTION_FLOOR);
         let raw = self.retention.unwrap_or(floor);
         let floored = raw.max(floor);
-        if let Some(explicit) = self.retention {
-            if floored != explicit {
-                tracing::warn!(
-                    requested_secs = explicit.as_secs(),
-                    floored_secs = floored.as_secs(),
-                    staleness_window_secs = staleness.as_secs(),
-                    "synthetic liveness canary retention below the staleness-derived floor; \
-                     raised so a GET /admin/canary read can always see the last recorded \
-                     success (issue #796, AC9)"
-                );
-            }
+        if let Some(explicit) = self.retention
+            && floored != explicit
+        {
+            tracing::warn!(
+                requested_secs = explicit.as_secs(),
+                floored_secs = floored.as_secs(),
+                staleness_window_secs = staleness.as_secs(),
+                "synthetic liveness canary retention below the staleness-derived floor; \
+                 raised so a GET /admin/canary read can always see the last recorded \
+                 success (issue #796, AC9)"
+            );
         }
         floored.clamp(Duration::from_secs(1), MAX_DERIVED_RETENTION)
     }
@@ -915,7 +915,13 @@ mod tests {
         assert_eq!(cfg.interval(), MIN_CANARY_INTERVAL);
         assert!(cfg.per_probe_timeout() >= PROBE_MIN_RUNTIME);
         assert!(cfg.per_probe_timeout() < cfg.interval());
-        assert!(cfg.per_probe_timeout() <= cfg.interval() - Duration::from_secs(1));
+        assert!(
+            cfg.per_probe_timeout()
+                <= cfg
+                    .interval()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("interval is clamped >= MIN_CANARY_INTERVAL")
+        );
     }
 
     #[test]
