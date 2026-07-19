@@ -8909,3 +8909,87 @@ mod token_bootstrap_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod scaffold_new_tests {
+    //! Unit tests for the `harvest new` scaffold (issue #692): clap parsing of
+    //! the `New` variant and the name-derivation / keyword-rejection helpers.
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    #[test]
+    fn new_parses_name_and_flags() {
+        let cli = parse(&[
+            "new",
+            "orders",
+            "--force",
+            "--template",
+            "minimal",
+            "--path",
+            "/tmp/x",
+        ]);
+        match cli.command {
+            Commands::New {
+                name,
+                path,
+                force,
+                template,
+            } => {
+                assert_eq!(name, "orders");
+                assert_eq!(path, Some(PathBuf::from("/tmp/x")));
+                assert!(force);
+                assert_eq!(template, ScaffoldTemplate::Minimal);
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_defaults_no_path_no_force_minimal_template() {
+        let cli = parse(&["new", "orders"]);
+        match cli.command {
+            Commands::New {
+                name,
+                path,
+                force,
+                template,
+            } => {
+                assert_eq!(name, "orders");
+                assert_eq!(path, None);
+                assert!(!force);
+                assert_eq!(template, ScaffoldTemplate::Minimal);
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_crate_ident_hyphens_to_underscores() {
+        assert_eq!(derive_crate_ident("my-app"), "my_app");
+        assert_eq!(derive_crate_ident("plain"), "plain");
+    }
+
+    #[test]
+    fn keyword_names_are_rejected() {
+        for kw in ["fn", "match", "async", "type", "move", "struct"] {
+            assert!(
+                validate_project_name(kw).is_err(),
+                "keyword {kw:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_names_pass_validation() {
+        for ok in ["orders", "my-app", "app2", "a"] {
+            assert!(
+                validate_project_name(ok).is_ok(),
+                "{ok:?} should be a valid name"
+            );
+        }
+    }
+}
