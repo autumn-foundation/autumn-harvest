@@ -423,6 +423,11 @@ pub struct HarvestApiState {
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Starter defaults; overridable per deployment via the plugin builder.
     status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
+    /// Built-in synthetic liveness canary configuration (issue #796), mirrored
+    /// from the plugin builder at startup so the (follow-up) `GET /admin/canary`
+    /// read model can resolve the probe interval / staleness window. `None`
+    /// when the canary is disabled.
+    canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
 }
 
 impl Default for HarvestApiState {
@@ -472,6 +477,7 @@ impl Default for HarvestApiState {
             status_thresholds: Arc::new(Mutex::new(
                 crate::status_summary::StatusThresholds::default(),
             )),
+            canary_config: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -676,6 +682,33 @@ impl HarvestApiState {
     #[must_use]
     pub fn status_thresholds(&self) -> crate::status_summary::StatusThresholds {
         self.status_thresholds
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
+    }
+
+    /// Mirror the built-in synthetic liveness canary configuration (issue #796)
+    /// from the plugin builder at startup. `None` disables the canary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_canary_config(&self, config: Option<crate::canary::CanaryConfig>) {
+        *self
+            .canary_config
+            .lock()
+            .expect("harvest api state lock poisoned") = config;
+    }
+
+    /// The mirrored synthetic liveness canary configuration, if enabled
+    /// (issue #796).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn canary_config(&self) -> Option<crate::canary::CanaryConfig> {
+        self.canary_config
             .lock()
             .expect("harvest api state lock poisoned")
             .clone()

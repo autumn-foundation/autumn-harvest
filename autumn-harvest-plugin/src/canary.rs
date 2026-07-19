@@ -25,6 +25,152 @@ use std::time::Duration;
 
 use autumn_harvest::prelude::*;
 
+/// Upper bound on any derived (or user-supplied) retention age, kept safely
+/// below the core `RetentionConfig` validator's 10-year ceiling so a
+/// pathologically large probe interval can never fail `try_build()`
+/// (issue #796, AC9). Realistic canary intervals are seconds-to-minutes; this
+/// clamp is purely defensive.
+const MAX_DERIVED_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+
+/// One hour — the floor for the aggressive self-cleaning retention window, and
+/// the fallback when the derived staleness-based value would be smaller
+/// (issue #796, AC9). The floor must exceed the staleness window so a
+/// `GET /admin/canary` read can always see the last recorded success.
+const RETENTION_FLOOR: Duration = Duration::from_secs(60 * 60);
+
+/// Opt-in configuration for the built-in synthetic liveness canary (issue #796).
+///
+/// Passed to [`crate::plugin::HarvestPlugin::synthetic_canary`]. Absent (the
+/// plugin default), the canary is entirely off and the runtime is byte-for-byte
+/// identical (AC1).
+#[derive(Clone, Debug)]
+pub struct CanaryConfig {
+    /// How often each queue's probe fires. Should be comfortably larger than
+    /// the probe's own work (one dispatched activity + a 1s durable timer) —
+    /// a few seconds at minimum, tens of seconds recommended.
+    interval: Duration,
+    /// Probe queues. Defaults to `["default"]`; one canary workflow +
+    /// schedule is registered per queue so a single wedged worker pool is
+    /// distinguishable from "some queue is draining" (AC3).
+    queues: Vec<String>,
+    /// Per-probe execution timeout (`execution_timeout` → `deadline_at`). A
+    /// wedged probe times out before the next tick, so probes never block
+    /// (AC6). Defaults to a fraction of `interval`, strictly below it where
+    /// the granularity allows.
+    per_probe_timeout: Duration,
+    /// Window after which a missing success is considered stale (AC7). `None`
+    /// resolves to `2 × interval` via [`Self::effective_staleness_window`].
+    staleness_window: Option<Duration>,
+    /// How long a completed canary run's history is retained before the
+    /// janitor self-cleans it (AC9). `None` resolves via
+    /// [`Self::effective_retention`] to a value that always exceeds the
+    /// staleness window.
+    retention: Option<Duration>,
+}
+
+impl CanaryConfig {
+    /// Create a canary config firing every `interval`, probing the `"default"`
+    /// queue, with a derived per-probe timeout strictly below `interval`
+    /// (clamped to at least 1s), and `None` (auto) staleness/retention.
+    #[must_use]
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            queues: vec!["default".to_string()],
+            per_probe_timeout: Self::derive_per_probe_timeout(interval),
+            staleness_window: None,
+            retention: None,
+        }
+    }
+
+    /// Derive a per-probe timeout strictly below `interval` where the
+    /// whole-second granularity allows, clamped to at least 1s (AC6).
+    fn derive_per_probe_timeout(interval: Duration) -> Duration {
+        (interval / 2)
+            .min(interval.saturating_sub(Duration::from_secs(1)))
+            .max(Duration::from_secs(1))
+    }
+
+    /// Replace the probe queue set (AC3).
+    #[must_use]
+    pub fn with_queues(mut self, queues: Vec<String>) -> Self {
+        self.queues = queues;
+        self
+    }
+
+    /// Add a single probe queue.
+    #[must_use]
+    pub fn with_queue(mut self, queue: String) -> Self {
+        self.queues.push(queue);
+        self
+    }
+
+    /// Override the per-probe execution timeout (AC6).
+    #[must_use]
+    pub const fn with_per_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.per_probe_timeout = timeout;
+        self
+    }
+
+    /// Override the staleness window (AC7). Default: `2 × interval`.
+    #[must_use]
+    pub const fn with_staleness_window(mut self, window: Duration) -> Self {
+        self.staleness_window = Some(window);
+        self
+    }
+
+    /// Override the canary-history retention window (AC9). Clamped to a sane
+    /// range at read time so it can never fail `try_build()`.
+    #[must_use]
+    pub const fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+
+    /// The configured probe interval.
+    #[must_use]
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// The configured probe queues.
+    #[must_use]
+    pub fn queues(&self) -> &[String] {
+        &self.queues
+    }
+
+    /// The configured per-probe execution timeout.
+    #[must_use]
+    pub const fn per_probe_timeout(&self) -> Duration {
+        self.per_probe_timeout
+    }
+
+    /// The effective staleness window: the override if set, else `2 × interval`
+    /// (AC7).
+    #[must_use]
+    pub fn effective_staleness_window(&self) -> Duration {
+        self.staleness_window
+            .unwrap_or_else(|| self.interval.saturating_mul(2))
+    }
+
+    /// The effective canary-history retention window (AC9).
+    ///
+    /// The override if set, else `max(2 × staleness_window, 1h)` — always
+    /// exceeding the staleness window so a `GET /admin/canary` read can still
+    /// see the last recorded success. The result is clamped to
+    /// `[1s, MAX_DERIVED_RETENTION]` so it is always within the core
+    /// `RetentionConfig` validator's bounds and can never fail `try_build()`.
+    #[must_use]
+    pub fn effective_retention(&self) -> Duration {
+        let raw = self.retention.unwrap_or_else(|| {
+            self.effective_staleness_window()
+                .saturating_mul(2)
+                .max(RETENTION_FLOOR)
+        });
+        raw.clamp(Duration::from_secs(1), MAX_DERIVED_RETENTION)
+    }
+}
+
 /// Handler for the built-in synthetic liveness canary workflow (issue #796).
 ///
 /// Exercises the full live execution path: dispatch one **non-local** activity
@@ -167,5 +313,58 @@ mod tests {
         // AC2: must be a dispatched activity, never a local (inline) one.
         assert!(!info.is_local);
         assert_eq!(info.default_start_to_close, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn config_defaults() {
+        let cfg = CanaryConfig::new(Duration::from_secs(30));
+        // AC3: default probes the "default" queue.
+        assert_eq!(cfg.queues(), &["default".to_string()]);
+        assert_eq!(cfg.interval(), Duration::from_secs(30));
+        // AC6: per-probe timeout strictly below interval.
+        assert!(cfg.per_probe_timeout() < cfg.interval());
+        assert!(cfg.per_probe_timeout() >= Duration::from_secs(1));
+        // AC7: default staleness window is 2 × interval.
+        assert_eq!(cfg.effective_staleness_window(), Duration::from_secs(60));
+        // AC9: retention floor must EXCEED the staleness window.
+        assert!(cfg.effective_retention() > cfg.effective_staleness_window());
+    }
+
+    #[test]
+    fn per_probe_timeout_is_at_least_one_second_for_tiny_intervals() {
+        // A 1s interval cannot yield a strictly-smaller whole-second timeout;
+        // the floor is 1s.
+        let cfg = CanaryConfig::new(Duration::from_secs(1));
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(1));
+        // A 2s interval yields a strictly-smaller 1s timeout.
+        let cfg = CanaryConfig::new(Duration::from_secs(2));
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(1));
+        assert!(cfg.per_probe_timeout() < cfg.interval());
+    }
+
+    #[test]
+    fn config_builders_override_defaults() {
+        let cfg = CanaryConfig::new(Duration::from_secs(10))
+            .with_queues(vec!["email".to_string(), "sms".to_string()])
+            .with_queue("priority".to_string())
+            .with_per_probe_timeout(Duration::from_secs(4))
+            .with_staleness_window(Duration::from_secs(120))
+            .with_retention(Duration::from_secs(7200));
+        assert_eq!(cfg.queues(), &["email", "sms", "priority"]);
+        assert_eq!(cfg.per_probe_timeout(), Duration::from_secs(4));
+        assert_eq!(cfg.effective_staleness_window(), Duration::from_secs(120));
+        assert_eq!(cfg.effective_retention(), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn effective_retention_is_clamped_within_validator_bounds() {
+        // A huge interval would derive a retention above the 10-year ceiling;
+        // it must clamp so try_build() cannot fail (AC9).
+        let cfg = CanaryConfig::new(MAX_DERIVED_RETENTION);
+        assert!(cfg.effective_retention() <= MAX_DERIVED_RETENTION);
+        assert!(cfg.effective_retention() >= Duration::from_secs(1));
+        // An explicit zero retention is floored to a valid (>= 1s) value.
+        let cfg = CanaryConfig::new(Duration::from_secs(30)).with_retention(Duration::ZERO);
+        assert!(cfg.effective_retention() >= Duration::from_secs(1));
     }
 }

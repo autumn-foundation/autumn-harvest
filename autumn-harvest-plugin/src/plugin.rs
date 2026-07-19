@@ -132,6 +132,10 @@ pub struct HarvestPlugin {
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
     status_thresholds: crate::status_summary::StatusThresholds,
+    /// Built-in synthetic liveness canary configuration (issue #796). Set via
+    /// [`Self::synthetic_canary`]; `None` (default) leaves the canary entirely
+    /// off and the runtime byte-for-byte unchanged (AC1).
+    canary_config: Option<crate::canary::CanaryConfig>,
     /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
@@ -163,6 +167,7 @@ impl HarvestPlugin {
             role_auth_enabled: false,
             api_tokens_enabled: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
+            canary_config: None,
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
             #[cfg(feature = "metrics")]
@@ -439,6 +444,23 @@ impl HarvestPlugin {
         self
     }
 
+    /// Enable the built-in synthetic liveness canary (issue #796).
+    ///
+    /// Registers a throwaway probe workflow + activity per configured queue and
+    /// schedules them on `config`'s interval across every writable shard, so the
+    /// live `start → dispatch → activity → durable-timer → complete` path is
+    /// exercised continuously and a wedged pipeline surfaces within one probe
+    /// interval — with zero operator-authored workflow code.
+    ///
+    /// Off by default: without this call the canary is entirely absent and the
+    /// runtime is byte-for-byte unchanged (AC1). Distinct from the #512 replay
+    /// canary — see [`crate::canary`].
+    #[must_use]
+    pub fn synthetic_canary(mut self, config: crate::canary::CanaryConfig) -> Self {
+        self.canary_config = Some(config);
+        self
+    }
+
     /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
     /// (issue #344).
     ///
@@ -529,6 +551,7 @@ impl Plugin for HarvestPlugin {
             role_auth_enabled,
             api_tokens_enabled,
             status_thresholds,
+            canary_config,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
             #[cfg(feature = "metrics")]
@@ -651,6 +674,11 @@ impl Plugin for HarvestPlugin {
         api_state.set_decode_payloads_on_read(decode_payloads_on_read);
         // Issue #679: mirror the rolled-up status thresholds into the API state.
         api_state.set_status_thresholds(status_thresholds);
+        // Issue #796: mirror the synthetic liveness canary config so
+        // `start_harvest_runtime` can register the probe workflow/activity/
+        // schedule, and the (follow-up) `GET /admin/canary` read model can
+        // resolve the interval/staleness window. `None` leaves the canary off.
+        api_state.set_canary_config(canary_config);
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
@@ -2084,6 +2112,27 @@ mod tests {
             plugin.decode_payloads_on_read,
             "HarvestPlugin::decode_payloads_on_read() must set the opt-in flag"
         );
+    }
+
+    /// The synthetic liveness canary (issue #796) must be off by default so a
+    /// plugin that never calls `synthetic_canary` produces a byte-for-byte
+    /// identical runtime (AC1), and the opt-in must store the config.
+    #[test]
+    fn synthetic_canary_defaults_off_and_sets_on_builder() {
+        let plugin = HarvestPlugin::new();
+        assert!(
+            plugin.canary_config.is_none(),
+            "canary must default off (issue #796 AC1)"
+        );
+
+        let cfg = crate::canary::CanaryConfig::new(std::time::Duration::from_secs(30))
+            .with_queues(vec!["email".to_string()]);
+        let plugin = plugin.synthetic_canary(cfg);
+        let stored = plugin
+            .canary_config
+            .as_ref()
+            .expect("synthetic_canary() must store the config");
+        assert_eq!(stored.queues(), &["email".to_string()]);
     }
 
     /// Issue #679: the rolled-up status thresholds default to the starter
