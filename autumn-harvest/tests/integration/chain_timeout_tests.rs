@@ -103,10 +103,20 @@ struct TimeoutSpy {
 }
 impl TimeoutSpy {
     fn chain_count_for(&self, name: &str) -> usize {
-        self.chain.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+        self.chain
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .count()
     }
     fn run_count_for(&self, name: &str) -> usize {
-        self.run.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+        self.run
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .count()
     }
 }
 impl MetricsRecorder for TimeoutSpy {
@@ -324,7 +334,11 @@ async fn per_run_timeout_increments_run_counter_not_chain() {
     timeout::enforce_workflow_execution_timeouts(&mut conn, &spy)
         .await
         .expect("scan");
-    assert_eq!(spy.run_count_for(&wf_name), 1, "run counter fires for this run");
+    assert_eq!(
+        spy.run_count_for(&wf_name),
+        1,
+        "run counter fires for this run"
+    );
     assert_eq!(
         spy.chain_count_for(&wf_name),
         0,

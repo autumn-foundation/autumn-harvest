@@ -12601,6 +12601,20 @@ pub(crate) async fn start_workflow(
                 .max_workflow_execution_timeout()
                 .and_then(|d| chrono::Duration::from_std(d).ok())
                 .map(|d| d.num_seconds());
+            // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
+            // default + fleet-wide ceiling-as-default so a debounced start does not
+            // silently drop a declared chain cap.
+            let effective_chain_execution_timeout_secs = runtime
+                .registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|info| info.chain_execution_timeout)
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds());
+            let effective_chain_ceiling_secs = api_state
+                .max_workflow_chain_timeout()
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds());
 
             // Route to the shard that owns this debounce key (shard-local, consistent with #247).
             // The eventual execution is created on this shard, so it — not the
@@ -12702,6 +12716,8 @@ pub(crate) async fn start_workflow(
                     runbook_url: info_runbook.map(str::to_string),
                     severity: info_severity.map(str::to_string),
                     max_execution_timeout_ceiling_secs: effective_ceiling_secs,
+                    chain_execution_timeout_secs: effective_chain_execution_timeout_secs,
+                    max_workflow_chain_timeout_ceiling_secs: effective_chain_ceiling_secs,
                     max_workflow_input_bytes: Some(effective_wf_cap),
                     trace_context: debounce_trace_ctx,
                     workflow_retry_policy: debounce_workflow_retry_policy,
@@ -12924,6 +12940,20 @@ pub(crate) async fn start_workflow(
             .max_workflow_execution_timeout()
             .and_then(|d| chrono::Duration::from_std(d).ok())
             .map(|d| d.num_seconds());
+        // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
+        // default + fleet-wide ceiling-as-default so a batched start does not
+        // silently drop a declared chain cap.
+        let effective_chain_execution_timeout_secs = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|info| info.chain_execution_timeout)
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|d| d.num_seconds());
+        let effective_chain_ceiling_secs = api_state
+            .max_workflow_chain_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|d| d.num_seconds());
 
         let batch_shard = runtime
             .router
@@ -13014,6 +13044,8 @@ pub(crate) async fn start_workflow(
                 runbook_url: info_runbook.map(str::to_string),
                 severity: info_severity.map(str::to_string),
                 max_execution_timeout_ceiling_secs: effective_ceiling_secs,
+                chain_execution_timeout_secs: effective_chain_execution_timeout_secs,
+                max_workflow_chain_timeout_ceiling_secs: effective_chain_ceiling_secs,
                 max_workflow_input_bytes: Some(effective_wf_cap),
                 trace_context: debounce_trace_ctx,
                 workflow_retry_policy: batch_workflow_retry_policy,
@@ -13405,6 +13437,11 @@ pub(crate) async fn start_workflow(
             max_execution_timeout_ceiling_secs: api_state
                 .max_workflow_execution_timeout()
                 .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds()),
+            // Chain-scoped lifetime cap (issue #617): workflow-type default +
+            // fleet-wide ceiling captured so the deferred fire keeps the cap.
+            chain_execution_timeout_secs: info_chain_timeout_chrono.map(|d| d.num_seconds()),
+            max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling
                 .map(|d| d.num_seconds()),
             max_workflow_input_bytes: Some(effective_wf_cap),
             trace_context: trace_ctx.clone(),
@@ -14198,6 +14235,11 @@ async fn batch_start_workflows(
     let max_exec_timeout_ceiling = api_state
         .max_workflow_execution_timeout()
         .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
+    // Chain-scoped lifetime cap ceiling / fleet-wide default (issue #617),
+    // resolved once for every batch item.
+    let max_chain_timeout_ceiling = api_state
+        .max_workflow_chain_timeout()
+        .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
 
     // ── OTel batch span — created before any DB work (issue #357 telemetry AC) ─
     // Dynamic attributes (shards_touched, rejected_count) are recorded via
@@ -14601,20 +14643,28 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-            let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy) =
-                runtime.registry.workflows.get(&item.workflow_name).map_or(
-                    (None, None, None, None, None, None),
-                    |info| {
-                        (
-                            info.owner,
-                            info.runbook_url,
-                            info.severity,
-                            info.sla,
-                            info.execution_timeout,
-                            info.retry_policy.clone(),
-                        )
-                    },
-                );
+            let (
+                owner,
+                runbook_url,
+                severity,
+                info_sla,
+                info_execution_timeout,
+                info_chain_execution_timeout,
+                info_retry_policy,
+            ) = runtime.registry.workflows.get(&item.workflow_name).map_or(
+                (None, None, None, None, None, None, None),
+                |info| {
+                    (
+                        info.owner,
+                        info.runbook_url,
+                        info.severity,
+                        info.sla,
+                        info.execution_timeout,
+                        info.chain_execution_timeout,
+                        info.retry_policy.clone(),
+                    )
+                },
+            );
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
             let item_workflow_retry_policy = info_retry_policy;
 
@@ -14709,6 +14759,13 @@ async fn batch_start_workflows(
                     severity: severity.map(str::to_string),
                     max_execution_timeout_ceiling_secs: max_exec_timeout_ceiling
                         .map(|d| d.num_seconds()),
+                    // Chain-scoped lifetime cap (issue #617): workflow-type default
+                    // + fleet-wide ceiling captured so a batched fire keeps the cap.
+                    chain_execution_timeout_secs: info_chain_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map(|d| d.num_seconds()),
+                    max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling
+                        .map(|d| d.num_seconds()),
                     max_workflow_input_bytes: Some(effective_wf_cap),
                     trace_context: trace_ctx.clone(),
                     workflow_retry_policy: item_workflow_retry_policy
@@ -14802,8 +14859,12 @@ async fn batch_start_workflows(
                     conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: trace_ctx,
                     max_execution_timeout_ceiling: max_exec_timeout_ceiling,
-                    chain_execution_timeout: None,
-                    max_workflow_chain_timeout_ceiling: None,
+                    // Chain-scoped lifetime cap (issue #617): workflow-type default
+                    // + fleet-wide ceiling-as-default, at parity with the per-run
+                    // ceiling threaded above.
+                    chain_execution_timeout: info_chain_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
                     inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
@@ -15827,20 +15888,28 @@ pub(crate) async fn signal_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy_sws) =
-        runtime.registry.workflows.get(&workflow_name).map_or(
-            (None, None, None, None, None, None),
-            |info| {
-                (
-                    info.owner,
-                    info.runbook_url,
-                    info.severity,
-                    info.sla,
-                    info.execution_timeout,
-                    info.retry_policy.clone(),
-                )
-            },
-        );
+    let (
+        owner,
+        runbook_url,
+        severity,
+        info_sla,
+        info_execution_timeout,
+        info_chain_execution_timeout,
+        info_retry_policy_sws,
+    ) = runtime.registry.workflows.get(&workflow_name).map_or(
+        (None, None, None, None, None, None, None),
+        |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+                info.chain_execution_timeout,
+                info.retry_policy.clone(),
+            )
+        },
+    );
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
@@ -15866,6 +15935,13 @@ pub(crate) async fn signal_with_start_workflow(
             trace_context: trace_ctx,
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            // Chain-scoped lifetime cap (issue #617): workflow-type default +
+            // fleet-wide ceiling-as-default, at parity with the per-run timeout.
+            chain_execution_timeout: info_chain_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok()),
+            max_workflow_chain_timeout_ceiling: api_state
+                .max_workflow_chain_timeout()
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             concurrency_key,
             concurrency_limit,
@@ -16439,20 +16515,28 @@ async fn update_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy_uws) =
-        runtime.registry.workflows.get(&workflow_name).map_or(
-            (None, None, None, None, None, None),
-            |info| {
-                (
-                    info.owner,
-                    info.runbook_url,
-                    info.severity,
-                    info.sla,
-                    info.execution_timeout,
-                    info.retry_policy.clone(),
-                )
-            },
-        );
+    let (
+        owner,
+        runbook_url,
+        severity,
+        info_sla,
+        info_execution_timeout,
+        info_chain_execution_timeout,
+        info_retry_policy_uws,
+    ) = runtime.registry.workflows.get(&workflow_name).map_or(
+        (None, None, None, None, None, None, None),
+        |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+                info.chain_execution_timeout,
+                info.retry_policy.clone(),
+            )
+        },
+    );
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
@@ -16546,6 +16630,13 @@ async fn update_with_start_workflow(
         trace_context: trace_ctx,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
+            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+        // Chain-scoped lifetime cap (issue #617): workflow-type default +
+        // fleet-wide ceiling-as-default, at parity with the per-run timeout.
+        chain_execution_timeout: info_chain_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_chain_timeout_ceiling: api_state
+            .max_workflow_chain_timeout()
             .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
         concurrency_key,
         concurrency_limit,
@@ -22024,6 +22115,14 @@ async fn trigger_schedule_now(
         .get(&workflow_name)
         .and_then(|info| info.execution_timeout)
         .and_then(|d| chrono::Duration::from_std(d).ok());
+    // Chain-scoped lifetime cap default (issue #617): only registered workflows
+    // carry it; DAGs have no chain-cap concept.
+    let info_chain_execution_timeout = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.chain_execution_timeout)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
     let (concurrency_key, concurrency_limit) = runtime
         .registry
         .workflows
@@ -22157,6 +22256,13 @@ async fn trigger_schedule_now(
             severity: severity.map(str::to_string),
             max_execution_timeout_ceiling_secs: api_state
                 .max_workflow_execution_timeout()
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            // Chain-scoped lifetime cap (issue #617): workflow-type default +
+            // fleet-wide ceiling captured so a throttled manual-trigger fire keeps
+            // the cap.
+            chain_execution_timeout_secs: info_chain_execution_timeout.map(|d| d.num_seconds()),
+            max_workflow_chain_timeout_ceiling_secs: api_state
+                .max_workflow_chain_timeout()
                 .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             max_workflow_input_bytes: Some(effective_cap),
             trace_context: None,
@@ -22304,8 +22410,12 @@ async fn trigger_schedule_now(
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
-            chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: None,
+            // Chain-scoped lifetime cap (issue #617): workflow-type default +
+            // fleet-wide ceiling-as-default, at parity with the per-run timeout.
+            chain_execution_timeout: info_chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling: api_state
+                .max_workflow_chain_timeout()
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
             inherited_chain_deadline_at: None,
             concurrency_key,
             concurrency_limit,
@@ -23394,19 +23504,26 @@ async fn schedule_backfill(
                     }
                 }
 
-                let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
-                    .registry
-                    .workflows
-                    .get(&wf_name)
-                    .map_or((None, None, None, None, None), |info| {
+                let (
+                    owner,
+                    runbook_url,
+                    severity,
+                    info_sla,
+                    info_execution_timeout,
+                    info_chain_execution_timeout,
+                ) = runtime.registry.workflows.get(&wf_name).map_or(
+                    (None, None, None, None, None, None),
+                    |info| {
                         (
                             info.owner,
                             info.runbook_url,
                             info.severity,
                             info.sla,
                             info.execution_timeout,
+                            info.chain_execution_timeout,
                         )
-                    });
+                    },
+                );
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
                 // issue #377: check admission gates before firing a backfill run.
@@ -23566,6 +23683,17 @@ async fn schedule_backfill(
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
                         max_execution_timeout_ceiling_secs: None,
+                        // Chain-scoped lifetime cap (issue #617): workflow-type
+                        // default + fleet-wide ceiling captured so a throttled
+                        // backfill fire keeps the cap (parity with the non-throttled
+                        // backfill start path).
+                        chain_execution_timeout_secs: info_chain_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
+                        max_workflow_chain_timeout_ceiling_secs: api_state
+                            .max_workflow_chain_timeout()
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
                         max_workflow_input_bytes: Some(effective_cap),
                         trace_context: None,
                         workflow_retry_policy: effective_retry,
@@ -23689,8 +23817,17 @@ async fn schedule_backfill(
                             autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
+                        // Chain-scoped lifetime cap (issue #617): backfilled runs
+                        // inherit the workflow-type default + fleet-wide
+                        // ceiling-as-default so a whole scheduled chain is capped
+                        // even when a workflow under-specifies (AC4).
+                        chain_execution_timeout: info_chain_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        max_workflow_chain_timeout_ceiling: api_state
+                            .max_workflow_chain_timeout()
+                            .map(|d| {
+                                chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+                            }),
                         inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,

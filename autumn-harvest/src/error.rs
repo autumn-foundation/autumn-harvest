@@ -92,7 +92,7 @@ impl std::fmt::Display for TimeoutType {
             Self::ScheduleToClose => write!(f, "ScheduleToClose"),
             Self::Heartbeat => write!(f, "Heartbeat"),
             Self::WorkflowExecution => write!(f, "WorkflowExecution"),
-            Self::WorkflowChain => write!(f, "workflow chain lifetime exceeded"),
+            Self::WorkflowChain => write!(f, "WorkflowChain"),
         }
     }
 }

@@ -268,6 +268,9 @@ async fn signal_with_start_records_signal_with_start_source() {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
             signal_name: "go",
@@ -328,6 +331,9 @@ async fn update_with_start_records_update_with_start_source() {
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
             update_id: UpdateId::new(),

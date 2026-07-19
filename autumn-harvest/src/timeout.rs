@@ -192,6 +192,10 @@ pub const fn schedule_to_close_timeout_query() -> &'static str {
 /// Both deadlines are computed at start time (`started_at + timeout`), so this is
 /// an indexed range scan served by `idx_harvest_executions_deadline` and
 /// `idx_harvest_executions_chain_deadline`.
+///
+/// This `const` renders `NOW()` illustratively for the SQL-shape unit test; the
+/// executed scanner (`enforce_workflow_execution_timeouts`) uses the equivalent
+/// Diesel DSL with a Rust-captured `now` (see below), not this string.
 #[must_use]
 pub const fn workflow_execution_timeout_query() -> &'static str {
     "SELECT * FROM harvest_workflow_executions \
@@ -3614,6 +3618,32 @@ mod tests {
     }
 
     #[test]
+    fn chain_deadline_checked_add_overflow_yields_none_not_panic() {
+        use chrono::Duration;
+        // Because the chain ceiling doubles as the effective value (AC4), an
+        // absurd operator ceiling can reach `Duration::MAX`, and
+        // `effective_chain_timeout(None, ceiling)` returns it verbatim.
+        let effective = effective_chain_timeout(None, Some(Duration::MAX));
+        assert_eq!(effective, Some(Duration::MAX));
+        // The start path adds it to the start instant with `checked_add_signed`
+        // so an overflow yields `None` (no chain cap) rather than panicking, which
+        // is exactly what the fresh-start / reset / child sites now do.
+        let start = Utc::now();
+        let chain_deadline_at = effective.and_then(|d| start.checked_add_signed(d));
+        assert_eq!(
+            chain_deadline_at, None,
+            "Duration::MAX must overflow to None, never panic"
+        );
+        // A sane duration must still produce a deadline.
+        let sane = effective_chain_timeout(None, Some(Duration::hours(1)));
+        let ok = sane.and_then(|d| start.checked_add_signed(d));
+        assert!(
+            ok.is_some(),
+            "a representable chain cap must yield a deadline"
+        );
+    }
+
+    #[test]
     fn chain_timeout_metric_has_correct_name() {
         assert_eq!(
             crate::telemetry::METRIC_WORKFLOW_CHAIN_TIMEOUT,
@@ -3632,10 +3662,8 @@ mod tests {
     #[test]
     fn timeout_type_workflow_chain_has_distinct_display() {
         use crate::error::TimeoutType;
-        assert_eq!(
-            TimeoutType::WorkflowChain.to_string(),
-            "workflow chain lifetime exceeded"
-        );
+        // Consistent with every sibling variant, Display renders the variant name.
+        assert_eq!(TimeoutType::WorkflowChain.to_string(), "WorkflowChain");
         assert_ne!(
             TimeoutType::WorkflowChain.to_string(),
             TimeoutType::WorkflowExecution.to_string()

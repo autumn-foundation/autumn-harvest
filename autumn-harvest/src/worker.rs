@@ -446,6 +446,17 @@ pub struct HandlerRegistry {
     /// ceiling. Applied to scheduler-fired starts so automated fires respect
     /// the same operator-configured cap as API/manual starts.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// Server-side ceiling on the chain-scoped lifetime cap, doubling as a
+    /// fleet-wide chain default (issue #617). Threaded here (rather than resolved
+    /// per-request from `api_state` like the HTTP paths) so the scheduler tick —
+    /// a core-crate component with no `api_state` — can apply the fleet-wide chain
+    /// default to scheduled runs. `None` = no chain cap applied fleet-wide.
+    ///
+    /// This deliberately diverges from the per-run `execution_timeout` ceiling,
+    /// which is NOT threaded into the scheduler: the chain ceiling is a fleet-wide
+    /// DEFAULT (must reach every start, AC4), whereas the per-run ceiling only
+    /// caps a specified value.
+    pub max_workflow_chain_timeout: Option<std::time::Duration>,
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
@@ -614,6 +625,7 @@ impl HandlerRegistry {
                 circuit_policies,
             )),
             max_workflow_attempts_ceiling: None,
+            max_workflow_chain_timeout: None,
             payload_offloader: None,
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
@@ -698,6 +710,19 @@ impl HandlerRegistry {
         {
             *lock = ceiling;
         }
+        self
+    }
+
+    /// Set the server-side ceiling on the chain-scoped lifetime cap / fleet-wide
+    /// chain default (issue #617). Applied to scheduler-fired starts so a whole
+    /// scheduled continue-as-new chain is capped even when a workflow
+    /// under-specifies (AC4).
+    #[must_use]
+    pub const fn with_max_workflow_chain_timeout(
+        mut self,
+        ceiling: Option<std::time::Duration>,
+    ) -> Self {
+        self.max_workflow_chain_timeout = ceiling;
         self
     }
 
@@ -908,6 +933,10 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
+            )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
             .field(
@@ -5765,8 +5794,10 @@ async fn persist_all_started_child_workflows(
                     // resolved here.
                     let child_chain_execution_timeout = child_chain_execution_timeout
                         .and_then(|d| chrono::Duration::from_std(d).ok());
-                    let child_chain_deadline_at =
-                        child_chain_execution_timeout.map(|d| chrono::Utc::now() + d);
+                    // `checked_add_signed` guards against `Duration::MAX` overflow
+                    // (issue #617): `DateTime + Duration` panics; yield `None`.
+                    let child_chain_deadline_at = child_chain_execution_timeout
+                        .and_then(|d| chrono::Utc::now().checked_add_signed(d));
                     let child_row = NewWorkflowExecution {
                         continued_from_exec_id: None,
                         first_exec_id: None,
@@ -5954,7 +5985,10 @@ async fn insert_awaited_child_execution(
     // Child = its own logical workflow → fresh chain origin (issue #617).
     let child_chain_execution_timeout =
         child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    let child_chain_deadline_at = child_chain_execution_timeout.map(|d| chrono::Utc::now() + d);
+    // `checked_add_signed` guards against `Duration::MAX` overflow (issue #617):
+    // `DateTime + Duration` panics; yield `None` instead.
+    let child_chain_deadline_at =
+        child_chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
     let child_row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,

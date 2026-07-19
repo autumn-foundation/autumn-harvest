@@ -31,6 +31,9 @@ fn update_with_start_params_is_cloneable_and_debug() {
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
         update_id,
@@ -99,6 +102,9 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
         update_id,
@@ -202,6 +208,9 @@ mod db_tests {
             reuse_policy,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
             update_id,

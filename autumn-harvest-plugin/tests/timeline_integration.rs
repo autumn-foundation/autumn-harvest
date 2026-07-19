@@ -60,6 +60,9 @@ const INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source_ref TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS started_by TEXT NULL;\n",
+    // issue #617: chain-scoped lifetime cap columns (read back by WorkflowExecution::as_select()).
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"

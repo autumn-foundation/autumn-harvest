@@ -615,9 +615,13 @@ pub async fn start_or_load_workflow_execution_collect(
         request.chain_execution_timeout,
         request.max_workflow_chain_timeout_ceiling,
     );
+    // `checked_add_signed` (not `+`) because the chain ceiling doubles as the
+    // effective value (AC4): an absurd operator ceiling can reach
+    // `chrono::Duration::MAX`, and `DateTime + Duration` PANICS on overflow. On
+    // overflow we yield `None` (no chain cap) rather than crash the start path.
     let chain_deadline_at = request
         .inherited_chain_deadline_at
-        .or_else(|| effective_chain_timeout.map(|d| target_start_time + d));
+        .or_else(|| effective_chain_timeout.and_then(|d| target_start_time.checked_add_signed(d)));
 
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
@@ -3696,6 +3700,15 @@ pub struct SignalWithStartParams<'a> {
     /// Server-side ceiling applied to `execution_timeout`. Forwarded to
     /// [`StartWorkflowParams::max_execution_timeout_ceiling`].
     pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Chain-scoped lifetime cap DURATION for a fresh chain-origin start (issue
+    /// #617). Forwarded to [`StartWorkflowParams::chain_execution_timeout`]. A
+    /// signal-with-start always begins a fresh chain origin, so there is no
+    /// `inherited_chain_deadline_at`. `None` = caller specified no chain cap.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    /// Server-side ceiling on the chain cap, doubling as a fleet-wide default
+    /// (issue #617). Forwarded to
+    /// [`StartWorkflowParams::max_workflow_chain_timeout_ceiling`].
+    pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
     /// Pre-resolved concurrency group key. Forwarded to
     /// [`StartWorkflowParams::concurrency_key`].
     pub concurrency_key: Option<String>,
@@ -4003,8 +4016,13 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: request.trace_context.clone(),
                         max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
+                        // Chain-scoped lifetime cap (issue #617): forward the
+                        // request's fresh-origin chain cap + fleet-wide ceiling.
+                        // A signal-/update-with-start never inherits a chain
+                        // deadline — it always begins a fresh chain origin.
+                        chain_execution_timeout: request.chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling: request
+                            .max_workflow_chain_timeout_ceiling,
                         inherited_chain_deadline_at: None,
                         concurrency_key: request.concurrency_key.clone(),
                         concurrency_limit: request.concurrency_limit,
@@ -4406,6 +4424,15 @@ pub struct UpdateWithStartParams<'a> {
     pub trace_context: Option<TraceContextCarrier>,
     /// Server-side ceiling applied to `execution_timeout`.
     pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Chain-scoped lifetime cap DURATION for a fresh chain-origin start (issue
+    /// #617). Forwarded to [`StartWorkflowParams::chain_execution_timeout`]. An
+    /// update-with-start always begins a fresh chain origin, so there is no
+    /// `inherited_chain_deadline_at`. `None` = caller specified no chain cap.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    /// Server-side ceiling on the chain cap, doubling as a fleet-wide default
+    /// (issue #617). Forwarded to
+    /// [`StartWorkflowParams::max_workflow_chain_timeout_ceiling`].
+    pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
     /// Pre-resolved concurrency group key.
     pub concurrency_key: Option<String>,
     /// Per-key concurrency cap.
@@ -4595,8 +4622,13 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: request.trace_context.clone(),
                         max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
+                        // Chain-scoped lifetime cap (issue #617): forward the
+                        // request's fresh-origin chain cap + fleet-wide ceiling.
+                        // A signal-/update-with-start never inherits a chain
+                        // deadline — it always begins a fresh chain origin.
+                        chain_execution_timeout: request.chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling: request
+                            .max_workflow_chain_timeout_ceiling,
                         inherited_chain_deadline_at: None,
                         concurrency_key: request.concurrency_key.clone(),
                         concurrency_limit: request.concurrency_limit,

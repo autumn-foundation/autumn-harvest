@@ -1073,6 +1073,7 @@ impl BuiltHarvest {
         )
         .with_current_details_cap(self.max_current_details_bytes)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
         .with_payload_offloader(self.payload_offloader.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(
@@ -1138,6 +1139,7 @@ impl BuiltHarvest {
         )
         .with_current_details_cap(self.max_current_details_bytes)
         .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
         .with_payload_offloader(self.payload_offloader.clone())
         .with_activity_interceptors(self.activity_interceptors.clone())
         .with_activity_defaults(

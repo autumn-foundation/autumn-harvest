@@ -3802,6 +3802,9 @@ fn signal_with_start_fresh_params(workflow_id: &'static str) -> SignalWithStartP
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
         signal_name: "go",
@@ -3836,6 +3839,9 @@ fn update_with_start_fresh_params(workflow_id: &'static str) -> UpdateWithStartP
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
         concurrency_key: None,
         concurrency_limit: None,
         update_id: UpdateId::new(),
