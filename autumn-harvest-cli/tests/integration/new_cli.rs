@@ -4,12 +4,16 @@
 //! render the embedded `minimal` template, and drive `run_new` end to end into
 //! `tempfile::tempdir()` sandboxes (mirroring `det_check_cli.rs`).
 
-use std::path::Path;
+use std::sync::Mutex;
 
 use autumn_harvest_cli::{
-    ScaffoldNames, ScaffoldTemplate, apply_substitutions, derive_crate_ident, derive_names,
-    render_minimal, run_new,
+    ScaffoldTemplate, apply_substitutions, derive_crate_ident, derive_names, render_minimal,
+    run_new,
 };
+
+/// Serializes the one test that mutates the process-global current directory so
+/// it never races the other (cwd-independent) tests in this binary.
+static CWD_GUARD: Mutex<()> = Mutex::new(());
 
 /// Reads the real `examples/quickstart/src/main.rs` at test time so the parity
 /// assertion tracks the shape CI actually compiles (the scaffold-rot signal).
@@ -267,21 +271,25 @@ fn run_new_rejects_invalid_name_without_writing() {
 }
 
 #[test]
-fn default_path_uses_name_relative_to_cwd() {
-    // When path is None, the target is ./<name>. Drive it inside a tempdir cwd
-    // so the test never pollutes the workspace.
+fn default_path_none_resolves_to_name_under_cwd() {
+    // When --path is omitted, run_new writes to ./<name>. Drive it inside a
+    // tempdir cwd (serialized, restored after) so the workspace is untouched.
+    let _guard = CWD_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("tempdir");
+    let original = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(dir.path()).expect("chdir to tempdir");
+
     let name = "scaffold_cwd_demo";
-    // Render + write manually via run_new with an explicit path equal to the
-    // documented default (cwd/<name>), which is what None resolves to.
-    let target: &Path = &dir.path().join(name);
-    run_new(name, Some(target), false, ScaffoldTemplate::Minimal).expect("scaffold ok");
-    assert!(target.join("Cargo.toml").exists());
-    let _ = ScaffoldNames {
-        crate_name: name.to_string(),
-        ident: name.to_string(),
-        workflow_fn: format!("{name}_workflow"),
-        activity_fn: format!("{name}_activity"),
-        queue: name.to_string(),
-    };
+    let result = run_new(name, None, false, ScaffoldTemplate::Minimal);
+
+    // Restore cwd before asserting so a panic can't leave the process adrift.
+    std::env::set_current_dir(&original).expect("restore cwd");
+
+    result.expect("scaffold ok");
+    assert!(
+        dir.path().join(name).join("Cargo.toml").exists(),
+        "None path must resolve to ./<name>"
+    );
 }
