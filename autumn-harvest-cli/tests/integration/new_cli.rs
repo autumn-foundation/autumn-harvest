@@ -174,6 +174,7 @@ fn scaffold_rot_wiring_parity_with_quickstart() {
     for token in [
         "use autumn_harvest::prelude::*;",
         "HarvestPlugin::new()",
+        ".routes(routes![",
         ".workflows(workflows![",
         ".activities(activities![",
         ".worker(WorkerConfig::default()",

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestPlugin;
+use autumn_web::prelude::*;
 
 /// Greets `name` by running the `{{activity_fn}}` activity, then returns the
 /// activity's message.
@@ -41,9 +42,17 @@ async fn {{activity_fn}}(
     Ok(serde_json::json!({ "message": message }))
 }
 
+/// A tiny landing route. autumn-web requires at least one HTTP route, so this
+/// gives the app one; the durable workflow lives behind the management API.
+#[get("/")]
+async fn index() -> &'static str {
+    "{{crate_name}} is running. Open the dashboard at /api/harvest/ui\n"
+}
+
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
+        .routes(routes![index])
         .plugin(
             HarvestPlugin::new()
                 .workflows(workflows![{{workflow_fn}}])
