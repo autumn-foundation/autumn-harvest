@@ -101,6 +101,9 @@ required-features = ["db"]
 name = "timezone_cron_schedule"
 
 [[example]]
+name = "auto_heartbeat"
+
+[[example]]
 name = "collect_approvals"
 
 [[example]]

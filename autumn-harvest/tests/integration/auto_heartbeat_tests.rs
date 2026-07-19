@@ -420,23 +420,17 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
 
     assert_eq!(execution.state, "COMPLETED");
 
-    // No heartbeat (nor any) ActivityTimedOut event was ever appended — the
+    // No heartbeat ActivityTimedOut event was ever appended — the
     // auto-heartbeat kept `last_heartbeat_at` fresh throughout.
     let history = load_history(&url, exec_id).await;
-    let heartbeat_timeouts: Vec<_> = history
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                WorkflowEvent::ActivityTimedOut {
-                    timeout_type: autumn_harvest::error::TimeoutType::Heartbeat,
-                    ..
-                }
-            )
-        })
-        .collect();
     assert!(
-        heartbeat_timeouts.is_empty(),
+        !history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: autumn_harvest::error::TimeoutType::Heartbeat,
+                ..
+            }
+        )),
         "auto-heartbeat must prevent any Heartbeat reclaim; history={history:?}"
     );
     assert!(
@@ -477,12 +471,12 @@ async fn seed_running_activity(
     diesel::sql_query(format!(
         "UPDATE harvest_task_queue \
          SET state = 'RUNNING', worker_id = 'w-1', \
-             started_at = NOW() - make_interval(secs => $2), \
+             started_at = NOW() - ($2 * INTERVAL '1 second'), \
              last_heartbeat_at = {hb_sql} \
          WHERE id = $1"
     ))
     .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::Double, _>(started_secs_ago as f64)
+    .bind::<diesel::sql_types::BigInt, _>(started_secs_ago)
     .execute(conn)
     .await
     .expect("drive task into RUNNING");
@@ -491,7 +485,10 @@ async fn seed_running_activity(
 }
 
 fn reason_for(tasks: &[(TaskQueueItem, TimeoutReason)], id: Uuid) -> Option<TimeoutReason> {
-    tasks.iter().find(|(t, _)| t.id == id).map(|(_, r)| r.clone())
+    tasks
+        .iter()
+        .find(|(t, _)| t.id == id)
+        .map(|(_, r)| r.clone())
 }
 
 #[tokio::test]
