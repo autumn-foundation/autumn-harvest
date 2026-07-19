@@ -234,19 +234,38 @@ impl CanaryConfig {
 
     /// The effective canary-history retention window (AC9).
     ///
-    /// The override if set, else `max(2 × staleness_window, 1h)` — always
-    /// exceeding the staleness window so a `GET /admin/canary` read can still
-    /// see the last recorded success. The result is clamped to
-    /// `[1s, MAX_DERIVED_RETENTION]` so it is always within the core
+    /// **Floored at `max(2 × staleness_window, 1h)` in every config path** —
+    /// including an explicit [`Self::with_retention`] override — so a
+    /// `GET /admin/canary` read can always still see the last recorded success.
+    /// A retention window at or below the staleness window would let the janitor
+    /// prune each success row before the staleness check reads it, producing a
+    /// **false-positive stale alert on a perfectly healthy pipeline** (the worst
+    /// failure mode for a liveness tool). An explicit override below the floor is
+    /// raised (with a warning) rather than honoured verbatim. The result is
+    /// clamped to `[1s, MAX_DERIVED_RETENTION]` so it is always within the core
     /// `RetentionConfig` validator's bounds and can never fail `try_build()`.
     #[must_use]
     pub fn effective_retention(&self) -> Duration {
-        let raw = self.retention.unwrap_or_else(|| {
-            self.effective_staleness_window()
-                .saturating_mul(2)
-                .max(RETENTION_FLOOR)
-        });
-        raw.clamp(Duration::from_secs(1), MAX_DERIVED_RETENTION)
+        let staleness = self.effective_staleness_window();
+        // Retention MUST exceed staleness so the success row outlives the
+        // freshness check that reads it (issue #796, AC9). Floor at 2× staleness
+        // (or 1h, whichever is larger) in ALL paths.
+        let floor = staleness.saturating_mul(2).max(RETENTION_FLOOR);
+        let raw = self.retention.unwrap_or(floor);
+        let floored = raw.max(floor);
+        if let Some(explicit) = self.retention {
+            if floored != explicit {
+                tracing::warn!(
+                    requested_secs = explicit.as_secs(),
+                    floored_secs = floored.as_secs(),
+                    staleness_window_secs = staleness.as_secs(),
+                    "synthetic liveness canary retention below the staleness-derived floor; \
+                     raised so a GET /admin/canary read can always see the last recorded \
+                     success (issue #796, AC9)"
+                );
+            }
+        }
+        floored.clamp(Duration::from_secs(1), MAX_DERIVED_RETENTION)
     }
 }
 
@@ -939,9 +958,29 @@ mod tests {
         let cfg = CanaryConfig::new(MAX_DERIVED_RETENTION);
         assert!(cfg.effective_retention() <= MAX_DERIVED_RETENTION);
         assert!(cfg.effective_retention() >= Duration::from_secs(1));
-        // An explicit zero retention is floored to a valid (>= 1s) value.
+        // An explicit zero retention is raised above the staleness window (AC9).
         let cfg = CanaryConfig::new(Duration::from_secs(30)).with_retention(Duration::ZERO);
         assert!(cfg.effective_retention() >= Duration::from_secs(1));
+        assert!(cfg.effective_retention() > cfg.effective_staleness_window());
+    }
+
+    #[test]
+    fn explicit_retention_below_staleness_is_floored_above_staleness() {
+        // AC9: an explicit retention below the staleness window would let the
+        // janitor prune the last success before the freshness check reads it,
+        // producing a false-positive stale alert on a healthy pipeline. It must
+        // be floored above the staleness window in the explicit-override path.
+        let cfg = CanaryConfig::new(Duration::from_secs(30))
+            .with_staleness_window(Duration::from_secs(3600))
+            .with_retention(Duration::from_secs(60));
+        assert_eq!(cfg.effective_staleness_window(), Duration::from_secs(3600));
+        assert!(
+            cfg.effective_retention() > cfg.effective_staleness_window(),
+            "explicit retention below staleness must be floored above it, got {:?}",
+            cfg.effective_retention()
+        );
+        // At least 2× the staleness window.
+        assert!(cfg.effective_retention() >= Duration::from_secs(7200));
     }
 
     fn canary_schedule<'a>(
