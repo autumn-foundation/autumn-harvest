@@ -395,7 +395,6 @@ pub fn canary_activity_info() -> ActivityInfo {
 ///
 /// - registers the reserved canary activity (once, for all queues);
 /// - registers a per-queue probe workflow named `{PREFIX}__{queue}`;
-/// - ensures a worker drains that queue;
 /// - schedules the probe on `cfg.interval()` across **every writable shard**
 ///   (AC4), with [`OverlapPolicy::Skip`] so probes never pile up (AC6) and a
 ///   per-run `execution_timeout` so a wedged probe times out (AC6); and
@@ -404,6 +403,21 @@ pub fn canary_activity_info() -> ActivityInfo {
 ///   runs the janitor and resolves the override age via `effective_max_age` —
 ///   causes the canary's own history to be purged shortly after each run even
 ///   when no global retention `max_age` is configured.
+///
+/// **The probed queue MUST be polled by some worker in the fleet built from this
+/// builder** — that is the fleet whose liveness the canary is testing. The
+/// canary deliberately does **not** force the local worker to poll the probe
+/// queue: a probe queue served only by a dedicated remote fleet (e.g.
+/// `gpu-heavy`) must be measured on *that* fleet, and auto-adding it to the
+/// local worker's queue set would make the local worker claim that fleet's real
+/// customer tasks and could report a false-"healthy" (the probe would prove the
+/// *local* worker drains the queue, not the intended fleet). If no worker in the
+/// fleet polls the probe queue, the probe simply times out — correctly flagging
+/// "this queue has no live pollers", a real liveness failure. The default
+/// `"default"` queue is already polled by the builder's default worker, so the
+/// out-of-the-box config works with no extra wiring; probing any other queue
+/// requires that a worker (local via [`WorkerConfig::with_queues`], or a
+/// separate process) is configured to drain it.
 #[must_use]
 pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> HarvestBuilder {
     use autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX;
@@ -432,15 +446,10 @@ pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> Harve
             per_probe_timeout,
         )]);
 
-        // Ensure the probe's queue is drained by a worker.
-        if !builder
-            .worker_config_mut()
-            .queues
-            .iter()
-            .any(|q| q == queue)
-        {
-            builder.worker_config_mut().queues.push(queue.clone());
-        }
+        // Deliberately do NOT force the local worker to poll `queue`: the probe
+        // must be run by whatever worker in the fleet-under-test legitimately
+        // drains that queue (see the fn-level doc). If none does, the probe
+        // times out — correctly flagging "this queue has no live pollers".
 
         // Schedule the probe across every writable shard (AC4), never piling
         // up (AC6), with a per-run deadline (AC6). The input carries the queue
@@ -1030,13 +1039,14 @@ mod tests {
         assert_eq!(s.execution_timeout, Some(cfg.per_probe_timeout()));
         assert_eq!(s.queue_name, "default");
 
-        // The probe queue is present in the worker's queue set.
-        assert!(
-            builder
-                .worker_config()
-                .queues
-                .iter()
-                .any(|q| q == "default")
+        // register_canary does NOT force the local worker to poll the probe
+        // queue: the fleet-under-test is responsible for draining it. The
+        // builder's default worker already polls "default", and register_canary
+        // leaves the worker queue set untouched.
+        assert_eq!(
+            builder.worker_config().queues,
+            vec!["default".to_string()],
+            "register_canary must not mutate the worker queue set"
         );
 
         // A retention override exists for the canary workflow (AC9).
@@ -1078,15 +1088,15 @@ mod tests {
         assert_eq!(canary_scheds.len(), 2);
         assert!(canary_scheds.iter().all(|s| s.all_writable_shards));
 
-        // Both queues in the worker queue set.
+        // register_canary does NOT auto-add a non-default probe queue to the
+        // local worker: probing "email" is a statement about whichever fleet
+        // drains "email", not the local worker. The default worker set is left
+        // untouched, so "email" is absent unless the operator wired a worker for
+        // it themselves.
         assert!(
-            builder
-                .worker_config()
-                .queues
-                .iter()
-                .any(|q| q == "default")
+            !builder.worker_config().queues.iter().any(|q| q == "email"),
+            "register_canary must not force the local worker to poll a probe queue"
         );
-        assert!(builder.worker_config().queues.iter().any(|q| q == "email"));
 
         // Retention overrides for both.
         let overrides = builder.retention_config().workflow_overrides();
