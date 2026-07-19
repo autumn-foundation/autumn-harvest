@@ -2555,14 +2555,34 @@ const MINIMAL_TEMPLATE: &[(&str, &str)] = &[
     ),
 ];
 
-/// Derives the Rust identifier form of a project name (`-` → `_`).
+/// Derives a clean, warning-free `snake_case` Rust identifier from a project name.
+///
+/// Lowercases, maps `-` → `_`, collapses runs of `_`, and trims leading/trailing
+/// `_`, so any spec-valid `<name>` (`^[A-Za-z][A-Za-z0-9_-]*$`) yields a valid
+/// `snake_case` ident with no `non_snake_case` warnings and no double underscore:
+/// `my-app` → `my_app`, `MyApp` → `myapp`, `trail-` → `trail`, `my--app` →
+/// `my_app`. A spec-valid name always starts with an ASCII letter, so the result
+/// is non-empty and never begins with a digit or `_`.
 #[must_use]
 pub fn derive_crate_ident(name: &str) -> String {
-    name.replace('-', "_")
+    let mut out = String::with_capacity(name.len());
+    let mut prev_underscore = false;
+    for c in name.chars() {
+        if c == '-' || c == '_' {
+            if !prev_underscore {
+                out.push('_');
+            }
+            prev_underscore = true;
+        } else {
+            out.push(c.to_ascii_lowercase());
+            prev_underscore = false;
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
-/// Validates a project name for use as both a Cargo package name and (after
-/// `-` → `_`) a Rust identifier.
+/// Validates a project name for use as a Cargo package name (from which
+/// [`derive_crate_ident`] later derives the scaffold's Rust identifiers).
 ///
 /// # Errors
 ///
@@ -2580,8 +2600,7 @@ pub fn validate_project_name(name: &str) -> Result<(), CliError> {
             "invalid project name '{name}': must be at most {MAX_PROJECT_NAME_LEN} characters"
         )));
     }
-    let first = name.chars().next().unwrap_or('\0');
-    if !first.is_ascii_alphabetic() {
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
         return Err(CliError::InvalidInput(format!(
             "invalid project name '{name}': must start with an ASCII letter"
         )));
@@ -2594,13 +2613,19 @@ pub fn validate_project_name(name: &str) -> Result<(), CliError> {
             "invalid project name '{name}': only ASCII letters, digits, '-' and '_' are allowed"
         )));
     }
-    let ident = derive_crate_ident(name);
-    if RUST_KEYWORDS.contains(&ident.as_str()) || RUST_KEYWORDS.contains(&name) {
+    // Keyword/reserved collision is checked against the raw `-` → `_` form (not
+    // the case-folded render ident) so name *acceptance* matches cargo-new: a
+    // name is rejected only when it is itself a keyword/reserved word, never
+    // merely because it case-folds to one (e.g. `MyApp` stays accepted).
+    let raw_ident = name.replace('-', "_");
+    if RUST_KEYWORDS.contains(&raw_ident.as_str()) || RUST_KEYWORDS.contains(&name) {
         return Err(CliError::InvalidInput(format!(
-            "invalid project name '{name}': resolves to the Rust keyword '{ident}'"
+            "invalid project name '{name}': resolves to the Rust keyword '{raw_ident}'"
         )));
     }
-    if RESERVED_PROJECT_NAMES.contains(&name) || RESERVED_PROJECT_NAMES.contains(&ident.as_str()) {
+    if RESERVED_PROJECT_NAMES.contains(&name)
+        || RESERVED_PROJECT_NAMES.contains(&raw_ident.as_str())
+    {
         return Err(CliError::InvalidInput(format!(
             "invalid project name '{name}': '{name}' is a reserved name"
         )));
@@ -2677,6 +2702,17 @@ pub fn run_new(
     let names = derive_names(name)?;
     let default_path = PathBuf::from(&names.crate_name);
     let target = path.unwrap_or(&default_path);
+
+    // A plain file (or other non-directory) at the target can never be
+    // scaffolded into; reject it up front with a clear message rather than
+    // letting `create_dir_all` surface an opaque OS error. `--force` cannot
+    // help — it only overwrites the scaffold's own files inside a directory.
+    if target.exists() && !target.is_dir() {
+        return Err(CliError::InvalidInput(format!(
+            "target '{}' exists and is not a directory",
+            target.display()
+        )));
+    }
 
     if !force && dir_is_non_empty(target) {
         return Err(CliError::InvalidInput(format!(
@@ -9293,5 +9329,32 @@ mod scaffold_new_tests {
                 "{ok:?} should be a valid name"
             );
         }
+    }
+
+    #[test]
+    fn uppercase_names_stay_accepted_cargo_new_parity() {
+        // Acceptance must match `cargo new`: an uppercase name is legal (only a
+        // cosmetic cargo warning), even when it case-folds to a keyword/reserved
+        // word. Only names that ARE a keyword/reserved word are rejected.
+        for ok in ["MyApp", "Fn", "Core", "Orders"] {
+            assert!(
+                validate_project_name(ok).is_ok(),
+                "{ok:?} should be accepted (cargo-new parity)"
+            );
+        }
+        for bad in ["fn", "core", "async"] {
+            assert!(
+                validate_project_name(bad).is_err(),
+                "{bad:?} should be rejected (keyword/reserved)"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_crate_ident_is_clean_snake_case() {
+        assert_eq!(derive_crate_ident("MyApp"), "myapp");
+        assert_eq!(derive_crate_ident("trail-"), "trail");
+        assert_eq!(derive_crate_ident("my--app"), "my_app");
+        assert_eq!(derive_crate_ident("A_B-c"), "a_b_c");
     }
 }

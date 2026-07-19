@@ -62,6 +62,22 @@ fn hyphenated_name_sanitizes_ident_to_underscores() {
 }
 
 #[test]
+fn derived_ident_is_clean_snake_case_for_any_valid_name() {
+    // Uppercase → lowercased (no non_snake_case warnings in the generated code).
+    assert_eq!(derive_crate_ident("MyApp"), "myapp");
+    // Trailing hyphen → trimmed (no trailing `_` in the ident).
+    assert_eq!(derive_crate_ident("trail-"), "trail");
+    // Repeated separators → collapsed (no double underscore).
+    assert_eq!(derive_crate_ident("my--app"), "my_app");
+    assert_eq!(derive_crate_ident("a_-b"), "a_b");
+    // crate_name stays verbatim (Cargo package name = user's `<name>`).
+    let names = derive_names("MyApp").expect("valid");
+    assert_eq!(names.crate_name, "MyApp");
+    assert_eq!(names.ident, "myapp");
+    assert_eq!(names.workflow_fn, "myapp_workflow");
+}
+
+#[test]
 fn apply_substitutions_replaces_all_keys_and_leaves_none() {
     let out = apply_substitutions(
         "fn {{workflow_fn}}() { queue = \"{{queue}}\"; ident = {{ident}}; }",
@@ -96,6 +112,32 @@ fn invalid_project_names_are_rejected() {
         assert!(
             derive_names(bad).is_err(),
             "expected {bad:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn over_length_name_is_rejected() {
+    // MAX_PROJECT_NAME_LEN is 64; a 65-char name must be rejected before any write.
+    let too_long = "a".repeat(65);
+    assert!(
+        derive_names(&too_long).is_err(),
+        "a 65-character name must be rejected"
+    );
+    // The boundary (exactly 64) is accepted.
+    let at_limit = "a".repeat(64);
+    assert!(
+        derive_names(&at_limit).is_ok(),
+        "a 64-character name must be accepted"
+    );
+}
+
+#[test]
+fn reserved_project_names_are_rejected() {
+    for reserved in ["core", "test", "std", "main", "lib", "build", "deps"] {
+        assert!(
+            derive_names(reserved).is_err(),
+            "reserved name {reserved:?} must be rejected"
         );
     }
 }
@@ -144,6 +186,50 @@ fn generated_main_rs_substitutes_all_identifiers() {
     assert!(
         main.contains("activities![my_app_activity]"),
         "main: {main}"
+    );
+}
+
+#[test]
+fn hyphenated_name_yields_valid_rust_ident_in_main_rs() {
+    // `my-app` is a valid Cargo name but an invalid Rust ident: main.rs must
+    // use the underscore form, never the literal hyphen form.
+    let files = render("my-app");
+    let main = file_content(&files, "src/main.rs");
+    assert!(
+        main.contains("async fn my_app_workflow"),
+        "main must use the underscore ident: {main}"
+    );
+    assert!(
+        !main.contains("my-app_workflow"),
+        "main must not contain a hyphenated ident: {main}"
+    );
+    // Cargo.toml keeps the verbatim package name.
+    let cargo = file_content(&files, "Cargo.toml");
+    assert!(cargo.contains("name = \"my-app\""), "cargo: {cargo}");
+}
+
+#[test]
+fn uppercase_and_repeat_separator_names_render_clean_snake_case_idents() {
+    // Uppercase package name is accepted (cargo-new parity) but the derived
+    // idents are clean lowercase snake_case, and no generated ident has a
+    // double underscore.
+    for name in ["MyApp", "my--app", "trail-"] {
+        let files = render(name);
+        let main = file_content(&files, "src/main.rs");
+        assert!(
+            !main.contains("__"),
+            "generated main.rs for {name:?} must have no double-underscore idents:\n{main}"
+        );
+    }
+    let files = render("MyApp");
+    let main = file_content(&files, "src/main.rs");
+    assert!(
+        main.contains("async fn myapp_workflow"),
+        "MyApp must derive the lowercase ident myapp_workflow: {main}"
+    );
+    assert!(
+        !main.contains("MyApp_workflow"),
+        "MyApp must not leak an uppercase ident into main.rs: {main}"
     );
 }
 
@@ -247,6 +333,44 @@ fn force_overwrites_existing_dir() {
     assert!(
         target.join("Cargo.toml").exists(),
         "--force must write the project"
+    );
+    // --force never removes files it did not write (no rm -rf): the pre-seeded
+    // sentinel survives untouched.
+    assert_eq!(
+        std::fs::read_to_string(target.join("keep.txt")).expect("keep.txt readable"),
+        "old",
+        "--force must not remove or overwrite files it did not write"
+    );
+}
+
+#[test]
+fn existing_file_at_target_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join("afile");
+    std::fs::write(&target, "i am a file").expect("seed file");
+
+    // A plain file at the target is not a directory we can scaffold into; the
+    // command must reject it with a clear "is not a directory" message (not an
+    // opaque create_dir_all OS error), even with --force.
+    let err = run_new("app", Some(&target), false, ScaffoldTemplate::Minimal)
+        .expect_err("a plain file at target must be rejected");
+    assert!(
+        matches!(err, autumn_harvest_cli::CliError::InvalidInput(_)),
+        "must be a clean InvalidInput rejection, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("not a directory"),
+        "error must explain the target is a file, got: {err}"
+    );
+    let forced = run_new("app", Some(&target), true, ScaffoldTemplate::Minimal);
+    assert!(
+        forced.is_err(),
+        "a plain file at target must be rejected even with --force"
+    );
+    // The file is left untouched.
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("file readable"),
+        "i am a file"
     );
 }
 
