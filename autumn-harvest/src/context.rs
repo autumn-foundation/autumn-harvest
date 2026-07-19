@@ -3710,6 +3710,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
@@ -4586,6 +4588,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, \
@@ -4777,6 +4781,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_local_activity never returns AwaitingExternalCompletion, \
@@ -5013,6 +5019,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
@@ -5728,6 +5736,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
@@ -6724,6 +6734,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 let actual = format!("{history_match:?}");
                 Err(self.nd_error(
@@ -7178,6 +7190,8 @@ impl WorkflowContext {
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_external_signal never returns Failed, ActivityInProgress, \
@@ -7322,11 +7336,14 @@ impl WorkflowContext {
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::DetachedChildSpawned { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
-            | HistoryMatch::ExternalSignalFailed { .. } => {
+            | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. } => {
                 unreachable!(
                     "match_external_cancel never returns Failed, ActivityInProgress, \
                      AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
-                     TimedOut, DetachedChildSpawned, ExternalSignalInProgress, or ExternalSignalFailed"
+                     TimedOut, DetachedChildSpawned, ExternalSignalInProgress, ExternalSignalFailed, \
+                     ExternalAwaitInProgress, or ExternalAwaitFailed"
                 )
             }
         }
@@ -8922,6 +8939,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_external_activity never returns ChildInProgress, \
@@ -8989,6 +9008,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 let actual = format!("{history_match:?}");
                 Err(self.nd_error(
