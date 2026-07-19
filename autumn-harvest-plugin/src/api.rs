@@ -26057,6 +26057,10 @@ async fn run_replay_canary_handler(
 async fn replay_diagnosis(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
+    // Issue #608 (PR #1107 Codex review): needed to gate + audit read-path codec
+    // decoding of this execution's payloads (see the load block below).
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<crate::replay_diagnosis::ReplayDiagnosisResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     let runtime = api_state.runtime().map_err(map_error)?;
@@ -26119,30 +26123,103 @@ async fn replay_diagnosis(
         .handler;
 
     // Load the recorded history exactly as the live worker loads it for replay:
-    // decode with the runtime's own codecs (#608) and inflate offloaded payloads
-    // via the registry's offloader (#524), so an encrypted or offloaded history
-    // replays faithfully rather than hard-500ing on ciphertext / false-diverging
-    // on an offload reference envelope. When neither is configured (the default),
-    // `load_history_inflated` with a `None` offloader + identity codecs is
-    // behaviorally identical to `load_history`. Then DROP the DB connection before
-    // driving user code — WorkflowReplayer needs no DB, and holding a pool slot
-    // for the whole replay would starve other management/worker DB operations (the
-    // #612 pool-slot discipline).
+    // codec-decode payloads (#608) and inflate offloaded payloads via the
+    // registry's offloader (#524), so an encrypted or offloaded history replays
+    // faithfully rather than hard-erroring on ciphertext / false-diverging on an
+    // offload reference envelope. Then DROP the DB connection before driving user
+    // code — WorkflowReplayer needs no DB, and holding a pool slot for the whole
+    // replay would starve other management/worker DB operations (the #612
+    // pool-slot discipline).
     //
-    // Design choice: build a HistorySnapshot from the already-loaded execution row
-    // + this history and replay via `replay_canary_snapshot` (drop-first), rather
-    // than `WorkflowReplayer::replay_from_db`, which reloads history + meta and
-    // holds its connection across the whole replay. Both are correct; drop-first
-    // keeps the pool slot free for the ~bounded replay duration.
-    let history = store::load_history_inflated(
-        &mut conn,
-        exec_id,
-        &api_state.payload_codecs(),
-        runtime.registry.payload_offloader(),
-    )
-    .await
-    .map_err(map_error)?;
-    drop(conn);
+    // #608 read-path decode gate (PR #1107 Codex review): decoding is gated
+    // behind the deployment opt-in (`decode_payloads_on_read`) + admin — the
+    // exact `read_path_decoder` predicate every other #608 read surface uses.
+    // The merged endpoint decoded with the runtime's codecs UNCONDITIONALLY,
+    // which on a non-identity-codec deployment (a) decoded — and surfaced, via
+    // `failure.error` / `divergence.expected` / `divergence.actual` — encrypted
+    // payloads even with the operator's decode gate OFF, and (b) dropped the
+    // connection without writing the required `payload.decode_read` audit row.
+    // This route is already admin-gated (`require_admin`), so the gate resolves
+    // to the `decode_payloads_on_read` flag in practice. Offload inflation (#524)
+    // is NOT a #608 concern (a storage indirection, not decryption) and is kept
+    // in BOTH branches so an offloaded history replays faithfully regardless of
+    // the decode gate — matching the closest #608 replay-driving sibling.
+    //
+    // Design choice: build a HistorySnapshot from the already-loaded execution
+    // row + this history and replay via `replay_canary_snapshot` (drop-first),
+    // rather than `WorkflowReplayer::replay_from_db`, which reloads history + meta
+    // and holds its connection across the whole replay. Both are correct;
+    // drop-first keeps the pool slot free for the ~bounded replay duration.
+    let offloader = runtime.registry.payload_offloader();
+    // Decode ON (deployment opt-in + admin): decode with the runtime's real
+    // codecs exactly as the live worker does, and write the audit row when ≥1
+    // codec envelope was decoded. `load_history_inflated` strict-decodes
+    // (matching the worker's replay fidelity); the audit count is derived from a
+    // lossy scan of the raw stored payloads (never used for the replay itself).
+    // Offloaded-then-encrypted payloads (PayloadStore + non-identity codec both
+    // configured) are not offload-inflated for the count, so the audit
+    // conservatively counts inline-encrypted envelopes only — a rare-combo edge
+    // that under-counts, never a leak.
+    let history = if let Some(codecs) =
+        read_path_decoder(&api_state, extension_session(maybe_session)).await
+    {
+        let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
+            .await
+            .map_err(map_error)?;
+        let mut outcome = LossyDecodeOutcome::default();
+        if let Ok(raw) = store::load_history_undecoded(&mut conn, exec_id).await {
+            for event in &raw.events {
+                if let Ok(mut value) = serde_json::to_value(event) {
+                    outcome = outcome.merged(codecs.decode_value_lossy(&mut value));
+                }
+            }
+        }
+        let target = exec_id.to_string();
+        // Reuse the handler's own (execution-shard) connection, mirroring the
+        // history-export audit — a second pool acquire while it is live can
+        // stall a size-1 pool (PR #936 review).
+        audit_decoded_read(
+            &api_state,
+            Some(&mut conn),
+            &headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            "POST /workflows/{id}/replay-diagnosis",
+            Some(exec_id.shard()),
+            outcome,
+            None,
+        )
+        .await;
+        drop(conn);
+        history
+    } else {
+        // Decode OFF (or non-admin): do NOT codec-decode. Load with the identity
+        // codec (still inflating offloaded refs). On an identity-codec deployment
+        // this is byte-identical to the merged behavior — no envelopes exist, so
+        // all 16 identity-deployment integration tests are unaffected. On a
+        // non-identity deployment the identity decode hard-errors
+        // `UnknownPayloadCodec` on the first encrypted envelope; map that to an
+        // HONEST 410 (via `HistoryUnavailable`, the endpoint's existing "history
+        // not diagnosable" contract) rather than leaking ciphertext into the
+        // verdict, false-diverging, or 503-ing — the operator must enable
+        // read-path decoding (admin) to diagnose an encrypted execution.
+        let identity = PayloadCodecs::default();
+        match store::load_history_inflated(&mut conn, exec_id, &identity, offloader).await {
+            Ok(history) => {
+                drop(conn);
+                history
+            }
+            Err(HarvestError::UnknownPayloadCodec { .. }) => {
+                return Err(map_error(HarvestError::HistoryUnavailable {
+                    exec_id,
+                    reason: "payload decoding is required to diagnose this execution; \
+                             enable decode-on-read (admin)"
+                        .to_string(),
+                }));
+            }
+            Err(error) => return Err(map_error(error)),
+        }
+    };
 
     // Whether the recorded history reached its terminal seal — needed by the
     // sealed-mid-await reclassification below, computed before `history.events`

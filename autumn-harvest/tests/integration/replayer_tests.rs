@@ -8812,3 +8812,112 @@ async fn interleaved_sibling_child_workflow_terminal_before_timer_replays_succee
          match_child_workflow re-matches after the rewind:\n{report}"
     );
 }
+
+// ─── Issue #614 (PR #1107 Codex review): STRICT replay honors with_history_policy ───
+//
+// The merged #1107 fix threaded the runtime's history policy into the CANARY
+// replay path only; the STRICT paths (`replay_from_events` / `replay_from_snapshot`
+// → `run_workflow_strict` / `_advancing_clock`) still hardcoded
+// `WorkflowHistoryPolicy::default()`, so a caller that set `with_history_policy`
+// and then used a strict path had the setting silently ignored — a
+// `should_continue_as_new`-branching workflow then false-diverged. This block pins
+// the fix on the strict path: the same workflow + history that DIVERGES under the
+// default policy replays CLEAN once `with_history_policy(threshold = 2)` is set.
+
+/// Schedules `checkpoint` when `should_continue_as_new()` trips (via the
+/// history-size threshold), else `keep_going`. The recorded history fixes which
+/// activity was scheduled, so a wrong effective policy schedules the other
+/// activity and diverges — the decision is observable through replay determinism.
+fn history_policy_branch_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity = if ctx.should_continue_as_new() {
+            "checkpoint"
+        } else {
+            "keep_going"
+        };
+        ctx.execute_activity_raw(activity, Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// A 4-event history recorded by the `checkpoint` branch (event count 4 > the
+/// tuned threshold of 2): `WorkflowStarted`, `ActivityScheduled(checkpoint)`,
+/// `ActivityCompleted`, `WorkflowCompleted`. Under the DEFAULT policy (large
+/// threshold) `should_continue_as_new()` never trips for this small history.
+fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
+    let activity_id = ActivityExecId::new();
+    vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "checkpoint".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn strict_replay_default_policy_diverges_from_low_threshold_history() {
+    // Negative control: under the DEFAULT history policy (large threshold) the
+    // 4-event history never trips `should_continue_as_new()`, so the workflow
+    // schedules `keep_going` and diverges from the recorded `checkpoint`. Proves
+    // the fixture is discriminating (and that the strict-path default is
+    // unchanged for callers that never set a policy).
+    let report = WorkflowReplayer::new()
+        .register_fn("history_policy_branch", history_policy_branch_workflow)
+        .replay_from_events(history_policy_checkpoint_fixture())
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ActivityScheduleMismatch,
+                ..
+            }
+        ),
+        "default policy must diverge (keep_going vs recorded checkpoint):\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn strict_replay_honors_with_history_policy() {
+    // Issue #614 (PR #1107 Codex review): the STRICT `replay_from_events` path
+    // must honor `with_history_policy`. With threshold = 2 the 4-event history
+    // trips `should_continue_as_new()`, so the workflow schedules `checkpoint`,
+    // matching the recorded history → ReplaySucceeded. BEFORE the fix the strict
+    // path hardcoded the default policy, ignored this setter, scheduled
+    // `keep_going`, and reported NonDeterminismDetected (identical to the negative
+    // control above) — so this test is the fix's regression guard.
+    let policy =
+        autumn_harvest::context::WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
+    let report = WorkflowReplayer::new()
+        .with_history_policy(policy)
+        .register_fn("history_policy_branch", history_policy_branch_workflow)
+        .replay_from_events(history_policy_checkpoint_fixture())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "strict replay must honor with_history_policy(threshold=2) and replay clean:\n{report}"
+    );
+}

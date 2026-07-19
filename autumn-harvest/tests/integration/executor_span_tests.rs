@@ -245,6 +245,8 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             // Issue #698: workflow type name / business workflow_id.
             "echo_workflow".to_string(),
             None,
+            // Issue #614: default history policy for this span test.
+            autumn_harvest::context::WorkflowHistoryPolicy::default(),
         ));
 
     // 1. Span must be named correctly.

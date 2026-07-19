@@ -554,6 +554,8 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     // Issue #698: workflow type name / business workflow_id.
                     "telemetry_master_workflow".to_string(),
                     None,
+                    // Issue #614: default history policy for this span test.
+                    autumn_harvest::context::WorkflowHistoryPolicy::default(),
                 )
                 .await;
             });
