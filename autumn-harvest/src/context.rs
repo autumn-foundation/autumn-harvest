@@ -8055,8 +8055,23 @@ impl WorkflowContext {
     /// `max_in_flight`; because activities are dispatched in input order, the
     /// `ActivityScheduled` events are recorded globally in input order `0..N`,
     /// which is what makes replay **window-independent** — the same recorded
-    /// history replays to identical results regardless of the window the
-    /// replaying code is configured with.
+    /// history replays *and resumes* to identical results regardless of the
+    /// window the replaying code is configured with, whether that window is
+    /// **larger or smaller** than the one that produced the recorded state.
+    ///
+    /// This holds because a windowed call runs in **two phases**: it first
+    /// *resumes* the already-scheduled input-order prefix as one homogeneous
+    /// batch (every prefix slot is in history, so each resolves to `Matched` or
+    /// emits only `WaitForActivity` — never `ScheduleActivity`), and only once
+    /// that prefix is fully resolved does it dispatch the fresh remainder in
+    /// `W`-sized waves. This is what prevents a mid-flight window **increase**
+    /// from regrouping an in-flight slot with never-scheduled fresh slots into a
+    /// mixed `[WaitForActivity + ScheduleActivity]` suspension batch the worker
+    /// cannot persist. On a window **decrease**, already-scheduled work (up to
+    /// the old, larger window) drains during the resume phase before the smaller
+    /// window governs any further dispatch, so peak in-flight can briefly exceed
+    /// the newly-lowered window — inherent and correct (the window bounds *new*
+    /// dispatch, never work already in flight).
     ///
     /// Fail-fast: the **first** activity failure aborts the call and later
     /// waves are **never dispatched** (a deliberate backpressure semantic — a
@@ -8072,7 +8087,8 @@ impl WorkflowContext {
     ///
     /// # Cancellation
     ///
-    /// `is_cancelled()` is checked **before each wave**. Returns
+    /// `is_cancelled()` is checked up front and again at the start of every
+    /// drive cycle (before dispatching any further wave). Returns
     /// [`HarvestError::Cancelled`] when the workflow has been cancelled.
     ///
     /// # Errors
