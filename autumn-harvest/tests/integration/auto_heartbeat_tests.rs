@@ -1,7 +1,7 @@
 #![cfg(feature = "db")]
 //! Auto-heartbeat guard behavioural tests — issue #682.
 //!
-//! Two complementary proofs:
+//! Three complementary proofs:
 //!
 //! * TEST A (`auto_heartbeat_prevents_spurious_heartbeat_reclaim`): the value of
 //!   the feature. A long-running activity that never manually heartbeats but
@@ -19,6 +19,14 @@
 //!   NOT protect a wedged activity from the independent `start_to_close`
 //!   ceiling. Also asserts the converse: a stale heartbeat IS reclaimed as
 //!   `Heartbeat`, so the fresh-heartbeat protection is real, not vacuous.
+//!
+//! * TEST C (`auto_heartbeat_activity_still_reclaimed_by_start_to_close`): the
+//!   end-to-end complement to TEST B. A real activity installs
+//!   `ctx.start_auto_heartbeat_default()` and then wedges by sleeping past a
+//!   tight `start_to_close`; driven through the worker with a live scanner, it
+//!   IS reclaimed as `StartToClose` (never `Heartbeat`) and the workflow fails —
+//!   proving auto-heartbeat defeats only the heartbeat timeout, never the hard
+//!   `start_to_close` ceiling.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted
@@ -287,12 +295,44 @@ fn long_auto_hb_activity(
         let _guard = ctx
             .start_auto_heartbeat_default()
             .map_err(|e| e.to_string())?;
-        // heartbeat_timeout is 3s (see ActivityInfo); run for ~11s (>3×).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(11);
+        // heartbeat_timeout is 6s (see ActivityInfo); auto interval is 2s, so
+        // the freshness margin is ~3s of leeway against the 6s window even on a
+        // loaded CI runner. Run for ~19s (> 3× the window).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(19);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(150)).await;
             ctx.check_cancellation().await.map_err(|e| e.to_string())?;
         }
+        Ok(serde_json::json!({"done": true}))
+    })
+}
+
+/// Workflow that calls the wedging auto-heartbeat activity (TEST C).
+fn workflow_calls_wedge_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("wedge_auto_hb_activity", input, "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Activity that installs an auto-heartbeat guard (keeping `last_heartbeat_at`
+/// fresh) and then *wedges* by sleeping well past its tight `start_to_close`
+/// ceiling without cooperating. Proves the full composition: auto-heartbeat
+/// defeats only the heartbeat timeout, NEVER the independent `start_to_close`
+/// ceiling — the wedge is still reclaimed.
+fn wedge_auto_hb_activity(
+    ctx: &autumn_harvest::ActivityContext,
+    _input: serde_json::Value,
+) -> BoxFut<'_> {
+    Box::pin(async move {
+        let _guard = ctx
+            .start_auto_heartbeat_default()
+            .map_err(|e| e.to_string())?;
+        // heartbeat_timeout is 3s (auto interval 1s keeps last_heartbeat_at
+        // fresh); start_to_close is 2s. Sleep ~8s so the scanner reclaims via
+        // start_to_close while the activity is still "running" and pinging.
+        tokio::time::sleep(Duration::from_secs(8)).await;
         Ok(serde_json::json!({"done": true}))
     })
 }
@@ -367,12 +407,13 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
 
     let registry = build_registry(
         vec![workflow_info("long_wf", workflow_calls_long_activity)],
-        // heartbeat_timeout = 3s, NO start_to_close (so only heartbeat
-        // enforcement is active). Default auto interval = 3s / 3 = 1s.
+        // heartbeat_timeout = 6s, NO start_to_close (so only heartbeat
+        // enforcement is active). Default auto interval = 6s / 3 = 2s, giving a
+        // ~3s freshness margin against the 6s window (widened for CI headroom).
         vec![activity_info(
             "long_auto_hb_activity",
             long_auto_hb_activity,
-            Some(Duration::from_secs(3)),
+            Some(Duration::from_secs(6)),
             None,
         )],
     );
@@ -410,8 +451,8 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
         }
     });
 
-    // The activity runs ~11s; give a generous ceiling for CI.
-    let execution = wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(40)).await;
+    // The activity runs ~19s; give a generous ceiling for CI.
+    let execution = wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(60)).await;
 
     scanner_stop.notify_one();
     let _ = scanner_handle.await;
@@ -559,5 +600,100 @@ async fn fresh_heartbeat_does_not_defeat_start_to_close() {
         reason_for(&timed_out, stale_no_s2c),
         Some(TimeoutReason::Heartbeat),
         "a stale heartbeat with an elapsed heartbeat_timeout must be reclaimed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TEST C — end-to-end: an auto-heartbeat activity is still reclaimed by
+// start_to_close (the airtight full-composition wedge proof, AC).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_heartbeat_activity_still_reclaimed_by_start_to_close() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = seed_workflow(&mut conn, "wedge_wf_e2e", serde_json::json!({"n": 1})).await;
+
+    let registry = build_registry(
+        vec![workflow_info("wedge_wf_e2e", workflow_calls_wedge_activity)],
+        // heartbeat_timeout = 3s (auto interval 1s keeps last_heartbeat_at
+        // fresh), start_to_close = 2s (the tight ceiling the wedge cannot
+        // escape). Default auto interval = 3s / 3 = 1s.
+        vec![activity_info(
+            "wedge_auto_hb_activity",
+            wedge_auto_hb_activity,
+            Some(Duration::from_secs(3)),
+            Some(Duration::from_secs(2)),
+        )],
+    );
+    let worker = build_worker("worker-wedge-hb", Arc::clone(&registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let run_handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // Background timeout scanner sweeping every 250ms — enforces start_to_close
+    // even though the auto-heartbeat keeps `last_heartbeat_at` fresh.
+    let scanner_pool = pool.clone();
+    let scanner_stop = Arc::new(tokio::sync::Notify::new());
+    let scanner_stop_for_task = Arc::clone(&scanner_stop);
+    let scanner_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = scanner_stop_for_task.notified() => break,
+                () = tokio::time::sleep(Duration::from_millis(250)) => {
+                    let mut c = scanner_pool.get().await.expect("scanner conn");
+                    let _ = timeout::enforce_timeouts_once(
+                        &mut c,
+                        &NoOpMetrics,
+                        Duration::from_secs(60),
+                        &None,
+                        &[ShardId::new(0)],
+                        None,
+                        None,
+                        60,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+
+    // The wedge is reclaimed by start_to_close (~2s) and the workflow fails; a
+    // generous ceiling for CI.
+    let execution = wait_for_state(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+
+    scanner_stop.notify_one();
+    let _ = scanner_handle.await;
+    worker.shutdown();
+    let _ = run_handle.await;
+
+    assert_eq!(execution.state, "FAILED");
+
+    // The wedge was reclaimed by StartToClose, NOT Heartbeat: the auto-heartbeat
+    // kept `last_heartbeat_at` fresh, so the ONLY thing that could reclaim it is
+    // the independent start_to_close ceiling. This is the airtight
+    // full-composition proof requested by the coordinator.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: autumn_harvest::error::TimeoutType::StartToClose,
+                ..
+            }
+        )),
+        "the wedged auto-heartbeat activity must be reclaimed by start_to_close; history={history:?}"
+    );
+    assert!(
+        !history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: autumn_harvest::error::TimeoutType::Heartbeat,
+                ..
+            }
+        )),
+        "auto-heartbeat must keep last_heartbeat_at fresh — no Heartbeat reclaim; history={history:?}"
     );
 }

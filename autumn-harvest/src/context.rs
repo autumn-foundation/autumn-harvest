@@ -10271,13 +10271,28 @@ impl Drop for AutoHeartbeatGuard {
 }
 
 impl AutoHeartbeatGuard {
-    /// Test-only: whether the ticker task has terminated (used to prove the
-    /// ticker exits cleanly via `break` — never a panic — once the heartbeat
-    /// channel is closed).
+    /// Test-only: consume the guard and extract its ticker `JoinHandle`
+    /// **without** running [`Drop`] (which would `abort()` the task).
+    ///
+    /// Used to prove the ticker exits *cleanly* — awaiting the returned handle
+    /// yields `Ok(())` when a closed heartbeat channel makes the loop `break`,
+    /// and a `JoinError` only if it panicked. This is stronger than
+    /// `JoinHandle::is_finished()`, which is also `true` for a task that
+    /// panicked.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub fn is_ticker_finished(&self) -> bool {
-        self.handle.is_finished()
+    pub fn into_join_handle(self) -> tokio::task::JoinHandle<()> {
+        let md = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `md` is a `ManuallyDrop`, so `Drop for AutoHeartbeatGuard`
+        // (which would `handle.abort()`) never runs, and each field is moved out
+        // exactly once — no double-free. The abort is deliberately bypassed so
+        // the ticker can terminate on its own via the closed channel.
+        let handle = unsafe { std::ptr::read(&raw const md.handle) };
+        // Dropping the `stop` token does NOT cancel it (only `.cancel()` does),
+        // so the ticker still exits only via the closed channel, as intended.
+        let stop = unsafe { std::ptr::read(&raw const md.stop) };
+        drop(stop);
+        handle
     }
 }
 
@@ -13279,13 +13294,18 @@ mod tests {
         // Close the channel: the flusher's receiver is gone.
         drop(rx);
 
-        // The next tick's send fails; the ticker must break (never .unwrap()).
+        // The next tick's send fails; the ticker must break cleanly (never .unwrap()).
         advance_ticks(interval, 3).await;
 
+        // Extract the handle without running Drop (which would abort the task)
+        // and prove the ticker exited via a clean `break` returning Ok(()) — a
+        // panic would surface as a JoinError. `JoinHandle::is_finished()` alone
+        // is insufficient here (it is also true for a panicked task).
+        let joined = guard.into_join_handle().await;
         assert!(
-            guard.is_ticker_finished(),
-            "the ticker task must terminate (via break, not panic) once the \
-             heartbeat channel is closed"
+            joined.is_ok(),
+            "the ticker must exit cleanly (Ok) via break on a closed channel, \
+             not panic; got {joined:?}"
         );
     }
 
@@ -13342,6 +13362,94 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_default_interval_is_timeout_over_three() {
+        // AC#2: start_auto_heartbeat_default() derives interval = heartbeat_timeout / 3.
+        // With heartbeat_timeout = 9s the interval must be exactly 3s. This
+        // distinguishes /3 (3s) from /2 (4.5s), /1 (9s), and *3 (27s): a second
+        // ping arrives at exactly 3s, not before and not later.
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(9));
+        let _guard = ctx
+            .start_auto_heartbeat_default()
+            .expect("default auto-heartbeat should start with a configured timeout");
+
+        // Let the ticker spawn and fire its immediate first tick.
+        tokio::task::yield_now().await;
+        let first = drain(&mut rx);
+        assert_eq!(
+            first.len(),
+            1,
+            "the immediate first tick should have fired exactly once, got {first:?}"
+        );
+
+        // Advance to just before the derived 3s boundary (2999ms): no second
+        // ping yet (rules out any interval < 3s, e.g. /9=1s or a stray /2).
+        tokio::time::advance(Duration::from_millis(2999)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no second ping before the derived 3s interval elapses"
+        );
+
+        // Cross the exact 3s boundary: the second ping fires now (rules out any
+        // interval > 3s, e.g. /2=4.5s or the whole 9s timeout).
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "the second ping must fire exactly at the derived 3s (= 9s / 3) boundary"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_first_ping_preserves_resume_checkpoint() {
+        // AC#4 (#151 under #682): the auto-heartbeat cell is seeded from the
+        // previous attempt's resume snapshot in new_with_cancellation_check, so
+        // the FIRST liveness ping (before any manual ctx.heartbeat) re-sends the
+        // resumed checkpoint rather than clobbering it with `null`. A regression
+        // to Mutex::new(None) would silently drop the checkpoint on retry.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Lazily-built pool: never connected (the ticker path never touches the
+        // durable cancellation check), it only satisfies the ctor signature.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://invalid-not-connected/db");
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool should build without connecting");
+
+        let ctx = ActivityContext::new_with_cancellation_check(
+            empty_shared_state(),
+            Some(tx),
+            Some(serde_json::json!({"checkpoint": 42})),
+            cancel,
+            uuid::Uuid::new_v4(),
+            pool,
+        )
+        .with_heartbeat_timeout(Duration::from_secs(3));
+
+        // No manual heartbeat: start the ticker and let its first ping fire.
+        let interval = Duration::from_millis(200);
+        let _guard = ctx
+            .start_auto_heartbeat(interval)
+            .expect("auto-heartbeat should start");
+
+        advance_ticks(interval, 1).await;
+
+        let pings = drain(&mut rx);
+        assert!(!pings.is_empty(), "the first auto ping should have fired");
+        assert!(
+            pings
+                .iter()
+                .all(|v| v == &serde_json::json!({"checkpoint": 42})),
+            "the first auto ping must re-send the resumed checkpoint (not null), got {pings:?}"
+        );
+    }
+
     #[tokio::test]
     async fn auto_heartbeat_requires_heartbeat_timeout() {
         // Live flusher, but NO heartbeat_timeout configured: both methods reject
@@ -13353,16 +13461,16 @@ mod tests {
         assert!(
             matches!(
                 ctx.start_auto_heartbeat(Duration::from_millis(100)),
-                Err(HarvestError::Config(_))
+                Err(HarvestError::Config(message)) if message.contains("heartbeat_timeout")
             ),
-            "start_auto_heartbeat must require a configured heartbeat_timeout"
+            "start_auto_heartbeat must reject with a heartbeat_timeout-specific message"
         );
         assert!(
             matches!(
                 ctx.start_auto_heartbeat_default(),
-                Err(HarvestError::Config(_))
+                Err(HarvestError::Config(message)) if message.contains("heartbeat_timeout")
             ),
-            "start_auto_heartbeat_default must require a configured heartbeat_timeout"
+            "start_auto_heartbeat_default must reject with a heartbeat_timeout-specific message"
         );
     }
 
