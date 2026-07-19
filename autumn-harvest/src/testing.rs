@@ -2989,8 +2989,16 @@ pub struct WorkflowTestEnv {
     /// the target's terminal cause (`reason_code`, message, typed fields). An
     /// awaited target present here resolves to the typed `Err` branch. Takes
     /// precedence over `external_await_results` if both are set for a target.
-    external_await_failures:
-        HashMap<ExecutionId, (String, Option<String>, Option<String>, Option<Value>, Option<bool>)>,
+    external_await_failures: HashMap<
+        ExecutionId,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<Value>,
+            Option<bool>,
+        ),
+    >,
 }
 
 impl Default for WorkflowTestEnv {
@@ -4719,6 +4727,10 @@ mod tests {
         assert_eq!(
             classify_kind("external signal", "ActivityScheduled"),
             NonDeterminismKind::ExternalSignalMismatch
+        );
+        assert_eq!(
+            classify_kind("external await", "ExternalAwaitRequested(target=x)"),
+            NonDeterminismKind::ExternalAwaitMismatch
         );
         assert_eq!(
             classify_kind("continue-as-new", ""),

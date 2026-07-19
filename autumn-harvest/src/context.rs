@@ -18034,6 +18034,188 @@ mod tests {
         }
     }
 
+    // ── await_external_workflow tests (issue #757) ───────────────────────────
+
+    #[tokio::test]
+    async fn await_external_workflow_live_mode_emits_command() {
+        let target = ExecutionId::new();
+        let ctx = WorkflowContext::new_test();
+        let cmd_fut = ctx.await_external_workflow_value(target);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "one AwaitExternalWorkflow command expected");
+        match &cmds[0] {
+            WorkflowCommand::AwaitExternalWorkflow {
+                target: t,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(*t, target);
+                assert!(!already_requested, "first call is not already_requested");
+            }
+            other => panic!("expected AwaitExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_self_await_rejected_records_no_history() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        );
+        let result = ctx.await_external_workflow_value(own_id).await;
+        assert!(result.is_err(), "self-await should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalAwaitFailed {
+                reason_code,
+                target,
+                await_id,
+            } => {
+                assert_eq!(reason_code, "self_await");
+                assert_eq!(target, own_id);
+                // Nil sentinel — self-await records no history, so the id is stable.
+                assert_eq!(await_id.as_uuid(), uuid::Uuid::nil());
+            }
+            other => panic!("expected ExternalAwaitFailed(self_await), got {other:?}"),
+        }
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "self-await emits no commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_replays_resolved_output() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({ "tracking": "xyz" }),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.await_external_workflow_value(target).await;
+        assert_eq!(result.unwrap(), serde_json::json!({ "tracking": "xyz" }));
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_replays_failed_target_as_typed_workflow_failed() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_failed".into(),
+                message: Some("card declined".into()),
+                error_type: Some("PaymentDeclined".into()),
+                details: Some(serde_json::json!({ "code": 402 })),
+                non_retryable: Some(true),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx.await_external_workflow_value(target).await.unwrap_err();
+        // A terminal-not-completed target surfaces as a typed WorkflowFailed.
+        assert_eq!(err.workflow_error_type(), Some("PaymentDeclined"));
+        assert_eq!(err.workflow_details().unwrap()["code"], 402);
+        assert!(err.is_workflow_non_retryable());
+        match err {
+            HarvestError::WorkflowFailed { name, reason, .. } => {
+                assert_eq!(name, format!("external-workflow:{target}"));
+                assert_eq!(reason, "card declined");
+            }
+            other => panic!("expected WorkflowFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_replays_target_unknown_as_await_failed() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_unknown".into(),
+                message: None,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx.await_external_workflow_value(target).await.unwrap_err();
+        match err {
+            HarvestError::ExternalAwaitFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_unknown");
+            }
+            other => panic!("expected ExternalAwaitFailed(target_unknown), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_nondeterminism_wrong_target() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let other_target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: Value::Null,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .await_external_workflow_value(other_target)
+            .await
+            .unwrap_err();
+        match err {
+            HarvestError::NonDeterministic { reason: msg, .. } => {
+                assert!(msg.contains("external await mismatch"), "msg: {msg}");
+            }
+            other => panic!("expected NonDeterministic, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn cancel_external_workflow_after_activity_replays_correctly() {
         let cancel_id = crate::types::ExternalCancelId::new();

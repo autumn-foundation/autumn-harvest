@@ -5700,9 +5700,9 @@ pub async fn read_external_await_outcome(
         };
 
         let outcome = match execution.state.as_str() {
-            "COMPLETED" => ExternalAwaitOutcome::Completed(
-                execution.output.unwrap_or(serde_json::Value::Null),
-            ),
+            "COMPLETED" => {
+                ExternalAwaitOutcome::Completed(execution.output.unwrap_or(serde_json::Value::Null))
+            }
             "FAILED" => {
                 let decoded = execution
                     .error

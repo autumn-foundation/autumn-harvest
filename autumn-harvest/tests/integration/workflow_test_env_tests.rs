@@ -3437,3 +3437,124 @@ async fn test_default_env_metadata_in_activity_input_replays_clean() {
          clean:\n{report}"
     );
 }
+
+// ── await_external_workflow coverage (issue #757) ────────────────────────────
+
+/// Awaits an external target and returns its output verbatim.
+fn await_target_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(input["target"].as_str().ok_or("missing target")?)
+                .map_err(|e| e.to_string())?,
+        );
+        let out = ctx
+            .await_external_workflow_value(target)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    })
+}
+
+/// Awaits an external target and surfaces the typed failure fields into its
+/// output so a test can assert the Err branch's typed cause.
+fn await_target_capturing_error_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(input["target"].as_str().ok_or("missing target")?)
+                .map_err(|e| e.to_string())?,
+        );
+        match ctx.await_external_workflow_value(target).await {
+            Ok(v) => Ok(json!({ "ok": v })),
+            Err(e) => Ok(json!({
+                "error_type": e.workflow_error_type(),
+                "message": e.to_string(),
+            })),
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_ok_branch() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_result(target, json!({ "tracking": "abc" }))
+        .run(
+            await_target_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    assert_eq!(outcome.result, Ok(json!({ "tracking": "abc" })));
+    let events = outcome.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitRequested { .. })),
+        "expected ExternalAwaitRequested"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitResolved { .. })),
+        "expected ExternalAwaitResolved"
+    );
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_typed_err_branch() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_failure(
+            target,
+            "target_failed",
+            Some("card declined".to_string()),
+            Some("PaymentDeclined".to_string()),
+            None,
+            Some(true),
+        )
+        .run(
+            await_target_capturing_error_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    let result = outcome.result.clone().expect("workflow completes");
+    assert_eq!(result["error_type"], json!("PaymentDeclined"));
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("card declined"),
+        "message should carry the target's terminal cause: {result}"
+    );
+    // The typed failure is frozen into the awaiter's history.
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ExternalAwaitFailed { .. })),
+        "expected ExternalAwaitFailed in history"
+    );
+}
+
+#[tokio::test]
+async fn test_await_external_workflow_replays_deterministically() {
+    let target = ExecutionId::new();
+    let outcome = WorkflowTestEnv::new()
+        .with_external_await_result(target, json!(42))
+        .run(
+            await_target_workflow,
+            json!({ "target": target.to_string() }),
+        )
+        .await;
+    outcome.result.clone().expect("workflow completes");
+    let report = outcome.replay_check(await_target_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a workflow awaiting an external target must replay clean:\n{report}"
+    );
+}

@@ -11846,9 +11846,10 @@ mod tests {
     fn match_external_await_requested_no_terminal_is_in_progress() {
         let target = ExecutionId::new();
         let await_id = ExternalAwaitId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            WorkflowEvent::ExternalAwaitRequested { await_id, target },
-        ]);
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::ExternalAwaitRequested {
+            await_id,
+            target,
+        }]);
         assert_eq!(
             matcher.match_external_await(target),
             HistoryMatch::ExternalAwaitInProgress { await_id }
@@ -11860,12 +11861,10 @@ mod tests {
         let recorded_target = ExecutionId::new();
         let requested_target = ExecutionId::new();
         let await_id = ExternalAwaitId::new();
-        let mut matcher = HistoryMatcher::new(vec![
-            WorkflowEvent::ExternalAwaitRequested {
-                await_id,
-                target: recorded_target,
-            },
-        ]);
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::ExternalAwaitRequested {
+            await_id,
+            target: recorded_target,
+        }]);
         assert!(matches!(
             matcher.match_external_await(requested_target),
             HistoryMatch::Diverged { .. }
