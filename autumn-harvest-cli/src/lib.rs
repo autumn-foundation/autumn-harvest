@@ -87,6 +87,15 @@ pub enum DetCheckFormat {
     Json,
 }
 
+/// Project template flavour for `harvest new` (issue #692).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ScaffoldTemplate {
+    /// One `#[workflow]` calling one `#[activity]`, `HarvestPlugin` wiring, a
+    /// `compose.yaml` Postgres, and a README with the exact run steps.
+    #[default]
+    Minimal,
+}
+
 /// Signal reapply policy for `workflow reset`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ResetSignalReapply {
@@ -609,6 +618,32 @@ enum Commands {
         /// location, then exit `0` (audit mode).
         #[arg(long, default_value_t = false)]
         list_suppressions: bool,
+    },
+
+    /// Scaffold a new, runnable autumn-harvest project (issue #692).
+    ///
+    /// Emits a complete crate — a `Cargo.toml` with crates.io deps and the `db`
+    /// feature, a `#[workflow]`/`#[activity]` pair with `HarvestPlugin` wiring, a
+    /// `compose.yaml` Postgres, an `autumn.toml`, and a README whose three-command
+    /// path reaches one terminal execution. Pure local file generation: no
+    /// database, no network. Everything is named after `<name>` — no manual
+    /// find-and-replace of example identifiers.
+    New {
+        /// Project name. Becomes the crate name, the workflow/activity function
+        /// stems, and the activity queue. Must be a valid Cargo package name
+        /// (letters/digits/`-`/`_`, starting with a letter).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Target directory (defaults to `./<name>`).
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Overwrite files in a non-empty target directory. Opt-in; never
+        /// removes files it did not write (no `rm -rf`).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Template to emit. Currently only `minimal` ships.
+        #[arg(long, value_enum, default_value_t)]
+        template: ScaffoldTemplate,
     },
 }
 
@@ -2024,6 +2059,9 @@ impl Cli {
             Commands::DetCheck { .. } => {
                 unreachable!("DetCheck handles its own execution locally")
             }
+            Commands::New { .. } => {
+                unreachable!("New handles its own execution locally")
+            }
         }
     }
 }
@@ -2102,6 +2140,17 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     } = &cli.command
     {
         return run_det_check(paths, *format, *deny_warnings, *list_suppressions);
+    }
+
+    // `new` is pure local file generation: no HTTP, no DB (mirrors DetCheck).
+    if let Commands::New {
+        name,
+        path,
+        force,
+        template,
+    } = &cli.command
+    {
+        return run_new(name, path.as_deref(), *force, *template);
     }
 
     // Token bootstrap is an OFFLINE seed: print the secret + INSERT SQL, open no
@@ -2430,6 +2479,259 @@ pub fn run_det_check(
         return Err(err);
     }
     Ok(())
+}
+
+// ── harvest new: project scaffolding (issue #692) ───────────────────────────
+
+/// Every identifier the scaffold derives from the project `<name>`.
+///
+/// All fields are a pure function of `<name>`, so a generated project never
+/// contains leftover example identifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScaffoldNames {
+    /// The Cargo package name (may contain `-`), verbatim `<name>`.
+    pub crate_name: String,
+    /// A valid Rust identifier derived from `<name>` (`-` → `_`).
+    pub ident: String,
+    /// The workflow function name, `{ident}_workflow`.
+    pub workflow_fn: String,
+    /// The activity function name, `{ident}_activity`.
+    pub activity_fn: String,
+    /// The activity queue name, `{ident}`.
+    pub queue: String,
+}
+
+/// Rust keywords (strict + reserved) that must not be used as an identifier.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+    "use", "where", "while", "async", "await", "abstract", "become", "box", "do", "final", "gen",
+    "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "union",
+];
+
+/// Cargo/Rust special names that produce confusing or conflicting crates.
+const RESERVED_PROJECT_NAMES: &[&str] = &[
+    "test",
+    "deps",
+    "build",
+    "core",
+    "std",
+    "alloc",
+    "proc-macro",
+    "proc_macro",
+    "main",
+    "lib",
+];
+
+/// The maximum accepted project-name length.
+const MAX_PROJECT_NAME_LEN: usize = 64;
+
+/// The embedded `minimal` template: (relative output path, template body).
+const MINIMAL_TEMPLATE: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../templates/minimal/Cargo.toml.tmpl"),
+    ),
+    (
+        "src/main.rs",
+        include_str!("../templates/minimal/main.rs.tmpl"),
+    ),
+    (
+        "README.md",
+        include_str!("../templates/minimal/README.md.tmpl"),
+    ),
+    (
+        "compose.yaml",
+        include_str!("../templates/minimal/compose.yaml.tmpl"),
+    ),
+    (
+        "autumn.toml",
+        include_str!("../templates/minimal/autumn.toml.tmpl"),
+    ),
+    (
+        ".gitignore",
+        include_str!("../templates/minimal/gitignore.tmpl"),
+    ),
+];
+
+/// Derives the Rust identifier form of a project name (`-` → `_`).
+#[must_use]
+pub fn derive_crate_ident(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+/// Validates a project name for use as both a Cargo package name and (after
+/// `-` → `_`) a Rust identifier.
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidInput`] when the name is empty, too long, not a
+/// valid Cargo package name (`^[A-Za-z][A-Za-z0-9_-]*$`), a Rust keyword, or a
+/// reserved project name.
+pub fn validate_project_name(name: &str) -> Result<(), CliError> {
+    if name.is_empty() {
+        return Err(CliError::InvalidInput(
+            "invalid project name: name must not be empty".to_string(),
+        ));
+    }
+    if name.len() > MAX_PROJECT_NAME_LEN {
+        return Err(CliError::InvalidInput(format!(
+            "invalid project name '{name}': must be at most {MAX_PROJECT_NAME_LEN} characters"
+        )));
+    }
+    let first = name.chars().next().unwrap_or('\0');
+    if !first.is_ascii_alphabetic() {
+        return Err(CliError::InvalidInput(format!(
+            "invalid project name '{name}': must start with an ASCII letter"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(CliError::InvalidInput(format!(
+            "invalid project name '{name}': only ASCII letters, digits, '-' and '_' are allowed"
+        )));
+    }
+    let ident = derive_crate_ident(name);
+    if RUST_KEYWORDS.contains(&ident.as_str()) || RUST_KEYWORDS.contains(&name) {
+        return Err(CliError::InvalidInput(format!(
+            "invalid project name '{name}': resolves to the Rust keyword '{ident}'"
+        )));
+    }
+    if RESERVED_PROJECT_NAMES.contains(&name) || RESERVED_PROJECT_NAMES.contains(&ident.as_str()) {
+        return Err(CliError::InvalidInput(format!(
+            "invalid project name '{name}': '{name}' is a reserved name"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates `name` and derives every scaffold identifier from it.
+///
+/// # Errors
+///
+/// Propagates [`validate_project_name`]'s error for an invalid name.
+pub fn derive_names(name: &str) -> Result<ScaffoldNames, CliError> {
+    validate_project_name(name)?;
+    let ident = derive_crate_ident(name);
+    Ok(ScaffoldNames {
+        crate_name: name.to_string(),
+        workflow_fn: format!("{ident}_workflow"),
+        activity_fn: format!("{ident}_activity"),
+        queue: ident.clone(),
+        ident,
+    })
+}
+
+/// Replaces every `{{key}}` placeholder in `template` with its value, applying
+/// substitutions in the given order.
+#[must_use]
+pub fn apply_substitutions(template: &str, subs: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (key, value) in subs {
+        out = out.replace(key, value);
+    }
+    out
+}
+
+/// Renders the `minimal` template for `names`, returning
+/// `(relative_output_path, rendered_content)` for every file to emit.
+#[must_use]
+pub fn render_minimal(names: &ScaffoldNames) -> Vec<(&'static str, String)> {
+    let subs = [
+        ("{{crate_name}}", names.crate_name.as_str()),
+        ("{{ident}}", names.ident.as_str()),
+        ("{{workflow_fn}}", names.workflow_fn.as_str()),
+        ("{{activity_fn}}", names.activity_fn.as_str()),
+        ("{{queue}}", names.queue.as_str()),
+    ];
+    MINIMAL_TEMPLATE
+        .iter()
+        .map(|(path, body)| (*path, apply_substitutions(body, &subs)))
+        .collect()
+}
+
+/// Returns `true` when `dir` exists and contains at least one entry.
+fn dir_is_non_empty(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// Scaffolds a new project named `name` into `path` (default `./<name>`).
+///
+/// Validates the name and renders the template entirely before writing any
+/// file, so an invalid name or a non-empty target (without `force`) leaves the
+/// filesystem untouched. Never removes files it did not write.
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidInput`] for an invalid name or a non-empty target
+/// directory without `force`, or [`CliError::WriteOutput`] on an I/O failure.
+pub fn run_new(
+    name: &str,
+    path: Option<&Path>,
+    force: bool,
+    template: ScaffoldTemplate,
+) -> Result<(), CliError> {
+    let names = derive_names(name)?;
+    let default_path = PathBuf::from(&names.crate_name);
+    let target = path.unwrap_or(&default_path);
+
+    if !force && dir_is_non_empty(target) {
+        return Err(CliError::InvalidInput(format!(
+            "target directory '{}' is not empty; pass --force to overwrite",
+            target.display()
+        )));
+    }
+
+    let files = match template {
+        ScaffoldTemplate::Minimal => render_minimal(&names),
+    };
+
+    // Render is complete and the target passed the safety check: now write.
+    fs::create_dir_all(target).map_err(|source| CliError::WriteOutput {
+        path: target.display().to_string(),
+        source,
+    })?;
+    for (rel, content) in &files {
+        let out = target.join(rel);
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(|source| CliError::WriteOutput {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        fs::write(&out, content).map_err(|source| CliError::WriteOutput {
+            path: out.display().to_string(),
+            source,
+        })?;
+    }
+
+    print_new_next_steps(&names, target);
+    Ok(())
+}
+
+/// Prints the post-scaffold "next steps" (the three-command run path).
+fn print_new_next_steps(names: &ScaffoldNames, target: &Path) {
+    println!(
+        "Created project '{}' in {}",
+        names.crate_name,
+        target.display()
+    );
+    println!();
+    println!("Next steps:");
+    println!("  cd {}", target.display());
+    println!("  docker compose up -d");
+    println!("  AUTUMN_PROFILE=dev cargo run");
+    println!();
+    println!(
+        "  # then trigger a run:\n  curl -X POST http://localhost:3000/api/harvest/workflows/{}/start \\",
+        names.workflow_fn
+    );
+    println!(
+        "    -H 'Content-Type: application/json' -d '{{\"workflow_id\":\"demo-1\",\"input\":\"World\"}}'"
+    );
 }
 
 /// Execute the API request represented by the CLI arguments.

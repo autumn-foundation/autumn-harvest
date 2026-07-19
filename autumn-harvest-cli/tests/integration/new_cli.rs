@@ -22,18 +22,17 @@ fn quickstart_main_rs() -> String {
 }
 
 /// Convenience: render the minimal template for `name`, returning
-/// (relative_path, content) pairs. Panics if the name is invalid.
+/// `(relative_path, content)` pairs. Panics if the name is invalid.
 fn render(name: &str) -> Vec<(&'static str, String)> {
     let names = derive_names(name).expect("name should be valid");
     render_minimal(&names)
 }
 
 fn file_content<'a>(files: &'a [(&'static str, String)], rel: &str) -> &'a str {
-    files
-        .iter()
-        .find(|(p, _)| *p == rel)
-        .map(|(_, c)| c.as_str())
-        .unwrap_or_else(|| panic!("template must emit {rel}"))
+    match files.iter().find(|(p, _)| *p == rel) {
+        Some((_, c)) => c.as_str(),
+        None => panic!("template must emit {rel}"),
+    }
 }
 
 // ── name derivation & substitution (unit-ish, over the public surface) ───────
@@ -80,15 +79,15 @@ fn apply_substitutions_replaces_all_keys_and_leaves_none() {
 #[test]
 fn invalid_project_names_are_rejected() {
     for bad in [
-        "",           // empty
-        "123bad",     // starts with a digit
-        "has space",  // whitespace
-        "a.b",        // dot / path-ish
-        "../evil",    // path traversal
-        "a/b",        // separator
-        "fn",         // Rust keyword (via ident)
-        "match",      // Rust keyword
-        "-lead",      // leading hyphen
+        "",          // empty
+        "123bad",    // starts with a digit
+        "has space", // whitespace
+        "a.b",       // dot / path-ish
+        "../evil",   // path traversal
+        "a/b",       // separator
+        "fn",        // Rust keyword (via ident)
+        "match",     // Rust keyword
+        "-lead",     // leading hyphen
     ] {
         assert!(
             derive_names(bad).is_err(),
@@ -114,8 +113,14 @@ fn generated_cargo_toml_uses_cratesio_version_deps_and_no_path() {
     let files = render("my-app");
     let cargo = file_content(&files, "Cargo.toml");
     assert!(cargo.contains("name = \"my-app\""), "cargo: {cargo}");
-    assert!(cargo.contains("autumn-harvest = { version = \"0.4\""), "cargo: {cargo}");
-    assert!(cargo.contains("autumn-harvest-plugin = \"0.4\""), "cargo: {cargo}");
+    assert!(
+        cargo.contains("autumn-harvest = { version = \"0.4\""),
+        "cargo: {cargo}"
+    );
+    assert!(
+        cargo.contains("autumn-harvest-plugin = \"0.4\""),
+        "cargo: {cargo}"
+    );
     assert!(cargo.contains("autumn-web = \"0.5\""), "cargo: {cargo}");
     assert!(cargo.contains("features = [\"db\"]"), "cargo: {cargo}");
     assert!(
@@ -132,7 +137,10 @@ fn generated_main_rs_substitutes_all_identifiers() {
     assert!(main.contains("async fn my_app_activity"), "main: {main}");
     assert!(main.contains("queue = \"my_app\""), "main: {main}");
     assert!(main.contains("workflows![my_app_workflow]"), "main: {main}");
-    assert!(main.contains("activities![my_app_activity]"), "main: {main}");
+    assert!(
+        main.contains("activities![my_app_activity]"),
+        "main: {main}"
+    );
 }
 
 #[test]
@@ -148,7 +156,10 @@ fn readme_documents_three_command_path() {
         readme.contains("workflows/app_workflow/start"),
         "readme must curl the named workflow: {readme}"
     );
-    assert!(readme.contains("Docker"), "readme must state the prereq: {readme}");
+    assert!(
+        readme.contains("Docker"),
+        "readme must state the prereq: {readme}"
+    );
 }
 
 #[test]
@@ -250,7 +261,7 @@ fn run_new_rejects_invalid_name_without_writing() {
     let result = run_new("123bad", Some(&target), false, ScaffoldTemplate::Minimal);
     assert!(result.is_err(), "invalid name must be rejected");
     assert!(
-        !target.exists() || std::fs::read_dir(&target).map(|mut d| d.next().is_none()).unwrap_or(true),
+        !target.exists() || std::fs::read_dir(&target).is_ok_and(|mut d| d.next().is_none()),
         "no files may be written for an invalid name"
     );
 }

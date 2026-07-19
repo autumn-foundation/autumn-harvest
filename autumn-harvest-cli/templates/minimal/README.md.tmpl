@@ -1,0 +1,52 @@
+# {{crate_name}}
+
+A minimal, runnable [autumn-harvest](https://crates.io/crates/autumn-harvest)
+project: one `#[workflow]` (`{{workflow_fn}}`) calling one `#[activity]`
+(`{{activity_fn}}`), backed by Postgres.
+
+## Prerequisites
+
+- Stable Rust toolchain (`rustup default stable`)
+- Docker (for the Postgres defined in `compose.yaml`)
+
+## Run it — three commands to a durable execution
+
+1. Start Postgres:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. Start the app. `AUTUMN_PROFILE=dev` auto-applies the harvest migrations on
+   first run, so there is **no** manual `diesel migration run` step:
+
+   ```bash
+   AUTUMN_PROFILE=dev cargo run
+   ```
+
+   App: <http://localhost:3000> · Management API:
+   <http://localhost:3000/api/harvest> · Dashboard:
+   <http://localhost:3000/api/harvest/ui>
+
+3. Trigger a workflow execution:
+
+   ```bash
+   curl -s -X POST http://localhost:3000/api/harvest/workflows/{{workflow_fn}}/start \
+     -H 'Content-Type: application/json' \
+     -d '{"workflow_id":"demo-1","input":"World"}'
+   ```
+
+Watch it reach `COMPLETED` in the dashboard, or describe it from the CLI using
+the `execution_id` returned by step 3:
+
+```bash
+cargo run -p autumn-harvest-cli -- \
+  --base-url http://localhost:3000/api/harvest \
+  workflow describe <execution_id>
+```
+
+## Tear down
+
+```bash
+docker compose down -v
+```
