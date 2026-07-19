@@ -3138,7 +3138,7 @@
         {
           "id": 89,
           "type": "timeseries",
-          "title": "Summary retention \u2014 summaries GC'd (issue #752)",
+          "title": "Summary retention — summaries GC'd (issue #752)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4434,7 +4434,7 @@
         {
           "id": 908,
           "type": "timeseries",
-          "title": "Update latency (admit \u2192 terminal)",
+          "title": "Update latency (admit → terminal)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

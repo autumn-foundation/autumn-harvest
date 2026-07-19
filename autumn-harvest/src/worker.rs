@@ -13317,7 +13317,7 @@ pub enum ActiveWorkflowState {
 impl ActiveWorkflowState {
     /// Maps a raw `harvest_workflow_executions.state` string to the bounded
     /// active state, or `None` for any non-active state (COMPLETED, FAILED,
-    /// CANCELLED, TIMED_OUT, TERMINATED, CONTINUED_AS_NEW).
+    /// CANCELLED, `TIMED_OUT`, TERMINATED, `CONTINUED_AS_NEW`).
     #[must_use]
     pub fn from_db_str(state: &str) -> Option<Self> {
         match state {
@@ -13346,6 +13346,11 @@ impl ActiveWorkflowState {
 /// Otherwise returns every current `(workflow, state)` count, plus a zero-fill
 /// for every pair present last tick but absent this tick so a drained pair
 /// falls back to `0` rather than lingering at a stale value.
+///
+/// The result is *content*-deterministic (the same inputs always produce the
+/// same set of `(workflow, state, count)` tuples), but the returned `Vec`'s
+/// order follows `HashMap` iteration and is **not** order-stable. That is fine:
+/// the consumer calls `.set()` once per series, order-independently.
 pub(crate) fn compute_active_gauge_emissions(
     last_keys: &std::collections::HashSet<(String, ActiveWorkflowState)>,
     this_counts: &std::collections::HashMap<(String, ActiveWorkflowState), u64>,
@@ -13364,6 +13369,28 @@ pub(crate) fn compute_active_gauge_emissions(
         out.push((workflow.clone(), *state, 0));
     }
     Some(out)
+}
+
+/// Fold each shard's per-`(workflow, state)` counts into one fleet-wide map,
+/// summing the same key across shards (issue #770).
+///
+/// A `(workflow, state)` pair present on more than one shard has its counts
+/// **added, never overwritten**, so the gauge reflects the fleet-wide total.
+/// The caller only merges the shards it read successfully — a shard read
+/// failure short-circuits the whole tick to no-emit before this is called, so
+/// a partial set is never folded (mirrors the `read_failed` skip in
+/// `compute_active_gauge_emissions`).
+pub(crate) fn merge_active_shard_counts(
+    per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>>,
+) -> std::collections::HashMap<(String, ActiveWorkflowState), u64> {
+    let mut counts: std::collections::HashMap<(String, ActiveWorkflowState), u64> =
+        std::collections::HashMap::new();
+    for shard in per_shard {
+        for (workflow_name, state, count) in shard {
+            *counts.entry((workflow_name, state)).or_insert(0) += count;
+        }
+    }
+    counts
 }
 
 /// Periodically sample the count of currently-active (RUNNING/PAUSED)
@@ -13395,11 +13422,10 @@ fn spawn_workflow_active_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            // Active executions live on the shard that owns them, so sum the
-            // per-(workflow, state) counts across every shard for a fleet-wide
-            // gauge.
-            let mut counts: std::collections::HashMap<(String, ActiveWorkflowState), u64> =
-                std::collections::HashMap::new();
+            // Active executions live on the shard that owns them, so collect
+            // each shard's per-(workflow, state) counts and sum them across
+            // every shard for a fleet-wide gauge.
+            let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
             for pool in &pools {
                 let mut conn = match pool.get().await {
@@ -13415,11 +13441,7 @@ fn spawn_workflow_active_sampler(
                 };
 
                 match sample_active_workflow_counts(&mut conn).await {
-                    Ok(rows) => {
-                        for (workflow_name, state, count) in rows {
-                            *counts.entry((workflow_name, state)).or_insert(0) += count;
-                        }
-                    }
+                    Ok(rows) => per_shard.push(rows),
                     Err(error) => {
                         tracing::debug!(error = %error, "active workflow sample failed");
                         read_failed = true;
@@ -13427,8 +13449,16 @@ fn spawn_workflow_active_sampler(
                 }
             }
 
-            if let Some(emissions) =
-                compute_active_gauge_emissions(&reported, &counts, read_failed)
+            // Never fold a partial set: on any shard read failure the tick is
+            // skipped (compute_active_gauge_emissions returns None), so the
+            // merged map is only built when every shard read succeeded.
+            let counts = if read_failed {
+                std::collections::HashMap::new()
+            } else {
+                merge_active_shard_counts(per_shard)
+            };
+
+            if let Some(emissions) = compute_active_gauge_emissions(&reported, &counts, read_failed)
             {
                 for (workflow_name, state, count) in &emissions {
                     telemetry
@@ -13448,11 +13478,13 @@ fn spawn_workflow_active_sampler(
 /// Query the count of active (RUNNING/PAUSED) executions per workflow type and
 /// lifecycle state (issue #770).
 ///
-/// Returns `(workflow_name, state, count)` rows. The `WHERE` clause already
-/// bounds `state` to the two active values; any row whose state is
-/// unexpectedly outside that set is dropped (with a debug log) as
-/// defense-in-depth so the bounded `state` label can never carry a third
-/// value.
+/// Returns `(workflow_name, state, count)` rows. The `WHERE state IN
+/// ('RUNNING','PAUSED')` clause is a performance optimization that bounds the
+/// scan; it is redundant with the [`ActiveWorkflowState::from_db_str`] Rust
+/// guard, which is the authoritative filter and drops (with a debug log) any
+/// row whose state is unexpectedly outside that set, as defense-in-depth so
+/// the bounded `state` label can never carry a third value. The tests exercise
+/// the Rust guard; the SQL predicate is not independently isolated by a test.
 pub async fn sample_active_workflow_counts(
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> crate::error::HarvestResult<Vec<(String, ActiveWorkflowState, u64)>> {
@@ -16137,9 +16169,7 @@ mod tests {
         .into_iter()
         .collect();
         let this: HashMap<(String, ActiveWorkflowState), u64> =
-            [(("alpha".to_owned(), ActiveWorkflowState::Running), 2)]
-                .into_iter()
-                .collect();
+            std::iter::once((("alpha".to_owned(), ActiveWorkflowState::Running), 2)).collect();
 
         let mut emissions = compute_active_gauge_emissions(&last, &this, false)
             .expect("a successful tick must emit");
@@ -16162,11 +16192,30 @@ mod tests {
         // A read failure must emit NOTHING so an outage never false-clears the
         // gauge (mirrors the history-oversized sampler's read_failed skip).
         let last: HashSet<(String, ActiveWorkflowState)> =
-            [("alpha".to_owned(), ActiveWorkflowState::Running)]
-                .into_iter()
-                .collect();
+            std::iter::once(("alpha".to_owned(), ActiveWorkflowState::Running)).collect();
         let this: HashMap<(String, ActiveWorkflowState), u64> = HashMap::new();
         assert!(compute_active_gauge_emissions(&last, &this, true).is_none());
+    }
+
+    #[test]
+    fn merge_active_shard_counts_sums_same_key_across_shards() {
+        use std::collections::HashMap;
+
+        // The SAME (workflow, state) key appearing on two shards must SUM, not
+        // overwrite — a merge that clobbered would report shard B's 3 instead
+        // of the fleet-wide 5 (the cross-shard-sum guarantee, issue #770).
+        let shard_a = vec![("alpha".to_owned(), ActiveWorkflowState::Running, 2)];
+        let shard_b = vec![
+            ("alpha".to_owned(), ActiveWorkflowState::Running, 3),
+            ("beta".to_owned(), ActiveWorkflowState::Paused, 1),
+        ];
+
+        let merged = merge_active_shard_counts(vec![shard_a, shard_b]);
+
+        let mut expected: HashMap<(String, ActiveWorkflowState), u64> = HashMap::new();
+        expected.insert(("alpha".to_owned(), ActiveWorkflowState::Running), 5);
+        expected.insert(("beta".to_owned(), ActiveWorkflowState::Paused), 1);
+        assert_eq!(merged, expected);
     }
 
     // ── WASM effective start-to-close resolution (issue #965, AC1) ───────────

@@ -20,7 +20,6 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::worker::{ActiveWorkflowState, sample_active_workflow_counts};
 use diesel::sql_types::Text;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -117,7 +116,7 @@ async fn sample_groups_active_states_and_excludes_terminal() {
     assert_eq!(map, expected);
 
     // No non-active (terminal) state may appear.
-    for ((_, state), _) in &map {
+    for (_, state) in map.keys() {
         assert!(
             state == "running" || state == "paused",
             "unexpected non-active state {state:?} in gauge sample"
