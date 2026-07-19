@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "db")]
+mod active_workflow_gauge_tests;
 mod activity_default_floor_tests;
 mod activity_failure_tests;
 mod activity_interceptor_tests;

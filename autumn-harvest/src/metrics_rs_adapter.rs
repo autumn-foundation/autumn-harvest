@@ -54,10 +54,10 @@ use crate::telemetry::{
     METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_KEY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
     METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER,
     METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
-    METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATUS,
-    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_PAYLOAD_BYTES,
-    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
-    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATE,
+    METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
+    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
+    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE,
     METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED,
     METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_AUTO_PAUSED,
@@ -72,7 +72,8 @@ use crate::telemetry::{
     METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES,
+    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RETRIES,
     METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
     METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
     METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SessionAcquisitionOutcome, SlotType,
@@ -740,6 +741,16 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(count as f64);
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn record_workflow_active(&self, workflow: &str, state: &str, count: u64) {
+        gauge!(
+            METRIC_WORKFLOW_ACTIVE,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+            METRIC_LABEL_STATE => state.to_owned(),
+        )
+        .set(count as f64);
+    }
+
     fn record_workflow_debounced(&self, workflow_name: &str) {
         // `debounce_key` is intentionally not a label (unbounded cardinality —
         // ADR-0001 §7); it lives in logs and the /admin/debounce endpoint.
@@ -1203,6 +1214,112 @@ mod tests {
             ],
             "the bridge must register both saga counters with exactly the \
              workflow + queue label constants, values un-swapped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Active-workflow gauge bridge (issue #770)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridges_workflow_active_gauge_with_workflow_and_state_labels_and_value() {
+        // Real gauge-VALUE assertion: a local `metrics::Recorder` returns a
+        // custom `Gauge` whose `set(f64)` calls are captured alongside the
+        // registered key name + labels, so a swapped label or dropped value in
+        // the bridge is caught here (the #754/#801 hardened bar).
+        type GaugeSample = (String, Vec<(String, String)>, f64);
+
+        struct RecordingGauge {
+            name: String,
+            labels: Vec<(String, String)>,
+            sink: std::sync::Arc<std::sync::Mutex<Vec<GaugeSample>>>,
+        }
+        impl metrics::GaugeFn for RecordingGauge {
+            fn increment(&self, _: f64) {}
+            fn decrement(&self, _: f64) {}
+            fn set(&self, value: f64) {
+                self.sink
+                    .lock()
+                    .unwrap()
+                    .push((self.name.clone(), self.labels.clone(), value));
+            }
+        }
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            gauges: std::sync::Arc<std::sync::Mutex<Vec<GaugeSample>>>,
+        }
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::from_arc(std::sync::Arc::new(RecordingGauge {
+                    name: key.name().to_owned(),
+                    labels: key
+                        .labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                    sink: std::sync::Arc::clone(&self.gauges),
+                }))
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_workflow_active("checkout", "running", 5);
+        });
+
+        let gauges = capture.gauges.lock().unwrap().clone();
+        assert_eq!(
+            gauges.as_slice(),
+            &[(
+                METRIC_WORKFLOW_ACTIVE.to_owned(),
+                vec![
+                    (METRIC_LABEL_WORKFLOW.to_owned(), "checkout".to_owned()),
+                    (METRIC_LABEL_STATE.to_owned(), "running".to_owned()),
+                ],
+                5.0,
+            )],
+            "the active-workflow gauge bridge must set harvest.workflow.active \
+             with exactly the workflow+state label constants and value 5.0"
         );
     }
 

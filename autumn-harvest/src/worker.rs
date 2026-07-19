@@ -13101,6 +13101,9 @@ struct WorkerMonitoringHandles {
     /// `db` is disabled.
     session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
+    /// Active-workflow population gauge sampler (issue #770). The task self-
+    /// no-ops when metrics are disabled.
+    workflow_active_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
@@ -13293,6 +13296,204 @@ async fn sample_history_oversized_counts(
             (
                 r.workflow_name,
                 u64::try_from(r.oversized_count.max(0)).unwrap_or(0),
+            )
+        })
+        .collect())
+}
+
+/// The two active (non-terminal) lifecycle states the active-workflow
+/// population gauge (issue #770) buckets executions into.
+///
+/// Bounded by construction so the `state` metric label can only ever be one
+/// of two values — the cardinality-safety guarantee is the enum itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ActiveWorkflowState {
+    /// A `RUNNING` execution (issue #603 nd-blocked runs stay `RUNNING`).
+    Running,
+    /// A `PAUSED` execution (issue #383 operator pause).
+    Paused,
+}
+
+impl ActiveWorkflowState {
+    /// Maps a raw `harvest_workflow_executions.state` string to the bounded
+    /// active state, or `None` for any non-active state (COMPLETED, FAILED,
+    /// CANCELLED, TIMED_OUT, TERMINATED, CONTINUED_AS_NEW).
+    #[must_use]
+    pub fn from_db_str(state: &str) -> Option<Self> {
+        match state {
+            "RUNNING" => Some(Self::Running),
+            "PAUSED" => Some(Self::Paused),
+            _ => None,
+        }
+    }
+
+    /// The lowercase metric-label value for this state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+/// Decide the gauge emissions for one active-workflow sampler tick (issue
+/// #770).
+///
+/// Returns `None` when the tick must be skipped — a shard read failed, so a
+/// partial aggregate (or a zero-fill) would false-clear the gauge during an
+/// outage (mirrors the history-oversized sampler's `read_failed` skip).
+/// Otherwise returns every current `(workflow, state)` count, plus a zero-fill
+/// for every pair present last tick but absent this tick so a drained pair
+/// falls back to `0` rather than lingering at a stale value.
+pub(crate) fn compute_active_gauge_emissions(
+    last_keys: &std::collections::HashSet<(String, ActiveWorkflowState)>,
+    this_counts: &std::collections::HashMap<(String, ActiveWorkflowState), u64>,
+    read_failed: bool,
+) -> Option<Vec<(String, ActiveWorkflowState, u64)>> {
+    if read_failed {
+        return None;
+    }
+    let mut out: Vec<(String, ActiveWorkflowState, u64)> = this_counts
+        .iter()
+        .map(|((workflow, state), count)| (workflow.clone(), *state, *count))
+        .collect();
+    let this_keys: std::collections::HashSet<(String, ActiveWorkflowState)> =
+        this_counts.keys().cloned().collect();
+    for (workflow, state) in last_keys.difference(&this_keys) {
+        out.push((workflow.clone(), *state, 0));
+    }
+    Some(out)
+}
+
+/// Periodically sample the count of currently-active (RUNNING/PAUSED)
+/// executions per workflow type and lifecycle state and emit it as the
+/// `harvest.workflow.active` gauge (issue #770).
+///
+/// The live in-progress population, split by `(workflow, state)`. A steady
+/// rise while `harvest.workflow.terminal` stays flat signals a leak or
+/// backlog. Gated on `metrics.is_enabled()` — it issues sampler SQL, which is
+/// wasted work when no recorder is installed (mirrors
+/// `spawn_queue_depth_sampler`).
+fn spawn_workflow_active_sampler(
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL.
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        let mut reported: std::collections::HashSet<(String, ActiveWorkflowState)> =
+            std::collections::HashSet::new();
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            // Active executions live on the shard that owns them, so sum the
+            // per-(workflow, state) counts across every shard for a fleet-wide
+            // gauge.
+            let mut counts: std::collections::HashMap<(String, ActiveWorkflowState), u64> =
+                std::collections::HashMap::new();
+            let mut read_failed = false;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "active workflow sampler could not acquire DB connection"
+                        );
+                        read_failed = true;
+                        continue;
+                    }
+                };
+
+                match sample_active_workflow_counts(&mut conn).await {
+                    Ok(rows) => {
+                        for (workflow_name, state, count) in rows {
+                            *counts.entry((workflow_name, state)).or_insert(0) += count;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "active workflow sample failed");
+                        read_failed = true;
+                    }
+                }
+            }
+
+            if let Some(emissions) =
+                compute_active_gauge_emissions(&reported, &counts, read_failed)
+            {
+                for (workflow_name, state, count) in &emissions {
+                    telemetry
+                        .metrics
+                        .record_workflow_active(workflow_name, state.as_str(), *count);
+                }
+                reported = counts.keys().cloned().collect();
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
+/// Query the count of active (RUNNING/PAUSED) executions per workflow type and
+/// lifecycle state (issue #770).
+///
+/// Returns `(workflow_name, state, count)` rows. The `WHERE` clause already
+/// bounds `state` to the two active values; any row whose state is
+/// unexpectedly outside that set is dropped (with a debug log) as
+/// defense-in-depth so the bounded `state` label can never carry a third
+/// value.
+pub async fn sample_active_workflow_counts(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<Vec<(String, ActiveWorkflowState, u64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        active_count: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT workflow_name, state, COUNT(*)::bigint AS active_count \
+         FROM harvest_workflow_executions \
+         WHERE state IN ('RUNNING', 'PAUSED') \
+         GROUP BY workflow_name, state",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            ActiveWorkflowState::from_db_str(&r.state).map_or_else(
+                || {
+                    tracing::debug!(
+                        state = %r.state,
+                        "active workflow sampler dropping unexpected non-active state"
+                    );
+                    None
+                },
+                |state| {
+                    Some((
+                        r.workflow_name,
+                        state,
+                        u64::try_from(r.active_count.max(0)).unwrap_or(0),
+                    ))
+                },
             )
         })
         .collect())
@@ -13976,6 +14177,9 @@ impl Worker {
         if let Err(error) = monitors.history_oversized_sampler.await {
             tracing::warn!(error = %error, "history oversized sampler failed during shutdown");
         }
+        if let Err(error) = monitors.workflow_active_sampler.await {
+            tracing::warn!(error = %error, "active workflow sampler failed during shutdown");
+        }
         if let Some(handle) = monitors.worker_slot_sampler
             && let Err(error) = handle.await
         {
@@ -14269,6 +14473,14 @@ impl Worker {
             self.registry.history_policy().continue_as_new_threshold(),
             self.config.poll_interval,
         );
+        // Active-workflow population gauge (issue #770): the live in-progress
+        // count per (workflow, state). Self-no-ops when metrics are disabled.
+        let workflow_active_sampler = spawn_workflow_active_sampler(
+            sampler_pools.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        );
         // Adaptive slot-tuner control loop (issue #548): only spawned when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
         // below, this is NOT gated on `metrics.is_enabled()` — it is a
@@ -14462,6 +14674,7 @@ impl Worker {
             pause_auto_resumers,
             session_slot_reconcilers,
             history_oversized_sampler,
+            workflow_active_sampler,
             worker_slot_sampler,
             stranded_work_sampler,
             schedule_overdue_sampler,
@@ -14652,6 +14865,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "history oversized sampler failed during shutdown"
+            );
+        }
+        if let Err(error) = monitors.workflow_active_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "active workflow sampler failed during shutdown"
             );
         }
         if let Some(handle) = monitors.worker_slot_sampler
@@ -15866,6 +16086,88 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── Active-workflow population gauge (issue #770) ────────────────────────
+
+    #[test]
+    fn active_workflow_state_maps_only_active_db_states() {
+        assert_eq!(
+            ActiveWorkflowState::from_db_str("RUNNING"),
+            Some(ActiveWorkflowState::Running)
+        );
+        assert_eq!(
+            ActiveWorkflowState::from_db_str("PAUSED"),
+            Some(ActiveWorkflowState::Paused)
+        );
+        // Every terminal / non-active state maps to None so the bounded
+        // `state` label can never carry a third value.
+        for terminal in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "TERMINATED",
+            "CONTINUED_AS_NEW",
+            "SUSPENDED",
+            "",
+            "running",
+        ] {
+            assert_eq!(
+                ActiveWorkflowState::from_db_str(terminal),
+                None,
+                "state {terminal:?} must not be an active state"
+            );
+        }
+    }
+
+    #[test]
+    fn active_workflow_state_label_strings_are_lowercase() {
+        assert_eq!(ActiveWorkflowState::Running.as_str(), "running");
+        assert_eq!(ActiveWorkflowState::Paused.as_str(), "paused");
+    }
+
+    #[test]
+    fn compute_active_gauge_emissions_zero_fills_dropped_keys() {
+        use std::collections::{HashMap, HashSet};
+
+        let last: HashSet<(String, ActiveWorkflowState)> = [
+            ("alpha".to_owned(), ActiveWorkflowState::Running),
+            ("beta".to_owned(), ActiveWorkflowState::Running),
+        ]
+        .into_iter()
+        .collect();
+        let this: HashMap<(String, ActiveWorkflowState), u64> =
+            [(("alpha".to_owned(), ActiveWorkflowState::Running), 2)]
+                .into_iter()
+                .collect();
+
+        let mut emissions = compute_active_gauge_emissions(&last, &this, false)
+            .expect("a successful tick must emit");
+        emissions.sort();
+        assert_eq!(
+            emissions,
+            vec![
+                // still-active pair keeps its current count
+                ("alpha".to_owned(), ActiveWorkflowState::Running, 2),
+                // dropped-since-last-tick pair is zero-filled, not left stale
+                ("beta".to_owned(), ActiveWorkflowState::Running, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_active_gauge_emissions_skips_on_read_failure() {
+        use std::collections::{HashMap, HashSet};
+
+        // A read failure must emit NOTHING so an outage never false-clears the
+        // gauge (mirrors the history-oversized sampler's read_failed skip).
+        let last: HashSet<(String, ActiveWorkflowState)> =
+            [("alpha".to_owned(), ActiveWorkflowState::Running)]
+                .into_iter()
+                .collect();
+        let this: HashMap<(String, ActiveWorkflowState), u64> = HashMap::new();
+        assert!(compute_active_gauge_emissions(&last, &this, true).is_none());
+    }
 
     // ── WASM effective start-to-close resolution (issue #965, AC1) ───────────
     //
