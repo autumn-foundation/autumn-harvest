@@ -19,11 +19,21 @@
 //! (workflow/activity `Info` construction, per-writable-shard schedule,
 //! aggressive self-cleaning retention) and the opt-in [`CanaryConfig`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::prelude::*;
+use autumn_harvest::worker::DbPool;
+use chrono::{DateTime, Utc};
+use diesel::sql_types::{Nullable, Text, Timestamptz};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use futures::future::join_all;
+use serde::Serialize;
+
+use crate::api::HarvestApiState;
+use crate::shard_fanout::{self, FanoutStatus, ShardObservation, UnavailableShard};
 
 /// Upper bound on any derived (or user-supplied) retention age, kept safely
 /// below the core `RetentionConfig` validator's 10-year ceiling so a
@@ -368,6 +378,391 @@ pub fn register_canary(mut builder: HarvestBuilder, cfg: &CanaryConfig) -> Harve
     builder
 }
 
+// ── `GET /admin/canary` read model (issue #796) ─────────────────────────────
+//
+// This is the OBSERVE side of the synthetic liveness canary: it reconstructs,
+// per `(queue, shard)`, the freshness of the built-in probe by reading the
+// canary executions the scheduler has been firing. It never starts a probe and
+// never mutates anything — the schedule + workflow (registered above) do the
+// probing; this endpoint only reports the last-success age so an operator (or a
+// staleness alert) can tell "the pipeline is live" from "queue X on shard Y has
+// not completed a probe in far too long".
+//
+// Distinct from the #512 replay canary, whose `/admin/workflows/replay-canary`
+// route validates *code changes* by replaying histories. This endpoint reports
+// the *running pipeline*'s liveness.
+
+/// Cross-shard completeness of a `GET /admin/canary` snapshot.
+///
+/// A type alias onto the shared [`FanoutStatus`] so the
+/// complete/partial/unavailable derivation rule lives in exactly one place,
+/// alongside `workflow_count`'s and `schedule_runs`' reports.
+pub type CanaryReportStatus = FanoutStatus;
+
+/// Terminal states counted as a canary *failure* (a completed-but-not-succeeded
+/// probe). `RUNNING`/`SUSPENDED`/`PAUSED` are in-flight and counted as neither.
+const CANARY_FAILURE_STATES: &[&str] = &["FAILED", "TIMED_OUT", "CANCELLED", "TERMINATED"];
+
+/// One raw canary execution row read from a single shard.
+///
+/// Deliberately minimal — only the columns the freshness merge needs. Payloads
+/// are never read (a canary probe carries none of interest).
+#[derive(Debug, Clone)]
+pub struct CanaryRow {
+    /// The probe's target queue (`harvest_workflow_executions.queue_name`).
+    pub queue_name: String,
+    /// Terminal or in-flight state string.
+    pub state: String,
+    /// When the probe run started.
+    pub started_at: DateTime<Utc>,
+    /// When the probe run reached a terminal state (`NULL` while in flight).
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Freshness of one `(queue, shard)` synthetic-liveness probe (issue #796).
+#[derive(Debug, Clone, Serialize)]
+pub struct CanaryProbeStatus {
+    /// The probe's target queue.
+    pub queue: String,
+    /// The shard this probe ran on.
+    pub shard: i32,
+    /// `completed_at` of the most recent COMPLETED probe run, or `None` if this
+    /// `(queue, shard)` has never had a probe complete (AC4/AC7 — an empty or
+    /// write-blocked shard reports `None` here and `stale: true`).
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// Seconds since [`Self::last_success_at`] as of the snapshot, or `None`
+    /// when there has been no success.
+    pub age_of_last_success_secs: Option<i64>,
+    /// Wall-clock `completed_at - started_at` of the most recent COMPLETED probe
+    /// (its round-trip latency), or `None` when there has been no success.
+    pub last_roundtrip_ms: Option<i64>,
+    /// Count of COMPLETED probe runs in the retained (rolling) window.
+    pub success_count: i64,
+    /// Count of terminal non-completed probe runs (FAILED/TIMED_OUT/CANCELLED/
+    /// TERMINATED) in the retained window.
+    pub failure_count: i64,
+    /// `true` when the last success is older than the staleness window (or there
+    /// has been no success at all) — the alertable liveness signal (AC7).
+    pub stale: bool,
+}
+
+/// The full `GET /admin/canary` freshness report (issue #796).
+#[derive(Debug, Clone, Serialize)]
+pub struct CanaryReport {
+    /// Cross-shard completeness of this snapshot.
+    pub status: CanaryReportStatus,
+    /// When the snapshot was assembled.
+    pub as_of: DateTime<Utc>,
+    /// The staleness window (seconds) each probe's freshness was judged against.
+    pub staleness_window_secs: i64,
+    /// Per-`(queue, shard)` probe freshness, sorted by `(queue, shard)`.
+    pub probes: Vec<CanaryProbeStatus>,
+    /// Shards that could not be queried, named with a reason. Never silently
+    /// dropped; drives `status = partial`/`unavailable`.
+    pub unavailable_shards: Vec<UnavailableShard>,
+}
+
+impl CanaryReport {
+    /// An empty, complete report — used when the canary is disabled (no config
+    /// mirrored onto the runtime). The endpoint still answers `200`, it just
+    /// reports nothing (AC1: disabled ⇒ no probes).
+    fn empty(as_of: DateTime<Utc>) -> Self {
+        Self {
+            status: FanoutStatus::Complete,
+            as_of,
+            staleness_window_secs: 0,
+            probes: Vec::new(),
+            unavailable_shards: Vec::new(),
+        }
+    }
+}
+
+/// Merge per-shard canary observations into the freshness report (pure, no DB).
+///
+/// The probe grid is `expected` (the configured queues × the router's writable
+/// shards) **unioned** with any `(queue, shard)` pairs actually found in the
+/// data — so a queue recently removed from config still surfaces its stale
+/// leftover rows, and a configured `(queue, shard)` with zero rows still
+/// surfaces as a probe with `last_success_at: None, stale: true` (AC4).
+///
+/// For a reachable shard, each probe's freshness is derived from that shard's
+/// rows filtered to the probe's queue: `last_success` is the newest COMPLETED
+/// row (`last_success_at`/`last_roundtrip_ms`/`age`), `success_count` counts
+/// COMPLETED, `failure_count` counts terminal-non-completed. `stale` is true
+/// when there has been no success or the last success is older than
+/// `staleness_window`. Because canary history is retention-bounded (AC9),
+/// counting all present rows *is* the rolling window.
+///
+/// For an unreachable shard, every expected probe on it is reported stale with
+/// `last_success_at: None`, and the shard is named in `unavailable_shards`, so
+/// a write-blocked shard is never mistaken for healthy (AC7) and `status` drops
+/// to `partial`/`unavailable` — the call never fails wholesale.
+#[must_use]
+pub fn build_canary_report(
+    expected: &[(String, i32)],
+    observations: &[ShardObservation<CanaryRow>],
+    staleness_window: Duration,
+    now: DateTime<Utc>,
+) -> CanaryReport {
+    let (inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(observations);
+    let unreachable: BTreeSet<i32> = unavailable_shards.iter().map(|u| u.shard_id).collect();
+
+    // Rows from every reachable shard (a shard with `error: None` was inspected,
+    // even if it returned zero rows).
+    let mut rows_by_shard: BTreeMap<i32, &Vec<CanaryRow>> = BTreeMap::new();
+    for observation in observations {
+        if observation.error.is_none() {
+            rows_by_shard.insert(observation.shard_id, &observation.rows);
+        }
+    }
+
+    // Grid = expected ∪ observed (surface stale leftovers on shards/queues that
+    // are no longer configured but still have canary rows).
+    let mut grid: BTreeSet<(String, i32)> = expected.iter().cloned().collect();
+    for (shard, rows) in &rows_by_shard {
+        for row in rows.iter() {
+            grid.insert((row.queue_name.clone(), *shard));
+        }
+    }
+
+    let window_secs = i64::try_from(staleness_window.as_secs()).unwrap_or(i64::MAX);
+
+    let mut probes: Vec<CanaryProbeStatus> = grid
+        .into_iter()
+        .map(|(queue, shard)| {
+            // Unreachable, or a shard that was never inspected at all (e.g. a
+            // writable shard with no pool wired up yet): no data ⇒ stale.
+            let Some(rows) = rows_by_shard.get(&shard) else {
+                return stale_probe(queue, shard);
+            };
+            if unreachable.contains(&shard) {
+                return stale_probe(queue, shard);
+            }
+
+            let mut success_count = 0i64;
+            let mut failure_count = 0i64;
+            let mut last_success: Option<&CanaryRow> = None;
+            for row in rows.iter().filter(|r| r.queue_name == queue) {
+                if row.state == "COMPLETED" {
+                    success_count += 1;
+                    if let Some(completed) = row.completed_at {
+                        let newer = last_success
+                            .and_then(|prev| prev.completed_at)
+                            .is_none_or(|prev_completed| completed > prev_completed);
+                        if newer {
+                            last_success = Some(row);
+                        }
+                    }
+                } else if CANARY_FAILURE_STATES.contains(&row.state.as_str()) {
+                    failure_count += 1;
+                }
+            }
+
+            let (last_success_at, age, latency) = match last_success.and_then(|r| {
+                r.completed_at.map(|completed| (completed, r.started_at))
+            }) {
+                Some((completed, started)) => {
+                    let age = shard_fanout::age_secs(now, completed);
+                    let latency = completed
+                        .signed_duration_since(started)
+                        .num_milliseconds()
+                        .max(0);
+                    (Some(completed), Some(age), Some(latency))
+                }
+                None => (None, None, None),
+            };
+
+            let stale = age.is_none_or(|a| a > window_secs);
+            CanaryProbeStatus {
+                queue,
+                shard,
+                last_success_at,
+                age_of_last_success_secs: age,
+                last_roundtrip_ms: latency,
+                success_count,
+                failure_count,
+                stale,
+            }
+        })
+        .collect();
+
+    probes.sort_by(|a, b| a.queue.cmp(&b.queue).then_with(|| a.shard.cmp(&b.shard)));
+
+    CanaryReport {
+        status: FanoutStatus::from_counts(inspected, unavailable_shards.len()),
+        as_of: now,
+        staleness_window_secs: window_secs,
+        probes,
+        unavailable_shards,
+    }
+}
+
+/// A probe with no observed success — used for an unreachable or un-inspected
+/// `(queue, shard)`.
+fn stale_probe(queue: String, shard: i32) -> CanaryProbeStatus {
+    CanaryProbeStatus {
+        queue,
+        shard,
+        last_success_at: None,
+        age_of_last_success_secs: None,
+        last_roundtrip_ms: None,
+        success_count: 0,
+        failure_count: 0,
+        stale: true,
+    }
+}
+
+/// Per-shard canary rows read from the DB (`QueryableByName`).
+#[derive(Debug, diesel::QueryableByName)]
+struct CanaryRowDb {
+    #[diesel(sql_type = Text)]
+    queue_name: String,
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = Timestamptz)]
+    started_at: DateTime<Utc>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    completed_at: Option<DateTime<Utc>>,
+}
+
+/// Bounded upper limit on canary rows read per shard.
+///
+/// Canary history is aggressively retention-bounded (AC9), so a healthy shard
+/// holds only a handful of recent probe runs; this cap is a defensive ceiling
+/// so a mis-configured (never-cleaned) shard can never return an unbounded row
+/// set to the freshness merge. Ordered newest-first so the most recent success
+/// is always within the window.
+const CANARY_ROW_CAP: i64 = 500;
+
+/// Load this shard's canary execution rows (issue #796).
+///
+/// Selects only rows whose `workflow_name` carries the reserved canary prefix
+/// (`starts_with`, matching the fleet-count exclusion seam byte-for-byte — a
+/// prefix predicate, not a `LIKE` whose `_` wildcards would over-match the
+/// underscore-laden prefix).
+async fn load_canary_rows(conn: &mut AsyncPgConnection) -> Result<Vec<CanaryRow>, String> {
+    let rows: Vec<CanaryRowDb> = diesel::sql_query(
+        "SELECT queue_name, state, started_at, completed_at \
+         FROM harvest_workflow_executions \
+         WHERE starts_with(workflow_name, $1) \
+         ORDER BY completed_at DESC NULLS LAST \
+         LIMIT $2",
+    )
+    .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
+    .bind::<diesel::sql_types::BigInt, _>(CANARY_ROW_CAP)
+    .load(conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| CanaryRow {
+            queue_name: r.queue_name,
+            state: r.state,
+            started_at: r.started_at,
+            completed_at: r.completed_at,
+        })
+        .collect())
+}
+
+/// Query one shard for its canary rows (issue #796).
+///
+/// Returns a [`ShardObservation`] rather than propagating errors so a single
+/// unreachable shard never fails the whole fan-out — the merge folds it into
+/// `unavailable_shards` and a `partial`/`unavailable` status instead.
+async fn observe_canary_shard(shard_id: i32, pool: Option<DbPool>) -> ShardObservation<CanaryRow> {
+    let Some(pool) = pool else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        };
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!(
+                "database connection for shard {shard_id} could not be acquired"
+            )),
+        };
+    };
+    match load_canary_rows(&mut conn).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(e) => ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(e),
+        },
+    }
+}
+
+/// Build the synthetic-liveness-canary freshness report for `GET /admin/canary`
+/// (issue #796).
+///
+/// The probe grid is the configured queues × the router's **writable** shards
+/// (AC4): every writable shard must run its own probe loop, so a write-blocked
+/// shard with zero completed rows surfaces as a stale probe rather than being
+/// silently absent. The fan-out set unions that writable-shard grid with
+/// [`shard_fanout::expected_shards`] (pools + readable + default) so a shard
+/// mid-rollout, or one holding stale leftover probes for a de-configured queue,
+/// is still inspected. All shards are queried concurrently (`join_all`).
+///
+/// Never fails outright: an unreachable shard surfaces as `status:
+/// partial`/`unavailable` with a named `unavailable_shards` entry. When the
+/// canary is disabled (no config mirrored onto the runtime) an empty `complete`
+/// report is returned — the endpoint still works, it just reports nothing (AC1).
+pub async fn build_canary_report_from_shards(api_state: &HarvestApiState) -> CanaryReport {
+    let now = Utc::now();
+
+    let Some(cfg) = api_state.canary_config() else {
+        return CanaryReport::empty(now);
+    };
+    let staleness_window = cfg.effective_staleness_window();
+
+    // The router's writable shards drive the AC4 grid. A single-shard (or
+    // not-yet-started) router falls back to its default shard.
+    let writable: Vec<i32> = api_state.runtime().ok().map_or_else(
+        || vec![0],
+        |runtime| {
+            let router = runtime.router();
+            let shards: Vec<i32> = router.writable_shards().iter().map(|s| s.as_i32()).collect();
+            if shards.is_empty() {
+                vec![router.default_shard().as_i32()]
+            } else {
+                shards
+            }
+        },
+    );
+
+    // Expected grid = queues × writable shards.
+    let mut expected: Vec<(String, i32)> = Vec::new();
+    for queue in cfg.queues() {
+        for shard in &writable {
+            expected.push((queue.clone(), *shard));
+        }
+    }
+
+    // Fan-out set = expected_shards (pools + readable + default) ∪ writable, so
+    // every writable shard is inspected even when it has no pool wired up yet
+    // (reported unavailable), and any leftover-probe shard is included too.
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let mut fanout: BTreeSet<i32> = shard_fanout::expected_shards(api_state, &pools);
+    fanout.extend(writable.iter().copied());
+
+    let observations = fanout
+        .iter()
+        .map(|shard_id| observe_canary_shard(*shard_id, pools.get(shard_id).cloned()))
+        .collect::<Vec<_>>();
+    let observations = join_all(observations).await;
+
+    build_canary_report(&expected, &observations, staleness_window, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +990,229 @@ mod tests {
             built.is_ok(),
             "register_canary output must build: {built:?}"
         );
+    }
+
+    // ── build_canary_report (pure read-model, no DB) ─────────────────────────
+
+    use chrono::TimeZone as _;
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).unwrap()
+    }
+
+    fn row(
+        queue: &str,
+        state: &str,
+        started: i64,
+        completed: Option<i64>,
+    ) -> CanaryRow {
+        CanaryRow {
+            queue_name: queue.to_string(),
+            state: state.to_string(),
+            started_at: at(started),
+            completed_at: completed.map(at),
+        }
+    }
+
+    fn obs(shard_id: i32, rows: Vec<CanaryRow>, error: Option<&str>) -> ShardObservation<CanaryRow> {
+        ShardObservation {
+            shard_id,
+            rows,
+            error: error.map(ToOwned::to_owned),
+        }
+    }
+
+    fn probe<'a>(report: &'a CanaryReport, queue: &str, shard: i32) -> &'a CanaryProbeStatus {
+        report
+            .probes
+            .iter()
+            .find(|p| p.queue == queue && p.shard == shard)
+            .unwrap_or_else(|| panic!("expected a probe for ({queue}, {shard})"))
+    }
+
+    #[test]
+    fn healthy_probe_is_not_stale_with_latency_and_counts() {
+        // Newest COMPLETED probe finished at t=1000 (started 999 → 1000ms
+        // roundtrip); observed at t=1010 with a 60s window ⇒ fresh.
+        let now = at(1010);
+        let rows = vec![
+            row("default", "COMPLETED", 990, Some(991)),
+            row("default", "COMPLETED", 999, Some(1000)),
+        ];
+        let report = build_canary_report(
+            &[("default".to_string(), 0)],
+            &[obs(0, rows, None)],
+            Duration::from_secs(60),
+            now,
+        );
+        assert_eq!(report.status, CanaryReportStatus::Complete);
+        assert_eq!(report.staleness_window_secs, 60);
+        assert_eq!(report.probes.len(), 1);
+        let p = probe(&report, "default", 0);
+        assert!(!p.stale);
+        assert_eq!(p.last_success_at, Some(at(1000)));
+        assert_eq!(p.age_of_last_success_secs, Some(10));
+        assert_eq!(p.last_roundtrip_ms, Some(1000));
+        assert_eq!(p.success_count, 2);
+        assert_eq!(p.failure_count, 0);
+    }
+
+    #[test]
+    fn old_success_is_stale() {
+        // Last success at t=100; observed at t=1000 with a 60s window ⇒ stale.
+        let now = at(1000);
+        let rows = vec![row("default", "COMPLETED", 99, Some(100))];
+        let report = build_canary_report(
+            &[("default".to_string(), 0)],
+            &[obs(0, rows, None)],
+            Duration::from_secs(60),
+            now,
+        );
+        let p = probe(&report, "default", 0);
+        assert!(p.stale);
+        assert_eq!(p.age_of_last_success_secs, Some(900));
+        assert_eq!(p.success_count, 1);
+    }
+
+    #[test]
+    fn never_succeeded_probe_is_stale_with_no_success_and_failure_count() {
+        // Only FAILED/TIMED_OUT rows ⇒ stale, no last success, failure_count > 0.
+        let now = at(1000);
+        let rows = vec![
+            row("default", "FAILED", 10, Some(11)),
+            row("default", "TIMED_OUT", 20, Some(21)),
+        ];
+        let report = build_canary_report(
+            &[("default".to_string(), 0)],
+            &[obs(0, rows, None)],
+            Duration::from_secs(60),
+            now,
+        );
+        let p = probe(&report, "default", 0);
+        assert!(p.stale);
+        assert!(p.last_success_at.is_none());
+        assert!(p.age_of_last_success_secs.is_none());
+        assert!(p.last_roundtrip_ms.is_none());
+        assert_eq!(p.success_count, 0);
+        assert_eq!(p.failure_count, 2);
+    }
+
+    #[test]
+    fn expected_shard_with_zero_rows_is_present_and_stale() {
+        // AC4: a configured (queue, shard) with NO rows at all (e.g. a
+        // write-blocked shard that never completed a probe) must still appear as
+        // a stale probe, not vanish.
+        let now = at(1000);
+        let report = build_canary_report(
+            &[("default".to_string(), 0)],
+            &[obs(0, Vec::new(), None)],
+            Duration::from_secs(60),
+            now,
+        );
+        assert_eq!(report.status, CanaryReportStatus::Complete);
+        assert_eq!(report.probes.len(), 1);
+        let p = probe(&report, "default", 0);
+        assert!(p.stale, "AC4: empty shard probe must be stale");
+        assert!(p.last_success_at.is_none());
+        assert_eq!(p.success_count, 0);
+        assert_eq!(p.failure_count, 0);
+    }
+
+    #[test]
+    fn unreachable_shard_probes_are_stale_and_shard_is_named_partial() {
+        // AC7: an unreachable shard's expected probes are stale AND the shard is
+        // named in unavailable_shards AND status is partial (one shard OK).
+        let now = at(1000);
+        let report = build_canary_report(
+            &[("default".to_string(), 0), ("default".to_string(), 1)],
+            &[
+                obs(0, vec![row("default", "COMPLETED", 999, Some(1000))], None),
+                obs(1, Vec::new(), Some("connection refused")),
+            ],
+            Duration::from_secs(60),
+            now,
+        );
+        assert_eq!(report.status, CanaryReportStatus::Partial);
+        // Shard 0 is fresh, shard 1 (unreachable) is stale.
+        assert!(!probe(&report, "default", 0).stale);
+        let down = probe(&report, "default", 1);
+        assert!(down.stale);
+        assert!(down.last_success_at.is_none());
+        // Shard 1 is named, never silently dropped.
+        assert_eq!(report.unavailable_shards.len(), 1);
+        assert_eq!(report.unavailable_shards[0].shard_id, 1);
+        assert_eq!(report.unavailable_shards[0].reason, "connection refused");
+    }
+
+    #[test]
+    fn all_shards_unavailable_is_unavailable_not_a_hard_failure() {
+        let now = at(1000);
+        let report = build_canary_report(
+            &[("default".to_string(), 0)],
+            &[obs(0, Vec::new(), Some("pool missing"))],
+            Duration::from_secs(60),
+            now,
+        );
+        assert_eq!(report.status, CanaryReportStatus::Unavailable);
+        assert_eq!(report.probes.len(), 1);
+        assert!(probe(&report, "default", 0).stale);
+        assert_eq!(report.unavailable_shards.len(), 1);
+    }
+
+    #[test]
+    fn mixed_queues_and_shards_grid_with_leftover_row() {
+        // Grid = expected (default×{0,1}, email×{0,1}) ∪ observed. Shard 0 has a
+        // fresh `default` probe plus a leftover `legacy` queue row (de-configured
+        // but still present); shard 1 has a stale `email` probe. All appear.
+        let now = at(1000);
+        let report = build_canary_report(
+            &[
+                ("default".to_string(), 0),
+                ("default".to_string(), 1),
+                ("email".to_string(), 0),
+                ("email".to_string(), 1),
+            ],
+            &[
+                obs(
+                    0,
+                    vec![
+                        row("default", "COMPLETED", 999, Some(1000)),
+                        row("legacy", "COMPLETED", 500, Some(501)),
+                    ],
+                    None,
+                ),
+                obs(1, vec![row("email", "COMPLETED", 100, Some(101))], None),
+            ],
+            Duration::from_secs(60),
+            now,
+        );
+        assert_eq!(report.status, CanaryReportStatus::Complete);
+        // default/0 fresh; default/1 empty→stale; email/0 empty→stale; email/1 old→stale.
+        assert!(!probe(&report, "default", 0).stale);
+        assert!(probe(&report, "default", 1).stale);
+        assert!(probe(&report, "email", 0).stale);
+        assert!(probe(&report, "email", 1).stale);
+        // The de-configured `legacy` leftover surfaces (observed ∪ expected).
+        let legacy = probe(&report, "legacy", 0);
+        assert!(legacy.stale, "leftover is old (age 499 > 60s window)");
+        assert_eq!(legacy.success_count, 1);
+        // Probes are sorted by (queue, shard).
+        let order: Vec<(&str, i32)> = report
+            .probes
+            .iter()
+            .map(|p| (p.queue.as_str(), p.shard))
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(order, sorted);
+    }
+
+    #[test]
+    fn report_status_serializes_snake_case() {
+        let report = CanaryReport::empty(at(0));
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["status"], serde_json::json!("complete"));
+        assert!(value["probes"].as_array().unwrap().is_empty());
+        assert_eq!(value["staleness_window_secs"], serde_json::json!(0));
     }
 }
