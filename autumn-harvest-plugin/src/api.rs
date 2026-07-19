@@ -27609,6 +27609,12 @@ pub(crate) async fn load_stalled_workflows(
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.as_str()));
     }
+    // Issue #796 (AC8): hide synthetic liveness canary runs from the stalled
+    // view too, unless the caller explicitly filters to a canary workflow name.
+    // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
+    // itself wedged — a failure the canary exists to detect) would surface in
+    // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
+    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
