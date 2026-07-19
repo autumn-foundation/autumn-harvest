@@ -125,6 +125,7 @@ async fn load_tasks(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // issue #617 added chain-cap fields to the StartWorkflowParams literals
 async fn test_delayed_start_validation() {
     let (mut conn, _container) = setup_test_db().await;
 

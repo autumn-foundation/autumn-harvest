@@ -172,7 +172,7 @@ async fn load_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Strin
         .expect("load state")
 }
 
-fn default_params<'a>(exec_id: ExecutionId, workflow_id: &'a str) -> StartWorkflowParams<'a> {
+fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParams<'_> {
     StartWorkflowParams {
         workflow_name: "chain_cap_workflow",
         workflow_id,

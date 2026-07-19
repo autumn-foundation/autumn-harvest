@@ -741,6 +741,8 @@ pub async fn tick_once_sharded(
 /// Returns [`HarvestError`] if the DB pool is exhausted or the workflow start
 /// transaction fails.
 #[allow(clippy::too_many_arguments)]
+// Issue #617 added three chain-cap fields to the StartWorkflowParams literal here.
+#[allow(clippy::too_many_lines)]
 pub async fn trigger_unified_dag(
     pool: DbPool,
     dag_name: &str,

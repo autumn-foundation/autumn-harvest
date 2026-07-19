@@ -6262,6 +6262,7 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // issue #617 added a chain-cap field to the WorkflowSchedule literal
 async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade() {
     let (database_url, _container) = setup_test_database_url().await;
     let dag_name = "split_legacy_dag";
