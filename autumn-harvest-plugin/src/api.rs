@@ -27101,7 +27101,6 @@ fn apply_search_attr_filters<'a>(
     query
 }
 
-#[allow(clippy::too_many_lines)]
 /// Whether the default `GET /workflows` list should hide synthetic liveness
 /// canary runs (issue #796, AC8).
 ///

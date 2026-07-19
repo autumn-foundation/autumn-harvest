@@ -121,16 +121,19 @@ mod tests {
         assert!(!is_reserved_canary_name("__harvest_session_acquire"));
     }
 
-    /// The terminal-metric emission sites (`worker.rs::process_workflow_task`
-    /// and `timeout.rs::enforce_workflow_execution_timeouts`) route a run to
-    /// the `harvest.canary.*` metrics — and SKIP `harvest.workflow.terminal`
-    /// and the other business SLO counters (issue #796, AC8) — exactly when
+    /// The terminal-metric choke point (`telemetry::emit_workflow_terminal`,
+    /// exercised end to end at `worker.rs::process_workflow_task` and
+    /// `timeout.rs::enforce_workflow_execution_timeouts`) routes a run to the
+    /// `harvest.canary.*` metrics — and SKIPS `harvest.workflow.terminal` and
+    /// the other business SLO counters (issue #796, AC8) — exactly when
     /// [`is_canary_workflow`] returns `true` for the execution's
-    /// `workflow_name`. This pins that gate for the per-queue naming scheme a
-    /// real probe registration uses, and confirms an ordinary workflow still
-    /// takes the business-metric path.
+    /// `workflow_name`. This pins the *predicate* for the per-queue naming
+    /// scheme a real probe registration uses, and confirms an ordinary workflow
+    /// still takes the business-metric path. The choke point's own
+    /// record-vs-skip behavior is unit-tested at
+    /// `telemetry::tests::emit_workflow_terminal_skips_canary_and_records_business_workflows`.
     #[test]
-    fn terminal_emission_gate_selects_canary_runs_by_workflow_name() {
+    fn is_canary_workflow_gate_predicate_selects_canary_names() {
         // Probe runs (per-queue naming) → canary metrics, no terminal counter.
         for probe in [
             CANARY_WORKFLOW_NAME_PREFIX,
