@@ -10443,6 +10443,7 @@ impl ActivityContext {
 
     /// Attach an optional heartbeat timeout (worker convenience — passes a
     /// task row's `Option` straight through without a conditional rebind).
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     #[must_use]
     pub(crate) const fn with_heartbeat_timeout_opt(
         mut self,
