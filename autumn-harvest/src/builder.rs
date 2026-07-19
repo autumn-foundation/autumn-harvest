@@ -493,6 +493,31 @@ pub enum HarvestBuilderError {
         reason: String,
     },
 
+    /// A plain (non-DAG, non-canary) [`WorkflowSchedule`] opted into
+    /// `all_writable_shards`, which is only supported for DAG schedules and the
+    /// built-in synthetic liveness canary (issue #796).
+    ///
+    /// Registration honours the flag for any schedule, but the fire path only
+    /// encodes the shard id into the minted `ExecutionId` for DAGs and canaries
+    /// (it derives that from the workflow name / DAG-ness of the persisted
+    /// `harvest_schedules` row, which carries no `all_writable_shards` column).
+    /// A plain workflow opting in would register on every writable shard yet
+    /// mint every execution on the default shard — duplicate runs plus
+    /// cross-shard write inconsistency. Making it general-purpose would require
+    /// persisting the flag as a `harvest_schedules` column (a migration), which
+    /// #796 (AC10) deliberately avoids, so this combination is rejected here.
+    #[error(
+        "workflow_schedule for '{workflow_name}' sets all_writable_shards, which is \
+         only supported for DAG schedules and the built-in liveness canary; a plain \
+         workflow cannot use it because the fire path would mint executions on the \
+         default shard (making it general-purpose requires a harvest_schedules \
+         migration, avoided per issue #796 AC10)"
+    )]
+    AllWritableShardsUnsupported {
+        /// The plain workflow name that improperly opted into `all_writable_shards`.
+        workflow_name: String,
+    },
+
     /// A normal workflow registration reused the name of a DAG that is
     /// auto-registered as a workflow for unified DAG execution.
     #[error(
@@ -2206,6 +2231,20 @@ fn validate_workflow_schedules(
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
                 reason: "workflow schedule targets an auto-registered DAG workflow; use the DAG schedule registration instead".to_string(),
+            });
+        }
+        // `all_writable_shards` is only honoured on the fire path for DAG
+        // schedules and the built-in liveness canary (issue #796). A plain
+        // workflow opting in would register on every writable shard yet mint
+        // executions on the default shard (see the field docs). Reject fast so
+        // the footgun surfaces as a clear build error instead of silent
+        // duplicate/cross-shard-inconsistent runs at fire time.
+        if schedule.all_writable_shards
+            && schedule.dag_name.is_none()
+            && !crate::canary::is_canary_workflow(&schedule.workflow_name)
+        {
+            return Err(HarvestBuilderError::AllWritableShardsUnsupported {
+                workflow_name: schedule.workflow_name.clone(),
             });
         }
         // Reject zero-length intervals (would cause infinite loops in due_run_plan
@@ -4560,6 +4599,96 @@ mod tests {
         assert!(
             result.is_ok(),
             "valid timezone must be accepted: {result:?}"
+        );
+    }
+
+    fn named_workflow_info(name: &'static str) -> WorkflowInfo {
+        WorkflowInfo {
+            name,
+            ..fake_workflow_info()
+        }
+    }
+
+    #[test]
+    fn builder_rejects_all_writable_shards_on_plain_workflow_schedule() {
+        // A plain (non-DAG, non-canary) workflow opting into all_writable_shards
+        // must be rejected at build time — the fire path would mint executions
+        // on the default shard (issue #796).
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("nightly")])
+            .workflow_schedule(
+                WorkflowSchedule::new("nightly", Schedule::Interval(Duration::from_secs(60)))
+                    .with_all_writable_shards(),
+            )
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                HarvestBuilderError::AllWritableShardsUnsupported { workflow_name }
+                    if workflow_name == "nightly"
+            ),
+            "expected AllWritableShardsUnsupported, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_all_writable_shards_on_canary_schedule() {
+        // The built-in liveness canary (name starts with the reserved prefix)
+        // is allowed to opt in.
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("__harvest_canary_probe__default")])
+            .workflow_schedule(
+                WorkflowSchedule::new(
+                    "__harvest_canary_probe__default",
+                    Schedule::Interval(Duration::from_secs(30)),
+                )
+                .with_all_writable_shards(),
+            )
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "canary schedule with all_writable_shards must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_all_writable_shards_on_dag_schedule() {
+        // A DAG schedule (dag_name Some) encodes its shard on the fire path, so
+        // the flag is supported.
+        let mut sched =
+            WorkflowSchedule::new("daily_etl", Schedule::Interval(Duration::from_secs(60)))
+                .with_all_writable_shards();
+        sched.dag_name = Some("daily_etl".to_string());
+
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("daily_etl")])
+            .workflow_schedule(sched)
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "DAG schedule with all_writable_shards must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_plain_workflow_schedule_without_the_flag() {
+        // Default behaviour is unchanged: a plain schedule without the flag
+        // builds fine.
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("nightly")])
+            .workflow_schedule(WorkflowSchedule::new(
+                "nightly",
+                Schedule::Interval(Duration::from_secs(60)),
+            ))
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "plain schedule without the flag must be accepted: {result:?}"
         );
     }
 

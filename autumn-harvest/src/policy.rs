@@ -925,10 +925,24 @@ pub struct WorkflowSchedule {
     /// so the `UNIQUE(workflow_name)` constraint is not violated) and each
     /// shard's fire mints an execution on that shard.
     ///
-    /// The built-in synthetic liveness canary (issue #796, AC4) sets this so a
-    /// single write-blocked/dead shard surfaces as a failing/stale probe for
-    /// that shard. General-purpose: any multi-shard schedule needing per-shard
-    /// coverage may opt in.
+    /// **Supported only for DAG schedules and the built-in synthetic liveness
+    /// canary** (names starting with `__harvest_canary_probe`, issue #796, AC4).
+    /// The canary sets this so a single write-blocked/dead shard surfaces as a
+    /// failing/stale probe for that shard.
+    ///
+    /// For any other (plain, non-DAG) workflow this flag is **rejected at build
+    /// time** (`HarvestBuilderError::AllWritableShardsUnsupported`). The reason:
+    /// registration honours the flag for any schedule, but the fire path
+    /// (`scheduled_fire_encodes_shard`) only encodes the shard id into the minted
+    /// `ExecutionId` for DAGs and canaries — it derives that decision purely from
+    /// the workflow name and DAG-ness of the persisted `harvest_schedules` row,
+    /// which carries no `all_writable_shards` column. So a plain workflow opting
+    /// in would register on every writable shard yet mint every execution with
+    /// `ExecutionId::new()` (the router's default shard), producing duplicate
+    /// runs on the default shard and cross-shard write inconsistency. Making it
+    /// general-purpose would require persisting the flag as a `harvest_schedules`
+    /// column — a migration — which issue #796 (AC10) deliberately avoids; the
+    /// canary/DAG path stays migration-free via name-based shard encoding.
     #[serde(default)]
     pub all_writable_shards: bool,
 }
