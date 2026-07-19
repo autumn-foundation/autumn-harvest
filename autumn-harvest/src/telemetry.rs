@@ -513,6 +513,35 @@ pub const METRIC_SAGA_COMPENSATED: &str = "harvest.saga.compensated";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_SAGA_COMPENSATION_FAILED: &str = "harvest.saga.compensation_failed";
 
+/// Histogram: wall-clock seconds a synthetic liveness-canary probe took from
+/// start-requested to terminal completion (issue #796).
+///
+/// This is the built-in end-to-end pipeline probe, **distinct from the #512
+/// replay canary** (which validates code changes). Recorded only when a canary
+/// run reaches terminal completion; a timed-out probe increments
+/// [`METRIC_CANARY_FAILURE`] instead.
+///
+/// Labeled by `queue` (the probed task queue) and `shard` (the writable shard
+/// the probe ran on). Per ADR-0001 §7, `execution.id` is never a label.
+pub const METRIC_CANARY_ROUNDTRIP: &str = "harvest.canary.roundtrip";
+
+/// Counter: incremented once each time a synthetic liveness-canary probe
+/// reaches terminal completion (issue #796).
+///
+/// Labeled by `queue` and `shard`. `execution.id` stays span-only per the
+/// cardinality rule (ADR-0001 §7).
+pub const METRIC_CANARY_SUCCESS: &str = "harvest.canary.success";
+
+/// Counter: incremented once each time a synthetic liveness-canary probe fails
+/// (issue #796).
+///
+/// A failure is a probe that did not reach terminal completion within its
+/// per-probe timeout, or that terminated in a non-completed state.
+///
+/// Labeled by `queue` and `shard`. `execution.id` stays span-only per the
+/// cardinality rule (ADR-0001 §7).
+pub const METRIC_CANARY_FAILURE: &str = "harvest.canary.failure";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
@@ -2166,6 +2195,39 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    // ── Synthetic liveness canary (issue #796) ────────────────────────────
+    //
+    // The built-in end-to-end pipeline probe. Distinct from the #512 replay
+    // canary. Labels are limited to `queue` and `shard` (a `u16` here,
+    // stringified in the metrics-rs bridge). Per ADR-0001 §7, `execution.id`
+    // is never accepted, so the cardinality rule holds by construction.
+
+    /// A synthetic liveness-canary probe reached terminal completion on
+    /// `(queue, shard)` (issue #796).
+    ///
+    /// Maps to the counter [`METRIC_CANARY_SUCCESS`] labeled `queue`, `shard`.
+    fn record_canary_success(&self, queue: &str, shard: u16) {
+        let _ = (queue, shard);
+    }
+
+    /// A synthetic liveness-canary probe failed on `(queue, shard)` — it did
+    /// not complete within the per-probe timeout, or terminated in a
+    /// non-completed state (issue #796).
+    ///
+    /// Maps to the counter [`METRIC_CANARY_FAILURE`] labeled `queue`, `shard`.
+    fn record_canary_failure(&self, queue: &str, shard: u16) {
+        let _ = (queue, shard);
+    }
+
+    /// Observed round-trip latency (seconds) of a completed synthetic
+    /// liveness-canary probe on `(queue, shard)` (issue #796).
+    ///
+    /// Maps to the histogram [`METRIC_CANARY_ROUNDTRIP`] labeled `queue`,
+    /// `shard`.
+    fn record_canary_roundtrip(&self, queue: &str, shard: u16, duration_secs: f64) {
+        let _ = (queue, shard, duration_secs);
+    }
+
     // ── Signal & update lifecycle counters (issue #684) ───────────────────
 
     /// A `SignalReceived` event was durably delivered into a workflow's
@@ -2298,6 +2360,41 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_user_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
         let _ = (name, value, labels);
     }
+}
+
+/// Emit the once-per-terminal-outcome business counter `harvest.workflow.terminal`
+/// (issue #519), **skipping synthetic-liveness-canary probe runs** (issue #796,
+/// AC8).
+///
+/// This is the single choke point through which every non-canary terminal
+/// transition routes its business SLO counter, so a canary probe (identified by
+/// [`crate::canary::is_canary_workflow`]) can never leak into
+/// `harvest.workflow.terminal` no matter which terminal path it reaches (worker
+/// completion/failure, execution timeout, poison-pill quarantine, batch/operator
+/// cancel/terminate, history-cap, race-loser cancel, …). The canary-skip
+/// decision lives in exactly one place — here.
+///
+/// A canary probe emits ONLY `harvest.canary.*`; it never contributes to
+/// `harvest.workflow.terminal` or any other `harvest.workflow.*` business
+/// counter. The two primary terminal sites (worker completion and
+/// execution-timeout) additionally emit the probe's own `harvest.canary.*`
+/// signal in their canary branch and route their non-canary terminal through
+/// this helper. A canary still contributes to `harvest.activity.*`/
+/// `harvest.queue.*`, which it legitimately exercises.
+///
+/// Generic over `M: MetricsRecorder + ?Sized` so it accepts `&dyn
+/// MetricsRecorder`, `&(dyn MetricsRecorder + Send + Sync)`, and `&*Arc<dyn
+/// MetricsRecorder>` uniformly.
+pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    queue: &str,
+    outcome: WorkflowStatus,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_workflow_terminal(workflow_name, queue, outcome);
 }
 
 /// Default metrics recorder that discards every sample.
@@ -2614,6 +2711,21 @@ mod tests {
         );
         assert_eq!(METRIC_ACTIVITY_PANIC, "harvest.activity.panic");
         assert_eq!(METRIC_WORKFLOW_PANIC, "harvest.workflow.panic");
+        // Synthetic liveness canary (issue #796) — distinct from #512 replay canary.
+        assert_eq!(METRIC_CANARY_ROUNDTRIP, "harvest.canary.roundtrip");
+        assert_eq!(METRIC_CANARY_SUCCESS, "harvest.canary.success");
+        assert_eq!(METRIC_CANARY_FAILURE, "harvest.canary.failure");
+    }
+
+    #[test]
+    fn record_canary_metrics_have_noop_defaults() {
+        // Synthetic liveness-canary metrics (issue #796) must exist as no-op
+        // default trait methods so existing MetricsRecorder implementations
+        // compile without changes. Labels are `queue` and `shard` only.
+        let rec = NoOpMetrics;
+        rec.record_canary_success("default", 0);
+        rec.record_canary_failure("email", 2);
+        rec.record_canary_roundtrip("default", 0, 0.42);
     }
 
     #[test]
@@ -2743,6 +2855,59 @@ mod tests {
             6,
             "should emit once for each of the 6 terminal outcomes"
         );
+    }
+
+    #[test]
+    fn emit_workflow_terminal_skips_canary_and_records_business_workflows() {
+        // Issue #796 AC8: the single choke point routes a business workflow's
+        // terminal to `record_workflow_terminal` but skips a synthetic-liveness
+        // canary probe entirely, so a canary can never leak into
+        // `harvest.workflow.terminal` no matter which terminal path it reaches.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct TerminalCounter(AtomicUsize);
+        impl MetricsRecorder for TerminalCounter {
+            fn record_workflow_terminal(&self, _wf: &str, _q: &str, _outcome: WorkflowStatus) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(TerminalCounter::default());
+
+        // A canary probe (any per-queue name) records NOTHING.
+        for canary in [
+            crate::canary::CANARY_WORKFLOW_NAME_PREFIX,
+            "__harvest_canary_probe__default",
+            "__harvest_canary_probe__email",
+        ] {
+            emit_workflow_terminal(counter.as_ref(), canary, "default", WorkflowStatus::Failed);
+        }
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a canary probe must never increment harvest.workflow.terminal"
+        );
+
+        // An ordinary business workflow records once per call.
+        emit_workflow_terminal(
+            counter.as_ref(),
+            "onboarding",
+            "default",
+            WorkflowStatus::Completed,
+        );
+        emit_workflow_terminal(counter.as_ref(), "checkout", "q", WorkflowStatus::Cancelled);
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            2,
+            "business workflows must still increment harvest.workflow.terminal"
+        );
+
+        // Also works through a `&*Arc<dyn MetricsRecorder>` erased reference.
+        let erased: Arc<dyn MetricsRecorder> = counter.clone();
+        emit_workflow_terminal(&*erased, "billing", "default", WorkflowStatus::TimedOut);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 3);
     }
 
     #[test]

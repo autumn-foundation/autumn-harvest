@@ -3901,6 +3901,26 @@
     },
     {
       "method": "GET",
+      "path": "/admin/canary",
+      "category": "admin",
+      "read_only": true,
+      "description": "Synthetic liveness canary freshness report (issue #796). Reports, per (queue, shard), the age of the most recent COMPLETED built-in probe run so an operator or staleness alert can tell a live pipeline from a wedged one (workers polling but never completing, a stalled scheduler tick, a write-blocked shard). The probe grid is the configured probe queues × the router's writable shards, so a write-blocked or empty shard surfaces as a stale probe rather than being silently absent. Each probes[] entry carries queue, shard, last_success_at, age_of_last_success_secs, last_roundtrip_ms, success_count, failure_count, and stale (true when the last success is older than the staleness window or there has been no success). Fans out across shards; an unreachable shard is named in unavailable_shards and drops status to partial/unavailable rather than failing the call wholesale. When the canary is disabled an empty complete report is returned. Distinct from the #512 replay canary (POST /admin/workflows/replay-canary), which validates code changes by replaying histories.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "staleness_window_secs",
+          "probes",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
       "path": "/admin/version-gates/usage",
       "category": "admin",
       "read_only": true,

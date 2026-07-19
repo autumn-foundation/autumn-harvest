@@ -1314,7 +1314,8 @@ pub async fn fire_due_throttled_starts(
                 .await;
             }
             for (wf_name, q_name) in cancel_metrics {
-                metrics.record_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal(
+                    metrics,
                     &wf_name,
                     &q_name,
                     crate::telemetry::WorkflowStatus::Cancelled,

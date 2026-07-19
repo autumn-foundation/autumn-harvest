@@ -1048,7 +1048,15 @@ fn required_queues(runtime: &crate::api::HarvestApiRuntime) -> BTreeSet<String> 
         // called, never on `default_queue`. Counting them here would
         // spuriously report a deployment with no session-based workflow at
         // all as requiring a worker on `"default"`.
-        if !activity.is_local && !autumn_harvest::is_reserved_session_activity_name(activity.name) {
+        // Synthetic liveness canary (issue #796): the built-in canary activity
+        // has `default_queue: None` but is always dispatched on the probe's
+        // *target* queue (carried in the workflow input), never on
+        // `default_queue`. Counting it here would inject a phantom `"default"`
+        // required queue, flipping a healthy non-default-queue deployment RED.
+        if !activity.is_local
+            && !autumn_harvest::is_reserved_session_activity_name(activity.name)
+            && !autumn_harvest::canary::is_reserved_canary_name(activity.name)
+        {
             queues.insert(activity.default_queue.unwrap_or("default").to_string());
         }
     }

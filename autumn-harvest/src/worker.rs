@@ -2406,7 +2406,8 @@ async fn persist_external_signal_inline(
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
     }
     for (workflow_name, queue_name) in cancel_metrics {
-        metrics.record_workflow_terminal(
+        crate::telemetry::emit_workflow_terminal(
+            metrics,
             &workflow_name,
             &queue_name,
             crate::telemetry::WorkflowStatus::Cancelled,
@@ -8755,7 +8756,8 @@ pub async fn apply_race_loser_cancellations(
                 Ok((_, mut starts, _closed_children, terminal_metric)) => {
                     deferred.append(&mut starts);
                     if let Some((child_workflow_name, queue_name)) = terminal_metric {
-                        metrics.record_workflow_terminal(
+                        crate::telemetry::emit_workflow_terminal(
+                            metrics.as_ref(),
                             &child_workflow_name,
                             &queue_name,
                             WorkflowStatus::Cancelled,
@@ -10632,7 +10634,8 @@ async fn fail_workflow_for_history_cap(
     telemetry
         .metrics
         .record_workflow_history_size(&execution.workflow_name, terminal_count);
-    telemetry.metrics.record_workflow_terminal(
+    crate::telemetry::emit_workflow_terminal(
+        &*telemetry.metrics,
         &execution.workflow_name,
         &task.queue_name,
         WorkflowStatus::Failed,
@@ -10793,7 +10796,13 @@ async fn process_workflow_task(
                 | WorkflowEvent::MarkerRecorded { .. }
         )
     });
-    if task.attempt == 1 && !has_scheduling_events {
+    // Synthetic liveness canary (issue #796, AC8): a probe emits ONLY
+    // `harvest.canary.*` and no `harvest.workflow.*` business counter, so it is
+    // excluded from `harvest.workflow.started` too.
+    if task.attempt == 1
+        && !has_scheduling_events
+        && !crate::canary::is_canary_workflow(&prepared.execution.workflow_name)
+    {
         telemetry
             .metrics
             .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
@@ -11755,29 +11764,42 @@ async fn process_workflow_task(
         return Ok(());
     }
 
+    // Synthetic liveness canary (issue #796, AC8): a built-in throwaway probe
+    // workflow reports its health via the `harvest.canary.*` metrics and emits
+    // ONLY `harvest.canary.*` — it contributes to NO `harvest.workflow.*`
+    // business SLO counter (`duration`/`history_size`/`continue_as_new`/
+    // `terminal`), so probes never pollute success-rate or latency dashboards.
+    // It still contributes to `harvest.activity.*`/`harvest.queue.*` as it
+    // legitimately exercises them. DISTINCT from the #512 replay canary. Labels
+    // on `harvest.canary.*` are `queue` + `shard` only.
+    let is_canary = crate::canary::is_canary_workflow(&prepared.execution.workflow_name);
+    let canary_shard = u16::try_from(prepared.execution.shard_id).unwrap_or(0);
+
     let status = match &outcome {
         WorkflowOutcome::Completed { .. } => WorkflowStatus::Completed,
         WorkflowOutcome::Failed { .. } => WorkflowStatus::Failed,
         WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
         WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
     };
-    telemetry.metrics.record_workflow_completed(
-        &prepared.execution.workflow_name,
-        &task.queue_name,
-        started_at.elapsed().as_secs_f64(),
-        status,
-    );
-    if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
-        telemetry.metrics.record_workflow_history_size(
+    if !is_canary {
+        telemetry.metrics.record_workflow_completed(
             &prepared.execution.workflow_name,
-            terminal_history_event_count(next_event_id, &pending_cmds)
-                .saturating_add(terminal_parent_close_cascade_events),
+            &task.queue_name,
+            started_at.elapsed().as_secs_f64(),
+            status,
         );
-    }
-    if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
-        telemetry
-            .metrics
-            .record_workflow_continue_as_new(&prepared.execution.workflow_name);
+        if !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
+            telemetry.metrics.record_workflow_history_size(
+                &prepared.execution.workflow_name,
+                terminal_history_event_count(next_event_id, &pending_cmds)
+                    .saturating_add(terminal_parent_close_cascade_events),
+            );
+        }
+        if matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. }) {
+            telemetry
+                .metrics
+                .record_workflow_continue_as_new(&prepared.execution.workflow_name);
+        }
     }
     // Emit the once-per-terminal-outcome counter (issue #519).
     // Suspended is not a terminal state — a workflow that suspends N times
@@ -11789,13 +11811,38 @@ async fn process_workflow_task(
     // harvest.update.completed/failed — so it represents DURABLE terminal
     // outcomes only. This site (`record_workflow_terminal`, #519) keeps its own
     // pre-persist placement unchanged.
+    //
+    // The non-canary terminal counter routes through
+    // `crate::telemetry::emit_workflow_terminal`, the single choke point that
+    // skips canary probes (issue #796) — so the canary-skip for the terminal
+    // counter lives in exactly one place; the canary branches below emit only
+    // the probe's own `harvest.canary.*` signal.
     match &outcome {
         WorkflowOutcome::Completed { .. } => {
-            telemetry.metrics.record_workflow_terminal(
-                &prepared.execution.workflow_name,
-                &task.queue_name,
-                WorkflowStatus::Completed,
-            );
+            if is_canary {
+                // Round-trip = start-requested → completed wall-clock (AC5).
+                // Clamp a clock-skew negative delta to 0 (`.to_std()` errs on
+                // a negative chrono duration), mirroring the update-duration
+                // clamping precedent.
+                let roundtrip_secs = (chrono::Utc::now() - prepared.execution.started_at)
+                    .to_std()
+                    .map_or(0.0, |delta| delta.as_secs_f64());
+                telemetry
+                    .metrics
+                    .record_canary_success(&task.queue_name, canary_shard);
+                telemetry.metrics.record_canary_roundtrip(
+                    &task.queue_name,
+                    canary_shard,
+                    roundtrip_secs,
+                );
+            } else {
+                crate::telemetry::emit_workflow_terminal(
+                    &*telemetry.metrics,
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    WorkflowStatus::Completed,
+                );
+            }
         }
         WorkflowOutcome::Failed {
             non_deterministic_details,
@@ -11817,17 +11864,29 @@ async fn process_workflow_task(
                     .metrics
                     .record_workflow_non_determinism(&prepared.execution.workflow_name, build_id);
             }
-            telemetry.metrics.record_workflow_terminal(
+            if is_canary {
+                telemetry
+                    .metrics
+                    .record_canary_failure(&task.queue_name, canary_shard);
+            } else {
+                crate::telemetry::emit_workflow_terminal(
+                    &*telemetry.metrics,
+                    &prepared.execution.workflow_name,
+                    &task.queue_name,
+                    WorkflowStatus::Failed,
+                );
+            }
+        }
+        WorkflowOutcome::ContinuedAsNew { .. } => {
+            // A canary never continues-as-new; the choke point skips it anyway
+            // (AC8), so this is effectively unreachable for a canary.
+            crate::telemetry::emit_workflow_terminal(
+                &*telemetry.metrics,
                 &prepared.execution.workflow_name,
                 &task.queue_name,
-                WorkflowStatus::Failed,
+                WorkflowStatus::ContinuedAsNew,
             );
         }
-        WorkflowOutcome::ContinuedAsNew { .. } => telemetry.metrics.record_workflow_terminal(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            WorkflowStatus::ContinuedAsNew,
-        ),
         WorkflowOutcome::Suspended { .. } => {} // not terminal — no counter
     }
 
@@ -15641,7 +15700,8 @@ pub async fn quarantine_workflow_task_timeout(
     match result {
         Ok((deferred_starts, queue_used, closed_children)) => {
             if let Some(q) = queue_used {
-                metrics.record_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal(
+                    metrics,
                     workflow_name,
                     &q,
                     crate::telemetry::WorkflowStatus::Failed,

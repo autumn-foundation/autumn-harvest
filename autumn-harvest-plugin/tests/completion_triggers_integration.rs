@@ -1989,6 +1989,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
         max_runs: None,
         catchup_policy: None,
         retry_policy: None,
+        all_writable_shards: false,
     };
     autumn_harvest::register_workflow_schedules(&mut conn0, &[ws])
         .await

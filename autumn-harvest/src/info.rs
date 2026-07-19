@@ -1350,6 +1350,7 @@ impl DagInfo {
             max_runs: None,
             catchup_policy: None,
             retry_policy: None,
+            all_writable_shards: false,
         })
     }
 

@@ -355,6 +355,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/status", RouteClass::ReadOnly),
     // Effective runtime-config introspection (issue #695): read-only, secret-free.
     ("GET /admin/config", RouteClass::ReadOnly),
+    // Synthetic liveness canary freshness report (issue #796): read-only.
+    ("GET /admin/canary", RouteClass::ReadOnly),
     ("GET /admin/version-gates/usage", RouteClass::ReadOnly),
     (
         "GET /admin/version-gates/retirement-check",
@@ -749,6 +751,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/shards/health",
     "GET /admin/status",
     "GET /admin/config",
+    "GET /admin/canary",
     "GET /admin/version-gates/usage",
     "GET /admin/version-gates/retirement-check",
     "GET /admin/retention",
@@ -904,6 +907,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/shards/health", None),
     ("GET /admin/status", None),
     ("GET /admin/config", None),
+    ("GET /admin/canary", None),
     ("GET /admin/version-gates/usage", None),
     ("GET /admin/version-gates/retirement-check", None),
     ("GET /admin/retention", None),
@@ -1596,6 +1600,34 @@ mod tests {
                 .any(|(r, op)| *r == "GET /admin/status" && op.is_none()),
             "GET /admin/status must appear in ALL_MUTATION_ROUTES with no audit \
              operation (issue #679)"
+        );
+    }
+
+    #[test]
+    fn admin_canary_route_is_classified_read_only() {
+        // The synthetic liveness canary freshness report (issue #796) is a
+        // read-only cross-shard projection. This pin — not just the general
+        // exhaustiveness guards, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other — is what catches the route
+        // shipping unclassified.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/canary" && *c == RouteClass::ReadOnly),
+            "GET /admin/canary must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #796)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/canary" && op.is_none()),
+            "GET /admin/canary must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #796)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /admin/canary"),
+            "GET /admin/canary must appear in EXCLUDED_ROUTES (read-only, no \
+             audit trail; issue #796)"
         );
     }
 

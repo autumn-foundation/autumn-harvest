@@ -1,14 +1,14 @@
 {
   "uid": "harvest-starter-pack",
   "title": "Harvest Starter Pack",
-  "description": "Starter Grafana dashboard pack v0.1.0 for the Harvest workflow engine (autumn-harvest). Covers the full ADR-0001 / telemetry.rs metric catalogue as scraped through the metrics-rs adapter (MetricsRsRecorder + metrics-exporter-prometheus). Panel choices and any thresholds mentioned in panel descriptions are starter defaults, not universal SLOs \u2014 tune to your workload. Source of truth: docs/dashboards/starter-pack-v0.1.0.json in the autumn-harvest repo; alert mapping in docs/dashboards/README.md; response runbook in docs/runbooks/harvest-alerts.md.",
+  "description": "Starter Grafana dashboard pack v0.1.0 for the Harvest workflow engine (autumn-harvest). Covers the full ADR-0001 / telemetry.rs metric catalogue as scraped through the metrics-rs adapter (MetricsRsRecorder + metrics-exporter-prometheus). Panel choices and any thresholds mentioned in panel descriptions are starter defaults, not universal SLOs — tune to your workload. Source of truth: docs/dashboards/starter-pack-v0.1.0.json in the autumn-harvest repo; alert mapping in docs/dashboards/README.md; response runbook in docs/runbooks/harvest-alerts.md.",
   "tags": [
     "harvest",
     "starter-pack",
     "v0.1.0"
   ],
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "timezone": "",
@@ -268,7 +268,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_workflow_failure_rate (docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate) Fraction of terminal executions that ended failed, per workflow type. Starter default threshold: > 10% over 5m \u2014 a starter default, not a universal SLO."
+      "description": "Alert: harvest_workflow_failure_rate (docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate) Fraction of terminal executions that ended failed, per workflow type. Starter default threshold: > 10% over 5m — a starter default, not a universal SLO."
     },
     {
       "id": 5,
@@ -317,7 +317,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_queue_backlog_growth (docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth) Pending tasks per queue. max by (queue) avoids double-counting when several worker replicas sample the same cross-shard depth. Secondary capacity signal \u2014 the schedule-to-start p99 panel is the primary page."
+      "description": "Alert: harvest_queue_backlog_growth (docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth) Pending tasks per queue. max by (queue) avoids double-counting when several worker replicas sample the same cross-shard depth. Secondary capacity signal — the schedule-to-start p99 panel is the primary page."
     },
     {
       "id": 6,
@@ -375,7 +375,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_queue_schedule_to_start_high (docs/runbooks/harvest-alerts.md#harvest_queue_schedule_to_start_high) Seconds from task eligibility to worker claim \u2014 the canonical worker-capacity SLI (issue #501). The p99 target needs set_buckets_for_metric; the avg target works on a bucket-less exporter."
+      "description": "Alert: harvest_queue_schedule_to_start_high (docs/runbooks/harvest-alerts.md#harvest_queue_schedule_to_start_high) Seconds from task eligibility to worker claim — the canonical worker-capacity SLI (issue #501). The p99 target needs set_buckets_for_metric; the avg target works on a bucket-less exporter."
     },
     {
       "id": 7,
@@ -1065,7 +1065,7 @@
               }
             }
           ],
-          "description": "Observation-only soft SLA breaches (issue #487) \u2014 the run keeps executing; emitted exactly once per breaching run."
+          "description": "Observation-only soft SLA breaches (issue #487) — the run keeps executing; emitted exactly once per breaching run."
         },
         {
           "id": 22,
@@ -1114,7 +1114,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_workflow_non_determinism (docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism) Replay divergences detected (issue #480). Any non-zero value after a deploy means a replay-breaking build shipped \u2014 first action: GET /api/harvest/workflows?nd_blocked=true."
+          "description": "Alert: harvest_workflow_non_determinism (docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism) Replay divergences detected (issue #480). Any non-zero value after a deploy means a replay-breaking build shipped — first action: GET /api/harvest/workflows?nd_blocked=true."
         },
         {
           "id": 23,
@@ -1748,7 +1748,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_activity_failure_surge (docs/runbooks/harvest-alerts.md#harvest_activity_failure_surge) Failed activity completions per second (absolute rate \u2014 the alert\u2019s companion 5%-of-completions ratio form is readable from the Activity success ratio panel). Starter default: page above 5% of completions or > 10 failures in 5m for a critical activity."
+          "description": "Alert: harvest_activity_failure_surge (docs/runbooks/harvest-alerts.md#harvest_activity_failure_surge) Failed activity completions per second (absolute rate — the alert’s companion 5%-of-completions ratio form is readable from the Activity success ratio panel). Starter default: page above 5% of completions or > 10 failures in 5m for a critical activity."
         },
         {
           "id": 36,
@@ -1846,7 +1846,7 @@
               }
             }
           ],
-          "description": "Terminal/non-retryable per-attempt failures with error-type breakdown (issue #528). error_type values are author-shaped \u2014 kept to topk."
+          "description": "Terminal/non-retryable per-attempt failures with error-type breakdown (issue #528). error_type values are author-shaped — kept to topk."
         },
         {
           "id": 38,
@@ -1895,7 +1895,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_activity_retry_storm (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Alert: harvest_activity_retry_storm_critical (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Retries actually enqueued per second \u2014 the authoritative retry-storm signal. Starter defaults: ticket > 5/s, page > 20/s, both over 5m."
+          "description": "Alert: harvest_activity_retry_storm (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Alert: harvest_activity_retry_storm_critical (docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm) Retries actually enqueued per second — the authoritative retry-storm signal. Starter defaults: ticket > 5/s, page > 20/s, both over 5m."
         }
       ]
     },
@@ -2070,7 +2070,7 @@
               }
             }
           ],
-          "description": "Age of the oldest claimable eligible task per queue (issue #501) \u2014 the fast-detection companion to the schedule-to-start p99. Companion signal for Alert: harvest_queue_backlog_growth."
+          "description": "Age of the oldest claimable eligible task per queue (issue #501) — the fast-detection companion to the schedule-to-start p99. Companion signal for Alert: harvest_queue_backlog_growth."
         },
         {
           "id": 44,
@@ -2119,7 +2119,7 @@
               }
             }
           ],
-          "description": "Per-queue dispatch rate (issue #515) \u2014 confirms the live dispatch split matches configured queue weights."
+          "description": "Per-queue dispatch rate (issue #515) — confirms the live dispatch split matches configured queue weights."
         },
         {
           "id": 45,
@@ -2226,7 +2226,7 @@
               }
             }
           ],
-          "description": "Current tuner slot target per slot_type (issue #548) \u2014 confirms live behaviour stays inside the operator band. Per-replica series (each worker tunes its own slots), so the legend carries the instance label."
+          "description": "Current tuner slot target per slot_type (issue #548) — confirms live behaviour stays inside the operator band. Per-replica series (each worker tunes its own slots), so the legend carries the instance label."
         },
         {
           "id": 47,
@@ -2762,7 +2762,7 @@
               }
             }
           ],
-          "description": "Output-guarded completion triggers (issue #810): condition-skip rate per trigger and reason. reason=condition_unmet is a resolved skip (the guard evaluated false); reason=condition_invalid means a stored guard this build cannot parse \u2014 investigate mixed-version deploys or repair the condition."
+          "description": "Output-guarded completion triggers (issue #810): condition-skip rate per trigger and reason. reason=condition_unmet is a resolved skip (the guard evaluated false); reason=condition_invalid means a stored guard this build cannot parse — investigate mixed-version deploys or repair the condition."
         },
         {
           "id": 907,
@@ -3196,7 +3196,7 @@
               }
             }
           ],
-          "description": "Per-key in-flight executions against the concurrency limit (issue #247). key cardinality is author-controlled \u2014 kept to topk."
+          "description": "Per-key in-flight executions against the concurrency limit (issue #247). key cardinality is author-controlled — kept to topk."
         },
         {
           "id": 67,
@@ -3424,7 +3424,7 @@
               }
             }
           ],
-          "description": "Observed payload sizes by payload kind (issue #252). Bridged in the metrics-rs adapter by issue #754, but the engine has no emission call sites for harvest.payload.bytes as of v0.1.0 (pre-existing issue #252 gap) \u2014 this panel stays empty until emission is wired; see the issue #754 review."
+          "description": "Observed payload sizes by payload kind (issue #252). Bridged in the metrics-rs adapter by issue #754, but the engine has no emission call sites for harvest.payload.bytes as of v0.1.0 (pre-existing issue #252 gap) — this panel stays empty until emission is wired; see the issue #754 review."
         },
         {
           "id": 72,
@@ -3473,7 +3473,7 @@
               }
             }
           ],
-          "description": "Payloads rejected by the byte-cap guard (issue #252). Bridged in the metrics-rs adapter by issue #754, but the engine has no emission call sites for harvest.payload.rejected as of v0.1.0 (pre-existing issue #252 gap) \u2014 this panel stays empty until emission is wired; see the issue #754 review."
+          "description": "Payloads rejected by the byte-cap guard (issue #252). Bridged in the metrics-rs adapter by issue #754, but the engine has no emission call sites for harvest.payload.rejected as of v0.1.0 (pre-existing issue #252 gap) — this panel stays empty until emission is wired; see the issue #754 review."
         },
         {
           "id": 73,
@@ -3701,7 +3701,7 @@
               }
             }
           ],
-          "description": "Session acquisitions by outcome (acquired / timed_out / broken) \u2014 issue #606."
+          "description": "Session acquisitions by outcome (acquired / timed_out / broken) — issue #606."
         },
         {
           "id": 78,
@@ -3787,7 +3787,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
+            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
           }
         },
         {
@@ -3802,7 +3802,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
+            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
           }
         },
         {
@@ -3817,7 +3817,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
+            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
           }
         },
         {
@@ -3832,7 +3832,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
+            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
           }
         },
         {
@@ -3847,7 +3847,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution_id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
+            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution_id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
           }
         }
       ]
@@ -3911,7 +3911,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_saga_compensation_spike (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_spike) Real compensation sequences entered (issue #801) \u2014 counted exactly once per unwind, at unwind start. A sustained rise above the workflow's baseline is the earliest downstream-outage signal: forward saga steps are failing and rolling back en masse."
+          "description": "Alert: harvest_saga_compensation_spike (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_spike) Real compensation sequences entered (issue #801) — counted exactly once per unwind, at unwind start. A sustained rise above the workflow's baseline is the earliest downstream-outage signal: forward saga steps are failing and rolling back en masse."
         },
         {
           "id": 87,
@@ -3960,7 +3960,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_saga_compensation_failed (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed) Unwinds that finished with at least one compensation error (issue #801) \u2014 the dangling-state case (HarvestError::SagaCompensationFailed). Any increase warrants a page: committed side effects were left un-rolled-back and need manual reconciliation. Distinct from harvest_workflow_terminal{outcome=\"failed\"}."
+          "description": "Alert: harvest_saga_compensation_failed (docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed) Unwinds that finished with at least one compensation error (issue #801) — the dangling-state case (HarvestError::SagaCompensationFailed). Any increase warrants a page: committed side effects were left un-rolled-back and need manual reconciliation. Distinct from harvest_workflow_terminal{outcome=\"failed\"}."
         }
       ]
     },
@@ -4023,7 +4023,7 @@
               }
             }
           ],
-          "description": "Contained activity/local-activity handler panics per second (issue #782) \u2014 a `panic!()`/`unwrap()` in an `#[activity]` body caught at the dispatch boundary and converted to a retryable typed `HandlerPanic` failure. Fires once per panicking attempt (a retry that panics again increments again), so this is a per-attempt panic-rate signal distinct from ordinary `Err` failures and from process-crash quarantine (harvest_task_quarantined). A sustained rise points at a code bug in an activity, not a downstream outage."
+          "description": "Contained activity/local-activity handler panics per second (issue #782) — a `panic!()`/`unwrap()` in an `#[activity]` body caught at the dispatch boundary and converted to a retryable typed `HandlerPanic` failure. Fires once per panicking attempt (a retry that panics again increments again), so this is a per-attempt panic-rate signal distinct from ordinary `Err` failures and from process-crash quarantine (harvest_task_quarantined). A sustained rise points at a code bug in an activity, not a downstream outage."
         },
         {
           "id": 91,
@@ -4072,7 +4072,7 @@
               }
             }
           ],
-          "description": "Contained workflow-body handler panics per second (issue #782) \u2014 a panic in a `#[workflow]` body caught in the executor and re-dispatched under a bounded panic-retry budget (WorkerConfig::workflow_panic_max_attempts), then failed terminally as a typed `HandlerPanic`. Emitted on every panic entry (each retry and the final terminal failure), so a workflow that panics N times before exhausting its budget emits N samples. A rise indicates a deterministic code bug on the workflow path."
+          "description": "Contained workflow-body handler panics per second (issue #782) — a panic in a `#[workflow]` body caught in the executor and re-dispatched under a bounded panic-retry budget (WorkerConfig::workflow_panic_max_attempts), then failed terminally as a typed `HandlerPanic`. Emitted on every panic entry (each retry and the final terminal failure), so a workflow that panics N times before exhausting its budget emits N samples. A rise indicates a deterministic code bug on the workflow path."
         }
       ]
     },
@@ -4439,6 +4439,176 @@
             }
           ],
           "description": "Wall-clock latency from an update's durable admission (UpdateAdmitted) to its terminal result (UpdateCompleted/UpdateFailed) (issue #781). p99 needs set_buckets_for_metric on the exporter; the bucket-less avg fallback works on any install. Rejected updates are excluded (no handler runs)."
+        }
+      ]
+    },
+    {
+      "id": 97,
+      "type": "row",
+      "title": "Synthetic liveness canary",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 87
+      },
+      "panels": [
+        {
+          "id": 94,
+          "type": "timeseries",
+          "title": "Canary round-trip latency p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 88
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, queue, shard) (rate(harvest_canary_roundtrip_bucket{queue=~\"$queue\",shard=~\"$shard\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{queue}} / shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (queue, shard) (rate(harvest_canary_roundtrip_sum{queue=~\"$queue\",shard=~\"$shard\"}[$__rate_interval])) / sum by (queue, shard) (rate(harvest_canary_roundtrip_count{queue=~\"$queue\",shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "avg {{queue}} / shard {{shard}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Synthetic liveness-canary probe round-trip latency (issue #796) — wall-clock seconds from start-requested to terminal completion of the built-in throwaway workflow that exercises the live start → dispatch → activity → durable-timer → complete path, per probed (queue, shard). Distinct from the #512 replay canary (which validates code changes). The p99 target needs set_buckets_for_metric; the avg target works on a bucket-less exporter. A flatlined series means no probe has completed — a wedged pipeline for that (queue, shard)."
+        },
+        {
+          "id": 95,
+          "type": "timeseries",
+          "title": "Canary success rate",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 88
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, shard) (rate(harvest_canary_success_total{queue=~\"$queue\",shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "{{queue}} / shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Synthetic liveness-canary probe completions per second per (queue, shard) (issue #796). A rate that drops to zero while the fleet looks structurally healthy (workers heartbeating, queues shallow) is the signature of a silently wedged execution pipeline — detectable within one probe interval, before any customer workflow misses its SLA. Distinct from the #512 replay canary."
+        },
+        {
+          "id": 96,
+          "type": "timeseries",
+          "title": "Canary failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 96
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue, shard) (rate(harvest_canary_failure_total{queue=~\"$queue\",shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "{{queue}} / shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Synthetic liveness-canary probe failures per second per (queue, shard) (issue #796) — a probe that did not reach terminal completion within its per-probe timeout, or terminated in a non-completed state. A sustained rise on one (queue, shard) isolates a wedged worker pool or a write-blocked shard. Distinct from the #512 replay canary."
         }
       ]
     }

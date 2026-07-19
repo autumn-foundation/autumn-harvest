@@ -423,6 +423,11 @@ pub struct HarvestApiState {
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Starter defaults; overridable per deployment via the plugin builder.
     status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
+    /// Built-in synthetic liveness canary configuration (issue #796), mirrored
+    /// from the plugin builder at startup so the (follow-up) `GET /admin/canary`
+    /// read model can resolve the probe interval / staleness window. `None`
+    /// when the canary is disabled.
+    canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
 }
 
 impl Default for HarvestApiState {
@@ -472,6 +477,7 @@ impl Default for HarvestApiState {
             status_thresholds: Arc::new(Mutex::new(
                 crate::status_summary::StatusThresholds::default(),
             )),
+            canary_config: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -676,6 +682,33 @@ impl HarvestApiState {
     #[must_use]
     pub fn status_thresholds(&self) -> crate::status_summary::StatusThresholds {
         self.status_thresholds
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
+    }
+
+    /// Mirror the built-in synthetic liveness canary configuration (issue #796)
+    /// from the plugin builder at startup. `None` disables the canary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_canary_config(&self, config: Option<crate::canary::CanaryConfig>) {
+        *self
+            .canary_config
+            .lock()
+            .expect("harvest api state lock poisoned") = config;
+    }
+
+    /// The mirrored synthetic liveness canary configuration, if enabled
+    /// (issue #796).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn canary_config(&self) -> Option<crate::canary::CanaryConfig> {
+        self.canary_config
             .lock()
             .expect("harvest api state lock poisoned")
             .clone()
@@ -4397,6 +4430,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(effective_config).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/canary",
+            get(admin_canary).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/version-gates/usage",
             get(version_usage).route_layer(require_admin.clone()),
         )
@@ -5352,6 +5389,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/shards/health"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
+        ("GET", "/admin/canary"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/workflow-types/reachability"),
@@ -6479,6 +6517,21 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/admin/canary",
+            // `probes[]` entries carry queue/shard/last_success_at/
+            // age_of_last_success_secs/last_roundtrip_ms/success_count/
+            // failure_count/stale — nested, documented in the contract
+            // description; this list is top-level fields only.
+            Some(&[
+                "status",
+                "as_of",
+                "staleness_window_secs",
+                "probes",
+                "unavailable_shards",
+            ]),
+        ),
+        (
+            "GET",
             "/admin/version-gates/usage",
             Some(&["status", "observed_at", "filters", "items", "shards"]),
         ),
@@ -7016,6 +7069,26 @@ async fn effective_config(
         ))
     })?;
     Ok(Json(view))
+}
+
+/// `GET /admin/canary` — synthetic liveness canary freshness report (issue #796).
+///
+/// Read-only and admin-gated. Reports, per `(queue, shard)`, the age of the
+/// most recent COMPLETED built-in probe run so an operator (or a staleness
+/// alert) can tell a live pipeline from a wedged one — a stale probe means
+/// workers on that queue/shard are polling but never completing, the scheduler
+/// tick stalled, or the shard is write-blocked. Fans out across every writable
+/// shard; an unreachable shard is named in `unavailable_shards` and drops
+/// `status` to `partial`/`unavailable` rather than failing the call wholesale.
+/// When the canary is disabled an empty `complete` report is returned.
+///
+/// **Distinct from the #512 replay canary** (`POST /admin/workflows/replay-canary`),
+/// which validates *code changes* by replaying histories — this reports the
+/// *running pipeline*'s liveness.
+async fn admin_canary(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Json<crate::canary::CanaryReport> {
+    Json(crate::canary::build_canary_report_from_shards(&api_state).await)
 }
 
 async fn version_usage(
@@ -14727,7 +14800,11 @@ async fn batch_start_workflows(
                     }
                     let m = runtime.registry.telemetry().metrics.as_ref();
                     for (wf_name, q_name) in cancel_metrics {
-                        m.record_workflow_terminal(
+                        // Route through the single choke point so a synthetic
+                        // liveness canary (issue #796, AC8) never leaks into
+                        // harvest.workflow.terminal via a batch cancel.
+                        autumn_harvest::telemetry::emit_workflow_terminal(
+                            m,
                             &wf_name,
                             &q_name,
                             autumn_harvest::telemetry::WorkflowStatus::Cancelled,
@@ -20137,6 +20214,10 @@ async fn create_workflow_schedule(
         max_runs: request.max_runs.filter(|&n| n > 0),
         catchup_policy,
         retry_policy: request.retry_policy.clone(),
+        // Operator-created schedules keep single-shard placement; the
+        // per-writable-shard opt-in (issue #796) is set programmatically by the
+        // built-in synthetic liveness canary registration, not via this route.
+        all_writable_shards: false,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -27020,6 +27101,44 @@ fn apply_search_attr_filters<'a>(
     query
 }
 
+/// Whether the default `GET /workflows` list should hide synthetic liveness
+/// canary runs (issue #796, AC8).
+///
+/// Canary rows are excluded by default; a caller that explicitly filters to a
+/// canary `workflow_name` (i.e. one that [`autumn_harvest::canary::is_canary_workflow`]
+/// matches) opts back in and sees them.
+fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
+    !workflow_name.is_some_and(autumn_harvest::canary::is_canary_workflow)
+}
+
+/// Apply the synthetic liveness canary list exclusion to a workflow-list query
+/// (issue #796, AC8).
+///
+/// When [`exclude_canary_from_list`] is true, filters out rows whose
+/// `workflow_name` starts with the reserved canary prefix, so canary runs never
+/// pollute operator views or success-rate dashboards. Uses Postgres
+/// `starts_with` on the qualified column so it matches the prefix exactly (no
+/// LIKE wildcard ambiguity) and works inside the stalled loader's
+/// correlated-subquery context. The prefix is always a *bound* `Text` param,
+/// never interpolated.
+fn apply_canary_list_exclusion<'a>(
+    query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
+    workflow_name: Option<&str>,
+) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Text};
+
+    if exclude_canary_from_list(workflow_name) {
+        query.filter(
+            sql::<Bool>("NOT starts_with(harvest_workflow_executions.workflow_name, ")
+                .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
+                .sql(")"),
+        )
+    } else {
+        query
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
@@ -27080,6 +27199,9 @@ pub(crate) async fn load_workflows(
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
     }
+    // Issue #796 (AC8): hide synthetic liveness canary runs from the default
+    // list unless the caller explicitly filters to a canary workflow name.
+    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -27490,6 +27612,12 @@ pub(crate) async fn load_stalled_workflows(
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.as_str()));
     }
+    // Issue #796 (AC8): hide synthetic liveness canary runs from the stalled
+    // view too, unless the caller explicitly filters to a canary workflow name.
+    // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
+    // itself wedged — a failure the canary exists to detect) would surface in
+    // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
+    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -36906,6 +37034,27 @@ mod tests {
             !filters.paginated,
             "no pagination params → paginated must be false"
         );
+    }
+
+    // ── Synthetic liveness canary list exclusion (issue #796, AC8) ───────────
+
+    #[test]
+    fn exclude_canary_from_list_hides_canaries_by_default() {
+        // No workflow_name filter → canary rows are hidden.
+        assert!(exclude_canary_from_list(None));
+        // An ordinary workflow_name filter → canary rows stay hidden.
+        assert!(exclude_canary_from_list(Some("onboarding")));
+    }
+
+    #[test]
+    fn exclude_canary_from_list_includes_canaries_when_explicitly_filtered() {
+        // Explicitly filtering to a canary workflow name opts back in.
+        assert!(!exclude_canary_from_list(Some(
+            "__harvest_canary_probe__default"
+        )));
+        assert!(!exclude_canary_from_list(Some(
+            "__harvest_canary_probe__email"
+        )));
     }
 
     // ── Read-path payload decoding (issue #608) ──────────────────────────────

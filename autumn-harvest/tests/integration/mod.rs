@@ -13,6 +13,8 @@ mod auto_heartbeat_tests;
 #[cfg(feature = "db")]
 mod build_routing_tests;
 mod cache_delta_load_tests;
+#[cfg(feature = "db")]
+mod canary_tests;
 mod cancellation_tests;
 mod child_fanout_tests;
 mod child_policy_tests;
