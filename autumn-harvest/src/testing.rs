@@ -87,6 +87,9 @@ pub enum NonDeterminismKind {
     ExternalActivityMismatch,
     /// A `signal_external_workflow` call did not match the recorded event.
     ExternalSignalMismatch,
+    /// An `await_external_workflow` call did not match the recorded event
+    /// (issue #757) — the awaited target differs from what history recorded.
+    ExternalAwaitMismatch,
     /// A continue-as-new input differed from history.
     ContinueAsNewMismatch,
     /// The workflow returned before consuming all recorded history events.
@@ -122,6 +125,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::SideEffectDrift => write!(f, "SideEffectDrift"),
             Self::ExternalActivityMismatch => write!(f, "ExternalActivityMismatch"),
             Self::ExternalSignalMismatch => write!(f, "ExternalSignalMismatch"),
+            Self::ExternalAwaitMismatch => write!(f, "ExternalAwaitMismatch"),
             Self::ContinueAsNewMismatch => write!(f, "ContinueAsNewMismatch"),
             Self::EarlyCompletion => write!(f, "EarlyCompletion"),
             Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
@@ -1826,6 +1830,7 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
         "side-effect drift" => NonDeterminismKind::SideEffectDrift,
         "external activity" => NonDeterminismKind::ExternalActivityMismatch,
         "external signal" => NonDeterminismKind::ExternalSignalMismatch,
+        "external await" => NonDeterminismKind::ExternalAwaitMismatch,
         s if s.contains("continue") => NonDeterminismKind::ContinueAsNewMismatch,
         "early completion" => NonDeterminismKind::EarlyCompletion,
         _ => NonDeterminismKind::Unknown,
@@ -2976,6 +2981,16 @@ pub struct WorkflowTestEnv {
     /// (issue #698) so a no-DB test can prove `ctx.info().parent_execution_id` /
     /// `ctx.parent_execution_id()`. `None` (the default) models a top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// Canned `await_external_workflow` outcomes (issue #757): target → the
+    /// target's `COMPLETED` output. An awaited target present here resolves to
+    /// `Ok(output)`.
+    external_await_results: HashMap<ExecutionId, Value>,
+    /// Canned `await_external_workflow` failure outcomes (issue #757): target →
+    /// the target's terminal cause (`reason_code`, message, typed fields). An
+    /// awaited target present here resolves to the typed `Err` branch. Takes
+    /// precedence over `external_await_results` if both are set for a target.
+    external_await_failures:
+        HashMap<ExecutionId, (String, Option<String>, Option<String>, Option<Value>, Option<bool>)>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -3008,6 +3023,8 @@ impl WorkflowTestEnv {
             queue_name: String::new(),
             execution_timeout: None,
             parent_execution_id: None,
+            external_await_results: HashMap::new(),
+            external_await_failures: HashMap::new(),
         }
     }
 
@@ -3133,6 +3150,44 @@ impl WorkflowTestEnv {
     #[must_use]
     pub fn queue_signal(mut self, name: impl Into<String>, payload: Value) -> Self {
         self.queued_signals.push((name.into(), payload));
+        self
+    }
+
+    /// Configure `ctx.await_external_workflow(target)` to resolve to `Ok(output)`
+    /// (the target reached `COMPLETED` with `output`) — issue #757.
+    #[must_use]
+    pub fn with_external_await_result(mut self, target: ExecutionId, output: Value) -> Self {
+        self.external_await_results.insert(target, output);
+        self
+    }
+
+    /// Configure `ctx.await_external_workflow(target)` to resolve to a typed
+    /// `Err` (the target reached a non-`COMPLETED` terminal state) — issue #757.
+    ///
+    /// `reason_code` is one of `target_failed`/`target_timed_out`/
+    /// `target_cancelled`/`target_terminated`. The optional typed fields carry a
+    /// [`crate::failure::WorkflowFailure`]-style cause; pass `None`s for an
+    /// untyped failure.
+    #[must_use]
+    pub fn with_external_await_failure(
+        mut self,
+        target: ExecutionId,
+        reason_code: impl Into<String>,
+        message: Option<String>,
+        error_type: Option<String>,
+        details: Option<Value>,
+        non_retryable: Option<bool>,
+    ) -> Self {
+        self.external_await_failures.insert(
+            target,
+            (
+                reason_code.into(),
+                message,
+                error_type,
+                details,
+                non_retryable,
+            ),
+        );
         self
     }
 
@@ -3938,6 +3993,42 @@ impl WorkflowTestEnv {
                     history.push(WorkflowEvent::ExternalCancelRequested { cancel_id, target });
                 }
                 history.push(WorkflowEvent::ExternalCancelDelivered { cancel_id });
+                let _ = result_tx.send(Ok(()));
+                Ok(true)
+            }
+
+            // Await resolves from the configured canned outcome for the target
+            // (issue #757): a `with_external_await_failure` entry → the typed
+            // `Err` branch; else a `with_external_await_result` entry (or, if
+            // unconfigured, a `COMPLETED` with `Null` output) → the `Ok` branch.
+            WorkflowCommand::AwaitExternalWorkflow {
+                await_id,
+                target,
+                result_tx,
+                already_requested,
+            } => {
+                if !already_requested {
+                    history.push(WorkflowEvent::ExternalAwaitRequested { await_id, target });
+                }
+                if let Some((reason_code, message, error_type, details, non_retryable)) =
+                    self.external_await_failures.get(&target).cloned()
+                {
+                    history.push(WorkflowEvent::ExternalAwaitFailed {
+                        await_id,
+                        reason_code,
+                        message,
+                        error_type,
+                        details,
+                        non_retryable,
+                    });
+                } else {
+                    let output = self
+                        .external_await_results
+                        .get(&target)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    history.push(WorkflowEvent::ExternalAwaitResolved { await_id, output });
+                }
                 let _ = result_tx.send(Ok(()));
                 Ok(true)
             }

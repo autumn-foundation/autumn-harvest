@@ -2253,6 +2253,235 @@ pub async fn enforce_external_cancels_outbox(
     Ok(count)
 }
 
+/// Scan for `ExternalAwaitRequested` events without a matching terminal event
+/// and attempt to resolve the awaited target's terminal outcome (issue #757).
+///
+/// Observe-only: reads the target's terminal outcome via
+/// [`crate::execution::read_external_await_outcome`] and, when terminal, appends
+/// `ExternalAwaitResolved`/`ExternalAwaitFailed` to the **awaiter's** own history
+/// (inflated) and wakes it. A still-`RUNNING`/`PAUSED` target is left pending
+/// (retried next sweep — this is how "resolves within one poll interval after
+/// the target reaches terminal" is met). A `NotFound` target only becomes a
+/// permanent `target_unknown` failure once the grace window has elapsed.
+///
+/// Per-step outcome: `(processed, skipped_event_id)`.
+#[allow(clippy::too_many_lines)]
+pub async fn enforce_external_awaits_outbox(
+    conn: &mut AsyncPgConnection,
+    unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+) -> HarvestResult<usize> {
+    let mut count = 0;
+    let codecs = crate::payload_codec::PayloadCodecs::default();
+
+    let shards: Vec<i32> = if shard_assignments.is_empty() {
+        vec![0]
+    } else {
+        shard_assignments.iter().map(|s| s.as_i32()).collect()
+    };
+
+    let mut excluded_event_ids: Vec<i64> = Vec::new();
+
+    loop {
+        let shards_clone = shards.clone();
+        let codecs_clone = codecs.clone();
+        let excluded_clone = excluded_event_ids.clone();
+
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
+            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(|conn| {
+                let shards = shards_clone;
+                let codecs = codecs_clone;
+                let excluded = excluded_clone;
+                async move {
+                    let sql = "SELECT e.* FROM harvest_events e \
+                               INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                               WHERE e.event_type = 'ExternalAwaitRequested' \
+                                 AND execs.state = 'RUNNING' \
+                                 AND execs.shard_id = ANY($1) \
+                                 AND (e.event_data->'data'->>'await_id') IS NOT NULL \
+                                 AND NOT (e.id = ANY($2)) \
+                                 AND NOT EXISTS ( \
+                                     SELECT 1 FROM harvest_events res \
+                                     WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                       AND res.event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed') \
+                                       AND res.event_data->'data'->>'await_id' = e.event_data->'data'->>'await_id' \
+                                 ) \
+                               LIMIT 1 \
+                               FOR UPDATE OF e SKIP LOCKED";
+
+                    let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                        .get_result(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+
+                    let Some(row) = row_opt else {
+                        return Ok(None);
+                    };
+
+                    let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+
+                    let (await_id, target) = match codecs.decode_event(row.event_data.clone()) {
+                        Ok(WorkflowEvent::ExternalAwaitRequested { await_id, target }) => {
+                            (await_id, target)
+                        }
+                        Ok(other) => {
+                            tracing::error!(event = ?other, "await outbox sweep: query returned non-ExternalAwaitRequested event");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "await outbox sweep: failed to decode event_data");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                    };
+
+                    let age = Utc::now() - row.timestamp;
+                    let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
+                        .map_or(chrono::Duration::MAX, |d| d);
+                    let grace_expired = age > grace_chrono;
+
+                    let active_sharded_pool = sharded_pool
+                        .clone()
+                        .or_else(|| {
+                            crate::shard::GLOBAL_SHARDED_POOL.read().ok()
+                                .and_then(|lock| lock.clone())
+                        });
+
+                    let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                        if let (Some(t_pool), Some(c_pool)) = (
+                            pool.exact_pool_for_execution(target),
+                            pool.exact_pool_for_execution(caller_exec_id),
+                        ) {
+                            std::ptr::eq(t_pool, c_pool)
+                        } else {
+                            false
+                        }
+                    });
+
+                    // Resolve the target's outcome and existence on the correct
+                    // connection (same pool → this connection; else a target
+                    // connection). Returns `(outcome, target_exists)`; the reader
+                    // returns `None` for both still-running and not-found, so we
+                    // probe existence separately to drive the grace window.
+                    let resolve = |outcome: Option<crate::execution::ExternalAwaitOutcome>,
+                                   exists: bool|
+                     -> Option<WorkflowEvent> {
+                        match outcome {
+                            Some(crate::execution::ExternalAwaitOutcome::Completed(output)) => {
+                                Some(WorkflowEvent::ExternalAwaitResolved { await_id, output })
+                            }
+                            Some(crate::execution::ExternalAwaitOutcome::Terminal {
+                                reason_code,
+                                message,
+                                error_type,
+                                details,
+                                non_retryable,
+                            }) => Some(WorkflowEvent::ExternalAwaitFailed {
+                                await_id,
+                                reason_code,
+                                message,
+                                error_type,
+                                details,
+                                non_retryable,
+                            }),
+                            // Still running/paused (exists) → pending. Unknown
+                            // (not exists) → target_unknown only after grace.
+                            None => {
+                                if !exists && grace_expired {
+                                    Some(WorkflowEvent::ExternalAwaitFailed {
+                                        await_id,
+                                        reason_code: "target_unknown".to_string(),
+                                        message: None,
+                                        error_type: None,
+                                        details: None,
+                                        non_retryable: None,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    };
+
+                    let terminal_opt = if same_pool {
+                        let outcome =
+                            crate::execution::read_external_await_outcome(conn, target).await?;
+                        let exists = outcome.is_some()
+                            || crate::execution::load_execution(conn, target).await.is_ok();
+                        resolve(outcome, exists)
+                    } else {
+                        let Some(pool) = active_sharded_pool
+                            .as_ref()
+                            .and_then(|p| p.exact_pool_for_execution(target))
+                        else {
+                            tracing::warn!(
+                                target_shard = %target.shard(),
+                                "await outbox sweep: target shard not configured locally; skipping"
+                            );
+                            return Ok(Some((false, Some(row.id))));
+                        };
+                        let mut target_conn = match pool.get().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(error = %e, "await outbox sweep: failed to acquire target connection");
+                                return Ok(Some((false, Some(row.id))));
+                            }
+                        };
+                        let outcome = crate::execution::read_external_await_outcome(
+                            &mut target_conn,
+                            target,
+                        )
+                        .await?;
+                        let exists = outcome.is_some()
+                            || crate::execution::load_execution(&mut target_conn, target)
+                                .await
+                                .is_ok();
+                        resolve(outcome, exists)
+                    };
+
+                    if let Some(terminal_event) = terminal_opt {
+                        let history =
+                            lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                        store::append_events(
+                            conn,
+                            caller_exec_id,
+                            &[terminal_event],
+                            history.next_event_id,
+                        )
+                        .await?;
+                        queue::wake_workflow_task(conn, caller_exec_id).await?;
+                        Ok(Some((true, None)))
+                    } else {
+                        Ok(Some((false, Some(row.id))))
+                    }
+                }
+                .scope_boxed()
+            })
+            .await;
+
+        match step_res {
+            Ok(Some((processed, skipped_id))) => {
+                if processed {
+                    count += 1;
+                }
+                if let Some(id) = skipped_id {
+                    excluded_event_ids.push(id);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::error!(error = %e, "await outbox sweep error in transaction step");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(count)
+}
+
 /// Sweep every timeout-related enforcement pass in one connection.
 ///
 /// `session_worker_stale_secs` bounds the worker-session broken-session scan
@@ -2334,6 +2563,13 @@ pub async fn enforce_timeouts_once(
     count += enforce_external_cancels_outbox(
         conn,
         metrics,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+    )
+    .await?;
+    count += enforce_external_awaits_outbox(
+        conn,
         unknown_target_grace_window,
         sharded_pool,
         shard_assignments,

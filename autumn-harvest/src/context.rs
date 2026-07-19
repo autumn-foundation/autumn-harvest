@@ -28,8 +28,8 @@ use crate::replay::{
 };
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    IdempotencyKey, SessionId, TimerId, UpdateId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ExternalSignalId, IdempotencyKey, SessionId, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -566,6 +566,27 @@ pub enum WorkflowCommand {
         /// not be appended again (crash-recovery path).
         already_requested: bool,
     },
+    /// Durably await the terminal outcome of a sibling workflow execution
+    /// (issue #757).
+    ///
+    /// Observe-only — never affects the target's lifecycle. The command suspends
+    /// the caller; the worker appends `ExternalAwaitRequested` (and, when the
+    /// target is already terminal and same-shard, the terminal outcome inline).
+    /// The resolved value/error is carried in the appended
+    /// `ExternalAwaitResolved`/`ExternalAwaitFailed` event, not the channel — on
+    /// the resumed drive `match_external_await` returns the recorded outcome.
+    AwaitExternalWorkflow {
+        /// Correlation ID shared across all three history events.
+        await_id: ExternalAwaitId,
+        /// Target workflow execution to await.
+        target: ExecutionId,
+        /// Outcome channel used only as a suspension signal (the value is
+        /// recovered from the appended terminal event, not this channel).
+        result_tx: oneshot::Sender<Result<(), String>>,
+        /// When `true`, `ExternalAwaitRequested` is already in history and must
+        /// not be appended again (crash-recovery / re-park path).
+        already_requested: bool,
+    },
     /// Durably cancel the losing branches of a resolved `ctx.race()` (issue #600).
     ///
     /// Pushed once per race, in the same drained batch as the race's winner
@@ -780,6 +801,17 @@ impl std::fmt::Debug for WorkflowCommand {
             } => f
                 .debug_struct("RequestCancelExternalWorkflow")
                 .field("cancel_id", cancel_id)
+                .field("target", target)
+                .field("already_requested", already_requested)
+                .finish_non_exhaustive(),
+            Self::AwaitExternalWorkflow {
+                await_id,
+                target,
+                already_requested,
+                ..
+            } => f
+                .debug_struct("AwaitExternalWorkflow")
+                .field("await_id", await_id)
                 .field("target", target)
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
@@ -7377,6 +7409,210 @@ impl WorkflowContext {
                 "cancel of {target}: result channel dropped"
             ))),
         }
+    }
+
+    // ── External workflow await (issue #757) ─────────────────────────────────
+
+    /// Durably await the terminal outcome of an arbitrary sibling workflow
+    /// execution by `ExecutionId` (issue #757), deserializing its output into
+    /// `T`.
+    ///
+    /// Blocks (durably, via replay) until `target` reaches a terminal state:
+    /// - Target `COMPLETED` → resolves with the deserialized output.
+    /// - Target `FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED` → returns
+    ///   [`HarvestError::WorkflowFailed`] carrying the target's terminal cause
+    ///   (a typed, author-branchable value via `err.workflow_error_type()` /
+    ///   `err.workflow_details()` / `err.is_workflow_non_retryable()`).
+    /// - Target `RUNNING`/`PAUSED` → the caller parks and resolves within one
+    ///   outbox poll interval after the target reaches any terminal state.
+    ///
+    /// Await is **observe-only**: it never establishes parent/child linkage,
+    /// never cancels the target, and never triggers any lifecycle effect on it.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalAwaitFailed`] with `reason_code = "self_await"`
+    ///   when `target == self.exec_id()`.
+    /// - [`HarvestError::ExternalAwaitFailed`] with `reason_code =
+    ///   "target_unknown"` if no execution with `target` is found within the
+    ///   grace window.
+    /// - [`HarvestError::WorkflowFailed`] when the target reached a
+    ///   non-`COMPLETED` terminal state.
+    /// - [`HarvestError::Serialization`] if the target's output cannot be
+    ///   deserialized into `T`.
+    /// - [`HarvestError::NonDeterministic`] if the history at this position does
+    ///   not match the requested target.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn await_external_workflow<T>(&self, target: ExecutionId) -> HarvestResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let output = self.await_external_workflow_value(target).await?;
+        serde_json::from_value(output).map_err(HarvestError::from)
+    }
+
+    /// Untyped sibling of [`await_external_workflow`](Self::await_external_workflow):
+    /// returns the target's raw terminal output as a [`serde_json::Value`] on
+    /// success (issue #757).
+    ///
+    /// # Errors
+    ///
+    /// See [`await_external_workflow`](Self::await_external_workflow).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn await_external_workflow_value(&self, target: ExecutionId) -> HarvestResult<Value> {
+        use crate::replay::HistoryMatch;
+
+        // Self-await is always an immediate deterministic error. This path
+        // records no history, so the `await_id` must be a stable sentinel (nil
+        // UUID) rather than a fresh v4 — otherwise a workflow that surfaces the
+        // error into its output would diverge on replay (mirrors self-cancel).
+        if target == self.exec_id {
+            return Err(HarvestError::ExternalAwaitFailed {
+                await_id: ExternalAwaitId::from_uuid(uuid::Uuid::nil()),
+                target,
+                reason_code: "self_await".to_string(),
+            });
+        }
+
+        let history_match = self.match_history(|m| m.match_external_await(target));
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+
+            HistoryMatch::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => Err(Self::build_await_error(
+                target,
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            )),
+
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!("external await mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+
+            // Crash-recovery / still-pending: ExternalAwaitRequested is already
+            // durable; re-dispatch (re-park) with the recorded await_id.
+            HistoryMatch::ExternalAwaitInProgress { await_id } => {
+                self.dispatch_await_command(target, await_id, true).await
+            }
+
+            // First live call: generate a new await_id and dispatch.
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!(
+                    "ExternalAwaitRequested(target={target})"
+                ))?;
+                self.dispatch_await_command(target, ExternalAwaitId::new(), false)
+                    .await
+            }
+
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::DetachedChildSpawned { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. } => {
+                unreachable!(
+                    "match_external_await never returns Failed, ActivityInProgress, \
+                     AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
+                     TimedOut, DetachedChildSpawned, ExternalSignal*, or ExternalCancel*"
+                )
+            }
+        }
+    }
+
+    /// Build the caller-facing error for an `ExternalAwaitFailed` history match.
+    ///
+    /// A **transport** failure (`self_await`/`target_unknown`) surfaces as
+    /// [`HarvestError::ExternalAwaitFailed`]; a target that reached a
+    /// non-`COMPLETED` terminal state surfaces as a typed
+    /// [`HarvestError::WorkflowFailed`] carrying the target's own terminal cause
+    /// (the SAME shape a failed child surfaces as, issue #767).
+    fn build_await_error(
+        target: ExecutionId,
+        await_id: ExternalAwaitId,
+        reason_code: String,
+        message: Option<String>,
+        error_type: Option<String>,
+        details: Option<Value>,
+        non_retryable: Option<bool>,
+    ) -> HarvestError {
+        match reason_code.as_str() {
+            "self_await" | "target_unknown" => HarvestError::ExternalAwaitFailed {
+                await_id,
+                target,
+                reason_code,
+            },
+            _ => HarvestError::WorkflowFailed {
+                name: format!("external-workflow:{target}"),
+                reason: message.unwrap_or_else(|| reason_code.clone()),
+                error_type,
+                details,
+                non_retryable,
+            },
+        }
+    }
+
+    /// Push an `AwaitExternalWorkflow` command and await its resolution.
+    ///
+    /// Shared by the crash-recovery (`already_requested = true`) and first-call
+    /// (`already_requested = false`) dispatch paths. The resolved value is
+    /// recovered from the appended terminal event on the resumed drive — this
+    /// channel is only a suspension signal, so a dropped channel re-parks
+    /// rather than errors.
+    async fn dispatch_await_command(
+        &self,
+        target: ExecutionId,
+        await_id: ExternalAwaitId,
+        already_requested: bool,
+    ) -> HarvestResult<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.push_command(WorkflowCommand::AwaitExternalWorkflow {
+            await_id,
+            target,
+            result_tx: tx,
+            already_requested,
+        });
+        // Suspension. The `result_tx` sender lives inside the pushed command
+        // (held by the context) until the executor extracts it, so `rx` stays
+        // Pending; the executor drops this whole future at its suspension
+        // timeout and re-drives the workflow from history, where
+        // `match_external_await` recovers the recorded terminal outcome and this
+        // method never reaches `dispatch_await_command` at all. The value is
+        // carried in the appended `ExternalAwaitResolved`/`ExternalAwaitFailed`
+        // event — never this channel (which only carries `Result<(), String>`).
+        // The code past `rx.await` is therefore unreachable in production; park
+        // forever as a belt-and-braces guard so a spuriously-dropped sender
+        // re-parks rather than resolving with a bogus value.
+        let _ = rx.await;
+        std::future::pending::<HarvestResult<Value>>().await
     }
 
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
