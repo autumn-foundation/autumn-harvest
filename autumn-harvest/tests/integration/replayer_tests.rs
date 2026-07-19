@@ -8955,7 +8955,13 @@ fn unbounded_replay_4<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let activities: Vec<_> = (0..4)
-            .map(|i| (format!("task_{i}"), serde_json::json!(i), "default".to_string()))
+            .map(|i| {
+                (
+                    format!("task_{i}"),
+                    serde_json::json!(i),
+                    "default".to_string(),
+                )
+            })
             .collect();
         let results = ctx
             .execute_activity_fan_out_raw(activities)
@@ -8971,7 +8977,13 @@ fn windowed_replay_body(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
     Box::pin(async move {
         let activities: Vec<_> = (0..4)
-            .map(|i| (format!("task_{i}"), serde_json::json!(i), "default".to_string()))
+            .map(|i| {
+                (
+                    format!("task_{i}"),
+                    serde_json::json!(i),
+                    "default".to_string(),
+                )
+            })
             .collect();
         let results = ctx
             .execute_activity_fan_out_raw_windowed(activities, window)
@@ -9043,10 +9055,22 @@ async fn replayer_windowed_fan_out_is_window_independent() {
 
     // (a) all windows replay clean under the strict WorkflowReplayer.
     for (name, handler) in [
-        ("windowed_replay_w1", windowed_replay_w1 as WorkflowHandlerFn),
-        ("windowed_replay_w2", windowed_replay_w2 as WorkflowHandlerFn),
-        ("windowed_replay_w100", windowed_replay_w100 as WorkflowHandlerFn),
-        ("unbounded_replay_4", unbounded_replay_4 as WorkflowHandlerFn),
+        (
+            "windowed_replay_w1",
+            windowed_replay_w1 as WorkflowHandlerFn,
+        ),
+        (
+            "windowed_replay_w2",
+            windowed_replay_w2 as WorkflowHandlerFn,
+        ),
+        (
+            "windowed_replay_w100",
+            windowed_replay_w100 as WorkflowHandlerFn,
+        ),
+        (
+            "unbounded_replay_4",
+            unbounded_replay_4 as WorkflowHandlerFn,
+        ),
     ] {
         let report = WorkflowReplayer::new()
             .register_fn(name, handler)
@@ -9066,13 +9090,9 @@ async fn replayer_windowed_fan_out_is_window_independent() {
         windowed_replay_w100 as WorkflowHandlerFn,
         unbounded_replay_4 as WorkflowHandlerFn,
     ] {
-        let outcome = autumn_harvest::executor::run_workflow(
-            exec_id,
-            events.clone(),
-            handler,
-            Value::Null,
-        )
-        .await;
+        let outcome =
+            autumn_harvest::executor::run_workflow(exec_id, events.clone(), handler, Value::Null)
+                .await;
         match outcome {
             autumn_harvest::executor::WorkflowOutcome::Completed { output, .. } => {
                 outputs.push(output);
@@ -9080,10 +9100,12 @@ async fn replayer_windowed_fan_out_is_window_independent() {
             other => panic!("expected Completed, got {other:?}"),
         }
     }
-    let expected =
-        serde_json::json!({ "results": ["done_0", "done_1", "done_2", "done_3"] });
+    let expected = serde_json::json!({ "results": ["done_0", "done_1", "done_2", "done_3"] });
     for out in &outputs {
-        assert_eq!(*out, expected, "all windows must produce input-order results");
+        assert_eq!(
+            *out, expected,
+            "all windows must produce input-order results"
+        );
     }
 }
 
@@ -9097,9 +9119,13 @@ async fn replayer_windowed_fan_out_randomized_completion_order() {
     fn perm(seed: usize) -> Vec<usize> {
         let mut v = vec![0usize, 1, 2, 3];
         // Fisher–Yates with a small LCG seeded by `seed` — deterministic.
-        let mut state = (seed as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut state = (seed as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         for i in (1..v.len()).rev() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let j = (state >> 33) as usize % (i + 1);
             v.swap(i, j);
         }

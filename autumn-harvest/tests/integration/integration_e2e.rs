@@ -10389,7 +10389,13 @@ fn windowed_fanout_e2e_workflow<'a>(
         let n = usize::try_from(input["n"].as_u64().unwrap_or(20)).unwrap_or(20);
         let w = usize::try_from(input["w"].as_u64().unwrap_or(5)).unwrap_or(5);
         let activities: Vec<_> = (0..n)
-            .map(|i| ("slow_double".to_string(), serde_json::json!(i), "default".to_string()))
+            .map(|i| {
+                (
+                    "slow_double".to_string(),
+                    serde_json::json!(i),
+                    "default".to_string(),
+                )
+            })
             .collect();
         let results = ctx
             .execute_activity_fan_out_raw_windowed(activities, w)
@@ -10407,7 +10413,13 @@ fn unbounded_fanout_e2e_workflow<'a>(
     Box::pin(async move {
         let n = usize::try_from(input["n"].as_u64().unwrap_or(20)).unwrap_or(20);
         let activities: Vec<_> = (0..n)
-            .map(|i| ("slow_double".to_string(), serde_json::json!(i), "default".to_string()))
+            .map(|i| {
+                (
+                    "slow_double".to_string(),
+                    serde_json::json!(i),
+                    "default".to_string(),
+                )
+            })
             .collect();
         let results = ctx
             .execute_activity_fan_out_raw(activities)
@@ -10433,27 +10445,28 @@ fn slow_double_activity<'a>(
 }
 
 fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
-    let make_wf = |name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn| WorkflowInfo {
-        mcp: false,
-        name,
-        module: "integration_e2e",
-        handler,
-        execution_timeout: None,
-        sla: None,
-        concurrency: None,
-        debounce: None,
-        batch: None,
-        throttle: None,
-        max_input_bytes: None,
-        owner: None,
-        runbook_url: None,
-        severity: None,
-        description: None,
-        input_schema: None,
-        output_schema: None,
-        error_schema: None,
-        retry_policy: None,
-    };
+    let make_wf =
+        |name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn| WorkflowInfo {
+            mcp: false,
+            name,
+            module: "integration_e2e",
+            handler,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        };
     Arc::new(HandlerRegistry::new(
         vec![
             make_wf("windowed_fanout_e2e", windowed_fanout_e2e_workflow),
@@ -10556,7 +10569,7 @@ async fn count_active_activity_rows(database_url: &str, exec_id: ExecutionId) ->
 /// records exactly N=20 `ActivityScheduled` events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
-    let (database_url, _container) = setup_test_database_url().await;
+    let (database_url, _container) = setup_test_database_url_or_env().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
@@ -10568,8 +10581,12 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
         serde_json::json!({ "n": 20, "w": 5 }),
     )
     .await;
-    enqueue_started_workflow_task(&mut conn, windowed_exec, serde_json::json!({ "n": 20, "w": 5 }))
-        .await;
+    enqueue_started_workflow_task(
+        &mut conn,
+        windowed_exec,
+        serde_json::json!({ "n": 20, "w": 5 }),
+    )
+    .await;
 
     let registry = windowed_fanout_e2e_registry();
     let worker = build_runtime_worker("worker-e2e-windowed-fanout", 4, 30, registry);
@@ -10593,9 +10610,13 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
         })
     };
 
-    let windowed_execution =
-        wait_for_execution_state_with_timeout(&database_url, windowed_exec, "COMPLETED", Duration::from_secs(30))
-            .await;
+    let windowed_execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        windowed_exec,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
     std::sync::atomic::AtomicBool::store(&done, true, Ordering::SeqCst);
     poller.await.expect("poller task should join");
 
@@ -10618,9 +10639,13 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
     )
     .await;
     enqueue_started_workflow_task(&mut conn, unbounded_exec, serde_json::json!({ "n": 20 })).await;
-    let unbounded_execution =
-        wait_for_execution_state_with_timeout(&database_url, unbounded_exec, "COMPLETED", Duration::from_secs(30))
-            .await;
+    let unbounded_execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        unbounded_exec,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
 
     worker.shutdown();
     handle.await.expect("worker task should join");
@@ -10643,7 +10668,10 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
         .iter()
         .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
         .count();
-    assert_eq!(scheduled, 20, "windowed fan-out must schedule all 20 inputs exactly once");
+    assert_eq!(
+        scheduled, 20,
+        "windowed fan-out must schedule all 20 inputs exactly once"
+    );
     let markers = history
         .events
         .iter()

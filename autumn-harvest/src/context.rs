@@ -8097,12 +8097,49 @@ impl WorkflowContext {
 
     async fn fan_out_raw_windowed_impl(
         &self,
-        _activities: Vec<(String, Value, String)>,
-        _max_in_flight: usize,
-        _retry: Option<crate::policy::RetryPolicy>,
-        _timeout: Option<std::time::Duration>,
+        activities: Vec<(String, Value, String)>,
+        max_in_flight: usize,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
     ) -> HarvestResult<Vec<Value>> {
-        unimplemented!("fan_out_raw_windowed_impl — RED phase stub")
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `max_in_flight == 0` (or `< 1`) clamps up to 1 — never a panic, hang,
+        // or silent no-op. The window is a live-dispatch concern only and is
+        // never recorded in history.
+        let window = max_in_flight.max(1);
+
+        let mut results = Vec::with_capacity(count);
+        let mut iter = activities.into_iter();
+        loop {
+            let wave: Vec<_> = iter.by_ref().take(window).collect();
+            if wave.is_empty() {
+                break;
+            }
+            // Cancellation is checked before each wave, so a fan-out cancelled
+            // mid-drain stops launching further waves.
+            self.check_cancellation()?;
+            let wave_futs = wave.into_iter().map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    self.execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                }
+            });
+            // Fail-fast: the first activity failure aborts the call and later
+            // waves are never dispatched.
+            let wave_results = futures::future::try_join_all(wave_futs).await?;
+            results.extend(wave_results);
+        }
+        Ok(results)
     }
 
     /// Execute N activities in parallel with a bounded number **in flight at a
@@ -8142,12 +8179,55 @@ impl WorkflowContext {
 
     async fn fan_out_collect_raw_windowed_impl(
         &self,
-        _activities: Vec<(String, Value, String)>,
-        _max_in_flight: usize,
-        _retry: Option<crate::policy::RetryPolicy>,
-        _timeout: Option<std::time::Duration>,
+        activities: Vec<(String, Value, String)>,
+        max_in_flight: usize,
+        retry: Option<crate::policy::RetryPolicy>,
+        timeout: Option<std::time::Duration>,
     ) -> HarvestResult<Vec<Result<Value, String>>> {
-        unimplemented!("fan_out_collect_raw_windowed_impl — RED phase stub")
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = activities.len();
+        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // See `fan_out_raw_windowed_impl` for the `max_in_flight == 0` clamp.
+        let window = max_in_flight.max(1);
+
+        let mut results = Vec::with_capacity(count);
+        let mut iter = activities.into_iter();
+        loop {
+            let wave: Vec<_> = iter.by_ref().take(window).collect();
+            if wave.is_empty() {
+                break;
+            }
+            self.check_cancellation()?;
+            let wave_futs = wave.into_iter().map(|(name, input, queue)| {
+                let retry = retry.clone();
+                async move {
+                    match self
+                        .execute_activity_raw_with_opts(&name, input, &queue, retry, timeout)
+                        .await
+                    {
+                        Ok(v) => Ok(Ok(v)),
+                        Err(
+                            e
+                            @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                        ) => Ok(Err(e.to_string())),
+                        Err(e) => Err(e),
+                    }
+                }
+            });
+            // Per-slot failures are `Ok(Err(..))`, so `try_join_all` does not
+            // short-circuit — every wave is dispatched and all N inputs are
+            // processed. Only an engine-level error aborts the fan-out.
+            let wave_results = futures::future::try_join_all(wave_futs).await?;
+            results.extend(wave_results);
+        }
+        Ok(results)
     }
 
     /// Typed bounded fail-fast fan-out: run the same activity for every input in
