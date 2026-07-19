@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    TimerId, UpdateId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ExternalSignalId, TimerId, UpdateId, WorkerId,
 };
 
 fn default_error_type() -> String {
@@ -775,6 +775,66 @@ pub enum WorkflowEvent {
         /// The id of the timer that was cancelled.
         timer_id: TimerId,
     },
+
+    // ── External workflow await (issue #757) ──────────────────────────────────
+    /// A workflow requested to durably await the terminal outcome of another
+    /// workflow execution by `ExecutionId`.
+    ///
+    /// The `await_id` correlates this request with its terminal outcome event
+    /// (`ExternalAwaitResolved` or `ExternalAwaitFailed`). On replay the
+    /// caller's context returns the recorded outcome without re-observing the
+    /// target. Unlike cancel/signal, the await is **observe-only** — it never
+    /// establishes parent/child linkage, cancels, or otherwise affects the
+    /// target's lifecycle.
+    ExternalAwaitRequested {
+        /// Correlation ID linking this event to its terminal outcome.
+        await_id: ExternalAwaitId,
+        /// The execution ID of the workflow to await.
+        target: ExecutionId,
+    },
+    /// The awaited target reached a `COMPLETED` terminal state. Carries the
+    /// target's recorded output (inflated), frozen into the awaiter's own
+    /// history so replay is deterministic.
+    ExternalAwaitResolved {
+        /// Correlation ID matching the corresponding `ExternalAwaitRequested`.
+        await_id: ExternalAwaitId,
+        /// The target workflow's terminal output value.
+        output: serde_json::Value,
+    },
+    /// The awaited target reached a non-`COMPLETED` terminal state
+    /// (`FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED`), or the target could not
+    /// be found after the configured grace window.
+    ///
+    /// `reason_code` is one of:
+    /// - `"target_failed"` — the target reached `FAILED`.
+    /// - `"target_timed_out"` — the target reached `TIMED_OUT`.
+    /// - `"target_cancelled"` — the target reached `CANCELLED`.
+    /// - `"target_terminated"` — the target reached `TERMINATED`.
+    /// - `"target_unknown"` — no execution matching `target` was found within
+    ///   the grace window.
+    ///
+    /// For a `FAILED` target the `message`/`error_type`/`details`/`non_retryable`
+    /// carry the target's typed [`crate::failure::WorkflowFailure`] (decoded via
+    /// [`crate::failure::decode_workflow_failure`]); for transport failures or
+    /// untyped failures they are `None`.
+    ExternalAwaitFailed {
+        /// Correlation ID matching the corresponding `ExternalAwaitRequested`.
+        await_id: ExternalAwaitId,
+        /// Machine-readable reason code (see variant docs).
+        reason_code: String,
+        /// Human-readable failure message from the target's terminal cause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Stable error-type name from a typed target failure; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        /// Structured details from a typed target failure; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable flag from a typed target failure; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        non_retryable: Option<bool>,
+    },
 }
 
 impl WorkflowEvent {
@@ -900,6 +960,9 @@ impl WorkflowEvent {
             Self::WorkflowRedriven { .. } => "WorkflowRedriven",
             Self::WorkflowRetryScheduled { .. } => "WorkflowRetryScheduled",
             Self::TimerCancelled { .. } => "TimerCancelled",
+            Self::ExternalAwaitRequested { .. } => "ExternalAwaitRequested",
+            Self::ExternalAwaitResolved { .. } => "ExternalAwaitResolved",
+            Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
         }
     }
 
@@ -1512,11 +1575,27 @@ mod tests {
             WorkflowEvent::TimerCancelled {
                 timer_id: TimerId::new("t"),
             },
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: crate::types::ExternalAwaitId::new(),
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: crate::types::ExternalAwaitId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: crate::types::ExternalAwaitId::new(),
+                reason_code: "target_failed".into(),
+                message: None,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
         ];
 
-        assert_eq!(events.len(), 46);
+        assert_eq!(events.len(), 49);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 46, "duplicate type names detected");
+        assert_eq!(names.len(), 49, "duplicate type names detected");
     }
 
     // ── TimerCancelled tests (issue #768) ─────────────────────────────────────
@@ -2139,5 +2218,150 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         Ok(())
+    }
+
+    // ── ExternalAwait event tests (issue #757) ────────────────────────────
+
+    #[test]
+    fn external_await_requested_round_trips() -> Result<(), serde_json::Error> {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let event = WorkflowEvent::ExternalAwaitRequested { await_id, target };
+        assert_eq!(event.type_name(), "ExternalAwaitRequested");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: aid,
+                target: t,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(t, target);
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_resolved_round_trips() -> Result<(), serde_json::Error> {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let event = WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: serde_json::json!({"total": 42}),
+        };
+        assert_eq!(event.type_name(), "ExternalAwaitResolved");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: aid,
+                output,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(output["total"], 42);
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_failed_round_trips_with_typed_fields() -> Result<(), serde_json::Error> {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let event = WorkflowEvent::ExternalAwaitFailed {
+            await_id,
+            reason_code: "target_failed".into(),
+            message: Some("boom".into()),
+            error_type: Some("PaymentDeclined".into()),
+            details: Some(serde_json::json!({"code": 402})),
+            non_retryable: Some(true),
+        };
+        assert_eq!(event.type_name(), "ExternalAwaitFailed");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: aid,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(reason_code, "target_failed");
+                assert_eq!(message.as_deref(), Some("boom"));
+                assert_eq!(error_type.as_deref(), Some("PaymentDeclined"));
+                assert_eq!(details.unwrap()["code"], 402);
+                assert_eq!(non_retryable, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_failed_pre_757_json_deserializes_without_optional_fields()
+    -> Result<(), serde_json::Error> {
+        // A minimal ExternalAwaitFailed with only reason_code — the additive
+        // `#[serde(default)]` optional fields must deserialize to `None`.
+        let await_id = crate::types::ExternalAwaitId::new();
+        let legacy = serde_json::json!({
+            "type": "ExternalAwaitFailed",
+            "data": {
+                "await_id": await_id,
+                "reason_code": "target_unknown"
+            }
+        });
+        let back: WorkflowEvent = serde_json::from_value(legacy)?;
+        match back {
+            WorkflowEvent::ExternalAwaitFailed {
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(reason_code, "target_unknown");
+                assert_eq!(message, None);
+                assert_eq!(error_type, None);
+                assert_eq!(details, None);
+                assert_eq!(non_retryable, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_events_are_not_terminal_lifecycle() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        assert!(
+            !WorkflowEvent::ExternalAwaitRequested {
+                await_id,
+                target: ExecutionId::new(),
+            }
+            .is_terminal_lifecycle()
+        );
+        assert!(
+            !WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::Value::Null,
+            }
+            .is_terminal_lifecycle()
+        );
+        assert!(
+            !WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_failed".into(),
+                message: None,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            }
+            .is_terminal_lifecycle()
+        );
     }
 }

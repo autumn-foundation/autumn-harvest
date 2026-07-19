@@ -546,6 +546,26 @@ impl WorkflowSimulator {
                     history.push(WorkflowEvent::TimerCancelled { timer_id });
                     advanced = true;
                 }
+                // External await (issue #757): the simulator has no canned-outcome
+                // config, so it always resolves to a `COMPLETED` target with `Null`
+                // output (the `Ok` branch). Records `ExternalAwaitRequested` +
+                // `ExternalAwaitResolved` so the next replay cycle observes it.
+                WorkflowCommand::AwaitExternalWorkflow {
+                    await_id,
+                    target,
+                    result_tx,
+                    already_requested,
+                } => {
+                    if !already_requested {
+                        history.push(WorkflowEvent::ExternalAwaitRequested { await_id, target });
+                    }
+                    history.push(WorkflowEvent::ExternalAwaitResolved {
+                        await_id,
+                        output: Value::Null,
+                    });
+                    let _ = result_tx.send(Ok(()));
+                    advanced = true;
+                }
                 _ => {
                     // `WaitForSignal` is a no-op here: signals are ingested into
                     // history at task-prep (see the pre-dispatch drain in `run`,

@@ -9,6 +9,8 @@ mod admission_gate_tests;
 mod alert_pack_docs;
 mod audit_tests;
 #[cfg(feature = "db")]
+mod auto_heartbeat_tests;
+#[cfg(feature = "db")]
 mod build_routing_tests;
 mod cache_delta_load_tests;
 #[cfg(feature = "db")]
@@ -23,6 +25,7 @@ mod circuit_breaker_wiring_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
 mod context_headers_tests;
+mod cross_workflow_await_tests;
 mod cross_workflow_cancel_tests;
 #[cfg(feature = "db")]
 mod cross_workflow_signal_tests;

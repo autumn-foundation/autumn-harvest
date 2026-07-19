@@ -2078,6 +2078,7 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
+        WorkflowCommand::AwaitExternalWorkflow { .. } => "AwaitExternalWorkflow",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
         WorkflowCommand::ContinueAsNew { .. } => "ContinueAsNew",

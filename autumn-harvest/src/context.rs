@@ -28,8 +28,8 @@ use crate::replay::{
 };
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    IdempotencyKey, SessionId, TimerId, UpdateId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ExternalSignalId, IdempotencyKey, SessionId, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -566,6 +566,27 @@ pub enum WorkflowCommand {
         /// not be appended again (crash-recovery path).
         already_requested: bool,
     },
+    /// Durably await the terminal outcome of a sibling workflow execution
+    /// (issue #757).
+    ///
+    /// Observe-only — never affects the target's lifecycle. The command suspends
+    /// the caller; the worker appends `ExternalAwaitRequested` (and, when the
+    /// target is already terminal and same-shard, the terminal outcome inline).
+    /// The resolved value/error is carried in the appended
+    /// `ExternalAwaitResolved`/`ExternalAwaitFailed` event, not the channel — on
+    /// the resumed drive `match_external_await` returns the recorded outcome.
+    AwaitExternalWorkflow {
+        /// Correlation ID shared across all three history events.
+        await_id: ExternalAwaitId,
+        /// Target workflow execution to await.
+        target: ExecutionId,
+        /// Outcome channel used only as a suspension signal (the value is
+        /// recovered from the appended terminal event, not this channel).
+        result_tx: oneshot::Sender<Result<(), String>>,
+        /// When `true`, `ExternalAwaitRequested` is already in history and must
+        /// not be appended again (crash-recovery / re-park path).
+        already_requested: bool,
+    },
     /// Durably cancel the losing branches of a resolved `ctx.race()` (issue #600).
     ///
     /// Pushed once per race, in the same drained batch as the race's winner
@@ -780,6 +801,17 @@ impl std::fmt::Debug for WorkflowCommand {
             } => f
                 .debug_struct("RequestCancelExternalWorkflow")
                 .field("cancel_id", cancel_id)
+                .field("target", target)
+                .field("already_requested", already_requested)
+                .finish_non_exhaustive(),
+            Self::AwaitExternalWorkflow {
+                await_id,
+                target,
+                already_requested,
+                ..
+            } => f
+                .debug_struct("AwaitExternalWorkflow")
+                .field("await_id", await_id)
                 .field("target", target)
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
@@ -3710,6 +3742,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
@@ -4586,6 +4620,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, \
@@ -4777,6 +4813,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_local_activity never returns AwaitingExternalCompletion, \
@@ -5013,6 +5051,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
@@ -5728,6 +5768,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
@@ -6724,6 +6766,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 let actual = format!("{history_match:?}");
                 Err(self.nd_error(
@@ -7178,6 +7222,8 @@ impl WorkflowContext {
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_external_signal never returns Failed, ActivityInProgress, \
@@ -7322,11 +7368,14 @@ impl WorkflowContext {
             | HistoryMatch::TimedOut { .. }
             | HistoryMatch::DetachedChildSpawned { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
-            | HistoryMatch::ExternalSignalFailed { .. } => {
+            | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. } => {
                 unreachable!(
                     "match_external_cancel never returns Failed, ActivityInProgress, \
                      AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
-                     TimedOut, DetachedChildSpawned, ExternalSignalInProgress, or ExternalSignalFailed"
+                     TimedOut, DetachedChildSpawned, ExternalSignalInProgress, ExternalSignalFailed, \
+                     ExternalAwaitInProgress, or ExternalAwaitFailed"
                 )
             }
         }
@@ -7360,6 +7409,210 @@ impl WorkflowContext {
                 "cancel of {target}: result channel dropped"
             ))),
         }
+    }
+
+    // ── External workflow await (issue #757) ─────────────────────────────────
+
+    /// Durably await the terminal outcome of an arbitrary sibling workflow
+    /// execution by `ExecutionId` (issue #757), deserializing its output into
+    /// `T`.
+    ///
+    /// Blocks (durably, via replay) until `target` reaches a terminal state:
+    /// - Target `COMPLETED` → resolves with the deserialized output.
+    /// - Target `FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED` → returns
+    ///   [`HarvestError::WorkflowFailed`] carrying the target's terminal cause
+    ///   (a typed, author-branchable value via `err.workflow_error_type()` /
+    ///   `err.workflow_details()` / `err.is_workflow_non_retryable()`).
+    /// - Target `RUNNING`/`PAUSED` → the caller parks and resolves within one
+    ///   outbox poll interval after the target reaches any terminal state.
+    ///
+    /// Await is **observe-only**: it never establishes parent/child linkage,
+    /// never cancels the target, and never triggers any lifecycle effect on it.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalAwaitFailed`] with `reason_code = "self_await"`
+    ///   when `target == self.exec_id()`.
+    /// - [`HarvestError::ExternalAwaitFailed`] with `reason_code =
+    ///   "target_unknown"` if no execution with `target` is found within the
+    ///   grace window.
+    /// - [`HarvestError::WorkflowFailed`] when the target reached a
+    ///   non-`COMPLETED` terminal state.
+    /// - [`HarvestError::Serialization`] if the target's output cannot be
+    ///   deserialized into `T`.
+    /// - [`HarvestError::NonDeterministic`] if the history at this position does
+    ///   not match the requested target.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn await_external_workflow<T>(&self, target: ExecutionId) -> HarvestResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let output = self.await_external_workflow_value(target).await?;
+        serde_json::from_value(output).map_err(HarvestError::from)
+    }
+
+    /// Untyped sibling of [`await_external_workflow`](Self::await_external_workflow):
+    /// returns the target's raw terminal output as a [`serde_json::Value`] on
+    /// success (issue #757).
+    ///
+    /// # Errors
+    ///
+    /// See [`await_external_workflow`](Self::await_external_workflow).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn await_external_workflow_value(&self, target: ExecutionId) -> HarvestResult<Value> {
+        use crate::replay::HistoryMatch;
+
+        // Self-await is always an immediate deterministic error. This path
+        // records no history, so the `await_id` must be a stable sentinel (nil
+        // UUID) rather than a fresh v4 — otherwise a workflow that surfaces the
+        // error into its output would diverge on replay (mirrors self-cancel).
+        if target == self.exec_id {
+            return Err(HarvestError::ExternalAwaitFailed {
+                await_id: ExternalAwaitId::from_uuid(uuid::Uuid::nil()),
+                target,
+                reason_code: "self_await".to_string(),
+            });
+        }
+
+        let history_match = self.match_history(|m| m.match_external_await(target));
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+
+            HistoryMatch::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => Err(Self::build_await_error(
+                target,
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            )),
+
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!("external await mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+
+            // Crash-recovery / still-pending: ExternalAwaitRequested is already
+            // durable; re-dispatch (re-park) with the recorded await_id.
+            HistoryMatch::ExternalAwaitInProgress { await_id } => {
+                self.dispatch_await_command(target, await_id, true).await
+            }
+
+            // First live call: generate a new await_id and dispatch.
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!(
+                    "ExternalAwaitRequested(target={target})"
+                ))?;
+                self.dispatch_await_command(target, ExternalAwaitId::new(), false)
+                    .await
+            }
+
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::DetachedChildSpawned { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. } => {
+                unreachable!(
+                    "match_external_await never returns Failed, ActivityInProgress, \
+                     AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
+                     TimedOut, DetachedChildSpawned, ExternalSignal*, or ExternalCancel*"
+                )
+            }
+        }
+    }
+
+    /// Build the caller-facing error for an `ExternalAwaitFailed` history match.
+    ///
+    /// A **transport** failure (`self_await`/`target_unknown`) surfaces as
+    /// [`HarvestError::ExternalAwaitFailed`]; a target that reached a
+    /// non-`COMPLETED` terminal state surfaces as a typed
+    /// [`HarvestError::WorkflowFailed`] carrying the target's own terminal cause
+    /// (the SAME shape a failed child surfaces as, issue #767).
+    fn build_await_error(
+        target: ExecutionId,
+        await_id: ExternalAwaitId,
+        reason_code: String,
+        message: Option<String>,
+        error_type: Option<String>,
+        details: Option<Value>,
+        non_retryable: Option<bool>,
+    ) -> HarvestError {
+        match reason_code.as_str() {
+            "self_await" | "target_unknown" => HarvestError::ExternalAwaitFailed {
+                await_id,
+                target,
+                reason_code,
+            },
+            _ => HarvestError::WorkflowFailed {
+                name: format!("external-workflow:{target}"),
+                reason: message.unwrap_or_else(|| reason_code.clone()),
+                error_type,
+                details,
+                non_retryable,
+            },
+        }
+    }
+
+    /// Push an `AwaitExternalWorkflow` command and await its resolution.
+    ///
+    /// Shared by the crash-recovery (`already_requested = true`) and first-call
+    /// (`already_requested = false`) dispatch paths. The resolved value is
+    /// recovered from the appended terminal event on the resumed drive — this
+    /// channel is only a suspension signal, so a dropped channel re-parks
+    /// rather than errors.
+    async fn dispatch_await_command(
+        &self,
+        target: ExecutionId,
+        await_id: ExternalAwaitId,
+        already_requested: bool,
+    ) -> HarvestResult<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.push_command(WorkflowCommand::AwaitExternalWorkflow {
+            await_id,
+            target,
+            result_tx: tx,
+            already_requested,
+        });
+        // Suspension. The `result_tx` sender lives inside the pushed command
+        // (held by the context) until the executor extracts it, so `rx` stays
+        // Pending; the executor drops this whole future at its suspension
+        // timeout and re-drives the workflow from history, where
+        // `match_external_await` recovers the recorded terminal outcome and this
+        // method never reaches `dispatch_await_command` at all. The value is
+        // carried in the appended `ExternalAwaitResolved`/`ExternalAwaitFailed`
+        // event — never this channel (which only carries `Result<(), String>`).
+        // The code past `rx.await` is therefore unreachable in production; park
+        // forever as a belt-and-braces guard so a spuriously-dropped sender
+        // re-parks rather than resolving with a bogus value.
+        let _ = rx.await;
+        std::future::pending::<HarvestResult<Value>>().await
     }
 
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
@@ -8922,6 +9175,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_external_activity never returns ChildInProgress, \
@@ -8989,6 +9244,8 @@ impl WorkflowContext {
             | HistoryMatch::ExternalSignalFailed { .. }
             | HistoryMatch::ExternalCancelInProgress { .. }
             | HistoryMatch::ExternalCancelFailed { .. }
+            | HistoryMatch::ExternalAwaitInProgress { .. }
+            | HistoryMatch::ExternalAwaitFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 let actual = format!("{history_match:?}");
                 Err(self.nd_error(
@@ -10222,6 +10479,78 @@ pub struct ActivityContext {
     /// worker reads afterward, so no `Arc` is required.
     #[cfg(feature = "db")]
     transactional_commit_occurred: std::sync::atomic::AtomicBool,
+    /// Cross-retry heartbeat timeout configured for this activity (issue #682).
+    ///
+    /// Required by [`Self::start_auto_heartbeat`] /
+    /// [`Self::start_auto_heartbeat_default`]: an auto-heartbeat whose liveness
+    /// pings are never checked by the timeout scanner would be a silent no-op,
+    /// so those methods reject when this is `None`. Set by the worker from the
+    /// task row's `heartbeat_timeout`; `None` for test / local / no-flusher
+    /// contexts unless [`Self::with_heartbeat_timeout`] is called.
+    heartbeat_timeout: Option<std::time::Duration>,
+    /// Shared last-heartbeat payload cell for the auto-heartbeat ticker
+    /// (issue #682).
+    ///
+    /// [`Self::heartbeat`] writes the most recent serialized payload here;
+    /// the background ticker started by [`Self::start_auto_heartbeat`] reads
+    /// it so a liveness ping re-sends the current checkpoint (last-write-wins)
+    /// rather than clobbering `harvest_task_queue.heartbeat_details` with a
+    /// sentinel. Seeded from the previous attempt's resume snapshot where one
+    /// is available, so the first liveness ping (before any manual heartbeat)
+    /// preserves the durable checkpoint (issue #151).
+    last_heartbeat_payload: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+/// RAII guard returned by [`ActivityContext::start_auto_heartbeat`] /
+/// [`ActivityContext::start_auto_heartbeat_default`] (issue #682).
+///
+/// Owns the background ticker task that periodically re-sends the activity's
+/// last heartbeat payload so a *progressing but not manually pinging* activity
+/// is not spuriously reclaimed by the heartbeat-timeout scanner. Dropping the
+/// guard (typically when the activity handler returns) stops the ticker; the
+/// activity's own cancellation token is a *parent* of the ticker's token, so
+/// cancelling the activity also stops the ticker without the guard swallowing
+/// the cancellation (the handler still observes it through
+/// [`ActivityContext::is_cancelled`] / [`ActivityContext::check_cancellation`]).
+#[must_use = "binding the guard to `_` drops it immediately and stops the auto-heartbeat; bind it to a named local like `let _guard = ...`"]
+pub struct AutoHeartbeatGuard {
+    /// Child of the activity's cancellation token; cancelled on drop.
+    stop: tokio_util::sync::CancellationToken,
+    /// The spawned ticker task.
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AutoHeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.handle.abort();
+    }
+}
+
+impl AutoHeartbeatGuard {
+    /// Test-only: consume the guard and extract its ticker `JoinHandle`
+    /// **without** running [`Drop`] (which would `abort()` the task).
+    ///
+    /// Used to prove the ticker exits *cleanly* — awaiting the returned handle
+    /// yields `Ok(())` when a closed heartbeat channel makes the loop `break`,
+    /// and a `JoinError` only if it panicked. This is stronger than
+    /// `JoinHandle::is_finished()`, which is also `true` for a task that
+    /// panicked.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn into_join_handle(self) -> tokio::task::JoinHandle<()> {
+        let md = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `md` is a `ManuallyDrop`, so `Drop for AutoHeartbeatGuard`
+        // (which would `handle.abort()`) never runs, and each field is moved out
+        // exactly once — no double-free. The abort is deliberately bypassed so
+        // the ticker can terminate on its own via the closed channel.
+        let handle = unsafe { std::ptr::read(&raw const md.handle) };
+        // Dropping the `stop` token does NOT cancel it (only `.cancel()` does),
+        // so the ticker still exits only via the closed channel, as intended.
+        let stop = unsafe { std::ptr::read(&raw const md.stop) };
+        drop(stop);
+        handle
+    }
 }
 
 impl ActivityContext {
@@ -10256,6 +10585,8 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_timeout: None,
+            last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -10272,6 +10603,12 @@ impl ActivityContext {
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
             .then_some(NO_HEARTBEAT_FLUSHER_REASON);
+
+        // Seed the auto-heartbeat cell from the resume snapshot so the first
+        // liveness ping re-sends the existing checkpoint instead of clobbering
+        // it (issue #151 preservation, issue #682).
+        let last_heartbeat_payload =
+            std::sync::Arc::new(std::sync::Mutex::new(heartbeat_details.clone()));
 
         Self {
             state,
@@ -10293,6 +10630,8 @@ impl ActivityContext {
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_timeout: None,
+            last_heartbeat_payload,
         }
     }
 
@@ -10320,6 +10659,8 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            heartbeat_timeout: None,
+            last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -10355,6 +10696,32 @@ impl ActivityContext {
         headers: std::sync::Arc<HashMap<String, String>>,
     ) -> Self {
         self.context_headers = headers;
+        self
+    }
+
+    // ── Auto-heartbeat (issue #682) ───────────────────────────────────────────
+
+    /// Attach the activity's configured heartbeat timeout to this context.
+    ///
+    /// Required by [`Self::start_auto_heartbeat`] /
+    /// [`Self::start_auto_heartbeat_default`]. The worker sets this
+    /// automatically from the task row; you only need it when constructing a
+    /// context manually in tests.
+    #[must_use]
+    pub const fn with_heartbeat_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
+        self
+    }
+
+    /// Attach an optional heartbeat timeout (worker convenience — passes a
+    /// task row's `Option` straight through without a conditional rebind).
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn with_heartbeat_timeout_opt(
+        mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
+        self.heartbeat_timeout = timeout;
         self
     }
 
@@ -10601,6 +10968,11 @@ impl ActivityContext {
     /// sent by the current attempt become visible only to a later retry attempt,
     /// after the heartbeat flusher successfully writes them to Postgres.
     ///
+    /// A stored JSON `null` checkpoint is treated as no checkpoint (`Ok(None)`)
+    /// — a liveness-only auto-heartbeat (issue #682) that pings before any manual
+    /// `ctx.heartbeat(..)` persists `null`, and that must never mask or corrupt a
+    /// real checkpoint on a later retry (issue #151).
+    ///
     /// # Errors
     ///
     /// - [`HarvestError::Serialization`] if the stored payload does not
@@ -10614,11 +10986,12 @@ impl ActivityContext {
             return Err(HarvestError::Config(reason.into()));
         }
 
-        self.heartbeat_details
-            .clone()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(HarvestError::from)
+        match self.heartbeat_details.clone() {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v)
+                .map(Some)
+                .map_err(HarvestError::from),
+        }
     }
 
     /// Send a heartbeat to signal the activity is still running.
@@ -10676,6 +11049,15 @@ impl ActivityContext {
 
         let payload = serde_json::to_value(details)?;
 
+        // Record the latest payload in the shared cell so the auto-heartbeat
+        // ticker (issue #682) re-sends it as a liveness ping (last-write-wins),
+        // regardless of whether an auto-heartbeat guard is active. The std
+        // Mutex is never held across the `.await` below.
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+
         let Some(ref tx) = self.heartbeat_tx else {
             return Ok(());
         };
@@ -10684,6 +11066,181 @@ impl ActivityContext {
         })?;
 
         Ok(())
+    }
+
+    /// Start a background auto-heartbeat that keeps this activity alive without
+    /// manual `ctx.heartbeat(...)` calls (issue #682).
+    ///
+    /// Spawns a ticker that, every `interval`, re-sends the activity's most
+    /// recent heartbeat payload (or a `null` liveness ping if none was sent
+    /// yet) so a long-running-but-progressing activity is not spuriously
+    /// reclaimed by the heartbeat-timeout scanner. The returned
+    /// [`AutoHeartbeatGuard`] **must be bound to a named local** — binding it to
+    /// `_` drops it immediately and stops the ticker:
+    ///
+    /// ```rust,ignore
+    /// #[activity(heartbeat_timeout = "30s")]
+    /// async fn crunch(ctx: &ActivityContext, job: Job) -> Result<Report, String> {
+    ///     let _guard = ctx.start_auto_heartbeat(std::time::Duration::from_secs(10))
+    ///         .map_err(|e| e.to_string())?;
+    ///     // ... long CPU/IO work; no manual heartbeat needed ...
+    ///     Ok(report)
+    /// }
+    /// ```
+    ///
+    /// The ticker stops when the guard is dropped (typically when the handler
+    /// returns), when the activity's cancellation token fires (the ticker's
+    /// token is a *child* of it), or when the heartbeat channel closes. Because
+    /// the guard cancels only its own child token, cancelling the activity is
+    /// still observable to the handler via [`Self::is_cancelled`] /
+    /// [`Self::check_cancellation`] — the guard never swallows it.
+    ///
+    /// The re-sent payload is last-write-wins: whatever you last passed to
+    /// [`Self::heartbeat`] (or the previous attempt's durable checkpoint) is
+    /// what the liveness ping carries, so an auto-heartbeat never clobbers a
+    /// checkpoint used by [`Self::heartbeat_details`] on a later retry.
+    ///
+    /// Choose an `interval` **strictly less than** the configured
+    /// `heartbeat_timeout` — an `interval >= heartbeat_timeout` lets the window
+    /// elapse between pings and silently fails to protect the activity. Prefer
+    /// [`Self::start_auto_heartbeat_default`], which derives a safe
+    /// `heartbeat_timeout / 3`.
+    ///
+    /// Calling this more than once on the same context spawns multiple
+    /// independent tickers; that is harmless (the extra pings are redundant,
+    /// idempotent liveness signals) and each returned guard stops only its own
+    /// ticker.
+    ///
+    /// Even a leaked or forgotten guard cannot outlive the activity dispatch:
+    /// the ticker runs on a *child* of the activity's cancellation token, so the
+    /// worker's own activity-completion cancellation stops it regardless of
+    /// whether the guard was dropped.
+    ///
+    /// # Liveness tradeoff
+    ///
+    /// Auto-heartbeat keeps a *progressing-but-not-manually-pinging* activity
+    /// alive, but it necessarily weakens heartbeat-based wedge detection: a
+    /// live-but-deadlocked future will keep emitting liveness pings too. The
+    /// independent `start_to_close` / `schedule_to_close` timeouts remain the
+    /// hard wedge ceiling and are unaffected by heartbeats, so pair
+    /// auto-heartbeat with a `start_to_close` when you need a guaranteed upper
+    /// bound on activity runtime.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] if this context does not support heartbeats
+    ///   (a local activity, or a context with no heartbeat flusher attached).
+    /// - [`HarvestError::Config`] if no `heartbeat_timeout` is configured for
+    ///   the activity: the liveness pings would never be checked by the timeout
+    ///   scanner, so an auto-heartbeat would be a silent no-op. Configure
+    ///   `#[activity(heartbeat_timeout = "..")]` (or remove the auto-heartbeat
+    ///   call).
+    pub fn start_auto_heartbeat(
+        &self,
+        interval: std::time::Duration,
+    ) -> crate::HarvestResult<AutoHeartbeatGuard> {
+        // Reject on local / no-flusher contexts up front (covers both the local
+        // activity reason and the missing-flusher reason).
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
+        }
+
+        if self.heartbeat_timeout.is_none() {
+            return Err(HarvestError::Config(
+                "start_auto_heartbeat requires the activity to have a heartbeat_timeout \
+                 configured; without one the liveness pings are never checked. Configure \
+                 #[activity(heartbeat_timeout = \"..\")] or remove the auto-heartbeat call."
+                    .into(),
+            ));
+        }
+
+        // A zero-period `tokio::time::interval` panics; clamp defensively.
+        let interval = interval.max(std::time::Duration::from_millis(1));
+
+        // The unsupported-reason gate above guarantees a flusher is attached;
+        // guard defensively regardless.
+        let Some(tx) = self.heartbeat_tx.clone() else {
+            return Err(HarvestError::Config(NO_HEARTBEAT_FLUSHER_REASON.into()));
+        };
+
+        let cell = std::sync::Arc::clone(&self.last_heartbeat_payload);
+        let stop = self.cancel.child_token();
+        let ticker_stop = stop.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first `tick()` completes immediately; an early liveness ping
+            // is harmless.
+            loop {
+                tokio::select! {
+                    biased;
+                    () = ticker_stop.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let payload = {
+                            let guard = cell
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard.clone().unwrap_or(serde_json::Value::Null)
+                        };
+                        // Channel closed => the flusher is gone; stop silently
+                        // (never panic).
+                        if tx.send(payload).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(AutoHeartbeatGuard { stop, handle })
+    }
+
+    /// Start a background auto-heartbeat whose tick interval is derived from the
+    /// activity's configured `heartbeat_timeout` (issue #682).
+    ///
+    /// Uses `heartbeat_timeout / 3` as the interval — frequent enough that a
+    /// single missed flush never trips the timeout, without excessive writes.
+    /// Equivalent to `ctx.start_auto_heartbeat(heartbeat_timeout / 3)`; see
+    /// [`Self::start_auto_heartbeat`] for the full contract (cancellation,
+    /// last-write-wins, and the [`Liveness tradeoff`](Self::start_auto_heartbeat#liveness-tradeoff)
+    /// — auto-heartbeat weakens heartbeat-based wedge detection, so pair it with
+    /// a `start_to_close` ceiling for a guaranteed runtime upper bound).
+    ///
+    /// ```rust,ignore
+    /// #[activity(heartbeat_timeout = "30s")]
+    /// async fn crunch(ctx: &ActivityContext, job: Job) -> Result<Report, String> {
+    ///     let _guard = ctx.start_auto_heartbeat_default().map_err(|e| e.to_string())?;
+    ///     // ... long work; heartbeats happen automatically every ~10s ...
+    ///     Ok(report)
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] if this context does not support heartbeats
+    ///   (a local activity, or a context with no heartbeat flusher attached).
+    /// - [`HarvestError::Config`] if no `heartbeat_timeout` is configured, so
+    ///   there is nothing to derive the interval from. Use
+    ///   [`Self::start_auto_heartbeat`] with an explicit interval, or configure
+    ///   `#[activity(heartbeat_timeout = "..")]`.
+    pub fn start_auto_heartbeat_default(&self) -> crate::HarvestResult<AutoHeartbeatGuard> {
+        // Reject local / no-flusher contexts first, so the message matches the
+        // heartbeat-unsupported reason rather than the missing-timeout reason.
+        if let Some(reason) = self.heartbeat_unsupported_reason {
+            return Err(HarvestError::Config(reason.into()));
+        }
+
+        let Some(timeout) = self.heartbeat_timeout else {
+            return Err(HarvestError::Config(
+                "start_auto_heartbeat_default requires a configured heartbeat_timeout to \
+                 derive the tick interval; none is set. Use start_auto_heartbeat(interval) \
+                 with an explicit interval, or configure #[activity(heartbeat_timeout=\"..\")]."
+                    .into(),
+            ));
+        };
+
+        let interval = (timeout / 3).max(std::time::Duration::from_millis(1));
+        self.start_auto_heartbeat(interval)
     }
 
     /// Check whether the owning workflow has been cancelled.
@@ -11083,6 +11640,7 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+    use std::time::Duration;
 
     // ── Signal handlers (issue #546) ────────────────────────────────────────
 
@@ -12780,6 +13338,27 @@ mod tests {
         assert!(matches!(result, Err(HarvestError::Serialization(_))));
     }
 
+    #[test]
+    fn heartbeat_details_treats_stored_null_as_absent() {
+        // A liveness-only auto-heartbeat (issue #682) persists JSON `null`; it
+        // must read back as no checkpoint (`Ok(None)`), never a hard
+        // deserialization error, preserving the issue #151 resume contract.
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::Value::Null));
+        let details = ctx
+            .heartbeat_details::<TestHeartbeatDetails>()
+            .expect("stored JSON null must read as Ok(None)");
+        assert_eq!(details, None);
+
+        // A real checkpoint still deserializes normally.
+        let ctx = activity_context_with_heartbeat_details(Some(serde_json::json!({
+            "progress": 7,
+        })));
+        let details = ctx
+            .heartbeat_details::<TestHeartbeatDetails>()
+            .expect("real checkpoint should deserialize");
+        assert_eq!(details, Some(TestHeartbeatDetails { progress: 7 }));
+    }
+
     #[tokio::test]
     async fn local_activity_context_heartbeat_returns_explicit_error() {
         let ctx = ActivityContext::new_local_activity(
@@ -12875,6 +13454,339 @@ mod tests {
         assert!(
             matches!(result, Err(HarvestError::ActivityCancelled(_))),
             "check_cancellation should return ActivityCancelled when token is set"
+        );
+    }
+
+    // ── Auto-heartbeat guard (issue #682) ────────────────────────────────────
+
+    /// Build a live-channel activity context with a heartbeat timeout, plus its
+    /// receiver and cancellation token, for auto-heartbeat guard testing.
+    fn auto_heartbeat_ctx(
+        timeout: Duration,
+    ) -> (
+        ActivityContext,
+        tokio::sync::mpsc::Receiver<serde_json::Value>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel.clone())
+            .with_heartbeat_timeout(timeout);
+        (ctx, rx, cancel)
+    }
+
+    /// Deterministically fire `n` ticks of a paused-clock interval, yielding
+    /// after each advance so the spawned ticker task drains its send.
+    async fn advance_ticks(interval: Duration, n: usize) {
+        // The first `interval.tick()` is immediate; let it fire.
+        tokio::task::yield_now().await;
+        for _ in 0..n {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<serde_json::Value>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            out.push(v);
+        }
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_ticks_send_payloads() {
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(300);
+        let _guard = ctx
+            .start_auto_heartbeat(interval)
+            .expect("auto-heartbeat should start with a configured timeout");
+
+        advance_ticks(interval, 4).await;
+
+        let pings = drain(&mut rx);
+        assert!(
+            pings.len() >= 3,
+            "expected at least 3 auto-heartbeat pings, got {}",
+            pings.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_guard_drop_stops_ticker() {
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        advance_ticks(interval, 3).await;
+        assert!(!drain(&mut rx).is_empty(), "ticker should have sent pings");
+
+        // Drop stops the ticker (AC#7).
+        drop(guard);
+        tokio::task::yield_now().await;
+        let _ = drain(&mut rx); // clear anything in flight at drop
+
+        advance_ticks(interval, 5).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no pings should arrive after the guard is dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_stops_on_cancellation() {
+        let (ctx, mut rx, cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let _guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        advance_ticks(interval, 3).await;
+        let _ = drain(&mut rx);
+
+        // Cancelling the activity's own token (parent) auto-cancels the ticker's
+        // child token — the ticker stops, but the activity still sees the
+        // cancellation through is_cancelled() (not swallowed by the guard).
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        let _ = drain(&mut rx);
+
+        advance_ticks(interval, 5).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no pings should arrive after cancellation"
+        );
+        assert!(
+            ctx.is_cancelled(),
+            "the activity must still observe cancellation through is_cancelled()"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_closed_channel_no_panic() {
+        let (ctx, rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        // Close the channel: the flusher's receiver is gone.
+        drop(rx);
+
+        // The next tick's send fails; the ticker must break cleanly (never .unwrap()).
+        advance_ticks(interval, 3).await;
+
+        // Extract the handle without running Drop (which would abort the task)
+        // and prove the ticker exited via a clean `break` returning Ok(()) — a
+        // panic would surface as a JoinError. `JoinHandle::is_finished()` alone
+        // is insufficient here (it is also true for a panicked task).
+        let joined = guard.into_join_handle().await;
+        assert!(
+            joined.is_ok(),
+            "the ticker must exit cleanly (Ok) via break on a closed channel, \
+             not panic; got {joined:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_last_write_wins() {
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+
+        // Seed the checkpoint, then drain the manual send so we observe only
+        // subsequent auto pings.
+        ctx.heartbeat(serde_json::json!({"a": 1}))
+            .await
+            .expect("manual heartbeat");
+        let _guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+        let _ = drain(&mut rx); // clear the manual {a:1}
+
+        advance_ticks(interval, 3).await;
+        let phase1 = drain(&mut rx);
+        assert!(!phase1.is_empty(), "auto pings should have arrived");
+        assert!(
+            phase1.iter().all(|v| v == &serde_json::json!({"a": 1})),
+            "auto pings must re-send the last heartbeat payload, got {phase1:?}"
+        );
+
+        // Update the checkpoint; auto pings must now reflect the new payload.
+        ctx.heartbeat(serde_json::json!({"b": 2}))
+            .await
+            .expect("manual heartbeat");
+        let _ = drain(&mut rx); // clear the manual {b:2}
+        advance_ticks(interval, 3).await;
+        let phase2 = drain(&mut rx);
+        assert!(!phase2.is_empty(), "auto pings should have arrived");
+        assert!(
+            phase2.iter().all(|v| v == &serde_json::json!({"b": 2})),
+            "auto pings must reflect the last-written payload, got {phase2:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_liveness_only_ping() {
+        // No manual heartbeat, no resume snapshot: the liveness ping sends the
+        // initial cell value (JSON null) without panicking.
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(3));
+        let interval = Duration::from_millis(200);
+        let _guard = ctx.start_auto_heartbeat(interval).expect("start guard");
+
+        advance_ticks(interval, 3).await;
+
+        let pings = drain(&mut rx);
+        assert!(!pings.is_empty(), "liveness pings should have arrived");
+        assert!(
+            pings.iter().all(|v| v == &serde_json::Value::Null),
+            "liveness-only pings should be JSON null, got {pings:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_default_interval_is_timeout_over_three() {
+        // AC#2: start_auto_heartbeat_default() derives interval = heartbeat_timeout / 3.
+        // With heartbeat_timeout = 9s the interval must be exactly 3s. This
+        // distinguishes /3 (3s) from /2 (4.5s), /1 (9s), and *3 (27s): a second
+        // ping arrives at exactly 3s, not before and not later.
+        let (ctx, mut rx, _cancel) = auto_heartbeat_ctx(Duration::from_secs(9));
+        let _guard = ctx
+            .start_auto_heartbeat_default()
+            .expect("default auto-heartbeat should start with a configured timeout");
+
+        // Let the ticker spawn and fire its immediate first tick.
+        tokio::task::yield_now().await;
+        let first = drain(&mut rx);
+        assert_eq!(
+            first.len(),
+            1,
+            "the immediate first tick should have fired exactly once, got {first:?}"
+        );
+
+        // Advance to just before the derived 3s boundary (2999ms): no second
+        // ping yet (rules out any interval < 3s, e.g. /9=1s or a stray /2).
+        tokio::time::advance(Duration::from_millis(2999)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no second ping before the derived 3s interval elapses"
+        );
+
+        // Cross the exact 3s boundary: the second ping fires now (rules out any
+        // interval > 3s, e.g. /2=4.5s or the whole 9s timeout).
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "the second ping must fire exactly at the derived 3s (= 9s / 3) boundary"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn auto_heartbeat_first_ping_preserves_resume_checkpoint() {
+        // AC#4 (#151 under #682): the auto-heartbeat cell is seeded from the
+        // previous attempt's resume snapshot in new_with_cancellation_check, so
+        // the FIRST liveness ping (before any manual ctx.heartbeat) re-sends the
+        // resumed checkpoint rather than clobbering it with `null`. A regression
+        // to Mutex::new(None) would silently drop the checkpoint on retry.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Lazily-built pool: never connected (the ticker path never touches the
+        // durable cancellation check), it only satisfies the ctor signature.
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://invalid-not-connected/db");
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool should build without connecting");
+
+        let ctx = ActivityContext::new_with_cancellation_check(
+            empty_shared_state(),
+            Some(tx),
+            Some(serde_json::json!({"checkpoint": 42})),
+            cancel,
+            uuid::Uuid::new_v4(),
+            pool,
+        )
+        .with_heartbeat_timeout(Duration::from_secs(3));
+
+        // No manual heartbeat: start the ticker and let its first ping fire.
+        let interval = Duration::from_millis(200);
+        let _guard = ctx
+            .start_auto_heartbeat(interval)
+            .expect("auto-heartbeat should start");
+
+        advance_ticks(interval, 1).await;
+
+        let pings = drain(&mut rx);
+        assert!(!pings.is_empty(), "the first auto ping should have fired");
+        assert!(
+            pings
+                .iter()
+                .all(|v| v == &serde_json::json!({"checkpoint": 42})),
+            "the first auto ping must re-send the resumed checkpoint (not null), got {pings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_heartbeat_requires_heartbeat_timeout() {
+        // Live flusher, but NO heartbeat_timeout configured: both methods reject
+        // rather than silently spawning a ticker whose pings are never checked.
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel);
+
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat(Duration::from_millis(100)),
+                Err(HarvestError::Config(message)) if message.contains("heartbeat_timeout")
+            ),
+            "start_auto_heartbeat must reject with a heartbeat_timeout-specific message"
+        );
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat_default(),
+                Err(HarvestError::Config(message)) if message.contains("heartbeat_timeout")
+            ),
+            "start_auto_heartbeat_default must reject with a heartbeat_timeout-specific message"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_heartbeat_rejected_on_local() {
+        // Local activities cannot heartbeat at all — auto-heartbeat must reject
+        // with the unsupported reason, even if a timeout were somehow set.
+        let ctx = ActivityContext::new_local_activity(
+            empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_heartbeat_timeout(Duration::from_secs(3));
+
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat(Duration::from_millis(100)),
+                Err(HarvestError::Config(message)) if message.contains("local activities")
+            ),
+            "auto-heartbeat must be rejected for local activities"
+        );
+        assert!(
+            matches!(
+                ctx.start_auto_heartbeat_default(),
+                Err(HarvestError::Config(message)) if message.contains("local activities")
+            ),
+            "auto-heartbeat (default) must be rejected for local activities"
+        );
+
+        // A no-flusher context is likewise rejected.
+        let no_flusher = ActivityContext::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_heartbeat_timeout(Duration::from_secs(3));
+        assert!(
+            matches!(
+                no_flusher.start_auto_heartbeat_default(),
+                Err(HarvestError::Config(_))
+            ),
+            "auto-heartbeat must be rejected when no heartbeat flusher is attached"
         );
     }
 
@@ -17774,6 +18686,188 @@ mod tests {
                 assert_eq!(target, own_id);
             }
             other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
+        }
+    }
+
+    // ── await_external_workflow tests (issue #757) ───────────────────────────
+
+    #[tokio::test]
+    async fn await_external_workflow_live_mode_emits_command() {
+        let target = ExecutionId::new();
+        let ctx = WorkflowContext::new_test();
+        let cmd_fut = ctx.await_external_workflow_value(target);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "one AwaitExternalWorkflow command expected");
+        match &cmds[0] {
+            WorkflowCommand::AwaitExternalWorkflow {
+                target: t,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(*t, target);
+                assert!(!already_requested, "first call is not already_requested");
+            }
+            other => panic!("expected AwaitExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_self_await_rejected_records_no_history() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        );
+        let result = ctx.await_external_workflow_value(own_id).await;
+        assert!(result.is_err(), "self-await should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalAwaitFailed {
+                reason_code,
+                target,
+                await_id,
+            } => {
+                assert_eq!(reason_code, "self_await");
+                assert_eq!(target, own_id);
+                // Nil sentinel — self-await records no history, so the id is stable.
+                assert_eq!(await_id.as_uuid(), uuid::Uuid::nil());
+            }
+            other => panic!("expected ExternalAwaitFailed(self_await), got {other:?}"),
+        }
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "self-await emits no commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_replays_resolved_output() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({ "tracking": "xyz" }),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.await_external_workflow_value(target).await;
+        assert_eq!(result.unwrap(), serde_json::json!({ "tracking": "xyz" }));
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_replays_failed_target_as_typed_workflow_failed() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_failed".into(),
+                message: Some("card declined".into()),
+                error_type: Some("PaymentDeclined".into()),
+                details: Some(serde_json::json!({ "code": 402 })),
+                non_retryable: Some(true),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx.await_external_workflow_value(target).await.unwrap_err();
+        // A terminal-not-completed target surfaces as a typed WorkflowFailed.
+        assert_eq!(err.workflow_error_type(), Some("PaymentDeclined"));
+        assert_eq!(err.workflow_details().unwrap()["code"], 402);
+        assert!(err.is_workflow_non_retryable());
+        match err {
+            HarvestError::WorkflowFailed { name, reason, .. } => {
+                assert_eq!(name, format!("external-workflow:{target}"));
+                assert_eq!(reason, "card declined");
+            }
+            other => panic!("expected WorkflowFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_replays_target_unknown_as_await_failed() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_unknown".into(),
+                message: None,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx.await_external_workflow_value(target).await.unwrap_err();
+        match err {
+            HarvestError::ExternalAwaitFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_unknown");
+            }
+            other => panic!("expected ExternalAwaitFailed(target_unknown), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_external_workflow_nondeterminism_wrong_target() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let other_target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: Value::Null,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .await_external_workflow_value(other_target)
+            .await
+            .unwrap_err();
+        match err {
+            HarvestError::NonDeterministic { reason: msg, .. } => {
+                assert!(msg.contains("external await mismatch"), "msg: {msg}");
+            }
+            other => panic!("expected NonDeterministic, got {other:?}"),
         }
     }
 

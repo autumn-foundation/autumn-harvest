@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    ParentClosePolicy, UpdateId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ExternalSignalId, ParentClosePolicy, UpdateId,
 };
 
 /// Result of matching a workflow command against the event history.
@@ -166,6 +166,33 @@ pub enum HistoryMatch {
         cancel_id: ExternalCancelId,
         /// The machine-readable reason code from history.
         reason_code: String,
+    },
+    /// History has an `ExternalAwaitRequested` event but no terminal event yet
+    /// (issue #757).
+    ///
+    /// Crash-recovery / still-pending path — mirrors `ExternalCancelInProgress`.
+    /// The caller re-dispatches with the recorded `await_id` (idempotent) and
+    /// suspends until the outbox appends a terminal to its own history.
+    ExternalAwaitInProgress {
+        /// The `ExternalAwaitId` already recorded in history. Must be reused.
+        await_id: ExternalAwaitId,
+    },
+    /// History contains an `ExternalAwaitFailed` terminal event for an
+    /// `await_external_workflow` call (issue #757). Carries the target's typed
+    /// terminal cause so the replayed error matches the durable event exactly.
+    ExternalAwaitFailed {
+        /// The `ExternalAwaitId` recorded in the originating event.
+        await_id: ExternalAwaitId,
+        /// The machine-readable reason code from history.
+        reason_code: String,
+        /// Human-readable failure message from the target's terminal cause.
+        message: Option<String>,
+        /// Stable error-type name from a typed target failure.
+        error_type: Option<String>,
+        /// Structured details from a typed target failure.
+        details: Option<Value>,
+        /// Advisory non-retryable flag from a typed target failure.
+        non_retryable: Option<bool>,
     },
 }
 
@@ -521,6 +548,31 @@ struct StashedExternalCancel {
     terminal: Option<StashedCancelTerminal>,
 }
 
+/// Terminal outcome for an early-drained external await (issue #757).
+#[derive(Debug, Clone)]
+enum StashedAwaitTerminal {
+    /// Target reached `COMPLETED` — carries the recorded output value.
+    Resolved(Value),
+    /// Target reached a non-`COMPLETED` terminal state (or was unknown) —
+    /// carries the recorded reason code + typed failure fields.
+    Failed {
+        reason_code: String,
+        message: Option<String>,
+        error_type: Option<String>,
+        details: Option<Value>,
+        non_retryable: Option<bool>,
+    },
+}
+
+/// An `ExternalAwaitRequested` event that was drained early (mirrors
+/// `StashedExternalCancel` for the await primitive, issue #757).
+#[derive(Debug, Clone)]
+struct StashedExternalAwait {
+    await_id: ExternalAwaitId,
+    target: ExecutionId,
+    terminal: Option<StashedAwaitTerminal>,
+}
+
 /// The frozen resolution recorded on a `LocalActivityScheduled` event
 /// (issue #620, AC8; Codex P2). Returned by
 /// [`HistoryMatcher::recorded_local_activity_resolution`].
@@ -560,6 +612,8 @@ pub struct HistoryMatcher {
     pending_external_signals: Vec<StashedExternalSignal>,
     /// External cancels drained before their natural cursor position (issue #492).
     pending_external_cancels: Vec<StashedExternalCancel>,
+    /// External awaits drained before their natural cursor position (issue #757).
+    pending_external_awaits: Vec<StashedExternalAwait>,
     /// Indices of events that are transparent to command-dispatch replay and
     /// therefore pre-marked consumed (issue #383: `WorkflowExecutionPaused` /
     /// `WorkflowExecutionResumed`). These are pure operator-lifecycle no-ops:
@@ -695,6 +749,7 @@ impl HistoryMatcher {
             pending_signals: VecDeque::new(),
             pending_external_signals: Vec::new(),
             pending_external_cancels: Vec::new(),
+            pending_external_awaits: Vec::new(),
             transparent_events,
             late_race_signal_events: HashSet::new(),
             race_reserved_signal_events,
@@ -1194,6 +1249,55 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 // Update events are transparent to the activity scan.
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
@@ -1408,6 +1512,55 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
                 }
@@ -1500,6 +1653,7 @@ impl HistoryMatcher {
             || !self.pending_signals.is_empty()
             || !self.pending_external_signals.is_empty()
             || !self.pending_external_cancels.is_empty()
+            || !self.pending_external_awaits.is_empty()
     }
 
     /// Number of events loaded into this replay matcher.
@@ -1557,7 +1711,12 @@ impl HistoryMatcher {
         }
         // External cancels drained early that were never consumed by
         // request_cancel_external_workflow represent unconsumed history.
-        !self.pending_external_cancels.is_empty()
+        if !self.pending_external_cancels.is_empty() {
+            return true;
+        }
+        // External awaits drained early that were never consumed by
+        // await_external_workflow represent unconsumed history (issue #757).
+        !self.pending_external_awaits.is_empty()
     }
 
     /// End-of-drive count of genuinely-unconsumed `SignalReceived` events,
@@ -1753,6 +1912,59 @@ impl HistoryMatcher {
                         .find(|p| p.cancel_id == id)
                     {
                         p.terminal = Some(StashedCancelTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(self.cursor);
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                }
+                // External await event triplets are drained early too (issue #757).
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(self.cursor);
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(self.cursor);
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
                     }
                     self.consumed_signal_events.insert(self.cursor);
                     self.cursor += 1;
@@ -2212,6 +2424,55 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -2452,6 +2713,55 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
                 _ => break,
             }
         }
@@ -2685,6 +2995,50 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    self.pending_external_awaits.push(StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *await_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *await_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Failed {
+                            reason_code: reason_code.clone(),
+                            message: message.clone(),
+                            error_type: error_type.clone(),
+                            details: details.clone(),
+                            non_retryable: *non_retryable,
+                        });
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
 
                 // Interleaved commands — note the position but keep scanning for
                 // the terminal event.
@@ -2725,6 +3079,324 @@ impl HistoryMatcher {
         HistoryMatch::ExternalCancelInProgress { cancel_id }
     }
 
+    /// Match `await_external_workflow(target)` against history (issue #757).
+    ///
+    /// Mirrors `match_external_cancel` but keyed on the awaited `target`, and
+    /// carries the target's terminal cause (output on success, typed failure
+    /// otherwise) frozen into the awaiter's own history.
+    ///
+    /// Returns:
+    /// - `Matched { output }` when `ExternalAwaitResolved` is in history (target
+    ///   reached `COMPLETED`) — carries the recorded output value.
+    /// - `ExternalAwaitFailed { .. }` when history shows the await failed
+    ///   (target reached a non-`COMPLETED` terminal state, or unknown).
+    /// - `ExternalAwaitInProgress { await_id }` when only `ExternalAwaitRequested`
+    ///   is recorded (crash recovery / still-pending: re-dispatch with the
+    ///   recorded `await_id`).
+    /// - `Diverged` when the history event mismatches the expected target.
+    /// - `NoMatch` when there is no history at or beyond the cursor.
+    #[allow(clippy::too_many_lines)]
+    pub fn match_external_await(&mut self, target: ExecutionId) -> HistoryMatch {
+        // prepare_match drains any ExternalAwait events sitting at the current
+        // cursor into the stash first (mirrors match_external_cancel).
+        let stash_size_before = self.pending_external_awaits.len();
+        let has_history = self.prepare_match();
+
+        // Check the stash (which now includes any newly drained events).
+        if let Some(pos) = self
+            .pending_external_awaits
+            .iter()
+            .position(|s| s.target == target)
+        {
+            let stashed = self.pending_external_awaits.remove(pos);
+            return match stashed.terminal {
+                Some(StashedAwaitTerminal::Resolved(output)) => HistoryMatch::Matched { output },
+                Some(StashedAwaitTerminal::Failed {
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                }) => HistoryMatch::ExternalAwaitFailed {
+                    await_id: stashed.await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                },
+                None => HistoryMatch::ExternalAwaitInProgress {
+                    await_id: stashed.await_id,
+                },
+            };
+        }
+
+        if !has_history {
+            // History recorded a *different* await at this position.
+            if self.pending_external_awaits.len() > stash_size_before {
+                let actual = &self.pending_external_awaits[stash_size_before];
+                return HistoryMatch::Diverged {
+                    expected: format!("ExternalAwaitRequested(target={target})"),
+                    actual: format!("ExternalAwaitRequested(target={})", actual.target),
+                    event_index: i32::try_from(self.cursor).ok(),
+                };
+            }
+            return HistoryMatch::NoMatch;
+        }
+
+        // Cursor-based path: the ExternalAwaitRequested event is at or ahead of cursor.
+        let WorkflowEvent::ExternalAwaitRequested {
+            await_id,
+            target: recorded_target,
+        } = &self.events[self.cursor]
+        else {
+            return HistoryMatch::Diverged {
+                expected: format!("ExternalAwaitRequested(target={target})"),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        };
+
+        if *recorded_target != target {
+            return HistoryMatch::Diverged {
+                expected: format!("ExternalAwaitRequested(target={target})"),
+                actual: format!("ExternalAwaitRequested(target={recorded_target})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+
+        let await_id = *await_id;
+        // Advance past ExternalAwaitRequested.
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                // Terminal events for this await — settle_terminal handles
+                // out-of-order consumption correctly.
+                WorkflowEvent::ExternalAwaitResolved {
+                    await_id: id,
+                    output,
+                } if *id == await_id => {
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id: id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } if *id == await_id => {
+                    let result = HistoryMatch::ExternalAwaitFailed {
+                        await_id,
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    return self.settle_terminal(scan_cursor, first_interleaved_command, result);
+                }
+
+                // Interleaved lifecycle / update events — skip transparently.
+                WorkflowEvent::WorkflowStarted { .. }
+                | WorkflowEvent::UpdateAdmitted { .. }
+                | WorkflowEvent::UpdateCompleted { .. }
+                | WorkflowEvent::UpdateFailed { .. }
+                | WorkflowEvent::WorkflowExecutionPaused { .. }
+                | WorkflowEvent::WorkflowExecutionResumed { .. } => {
+                    scan_cursor += 1;
+                }
+
+                // Signals can arrive while the external await is in-flight — stash
+                // them so a later `receive_signal` still observes them.
+                WorkflowEvent::SignalReceived {
+                    signal_name: sn,
+                    payload,
+                } => {
+                    let sn = sn.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, sn, payload);
+                    scan_cursor += 1;
+                }
+
+                // Interleaved external-signal triplets — stash for later.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target: sig_target,
+                    signal_name,
+                    payload,
+                    idempotency_key,
+                } => {
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *sig_target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Delivered,
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Failed(reason_code.clone()),
+                    );
+                    scan_cursor += 1;
+                }
+
+                // Interleaved external-cancel triplets — stash.
+                WorkflowEvent::ExternalCancelRequested {
+                    cancel_id: other_id,
+                    target: other_target,
+                } => {
+                    self.pending_external_cancels.push(StashedExternalCancel {
+                        cancel_id: *other_id,
+                        target: *other_target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalCancelDelivered {
+                    cancel_id: other_id,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|s| s.cancel_id == *other_id)
+                    {
+                        s.terminal = Some(StashedCancelTerminal::Delivered);
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalCancelFailed {
+                    cancel_id: other_id,
+                    reason_code,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_cancels
+                        .iter_mut()
+                        .find(|s| s.cancel_id == *other_id)
+                    {
+                        s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                // Other ExternalAwait triplets (sibling awaits) — stash.
+                WorkflowEvent::ExternalAwaitRequested {
+                    await_id: other_id,
+                    target: other_target,
+                } => {
+                    self.pending_external_awaits.push(StashedExternalAwait {
+                        await_id: *other_id,
+                        target: *other_target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved {
+                    await_id: other_id,
+                    output,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *other_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id: other_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *other_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Failed {
+                            reason_code: reason_code.clone(),
+                            message: message.clone(),
+                            error_type: error_type.clone(),
+                            details: details.clone(),
+                            non_retryable: *non_retryable,
+                        });
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                // Interleaved commands — note the position but keep scanning for
+                // the terminal event.
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. } => {
+                    if first_interleaved_command.is_none() {
+                        first_interleaved_command = Some(scan_cursor);
+                    }
+                    scan_cursor += 1;
+                }
+
+                _ => break,
+            }
+        }
+
+        // ExternalAwaitRequested found in history but no terminal event yet.
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
+        HistoryMatch::ExternalAwaitInProgress { await_id }
+    }
+
     /// Peek forward to determine if `TimerStarted` for the requested ID is the next active deterministic event in history.
     #[must_use]
     pub fn is_timer_started_next(&self, timer_id: &str) -> bool {
@@ -2747,6 +3419,10 @@ impl HistoryMatcher {
                 | WorkflowEvent::ExternalCancelRequested { .. }
                 | WorkflowEvent::ExternalCancelDelivered { .. }
                 | WorkflowEvent::ExternalCancelFailed { .. }
+                // External await event triplets are transparent here (issue #757).
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. }
                 | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
                 // A cancellable-timer cancel (issue #768) is transparent here.
                 | WorkflowEvent::TimerCancelled { .. } => {
@@ -2967,6 +3643,58 @@ impl HistoryMatcher {
                         .find(|p| p.cancel_id == id)
                     {
                         p.terminal = Some(StashedCancelTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                    continue;
+                }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                    continue;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                    continue;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
                     }
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
@@ -3339,6 +4067,56 @@ impl HistoryMatcher {
                 self.consumed_signal_events.insert(scan);
                 TimerScanStep::Cross
             }
+            // External await event triplets are transparent to the timer scan (issue #757).
+            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                let stashed = StashedExternalAwait {
+                    await_id: *await_id,
+                    target: *target,
+                    terminal: None,
+                };
+                self.pending_external_awaits.push(stashed);
+                self.consumed_signal_events.insert(scan);
+                TimerScanStep::Cross
+            }
+            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                let id = *await_id;
+                let out = output.clone();
+                if let Some(p) = self
+                    .pending_external_awaits
+                    .iter_mut()
+                    .find(|p| p.await_id == id)
+                {
+                    p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                }
+                self.consumed_signal_events.insert(scan);
+                TimerScanStep::Cross
+            }
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                let id = *await_id;
+                let term = StashedAwaitTerminal::Failed {
+                    reason_code: reason_code.clone(),
+                    message: message.clone(),
+                    error_type: error_type.clone(),
+                    details: details.clone(),
+                    non_retryable: *non_retryable,
+                };
+                if let Some(p) = self
+                    .pending_external_awaits
+                    .iter_mut()
+                    .find(|p| p.await_id == id)
+                {
+                    p.terminal = Some(term);
+                }
+                self.consumed_signal_events.insert(scan);
+                TimerScanStep::Cross
+            }
             // Update events are transparent to the timer scan.
             e if Self::is_update_event(e) => TimerScanStep::Cross,
             // Any other UNCONSUMED command-bearing event is a real ordering point
@@ -3631,6 +4409,55 @@ impl HistoryMatcher {
                         .find(|p| p.cancel_id == id)
                     {
                         p.terminal = Some(StashedCancelTerminal::Failed(code));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    let stashed = StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    };
+                    self.pending_external_awaits.push(stashed);
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    let id = *await_id;
+                    let out = output.clone();
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(StashedAwaitTerminal::Resolved(out));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    let id = *await_id;
+                    let term = StashedAwaitTerminal::Failed {
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                        error_type: error_type.clone(),
+                        details: details.clone(),
+                        non_retryable: *non_retryable,
+                    };
+                    if let Some(p) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|p| p.await_id == id)
+                    {
+                        p.terminal = Some(term);
                     }
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
@@ -4104,6 +4931,50 @@ impl HistoryMatcher {
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    self.pending_external_awaits.push(StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *await_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *await_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Failed {
+                            reason_code: reason_code.clone(),
+                            message: message.clone(),
+                            error_type: error_type.clone(),
+                            details: details.clone(),
+                            non_retryable: *non_retryable,
+                        });
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
 
                 _ => break,
             }
@@ -4368,6 +5239,9 @@ impl HistoryMatcher {
                             | WorkflowEvent::ExternalCancelRequested { .. }
                             | WorkflowEvent::ExternalCancelDelivered { .. }
                             | WorkflowEvent::ExternalCancelFailed { .. }
+                            | WorkflowEvent::ExternalAwaitRequested { .. }
+                            | WorkflowEvent::ExternalAwaitResolved { .. }
+                            | WorkflowEvent::ExternalAwaitFailed { .. }
                     )
                     || Self::is_update_event(ev)
                 {
@@ -4687,6 +5561,50 @@ impl HistoryMatcher {
                         .find(|s| s.cancel_id == *cancel_id)
                     {
                         s.terminal = Some(StashedCancelTerminal::Failed(reason_code.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                    self.pending_external_awaits.push(StashedExternalAwait {
+                        await_id: *await_id,
+                        target: *target,
+                        terminal: None,
+                    });
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *await_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Resolved(output.clone()));
+                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalAwaitFailed {
+                    await_id,
+                    reason_code,
+                    message,
+                    error_type,
+                    details,
+                    non_retryable,
+                } => {
+                    if let Some(s) = self
+                        .pending_external_awaits
+                        .iter_mut()
+                        .find(|s| s.await_id == *await_id)
+                    {
+                        s.terminal = Some(StashedAwaitTerminal::Failed {
+                            reason_code: reason_code.clone(),
+                            message: message.clone(),
+                            error_type: error_type.clone(),
+                            details: details.clone(),
+                            non_retryable: *non_retryable,
+                        });
                     }
                     self.consumed_signal_events.insert(scan_cursor);
                     scan_cursor += 1;
@@ -10859,5 +11777,155 @@ mod tests {
             matcher.match_side_effect_now_tolerant(),
             SideEffectNowMatch::Frontier
         );
+    }
+
+    // ── match_external_await tests (issue #757) ───────────────────────────
+
+    #[test]
+    fn match_external_await_no_history_is_no_match() {
+        let target = ExecutionId::new();
+        // Empty history: the first live await returns NoMatch.
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(matcher.match_external_await(target), HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn match_external_await_resolved_returns_matched_with_output() {
+        let target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let output = serde_json::json!({"tracking": "abc123"});
+        let mut matcher = HistoryMatcher::new(vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: output.clone(),
+            },
+        ]);
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched { output }
+        );
+    }
+
+    #[test]
+    fn match_external_await_failed_returns_typed_fields() {
+        let target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let mut matcher = HistoryMatcher::new(vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_failed".into(),
+                message: Some("payment declined".into()),
+                error_type: Some("PaymentDeclined".into()),
+                details: Some(serde_json::json!({"code": 402})),
+                non_retryable: Some(true),
+            },
+        ]);
+        match matcher.match_external_await(target) {
+            HistoryMatch::ExternalAwaitFailed {
+                await_id: aid,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(reason_code, "target_failed");
+                assert_eq!(message.as_deref(), Some("payment declined"));
+                assert_eq!(error_type.as_deref(), Some("PaymentDeclined"));
+                assert_eq!(details.unwrap()["code"], 402);
+                assert_eq!(non_retryable, Some(true));
+            }
+            other => panic!("expected ExternalAwaitFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_external_await_requested_no_terminal_is_in_progress() {
+        let target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::ExternalAwaitRequested {
+            await_id,
+            target,
+        }]);
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::ExternalAwaitInProgress { await_id }
+        );
+    }
+
+    #[test]
+    fn match_external_await_wrong_target_diverges() {
+        let recorded_target = ExecutionId::new();
+        let requested_target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let mut matcher = HistoryMatcher::new(vec![WorkflowEvent::ExternalAwaitRequested {
+            await_id,
+            target: recorded_target,
+        }]);
+        assert!(matches!(
+            matcher.match_external_await(requested_target),
+            HistoryMatch::Diverged { .. }
+        ));
+    }
+
+    #[test]
+    fn match_external_await_concurrent_with_activity_replays_both() {
+        // A workflow that awaits an external target concurrently with an
+        // activity: the await's Requested + Resolved events are interleaved
+        // around the activity's Scheduled/Completed. The activity scan must
+        // transparently stash the await triplet, and vice versa — neither
+        // diverges. (Regression test for a missed stash triplet.)
+        let target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let act_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "compute".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: act_id,
+                output: serde_json::json!(7),
+            },
+        ];
+        // Match the activity first (interleaved await events must be stashed,
+        // not break the scan).
+        let mut matcher = HistoryMatcher::new(events.clone());
+        assert_eq!(
+            matcher.match_activity("compute"),
+            HistoryMatch::Matched {
+                output: serde_json::json!(7)
+            }
+        );
+        // Then the await resolves from the stash.
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+
+        // Reverse order: polling the await future first (before the concurrent
+        // activity future has scanned forward past the interleaved
+        // `ActivityScheduled`) yields `ExternalAwaitInProgress` — never a
+        // divergence — exactly like the cancel primitive. In a real
+        // `tokio::join!` re-drive the activity future settles the await's
+        // terminal on a later fresh cycle; full end-to-end resolution across
+        // randomized re-drives is covered by the `WorkflowReplayer` fixtures.
+        let mut matcher2 = HistoryMatcher::new(events);
+        assert!(matches!(
+            matcher2.match_external_await(target),
+            HistoryMatch::ExternalAwaitInProgress { .. }
+        ));
     }
 }

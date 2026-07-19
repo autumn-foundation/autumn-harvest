@@ -296,7 +296,7 @@ pub use completion_trigger::{
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
 };
 pub use context::{
-    ActivityContext, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
+    ActivityContext, AutoHeartbeatGuard, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
     DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder,
     RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand,
     WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
@@ -448,9 +448,10 @@ pub use timeline::{
 #[cfg(any(test, feature = "testing"))]
 pub use trace_export::export_chrome_trace;
 pub use types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
-    ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, StartSource, TimerId,
-    UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalAwaitId,
+    ExternalCancelId, ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId,
+    StartSource, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]
