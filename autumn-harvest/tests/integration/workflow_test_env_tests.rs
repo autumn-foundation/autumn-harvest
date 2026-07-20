@@ -3836,4 +3836,3 @@ async fn windowed_fan_out_drives_to_completion() {
         .count();
     assert_eq!(completed, 10, "all 10 activities completed");
 }
-}
