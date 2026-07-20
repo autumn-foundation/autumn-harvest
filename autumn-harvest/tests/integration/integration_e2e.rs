@@ -80,6 +80,12 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
     "\n",
+    // Reset (#148/#538) refines the active-uniqueness index to exclude
+    // TERMINATED rows; placed after continue_as_new (creates the index) and
+    // after external_tasks (whose state_check it recreates), and before the
+    // pause migration so the later PAUSED-inclusive state_check wins.
+    include_str!("../../migrations/20260503000000_harvest_workflow_reset/up.sql"),
+    "\n",
     include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
     "\n",
     include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
@@ -168,7 +174,11 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #740: start_source/start_source_ref/started_by provenance columns on
     // harvest_workflow_executions.
-    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql")
+    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql"),
+    "\n",
+    // issue #617: chain_execution_timeout/chain_deadline_at columns on
+    // harvest_workflow_executions.
+    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
