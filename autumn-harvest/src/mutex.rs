@@ -287,6 +287,19 @@ pub const fn holder_holds_any_stmt() -> &'static str {
     "SELECT lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 ORDER BY lock_key LIMIT 1"
 }
 
+/// Best-effort grant metrics for `$2` (`waiter_exec_id`) on key `$1`: the
+/// waiter's `requested_at` (for the wait-duration histogram) and the current
+/// total waiter-queue depth for the key (for the contention gauge). The waiter
+/// row still exists at grant time — [`grant_lock_stmt`] does not delete it, only
+/// the eventual fenced release does — so this reads it directly. Returns at most
+/// one row.
+#[must_use]
+pub const fn waiter_wait_metrics_stmt() -> &'static str {
+    "SELECT requested_at, \
+            (SELECT count(*) FROM harvest_mutex_waiters WHERE lock_key = $1) AS depth \
+     FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2"
+}
+
 // ── DB-backed operations (advisory-first; to_regclass-guarded entry points) ──
 
 #[cfg(feature = "db")]
@@ -345,6 +358,14 @@ mod db_ops {
     struct TableExists {
         #[diesel(sql_type = diesel::sql_types::Bool)]
         present: bool,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct WaitMetricsRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        requested_at: DateTime<Utc>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        depth: i64,
     }
 
     /// Whether the `harvest_mutex_locks` table exists on this connection's
@@ -420,6 +441,26 @@ mod db_ops {
             },
             None => MutexGrantOutcome::Enqueued,
         })
+    }
+
+    /// Best-effort read of the waiter's `requested_at` and the key's current
+    /// waiter-queue depth at grant time, for the `harvest.mutex.wait_duration`
+    /// and `harvest.mutex.contention_depth` metrics. Returns `None` if the
+    /// waiter row is gone (shouldn't happen at grant time). **Not**
+    /// `table_present`-guarded — called only on the acquire/grant path.
+    pub async fn waiter_wait_metrics(
+        conn: &mut AsyncPgConnection,
+        key: &str,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Option<(DateTime<Utc>, i64)>> {
+        let row: Option<WaitMetricsRow> = diesel::sql_query(super::waiter_wait_metrics_stmt())
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .get_result(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        Ok(row.map(|r| (r.requested_at, r.depth)))
     }
 
     /// Would a grant to `exec_id` on `key` succeed right now? (Post-park
@@ -662,6 +703,7 @@ pub use db_ops::{
     delete_waiters_for_holder, holder_holds_any_mutex, is_grantable_head,
     reclaim_expired_leases_and_wake, release_all_locks_for_holder, release_lock,
     renew_leases_for_holder, sweep_terminal_holder_and_wake, table_present, try_grant_or_enqueue,
+    waiter_wait_metrics,
 };
 
 #[cfg(test)]
@@ -842,5 +884,14 @@ mod pure_tests {
         let holds = holder_holds_any_stmt();
         assert!(holds.contains("SELECT lock_key FROM harvest_mutex_locks"));
         assert!(holds.contains("LIMIT 1"));
+    }
+
+    #[test]
+    fn waiter_wait_metrics_stmt_reads_requested_at_and_depth() {
+        let sql = waiter_wait_metrics_stmt();
+        assert!(sql.contains("requested_at"));
+        assert!(sql.contains("count(*)"));
+        assert!(sql.contains("AS depth"));
+        assert!(sql.contains("waiter_exec_id = $2"));
     }
 }
