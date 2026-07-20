@@ -173,6 +173,9 @@ async fn seed_execution(
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -429,6 +432,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             module: "workflow_reset_integration",
             handler: replay_checkpoints_then_signal,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 

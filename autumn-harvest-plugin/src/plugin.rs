@@ -940,6 +940,8 @@ async fn start_harvest_runtime(
     api_state.set_query_timeout(built.worker_config().query_timeout);
     // Propagate the server-side execution timeout ceiling (issue #243).
     api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
+    // Propagate the server-side chain-cap ceiling / fleet-wide default (issue #617).
+    api_state.set_max_workflow_chain_timeout(built.max_workflow_chain_timeout);
     // Propagate the hard history event ceiling (issue #493).
     // Prefer the builder-level value; fall back to the WorkerConfig value so
     // that /admin/preflight accurately reflects the ceiling even when it was
@@ -1044,6 +1046,7 @@ async fn start_harvest_runtime(
     let update_handlers = built.update_handlers().to_vec();
     let max_workflow_input_bytes = built.max_workflow_input_bytes;
     let max_workflow_execution_timeout = built.max_workflow_execution_timeout;
+    let max_workflow_chain_timeout = built.max_workflow_chain_timeout;
     let max_workflow_attempts = built.max_workflow_attempts;
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
@@ -1236,6 +1239,7 @@ async fn start_harvest_runtime(
     .with_handlers(query_handlers, update_handlers)
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
+    .with_max_workflow_chain_timeout(max_workflow_chain_timeout)
     .with_max_workflow_start_delay(max_workflow_start_delay)
     .with_max_signal_payload_bytes(max_signal_payload_bytes)
     .with_query_timeout(query_timeout)
@@ -1345,6 +1349,9 @@ async fn start_harvest_runtime(
                             autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        chain_execution_timeout: None,
+                        max_workflow_chain_timeout_ceiling: None,
+                        inherited_chain_deadline_at: None,
                         concurrency_key: None,
                         concurrency_limit: None,
                         priority: autumn_harvest::prelude::Priority::default(),
@@ -1922,6 +1929,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             concurrency: None,
 
             debounce: None,

@@ -73,6 +73,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 module: "tests",
                 handler: dummy_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
                 debounce: None,
@@ -94,6 +95,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 module: "tests",
                 handler: dummy_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
                 debounce: None,
@@ -119,6 +121,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 module: "tests",
                 handler: dummy_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
                 debounce: Some(autumn_harvest::debounce::DebouncePolicy {

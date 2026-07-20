@@ -180,22 +180,87 @@ pub const fn schedule_to_close_timeout_query() -> &'static str {
          AND e.state = 'PAUSED')"
 }
 
-/// SQL query to find RUNNING workflow executions that have exceeded their
-/// `execution_timeout` wall-clock deadline (issue #243).
+/// SQL query to find RUNNING workflow executions that have exceeded either their
+/// per-run `execution_timeout` deadline (issue #243) OR their chain-scoped
+/// lifetime cap deadline (issue #617).
 ///
-/// A workflow execution is considered timed out when:
-/// - `state = 'RUNNING'`
-/// - `deadline_at IS NOT NULL`
-/// - `deadline_at < NOW()`
+/// A workflow execution is considered timed out when `state = 'RUNNING'` and
+/// EITHER deadline has fired:
+/// - `deadline_at IS NOT NULL AND deadline_at < NOW()` (per-run), OR
+/// - `chain_deadline_at IS NOT NULL AND chain_deadline_at < NOW()` (chain).
 ///
-/// `deadline_at` is computed and persisted at start time as
-/// `started_at + execution_timeout`, so this is a simple indexed range scan.
+/// Both deadlines are computed at start time (`started_at + timeout`), so this is
+/// an indexed range scan served by `idx_harvest_executions_deadline` and
+/// `idx_harvest_executions_chain_deadline`.
+///
+/// This `const` renders `NOW()` illustratively for the SQL-shape unit test; the
+/// executed scanner (`enforce_workflow_execution_timeouts`) uses the equivalent
+/// Diesel DSL with a Rust-captured `now` (see below), not this string.
 #[must_use]
 pub const fn workflow_execution_timeout_query() -> &'static str {
     "SELECT * FROM harvest_workflow_executions \
      WHERE state = 'RUNNING' \
-     AND deadline_at IS NOT NULL \
-     AND deadline_at < NOW()"
+     AND ((deadline_at IS NOT NULL AND deadline_at < NOW()) \
+       OR (chain_deadline_at IS NOT NULL AND chain_deadline_at < NOW()))"
+}
+
+/// Which timeout deadline fired for a scanned, expired workflow execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// The per-run `execution_timeout` deadline (`deadline_at`) fired (issue #243).
+    Run,
+    /// The chain-scoped lifetime cap deadline (`chain_deadline_at`) fired (issue #617).
+    Chain,
+}
+
+/// Resolve the effective chain-scoped lifetime cap from the workflow-declared
+/// value and the fleet-wide builder ceiling (issue #617, AC4).
+///
+/// The effective cap is the MINIMUM of any present values, and `None` only when
+/// BOTH are absent. This DIVERGES deliberately from #243's per-run ceiling: there
+/// the ceiling only caps a *specified* value (`(None, Some) => None`), while here
+/// the ceiling ALSO acts as a fleet-wide DEFAULT (`(None, Some) => Some(ceiling)`)
+/// so an operator can cap every chain even when a workflow under-specifies.
+#[must_use]
+pub fn effective_chain_timeout(
+    workflow: Option<chrono::Duration>,
+    ceiling: Option<chrono::Duration>,
+) -> Option<chrono::Duration> {
+    match (workflow, ceiling) {
+        (Some(w), Some(c)) => Some(w.min(c)),
+        (Some(w), None) => Some(w),
+        // The #243 divergence: ceiling doubles as a fleet-wide default here.
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// Given the two candidate deadlines on an expired scanned row and the scan
+/// instant, decide which deadline fired and return it (issue #617).
+///
+/// The chain deadline takes PRECEDENCE: if both fired, the run has exceeded its
+/// whole-chain lifetime and is terminated as a chain timeout. A chain-only expiry
+/// (no per-run deadline configured) is handled without panicking — the scanner
+/// selects rows on either disjunct, so `deadline_at` may be `None` here.
+#[must_use]
+pub fn classify_workflow_timeout(
+    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (chrono::DateTime<chrono::Utc>, TimeoutKind) {
+    let chain_fired = chain_deadline_at.is_some_and(|d| d < now);
+    if chain_fired {
+        (
+            chain_deadline_at.expect("chain_fired implies chain_deadline_at is Some"),
+            TimeoutKind::Chain,
+        )
+    } else {
+        (
+            deadline_at
+                .expect("selected row without a fired chain deadline implies deadline_at < NOW()"),
+            TimeoutKind::Run,
+        )
+    }
 }
 
 /// Find all tasks that have exceeded their timeout limits.
@@ -1498,10 +1563,19 @@ pub async fn enforce_workflow_execution_timeouts(
     metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
     let now = Utc::now();
+    // Select rows where EITHER the per-run deadline (issue #243) OR the chain
+    // deadline (issue #617) has fired. The chain cap is carried verbatim across
+    // continue-as-new, so a runaway loop cannot escape it by continuing.
     let expired: Vec<WorkflowExecution> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
-        .filter(harvest_workflow_executions::deadline_at.is_not_null())
-        .filter(harvest_workflow_executions::deadline_at.lt(Some(now)))
+        .filter(
+            harvest_workflow_executions::deadline_at
+                .is_not_null()
+                .and(harvest_workflow_executions::deadline_at.lt(Some(now)))
+                .or(harvest_workflow_executions::chain_deadline_at
+                    .is_not_null()
+                    .and(harvest_workflow_executions::chain_deadline_at.lt(Some(now)))),
+        )
         .select(WorkflowExecution::as_select())
         .load(conn)
         .await
@@ -1511,17 +1585,23 @@ pub async fn enforce_workflow_execution_timeouts(
 
     for execution in &expired {
         let exec_id = execution_id_from_uuid(execution.id);
-        let deadline = execution
-            .deadline_at
-            .expect("workflow_execution_timeout_query guarantees deadline_at IS NOT NULL");
+        // Chain deadline takes precedence when both fired (issue #617). A
+        // chain-only expiry has no per-run `deadline_at`, so classification must
+        // not `.expect()` `deadline_at`.
+        let (deadline, timeout_kind) =
+            classify_workflow_timeout(execution.deadline_at, execution.chain_deadline_at, now);
         let timed_out_at = Utc::now();
 
         let timeout_event = WorkflowEvent::WorkflowExecutionTimedOut {
             deadline,
             timed_out_at,
         };
+        let timeout_type = match timeout_kind {
+            TimeoutKind::Chain => TimeoutType::WorkflowChain,
+            TimeoutKind::Run => TimeoutType::WorkflowExecution,
+        };
         let error_msg = HarvestError::Timeout {
-            timeout_type: TimeoutType::WorkflowExecution,
+            timeout_type,
             task_name: execution.workflow_name.clone(),
         }
         .to_string();
@@ -1612,7 +1692,17 @@ pub async fn enforce_workflow_execution_timeouts(
             let canary_shard = u16::try_from(execution.shard_id).unwrap_or(0);
             metrics.record_canary_failure(&execution.queue_name, canary_shard);
         } else {
-            metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
+            // The chain-vs-run distinction lives in the two timeout counters
+            // (issue #617, AC6), not in the terminal outcome — both emit
+            // `WorkflowStatus::TimedOut`.
+            match timeout_kind {
+                TimeoutKind::Chain => {
+                    metrics.record_workflow_chain_timeout(&workflow_name, &execution.queue_name);
+                }
+                TimeoutKind::Run => {
+                    metrics.record_workflow_timeout(&workflow_name, &execution.queue_name);
+                }
+            }
             crate::telemetry::emit_workflow_terminal(
                 metrics,
                 &workflow_name,
@@ -3441,6 +3531,143 @@ mod tests {
             "must reference deadline_at column"
         );
         assert!(sql.contains("NOW()"), "must compare against NOW()");
+    }
+
+    // ── Chain-scoped lifetime cap tests (issue #617) ─────────────────────────
+
+    #[test]
+    fn chain_timeout_query_includes_the_chain_deadline_disjunct() {
+        let sql = workflow_execution_timeout_query();
+        // Must still enforce the per-run deadline (issue #243)…
+        assert!(
+            sql.contains("deadline_at IS NOT NULL"),
+            "must still reference the per-run deadline_at"
+        );
+        // …AND the chain deadline disjunct (issue #617).
+        assert!(
+            sql.contains("chain_deadline_at IS NOT NULL"),
+            "must reference chain_deadline_at IS NOT NULL"
+        );
+        assert!(
+            sql.contains("chain_deadline_at < NOW()"),
+            "must compare chain_deadline_at against NOW()"
+        );
+        assert!(
+            sql.contains(" OR "),
+            "the two deadlines must be OR'd so either can fire"
+        );
+    }
+
+    #[test]
+    fn effective_chain_timeout_truth_table() {
+        use chrono::Duration;
+        let w = Duration::hours(10);
+        let c = Duration::hours(3);
+        // both → min
+        assert_eq!(effective_chain_timeout(Some(w), Some(c)), Some(c));
+        assert_eq!(
+            effective_chain_timeout(Some(c), Some(w)),
+            Some(c),
+            "min is symmetric"
+        );
+        // only workflow → workflow
+        assert_eq!(effective_chain_timeout(Some(w), None), Some(w));
+        // only ceiling → ceiling (the #243 divergence: ceiling doubles as a default)
+        assert_eq!(effective_chain_timeout(None, Some(c)), Some(c));
+        // neither → None
+        assert_eq!(effective_chain_timeout(None, None), None);
+    }
+
+    #[test]
+    fn classify_workflow_timeout_chain_takes_precedence() {
+        use chrono::Duration;
+        let now = Utc::now();
+        let run = now - Duration::seconds(10);
+        let chain = now - Duration::seconds(5);
+        // Both fired → chain wins (precedence).
+        let (fired, kind) = classify_workflow_timeout(Some(run), Some(chain), now);
+        assert_eq!(kind, TimeoutKind::Chain);
+        assert_eq!(fired, chain);
+    }
+
+    #[test]
+    fn classify_workflow_timeout_run_only() {
+        use chrono::Duration;
+        let now = Utc::now();
+        let run = now - Duration::seconds(10);
+        // Chain deadline in the future (not fired) → run wins.
+        let future_chain = now + Duration::hours(1);
+        let (fired, kind) = classify_workflow_timeout(Some(run), Some(future_chain), now);
+        assert_eq!(kind, TimeoutKind::Run);
+        assert_eq!(fired, run);
+        // No chain deadline at all → run wins.
+        let (fired2, kind2) = classify_workflow_timeout(Some(run), None, now);
+        assert_eq!(kind2, TimeoutKind::Run);
+        assert_eq!(fired2, run);
+    }
+
+    #[test]
+    fn classify_workflow_timeout_chain_only_does_not_panic() {
+        use chrono::Duration;
+        let now = Utc::now();
+        let chain = now - Duration::seconds(5);
+        // A chain-only expiry has no per-run deadline_at — must NOT panic.
+        let (fired, kind) = classify_workflow_timeout(None, Some(chain), now);
+        assert_eq!(kind, TimeoutKind::Chain);
+        assert_eq!(fired, chain);
+    }
+
+    #[test]
+    fn chain_deadline_checked_add_overflow_yields_none_not_panic() {
+        use chrono::Duration;
+        // Because the chain ceiling doubles as the effective value (AC4), an
+        // absurd operator ceiling can reach `Duration::MAX`, and
+        // `effective_chain_timeout(None, ceiling)` returns it verbatim.
+        let effective = effective_chain_timeout(None, Some(Duration::MAX));
+        assert_eq!(effective, Some(Duration::MAX));
+        // The start path adds it to the start instant with `checked_add_signed`
+        // so an overflow yields `None` (no chain cap) rather than panicking, which
+        // is exactly what the fresh-start / reset / child sites now do.
+        let start = Utc::now();
+        let chain_deadline_at = effective.and_then(|d| start.checked_add_signed(d));
+        assert_eq!(
+            chain_deadline_at, None,
+            "Duration::MAX must overflow to None, never panic"
+        );
+        // A sane duration must still produce a deadline.
+        let sane = effective_chain_timeout(None, Some(Duration::hours(1)));
+        let ok = sane.and_then(|d| start.checked_add_signed(d));
+        assert!(
+            ok.is_some(),
+            "a representable chain cap must yield a deadline"
+        );
+    }
+
+    #[test]
+    fn chain_timeout_metric_has_correct_name() {
+        assert_eq!(
+            crate::telemetry::METRIC_WORKFLOW_CHAIN_TIMEOUT,
+            "harvest.workflow.chain_timeout"
+        );
+    }
+
+    #[test]
+    fn record_workflow_chain_timeout_is_callable_on_no_op_recorder() {
+        use crate::telemetry::MetricsRecorder;
+        struct NoOp;
+        impl MetricsRecorder for NoOp {}
+        NoOp.record_workflow_chain_timeout("my_workflow", "default");
+    }
+
+    #[test]
+    fn timeout_type_workflow_chain_has_distinct_display() {
+        use crate::error::TimeoutType;
+        // Consistent with every sibling variant, Display renders the variant name.
+        assert_eq!(TimeoutType::WorkflowChain.to_string(), "WorkflowChain");
+        assert_ne!(
+            TimeoutType::WorkflowChain.to_string(),
+            TimeoutType::WorkflowExecution.to_string()
+        );
     }
 
     // ── Soft SLA breach scanner tests (issue #487) ────────────────────────────

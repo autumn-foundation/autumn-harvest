@@ -854,6 +854,19 @@ pub struct WorkflowSchedule {
     /// schedule. `None` = no deadline enforced (today's behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_timeout: Option<std::time::Duration>,
+    /// Chain-scoped lifetime cap for this schedule (issue #617). Distinct from
+    /// [`execution_timeout`](Self::execution_timeout): anchored at the first run's
+    /// start and carried verbatim across every continue-as-new.
+    ///
+    /// **Currently inert** — at exact parity with [`execution_timeout`](Self::execution_timeout),
+    /// this per-schedule value is NOT persisted on `harvest_schedules` and NOT
+    /// read by the scheduler tick. The *functional* schedule-level chain default
+    /// is delivered by the workflow-type `#[workflow(chain_execution_timeout = "…")]`
+    /// attribute (inherited through `WorkflowInfo` at tick time), plus the
+    /// fleet-wide ceiling ([`HarvestBuilder::max_workflow_chain_timeout`]). The
+    /// builder method is kept for API symmetry with #243's third surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_execution_timeout: Option<std::time::Duration>,
     /// Optional named calendar to consult before each firing.
     ///
     /// When `Some("us-federal-holidays")`, the scheduler looks up the
@@ -973,6 +986,7 @@ impl WorkflowSchedule {
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
             execution_timeout: None,
+            chain_execution_timeout: None,
             calendar: None,
             skip_policy: SkipPolicy::Skip,
             consecutive_failure_limit: None,
@@ -1004,6 +1018,21 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_execution_timeout(mut self, timeout: Duration) -> Self {
         self.execution_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the chain-scoped lifetime cap for this schedule (issue #617).
+    ///
+    /// **Currently inert** — mirroring #243's [`with_execution_timeout`](Self::with_execution_timeout),
+    /// the value set here is NOT persisted on `harvest_schedules` and NOT read by
+    /// the scheduler tick. To give scheduled runs a chain cap, declare it on the
+    /// workflow type via `#[workflow(chain_execution_timeout = "…")]` (inherited
+    /// through `WorkflowInfo` at tick) and/or set the fleet-wide ceiling with
+    /// [`HarvestBuilder::max_workflow_chain_timeout`]. This builder method is kept
+    /// for API symmetry with #243's third surface.
+    #[must_use]
+    pub const fn with_chain_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.chain_execution_timeout = Some(timeout);
         self
     }
 

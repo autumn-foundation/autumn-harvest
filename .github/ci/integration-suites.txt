@@ -51,8 +51,9 @@ compileonly  autumn-harvest-plugin  status_summary_localpg           -          
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
-linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
+linux        autumn-harvest         integration                      -                          canary_tests
+linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_timeout_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
