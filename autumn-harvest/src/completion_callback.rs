@@ -2442,7 +2442,6 @@ async fn apply_outcome(
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
-    use diesel_async::scoped_futures::ScopedFutureExt;
 
     use crate::schema::harvest_completion_deliveries::dsl;
 
@@ -2501,34 +2500,31 @@ async fn apply_outcome(
             last_status,
             last_error,
         } => {
-            conn.transaction::<_, crate::error::HarvestError, _>(|conn| {
-                async move {
-                    let entry =
-                        dead_letter_entry_with_current_payload(conn, row, last_status).await?;
+            conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
+                let entry =
+                    dead_letter_entry_with_current_payload(conn, row, last_status).await?;
 
-                    let updated = diesel::update(
-                        dsl::harvest_completion_deliveries
-                            .find(row.id)
-                            .filter(dsl::attempt.eq(row.attempt)),
-                    )
-                    .set((
-                        dsl::state.eq("FAILED"),
-                        dsl::last_status.eq(last_status.map(i32::from)),
-                        dsl::last_error.eq(last_error),
-                        dsl::updated_at.eq(Utc::now()),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                let updated = diesel::update(
+                    dsl::harvest_completion_deliveries
+                        .find(row.id)
+                        .filter(dsl::attempt.eq(row.attempt)),
+                )
+                .set((
+                    dsl::state.eq("FAILED"),
+                    dsl::last_status.eq(last_status.map(i32::from)),
+                    dsl::last_error.eq(last_error),
+                    dsl::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                    // A stale/superseded attempt must not dead-letter a row a
-                    // newer attempt already resolved differently.
-                    if updated > 0 {
-                        crate::dlq::dead_letter(conn, &entry).await?;
-                    }
-                    Ok(())
+                // A stale/superseded attempt must not dead-letter a row a
+                // newer attempt already resolved differently.
+                if updated > 0 {
+                    crate::dlq::dead_letter(conn, &entry).await?;
                 }
-                .scope_boxed()
+                Ok(())
             })
             .await?;
         }
@@ -2883,68 +2879,64 @@ pub async fn redrive_delivery(
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
-    use diesel_async::scoped_futures::ScopedFutureExt;
 
     use crate::schema::harvest_completion_deliveries::dsl;
     use crate::schema::harvest_dead_letters::dsl as dlq_dsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    conn.transaction::<DeliveryRedriveOutcome, crate::error::HarvestError, _>(|conn| {
-        async move {
-            let current: Option<(String, i32)> = dsl::harvest_completion_deliveries
-                .find(delivery_id)
-                .filter(dsl::workflow_exec_id.eq(exec_uuid))
-                .select((dsl::state, dsl::max_attempts))
-                .for_update()
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-
-            let Some((state, max_attempts)) = current else {
-                return Ok(DeliveryRedriveOutcome::NotFound);
-            };
-            if state != "FAILED" {
-                return Ok(DeliveryRedriveOutcome::NotFailed {
-                    current_state: state,
-                });
-            }
-
-            // Extend the ceiling rather than resetting `attempt` — see the
-            // doc comment above for why reusing attempt numbers is unsafe.
-            let extended_max_attempts = max_attempts.saturating_add(max_attempts.max(1));
-
-            diesel::update(
-                dsl::harvest_completion_deliveries
-                    .find(delivery_id)
-                    .filter(dsl::workflow_exec_id.eq(exec_uuid)),
-            )
-            .filter(dsl::state.eq("FAILED"))
-            .set((
-                dsl::state.eq("PENDING"),
-                dsl::max_attempts.eq(extended_max_attempts),
-                dsl::next_attempt_at.eq(Utc::now()),
-                dsl::last_status.eq(None::<i32>),
-                dsl::last_error.eq(None::<String>),
-                dsl::updated_at.eq(Utc::now()),
-            ))
-            .execute(conn)
+    conn.transaction::<DeliveryRedriveOutcome, crate::error::HarvestError, _>(async |conn| {
+        let current: Option<(String, i32)> = dsl::harvest_completion_deliveries
+            .find(delivery_id)
+            .filter(dsl::workflow_exec_id.eq(exec_uuid))
+            .select((dsl::state, dsl::max_attempts))
+            .for_update()
+            .first(conn)
             .await
+            .optional()
             .map_err(crate::error::database_error)?;
 
-            diesel::delete(
-                dlq_dsl::harvest_dead_letters
-                    .filter(dlq_dsl::original_task_id.eq(delivery_id))
-                    .filter(dlq_dsl::task_type.eq("CALLBACK")),
-            )
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-            Ok(DeliveryRedriveOutcome::Redriven)
+        let Some((state, max_attempts)) = current else {
+            return Ok(DeliveryRedriveOutcome::NotFound);
+        };
+        if state != "FAILED" {
+            return Ok(DeliveryRedriveOutcome::NotFailed {
+                current_state: state,
+            });
         }
-        .scope_boxed()
+
+        // Extend the ceiling rather than resetting `attempt` — see the
+        // doc comment above for why reusing attempt numbers is unsafe.
+        let extended_max_attempts = max_attempts.saturating_add(max_attempts.max(1));
+
+        diesel::update(
+            dsl::harvest_completion_deliveries
+                .find(delivery_id)
+                .filter(dsl::workflow_exec_id.eq(exec_uuid)),
+        )
+        .filter(dsl::state.eq("FAILED"))
+        .set((
+            dsl::state.eq("PENDING"),
+            dsl::max_attempts.eq(extended_max_attempts),
+            dsl::next_attempt_at.eq(Utc::now()),
+            dsl::last_status.eq(None::<i32>),
+            dsl::last_error.eq(None::<String>),
+            dsl::updated_at.eq(Utc::now()),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        diesel::delete(
+            dlq_dsl::harvest_dead_letters
+                .filter(dlq_dsl::original_task_id.eq(delivery_id))
+                .filter(dlq_dsl::task_type.eq("CALLBACK")),
+        )
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        Ok(DeliveryRedriveOutcome::Redriven)
     })
     .await
 }

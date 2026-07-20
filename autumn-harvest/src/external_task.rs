@@ -9,7 +9,6 @@
 use chrono::Utc;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use scoped_futures::ScopedFutureExt;
 
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
@@ -315,37 +314,34 @@ pub async fn complete_externally(
     token: ExternalActivityToken,
     output: serde_json::Value,
 ) -> HarvestResult<bool> {
-    conn.transaction::<bool, HarvestError, _>(|conn| {
-        async move {
-            let task = lock_task(conn, token).await?;
+    conn.transaction::<bool, HarvestError, _>(async |conn| {
+        let task = lock_task(conn, token).await?;
 
-            if task.state != "PENDING" {
-                return Ok(false);
-            }
-
-            let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
-            let activity_id = ActivityExecId::from_uuid(task.activity_id);
-
-            diesel::update(harvest_external_tasks::table.find(task.id))
-                .set((
-                    harvest_external_tasks::state.eq("COMPLETED"),
-                    harvest_external_tasks::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-
-            let event = WorkflowEvent::ActivityCompletedExternally {
-                activity_id,
-                token,
-                output,
-            };
-            store::append_single_event(conn, exec_id, event).await?;
-            crate::queue::wake_workflow_task(conn, exec_id).await?;
-
-            Ok(true)
+        if task.state != "PENDING" {
+            return Ok(false);
         }
-        .scope_boxed()
+
+        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
+        let activity_id = ActivityExecId::from_uuid(task.activity_id);
+
+        diesel::update(harvest_external_tasks::table.find(task.id))
+            .set((
+                harvest_external_tasks::state.eq("COMPLETED"),
+                harvest_external_tasks::updated_at.eq(Utc::now()),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+        let event = WorkflowEvent::ActivityCompletedExternally {
+            activity_id,
+            token,
+            output,
+        };
+        store::append_single_event(conn, exec_id, event).await?;
+        crate::queue::wake_workflow_task(conn, exec_id).await?;
+
+        Ok(true)
     })
     .await
 }
@@ -365,38 +361,35 @@ pub async fn fail_externally(
     error: String,
     retryable: bool,
 ) -> HarvestResult<bool> {
-    conn.transaction::<bool, HarvestError, _>(|conn| {
-        async move {
-            let task = lock_task(conn, token).await?;
+    conn.transaction::<bool, HarvestError, _>(async |conn| {
+        let task = lock_task(conn, token).await?;
 
-            if task.state != "PENDING" {
-                return Ok(false);
-            }
-
-            let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
-            let activity_id = ActivityExecId::from_uuid(task.activity_id);
-
-            diesel::update(harvest_external_tasks::table.find(task.id))
-                .set((
-                    harvest_external_tasks::state.eq("FAILED"),
-                    harvest_external_tasks::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-
-            let event = WorkflowEvent::ActivityFailedExternally {
-                activity_id,
-                token,
-                error,
-                retryable,
-            };
-            store::append_single_event(conn, exec_id, event).await?;
-            crate::queue::wake_workflow_task(conn, exec_id).await?;
-
-            Ok(true)
+        if task.state != "PENDING" {
+            return Ok(false);
         }
-        .scope_boxed()
+
+        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
+        let activity_id = ActivityExecId::from_uuid(task.activity_id);
+
+        diesel::update(harvest_external_tasks::table.find(task.id))
+            .set((
+                harvest_external_tasks::state.eq("FAILED"),
+                harvest_external_tasks::updated_at.eq(Utc::now()),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+        let event = WorkflowEvent::ActivityFailedExternally {
+            activity_id,
+            token,
+            error,
+            retryable,
+        };
+        store::append_single_event(conn, exec_id, event).await?;
+        crate::queue::wake_workflow_task(conn, exec_id).await?;
+
+        Ok(true)
     })
     .await
 }
@@ -415,44 +408,41 @@ pub async fn extend_deadline(
     token: ExternalActivityToken,
     extend_by_secs: u64,
 ) -> HarvestResult<()> {
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            let task = lock_task(conn, token).await?;
+    conn.transaction::<(), HarvestError, _>(async |conn| {
+        let task = lock_task(conn, token).await?;
 
-            if task.state != "PENDING" {
-                return Err(HarvestError::Config(format!(
-                    "external task {token} is already terminal ({}); cannot extend deadline",
-                    task.state
-                )));
-            }
-
-            let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
-            let activity_id = ActivityExecId::from_uuid(task.activity_id);
-
-            let dur = crate::worker::chrono_duration_from_secs(
-                extend_by_secs,
-                "external task extend by",
-            )?;
-
-            let new_deadline = Utc::now().checked_add_signed(dur).ok_or_else(|| {
-                crate::error::HarvestError::Database("Datetime addition overflow".to_string())
-            })?;
-
-            diesel::update(harvest_external_tasks::table.find(task.id))
-                .set((
-                    harvest_external_tasks::schedule_to_close_at.eq(new_deadline),
-                    harvest_external_tasks::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-
-            let event = WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token };
-            store::append_single_event(conn, exec_id, event).await?;
-
-            Ok(())
+        if task.state != "PENDING" {
+            return Err(HarvestError::Config(format!(
+                "external task {token} is already terminal ({}); cannot extend deadline",
+                task.state
+            )));
         }
-        .scope_boxed()
+
+        let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
+        let activity_id = ActivityExecId::from_uuid(task.activity_id);
+
+        let dur = crate::worker::chrono_duration_from_secs(
+            extend_by_secs,
+            "external task extend by",
+        )?;
+
+        let new_deadline = Utc::now().checked_add_signed(dur).ok_or_else(|| {
+            crate::error::HarvestError::Database("Datetime addition overflow".to_string())
+        })?;
+
+        diesel::update(harvest_external_tasks::table.find(task.id))
+            .set((
+                harvest_external_tasks::schedule_to_close_at.eq(new_deadline),
+                harvest_external_tasks::updated_at.eq(Utc::now()),
+            ))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+        let event = WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token };
+        store::append_single_event(conn, exec_id, event).await?;
+
+        Ok(())
     })
     .await
 }

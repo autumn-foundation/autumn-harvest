@@ -11850,7 +11850,6 @@ impl ActivityContext {
         }
 
         use diesel_async::AsyncConnection as _;
-        use scoped_futures::ScopedFutureExt as _;
 
         let Some(txn) = &self.transactional_state else {
             return Err(
@@ -11873,87 +11872,84 @@ impl ActivityContext {
             })?;
 
         let result = conn
-            .transaction::<T, TxError, _>(|conn| {
-                async move {
-                    // Run user domain writes.
-                    let user_result = f(conn).await.map_err(TxError::User)?;
+            .transaction::<T, TxError, _>(async |conn| {
+                // Run user domain writes.
+                let user_result = f(conn).await.map_err(TxError::User)?;
 
-                    // Serialize the result for the event log.
-                    let output =
-                        serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+                // Serialize the result for the event log.
+                let output =
+                    serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
 
-                    // Enforce the result-size cap before committing.  The worker's
-                    // post-handler cap check runs after the handler returns, which
-                    // is too late for transactional activities — the event would
-                    // already be committed.  Rolling back here ensures an oversized
-                    // result never lands in harvest_events.
-                    if max_result_bytes > 0 {
-                        let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                        if observed > max_result_bytes {
-                            use crate::failure::IntoActivityErrorString as _;
-                            let payload = crate::failure::ActivityFailure::non_retryable(
-                                "PayloadTooLarge",
-                                format!(
-                                    "transactional activity result exceeds cap: \
-                                 {observed} bytes (cap {max_result_bytes} bytes)"
-                                ),
-                            )
-                            .into_error_payload();
-                            return Err(TxError::Payload(payload));
-                        }
+                // Enforce the result-size cap before committing.  The worker's
+                // post-handler cap check runs after the handler returns, which
+                // is too late for transactional activities — the event would
+                // already be committed.  Rolling back here ensures an oversized
+                // result never lands in harvest_events.
+                if max_result_bytes > 0 {
+                    let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                    if observed > max_result_bytes {
+                        use crate::failure::IntoActivityErrorString as _;
+                        let payload = crate::failure::ActivityFailure::non_retryable(
+                            "PayloadTooLarge",
+                            format!(
+                                "transactional activity result exceeds cap: \
+                             {observed} bytes (cap {max_result_bytes} bytes)"
+                            ),
+                        )
+                        .into_error_payload();
+                        return Err(TxError::Payload(payload));
                     }
-
-                    // Lock the execution row first (consistent with the rest of the
-                    // codebase: harvest_workflow_executions → harvest_task_queue)
-                    // and load history so we can compute the next sequential
-                    // event_id before appending.
-                    let history = crate::store::lock_and_load_history(conn, exec_id).await?;
-
-                    // Idempotency guard: verify the task is still RUNNING before
-                    // we commit.  If it's already COMPLETED (e.g. this is a
-                    // crash-recovery attempt where the first transaction succeeded)
-                    // we roll back the user writes so the caller sees a clean
-                    // slate, matching the "exactly-once" contract.
-                    match crate::queue::task_state_for_update(conn, task_id).await? {
-                        Some(ref s) if s == "RUNNING" => {}
-                        Some(other) => {
-                            return Err(TxError::Harvest(HarvestError::Config(format!(
-                                "transactional activity task {task_id} is in state '{other}', \
-                             not RUNNING; rolling back user writes (the ActivityCompleted \
-                             event was already committed by a prior attempt)"
-                            ))));
-                        }
-                        None => {
-                            return Err(TxError::Harvest(HarvestError::Config(format!(
-                                "transactional activity task {task_id} no longer exists; \
-                             rolling back user writes"
-                            ))));
-                        }
-                    }
-
-                    // Append ActivityCompleted within the same transaction.
-                    let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
-                        activity_id,
-                        output: output.clone(),
-                    };
-                    crate::store::append_events(
-                        conn,
-                        exec_id,
-                        &[completion_event],
-                        history.next_event_id,
-                    )
-                    .await?;
-
-                    // Mark the task COMPLETED.
-                    crate::queue::complete_task(conn, task_id, output).await?;
-
-                    // Wake the workflow so it can pick up the ActivityCompleted
-                    // result on its next execution cycle.
-                    crate::queue::wake_workflow_task(conn, exec_id).await?;
-
-                    Ok(user_result)
                 }
-                .scope_boxed()
+
+                // Lock the execution row first (consistent with the rest of the
+                // codebase: harvest_workflow_executions → harvest_task_queue)
+                // and load history so we can compute the next sequential
+                // event_id before appending.
+                let history = crate::store::lock_and_load_history(conn, exec_id).await?;
+
+                // Idempotency guard: verify the task is still RUNNING before
+                // we commit.  If it's already COMPLETED (e.g. this is a
+                // crash-recovery attempt where the first transaction succeeded)
+                // we roll back the user writes so the caller sees a clean
+                // slate, matching the "exactly-once" contract.
+                match crate::queue::task_state_for_update(conn, task_id).await? {
+                    Some(ref s) if s == "RUNNING" => {}
+                    Some(other) => {
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
+                            "transactional activity task {task_id} is in state '{other}', \
+                         not RUNNING; rolling back user writes (the ActivityCompleted \
+                         event was already committed by a prior attempt)"
+                        ))));
+                    }
+                    None => {
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
+                            "transactional activity task {task_id} no longer exists; \
+                         rolling back user writes"
+                        ))));
+                    }
+                }
+
+                // Append ActivityCompleted within the same transaction.
+                let completion_event = crate::event::WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: output.clone(),
+                };
+                crate::store::append_events(
+                    conn,
+                    exec_id,
+                    &[completion_event],
+                    history.next_event_id,
+                )
+                .await?;
+
+                // Mark the task COMPLETED.
+                crate::queue::complete_task(conn, task_id, output).await?;
+
+                // Wake the workflow so it can pick up the ActivityCompleted
+                // result on its next execution cycle.
+                crate::queue::wake_workflow_task(conn, exec_id).await?;
+
+                Ok(user_result)
             })
             .await;
 
