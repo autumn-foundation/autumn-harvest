@@ -14,9 +14,10 @@ use crate::schema::{
     harvest_batch_jobs, harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions,
     harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
-    harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_payload_refs,
-    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_sessions,
-    harvest_signals, harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
+    harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
+    harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
+    harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions,
 };
 
@@ -1439,4 +1440,63 @@ pub struct NewHarvestWasmModule<'a> {
     pub activity_name: &'a str,
     pub wasm_bytes: &'a [u8],
     pub active: bool,
+}
+
+// ── Durable mutex locks (issue #691) ────────────────────────────────────────
+
+/// A currently-held durable mutex lock row from `harvest_mutex_locks`
+/// (issue #691).
+///
+/// Derives `QueryableByName` (alongside the ORM-path `Queryable`) so the
+/// advisory-locked grant/release/reclaim/renewal helpers in
+/// [`crate::mutex`] can load rows directly via raw `sql_query`, mirroring
+/// `HarvestSession`'s dual-path precedent.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_mutex_locks)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestMutexLock {
+    pub lock_key: String,
+    pub holder_exec_id: Uuid,
+    pub lock_seq: i64,
+    pub acquired_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+/// Insert struct for granting a durable mutex lock (issue #691).
+///
+/// `acquired_at` is omitted so Postgres fills its `DEFAULT NOW()`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_mutex_locks)]
+pub struct NewHarvestMutexLock {
+    pub lock_key: String,
+    pub holder_exec_id: Uuid,
+    pub lock_seq: i64,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+/// A FIFO waiter row from `harvest_mutex_waiters` (issue #691). The BIGSERIAL
+/// `id` encodes request order; the smallest id for a key wins the next grant.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_mutex_waiters)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestMutexWaiter {
+    pub id: i64,
+    pub lock_key: String,
+    pub waiter_exec_id: Uuid,
+    pub requested_at: DateTime<Utc>,
+}
+
+/// Insert struct for enqueuing a durable mutex waiter (issue #691).
+///
+/// `id` (BIGSERIAL) and `requested_at` (`DEFAULT NOW()`) are omitted so
+/// Postgres fills them.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_mutex_waiters)]
+pub struct NewHarvestMutexWaiter {
+    pub lock_key: String,
+    pub waiter_exec_id: Uuid,
 }

@@ -534,6 +534,19 @@ pub enum HarvestError {
         /// heartbeat", "host worker draining", "session lease expired").
         reason: String,
     },
+
+    /// A workflow tried to re-acquire a durable mutex key it already holds
+    /// (issue #691).
+    ///
+    /// Durable mutexes are non-reentrant: acquiring a key the same workflow
+    /// already holds would deadlock (the holder can never release while it is
+    /// blocked waiting for itself), so `ctx.mutex(key).acquire()` returns this
+    /// synchronously instead of parking. Author-catchable.
+    #[error("workflow already holds mutex '{key}'; re-acquiring the same key would deadlock")]
+    MutexSelfDeadlock {
+        /// The lock key the workflow already holds.
+        key: String,
+    },
 }
 
 /// The Postgres constraint name backing the `harvest_events`
@@ -729,6 +742,14 @@ impl HarvestError {
             Self::WorkflowFailed { non_retryable, .. } => non_retryable.unwrap_or(false),
             _ => false,
         }
+    }
+
+    /// Returns `true` if this is a
+    /// [`MutexSelfDeadlock`](HarvestError::MutexSelfDeadlock) — a workflow
+    /// re-acquiring a durable mutex key it already holds (issue #691).
+    #[must_use]
+    pub fn is_mutex_self_deadlock(&self) -> bool {
+        matches!(self, Self::MutexSelfDeadlock { .. })
     }
 
     /// If this is an [`ExternalAwaitFailed`](HarvestError::ExternalAwaitFailed)

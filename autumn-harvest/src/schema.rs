@@ -863,6 +863,39 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable mutual-exclusion locks (issue #691). One row per currently-held
+    /// key; absence of a row means the key is free. At most one holder per key
+    /// per shard.
+    harvest_mutex_locks (lock_key) {
+        lock_key         -> Text,
+        /// Execution that currently holds the lock.
+        holder_exec_id   -> Uuid,
+        /// Monotonic fencing token minted on each grant; release/reclaim match
+        /// on `(holder_exec_id, lock_seq)`.
+        lock_seq         -> Int8,
+        acquired_at      -> Timestamptz,
+        /// TTL backstop; renewed forward by the holder's decision cycles.
+        lease_expires_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// FIFO waiter queue for durable mutex locks (issue #691). One row per
+    /// execution waiting on a key; BIGSERIAL `id` encodes request order and the
+    /// smallest id for a key wins the next grant.
+    harvest_mutex_waiters (id) {
+        id             -> Int8,
+        lock_key       -> Text,
+        waiter_exec_id -> Uuid,
+        requested_at   -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -895,4 +928,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_sessions,
     harvest_execution_summaries,
     harvest_wasm_modules,
+    harvest_mutex_locks,
+    harvest_mutex_waiters,
 );

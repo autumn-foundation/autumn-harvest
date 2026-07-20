@@ -55,7 +55,8 @@ use crate::telemetry::{
     METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER,
     METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
     METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_STATUS,
-    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_PAYLOAD_BYTES,
+    METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
+    METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT, METRIC_PAYLOAD_BYTES,
     METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
     METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE,
@@ -815,6 +816,31 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_mutex_wait(&self, workflow: &str, seconds: f64) {
+        histogram!(
+            METRIC_MUTEX_WAIT,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .record(seconds);
+    }
+
+    fn record_mutex_held(&self, workflow: &str, seconds: f64) {
+        histogram!(
+            METRIC_MUTEX_HELD,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .record(seconds);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_mutex_contention(&self, workflow: &str, depth: u64) {
+        gauge!(
+            METRIC_MUTEX_CONTENTION,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+        )
+        .set(depth as f64);
+    }
+
     fn record_canary_success(&self, queue: &str, shard: u16) {
         counter!(
             METRIC_CANARY_SUCCESS,
@@ -1029,6 +1055,9 @@ mod tests {
         rec.record_queue_oldest_pending_age("q", 30.0);
         rec.record_completion_trigger_fired("trigger-uuid", "started");
         rec.record_completion_trigger_skipped("trigger-uuid", "condition_unmet");
+        rec.record_mutex_wait("wf", 0.25);
+        rec.record_mutex_held("wf", 1.5);
+        rec.record_mutex_contention("wf", 3);
     }
 
     // -----------------------------------------------------------------------
