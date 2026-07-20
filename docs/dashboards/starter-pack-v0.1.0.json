@@ -4611,6 +4611,185 @@
           "description": "Synthetic liveness-canary probe failures per second per (queue, shard) (issue #796) — a probe that did not reach terminal completion within its per-probe timeout, or terminated in a non-completed state. A sustained rise on one (queue, shard) isolates a wedged worker pool or a write-blocked shard. Distinct from the #512 replay canary."
         }
       ]
+    },
+    {
+      "id": 909,
+      "type": "row",
+      "title": "Durable mutex",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 89
+      },
+      "panels": [
+        {
+          "id": 910,
+          "type": "timeseries",
+          "title": "Mutex acquire wait p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 90
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_mutex_wait_duration_bucket{workflow=~\"$workflow\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (workflow) (rate(harvest_mutex_wait_duration_sum{workflow=~\"$workflow\"}[$__rate_interval])) / sum by (workflow) (rate(harvest_mutex_wait_duration_count{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "avg {{workflow}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Wall-clock time a workflow waited to acquire a durable mutex, from request (enqueued as a FIFO waiter) to grant (issue #691). p99 needs set_buckets_for_metric on the exporter; the bucket-less avg fallback works on any install. The lock key is deliberately not a label (ADR-0001 §7) — high cardinality."
+        },
+        {
+          "id": 911,
+          "type": "timeseries",
+          "title": "Mutex held duration p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 90
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_mutex_held_duration_bucket{workflow=~\"$workflow\"}[$__rate_interval])))",
+              "legendFormat": "p99 {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (workflow) (rate(harvest_mutex_held_duration_sum{workflow=~\"$workflow\"}[$__rate_interval])) / sum by (workflow) (rate(harvest_mutex_held_duration_count{workflow=~\"$workflow\"}[$__rate_interval]))",
+              "legendFormat": "avg {{workflow}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Wall-clock time a durable mutex was held, from grant to release (drop / explicit / terminal sweep / lease reclaim) (issue #691). Long holds serialize contenders and are the first thing to check when acquire waits climb. p99 needs set_buckets_for_metric; the avg fallback works on any install."
+        },
+        {
+          "id": 912,
+          "type": "timeseries",
+          "title": "Mutex contention depth",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 98
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (workflow) (harvest_mutex_contention_depth{workflow=~\"$workflow\"})",
+              "legendFormat": "waiters {{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "FIFO waiter-queue length for a durable mutex key at the moment of the last grant (contention depth, issue #691). A sustained rise means workflows are queueing on a hot lock key — combine with the held-duration panel to find long-held locks. The lock key is deliberately not a label (ADR-0001 §7)."
+        }
+      ]
     }
   ]
 }

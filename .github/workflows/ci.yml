@@ -200,6 +200,9 @@ jobs:
       - name: Run interface_schema_workflow example tests (issue #610)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
+      - name: Run mutex_ledger example tests (issue #691)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example mutex_ledger
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.

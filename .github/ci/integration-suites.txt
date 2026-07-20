@@ -51,8 +51,8 @@ compileonly  autumn-harvest-plugin  status_summary_localpg           -          
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
-linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
+linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          child_timeout_tests
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
@@ -61,6 +61,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          metrics_integration
+linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
 linux        autumn-harvest         integration                      -                          retention_overrides_tests

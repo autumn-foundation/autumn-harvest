@@ -1087,6 +1087,47 @@ Out of scope (per issue #606): cross-worker session migration/failover, a built-
 
 See `autumn-harvest/examples/worker_session_pipeline.rs` for a complete download-transcode-upload example.
 
+### Durable Mutex — ctx.mutex (issue #691)
+
+`ctx.mutex(key)` gives a `#[workflow]` body durable, named, cross-workflow **mutual exclusion** for a critical region — the answer to "two executions must not read-modify-write the same shared resource at once." A `#[workflow]` cannot reach for a `std::sync::Mutex` (it would not survive a worker restart, and holding a std lock across a durable `.await` breaks replay); `ctx.mutex` coordinates the lock through Postgres so it survives restarts, worker failover, and replay.
+
+```rust
+#[workflow]
+async fn apply_ledger_op(ctx: &WorkflowContext, op: LedgerOp) -> Result<i64, String> {
+    // acquire() durably suspends THIS execution until it holds the key.
+    let guard = ctx.mutex(format!("ledger:{}", op.account)).acquire().await
+        .map_err(|e| e.to_string())?;
+    // ── critical section ── the guard is held across the durable activity, so
+    //    no other execution can enter for the same key. The rest of the
+    //    workflow (outside this region) still runs concurrently with peers.
+    let new_balance = ctx.execute_activity(&apply_delta_info(), op.amount).await?;
+    // Released when `guard` drops at scope end, or explicitly via `guard.release()`.
+    // `guard.lock_seq()` is the fencing token minted for this grant.
+    Ok(new_balance)
+}
+```
+
+The guard is a `#[must_use]` RAII handle. It releases the lock on **any** of: drop / scope exit, an explicit `guard.release()`, the holder reaching a terminal state (complete/fail/cancel/terminate/timeout — a terminal sweep frees the lock), or the lease TTL expiring (crash backstop). Dropping it pushes exactly one **event-less** `ReleaseMutex` bookkeeping command (zero `harvest_events` footprint). A guard held while the workflow parks on an `.await` is **not** released under the still-parked holder — the lock stays held across the suspension (the timeout-guard contract).
+
+**Per-key concurrency (#247) vs mutex — different problems:**
+
+| | Per-key concurrency (`#[workflow(concurrency(...))]`, #247) | `ctx.mutex(key)` (#691) |
+|---|---|---|
+| Gates | **Admission** at workflow *start* | A **region** *mid-workflow* |
+| Caps | The running *count* of whole workflows sharing a key | Exactly one holder of a key at a time |
+| Effect on the rest of the run | `limit = 1` serializes the **entire** workflow (and risks parent/child deadlock) | Only the critical region serializes; the rest of each workflow runs concurrently with peers |
+| Reach for it when | You want at most N concurrent runs per tenant/entity | Two runs must not touch the same shared resource inside a region |
+
+**Semantics & contracts:**
+- **No new event variant.** A grant records the single existing `MutexGranted` anchor; release is event-less bookkeeping (mirrors `SetCurrentDetails`). Replay recovers the guard from the recorded grant, regardless of which fencing token (`lock_seq`) was minted.
+- **FIFO fairness.** Contenders are granted in arrival order (a BIGSERIAL head-of-line waiter queue).
+- **Lease-based liveness (crash safety).** A held lock carries a lease the holder renews each decision cycle. If the holder crashes, an expired lease is reclaimed and the next FIFO waiter is granted. **Honest lease contract:** the lease TTL (default 60 s; `WorkerConfig::with_mutex_lease_ttl`) must exceed the worst-case *single held step*; `lock_seq` fences the lock table (a reclaimed-then-resumed old holder's release is a 0-row no-op, so the table never corrupts), but the engine cannot fence the author's *external* side effects — the standard lease-lock caveat.
+- **Shard-local scope.** The lock is scoped to the workflow's own shard (same scope as per-key concurrency, #247): contending workflows must resolve to the **same** shard. Cross-shard global mutual exclusion is out of scope.
+- **Non-reentrant.** Re-acquiring a key this execution already holds returns `HarvestError::MutexSelfDeadlock` **synchronously** (before any history match), so a self-deadlock surfaces the same typed error live and on replay rather than hanging.
+- **Cross-key deadlock.** Two workflows each acquiring keys A and B in opposite orders can deadlock (holder-A-waits-B vs holder-B-waits-A) until a lease expires. Acquire multiple keys in a consistent **global order** (e.g. sorted by key) to avoid it.
+
+Author-facing primitive only: exclusive-only, no reentrancy/upgrade/downgrade, and no operator force-release route (all out of scope per the issue). See `autumn-harvest/examples/mutex_ledger.rs` for a complete two-workflow serialized-ledger example.
+
 ### Workflow Input/Output JSON Schema (issue #373)
 
 Operators and non-Rust callers can discover the expected JSON shape of each workflow's input and output through the management API without reading Rust source. Schema publishing is **opt-in** — workflows that don't attach a schema continue to work exactly as today.
