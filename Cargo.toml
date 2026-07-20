@@ -53,7 +53,7 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp", 
 
 # SQLite (embedded, single-writer edge backend — bundled builds SQLite from
 # source so no system libsqlite3 and no Docker are required for tests).
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Dev / test
 testcontainers = "0.27"
