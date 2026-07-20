@@ -200,6 +200,9 @@ jobs:
       - name: Run interface_schema_workflow example tests (issue #610)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
+      - name: Run fanout_batch example tests (issue #750)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example fanout_batch
       # ── Manifest-driven integration suites ──────────────────────────────
       # The per-suite `cargo test` steps that used to live here are now data in
       # `.github/ci/integration-suites.txt`, executed by `.github/ci/run-suites.sh`.
