@@ -987,6 +987,11 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",
         WorkflowCommand::CancelTimer { .. } => "CancelTimer",
+        // Issue #691: real park (`AcquireMutex`) / release (`ReleaseMutex`)
+        // dispatch wiring lands in a later milestone; this arm exists only to
+        // keep `workflow_command_name` exhaustive.
+        WorkflowCommand::AcquireMutex { .. } => "AcquireMutex",
+        WorkflowCommand::ReleaseMutex { .. } => "ReleaseMutex",
     }
 }
 

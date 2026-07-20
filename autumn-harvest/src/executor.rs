@@ -130,17 +130,30 @@ async fn run_workflow_handler_cycle(
         Ok(fut) => fut,
         Err(message) => return HandlerCycleResult::Panicked(message),
     };
-    match tokio::time::timeout(
-        SUSPENSION_TIMEOUT,
-        std::panic::AssertUnwindSafe(handler_fut).catch_unwind(),
-    )
-    .await
-    {
+    // Issue #691 (durable mutex) TIMEOUT-GUARD FIX — the borrow is load-bearing.
+    //
+    // `tokio::time::timeout(dur, fut)` OWNS `fut`; on timeout the `Timeout`
+    // future is consumed by the `.await` and drops `fut` (and any `MutexGuard`
+    // the workflow holds across the suspension) BEFORE the `Err(_elapsed)` arm
+    // runs — so setting `suspending` in that arm would run too late, the guard's
+    // `Drop` would see `suspending == false`, push a `ReleaseMutex`, and free the
+    // lock under the still-parked holder (a mutual-exclusion break after the very
+    // first suspension). Instead we pin the future and pass `&mut guarded` so the
+    // `Timeout` owns only the reference; on timeout the reference is dropped but
+    // `guarded` (owning the suspended future + guard) lives to this function's
+    // scope exit, dropping only AFTER `ctx.set_suspending(true)` has run. A guard
+    // dropped mid-poll or at genuine completion still sees `suspending == false`
+    // (never set on the `Ok(..)` arms) and releases normally.
+    let mut guarded = std::pin::pin!(std::panic::AssertUnwindSafe(handler_fut).catch_unwind());
+    match tokio::time::timeout(SUSPENSION_TIMEOUT, &mut guarded).await {
         Ok(Ok(result)) => HandlerCycleResult::Returned(result),
         Ok(Err(panic_payload)) => {
             HandlerCycleResult::Panicked(crate::error::panic_message(panic_payload))
         }
-        Err(_elapsed) => HandlerCycleResult::Suspended,
+        Err(_elapsed) => {
+            ctx.set_suspending(true);
+            HandlerCycleResult::Suspended
+        }
     }
 }
 

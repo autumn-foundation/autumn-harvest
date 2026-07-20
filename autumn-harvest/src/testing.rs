@@ -4209,6 +4209,13 @@ impl WorkflowTestEnv {
             | WorkflowCommand::Complete { .. }
             | WorkflowCommand::Fail { .. }
             | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
+
+            // Issue #691 (ctx.mutex): real `WorkflowTestEnv` auto-grant/release
+            // (record `MutexGranted`, honor `with_mutex_contended`) lands in the
+            // next milestone. This arm exists only to keep the match exhaustive.
+            WorkflowCommand::AcquireMutex { .. } | WorkflowCommand::ReleaseMutex { .. } => {
+                Ok(false)
+            }
         }
     }
 

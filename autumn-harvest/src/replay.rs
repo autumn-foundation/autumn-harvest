@@ -362,6 +362,38 @@ pub enum PatchMarkerMatch {
     NewlyPatched,
 }
 
+/// Result of matching a durable-mutex acquire against recorded history
+/// (issue #691).
+///
+/// A [`WorkflowEvent::MutexGranted`] is the replay anchor for
+/// `ctx.mutex(key).acquire()`: it is appended at a clean resume cursor when the
+/// lock is granted, so the matcher is strictly positional (mirrors
+/// [`HistoryMatcher::match_timer_arm`]). Release is event-less bookkeeping, so
+/// no forward-scan skip-list needs updating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutexGrantMatch {
+    /// A `MutexGranted` for the key was recorded at the cursor and consumed. The
+    /// caller rebuilds the held-lock guard using `lock_seq`.
+    Granted {
+        /// The fencing token recorded with the grant.
+        lock_seq: i64,
+        /// The wall-clock instant the lock was granted.
+        acquired_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// The cursor is past end of history (first live acquire) — the caller
+    /// suspends on an `AcquireMutex` command.
+    NoMatch,
+    /// A different event / key is at the cursor — non-deterministic divergence.
+    Diverged {
+        /// What the workflow expected (`MutexGranted(key)`).
+        expected: String,
+        /// What was actually recorded at the cursor.
+        actual: String,
+        /// Index of the diverging event, if representable.
+        event_index: Option<i32>,
+    },
+}
+
 /// Outcome of a *tolerant* deadline-branch clock read (issue #772).
 ///
 /// Used ONLY by `should_continue_as_new`'s internal deadline check
@@ -3838,6 +3870,56 @@ impl HistoryMatcher {
         self.advance_to_next_unconsumed_event();
         HistoryMatch::Matched {
             output: Value::Null,
+        }
+    }
+
+    // ── Durable mutex (issue #691) ───────────────────────────────────────────
+
+    /// Match a durable-mutex acquire against history (issue #691).
+    ///
+    /// Positional (like a marker / [`Self::match_timer_arm`]): expects a
+    /// [`WorkflowEvent::MutexGranted`] with the matching `key` at the current
+    /// cursor, consumes it, and returns [`MutexGrantMatch::Granted`] carrying the
+    /// recorded `lock_seq`/`acquired_at`. Because acquire is a SOLO suspension
+    /// (its `MutexGranted` anchor always lands at a clean resume cursor), no
+    /// forward scan and no other-scan skip-list changes are needed.
+    ///
+    /// Returns [`MutexGrantMatch::NoMatch`] when the cursor is past end (first
+    /// live acquire — the caller suspends on an `AcquireMutex` command) and
+    /// [`MutexGrantMatch::Diverged`] when a different event / key is at the cursor.
+    pub fn match_mutex_granted(&mut self, key: &str) -> MutexGrantMatch {
+        if !self.prepare_match() {
+            return MutexGrantMatch::NoMatch;
+        }
+
+        let WorkflowEvent::MutexGranted {
+            key: recorded_key,
+            lock_seq,
+            acquired_at,
+        } = &self.events[self.cursor]
+        else {
+            return MutexGrantMatch::Diverged {
+                expected: format!("MutexGranted({key})"),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        };
+
+        if recorded_key.as_str() != key {
+            return MutexGrantMatch::Diverged {
+                expected: format!("MutexGranted({key})"),
+                actual: format!("MutexGranted({recorded_key})"),
+                event_index: i32::try_from(self.cursor).ok(),
+            };
+        }
+
+        let lock_seq = *lock_seq;
+        let acquired_at = *acquired_at;
+        self.cursor += 1;
+        self.advance_to_next_unconsumed_event();
+        MutexGrantMatch::Granted {
+            lock_seq,
+            acquired_at,
         }
     }
 
