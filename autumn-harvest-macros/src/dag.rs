@@ -289,6 +289,8 @@ fn emit_workflow_companion(
                     })
                 },
                 execution_timeout: None,
+                // DAGs carry no chain-scoped lifetime cap (issue #617).
+                chain_execution_timeout: None,
                 sla: ::std::option::Option::None,
                 concurrency: ::std::option::Option::None,
                 debounce: ::std::option::Option::None,

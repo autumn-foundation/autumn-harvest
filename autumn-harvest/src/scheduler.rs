@@ -741,6 +741,8 @@ pub async fn tick_once_sharded(
 /// Returns [`HarvestError`] if the DB pool is exhausted or the workflow start
 /// transaction fails.
 #[allow(clippy::too_many_arguments)]
+// Issue #617 added three chain-cap fields to the StartWorkflowParams literal here.
+#[allow(clippy::too_many_lines)]
 pub async fn trigger_unified_dag(
     pool: DbPool,
     dag_name: &str,
@@ -840,6 +842,9 @@ pub async fn trigger_unified_dag(
             conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1672,6 +1677,8 @@ fn merge_schedule_patch(
             .unwrap_or_else(|| u32::try_from(existing.buffer_all_max).unwrap_or(0)),
         // Not persisted on harvest_schedules; nothing to preserve.
         execution_timeout: None,
+        // Not persisted on harvest_schedules; nothing to preserve (issue #617).
+        chain_execution_timeout: None,
         calendar: patch
             .calendar
             .as_ref()
@@ -3384,6 +3391,18 @@ async fn tick_one_workflow_schedule(
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
                     max_execution_timeout_ceiling_secs: None,
+                    // Chain-scoped lifetime cap (issue #617): workflow-type default
+                    // + fleet-wide ceiling (via registry, since the core scheduler
+                    // has no api_state) captured so a throttled scheduled fire keeps
+                    // the cap — parity with the tick's normal start path.
+                    chain_execution_timeout_secs: wf_info
+                        .and_then(|info| info.chain_execution_timeout)
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map(|d| d.num_seconds()),
+                    max_workflow_chain_timeout_ceiling_secs: registry
+                        .max_workflow_chain_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map(|d| d.num_seconds()),
                     max_workflow_input_bytes: Some(effective_cap),
                     trace_context: None,
                     workflow_retry_policy: effective_retry,
@@ -3455,6 +3474,20 @@ async fn tick_one_workflow_schedule(
                 conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
                 max_execution_timeout_ceiling: None,
+                // Chain-scoped lifetime cap (issue #617): carry the workflow-type
+                // default AND the fleet-wide chain ceiling-as-default, so a whole
+                // scheduled continue-as-new chain is capped even when the workflow
+                // under-specifies (AC4). The ceiling reaches the core scheduler via
+                // the `HandlerRegistry` (it has no `api_state`), diverging from the
+                // per-run `execution_timeout` ceiling which is a pure cap, not a
+                // fleet-wide default.
+                chain_execution_timeout: wf_info
+                    .and_then(|info| info.chain_execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                max_workflow_chain_timeout_ceiling: registry
+                    .max_workflow_chain_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+                inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
                 priority: Priority::default(),
@@ -4956,6 +4989,17 @@ async fn drain_buffered_schedule_runs(
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
                         max_execution_timeout_ceiling_secs: None,
+                        // Chain-scoped lifetime cap (issue #617): workflow-type
+                        // default + fleet-wide ceiling (via registry) so a throttled
+                        // buffered-drain fire keeps the cap.
+                        chain_execution_timeout_secs: wf_info
+                            .and_then(|info| info.chain_execution_timeout)
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
+                        max_workflow_chain_timeout_ceiling_secs: registry
+                            .max_workflow_chain_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
                         max_workflow_input_bytes: Some(effective_cap),
                         trace_context: None,
                         workflow_retry_policy: effective_retry,
@@ -5025,6 +5069,20 @@ async fn drain_buffered_schedule_runs(
                     conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
+                    // Chain-scoped lifetime cap (issue #617): carry the
+                    // workflow-type default AND the fleet-wide chain ceiling (via
+                    // the registry, since the core scheduler has no api_state) so a
+                    // BUFFERED continue-as-new chain is capped even when the
+                    // workflow under-specifies (AC4) — IDENTICAL to the tick-direct
+                    // start path above, and consistent with this site's own
+                    // throttled sibling.
+                    chain_execution_timeout: wf_info
+                        .and_then(|info| info.chain_execution_timeout)
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    max_workflow_chain_timeout_ceiling: registry
+                        .max_workflow_chain_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    inherited_chain_deadline_at: None,
                     concurrency_key,
                     concurrency_limit,
                     priority: Priority::default(),

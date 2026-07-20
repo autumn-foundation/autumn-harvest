@@ -168,6 +168,8 @@ async fn seed_run(
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,

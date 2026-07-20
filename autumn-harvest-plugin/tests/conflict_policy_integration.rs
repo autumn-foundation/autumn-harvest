@@ -114,6 +114,7 @@ fn plain_info(name: &'static str) -> WorkflowInfo {
         module: "tests",
         handler: dummy_workflow,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,

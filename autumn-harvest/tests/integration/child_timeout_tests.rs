@@ -45,6 +45,7 @@ fn wf_info(name: &'static str, handler: WfHandler) -> WorkflowInfo {
         module: "child_timeout_tests",
         handler,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,

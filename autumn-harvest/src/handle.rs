@@ -164,6 +164,9 @@ struct WorkflowHandleClientInner {
     query_handlers: Vec<crate::info::QueryHandlerInfo>,
     max_workflow_input_bytes: u64,
     max_workflow_execution_timeout: Option<Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
+    /// default (issue #617). `None` = no chain cap applied fleet-wide.
+    max_workflow_chain_timeout: Option<Duration>,
     max_workflow_start_delay: Duration,
     max_signal_payload_bytes: u64,
     query_timeout: Duration,
@@ -196,6 +199,10 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field(
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
+            )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
             )
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
@@ -258,6 +265,7 @@ impl WorkflowHandleClient {
                 query_handlers: Vec::new(),
                 max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
                 max_workflow_execution_timeout: None,
+                max_workflow_chain_timeout: None,
                 max_workflow_start_delay: crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY,
                 max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
                 query_timeout: Duration::from_secs(5),
@@ -332,6 +340,16 @@ impl WorkflowHandleClient {
     pub fn with_max_workflow_execution_timeout(self, ceiling: Option<Duration>) -> Self {
         let mut inner = (*self.inner).clone();
         inner.max_workflow_execution_timeout = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Add the global chain-scoped lifetime cap ceiling to the client (issue #617).
+    #[must_use]
+    pub fn with_max_workflow_chain_timeout(self, ceiling: Option<Duration>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_chain_timeout = ceiling;
         Self {
             inner: Arc::new(inner),
         }
@@ -419,6 +437,13 @@ impl WorkflowHandleClient {
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
         self.inner.max_workflow_execution_timeout
+    }
+
+    /// Get the chain-scoped lifetime cap ceiling (issue #617). Doubles as the
+    /// fleet-wide chain default.
+    #[must_use]
+    pub fn max_workflow_chain_timeout(&self) -> Option<Duration> {
+        self.inner.max_workflow_chain_timeout
     }
 
     /// Get the maximum allowed workflow start delay.

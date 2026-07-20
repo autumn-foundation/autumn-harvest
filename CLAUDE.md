@@ -779,6 +779,10 @@ See `autumn-harvest/examples/signal_handlers_subscription.rs` for a complete sub
 | `execute_activity_fan_out_collect(info, inputs)` | Collect-all: returns `Ok(Vec<Result<O, String>>)` — per-slot errors |
 | `execute_activity_fan_out_raw(activities)` | Raw fail-fast: `Vec<(String, Value, String)>` input |
 | `execute_activity_fan_out_collect_raw(activities)` | Raw collect-all |
+| `execute_activity_fan_out_windowed(info, inputs, max_in_flight)` | **Bounded** fail-fast: at most `W` in flight at a time |
+| `execute_activity_fan_out_collect_windowed(info, inputs, max_in_flight)` | **Bounded** collect-all: at most `W` in flight at a time |
+| `execute_activity_fan_out_raw_windowed(activities, max_in_flight)` | **Bounded** raw fail-fast |
+| `execute_activity_fan_out_collect_raw_windowed(activities, max_in_flight)` | **Bounded** raw collect-all |
 
 ```rust
 // Typed, homogeneous fan-out — all slots run the same activity
@@ -799,6 +803,13 @@ let results = ctx.execute_activity_fan_out_raw(vec![
     ("send_email".to_string(), json!(addr1), "email-workers".to_string()),
     ("send_sms".to_string(),   json!(phone), "sms-workers".to_string()),
 ]).await.map_err(|e| e.to_string())?;
+
+// Bounded / windowed — process a wide collection at most 50 at a time
+// (the durable, replay-safe equivalent of futures::stream::buffer_unordered):
+let results: Vec<ItemResult> = ctx
+    .execute_activity_fan_out_windowed(&process_item_info(), items, 50)
+    .await
+    .map_err(|e| e.to_string())?;
 ```
 
 **Determinism rule — the input collection MUST be derived from already-recorded state** (workflow input, prior activity outputs, signals).  Never derive the collection from non-deterministic sources such as the system clock, `rand`, or an in-process counter.  If the collection is derived from a prior activity output, that output is in history and is therefore deterministic.
@@ -807,7 +818,21 @@ let results = ctx.execute_activity_fan_out_raw(vec![
 
 **Cancellation**: both methods check `ctx.is_cancelled()` before dispatching and return `HarvestError::Cancelled` if the workflow has been cancelled.
 
-See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all three shapes (static N, dynamic N from a prior activity, and collect-all with partial failure).
+#### Bounded / windowed fan-out (issue #750)
+
+The `_windowed` variants add a `max_in_flight: usize` (`W`) argument to each of the four shapes above. Instead of scheduling **all** `N` inputs at once (which schedules `N` `harvest_task_queue` rows in a single suspension and hammers workers/downstreams), a windowed fan-out schedules the inputs in successive **waves** of at most `W`, so at no point are more than `W` of that call's activities in the scheduled-but-not-completed state. This is the durable, replay-safe equivalent of `futures::stream::buffer_unordered` — one method call replacing the ~30-line manual "loop / slice / call fan-out per chunk / stitch results" idiom.
+
+- **All `N` inputs are still processed**, and results are returned in **input order**, identical to the unbounded shapes (fail-fast returns the first `Err`; collect-all returns per-slot `Vec<Result<O, String>>`).
+- **`W == 0` (or `< 1`) clamps up to 1** — a defined, documented outcome, never a panic, hang, or silent no-op.
+- **`W >= N` produces behavior and recorded history identical to the unbounded path** (a single wave = one `try_join_all` over all `N`).
+- **Replay is window-independent — including across a window CHANGE**: the window governs live dispatch only and is **never** recorded. The recorded events are the *same* `MarkerRecorded { name: "fan_out:{seq}", details: N }` + per-input activity events as the unbounded path (no new `WorkflowEvent` variant, no migration), so a history produced by *any* window replays — and *resumes* — to identical results regardless of the `W` the replaying code is configured with, whether that `W` is **larger or smaller** than the one that produced the recorded partial state. This holds because a windowed call runs in **two phases**: it first *resumes* the already-scheduled input-order prefix as one homogeneous batch (every prefix slot is in history, so each resolves to `Matched` or emits only a `WaitForActivity` — never a `ScheduleActivity`), and only once that prefix is fully resolved does it dispatch the fresh remainder in `W`-sized waves. This is what prevents a mid-flight window *increase* from regrouping an in-flight slot together with never-scheduled fresh slots into a mixed `[WaitForActivity + ScheduleActivity]` suspension batch (which the worker cannot persist). A mismatch between recorded `N` and current-code `N` still surfaces `HarvestError::NonDeterministic`, exactly as the unbounded path does.
+- **Window DECREASE across a partial suspension — resume drains the old width**: work already scheduled under the *old* (larger) window cannot be un-dispatched, so when a fan-out is re-driven under a *smaller* window the resume phase waits on the **entire** already-scheduled prefix (up to the old width) before the smaller window governs any further dispatch. During that resume, peak in-flight can briefly exceed the newly-lowered `W`. This is inherent and correct — the window bounds *new* dispatch, never work already in flight — and introduces no new stampede.
+- **Cancellation is honored at the start of every drive cycle** (before dispatching any further wave), in addition to once up front; a fan-out whose (replay-reconstructed) context is cancelled returns `HarvestError::Cancelled` rather than launching further waves.
+- **Fail-fast backpressure**: on the first activity failure the fail-fast variants abort and **later waves are never dispatched** — a deliberate backpressure semantic, so a bounded fail-fast may process *fewer* items than the unbounded path would (which schedules all `N` up front regardless). Collect-all dispatches every wave (per-slot failures don't short-circuit) so all `N` inputs are always processed.
+- **Trade-off — convoy effect**: this is a chunked-wave scheduler, not a true sliding window. A wave does not refill until *every* activity in it completes, so one slow activity in a wave stalls that wave's remaining slots until it finishes (throughput is bounded by the slowest activity per wave, not per slot). For most fan-outs of similar-cost activities this is a non-issue; for highly heterogeneous latencies a smaller `W` or a true streaming primitive would keep more slots busy.
+- The two `try_join_all` known limitations of the unbounded fan-out (documented in the fan-out sections above) carry over **per-wave** — narrowed to a single wave's width, not widened.
+
+See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all shapes (static N, dynamic N from a prior activity, collect-all with partial failure, and a windowed fan-out over a collection larger than the window).
 
 ### External Workflow Family — signal / cancel / await
 

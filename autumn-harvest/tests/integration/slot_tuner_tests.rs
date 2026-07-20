@@ -115,6 +115,7 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
             module: "slot_tuner_tests",
             handler: slow_activity_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -216,6 +217,9 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),

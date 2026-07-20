@@ -337,6 +337,8 @@ pub fn canary_workflow_info(workflow_name: String, per_probe_timeout: Duration) 
         module: "autumn_harvest_plugin::canary",
         handler: canary_workflow_handler,
         execution_timeout: Some(per_probe_timeout),
+        // Synthetic liveness canary carries no chain-scoped cap (issue #617).
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,

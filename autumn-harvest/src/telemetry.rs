@@ -339,6 +339,17 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented when a workflow execution is terminated because its
+/// chain-scoped lifetime cap (`chain_deadline_at`) elapsed (issue #617).
+///
+/// Distinct from [`METRIC_WORKFLOW_TIMEOUT`]: the chain cap is anchored at the
+/// first run's start and carried verbatim across every continue-as-new, so this
+/// counter fires when a whole CAN chain (not a single run) has run too long.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_CHAIN_TIMEOUT: &str = "harvest.workflow.chain_timeout";
+
 /// Counter: incremented each time a workflow-task dispatch is abandoned because
 /// it did not complete or suspend within `WorkerConfig::workflow_task_timeout`
 /// (issue #494).
@@ -2018,6 +2029,17 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A workflow execution was terminated because its chain-scoped lifetime cap
+    /// (`chain_deadline_at`) elapsed (issue #617). Distinct from
+    /// [`Self::record_workflow_timeout`]: the chain cap spans a whole
+    /// continue-as-new chain, not a single run.
+    ///
+    /// Maps to the counter `harvest.workflow.chain_timeout{workflow, queue}`.
+    /// Additive, non-breaking default no-op.
+    fn record_workflow_chain_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
     /// A workflow-task dispatch was abandoned because it did not complete or
     /// suspend within `WorkerConfig::workflow_task_timeout` (issue #494).
     ///
@@ -2719,6 +2741,10 @@ mod tests {
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
+        assert_eq!(
+            METRIC_WORKFLOW_CHAIN_TIMEOUT,
+            "harvest.workflow.chain_timeout"
+        );
         assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
         assert_eq!(
             METRIC_WORKFLOW_NON_DETERMINISM,

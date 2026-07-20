@@ -308,6 +308,8 @@ metric is emitted in the source code.
 |--------|-----------|-----------|
 | `harvest.workflow.started` | Counter | `worker.rs` — `process_workflow_task`, on first live invocation |
 | `harvest.workflow.duration` | Histogram | `worker.rs` — `process_workflow_task`, on executor cycle completion |
+| `harvest.workflow.timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's per-run `deadline_at` (issue #243) elapses. Labels: `workflow`, `queue` |
+| `harvest.workflow.chain_timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's chain-scoped `chain_deadline_at` (issue #617) elapses. The chain cap is anchored at the first run's start and carried verbatim across every continue-as-new, so this counter — distinct from `harvest.workflow.timeout` — fires when a whole continue-as-new chain (not a single run) outlives its lifetime cap. Labels: `workflow`, `queue`. Both a chain and a run timeout still emit `harvest.workflow.terminal{outcome="timed_out"}`; the chain-vs-run distinction lives only in these two counters |
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
