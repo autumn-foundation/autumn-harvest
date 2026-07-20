@@ -590,38 +590,39 @@ impl WorkflowSimulator {
                 // `MutexGranted` with a monotonic `lock_seq` (count of prior
                 // grants + 1) and the run's `WorkflowStarted` clock. Release is
                 // event-less bookkeeping (no progress).
-                WorkflowCommand::AcquireMutex { key, .. } => {
-                    if !self.mutex_contended.contains(&key) {
-                        let lock_seq = i64::try_from(
-                            history
-                                .iter()
-                                .filter(|e| matches!(e, WorkflowEvent::MutexGranted { .. }))
-                                .count(),
-                        )
-                        .unwrap_or(i64::MAX)
-                        .saturating_add(1);
-                        // Deterministic clock: the run's `WorkflowStarted`
-                        // timestamp (history[0]). Only the key/`lock_seq` gate
-                        // replay matching; `acquired_at` is carried, not compared.
-                        let acquired_at = history
+                WorkflowCommand::AcquireMutex { key, .. }
+                    if !self.mutex_contended.contains(&key) =>
+                {
+                    let lock_seq = i64::try_from(
+                        history
                             .iter()
-                            .find_map(|e| match e {
-                                WorkflowEvent::WorkflowStarted { timestamp, .. } => {
-                                    Some(*timestamp)
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or_else(chrono::Utc::now);
-                        history.push(WorkflowEvent::MutexGranted {
-                            key,
-                            lock_seq,
-                            acquired_at,
-                        });
-                        advanced = true;
-                    }
+                            .filter(|e| matches!(e, WorkflowEvent::MutexGranted { .. }))
+                            .count(),
+                    )
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1);
+                    // Deterministic clock: the run's `WorkflowStarted`
+                    // timestamp (history[0]). Only the key/`lock_seq` gate
+                    // replay matching; `acquired_at` is carried, not compared.
+                    let acquired_at = history
+                        .iter()
+                        .find_map(|e| match e {
+                            WorkflowEvent::WorkflowStarted { timestamp, .. } => Some(*timestamp),
+                            _ => None,
+                        })
+                        .unwrap_or_else(chrono::Utc::now);
+                    history.push(WorkflowEvent::MutexGranted {
+                        key,
+                        lock_seq,
+                        acquired_at,
+                    });
+                    advanced = true;
                 }
-                WorkflowCommand::ReleaseMutex { .. } => {}
                 _ => {
+                    // `ReleaseMutex` (issue #691) is an event-less no-op here —
+                    // the harness has no lock table, so nothing is recorded and
+                    // no progress is made; it falls into this arm.
+                    //
                     // `WaitForSignal` is a no-op here: signals are ingested into
                     // history at task-prep (see the pre-dispatch drain in `run`,
                     // issue #775 Codex P2, mirroring production's

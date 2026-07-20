@@ -4882,6 +4882,7 @@ async fn process_mutex_releases_from_commands(
 ///   next cycle replays and `match_mutex_granted` resolves the grant inline.
 /// - `Enqueued` → park capturing `had_wake_requested`; post-commit self-wake if a
 ///   racing releaser's wake was captured OR the caller is now grantable-head.
+#[allow(clippy::too_many_lines)]
 async fn persist_mutex_acquire_park(
     conn: &mut AsyncPgConnection,
     detached_spawns: DetachedSpawnPersistence<'_>,
@@ -4891,6 +4892,16 @@ async fn persist_mutex_acquire_park(
     commands: &[WorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
+    enum MutexParkOutcome {
+        Granted {
+            wait_secs: Option<f64>,
+            depth: Option<u64>,
+        },
+        Enqueued {
+            had_wake_requested: bool,
+        },
+    }
+
     let registry = detached_spawns.registry;
     let metrics = registry.telemetry().metrics.clone();
     let workflow_name = detached_spawns.parent_execution.workflow_name.clone();
@@ -4915,16 +4926,6 @@ async fn persist_mutex_acquire_park(
 
     let ttl = crate::mutex::effective_mutex_lease_ttl();
     let metrics_enabled = metrics.is_enabled();
-
-    enum MutexParkOutcome {
-        Granted {
-            wait_secs: Option<f64>,
-            depth: Option<u64>,
-        },
-        Enqueued {
-            had_wake_requested: bool,
-        },
-    }
 
     let (deferred, park_outcome) = conn
         .transaction::<(

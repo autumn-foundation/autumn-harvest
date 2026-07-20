@@ -33,10 +33,13 @@ use std::time::Duration;
 use autumn_harvest::context::{ActivityContext, SharedState, WorkflowContext};
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::reset::{
-    WorkflowResetError, WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
+    ResetSignalReapplyPolicy, WorkflowResetError, WorkflowResetRequest, preview_workflow_reset,
+    reset_workflow_execution,
 };
 use autumn_harvest::telemetry::NoOpMetrics;
-use autumn_harvest::types::{ExecutionId, WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
+use autumn_harvest::types::{
+    ExecutionId, Priority, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{StartSource, StartWorkflowParams, start_or_load_workflow_execution};
 use diesel_async::SimpleAsyncConnection;
@@ -375,10 +378,10 @@ fn with_db_name(url: &str, db: &str) -> String {
         None => (url, None),
     };
     let prefix = base.rsplit_once('/').map_or(base, |(p, _)| p);
-    match query {
-        Some(q) => format!("{prefix}/{db}?{q}"),
-        None => format!("{prefix}/{db}"),
-    }
+    query.map_or_else(
+        || format!("{prefix}/{db}"),
+        |q| format!("{prefix}/{db}?{q}"),
+    )
 }
 
 /// Create an isolated, migrated database and return its URL.
@@ -541,9 +544,10 @@ where
         if f().await {
             return;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("poll_until timed out after {timeout:?}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "poll_until timed out after {timeout:?}"
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
 }
@@ -555,11 +559,10 @@ async fn wait_for_state(url: &str, exec_id: ExecutionId, target: &str, timeout: 
         if s == target {
             return;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "execution {exec_id} did not reach {target} (last state {s}) within {timeout:?}"
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "execution {exec_id} did not reach {target} (last state {s}) within {timeout:?}"
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
 }
@@ -589,7 +592,7 @@ async fn start(url: &str, workflow_name: &str, workflow_id: &str, input: Value) 
             max_execution_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
-            priority: Default::default(),
+            priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -1336,7 +1339,7 @@ async fn reset_rejected_while_holder_holds_mutex() {
             reset_point: None,
             reason: "test reset".into(),
             operator_id: "op".into(),
-            signal_reapply: Default::default(),
+            signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
         },
     )
@@ -1388,7 +1391,7 @@ async fn reset_after_release_succeeds() {
                 reset_point: None,
                 reason: "preview".into(),
                 operator_id: "op".into(),
-                signal_reapply: Default::default(),
+                signal_reapply: ResetSignalReapplyPolicy::default(),
                 allow_terminal_source: false,
             },
         )
@@ -1409,7 +1412,7 @@ async fn reset_after_release_succeeds() {
             reset_point: None,
             reason: "reset after release".into(),
             operator_id: "op".into(),
-            signal_reapply: Default::default(),
+            signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
         },
         None,

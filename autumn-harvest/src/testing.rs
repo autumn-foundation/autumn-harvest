@@ -4237,6 +4237,10 @@ impl WorkflowTestEnv {
             // harness — appends no event, changes no history, drives no wait.
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::ScheduleExternalActivity { .. }
+            // Release is EVENT-LESS bookkeeping (mirrors `SetCurrentDetails`,
+            // issue #691): the worker frees the lock in production, but the
+            // harness has no lock table, so nothing is recorded. No progress.
+            | WorkflowCommand::ReleaseMutex { .. }
             | WorkflowCommand::Complete { .. }
             | WorkflowCommand::Fail { .. }
             | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
@@ -4270,10 +4274,6 @@ impl WorkflowTestEnv {
                 });
                 Ok(true)
             }
-            // Release is EVENT-LESS bookkeeping (mirrors `SetCurrentDetails`):
-            // the worker frees the lock in production, but the harness has no
-            // lock table, so nothing is recorded. No progress.
-            WorkflowCommand::ReleaseMutex { .. } => Ok(false),
         }
     }
 

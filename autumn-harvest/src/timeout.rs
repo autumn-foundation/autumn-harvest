@@ -2532,7 +2532,7 @@ pub async fn enforce_external_awaits_outbox(
 /// # Errors
 ///
 /// Returns the first database or persistence error encountered.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),

@@ -748,7 +748,7 @@ impl HarvestError {
     /// [`MutexSelfDeadlock`](HarvestError::MutexSelfDeadlock) — a workflow
     /// re-acquiring a durable mutex key it already holds (issue #691).
     #[must_use]
-    pub fn is_mutex_self_deadlock(&self) -> bool {
+    pub const fn is_mutex_self_deadlock(&self) -> bool {
         matches!(self, Self::MutexSelfDeadlock { .. })
     }
 

@@ -140,7 +140,9 @@ pub struct MutexWakeTarget {
 
 // ── SQL statement helpers (each shape-tested; advisory-first callers) ────────
 
-/// Advisory-first serialization lock. `$1` = `lock_key`. `hashtext` is 32-bit
+/// Advisory-first serialization lock.
+///
+/// `$1` = `lock_key`. `hashtext` is 32-bit
 /// (rare, harmless cross-key collisions — see the module docs); the cast to
 /// `int8` matches `pg_advisory_xact_lock`'s `bigint` argument.
 #[must_use]
@@ -148,7 +150,9 @@ pub const fn advisory_lock_stmt() -> &'static str {
     "SELECT pg_advisory_xact_lock(hashtext($1)::int8)"
 }
 
-/// Append a FIFO waiter idempotently. `$1` = `lock_key`, `$2` = `waiter_exec_id`.
+/// Append a FIFO waiter idempotently.
+///
+/// `$1` = `lock_key`, `$2` = `waiter_exec_id`.
 /// `ON CONFLICT DO NOTHING` preserves the original BIGSERIAL `id` (and thus FIFO
 /// position) across re-parks.
 #[must_use]
@@ -159,7 +163,9 @@ pub const fn enqueue_waiter_stmt() -> &'static str {
 }
 
 /// Grant the lock to `$2` **iff** it is the head of line and the key is free (or
-/// its lease has expired). `$1` = `lock_key`, `$2` = `holder_exec_id`, `$3` =
+/// its lease has expired).
+///
+/// `$1` = `lock_key`, `$2` = `holder_exec_id`, `$3` =
 /// lease TTL seconds (double). Mints the next `lock_seq`, `RETURNING` it on
 /// success; no row on failure.
 ///
@@ -184,8 +190,9 @@ pub const fn grant_lock_stmt() -> &'static str {
 }
 
 /// Read-only "would a grant to `$2` succeed right now?" check: `$2` is the head
-/// of line AND the key is either free or its lease has expired. `$1` =
-/// `lock_key`, `$2` = `waiter_exec_id`. Returns one `grantable` bool row.
+/// of line AND the key is either free or its lease has expired.
+///
+/// `$1` = `lock_key`, `$2` = `waiter_exec_id`. Returns one `grantable` bool row.
 #[must_use]
 pub const fn is_grantable_head_stmt() -> &'static str {
     "SELECT NOT EXISTS ( \
@@ -205,8 +212,9 @@ pub const fn head_of_line_stmt() -> &'static str {
     "SELECT waiter_exec_id FROM harvest_mutex_waiters WHERE lock_key = $1 ORDER BY id ASC LIMIT 1"
 }
 
-/// Fenced release: delete the lock row only if `$2`/`$3` still own it. `$1` =
-/// `lock_key`, `$2` = `holder_exec_id`, `$3` = `lock_seq`. `RETURNING acquired_at`
+/// Fenced release: delete the lock row only if `$2`/`$3` still own it.
+///
+/// `$1` = `lock_key`, `$2` = `holder_exec_id`, `$3` = `lock_seq`. `RETURNING acquired_at`
 /// (for the held-duration metric) — no row when fenced out.
 #[must_use]
 pub const fn release_lock_stmt() -> &'static str {
@@ -257,8 +265,9 @@ pub const fn expired_leases_stmt() -> &'static str {
 }
 
 /// Fenced reclaim: under the advisory lock, delete the lock row only if the
-/// lease is *still* expired and the holder is *still* not `PAUSED`. `$1` =
-/// `lock_key`. `RETURNING holder_exec_id` (the reclaimed holder) — no row if a
+/// lease is *still* expired and the holder is *still* not `PAUSED`.
+///
+/// `$1` = `lock_key`. `RETURNING holder_exec_id` (the reclaimed holder) — no row if a
 /// renewal/resume won the race.
 #[must_use]
 pub const fn reclaim_expired_lock_stmt() -> &'static str {
@@ -287,7 +296,9 @@ pub const fn holder_holds_any_stmt() -> &'static str {
     "SELECT lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 ORDER BY lock_key LIMIT 1"
 }
 
-/// Best-effort grant metrics for `$2` (`waiter_exec_id`) on key `$1`: the
+/// Best-effort grant metrics for `$2` (`waiter_exec_id`) on key `$1`.
+///
+/// Reads the
 /// waiter's `requested_at` (for the wait-duration histogram) and the current
 /// total waiter-queue depth for the key (for the contention gauge). The waiter
 /// row still exists at grant time — [`grant_lock_stmt`] does not delete it, only
@@ -369,10 +380,15 @@ mod db_ops {
     }
 
     /// Whether the `harvest_mutex_locks` table exists on this connection's
-    /// database. Per-call (no caching) — a cached answer is unsound under a
+    /// database.
+    ///
+    /// Per-call (no caching) — a cached answer is unsound under a
     /// staggered multi-shard migration, matching `debounce`/`throttle`/
     /// `start_idempotency`. Cross-suite mutex-table access is guarded by this so
     /// a fresh schema lacking the migration no-ops instead of erroring.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if the database query fails.
     pub async fn table_present(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
         let exists: TableExists =
             diesel::sql_query("SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present")
@@ -408,9 +424,14 @@ mod db_ops {
     }
 
     /// Acquire attempt: advisory-first, enqueue the waiter idempotently, then try
-    /// to grant to the head of line. **Not** `table_present`-guarded — this runs
+    /// to grant to the head of line.
+    ///
+    /// **Not** `table_present`-guarded — this runs
     /// only on the acquire path, which is active exactly when the feature is.
     /// Caller must hold the enclosing park transaction.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if a database query fails.
     pub async fn try_grant_or_enqueue(
         conn: &mut AsyncPgConnection,
         key: &str,
@@ -435,19 +456,23 @@ mod db_ops {
             .optional()
             .map_err(database_error)?;
 
-        Ok(match granted {
-            Some(g) => MutexGrantOutcome::Granted {
+        Ok(granted.map_or(MutexGrantOutcome::Enqueued, |g| {
+            MutexGrantOutcome::Granted {
                 lock_seq: g.lock_seq,
-            },
-            None => MutexGrantOutcome::Enqueued,
-        })
+            }
+        }))
     }
 
     /// Best-effort read of the waiter's `requested_at` and the key's current
-    /// waiter-queue depth at grant time, for the `harvest.mutex.wait_duration`
+    /// waiter-queue depth at grant time.
+    ///
+    /// Feeds the `harvest.mutex.wait_duration`
     /// and `harvest.mutex.contention_depth` metrics. Returns `None` if the
     /// waiter row is gone (shouldn't happen at grant time). **Not**
     /// `table_present`-guarded — called only on the acquire/grant path.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if the database query fails.
     pub async fn waiter_wait_metrics(
         conn: &mut AsyncPgConnection,
         key: &str,
@@ -465,6 +490,9 @@ mod db_ops {
 
     /// Would a grant to `exec_id` on `key` succeed right now? (Post-park
     /// self-wake re-check for the enqueued path.)
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if the database query fails.
     pub async fn is_grantable_head(
         conn: &mut AsyncPgConnection,
         key: &str,
@@ -479,9 +507,14 @@ mod db_ops {
         Ok(row.grantable)
     }
 
-    /// Fenced release of a single lock, then wake the new head of line. Returns
+    /// Fenced release of a single lock, then wake the new head of line.
+    ///
+    /// Returns
     /// the released lock's `acquired_at` (`Some`) — or `None` if the fence
     /// rejected it (a reclaimed-then-resumed stale holder, harmless no-op).
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if a database query fails.
     pub async fn release_lock(
         conn: &mut AsyncPgConnection,
         key: &str,
@@ -518,8 +551,13 @@ mod db_ops {
     }
 
     /// Release every lock `holder` currently holds and wake each freed key's new
-    /// head of line. Guarded (no-op if the table is absent). Advisory-first
+    /// head of line.
+    ///
+    /// Guarded (no-op if the table is absent). Advisory-first
     /// per key; keys are selected unlocked, then each is locked and freed.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if a database query fails.
     pub async fn release_all_locks_for_holder(
         conn: &mut AsyncPgConnection,
         holder: ExecutionId,
@@ -564,8 +602,13 @@ mod db_ops {
     }
 
     /// Remove every waiter row for `exec_id` across all keys and wake each key's
-    /// new head of line. Guarded. A spurious wake (the exec wasn't actually the
+    /// new head of line.
+    ///
+    /// Guarded. A spurious wake (the exec wasn't actually the
     /// head) is safe — the woken task simply re-parks.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if a database query fails.
     pub async fn delete_waiters_for_holder(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -599,10 +642,15 @@ mod db_ops {
     }
 
     /// Reclaim expired-lease locks (crash recovery) and wake each freed key's new
-    /// head of line. Guarded. Candidates are selected unlocked; each is then
+    /// head of line.
+    ///
+    /// Guarded. Candidates are selected unlocked; each is then
     /// locked (advisory-first) and re-checked under the fenced reclaim statement
     /// so a renewal/resume that won the race is skipped. Returns the number of
     /// locks actually reclaimed.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if a database query fails.
     pub async fn reclaim_expired_leases_and_wake(
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<usize> {
@@ -647,6 +695,9 @@ mod db_ops {
 
     /// Renew every lease `holder` holds forward by `ttl`. Guarded. No advisory
     /// lock (single-lock-type UPDATE, no ABBA).
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if the database query fails.
     pub async fn renew_leases_for_holder(
         conn: &mut AsyncPgConnection,
         holder: ExecutionId,
@@ -665,8 +716,13 @@ mod db_ops {
     }
 
     /// Terminal auto-release: free every lock `exec_id` held and drop every
-    /// waiter row it owns, waking new heads of line. Guarded. Folded into the
+    /// waiter row it owns, waking new heads of line.
+    ///
+    /// Guarded. Folded into the
     /// terminal-transition chokepoint in a later milestone.
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if a database query fails.
     pub async fn sweep_terminal_holder_and_wake(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -681,6 +737,9 @@ mod db_ops {
 
     /// Any lock key `exec_id` currently holds (for the reset-reject check), or
     /// `None`. Guarded — a missing table means "holds nothing".
+    ///
+    /// # Errors
+    /// Returns `HarvestError` if the database query fails.
     pub async fn holder_holds_any_mutex(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
