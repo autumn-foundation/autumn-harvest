@@ -947,6 +947,14 @@ async fn fire_claimed_throttle_row(
     let max_execution_timeout_ceiling = opts
         .max_execution_timeout_ceiling_secs
         .and_then(chrono::Duration::try_seconds);
+    // Chain-scoped lifetime cap captured at admission (issue #617), so a throttled
+    // start of a chain-capped workflow does not silently drop the declared cap.
+    let chain_execution_timeout = opts
+        .chain_execution_timeout_secs
+        .and_then(chrono::Duration::try_seconds);
+    let max_workflow_chain_timeout_ceiling = opts
+        .max_workflow_chain_timeout_ceiling_secs
+        .and_then(chrono::Duration::try_seconds);
     let priority = opts
         .priority
         .and_then(crate::types::Priority::from_i32)
@@ -1004,6 +1012,9 @@ async fn fire_claimed_throttle_row(
         conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
+        chain_execution_timeout,
+        max_workflow_chain_timeout_ceiling,
+        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         priority,

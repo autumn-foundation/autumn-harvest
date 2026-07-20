@@ -3783,3 +3783,57 @@ async fn test_mutex_self_deadlock_in_test_env() {
          self-deadlocking second acquire fails synchronously before emitting one"
     );
 }
+
+// ─────────────── Bounded / windowed activity fan-out (issue #750) ─────────────
+
+/// Windowed fan-out over 10 items with window 3, driven to completion by the
+/// harness. Every input is processed, results are in input order, and all 10
+/// activity events are recorded in order.
+fn windowed_env_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activities: Vec<_> = (0..10)
+            .map(|i| ("double".to_string(), json!(i), "default".to_string()))
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw_windowed(activities, 3)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "results": results }))
+    })
+}
+
+#[tokio::test]
+async fn windowed_fan_out_drives_to_completion() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("double", |v| Ok(json!(v.as_u64().unwrap() * 2)))
+        .run(windowed_env_workflow, json!(null))
+        .await;
+
+    let expected: Vec<Value> = (0..10u64).map(|i| json!(i * 2)).collect();
+    assert_eq!(outcome.result, Ok(json!({ "results": expected })));
+
+    let events = outcome.events();
+    let scheduled: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::ActivityScheduled { name, input, .. } if name == "double" => {
+                input.as_u64()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        scheduled,
+        (0..10u64).collect::<Vec<_>>(),
+        "all 10 activities scheduled in input order"
+    );
+    let completed = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .count();
+    assert_eq!(completed, 10, "all 10 activities completed");
+}
+}

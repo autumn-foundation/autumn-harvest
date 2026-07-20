@@ -339,6 +339,17 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented when a workflow execution is terminated because its
+/// chain-scoped lifetime cap (`chain_deadline_at`) elapsed (issue #617).
+///
+/// Distinct from [`METRIC_WORKFLOW_TIMEOUT`]: the chain cap is anchored at the
+/// first run's start and carried verbatim across every continue-as-new, so this
+/// counter fires when a whole CAN chain (not a single run) has run too long.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_CHAIN_TIMEOUT: &str = "harvest.workflow.chain_timeout";
+
 /// Counter: incremented each time a workflow-task dispatch is abandoned because
 /// it did not complete or suspend within `WorkerConfig::workflow_task_timeout`
 /// (issue #494).
@@ -706,6 +717,27 @@ pub const METRIC_SCHEDULE_OVERDUE: &str = "harvest.schedule.overdue";
 /// can nudge the author or enable `max_workflow_history_events`.
 pub const METRIC_WORKFLOW_HISTORY_OVERSIZED: &str = "harvest.workflow.history_oversized";
 
+/// Gauge: count of currently-*active* workflow executions, grouped by workflow
+/// type and lifecycle state (issue #770).
+///
+/// Labels:
+/// - `workflow` (= [`METRIC_LABEL_WORKFLOW`]): the workflow type name
+///   (bounded — one per registered `#[workflow]`).
+/// - `state` (= [`METRIC_LABEL_STATE`]): the active lifecycle state, one of
+///   exactly two bounded values — `"running"` or `"paused"` (issue #383).
+///
+/// `execution.id` MUST NOT appear here (ADR-0001 §7 cardinality rule); total
+/// series cardinality is bounded by `workflow_types × 2`.
+///
+/// Sourced from a shard-local `COUNT(*) … GROUP BY (workflow_name, state)
+/// WHERE state IN ('RUNNING','PAUSED')` and summed across every shard of the
+/// worker's `ShardedDbPool`. Sampled on the same cadence as
+/// `harvest.queue.depth`. A non-zero value is the live in-progress population;
+/// a steady rise while `harvest.workflow.terminal` stays flat signals a leak
+/// or backlog. `nd_blocked` runs stay `RUNNING` (issue #603) and so count
+/// under `state="running"`; there is no separate state for them.
+pub const METRIC_WORKFLOW_ACTIVE: &str = "harvest.workflow.active";
+
 /// Counter: incremented on every request that reaches an inbound webhook
 /// receiver route, regardless of outcome (issue #344).
 ///
@@ -1002,6 +1034,9 @@ pub const METRIC_LABEL_ACTIVITY_NAME: &str = "activity.name";
 pub const METRIC_LABEL_QUEUE: &str = "queue";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
+/// Metric label: active workflow lifecycle state (issue #770) — one of the
+/// bounded values `"running"` / `"paused"`.
+pub const METRIC_LABEL_STATE: &str = "state";
 /// Metric label: low-cardinality error class on failed activity records.
 pub const METRIC_LABEL_ERROR_TYPE: &str = "error.type";
 /// Metric label: whether a failure was flagged non-retryable.
@@ -1600,6 +1635,21 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, count);
     }
 
+    /// The current count of active workflow executions of type `workflow` in
+    /// lifecycle `state` (issue #770).
+    ///
+    /// `state` is always one of the two bounded values `"running"` /
+    /// `"paused"`. Callers emit one call per distinct `(workflow, state)` pair
+    /// per sampler tick and a `count` of `0` for pairs that were present last
+    /// tick but have since drained, so the gauge resets cleanly rather than
+    /// going stale.
+    ///
+    /// Maps to [`METRIC_WORKFLOW_ACTIVE`]. Per ADR-0001 §7, `execution.id` must
+    /// never be a label here.
+    fn record_workflow_active(&self, workflow: &str, state: &str, count: u64) {
+        let _ = (workflow, state, count);
+    }
+
     /// An activity invocation finished.
     fn record_activity_completed(
         &self,
@@ -1999,6 +2049,17 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.workflow.timeout{workflow, queue}`.
     fn record_workflow_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow execution was terminated because its chain-scoped lifetime cap
+    /// (`chain_deadline_at`) elapsed (issue #617). Distinct from
+    /// [`Self::record_workflow_timeout`]: the chain cap spans a whole
+    /// continue-as-new chain, not a single run.
+    ///
+    /// Maps to the counter `harvest.workflow.chain_timeout{workflow, queue}`.
+    /// Additive, non-breaking default no-op.
+    fn record_workflow_chain_timeout(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
 
@@ -2733,6 +2794,10 @@ mod tests {
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
+        assert_eq!(
+            METRIC_WORKFLOW_CHAIN_TIMEOUT,
+            "harvest.workflow.chain_timeout"
+        );
         assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
         assert_eq!(
             METRIC_WORKFLOW_NON_DETERMINISM,
@@ -3732,6 +3797,23 @@ mod tests {
             METRIC_SAGA_COMPENSATION_FAILED,
             "harvest.saga.compensation_failed"
         );
+    }
+
+    #[test]
+    fn workflow_active_metric_and_label_constant_names() {
+        // Issue #770 — the gauge name and the `state` label constant.
+        assert_eq!(METRIC_WORKFLOW_ACTIVE, "harvest.workflow.active");
+        assert_eq!(METRIC_LABEL_STATE, "state");
+    }
+
+    #[test]
+    fn record_workflow_active_has_noop_default() {
+        // MetricsRecorder::record_workflow_active must exist with a no-op
+        // default body (`state` as `&str`) so existing MetricsRecorder impls
+        // compile unchanged. Must not panic.
+        let rec = NoOpMetrics;
+        rec.record_workflow_active("checkout", "running", 3);
+        rec.record_workflow_active("checkout", "paused", 0);
     }
 
     #[test]

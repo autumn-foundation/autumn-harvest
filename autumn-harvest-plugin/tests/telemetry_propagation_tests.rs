@@ -128,6 +128,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -233,6 +234,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 

@@ -243,6 +243,8 @@ mod db_handle_surface {
                 assigned_build_id: None,
                 execution_timeout: None,
                 deadline_at: None,
+                chain_execution_timeout: None,
+                chain_deadline_at: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,

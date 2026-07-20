@@ -16,9 +16,9 @@ use autumn_harvest::telemetry::{
     METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
     METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED,
     METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED,
-    METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
+    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +131,17 @@ impl MetricsRecorder for RecordingMetrics {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_DLQ_ENTRIES,
             labels: vec![("shard", shard.to_string()), ("depth", depth.to_string())],
+        });
+    }
+
+    fn record_workflow_active(&self, workflow: &str, state: &str, count: u64) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_WORKFLOW_ACTIVE,
+            labels: vec![
+                ("workflow", workflow.to_owned()),
+                ("state", state.to_owned()),
+                ("count", count.to_string()),
+            ],
         });
     }
 
@@ -441,6 +452,7 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_timer_started(10.0);
     rec.record_queue_depth("default", 0);
     rec.record_dlq_entries(0, 0);
+    rec.record_workflow_active("wf", "running", 0);
     rec.record_schedule_run("dag", "my_dag");
     rec.record_schedule_skipped("dag", "my_dag", "max_active_runs_reached");
     rec.record_schedule_decision_write_failed();

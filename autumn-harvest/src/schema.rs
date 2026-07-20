@@ -29,6 +29,17 @@ diesel::table! {
         /// Absolute UTC deadline for execution-level timeout (issue #243).
         /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
         deadline_at -> Nullable<Timestamptz>,
+        /// Chain-scoped lifetime cap DURATION (issue #617). Distinct from the
+        /// per-run `execution_timeout`: mirrors it in shape but is anchored at the
+        /// first run's start and carried verbatim across every continue-as-new.
+        /// NULL = no chain cap configured (legacy behaviour).
+        chain_execution_timeout -> Nullable<Interval>,
+        /// Absolute UTC chain deadline (issue #617). Computed at the chain-origin
+        /// start as `started_at + chain_execution_timeout` and copied VERBATIM
+        /// into every continue-as-new successor (never recomputed as now + cap),
+        /// so a runaway loop cannot escape the cap by continuing-as-new.
+        /// NULL = no chain cap. Not shifted by pause/resume (absolute wall-clock).
+        chain_deadline_at -> Nullable<Timestamptz>,
         memo -> Nullable<Jsonb>,
         search_attrs -> Nullable<Jsonb>,
         created_at -> Timestamptz,

@@ -1292,6 +1292,17 @@ async fn insert_fork_execution(
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
     // Re-anchor the soft SLA deadline per-fork (issue #487).
     let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
+    // Reset deliberately starts a NEW chain origin (issue #617), consistent with
+    // `first_exec_id: None` / `schedule_id: None` below — an operator reset breaks
+    // the continue-as-new lineage (mirroring the #488 lineage-break precedent), so
+    // the chain deadline is RE-ANCHORED to the fork's own start rather than carried
+    // verbatim. A source with no chain cap yields `None` for both.
+    // `checked_add_signed` (not `+`) — an absurd operator ceiling can make the
+    // source's `chain_execution_timeout` reach `chrono::Duration::MAX`, and
+    // `DateTime + Duration` panics on overflow; yield `None` instead (issue #617).
+    let chain_deadline_at = source
+        .chain_execution_timeout
+        .and_then(|d| chrono::Utc::now().checked_add_signed(d));
     // Provenance ref for a reset fork is the source execution id (#740).
     let source_exec_id_str = source.id.to_string();
     // Strip the six replay-non-determinism diagnostic keys unconditionally
@@ -1313,6 +1324,9 @@ async fn insert_fork_execution(
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
+        // Re-anchored fresh chain origin (issue #617) — see comment above.
+        chain_execution_timeout: source.chain_execution_timeout,
+        chain_deadline_at,
         id: new_exec_id.as_uuid(),
         workflow_name: &source.workflow_name,
         workflow_id: &source.workflow_id,
@@ -1587,6 +1601,8 @@ mod tests {
             completed_at: None,
             execution_timeout: None,
             deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
             memo: None,
             search_attrs: None,
             created_at: Utc::now(),

@@ -451,6 +451,17 @@ pub struct HandlerRegistry {
     /// ceiling. Applied to scheduler-fired starts so automated fires respect
     /// the same operator-configured cap as API/manual starts.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// Server-side ceiling on the chain-scoped lifetime cap, doubling as a
+    /// fleet-wide chain default (issue #617). Threaded here (rather than resolved
+    /// per-request from `api_state` like the HTTP paths) so the scheduler tick —
+    /// a core-crate component with no `api_state` — can apply the fleet-wide chain
+    /// default to scheduled runs. `None` = no chain cap applied fleet-wide.
+    ///
+    /// This deliberately diverges from the per-run `execution_timeout` ceiling,
+    /// which is NOT threaded into the scheduler: the chain ceiling is a fleet-wide
+    /// DEFAULT (must reach every start, AC4), whereas the per-run ceiling only
+    /// caps a specified value.
+    pub max_workflow_chain_timeout: Option<std::time::Duration>,
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
@@ -619,6 +630,7 @@ impl HandlerRegistry {
                 circuit_policies,
             )),
             max_workflow_attempts_ceiling: None,
+            max_workflow_chain_timeout: None,
             payload_offloader: None,
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
@@ -703,6 +715,19 @@ impl HandlerRegistry {
         {
             *lock = ceiling;
         }
+        self
+    }
+
+    /// Set the server-side ceiling on the chain-scoped lifetime cap / fleet-wide
+    /// chain default (issue #617). Applied to scheduler-fired starts so a whole
+    /// scheduled continue-as-new chain is capped even when a workflow
+    /// under-specifies (AC4).
+    #[must_use]
+    pub const fn with_max_workflow_chain_timeout(
+        mut self,
+        ceiling: Option<std::time::Duration>,
+    ) -> Self {
+        self.max_workflow_chain_timeout = ceiling;
         self
     }
 
@@ -913,6 +938,10 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
+            )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
             .field(
@@ -4010,6 +4039,13 @@ async fn persist_workflow_failure(
                         conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
                         max_execution_timeout_ceiling: None,
+                        // Workflow-level retry (issue #523) is the same logical run
+                        // continuing, so the chain-scoped lifetime cap (issue #617)
+                        // is inherited verbatim: carry the origin's absolute
+                        // `chain_deadline_at` forward rather than re-anchoring it.
+                        chain_execution_timeout: exec_ref.chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling: None,
+                        inherited_chain_deadline_at: exec_ref.chain_deadline_at,
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
                         priority,
@@ -6005,14 +6041,16 @@ async fn persist_all_started_child_workflows(
                         severity,
                         child_sla,
                         child_execution_timeout,
+                        child_chain_execution_timeout,
                         child_retry_policy,
-                    ) = child_wf_info.map_or((None, None, None, None, None, None), |w| {
+                    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
                         (
                             w.owner,
                             w.runbook_url,
                             w.severity,
                             w.sla,
                             w.execution_timeout,
+                            w.chain_execution_timeout,
                             w.retry_policy.clone(),
                         )
                     });
@@ -6021,9 +6059,23 @@ async fn persist_all_started_child_workflows(
                     let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
                     let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
                     let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+                    // A child is its own logical workflow → fresh chain origin
+                    // (issue #617). Resolve the child's OWN `chain_execution_timeout`
+                    // exactly like its per-run timeout above and anchor the chain
+                    // deadline at the child's start. No builder ceiling is threaded
+                    // into the spawn path, matching how `execution_timeout` is
+                    // resolved here.
+                    let child_chain_execution_timeout = child_chain_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok());
+                    // `checked_add_signed` guards against `Duration::MAX` overflow
+                    // (issue #617): `DateTime + Duration` panics; yield `None`.
+                    let child_chain_deadline_at = child_chain_execution_timeout
+                        .and_then(|d| chrono::Utc::now().checked_add_signed(d));
                     let child_row = NewWorkflowExecution {
                         continued_from_exec_id: None,
                         first_exec_id: None,
+                        chain_execution_timeout: child_chain_execution_timeout,
+                        chain_deadline_at: child_chain_deadline_at,
                         id: child.child_id.as_uuid(),
                         workflow_name: &child.workflow_name,
                         workflow_id: &child_workflow_id,
@@ -6179,25 +6231,42 @@ async fn insert_awaited_child_execution(
     // Provenance ref for the child is the parent execution id (issue #740).
     let parent_exec_id_str = parent_exec_id.to_string();
     let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-    let (owner, runbook_url, severity, child_sla, child_execution_timeout, child_retry_policy) =
-        child_wf_info.map_or((None, None, None, None, None, None), |w| {
-            (
-                w.owner,
-                w.runbook_url,
-                w.severity,
-                w.sla,
-                w.execution_timeout,
-                w.retry_policy.clone(),
-            )
-        });
+    let (
+        owner,
+        runbook_url,
+        severity,
+        child_sla,
+        child_execution_timeout,
+        child_chain_execution_timeout,
+        child_retry_policy,
+    ) = child_wf_info.map_or((None, None, None, None, None, None, None), |w| {
+        (
+            w.owner,
+            w.runbook_url,
+            w.severity,
+            w.sla,
+            w.execution_timeout,
+            w.chain_execution_timeout,
+            w.retry_policy.clone(),
+        )
+    });
     let child_execution_timeout =
         child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
     let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
     let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
     let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+    // Child = its own logical workflow → fresh chain origin (issue #617).
+    let child_chain_execution_timeout =
+        child_chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    // `checked_add_signed` guards against `Duration::MAX` overflow (issue #617):
+    // `DateTime + Duration` panics; yield `None` instead.
+    let child_chain_deadline_at =
+        child_chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
     let child_row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
+        chain_execution_timeout: child_chain_execution_timeout,
+        chain_deadline_at: child_chain_deadline_at,
         id: child.child_id.as_uuid(),
         workflow_name: &child.workflow_name,
         workflow_id: &child_workflow_id,
@@ -7264,6 +7333,11 @@ async fn create_detached_child_executions(
         let child_row = NewWorkflowExecution {
             continued_from_exec_id: None,
             first_exec_id: None,
+            // Detached children do not resolve `execution_timeout` at spawn
+            // (`None` above), so the chain cap is `None` too — matching the
+            // existing per-run pattern precisely (issue #617).
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
             workflow_id: &child_workflow_id,
@@ -10085,6 +10159,12 @@ async fn persist_workflow_continue_as_new(
     let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
     // Re-anchor soft SLA deadline per-run (issue #487).
     let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
+    // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM. Unlike
+    // the per-run `deadline_at`/`sla_deadline_at` above (re-anchored to `now`), the
+    // chain deadline is anchored at the FIRST run's start and must NOT be
+    // recomputed as `now + timeout` — copying the predecessor's absolute
+    // `chain_deadline_at` is what makes the whole continue-as-new chain share one
+    // lifetime cap, so a runaway loop cannot escape it by continuing-as-new.
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -10097,6 +10177,9 @@ async fn persist_workflow_continue_as_new(
         queue_name: &execution.queue_name,
         execution_timeout: execution.execution_timeout,
         deadline_at: new_deadline_at,
+        // Carried verbatim across continue-as-new (issue #617) — see comment above.
+        chain_execution_timeout: execution.chain_execution_timeout,
+        chain_deadline_at: execution.chain_deadline_at,
         sla: execution.sla,
         sla_deadline_at: new_sla_deadline_at,
         memo: execution.memo.clone(),
@@ -13484,6 +13567,9 @@ struct WorkerMonitoringHandles {
     /// `db` is disabled.
     session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
+    /// Active-workflow population gauge sampler (issue #770). The task self-
+    /// no-ops when metrics are disabled.
+    workflow_active_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
@@ -13676,6 +13762,236 @@ async fn sample_history_oversized_counts(
             (
                 r.workflow_name,
                 u64::try_from(r.oversized_count.max(0)).unwrap_or(0),
+            )
+        })
+        .collect())
+}
+
+/// The two active (non-terminal) lifecycle states the active-workflow
+/// population gauge (issue #770) buckets executions into.
+///
+/// Bounded by construction so the `state` metric label can only ever be one
+/// of two values — the cardinality-safety guarantee is the enum itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ActiveWorkflowState {
+    /// A `RUNNING` execution (issue #603 nd-blocked runs stay `RUNNING`).
+    Running,
+    /// A `PAUSED` execution (issue #383 operator pause).
+    Paused,
+}
+
+impl ActiveWorkflowState {
+    /// Maps a raw `harvest_workflow_executions.state` string to the bounded
+    /// active state, or `None` for any non-active state (COMPLETED, FAILED,
+    /// CANCELLED, `TIMED_OUT`, TERMINATED, `CONTINUED_AS_NEW`).
+    #[must_use]
+    pub fn from_db_str(state: &str) -> Option<Self> {
+        match state {
+            "RUNNING" => Some(Self::Running),
+            "PAUSED" => Some(Self::Paused),
+            _ => None,
+        }
+    }
+
+    /// The lowercase metric-label value for this state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+/// Decide the gauge emissions for one active-workflow sampler tick (issue
+/// #770).
+///
+/// Returns `None` when the tick must be skipped — a shard read failed, so a
+/// partial aggregate (or a zero-fill) would false-clear the gauge during an
+/// outage (mirrors the history-oversized sampler's `read_failed` skip).
+/// Otherwise returns every current `(workflow, state)` count, plus a zero-fill
+/// for every pair present last tick but absent this tick so a drained pair
+/// falls back to `0` rather than lingering at a stale value.
+///
+/// The result is *content*-deterministic (the same inputs always produce the
+/// same set of `(workflow, state, count)` tuples), but the returned `Vec`'s
+/// order follows `HashMap` iteration and is **not** order-stable. That is fine:
+/// the consumer calls `.set()` once per series, order-independently.
+pub(crate) fn compute_active_gauge_emissions(
+    last_keys: &std::collections::HashSet<(String, ActiveWorkflowState)>,
+    this_counts: &std::collections::HashMap<(String, ActiveWorkflowState), u64>,
+    read_failed: bool,
+) -> Option<Vec<(String, ActiveWorkflowState, u64)>> {
+    if read_failed {
+        return None;
+    }
+    let mut out: Vec<(String, ActiveWorkflowState, u64)> = this_counts
+        .iter()
+        .map(|((workflow, state), count)| (workflow.clone(), *state, *count))
+        .collect();
+    let this_keys: std::collections::HashSet<(String, ActiveWorkflowState)> =
+        this_counts.keys().cloned().collect();
+    for (workflow, state) in last_keys.difference(&this_keys) {
+        out.push((workflow.clone(), *state, 0));
+    }
+    Some(out)
+}
+
+/// Fold each shard's per-`(workflow, state)` counts into one fleet-wide map,
+/// summing the same key across shards (issue #770).
+///
+/// A `(workflow, state)` pair present on more than one shard has its counts
+/// **added, never overwritten**, so the gauge reflects the fleet-wide total.
+/// The caller only merges the shards it read successfully — a shard read
+/// failure short-circuits the whole tick to no-emit before this is called, so
+/// a partial set is never folded (mirrors the `read_failed` skip in
+/// `compute_active_gauge_emissions`).
+pub(crate) fn merge_active_shard_counts(
+    per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>>,
+) -> std::collections::HashMap<(String, ActiveWorkflowState), u64> {
+    let mut counts: std::collections::HashMap<(String, ActiveWorkflowState), u64> =
+        std::collections::HashMap::new();
+    for shard in per_shard {
+        for (workflow_name, state, count) in shard {
+            *counts.entry((workflow_name, state)).or_insert(0) += count;
+        }
+    }
+    counts
+}
+
+/// Periodically sample the count of currently-active (RUNNING/PAUSED)
+/// executions per workflow type and lifecycle state and emit it as the
+/// `harvest.workflow.active` gauge (issue #770).
+///
+/// The live in-progress population, split by `(workflow, state)`. A steady
+/// rise while `harvest.workflow.terminal` stays flat signals a leak or
+/// backlog. Gated on `metrics.is_enabled()` — it issues sampler SQL, which is
+/// wasted work when no recorder is installed (mirrors
+/// `spawn_queue_depth_sampler`).
+fn spawn_workflow_active_sampler(
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL.
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        let mut reported: std::collections::HashSet<(String, ActiveWorkflowState)> =
+            std::collections::HashSet::new();
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            // Active executions live on the shard that owns them, so collect
+            // each shard's per-(workflow, state) counts and sum them across
+            // every shard for a fleet-wide gauge.
+            let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
+            let mut read_failed = false;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "active workflow sampler could not acquire DB connection"
+                        );
+                        read_failed = true;
+                        continue;
+                    }
+                };
+
+                match sample_active_workflow_counts(&mut conn).await {
+                    Ok(rows) => per_shard.push(rows),
+                    Err(error) => {
+                        tracing::debug!(error = %error, "active workflow sample failed");
+                        read_failed = true;
+                    }
+                }
+            }
+
+            // Never fold a partial set: on any shard read failure the tick is
+            // skipped (compute_active_gauge_emissions returns None), so the
+            // merged map is only built when every shard read succeeded.
+            let counts = if read_failed {
+                std::collections::HashMap::new()
+            } else {
+                merge_active_shard_counts(per_shard)
+            };
+
+            if let Some(emissions) = compute_active_gauge_emissions(&reported, &counts, read_failed)
+            {
+                for (workflow_name, state, count) in &emissions {
+                    telemetry
+                        .metrics
+                        .record_workflow_active(workflow_name, state.as_str(), *count);
+                }
+                reported = counts.keys().cloned().collect();
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
+/// Query the count of active (RUNNING/PAUSED) executions per workflow type and
+/// lifecycle state (issue #770).
+///
+/// Returns `(workflow_name, state, count)` rows. The `WHERE state IN
+/// ('RUNNING','PAUSED')` clause is a performance optimization that bounds the
+/// scan; it is redundant with the [`ActiveWorkflowState::from_db_str`] Rust
+/// guard, which is the authoritative filter and drops (with a debug log) any
+/// row whose state is unexpectedly outside that set, as defense-in-depth so
+/// the bounded `state` label can never carry a third value. The tests exercise
+/// the Rust guard; the SQL predicate is not independently isolated by a test.
+pub async fn sample_active_workflow_counts(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<Vec<(String, ActiveWorkflowState, u64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        active_count: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT workflow_name, state, COUNT(*)::bigint AS active_count \
+         FROM harvest_workflow_executions \
+         WHERE state IN ('RUNNING', 'PAUSED') \
+         GROUP BY workflow_name, state",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            ActiveWorkflowState::from_db_str(&r.state).map_or_else(
+                || {
+                    tracing::debug!(
+                        state = %r.state,
+                        "active workflow sampler dropping unexpected non-active state"
+                    );
+                    None
+                },
+                |state| {
+                    Some((
+                        r.workflow_name,
+                        state,
+                        u64::try_from(r.active_count.max(0)).unwrap_or(0),
+                    ))
+                },
             )
         })
         .collect())
@@ -14359,6 +14675,9 @@ impl Worker {
         if let Err(error) = monitors.history_oversized_sampler.await {
             tracing::warn!(error = %error, "history oversized sampler failed during shutdown");
         }
+        if let Err(error) = monitors.workflow_active_sampler.await {
+            tracing::warn!(error = %error, "active workflow sampler failed during shutdown");
+        }
         if let Some(handle) = monitors.worker_slot_sampler
             && let Err(error) = handle.await
         {
@@ -14652,6 +14971,14 @@ impl Worker {
             self.registry.history_policy().continue_as_new_threshold(),
             self.config.poll_interval,
         );
+        // Active-workflow population gauge (issue #770): the live in-progress
+        // count per (workflow, state). Self-no-ops when metrics are disabled.
+        let workflow_active_sampler = spawn_workflow_active_sampler(
+            sampler_pools.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        );
         // Adaptive slot-tuner control loop (issue #548): only spawned when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
         // below, this is NOT gated on `metrics.is_enabled()` — it is a
@@ -14845,6 +15172,7 @@ impl Worker {
             pause_auto_resumers,
             session_slot_reconcilers,
             history_oversized_sampler,
+            workflow_active_sampler,
             worker_slot_sampler,
             stranded_work_sampler,
             schedule_overdue_sampler,
@@ -15035,6 +15363,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "history oversized sampler failed during shutdown"
+            );
+        }
+        if let Err(error) = monitors.workflow_active_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "active workflow sampler failed during shutdown"
             );
         }
         if let Some(handle) = monitors.worker_slot_sampler
@@ -16250,6 +16585,105 @@ mod tests {
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
 
+    // ── Active-workflow population gauge (issue #770) ────────────────────────
+
+    #[test]
+    fn active_workflow_state_maps_only_active_db_states() {
+        assert_eq!(
+            ActiveWorkflowState::from_db_str("RUNNING"),
+            Some(ActiveWorkflowState::Running)
+        );
+        assert_eq!(
+            ActiveWorkflowState::from_db_str("PAUSED"),
+            Some(ActiveWorkflowState::Paused)
+        );
+        // Every terminal / non-active state maps to None so the bounded
+        // `state` label can never carry a third value.
+        for terminal in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "TERMINATED",
+            "CONTINUED_AS_NEW",
+            "SUSPENDED",
+            "",
+            "running",
+        ] {
+            assert_eq!(
+                ActiveWorkflowState::from_db_str(terminal),
+                None,
+                "state {terminal:?} must not be an active state"
+            );
+        }
+    }
+
+    #[test]
+    fn active_workflow_state_label_strings_are_lowercase() {
+        assert_eq!(ActiveWorkflowState::Running.as_str(), "running");
+        assert_eq!(ActiveWorkflowState::Paused.as_str(), "paused");
+    }
+
+    #[test]
+    fn compute_active_gauge_emissions_zero_fills_dropped_keys() {
+        use std::collections::{HashMap, HashSet};
+
+        let last: HashSet<(String, ActiveWorkflowState)> = [
+            ("alpha".to_owned(), ActiveWorkflowState::Running),
+            ("beta".to_owned(), ActiveWorkflowState::Running),
+        ]
+        .into_iter()
+        .collect();
+        let this: HashMap<(String, ActiveWorkflowState), u64> =
+            std::iter::once((("alpha".to_owned(), ActiveWorkflowState::Running), 2)).collect();
+
+        let mut emissions = compute_active_gauge_emissions(&last, &this, false)
+            .expect("a successful tick must emit");
+        emissions.sort();
+        assert_eq!(
+            emissions,
+            vec![
+                // still-active pair keeps its current count
+                ("alpha".to_owned(), ActiveWorkflowState::Running, 2),
+                // dropped-since-last-tick pair is zero-filled, not left stale
+                ("beta".to_owned(), ActiveWorkflowState::Running, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_active_gauge_emissions_skips_on_read_failure() {
+        use std::collections::{HashMap, HashSet};
+
+        // A read failure must emit NOTHING so an outage never false-clears the
+        // gauge (mirrors the history-oversized sampler's read_failed skip).
+        let last: HashSet<(String, ActiveWorkflowState)> =
+            std::iter::once(("alpha".to_owned(), ActiveWorkflowState::Running)).collect();
+        let this: HashMap<(String, ActiveWorkflowState), u64> = HashMap::new();
+        assert!(compute_active_gauge_emissions(&last, &this, true).is_none());
+    }
+
+    #[test]
+    fn merge_active_shard_counts_sums_same_key_across_shards() {
+        use std::collections::HashMap;
+
+        // The SAME (workflow, state) key appearing on two shards must SUM, not
+        // overwrite — a merge that clobbered would report shard B's 3 instead
+        // of the fleet-wide 5 (the cross-shard-sum guarantee, issue #770).
+        let shard_a = vec![("alpha".to_owned(), ActiveWorkflowState::Running, 2)];
+        let shard_b = vec![
+            ("alpha".to_owned(), ActiveWorkflowState::Running, 3),
+            ("beta".to_owned(), ActiveWorkflowState::Paused, 1),
+        ];
+
+        let merged = merge_active_shard_counts(vec![shard_a, shard_b]);
+
+        let mut expected: HashMap<(String, ActiveWorkflowState), u64> = HashMap::new();
+        expected.insert(("alpha".to_owned(), ActiveWorkflowState::Running), 5);
+        expected.insert(("beta".to_owned(), ActiveWorkflowState::Paused), 1);
+        assert_eq!(merged, expected);
+    }
+
     // ── WASM effective start-to-close resolution (issue #965, AC1) ───────────
     //
     // Proves the WASM dispatch seam honors a per-task `start_to_close` override
@@ -16983,6 +17417,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 

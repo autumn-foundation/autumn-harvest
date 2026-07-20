@@ -162,6 +162,18 @@ pub struct DebounceStartOptions {
     /// enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_execution_timeout_ceiling_secs: Option<i64>,
+    /// Effective chain-scoped lifetime cap DURATION (seconds), captured at
+    /// admission from the workflow-type `chain_execution_timeout` so a debounced /
+    /// throttled / batched start does NOT silently drop the declared chain cap
+    /// (issue #617). Mirrors `execution_timeout_secs` exactly. `None` = no
+    /// workflow-declared chain cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_execution_timeout_secs: Option<i64>,
+    /// Effective fleet-wide chain-cap ceiling / default (seconds), captured at
+    /// admission (issue #617). Mirrors `max_execution_timeout_ceiling_secs`.
+    /// `None` = no fleet-wide chain cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workflow_chain_timeout_ceiling_secs: Option<i64>,
     /// Effective workflow-input byte cap, captured at admission so a debounced
     /// start can't bypass the size limit the normal path enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -743,6 +755,15 @@ async fn fire_claimed_debounce_row(
     let max_execution_timeout_ceiling = opts
         .max_execution_timeout_ceiling_secs
         .and_then(chrono::Duration::try_seconds);
+    // Chain-scoped lifetime cap captured at admission (issue #617), so a debounced
+    // start of a `#[workflow(chain_execution_timeout = ...)]` workflow does not
+    // silently drop the declared cap.
+    let chain_execution_timeout = opts
+        .chain_execution_timeout_secs
+        .and_then(chrono::Duration::try_seconds);
+    let max_workflow_chain_timeout_ceiling = opts
+        .max_workflow_chain_timeout_ceiling_secs
+        .and_then(chrono::Duration::try_seconds);
     let priority = opts
         .priority
         .and_then(crate::types::Priority::from_i32)
@@ -780,6 +801,9 @@ async fn fire_claimed_debounce_row(
         conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
+        chain_execution_timeout,
+        max_workflow_chain_timeout_ceiling,
+        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         priority,

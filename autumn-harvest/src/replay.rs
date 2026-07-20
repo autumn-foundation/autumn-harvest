@@ -1801,6 +1801,38 @@ impl HistoryMatcher {
         self.cursor
     }
 
+    /// Count unconsumed `ActivityScheduled` events at or after the current
+    /// cursor, stopping early once `cap` is reached.
+    ///
+    /// **Read-only**: does *not* mutate the cursor or any consumed-set — it is
+    /// safe to call as a pure inspection before deciding how to dispatch.
+    ///
+    /// Used by the windowed activity fan-out (issue #750) to size the
+    /// already-scheduled prefix `[0..s)` that must be *resumed* (as one
+    /// homogeneous batch) before any fresh remainder is dispatched. Called
+    /// immediately after the fan-out's count marker has been consumed, so the
+    /// cursor sits on the fan-out's first `ActivityScheduled` and the next `s`
+    /// unconsumed `ActivityScheduled` events (a contiguous prefix, since the
+    /// fan-out dispatches strictly in input order) are exactly its own
+    /// already-dispatched slots. `cap` is the fan-out's own slot count, which
+    /// both bounds the scan and prevents ever counting a *later*, unrelated
+    /// activity that a fully-completed fan-out's continuation may have already
+    /// scheduled into history.
+    #[must_use]
+    pub(crate) fn count_pending_scheduled_activities(&self, cap: usize) -> usize {
+        let mut n = 0;
+        let mut cursor = self.cursor;
+        while cursor < self.events.len() && n < cap {
+            if !self.is_consumed(cursor)
+                && matches!(self.events[cursor], WorkflowEvent::ActivityScheduled { .. })
+            {
+                n += 1;
+            }
+            cursor += 1;
+        }
+        n
+    }
+
     /// Total number of events in history.
     #[must_use]
     pub const fn len(&self) -> usize {

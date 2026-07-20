@@ -905,6 +905,55 @@
             }
           ],
           "description": "Workflow completed while an update/signal handler was still in flight."
+        },
+        {
+          "id": 770,
+          "type": "timeseries",
+          "title": "Active workflows by type & state",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 66
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (workflow, state) (harvest_workflow_active{workflow=~\"$workflow\"})",
+              "legendFormat": "{{workflow}} {{state}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Live in-progress workflow population per type, split by lifecycle state (running/paused). max by (workflow, state) avoids replica double-counting: each replica samples the same fleet-wide count. A steady rise while terminal throughput stays flat signals a leak or backlog. Alert: harvest_workflow_population_leak"
         }
       ]
     },
@@ -968,6 +1017,55 @@
             }
           ],
           "description": "Executions force-timed-out by the execution_timeout scanner (issue #243), per hour."
+        },
+        {
+          "id": 909,
+          "type": "timeseries",
+          "title": "Workflow chain-lifetime timeouts",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 44
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow, queue) (increase(harvest_workflow_chain_timeout_total{workflow=~\"$workflow\",queue=~\"$queue\"}[1h]))",
+              "legendFormat": "{{workflow}} / {{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Executions force-timed-out because their chain-scoped lifetime cap (chain_execution_timeout, issue #617) elapsed across a continue-as-new chain, per hour. Distinct from the per-run execution timeout above."
         },
         {
           "id": 20,

@@ -812,6 +812,43 @@
         "GET /api/harvest/workflows/{execution_id}/history"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_signal_unhandled_rate"
+    },
+    {
+      "id": "harvest_workflow_population_leak",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#770 gauge harvest.workflow.active sampled per shard (labels workflow, state) plus the harvest.workflow.terminal counter.",
+      "default_threshold": "Ticket when the active population of a workflow type rises by more than 50 over an hour while its terminal completion rate stays effectively flat (< 0.01/s). Tune per workflow expected concurrency.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "The in-progress population of a workflow type keeps growing while few or no executions reach a terminal state — a leak or backlog (starts outpacing completions), not a healthy burst that later drains.",
+      "first_action": "harvest workflow list --state RUNNING --limit 25",
+      "dependencies": [
+        {
+          "ref": "#770",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_ACTIVE / harvest.workflow.active"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric labels: workflow, state"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Population growth (max-min over the window) paired with a near-zero terminal rate distinguishes a leak from a burst that drains. Keep workflow/state labels bounded.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "(sum by (workflow) (max_over_time(harvest_workflow_active[1h])) - sum by (workflow) (min_over_time(harvest_workflow_active[1h]))) > 50 and sum by (workflow) (rate(harvest_workflow_terminal_total[1h])) < 0.01"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest workflow list --state RUNNING --limit 25",
+        "GET /api/harvest/workflows?state=RUNNING"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_population_leak"
     }
   ]
 }

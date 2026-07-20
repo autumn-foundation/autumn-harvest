@@ -80,6 +80,12 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
     "\n",
+    // Reset (#148/#538) refines the active-uniqueness index to exclude
+    // TERMINATED rows; placed after continue_as_new (creates the index) and
+    // after external_tasks (whose state_check it recreates), and before the
+    // pause migration so the later PAUSED-inclusive state_check wins.
+    include_str!("../../migrations/20260503000000_harvest_workflow_reset/up.sql"),
+    "\n",
     include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
     "\n",
     include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
@@ -168,7 +174,11 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #740: start_source/start_source_ref/started_by provenance columns on
     // harvest_workflow_executions.
-    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql")
+    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql"),
+    "\n",
+    // issue #617: chain_execution_timeout/chain_deadline_at columns on
+    // harvest_workflow_executions.
+    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -262,7 +272,12 @@ const LEGACY_INIT_SQL: &str = concat!(
     // references the three start_source_* provenance columns.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS start_source_ref TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS started_by TEXT NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS started_by TEXT NULL;\n",
+    // issue #617: WorkflowExecution::as_select() and the modern start path's
+    // full-row insert touch the chain-scoped lifetime cap columns even for a
+    // workflow with no chain cap configured.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -653,6 +668,8 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -710,6 +727,8 @@ pub(crate) async fn insert_workflow_execution_with_id(
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -779,6 +798,9 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::default(),
@@ -1048,6 +1070,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -1071,6 +1094,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: child_echo_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -1102,6 +1126,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -1125,6 +1150,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -1452,6 +1478,7 @@ fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_branches_on_typed_child_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
                 debounce: None,
@@ -1473,6 +1500,7 @@ fn typed_child_failure_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: typed_failing_child_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
                 debounce: None,
@@ -1724,6 +1752,9 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::default(),
@@ -1762,6 +1793,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
             // Deliberately None: the ROW's execution_timeout (set via the start
             // param above) is the value that must be threaded, not this default.
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
             debounce: None,
@@ -1925,6 +1957,9 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: None,
         max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
         concurrency_key: None,
         concurrency_limit: None,
         priority: Priority::default(),
@@ -1985,6 +2020,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
             module: "integration_e2e",
             handler: deadline_echo_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
             debounce: None,
@@ -2144,6 +2180,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -2277,6 +2314,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             module: "integration_e2e",
             handler: failing_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -2423,6 +2461,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -2588,6 +2627,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -2994,6 +3034,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
                     execution_timeout: None,
+                    chain_execution_timeout: None,
                     sla: None,
                     concurrency: None,
 
@@ -3162,6 +3203,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     module: "integration_e2e",
                     handler: workflow_with_timer,
                     execution_timeout: None,
+                    chain_execution_timeout: None,
                     sla: None,
                     concurrency: None,
 
@@ -3553,6 +3595,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -3576,6 +3619,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -3599,6 +3643,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: child_beta_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -3738,6 +3783,7 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_child_fan_out,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -3761,6 +3807,7 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: fan_child_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -3943,6 +3990,7 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_ten_slow_children,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -3966,6 +4014,7 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: slow_fan_child_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -4264,6 +4313,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             module: "integration_e2e",
             handler: workflow_with_builder_state,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -4782,6 +4832,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             module: "integration_e2e",
             handler: signal_waiting_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -4911,6 +4962,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -5054,6 +5106,8 @@ async fn insert_named_workflow_execution(
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -5469,6 +5523,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -5610,6 +5665,7 @@ async fn worker_continue_as_new_records_own_start_source_referencing_predecessor
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -5734,6 +5790,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -5866,6 +5923,9 @@ mod reuse_policy_helpers {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -7225,6 +7285,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -7354,6 +7415,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -7470,6 +7532,7 @@ async fn workflow_schedule_pause_and_resume() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -7737,6 +7800,9 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -7776,6 +7842,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -7913,6 +7980,9 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -7952,6 +8022,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -8057,6 +8128,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -8426,6 +8498,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -8583,6 +8656,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -8722,6 +8796,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -8877,6 +8952,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -8954,6 +9030,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -9040,6 +9117,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -9130,6 +9208,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -9215,6 +9294,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -9304,6 +9384,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -9455,6 +9536,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         queue_name: "default",
         execution_timeout: Some(execution_timeout),
         deadline_at: Some(deadline_at),
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -9928,6 +10011,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             module: "integration_e2e",
             handler: workflow_calling_retry_activity,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -10281,6 +10365,7 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
             module: "integration_e2e",
             handler: saga_metrics_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -10373,4 +10458,320 @@ async fn worker_saga_unwind_emits_compensated_counter_exactly_once_across_decisi
         marker_count, 1,
         "exactly one saga_compensated marker in history"
     );
+}
+
+// ===========================================================================
+// Bounded / windowed activity fan-out (issue #750) — DB e2e success metric
+// ===========================================================================
+
+/// Windowed activity fan-out over 20 inputs with window 5. Reads `n`/`w` from
+/// input so the same handler is reusable, but this test fixes n=20, w=5.
+fn windowed_fanout_e2e_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["n"].as_u64().unwrap_or(20)).unwrap_or(20);
+        let w = usize::try_from(input["w"].as_u64().unwrap_or(5)).unwrap_or(5);
+        let activities: Vec<_> = (0..n)
+            .map(|i| {
+                (
+                    "slow_double".to_string(),
+                    serde_json::json!(i),
+                    "default".to_string(),
+                )
+            })
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw_windowed(activities, w)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+/// Unbounded control fan-out over the same inputs — same activity shape.
+fn unbounded_fanout_e2e_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input["n"].as_u64().unwrap_or(20)).unwrap_or(20);
+        let activities: Vec<_> = (0..n)
+            .map(|i| {
+                (
+                    "slow_double".to_string(),
+                    serde_json::json!(i),
+                    "default".to_string(),
+                )
+            })
+            .collect();
+        let results = ctx
+            .execute_activity_fan_out_raw(activities)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+/// Modestly-slow activity: doubles its numeric input after a short real sleep,
+/// so multiple in-flight activities are observable by a concurrent DB poller.
+/// (A `tokio::time::sleep` is fine here — this runs on the activity dispatch
+/// path, not inside the workflow poll's 100ms suspension window.)
+fn slow_double_activity<'a>(
+    _ctx: &'a ActivityContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let v = input.as_u64().unwrap_or(0);
+        Ok(serde_json::json!(v * 2))
+    })
+}
+
+fn windowed_fanout_e2e_registry() -> Arc<HandlerRegistry> {
+    let make_wf =
+        |name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn| WorkflowInfo {
+            mcp: false,
+            name,
+            module: "integration_e2e",
+            handler,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        };
+    Arc::new(HandlerRegistry::new(
+        vec![
+            make_wf("windowed_fanout_e2e", windowed_fanout_e2e_workflow),
+            make_wf("unbounded_fanout_e2e", unbounded_fanout_e2e_workflow),
+        ],
+        vec![ActivityInfo {
+            name: "slow_double",
+            module: "integration_e2e",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: slow_double_activity,
+        }],
+    ))
+}
+
+/// Insert a RUNNING execution row for `(workflow_name, workflow_id)`.
+async fn insert_named_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &'static str,
+    workflow_id: &'static str,
+    input: serde_json::Value,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new();
+    let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name,
+        workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input,
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert named workflow execution");
+    exec_id
+}
+
+/// Count `harvest_task_queue` rows in `RUNNING`/`PENDING` state that are
+/// activity tasks attributable to a specific workflow execution.
+///
+/// Takes a caller-owned connection so a polling loop can reuse ONE connection
+/// across all polls rather than establishing (and dropping) a fresh connection
+/// on every sample.
+async fn count_active_activity_rows(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .filter(harvest_task_queue::state.eq_any(["RUNNING", "PENDING"]))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("failed to count active activity rows")
+}
+
+/// Success metric (issue #750): a windowed fan-out (N=20, W=5) never has more
+/// than W=5 of its activities in `RUNNING`/`PENDING` at once, completes with
+/// byte-identical results to an unbounded fan-out over the same inputs, and
+/// records exactly N=20 `ActivityScheduled` events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let windowed_exec = insert_named_execution(
+        &mut conn,
+        "windowed_fanout_e2e",
+        "win-1",
+        serde_json::json!({ "n": 20, "w": 5 }),
+    )
+    .await;
+    enqueue_started_workflow_task(
+        &mut conn,
+        windowed_exec,
+        serde_json::json!({ "n": 20, "w": 5 }),
+    )
+    .await;
+
+    let registry = windowed_fanout_e2e_registry();
+    let worker = build_runtime_worker("worker-e2e-windowed-fanout", 4, 30, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Background peak tracker: poll the windowed exec's active activity rows.
+    let peak = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let url = database_url.clone();
+        let peak = Arc::clone(&peak);
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            // Open ONE connection for the whole poll loop instead of establishing
+            // (and dropping) a fresh connection on every 5ms sample.
+            let mut poll_conn =
+                <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&url)
+                    .await
+                    .expect("failed to connect for activity-row polling");
+            while !std::sync::atomic::AtomicBool::load(&done, Ordering::SeqCst) {
+                let n = count_active_activity_rows(&mut poll_conn, windowed_exec).await;
+                let n = usize::try_from(n).unwrap_or(0);
+                AtomicUsize::fetch_max(&peak, n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let windowed_execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        windowed_exec,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+    std::sync::atomic::AtomicBool::store(&done, true, Ordering::SeqCst);
+    poller.await.expect("poller task should join");
+
+    let peak_observed = AtomicUsize::load(&peak, Ordering::SeqCst);
+    assert!(
+        peak_observed <= 5,
+        "windowed fan-out (W=5) peaked at {peak_observed} concurrent activity rows; must stay <= 5"
+    );
+    assert!(
+        peak_observed > 0,
+        "peak tracker should have observed at least one in-flight activity row"
+    );
+
+    // Now run the unbounded control over the same inputs and compare results.
+    let unbounded_exec = insert_named_execution(
+        &mut conn,
+        "unbounded_fanout_e2e",
+        "unb-1",
+        serde_json::json!({ "n": 20 }),
+    )
+    .await;
+    enqueue_started_workflow_task(&mut conn, unbounded_exec, serde_json::json!({ "n": 20 })).await;
+    let unbounded_execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        unbounded_exec,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let expected: Vec<serde_json::Value> = (0..20u64).map(|i| serde_json::json!(i * 2)).collect();
+    assert_eq!(
+        windowed_execution.output,
+        Some(serde_json::json!({ "results": expected.clone() })),
+        "windowed output must be the doubled inputs in order"
+    );
+    assert_eq!(
+        windowed_execution.output, unbounded_execution.output,
+        "windowed fan-out must be byte-identical to the unbounded fan-out"
+    );
+
+    // Exactly N=20 activities were scheduled by the windowed run.
+    let history = load_history_from_url(&database_url, windowed_exec).await;
+    let scheduled = history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+        .count();
+    assert_eq!(
+        scheduled, 20,
+        "windowed fan-out must schedule all 20 inputs exactly once"
+    );
+    let markers = history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:")))
+        .count();
+    assert_eq!(markers, 1, "exactly one fan_out marker recorded");
 }

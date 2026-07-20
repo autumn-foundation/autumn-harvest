@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "db")]
+mod active_workflow_gauge_tests;
 mod activity_default_floor_tests;
 mod activity_failure_tests;
 mod activity_interceptor_tests;
@@ -16,6 +18,8 @@ mod cache_delta_load_tests;
 #[cfg(feature = "db")]
 mod canary_tests;
 mod cancellation_tests;
+#[cfg(feature = "db")]
+mod chain_timeout_tests;
 mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]

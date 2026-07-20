@@ -79,6 +79,8 @@ async fn insert_execution_for_queue(
         queue_name,
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,

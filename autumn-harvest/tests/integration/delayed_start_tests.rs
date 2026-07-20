@@ -77,6 +77,7 @@ fn delay_registry() -> Arc<HandlerRegistry> {
             module: "delayed_start_tests",
             handler: delay_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
 
@@ -124,6 +125,7 @@ async fn load_tasks(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // issue #617 added chain-cap fields to the StartWorkflowParams literals
 async fn test_delayed_start_validation() {
     let (mut conn, _container) = setup_test_db().await;
 
@@ -144,6 +146,9 @@ async fn test_delayed_start_validation() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -203,6 +208,9 @@ async fn test_delayed_start_validation() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -325,6 +333,9 @@ async fn test_delayed_start_no_premature_dispatch() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -415,6 +426,9 @@ async fn test_delayed_start_cancel_before_firing() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -512,6 +526,9 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -577,6 +594,9 @@ async fn test_immediate_start_skew_tolerance() {
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),

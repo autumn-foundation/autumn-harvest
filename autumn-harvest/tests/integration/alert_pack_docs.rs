@@ -20,6 +20,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_saga_compensation_failed",
     "harvest_update_rejected_rate",
     "harvest_signal_unhandled_rate",
+    "harvest_workflow_population_leak",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -69,6 +70,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_saga_compensation_failed_total",
     "harvest_update_rejected_total",
     "harvest_signal_unhandled_total",
+    "harvest_workflow_active",
 ];
 
 #[test]
