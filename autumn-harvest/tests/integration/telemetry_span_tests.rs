@@ -159,6 +159,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 module: "telemetry_span_tests",
                 handler: telemetry_master_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -182,6 +183,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 module: "telemetry_span_tests",
                 handler: telem_child_wf,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
 
@@ -316,6 +318,9 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: None,
                     max_execution_timeout_ceiling: None,
+                    chain_execution_timeout: None,
+                    max_workflow_chain_timeout_ceiling: None,
+                    inherited_chain_deadline_at: None,
                     concurrency_key: None,
                     concurrency_limit: None,
                     priority: Priority::default(),

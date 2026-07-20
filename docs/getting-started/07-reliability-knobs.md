@@ -213,6 +213,85 @@ reserved side-effect name, so it never consumes an author-side `ctx.system_now()
 call replays cleanly, with that `Now` matched by the workflow's own read rather
 than the deadline probe.
 
+**Per-run cap vs chain-scoped lifetime cap (`chain_execution_timeout`).** The
+`execution_timeout` above bounds a **single run** — and it is **re-anchored on
+every `continue_as_new`**, so a long-lived entity workflow that checkpoints and
+continues forever never trips it. That is exactly right for a *healthy* run, but
+it means `execution_timeout` alone cannot catch a **runaway loop that keeps
+continuing-as-new** (a stuck poller, a bug that re-continues without making
+progress). `chain_execution_timeout` is the bound for the *whole chain*:
+
+```rust
+// Per-run cap protects one run; chain cap protects the entire continue-as-new chain.
+#[workflow(execution_timeout = "1h", chain_execution_timeout = "7d")]
+async fn incremental_sync(ctx: &WorkflowContext, state: SyncState) -> Result<SyncState, String> {
+    // ... one cycle of work; continue_as_new to the next cycle ...
+    Ok(state)
+}
+```
+
+- **`execution_timeout`** — bounds *one run*; **re-anchored** at each
+  `continue_as_new` start. Reach for it to kill a single hung/runaway *attempt*.
+- **`chain_execution_timeout`** — anchored at the **first** run's start and
+  **carried verbatim** across every `continue_as_new`, so the deadline is the
+  same absolute instant for run #1 and run #500 of the chain. Reach for it as a
+  hard ceiling on total lifetime (SLA compliance, "this entity may live at most
+  N days") and as **runaway protection** a continuing loop cannot escape.
+
+When the chain cap elapses, the run is **terminated** (`TIMED_OUT`, the same
+`WorkflowExecutionTimedOut` event as `execution_timeout`); the metric
+`harvest.workflow.chain_timeout` distinguishes it from a per-run
+`harvest.workflow.timeout`.
+
+**Fleet-wide default — the builder ceiling doubles as a default (a deliberate
+divergence from `execution_timeout`).** `HarvestBuilder::max_workflow_chain_timeout(d)`
+both *caps* any workflow-declared `chain_execution_timeout` **and** acts as a
+**fleet-wide default**: a workflow that declares no chain cap still inherits the
+ceiling as its chain deadline. (This differs from
+`max_workflow_execution_timeout`, which only caps a *specified* per-run timeout.)
+So one builder call caps chains fleet-wide — even ones that under-specify:
+
+```rust
+HarvestBuilder::new()
+    .max_workflow_chain_timeout(Duration::from_secs(30 * 24 * 3600)) // no chain outlives 30d, fleet-wide
+    .build();
+```
+
+The ceiling-as-default is applied at these **origin** start paths: the plain
+HTTP `POST /workflows/{name}/start`, signal-with-start, update-with-start, batch
+start, trigger-now, workflow backfill, the scheduler tick (including its
+**buffered** overlap-policy fires), and debounce/throttle/batch deferred starts.
+(It is deliberately not applied on the CAN/retry/reset paths, which carry or
+re-anchor the chain deadline by their own rules above.)
+
+A few remaining origin start paths currently pass **no** chain cap and are
+therefore **not** covered by the fleet-wide default — a documented limitation,
+parity-consistent with their per-run `execution_timeout`-ceiling treatment (they
+thread neither ceiling): **completion-trigger** starts, the **Vantage UI manual
+schedule trigger**, the **webhook cross-shard outbox**, and **webhook-subscription**
+starts. The **typed Rust client stub's** `signal_with_start` / `update_with_start`
+are also uncovered (its `start` / `start_with_options` methods do apply the cap).
+For any of these, declare the cap on the workflow type with
+`#[workflow(chain_execution_timeout = "…")]`, or start via the HTTP route.
+
+**Absolute wall-clock — not shifted by pause.** Unlike `deadline_at` /
+`sla_deadline_at` (which resume pushes forward by the paused span),
+`chain_deadline_at` is an absolute compliance/runaway bound and is **not**
+extended by pause/resume. The chain cap is enforced by the timeout scanner only;
+it is deliberately **not** exposed to `ctx.deadline()` /
+`should_continue_as_new()` (which stay bound to the per-run deadline), so a
+continuing loop cannot read it and route around it.
+
+> **Operator callout — a long pause can kill a chain on resume.** Because
+> `chain_deadline_at` is absolute and is *not* shifted forward by the paused
+> span, a run **paused past its chain deadline** is timed out on the **first
+> timeout-scanner tick after resume** (the paused execution is skipped while
+> `PAUSED`, then caught the moment it returns to `RUNNING`). A long
+> compliance/investigation pause can therefore immediately terminate a chain the
+> instant it resumes. If you need a run to survive a pause that outlasts its
+> chain budget, cancel/terminate and restart with a fresh chain origin rather
+> than pausing.
+
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.patched()` — the recommended default for the
 overwhelmingly common two-state (before/after) change — so old executions

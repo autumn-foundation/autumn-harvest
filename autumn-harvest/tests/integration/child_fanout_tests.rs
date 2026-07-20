@@ -854,6 +854,7 @@ fn make_workflow_info(name: &'static str) -> autumn_harvest::info::WorkflowInfo 
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,

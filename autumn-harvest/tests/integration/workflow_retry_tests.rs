@@ -261,6 +261,7 @@ fn wf_info(
         module: "workflow_retry_tests",
         handler,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
         debounce: None,
@@ -348,6 +349,9 @@ async fn start_workflow(
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -407,6 +411,9 @@ async fn start_workflow_with_source(
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1493,4 +1500,109 @@ async fn retry_run_has_fresh_history_and_correct_linkage() {
 
     // Original run has FAILED state and its own history.
     assert_eq!(get_state(&mut check, original_exec_id).await, "FAILED");
+}
+
+/// Issue #617 (T3): a workflow-level retry (#523) is the same logical run trying
+/// again, so the retry execution must INHERIT the predecessor's chain-scoped
+/// lifetime cap VERBATIM — the origin's absolute `chain_deadline_at` is carried
+/// forward, NOT re-anchored to `now + chain_execution_timeout`. Driven
+/// end-to-end through the real worker loop; the inheritance happens inside
+/// `persist_workflow_failure`, which sets
+/// `inherited_chain_deadline_at = exec_ref.chain_deadline_at`. A
+/// re-anchor mutant (`inherited_chain_deadline_at: None`) fails this test.
+#[tokio::test]
+async fn workflow_retry_carries_chain_deadline_verbatim() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(50),
+        non_retryable_errors: vec![],
+        jitter: JitterPolicy::None,
+    };
+
+    let counter = Arc::new(CallCounter::default());
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let workflow_id = format!("retry-chain-{}", uuid::Uuid::new_v4());
+    let exec_id = start_workflow(
+        &mut conn,
+        "retry_chain_cap_wf",
+        &workflow_id,
+        Some(policy.clone()),
+    )
+    .await;
+
+    // Stamp the ORIGIN's chain cap BEFORE the worker fails it: a 7d duration and
+    // a FUTURE absolute deadline (so the retry successor is not immediately timed
+    // out). The retry must copy this absolute value verbatim.
+    let origin_chain_deadline = chrono::Utc::now() + chrono::Duration::hours(6);
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::chain_execution_timeout
+                .eq(Some(chrono::Duration::days(7))),
+            harvest_workflow_executions::chain_deadline_at.eq(Some(origin_chain_deadline)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("set origin chain columns");
+    drop(conn);
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info(
+            "retry_chain_cap_wf",
+            fail_once_then_succeed_handler,
+            Some(policy),
+        )],
+        make_shared_state(counter),
+        metrics.clone(),
+    ));
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&pool)).await;
+    });
+
+    let mut check = connect(&url).await;
+    let retry_exec = wait_for_retry_state(&mut check, exec_id, &["COMPLETED"]).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+
+    assert_eq!(get_attempt(&mut check, retry_exec).await, 2);
+
+    let (retry_timeout, retry_deadline): (
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = harvest_workflow_executions::table
+        .find(retry_exec.as_uuid())
+        .select((
+            harvest_workflow_executions::chain_execution_timeout,
+            harvest_workflow_executions::chain_deadline_at,
+        ))
+        .first(&mut check)
+        .await
+        .expect("load retry chain columns");
+
+    assert_eq!(
+        retry_timeout,
+        Some(chrono::Duration::days(7)),
+        "the retry carries the chain-cap DURATION"
+    );
+    let dl = retry_deadline.expect("retry chain deadline must be set");
+    let delta = (dl - origin_chain_deadline).num_milliseconds().abs();
+    assert!(
+        delta < 1000,
+        "the retry's chain_deadline_at must equal the origin's ABSOLUTE value \
+         (carried verbatim, NOT recomputed as now + 7d): got {dl}, expected {origin_chain_deadline}"
+    );
+    // Falsify the re-anchor hypothesis: a re-anchored (now + 7d) deadline would be
+    // days in the future; the verbatim value is only ~6h out.
+    assert!(
+        dl < chrono::Utc::now() + chrono::Duration::days(1),
+        "a re-anchored now+7d deadline would be days out; verbatim is ~6h"
+    );
 }

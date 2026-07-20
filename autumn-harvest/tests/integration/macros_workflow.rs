@@ -22,6 +22,52 @@ async fn concurrency_workflow(_ctx: &WorkflowContext, _input: String) -> Result<
     Ok("done".into())
 }
 
+// Issue #617: chain-scoped lifetime cap attribute + per-run execution_timeout.
+#[workflow(execution_timeout = "30m", chain_execution_timeout = "7d")]
+async fn long_poller(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[test]
+fn workflow_chain_execution_timeout_attribute_parses(/* issue #617 */) {
+    let info = __autumn_workflow_info_long_poller();
+    assert_eq!(info.name, "long_poller");
+    // The per-run and chain caps are independent.
+    assert_eq!(
+        info.execution_timeout,
+        Some(std::time::Duration::from_secs(1_800)),
+        "execution_timeout = '30m'"
+    );
+    let chain = info
+        .chain_execution_timeout
+        .expect("chain_execution_timeout = '7d' must produce Some(...)");
+    assert_eq!(
+        chain,
+        std::time::Duration::from_secs(7 * 86_400),
+        "7d = 604800 seconds"
+    );
+}
+
+#[test]
+fn workflow_without_chain_attribute_has_none() {
+    let info = __autumn_workflow_info_test_workflow();
+    assert!(
+        info.chain_execution_timeout.is_none(),
+        "no chain_execution_timeout attribute → None (issue #617)"
+    );
+}
+
+#[test]
+fn workflow_info_with_chain_execution_timeout_builder_sets_field() {
+    // Issue #617: fluent builder parity with `with_execution_timeout`.
+    let info = __autumn_workflow_info_test_workflow()
+        .with_chain_execution_timeout(std::time::Duration::from_secs(3_600));
+    assert_eq!(
+        info.chain_execution_timeout,
+        Some(std::time::Duration::from_secs(3_600))
+    );
+}
+
 #[test]
 fn workflow_companion_exists_and_returns_info() {
     let info = __autumn_workflow_info_test_workflow();

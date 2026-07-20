@@ -96,6 +96,14 @@ pub struct WorkflowExecution {
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
     pub deadline_at: Option<DateTime<Utc>>,
+    /// Chain-scoped lifetime cap DURATION (issue #617). Distinct from the per-run
+    /// `execution_timeout`: anchored at the chain-origin start and carried verbatim
+    /// across every continue-as-new. `None` = no chain cap configured.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC chain deadline (issue #617). Computed at the chain-origin start
+    /// as `started_at + chain_execution_timeout` and copied verbatim into every
+    /// continue-as-new successor (never recomputed). `None` = no chain cap.
+    pub chain_deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -223,6 +231,11 @@ pub struct NewWorkflowExecution<'a> {
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// NULL = no deadline enforced.
     pub deadline_at: Option<DateTime<Utc>>,
+    /// Chain-scoped lifetime cap DURATION (issue #617). `None` = no chain cap.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC chain deadline (issue #617). Anchored at the chain-origin
+    /// start and carried verbatim across continue-as-new. `None` = no chain cap.
+    pub chain_deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     /// Build ID from the active build policy for this queue at start time.
