@@ -67,6 +67,8 @@ mod metrics_coverage;
 mod metrics_integration;
 mod metrics_rs_adapter;
 mod migration_hygiene;
+#[cfg(feature = "db")]
+mod mutex_tests;
 mod nd_block_tests;
 mod panic_containment_tests;
 mod pause_tests;
