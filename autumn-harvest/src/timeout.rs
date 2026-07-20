@@ -879,8 +879,7 @@ async fn enforce_activity_timeout(
                 activity_id,
                 timeout_type: reason.timeout_type(),
             };
-            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id)
-                .await?;
+            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(true)
@@ -1184,41 +1183,37 @@ pub async fn force_fail_activity(
         // mirroring `enforce_activity_timeout`'s no-op treatment of the
         // same edge; the stuck RUNNING row only reconciles if the
         // in-flight worker attempt eventually returns.
-        let activity_id =
-            match pending_activity_id_for_task(&history.events, &task, &activity_name) {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    return Err(terminal_history_conflict(&activity_name, task_id));
-                }
-                // Legacy rows (`activity_id = NULL`) resolve through the
-                // name-based fallback, whose `NotFound` cannot distinguish
-                // "never scheduled" from "already terminal". Map the
-                // terminal-in-history case onto the same documented `409` as
-                // the `Ok(None)` branch above instead of letting it
-                // `?`-propagate as a `404`. `pending_activity_id_for_task`
-                // itself is deliberately unchanged — its other callers
-                // (worker finalize, broken-session reclaim) depend on the
-                // current contract.
-                Err(HarvestError::NotFound(_))
-                    if task.activity_id.is_none()
-                        && named_activity_has_terminal_event(
-                            &history.events,
-                            &activity_name,
-                        ) =>
-                {
-                    return Err(terminal_history_conflict(&activity_name, task_id));
-                }
-                Err(e) => return Err(e),
-            };
+        let activity_id = match pending_activity_id_for_task(&history.events, &task, &activity_name)
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return Err(terminal_history_conflict(&activity_name, task_id));
+            }
+            // Legacy rows (`activity_id = NULL`) resolve through the
+            // name-based fallback, whose `NotFound` cannot distinguish
+            // "never scheduled" from "already terminal". Map the
+            // terminal-in-history case onto the same documented `409` as
+            // the `Ok(None)` branch above instead of letting it
+            // `?`-propagate as a `404`. `pending_activity_id_for_task`
+            // itself is deliberately unchanged — its other callers
+            // (worker finalize, broken-session reclaim) depend on the
+            // current contract.
+            Err(HarvestError::NotFound(_))
+                if task.activity_id.is_none()
+                    && named_activity_has_terminal_event(&history.events, &activity_name) =>
+            {
+                return Err(terminal_history_conflict(&activity_name, task_id));
+            }
+            Err(e) => return Err(e),
+        };
 
         // Build the typed failure once and derive both persisted forms
         // from it: the wire envelope stored on the task row, and the
         // event fields decoded through `parse_error_payload_full` — the
         // exact decoder `worker::finalize_activity_failure` uses, so the
         // two recording paths cannot diverge.
-        let envelope =
-            crate::failure::ActivityFailure::operator_force_failed(reason.as_deref())
-                .into_error_payload();
+        let envelope = crate::failure::ActivityFailure::operator_force_failed(reason.as_deref())
+            .into_error_payload();
         let parsed = crate::failure::parse_error_payload_full(&envelope);
         let failed_event = WorkflowEvent::ActivityFailed {
             activity_id,
@@ -1258,12 +1253,10 @@ async fn enforce_workflow_timeout(
     let (deferred_starts, closed_children) = conn
         .transaction::<_, HarvestError, _>(async |conn| {
             let error = error.clone();
-            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id)
-                .await?;
+            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
             update_workflow_execution_timed_out(conn, exec_id, &error).await?;
             queue::fail_task(conn, task.id, &error).await?;
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,

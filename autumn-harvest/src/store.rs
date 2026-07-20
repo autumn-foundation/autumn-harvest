@@ -552,9 +552,7 @@ pub async fn admit_update_event(
                 .optional()
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| {
-                    crate::error::HarvestError::NotFound(format!(
-                        "workflow execution {exec_id}"
-                    ))
+                    crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
                 })?;
 
             // Reject updates submitted while the execution is paused with a

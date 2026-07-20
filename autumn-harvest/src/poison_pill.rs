@@ -459,9 +459,7 @@ mod scanner {
                     .map_err(crate::error::database_error)?;
                 match current {
                     Some((state, Some(wid), strikes))
-                        if state == "RUNNING"
-                            && wid == worker_id
-                            && strikes == prior_strikes => {}
+                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
                     _ => return Ok((false, None, Vec::new(), Vec::new())),
                 }
                 if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {

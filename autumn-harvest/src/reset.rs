@@ -770,8 +770,7 @@ pub async fn reset_workflow_execution(
             let plan = validate_reset_point(&events, reset_event_id)?;
 
             let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-            let source_next_event_id =
-                rows.last().map_or(0, |row| row.event_id.saturating_add(1));
+            let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
 
             let (deferred, closed_children) = terminate_source_execution(
                 conn,
@@ -792,11 +791,9 @@ pub async fn reset_workflow_execution(
             )
             .await?;
             let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
-            let source_external_cancelled =
-                cancel_pending_external_tasks(conn, exec_id).await?;
+            let source_external_cancelled = cancel_pending_external_tasks(conn, exec_id).await?;
             let signals_buffered =
-                reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply)
-                    .await?;
+                reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
 
             enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
 

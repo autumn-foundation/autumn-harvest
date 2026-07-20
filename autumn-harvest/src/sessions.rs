@@ -799,8 +799,7 @@ async fn break_session_and_fail_members(
             else {
                 continue;
             };
-            let Some(state) = crate::timeout::task_state_for_update(conn, task.id).await?
-            else {
+            let Some(state) = crate::timeout::task_state_for_update(conn, task.id).await? else {
                 continue;
             };
             if state != "PENDING" && state != "RUNNING" {

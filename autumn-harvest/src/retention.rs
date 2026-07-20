@@ -2560,10 +2560,8 @@ mod legal_hold_db {
                             .eq::<Option<DateTime<Utc>>>(None),
                         harvest_workflow_executions::legal_hold_until
                             .eq::<Option<DateTime<Utc>>>(None),
-                        harvest_workflow_executions::legal_hold_reason
-                            .eq::<Option<String>>(None),
-                        harvest_workflow_executions::legal_hold_actor
-                            .eq::<Option<String>>(None),
+                        harvest_workflow_executions::legal_hold_reason.eq::<Option<String>>(None),
+                        harvest_workflow_executions::legal_hold_actor.eq::<Option<String>>(None),
                     ))
                     .execute(conn)
                     .await

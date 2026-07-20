@@ -802,14 +802,13 @@ pub async fn start_or_load_workflow_execution_collect(
                 // row. Excludes the new row (`id != exec_id`) as a safety
                 // guard — the new row has state RUNNING, not COMPLETED, so it
                 // can never match, but the explicit exclusion is defensive.
-                let (carryover_result, carryover_error) = if let Some(sched_id) =
-                    request.schedule_id
-                {
-                    resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for)
-                        .await?
-                } else {
-                    (None, None)
-                };
+                let (carryover_result, carryover_error) =
+                    if let Some(sched_id) = request.schedule_id {
+                        resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for)
+                            .await?
+                    } else {
+                        (None, None)
+                    };
                 let started_event = WorkflowEvent::WorkflowStarted {
                     input: request.input.clone(),
                     timestamp: target_start_time,
@@ -879,9 +878,7 @@ pub async fn start_or_load_workflow_execution_collect(
                         // Seal race: retry with a fresh statement snapshot until
                         // the winner's replacement row is visible or the cap is
                         // exhausted (then fall through to the terminal NotFound).
-                        Err(HarvestError::NotFound(_))
-                            if attempt < SEAL_RACE_MAX_LOAD_RETRIES =>
-                        {
+                        Err(HarvestError::NotFound(_)) if attempt < SEAL_RACE_MAX_LOAD_RETRIES => {
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 SEAL_RACE_LOAD_BACKOFF_MS,
                             ))
@@ -983,12 +980,10 @@ pub async fn start_or_load_workflow_execution_collect(
                         Vec::new(),
                     )),
 
-                    WorkflowIdReusePolicy::RejectDuplicate => {
-                        Err(HarvestError::AlreadyExists {
-                            existing_exec_id: ExecutionId::from_uuid(existing.id),
-                            existing_state: existing.state,
-                        })
-                    }
+                    WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
+                        existing_exec_id: ExecutionId::from_uuid(existing.id),
+                        existing_state: existing.state,
+                    }),
 
                     WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
                         match existing.state.as_str() {
@@ -2114,9 +2109,7 @@ pub async fn cancel_workflow_execution_collect(
                 .await
                 .optional()
                 .map_err(database_error)?
-                .ok_or_else(|| {
-                    HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                })?;
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
             // Cancellation beats pause (issue #383): a PAUSED execution
             // is cancellable just like a RUNNING one; the transition to
@@ -2174,9 +2167,7 @@ pub async fn cancel_workflow_execution_collect(
                 execution
                     .sla_deadline_at
                     .map(|d| match execution.paused_at {
-                        Some(p) if d > p => {
-                            d + (completed_at - p).max(chrono::Duration::zero())
-                        }
+                        Some(p) if d > p => d + (completed_at - p).max(chrono::Duration::zero()),
                         _ => d,
                     })
             } else {
@@ -2192,8 +2183,7 @@ pub async fn cancel_workflow_execution_collect(
                         harvest_workflow_executions::completed_at.eq(Some(completed_at)),
                         harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
                         // Cancellation wins: clear the pending pause record.
-                        harvest_workflow_executions::paused_at
-                            .eq(None::<chrono::DateTime<Utc>>),
+                        harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
                         harvest_workflow_executions::pause_reason.eq(None::<String>),
                         harvest_workflow_executions::pause_actor.eq(None::<String>),
                     ))
@@ -2224,8 +2214,7 @@ pub async fn cancel_workflow_execution_collect(
                 format!("child workflow cancelled: {reason}"),
             )
             .await?;
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,
@@ -2434,9 +2423,7 @@ pub async fn pause_workflow_execution(
                 .await
                 .optional()
                 .map_err(database_error)?
-                .ok_or_else(|| {
-                    HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                })?;
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
             match execution.state.as_str() {
                 "RUNNING" => {}
@@ -2754,9 +2741,7 @@ pub async fn resume_workflow_execution(
                 .await
                 .optional()
                 .map_err(database_error)?
-                .ok_or_else(|| {
-                    HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                })?;
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
             if execution.state != "PAUSED" {
                 // Success no-op (issue #609, AC7): idempotent operator
@@ -2796,8 +2781,7 @@ pub async fn resume_workflow_execution(
                     .filter(harvest_workflow_executions::state.eq("PAUSED"))
                     .set((
                         harvest_workflow_executions::state.eq("RUNNING"),
-                        harvest_workflow_executions::paused_at
-                            .eq(None::<chrono::DateTime<Utc>>),
+                        harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
                         harvest_workflow_executions::pause_reason.eq(None::<String>),
                         harvest_workflow_executions::pause_actor.eq(None::<String>),
                         harvest_workflow_executions::deadline_at.eq(new_deadline_at),
@@ -3292,9 +3276,7 @@ pub async fn terminate_workflow_execution_collect(
                 .await
                 .optional()
                 .map_err(database_error)?
-                .ok_or_else(|| {
-                    HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                })?;
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
             // Idempotent no-op against any already-terminal state
             // (issue #504, AC #7): never append a duplicate terminal
@@ -3333,9 +3315,7 @@ pub async fn terminate_workflow_execution_collect(
                 execution
                     .sla_deadline_at
                     .map(|d| match execution.paused_at {
-                        Some(p) if d > p => {
-                            d + (completed_at - p).max(chrono::Duration::zero())
-                        }
+                        Some(p) if d > p => d + (completed_at - p).max(chrono::Duration::zero()),
                         _ => d,
                     })
             } else {
@@ -3377,8 +3357,7 @@ pub async fn terminate_workflow_execution_collect(
                 format!("child workflow terminated: {reason}"),
             )
             .await?;
-            let (mut deferred, closed_children) =
-                apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
             // Force-terminate fires `Terminated` completion triggers, NOT
             // `Cancelled` — a force-kill is distinct from a cooperative
             // cancellation downstream (issue #504). Operators opt into
@@ -4001,8 +3980,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     // A signal-/update-with-start never inherits a chain
                     // deadline — it always begins a fresh chain origin.
                     chain_execution_timeout: request.chain_execution_timeout,
-                    max_workflow_chain_timeout_ceiling: request
-                        .max_workflow_chain_timeout_ceiling,
+                    max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
                     inherited_chain_deadline_at: None,
                     concurrency_key: request.concurrency_key.clone(),
                     concurrency_limit: request.concurrency_limit,
@@ -4604,8 +4582,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                     // A signal-/update-with-start never inherits a chain
                     // deadline — it always begins a fresh chain origin.
                     chain_execution_timeout: request.chain_execution_timeout,
-                    max_workflow_chain_timeout_ceiling: request
-                        .max_workflow_chain_timeout_ceiling,
+                    max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
                     inherited_chain_deadline_at: None,
                     concurrency_key: request.concurrency_key.clone(),
                     concurrency_limit: request.concurrency_limit,
@@ -4643,29 +4620,31 @@ pub async fn update_with_start_workflow_execution_with_metrics(
             // rolls back via DebounceFreshStart without cancelling/spawning before
             // the rejection (issue #499). Attach returns the existing live run.
             let started = if request.reject_fresh_if_debounced {
-                let (s, mut deferred, mut checks, mut metrics_list) = start_or_load_workflow_execution_collect(
-                    conn,
-                    build_start_request(request.exec_id, effective_policy),
-                    true,
-                    true,
-                    metrics,
-                    None,
-                )
-                .await?;
+                let (s, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        build_start_request(request.exec_id, effective_policy),
+                        true,
+                        true,
+                        metrics,
+                        None,
+                    )
+                    .await?;
                 deferred_starts.append(&mut deferred);
                 deferred_checks.append(&mut checks);
                 cancel_metrics.append(&mut metrics_list);
                 s
             } else {
-                let (s, mut deferred, mut checks, mut metrics_list) = start_or_load_workflow_execution_collect(
-                    conn,
-                    build_start_request(request.exec_id, effective_policy),
-                    true,
-                    false,
-                    metrics,
-                    gate,
-                )
-                .await?;
+                let (s, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        build_start_request(request.exec_id, effective_policy),
+                        true,
+                        false,
+                        metrics,
+                        gate,
+                    )
+                    .await?;
                 deferred_starts.append(&mut deferred);
                 deferred_checks.append(&mut checks);
                 cancel_metrics.append(&mut metrics_list);
@@ -4697,15 +4676,19 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
                 ) {
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                let (fresh, mut deferred, mut checks, mut metrics_list) = start_or_load_workflow_execution_collect(
-                    conn,
-                    build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
-                    true,
-                    false,
-                    metrics,
-                    gate,
-                )
-                .await?;
+                let (fresh, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        build_start_request(
+                            fresh_exec_id,
+                            WorkflowIdReusePolicy::TerminateIfRunning,
+                        ),
+                        true,
+                        false,
+                        metrics,
+                        gate,
+                    )
+                    .await?;
                 deferred_starts.append(&mut deferred);
                 deferred_checks.append(&mut checks);
                 cancel_metrics.append(&mut metrics_list);

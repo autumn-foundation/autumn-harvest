@@ -293,9 +293,7 @@ pub async fn admit_batched_start(
                         concurrency_key: opts.concurrency_key,
                         concurrency_limit: opts.concurrency_limit,
                         priority,
-                        max_workflow_input_bytes: opts
-                            .max_workflow_input_bytes
-                            .unwrap_or(u64::MAX),
+                        max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,

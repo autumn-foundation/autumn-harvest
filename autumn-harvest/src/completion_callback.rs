@@ -2501,8 +2501,7 @@ async fn apply_outcome(
             last_error,
         } => {
             conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
-                let entry =
-                    dead_letter_entry_with_current_payload(conn, row, last_status).await?;
+                let entry = dead_letter_entry_with_current_payload(conn, row, last_status).await?;
 
                 let updated = diesel::update(
                     dsl::harvest_completion_deliveries

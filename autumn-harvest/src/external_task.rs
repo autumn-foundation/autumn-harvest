@@ -421,10 +421,8 @@ pub async fn extend_deadline(
         let exec_id = ExecutionId::from_uuid(task.workflow_exec_id);
         let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
-        let dur = crate::worker::chrono_duration_from_secs(
-            extend_by_secs,
-            "external task extend by",
-        )?;
+        let dur =
+            crate::worker::chrono_duration_from_secs(extend_by_secs, "external task extend by")?;
 
         let new_deadline = Utc::now().checked_add_signed(dur).ok_or_else(|| {
             crate::error::HarvestError::Database("Datetime addition overflow".to_string())

@@ -612,10 +612,8 @@ pub async fn replay_dead_letter(
                     && let Some(info) = reg.workflows.get(&workflow_name)
                     && let Some(policy) = &info.concurrency
                 {
-                    params.concurrency_key = crate::concurrency::resolve_concurrency_key(
-                        policy.key_expr,
-                        &params.input,
-                    );
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
                     params.max_concurrent = Some(policy.limit);
                 }
             }
@@ -1077,9 +1075,8 @@ pub async fn redrive_dead_letter(
                     .optional()
                     .map_err(crate::error::database_error)?;
 
-            let (build_id, workflow_name, state) = row.ok_or_else(|| {
-                HarvestError::NotFound(format!("workflow execution {exec_uuid}"))
-            })?;
+            let (build_id, workflow_name, state) = row
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_uuid}")))?;
 
             match state.as_str() {
                 // Live execution already owns the work — converge state by
