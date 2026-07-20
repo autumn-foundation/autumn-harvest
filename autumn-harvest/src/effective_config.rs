@@ -158,6 +158,8 @@ pub struct WorkerConfigView {
     pub max_workflow_history_events: Option<u64>,
     /// Default debounce max-wait cap, milliseconds.
     pub default_debounce_max_wait_ms: u64,
+    /// Durable-mutex (`ctx.mutex`) lease TTL, milliseconds (issue #691).
+    pub mutex_lease_ttl_ms: u64,
     /// Whether the adaptive dispatch-slot tuner is enabled.
     pub slot_tuner_enabled: bool,
     /// Advertised concurrent worker-session capacity (0 = sessions disabled).
@@ -267,6 +269,7 @@ impl WorkerConfigView {
             labels,
             max_workflow_history_events,
             default_debounce_max_wait,
+            mutex_lease_ttl,
             slot_tuner,
             // REDACTED — presence/count only, never the live handle. Bound above.
             #[cfg(feature = "db")]
@@ -306,6 +309,11 @@ impl WorkerConfigView {
             labels: labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             max_workflow_history_events: *max_workflow_history_events,
             default_debounce_max_wait_ms: dur_ms(*default_debounce_max_wait),
+            // Mirror the sibling `_ms` fields: surface the resolved TTL straight
+            // from the bound `WorkerConfig` field (the authoritative per-config
+            // value), rather than reading the process-global — the global is set
+            // from this same field at `From<WorkerConfig>` time (issue #691).
+            mutex_lease_ttl_ms: dur_ms(*mutex_lease_ttl),
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
             workflow_panic_max_attempts: *workflow_panic_max_attempts,

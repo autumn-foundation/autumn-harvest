@@ -310,6 +310,11 @@ impl WorkerRuntimeConfig {
 
 impl From<WorkerConfig> for WorkerRuntimeConfig {
     fn from(cfg: WorkerConfig) -> Self {
+        // Publish the configured mutex lease TTL to the process-global static
+        // read by the acquire/renewal paths (issue #691), mirroring how
+        // `start_idempotency::set_purge_window_secs` threads a duration knob
+        // without a new field on every call site.
+        crate::mutex::set_mutex_lease_ttl(cfg.mutex_lease_ttl);
         if let Some(first_queue) = cfg.queues.as_slice().first()
             && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
             && lock.is_none()
@@ -16559,6 +16564,7 @@ mod tests {
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             default_debounce_max_wait: Duration::from_secs(3600),
+            mutex_lease_ttl: crate::mutex::DEFAULT_MUTEX_LEASE_TTL,
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
             queue_weights: std::collections::HashMap::new(),

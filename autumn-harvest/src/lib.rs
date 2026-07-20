@@ -165,6 +165,8 @@ mod loom_sync;
 /// Enabled by the `metrics-rs` cargo feature.
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
+/// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
+pub mod mutex;
 pub mod payload_codec;
 pub mod payload_store;
 pub mod poison_pill;
@@ -368,6 +370,10 @@ pub use info::{
 };
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
+};
+pub use mutex::{
+    DEFAULT_MUTEX_LEASE_TTL, MutexGrantOutcome, MutexWakeTarget, effective_mutex_lease_ttl,
+    set_mutex_lease_ttl,
 };
 pub use payload_codec::{
     CodecError, IdentityCodec, LossyDecodeOutcome, PayloadCodec, PayloadCodecs,
