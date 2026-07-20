@@ -135,6 +135,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_saga_compensation_failed` | Sagas | Saga compensation failures | [runbook](../runbooks/harvest-alerts.md#harvest_saga_compensation_failed) |
 | `harvest_update_rejected_rate` | Signal & update lifecycle | Update validator rejections | [runbook](../runbooks/harvest-alerts.md#harvest_update_rejected_rate) |
 | `harvest_signal_unhandled_rate` | Signal & update lifecycle | Unhandled signals | [runbook](../runbooks/harvest-alerts.md#harvest_signal_unhandled_rate) |
+| `harvest_workflow_population_leak` | Workflow lifecycle | Active workflows by type & state | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_population_leak) |
 
 ### Readiness-style alerts (no native metric)
 

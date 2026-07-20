@@ -48,6 +48,7 @@ allos        autumn-harvest-plugin  security                         -          
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
+linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
