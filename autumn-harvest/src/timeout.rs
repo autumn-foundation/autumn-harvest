@@ -2649,6 +2649,25 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    // Reclaim expired durable-mutex leases (crash recovery, issue #691) and wake
+    // each freed key's new head of line. Shard-local: it runs against this
+    // connection's own database (like `enforce_broken_sessions`), and is a no-op
+    // when the mutex tables are absent (guarded internally).
+    //
+    // MUST run inside an explicit transaction. The reclaim takes a per-key
+    // `pg_advisory_xact_lock` before re-checking the lease and fencing the
+    // delete/wake — the mutex-vs-acquire race guard depends on that advisory
+    // being HELD across the whole per-key section. `enforce_timeouts_once` runs
+    // in autocommit (its body is not wrapped in a `conn.transaction`), so
+    // calling the reclaim directly would let each `pg_advisory_xact_lock` drop
+    // the instant its statement returns, defeating the guard. Wrapping the call
+    // in `conn.transaction(...)` keeps every advisory-xact lock alive until the
+    // transaction commits.
+    count += conn
+        .transaction::<usize, HarvestError, _>(|conn| {
+            async move { crate::mutex::reclaim_expired_leases_and_wake(conn).await }.scope_boxed()
+        })
+        .await?;
     Ok(count)
 }
 

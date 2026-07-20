@@ -17863,6 +17863,15 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
+        WorkflowResetError::HolderHoldsMutex { exec_id, key } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} holds durable mutex '{key}'; release it before resetting"
+                ),
+            }),
+        )
+            .into_response(),
         WorkflowResetError::Harvest(error) => map_error(error).into_response(),
     }
 }

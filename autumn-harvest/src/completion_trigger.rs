@@ -1161,6 +1161,17 @@ pub fn evaluate_triggers_for_execution<'a>(
         crate::completion_callback::enqueue_completion_deliveries(conn, &execution, exec_id, state)
             .await?;
 
+        // Durable mutex terminal auto-release (issue #691): this is the single
+        // per-terminal-transition chokepoint (complete/fail/cancel/terminate/
+        // timeout/poison-pill), so releasing every lock a now-terminal holder
+        // held and waking the next waiters here covers every terminal path in
+        // one place. It runs inside this same terminal transaction, so the
+        // per-key `pg_advisory_xact_lock`s the release/wake take hold across the
+        // whole sweep. A no-op when the mutex tables are absent (guarded). The
+        // non-terminal nd-block path (issue #603) deliberately does NOT reach
+        // this function, so a blocked holder keeps its locks.
+        crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
+
         let triggers = triggers_dsl::harvest_completion_triggers
             .filter(triggers_dsl::source_workflow_name.eq(&execution.workflow_name))
             .load::<CompletionTriggerDb>(conn)

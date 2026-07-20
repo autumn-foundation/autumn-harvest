@@ -2786,6 +2786,24 @@ pub async fn resume_workflow_execution(
                     )));
                 }
 
+                // Refresh any durable-mutex leases this holder owns (issue
+                // #691). A PAUSED holder stops running decision cycles, so it
+                // stops renewing its leases; the lease-reclaim scanner skips
+                // PAUSED holders while paused, but on resume the lease may be
+                // stale, so push it forward now (inside the same transaction
+                // that flips PAUSED->RUNNING) to preserve mutual exclusion —
+                // otherwise the very next scanner tick could reclaim a lock the
+                // resumed holder still believes it holds. A no-op when the
+                // mutex tables are absent (guarded). cancel/terminate are
+                // already covered by the terminal sweep in
+                // `evaluate_triggers_for_execution`.
+                crate::mutex::renew_leases_for_holder(
+                    conn,
+                    exec_id,
+                    crate::mutex::effective_mutex_lease_ttl(),
+                )
+                .await?;
+
                 shift_schedule_to_close_for_resume(conn, exec_id, pause_span).await?;
 
                 // Re-arm the executor: wake the parked workflow task so the
