@@ -256,6 +256,14 @@ pub enum QueryReplayOutcome {
 ///   timer+signal race shape (issue #600) this is a pure, deterministic function
 ///   of already-resolved history (the winner is fixed by recorded order), so it
 ///   is re-emitted identically on every replay and carries no new information.
+/// - [`ReleaseMutex`](WorkflowCommand::ReleaseMutex): a durable mutex release
+///   (issue #691) is event-less bookkeeping — a dropped [`MutexGuard`] always
+///   pushes exactly one release, deterministically, and it appends nothing to
+///   `harvest_events`. Like `CancelRaceLosers` it is re-emitted identically on
+///   every replay (the guard reconstructs from the recorded `MutexGranted`
+///   anchor), so a mutex-holding workflow that completes/continues with the
+///   guard dropped must NOT be flagged as "new commands emitted beyond recorded
+///   history" on the strict/canary replay path.
 ///
 /// This is the **single source of truth** for two callers that must agree, so
 /// the command classification is never re-enumerated by hand:
@@ -277,6 +285,7 @@ pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ReleaseMutex { .. }
     )
 }
 

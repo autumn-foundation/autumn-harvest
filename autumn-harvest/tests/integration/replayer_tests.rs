@@ -271,6 +271,79 @@ fn session_pipeline_workflow<'a>(
     })
 }
 
+// ──────────────────────────── mutex (issue #691) ─────────────────────────────
+//
+// Durable mutex replay contract: `ctx.mutex(key).acquire()` records a single
+// `MutexGranted { key, lock_seq, acquired_at }` anchor when the lock is granted
+// (the matcher is strictly positional); release is event-less bookkeeping. So a
+// recorded `[WorkflowStarted, MutexGranted]` history replays with 100% fidelity
+// regardless of which `lock_seq` was minted at grant time.
+
+/// Acquire a durable mutex, use the guard for a trivial critical section, drop
+/// it at scope end, and complete.
+fn mutex_grant_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+        // Trivial critical section — read the fencing token so the guard is used.
+        let _seq = guard.lock_seq();
+        Ok(serde_json::json!({"held": guard.key()}))
+    })
+}
+
+/// Acquire "k", release explicitly, then run an activity — proves the event-less
+/// release replays cleanly *before* a subsequent recorded event (the activity).
+fn mutex_release_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+        guard.release();
+        let r = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"step": r}))
+    })
+}
+
+/// Acquire key "a" — used to prove a recorded `MutexGranted { key: "b" }`
+/// diverges as a `MutexGrantMismatch` (key-divergence detection).
+fn mutex_grant_key_a_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _guard = ctx.mutex("a").acquire().await.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Hold "k", then re-acquire the same key. The self-deadlock guard must fire
+/// **synchronously** (before any positional history match), so the caught
+/// `MutexSelfDeadlock` branch replays deterministically rather than diverging —
+/// the P1 regression this pins (issue #691 review: a self-deadlock checked
+/// *after* the positional match returns the typed error live but nd-blocks on
+/// replay).
+fn mutex_self_deadlock_caught_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let g1 = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+        let result = match ctx.mutex("k").acquire().await {
+            Ok(_) => Err("expected a self-deadlock error".to_string()),
+            Err(e) if e.is_mutex_self_deadlock() => Ok(serde_json::json!("caught_self_deadlock")),
+            Err(e) => Err(e.to_string()),
+        };
+        drop(g1);
+        result
+    })
+}
+
 /// Workflow that starts a timer before any activities.
 fn timer_first_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -1284,6 +1357,16 @@ fn build_replayer() -> WorkflowReplayer {
             "await_external_concurrent_timer_workflow",
             await_external_concurrent_timer_wf,
         )
+        .register_fn("mutex_grant_workflow", mutex_grant_workflow)
+        .register_fn(
+            "mutex_release_then_activity_workflow",
+            mutex_release_then_activity_workflow,
+        )
+        .register_fn("mutex_grant_key_a_workflow", mutex_grant_key_a_workflow)
+        .register_fn(
+            "mutex_self_deadlock_caught_workflow",
+            mutex_self_deadlock_caught_workflow,
+        )
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -2151,6 +2234,183 @@ async fn replay_session_pipeline_workflow_succeeds_regardless_of_recorded_host_w
             "replay must succeed identically for recorded host '{host}', got: {report}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// (a4) Durable mutex (issue #691) replays deterministically. A granted lock is
+//      anchored by a single `MutexGranted` event; release is event-less
+//      bookkeeping. Replay recovers the guard from the recorded grant regardless
+//      of which `lock_seq` was minted, and a key divergence / self-deadlock are
+//      classified precisely.
+// ---------------------------------------------------------------------------
+
+/// History for a granted durable mutex on `key`: `[WorkflowStarted,
+/// MutexGranted { key, lock_seq, acquired_at }]`. Release records no event.
+fn mutex_grant_history(key: &str, lock_seq: i64) -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MutexGranted {
+            key: key.to_string(),
+            lock_seq,
+            acquired_at: Utc::now(),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replay_workflow_with_mutex_grant_succeeds() {
+    let (exec_id, events) = mutex_grant_history("k", 1);
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("mutex_grant_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a workflow that acquires a durable mutex must replay against its \
+         recorded MutexGranted history (release is event-less bookkeeping), \
+         got: {report}"
+    );
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
+}
+
+/// AC6 (issue #691): replay is deterministic across unbounded cycles regardless
+/// of which fencing token (`lock_seq`) was minted at grant time. Build 1000
+/// *distinct* fixtures, each varying the recorded `lock_seq` (and grant instant),
+/// and assert every one replays `ReplaySucceeded`.
+#[tokio::test]
+async fn replay_workflow_with_mutex_grant_succeeds_across_unbounded_cycles() {
+    let replayer = build_replayer();
+
+    for i in 0..1000_usize {
+        // Vary the recorded fencing token so no two fixtures are identical —
+        // the workflow recovers whatever `lock_seq` the grant carried.
+        let lock_seq = i64::try_from(i).unwrap_or(i64::MAX).wrapping_add(1);
+        let (exec_id, events) = mutex_grant_history("k", lock_seq);
+
+        let report = replayer
+            .replay_from_snapshot(make_snapshot("mutex_grant_workflow", exec_id, events))
+            .await;
+
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "cycle {i} (lock_seq={lock_seq}): a granted mutex must replay \
+             deterministically regardless of the recorded fencing token, \
+             got: {report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_workflow_mutex_release_before_subsequent_event_succeeds() {
+    // [WorkflowStarted, MutexGranted{k}, ActivityScheduled{step_one},
+    //  ActivityCompleted{step_one}] — the workflow acquires, releases (no event),
+    //  then schedules the activity whose events follow the grant. The event-less
+    //  release must not perturb the positional match of the subsequent activity.
+    let exec_id = ExecutionId::new();
+    let step_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MutexGranted {
+            key: "k".to_string(),
+            lock_seq: 1,
+            acquired_at: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: step_id,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: step_id,
+            output: serde_json::json!("done"),
+        },
+    ];
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "mutex_release_then_activity_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "an explicit mutex release before a subsequent recorded event (the \
+         activity) must replay cleanly — the release is event-less bookkeeping, \
+         got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replay_workflow_mutex_key_divergence_detected() {
+    // The workflow acquires key "a", but the recorded history granted "b" — a
+    // non-deterministic divergence classified as MutexGrantMismatch.
+    let (exec_id, events) = mutex_grant_history("b", 1);
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("mutex_grant_key_a_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::MutexGrantMismatch,
+                ..
+            }
+        ),
+        "acquiring a different mutex key than the recorded grant must be \
+         detected as MutexGrantMismatch, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn mutex_self_deadlock_is_checked_before_positional_match() {
+    // Only ONE MutexGranted is recorded (a self-deadlock never records a second
+    // grant). The workflow acquires "k" (matches the grant), then re-acquires
+    // "k" — which must surface `MutexSelfDeadlock` SYNCHRONOUSLY, before the
+    // positional history match, so the caught branch replays deterministically
+    // rather than nd-blocking (issue #691 review, P1).
+    let (exec_id, events) = mutex_grant_history("k", 1);
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "mutex_self_deadlock_caught_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a self-deadlock caught by the workflow must be raised before the \
+         positional history match, so replay succeeds deterministically \
+         instead of diverging, got: {report}"
+    );
 }
 
 // ---------------------------------------------------------------------------

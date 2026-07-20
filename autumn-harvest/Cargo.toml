@@ -136,6 +136,9 @@ name = "cancellable_timer_sla"
 name = "signal_aggregator"
 
 [[example]]
+name = "mutex_ledger"
+
+[[example]]
 name = "activity_interceptor"
 required-features = ["testing"]
 
