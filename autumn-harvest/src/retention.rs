@@ -1183,7 +1183,7 @@ async fn run_shard_tick(
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
         let cuts_inner = override_cuts.clone();
-        let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
+        let candidates = Box::pin(conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
             // Push each row's exact per-type effective cutoff into the
             // predicate (issue #737, PR #990 review): the correlated
             // `unnest` subquery resolves the override cutoff for this row's
@@ -1274,7 +1274,7 @@ async fn run_shard_tick(
             }
 
             Ok(rows)
-        })
+        }))
         .await?;
 
         // Release the checked-out connection immediately back to the pool
@@ -1782,7 +1782,7 @@ async fn delete_candidate_execution(
 ) -> HarvestResult<CandidateDeleteOutcome> {
     // Copy the policy into the transaction closure (it is `Copy`).
     let summary = summary.copied();
-    conn.transaction::<_, HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         let mut summarized = false;
         // ── Authoritative legal-hold re-check under a row lock (issue #747
         // BLOCKER 1) ─────────────────────────────────────────────────────
@@ -2014,7 +2014,7 @@ async fn delete_candidate_execution(
         .await
         .map_err(database_error)?;
         Ok(CandidateDeleteOutcome::Deleted { summarized })
-    })
+    }))
     .await
 }
 
@@ -2479,55 +2479,57 @@ mod legal_hold_db {
         // read-modify-write against a concurrent set/release (and against the
         // retention delete-tx re-check), rather than releasing at statement end
         // in autocommit mode.
-        conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
-            let (set_at, until, cur_reason, cur_actor) =
-                load_hold_for_update(conn, exec_id).await?;
+        Box::pin(
+            conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
+                let (set_at, until, cur_reason, cur_actor) =
+                    load_hold_for_update(conn, exec_id).await?;
 
-            if legal_hold_active(set_at, until, now) {
-                // Idempotent: an active hold already exists. Do NOT overwrite
-                // provenance — return the existing hold unchanged.
-                return Ok(LegalHoldOutcome {
+                if legal_hold_active(set_at, until, now) {
+                    // Idempotent: an active hold already exists. Do NOT overwrite
+                    // provenance — return the existing hold unchanged.
+                    return Ok(LegalHoldOutcome {
+                        execution_id: exec_id.to_string(),
+                        held: true,
+                        legal_hold_reason: cur_reason,
+                        legal_hold_actor: cur_actor,
+                        legal_hold_set_at: set_at,
+                        legal_hold_until: until,
+                        newly_held: false,
+                        released: false,
+                    });
+                }
+
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .set((
+                        harvest_workflow_executions::legal_hold_set_at.eq(Some(now)),
+                        harvest_workflow_executions::legal_hold_until.eq(hold_until),
+                        harvest_workflow_executions::legal_hold_reason.eq(stored_reason),
+                        harvest_workflow_executions::legal_hold_actor.eq(Some(actor)),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                // Report held/newly_held ACCURATELY (issue #747 MAJOR): a
+                // `hold_until` already in the past writes the columns but places
+                // no ACTIVE hold, so a direct core/CLI caller never gets a false
+                // `held: true`. (The HTTP handler rejects a past `hold_until`
+                // with 400 before reaching here — this is the belt-and-braces
+                // core-layer guard.)
+                let active = legal_hold_active(Some(now), hold_until, now);
+
+                Ok(LegalHoldOutcome {
                     execution_id: exec_id.to_string(),
-                    held: true,
-                    legal_hold_reason: cur_reason,
-                    legal_hold_actor: cur_actor,
-                    legal_hold_set_at: set_at,
-                    legal_hold_until: until,
-                    newly_held: false,
+                    held: active,
+                    legal_hold_reason: stored_reason.map(str::to_string),
+                    legal_hold_actor: Some(actor.to_string()),
+                    legal_hold_set_at: Some(now),
+                    legal_hold_until: hold_until,
+                    newly_held: active,
                     released: false,
-                });
-            }
-
-            diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                .set((
-                    harvest_workflow_executions::legal_hold_set_at.eq(Some(now)),
-                    harvest_workflow_executions::legal_hold_until.eq(hold_until),
-                    harvest_workflow_executions::legal_hold_reason.eq(stored_reason),
-                    harvest_workflow_executions::legal_hold_actor.eq(Some(actor)),
-                ))
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-
-            // Report held/newly_held ACCURATELY (issue #747 MAJOR): a
-            // `hold_until` already in the past writes the columns but places
-            // no ACTIVE hold, so a direct core/CLI caller never gets a false
-            // `held: true`. (The HTTP handler rejects a past `hold_until`
-            // with 400 before reaching here — this is the belt-and-braces
-            // core-layer guard.)
-            let active = legal_hold_active(Some(now), hold_until, now);
-
-            Ok(LegalHoldOutcome {
-                execution_id: exec_id.to_string(),
-                held: active,
-                legal_hold_reason: stored_reason.map(str::to_string),
-                legal_hold_actor: Some(actor.to_string()),
-                legal_hold_set_at: Some(now),
-                legal_hold_until: hold_until,
-                newly_held: active,
-                released: false,
-            })
-        })
+                })
+            }),
+        )
         .await
     }
 
@@ -2549,36 +2551,40 @@ mod legal_hold_db {
         // Read + update in one transaction (issue #747 MINOR 1) so the
         // `FOR UPDATE` lock holds across the clear, serializing against a
         // concurrent set/release.
-        conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
-            let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
+        Box::pin(
+            conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
+                let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
 
-            let was_set = set_at.is_some();
-            if was_set {
-                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                    .set((
-                        harvest_workflow_executions::legal_hold_set_at
-                            .eq::<Option<DateTime<Utc>>>(None),
-                        harvest_workflow_executions::legal_hold_until
-                            .eq::<Option<DateTime<Utc>>>(None),
-                        harvest_workflow_executions::legal_hold_reason.eq::<Option<String>>(None),
-                        harvest_workflow_executions::legal_hold_actor.eq::<Option<String>>(None),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-            }
+                let was_set = set_at.is_some();
+                if was_set {
+                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                        .set((
+                            harvest_workflow_executions::legal_hold_set_at
+                                .eq::<Option<DateTime<Utc>>>(None),
+                            harvest_workflow_executions::legal_hold_until
+                                .eq::<Option<DateTime<Utc>>>(None),
+                            harvest_workflow_executions::legal_hold_reason
+                                .eq::<Option<String>>(None),
+                            harvest_workflow_executions::legal_hold_actor
+                                .eq::<Option<String>>(None),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+                }
 
-            Ok(LegalHoldOutcome {
-                execution_id: exec_id.to_string(),
-                held: false,
-                legal_hold_reason: None,
-                legal_hold_actor: None,
-                legal_hold_set_at: None,
-                legal_hold_until: None,
-                newly_held: false,
-                released: was_set,
-            })
-        })
+                Ok(LegalHoldOutcome {
+                    execution_id: exec_id.to_string(),
+                    held: false,
+                    legal_hold_reason: None,
+                    legal_hold_actor: None,
+                    legal_hold_set_at: None,
+                    legal_hold_until: None,
+                    newly_held: false,
+                    released: was_set,
+                })
+            }),
+        )
         .await
     }
 }

@@ -1190,7 +1190,7 @@ async fn fire_due_on_conn(
 
     // Claim + fire + delete the whole due batch in one transaction so each
     // `FOR UPDATE SKIP LOCKED` lock is held until its row is deleted (or left).
-    let fired: Vec<FiredThrottle> = conn
+    let fired: Vec<FiredThrottle> = Box::pin(conn
         .transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
             let now = Utc::now();
             // Per-key-fair claim (code review P1, issue #607): a flat
@@ -1273,7 +1273,7 @@ async fn fire_due_on_conn(
                 }
             }
             Ok(results)
-        })
+        }))
         .await?;
 
     Ok(fired)

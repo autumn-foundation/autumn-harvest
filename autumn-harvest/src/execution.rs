@@ -684,360 +684,350 @@ pub async fn start_or_load_workflow_execution_collect(
         enqueue.scheduled_at = target_start_time;
     }
 
-    let main_result = conn
-        .transaction::<(
-            StartedWorkflowExecution,
-            Vec<DeferredTriggerStart>,
-            Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
-        ), HarvestError, _>(async |conn| {
-            let row = row;
-            let enqueue = enqueue.clone();
-            let request = request.clone();
-            // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the inner
-            // `async move` captures them directly from this closure's environment.
-            let mut tx_deferred_checks = Vec::new();
+    let main_result = Box::pin(conn.transaction::<(
+        StartedWorkflowExecution,
+        Vec<DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
+        Vec<(String, String)>,
+    ), HarvestError, _>(async |conn| {
+        let row = row;
+        let enqueue = enqueue.clone();
+        let request = request.clone();
+        // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the inner
+        // `async move` captures them directly from this closure's environment.
+        let mut tx_deferred_checks = Vec::new();
 
-            // Authoritative locked gate (issue #618, PR #1014). For every
-            // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
-            // above), take the `FOR UPDATE` lock on any non-sealed prior
-            // FIRST — before the INSERT — so the create-vs-attach decision the
-            // gate keys on is made on ONE stable, locked state. This is the
-            // move that closes the seal-under-lock TOCTOU: a prior that seals
-            // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
-            // and the start is excluded by the `for_update()` filter, so the
-            // fresh replacement it would otherwise leak is caught here. The
-            // lock is reused by the INSERT / `..._by_key_for_update` load
-            // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
-            // this never runs on the debounce path.
-            // Recompute the fast-path predicate from the (cloned) request:
-            // POINT 1 + the pre-check already applied the unlocked gate for the
-            // state-independent `terminate_via_pre_check` case, so skip it here.
-            // Every other policy (incl. conflict-driven Terminate with a
-            // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
-            // `UseExisting`/`Fail`) takes the locked read and keys the gate on
-            // the create-vs-attach decision for the LOCKED prior state.
-            let terminate_via_pre_check = request.reuse_policy
-                == WorkflowIdReusePolicy::TerminateIfRunning
-                && effective_active_conflict_behavior(
-                    request.reuse_policy,
-                    request.conflict_policy,
-                ) == ActiveConflictBehavior::Terminate;
-            if let Some(mode) = gate
-                && !terminate_via_pre_check
-                && !reject_fresh_if_debounced
-            {
-                let prior = try_load_active_execution_for_update(
+        // Authoritative locked gate (issue #618, PR #1014). For every
+        // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
+        // above), take the `FOR UPDATE` lock on any non-sealed prior
+        // FIRST — before the INSERT — so the create-vs-attach decision the
+        // gate keys on is made on ONE stable, locked state. This is the
+        // move that closes the seal-under-lock TOCTOU: a prior that seals
+        // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
+        // and the start is excluded by the `for_update()` filter, so the
+        // fresh replacement it would otherwise leak is caught here. The
+        // lock is reused by the INSERT / `..._by_key_for_update` load
+        // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
+        // this never runs on the debounce path.
+        // Recompute the fast-path predicate from the (cloned) request:
+        // POINT 1 + the pre-check already applied the unlocked gate for the
+        // state-independent `terminate_via_pre_check` case, so skip it here.
+        // Every other policy (incl. conflict-driven Terminate with a
+        // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
+        // `UseExisting`/`Fail`) takes the locked read and keys the gate on
+        // the create-vs-attach decision for the LOCKED prior state.
+        let terminate_via_pre_check = request.reuse_policy
+            == WorkflowIdReusePolicy::TerminateIfRunning
+            && effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
+                == ActiveConflictBehavior::Terminate;
+        if let Some(mode) = gate
+            && !terminate_via_pre_check
+            && !reject_fresh_if_debounced
+        {
+            let prior = try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?;
+            if start_will_create_new_execution(
+                prior.as_ref().map(|e| e.state.as_str()),
+                request.reuse_policy,
+                request.conflict_policy,
+            ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
+                mode,
+                request.workflow_name,
+                request.queue_name,
+                shard_id_value,
+                request.owner,
+            ) {
+                record_start_gate_block(metrics, scope_kind, &reason);
+                return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+            }
+        }
+
+        // `on_conflict_do_nothing()` (no explicit target) lets Postgres
+        // arbitrate against the partial unique index installed by the
+        // continue-as-new migration, which only enforces uniqueness on
+        // rows whose state is not sealed (`CONTINUED_AS_NEW` or
+        // `TERMINATED`). A previously sealed continue-as-new chain or reset
+        // source therefore does not block reusing the same
+        // (workflow_name, workflow_id).
+        let inserted = diesel::insert_into(harvest_workflow_executions::table)
+            .values(&row)
+            .on_conflict_do_nothing()
+            .returning(WorkflowExecution::as_returning())
+            .get_result(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+
+        if let Some(execution) = inserted {
+            // Atomic debounce gate: this INSERT is a fresh start. For a
+            // debounced workflow that must go through debounce admission,
+            // roll it back and signal the caller (no TOCTOU — decided here
+            // under the inserted row, not via an unlocked pre-scan).
+            if reject_fresh_if_debounced {
+                return Err(HarvestError::DebounceFreshStart {
+                    workflow_name: request.workflow_name.to_string(),
+                    workflow_id: request.workflow_id.to_string(),
+                });
+            }
+            if request.start_at.is_some_and(|sa| sa < now) {
+                return Err(HarvestError::Config(
+                    "Requested start_at is in the past".to_string(),
+                ));
+            }
+            // Enforce the input cap only on the fresh-insert path. Duplicates
+            // never reach here so the reuse-policy outcome is unaffected.
+            if request.max_workflow_input_bytes > 0 {
+                let observed = serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
+                if observed > request.max_workflow_input_bytes {
+                    return Err(crate::error::HarvestError::PayloadTooLarge {
+                        kind: crate::error::PayloadKind::WorkflowInput,
+                        observed_bytes: observed,
+                        cap_bytes: request.max_workflow_input_bytes,
+                        workflow_type: request.workflow_name.to_string(),
+                        activity_name: None,
+                    });
+                }
+            }
+            // Resolve last-completion-result carryover (issue #488).
+            // Runs inside the same transaction on the same shard-local
+            // connection so the read is consistent with the just-inserted
+            // row. Excludes the new row (`id != exec_id`) as a safety
+            // guard — the new row has state RUNNING, not COMPLETED, so it
+            // can never match, but the explicit exclusion is defensive.
+            let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
+                resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for).await?
+            } else {
+                (None, None)
+            };
+            let started_event = WorkflowEvent::WorkflowStarted {
+                input: request.input.clone(),
+                timestamp: target_start_time,
+                last_completion_result: carryover_result,
+                last_error: carryover_error,
+                scheduled_time: request.scheduled_for,
+            };
+            store::append_events(conn, exec_id, &[started_event], 0).await?;
+            queue::enqueue(conn, &enqueue).await?;
+            return Ok((
+                StartedWorkflowExecution::from_row(execution, true),
+                Vec::new(),
+                tx_deferred_checks,
+                Vec::new(),
+            ));
+        }
+
+        // INSERT was a no-op: a NON-SEALED prior existed at INSERT time
+        // (the active-uniqueness partial index only covers non-sealed
+        // states). Lock that prior row to decide what to do.
+        //
+        // Seal-race retry (issue #685 review, Codex P2): under concurrent
+        // `terminate_existing` (or any replace-type) starts of the same
+        // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
+        // a concurrent winner has sealed the prior it locked
+        // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
+        // non-sealed filter) and inserted a fresh RUNNING replacement. The
+        // loser's first `FOR UPDATE` SELECT took its statement snapshot
+        // before the winner committed, blocks on the prior's row lock, and
+        // -- on the winner's commit -- sees the prior filtered out via
+        // EvalPlanQual while the winner's freshly-inserted row is invisible
+        // to that same statement's snapshot, so the load returns `None`.
+        //
+        // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
+        // so re-issuing the load after the winner has committed picks up the
+        // replacement RUNNING row and the start CONVERGES (last-writer-wins)
+        // instead of surfacing a transient `NotFound`. The loser holds no
+        // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
+        // never locks the conflicting row, and a `None` `FOR UPDATE` locks
+        // nothing -- so the retry is safe. Once a row IS found and
+        // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
+        // `replace_execution` cannot be sealed out from under us (a rival
+        // must first take the same lock, which blocks until we commit). Each
+        // retry's `FOR UPDATE` naturally blocks on the current lock holder,
+        // so this is not a busy-loop; the small backoff only guards the
+        // pathological "sealed without a replacement" case (e.g. a
+        // concurrent reset), where the cap falls back to the pre-existing
+        // `NotFound`.
+        //
+        // Non-racing requests never reach a `None` here (the prior is still
+        // non-sealed under the lock), so this is transparent to the common
+        // path across every reuse/conflict policy.
+        let existing = {
+            let mut existing: Option<WorkflowExecution> = None;
+            for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
+                match load_workflow_execution_by_key_for_update(
                     conn,
                     request.workflow_name,
                     request.workflow_id,
                 )
-                .await?;
-                if start_will_create_new_execution(
-                    prior.as_ref().map(|e| e.state.as_str()),
-                    request.reuse_policy,
-                    request.conflict_policy,
-                ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
-                    mode,
-                    request.workflow_name,
-                    request.queue_name,
-                    shard_id_value,
-                    request.owner,
-                ) {
-                    record_start_gate_block(metrics, scope_kind, &reason);
-                    return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+                .await
+                {
+                    Ok(row) => {
+                        existing = Some(row);
+                        break;
+                    }
+                    // Seal race: retry with a fresh statement snapshot until
+                    // the winner's replacement row is visible or the cap is
+                    // exhausted (then fall through to the terminal NotFound).
+                    Err(HarvestError::NotFound(_)) if attempt < SEAL_RACE_MAX_LOAD_RETRIES => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            SEAL_RACE_LOAD_BACKOFF_MS,
+                        ))
+                        .await;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
+            match existing {
+                Some(row) => row,
+                None => {
+                    return Err(HarvestError::NotFound(format!(
+                        "workflow execution {}/{}",
+                        request.workflow_name, request.workflow_id
+                    )));
+                }
+            }
+        };
 
-            // `on_conflict_do_nothing()` (no explicit target) lets Postgres
-            // arbitrate against the partial unique index installed by the
-            // continue-as-new migration, which only enforces uniqueness on
-            // rows whose state is not sealed (`CONTINUED_AS_NEW` or
-            // `TERMINATED`). A previously sealed continue-as-new chain or reset
-            // source therefore does not block reusing the same
-            // (workflow_name, workflow_id).
-            let inserted = diesel::insert_into(harvest_workflow_executions::table)
-                .values(&row)
-                .on_conflict_do_nothing()
-                .returning(WorkflowExecution::as_returning())
-                .get_result(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-
-            if let Some(execution) = inserted {
-                // Atomic debounce gate: this INSERT is a fresh start. For a
-                // debounced workflow that must go through debounce admission,
-                // roll it back and signal the caller (no TOCTOU — decided here
-                // under the inserted row, not via an unlocked pre-scan).
-                if reject_fresh_if_debounced {
-                    return Err(HarvestError::DebounceFreshStart {
-                        workflow_name: request.workflow_name.to_string(),
-                        workflow_id: request.workflow_id.to_string(),
-                    });
-                }
-                if request.start_at.is_some_and(|sa| sa < now) {
-                    return Err(HarvestError::Config(
-                        "Requested start_at is in the past".to_string(),
-                    ));
-                }
-                // Enforce the input cap only on the fresh-insert path. Duplicates
-                // never reach here so the reuse-policy outcome is unaffected.
-                if request.max_workflow_input_bytes > 0 {
-                    let observed =
-                        serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
-                    if observed > request.max_workflow_input_bytes {
-                        return Err(crate::error::HarvestError::PayloadTooLarge {
-                            kind: crate::error::PayloadKind::WorkflowInput,
-                            observed_bytes: observed,
-                            cap_bytes: request.max_workflow_input_bytes,
-                            workflow_type: request.workflow_name.to_string(),
-                            activity_name: None,
-                        });
-                    }
-                }
-                // Resolve last-completion-result carryover (issue #488).
-                // Runs inside the same transaction on the same shard-local
-                // connection so the read is consistent with the just-inserted
-                // row. Excludes the new row (`id != exec_id`) as a safety
-                // guard — the new row has state RUNNING, not COMPLETED, so it
-                // can never match, but the explicit exclusion is defensive.
-                let (carryover_result, carryover_error) =
-                    if let Some(sched_id) = request.schedule_id {
-                        resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for)
-                            .await?
-                    } else {
-                        (None, None)
-                    };
-                let started_event = WorkflowEvent::WorkflowStarted {
-                    input: request.input.clone(),
-                    timestamp: target_start_time,
-                    last_completion_result: carryover_result,
-                    last_error: carryover_error,
-                    scheduled_time: request.scheduled_for,
-                };
-                store::append_events(conn, exec_id, &[started_event], 0).await?;
-                queue::enqueue(conn, &enqueue).await?;
-                return Ok((
-                    StartedWorkflowExecution::from_row(execution, true),
+        // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
+        // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
+        // axis; a terminal non-sealed prior is governed by the reuse axis
+        // exactly as before (the conflict axis has no effect there).
+        if is_active_conflict_state(&existing.state) {
+            match effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
+            {
+                // Return the existing running/paused execution unchanged —
+                // no new WorkflowStarted event, no task enqueued, no cancel.
+                ActiveConflictBehavior::Attach => Ok((
+                    StartedWorkflowExecution::from_row(existing, false),
                     Vec::new(),
                     tx_deferred_checks,
                     Vec::new(),
-                ));
-            }
+                )),
 
-            // INSERT was a no-op: a NON-SEALED prior existed at INSERT time
-            // (the active-uniqueness partial index only covers non-sealed
-            // states). Lock that prior row to decide what to do.
-            //
-            // Seal-race retry (issue #685 review, Codex P2): under concurrent
-            // `terminate_existing` (or any replace-type) starts of the same
-            // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
-            // a concurrent winner has sealed the prior it locked
-            // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
-            // non-sealed filter) and inserted a fresh RUNNING replacement. The
-            // loser's first `FOR UPDATE` SELECT took its statement snapshot
-            // before the winner committed, blocks on the prior's row lock, and
-            // -- on the winner's commit -- sees the prior filtered out via
-            // EvalPlanQual while the winner's freshly-inserted row is invisible
-            // to that same statement's snapshot, so the load returns `None`.
-            //
-            // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
-            // so re-issuing the load after the winner has committed picks up the
-            // replacement RUNNING row and the start CONVERGES (last-writer-wins)
-            // instead of surfacing a transient `NotFound`. The loser holds no
-            // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
-            // never locks the conflicting row, and a `None` `FOR UPDATE` locks
-            // nothing -- so the retry is safe. Once a row IS found and
-            // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
-            // `replace_execution` cannot be sealed out from under us (a rival
-            // must first take the same lock, which blocks until we commit). Each
-            // retry's `FOR UPDATE` naturally blocks on the current lock holder,
-            // so this is not a busy-loop; the small backoff only guards the
-            // pathological "sealed without a replacement" case (e.g. a
-            // concurrent reset), where the cap falls back to the pre-existing
-            // `NotFound`.
-            //
-            // Non-racing requests never reach a `None` here (the prior is still
-            // non-sealed under the lock), so this is transparent to the common
-            // path across every reuse/conflict policy.
-            let existing = {
-                let mut existing: Option<WorkflowExecution> = None;
-                for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
-                    match load_workflow_execution_by_key_for_update(
+                ActiveConflictBehavior::Fail => Err(HarvestError::AlreadyExists {
+                    existing_exec_id: ExecutionId::from_uuid(existing.id),
+                    existing_state: existing.state,
+                }),
+
+                // Cancel the active prior and start fresh (this is exactly
+                // the pre-#685 `TerminateIfRunning` active branch). Gate it
+                // before cancelling anything so a debounced workflow is
+                // routed to admission instead. PAUSED is active and occupies
+                // the uniqueness slot, so it must be cancelled before
+                // `replace_execution` seals it (issue #383). Reaching this
+                // point after the two-transaction pre-check cancel is the
+                // extreme-concurrency race where the prior is still active
+                // under the lock; we inline the cancel here so the new start
+                // is not silently blocked.
+                //
+                // Concurrency note (issue #685 review, FIX 4 + Codex P2):
+                // concurrent `terminate_existing` starts of the SAME
+                // `(workflow_name, workflow_id)` against one live prior are
+                // last-writer-wins and CONVERGE to a single surviving run.
+                // `terminate_existing` has no pre-check, so more contenders
+                // reach this inline branch than the pre-#685
+                // `TerminateIfRunning` path did; a loser that observed the
+                // winner seal the prior row it locked is retried internally
+                // by the seal-race loop around the load above (a fresh READ
+                // COMMITTED snapshot picks up the winner's replacement RUNNING
+                // row), so no transient `NotFound` is surfaced. It does NOT
+                // corrupt data, deadlock, or double-run (the seal + insert is
+                // transactional; `use_existing` never enters this branch).
+                ActiveConflictBehavior::Terminate => {
+                    if reject_fresh_if_debounced {
+                        return Err(HarvestError::DebounceFreshStart {
+                            workflow_name: request.workflow_name.to_string(),
+                            workflow_id: request.workflow_id.to_string(),
+                        });
+                    }
+                    let tx_cancel_metrics =
+                        vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
+                    let mut deferred = inline_cancel(
                         conn,
-                        request.workflow_name,
-                        request.workflow_id,
+                        ExecutionId::from_uuid(existing.id),
+                        &mut tx_deferred_checks,
                     )
-                    .await
-                    {
-                        Ok(row) => {
-                            existing = Some(row);
-                            break;
-                        }
-                        // Seal race: retry with a fresh statement snapshot until
-                        // the winner's replacement row is visible or the cap is
-                        // exhausted (then fall through to the terminal NotFound).
-                        Err(HarvestError::NotFound(_)) if attempt < SEAL_RACE_MAX_LOAD_RETRIES => {
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                SEAL_RACE_LOAD_BACKOFF_MS,
-                            ))
-                            .await;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                match existing {
-                    Some(row) => row,
-                    None => {
-                        return Err(HarvestError::NotFound(format!(
-                            "workflow execution {}/{}",
-                            request.workflow_name, request.workflow_id
-                        )));
-                    }
-                }
-            };
-
-            // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
-            // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
-            // axis; a terminal non-sealed prior is governed by the reuse axis
-            // exactly as before (the conflict axis has no effect there).
-            if is_active_conflict_state(&existing.state) {
-                match effective_active_conflict_behavior(
-                    request.reuse_policy,
-                    request.conflict_policy,
-                ) {
-                    // Return the existing running/paused execution unchanged —
-                    // no new WorkflowStarted event, no task enqueued, no cancel.
-                    ActiveConflictBehavior::Attach => Ok((
-                        StartedWorkflowExecution::from_row(existing, false),
-                        Vec::new(),
-                        tx_deferred_checks,
-                        Vec::new(),
-                    )),
-
-                    ActiveConflictBehavior::Fail => Err(HarvestError::AlreadyExists {
-                        existing_exec_id: ExecutionId::from_uuid(existing.id),
-                        existing_state: existing.state,
-                    }),
-
-                    // Cancel the active prior and start fresh (this is exactly
-                    // the pre-#685 `TerminateIfRunning` active branch). Gate it
-                    // before cancelling anything so a debounced workflow is
-                    // routed to admission instead. PAUSED is active and occupies
-                    // the uniqueness slot, so it must be cancelled before
-                    // `replace_execution` seals it (issue #383). Reaching this
-                    // point after the two-transaction pre-check cancel is the
-                    // extreme-concurrency race where the prior is still active
-                    // under the lock; we inline the cancel here so the new start
-                    // is not silently blocked.
-                    //
-                    // Concurrency note (issue #685 review, FIX 4 + Codex P2):
-                    // concurrent `terminate_existing` starts of the SAME
-                    // `(workflow_name, workflow_id)` against one live prior are
-                    // last-writer-wins and CONVERGE to a single surviving run.
-                    // `terminate_existing` has no pre-check, so more contenders
-                    // reach this inline branch than the pre-#685
-                    // `TerminateIfRunning` path did; a loser that observed the
-                    // winner seal the prior row it locked is retried internally
-                    // by the seal-race loop around the load above (a fresh READ
-                    // COMMITTED snapshot picks up the winner's replacement RUNNING
-                    // row), so no transient `NotFound` is surfaced. It does NOT
-                    // corrupt data, deadlock, or double-run (the seal + insert is
-                    // transactional; `use_existing` never enters this branch).
-                    ActiveConflictBehavior::Terminate => {
-                        if reject_fresh_if_debounced {
-                            return Err(HarvestError::DebounceFreshStart {
-                                workflow_name: request.workflow_name.to_string(),
-                                workflow_id: request.workflow_id.to_string(),
-                            });
-                        }
-                        let tx_cancel_metrics =
-                            vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
-                        let mut deferred = inline_cancel(
-                            conn,
-                            ExecutionId::from_uuid(existing.id),
-                            &mut tx_deferred_checks,
-                        )
-                        .await?;
-                        let (started_wf, mut extra_deferred) = replace_execution(
-                            conn, existing, &row, &enqueue, exec_id, &request, now,
-                        )
-                        .await?;
-                        deferred.append(&mut extra_deferred);
-                        Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
-                    }
-                }
-            } else {
-                // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/
-                // TIMED_OUT/SUSPENDED): reuse axis only, byte-for-byte identical
-                // to the pre-#685 behavior.
-                match request.reuse_policy {
-                    WorkflowIdReusePolicy::AllowDuplicate => Ok((
-                        StartedWorkflowExecution::from_row(existing, false),
-                        Vec::new(),
-                        tx_deferred_checks,
-                        Vec::new(),
-                    )),
-
-                    WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
-                        existing_exec_id: ExecutionId::from_uuid(existing.id),
-                        existing_state: existing.state,
-                    }),
-
-                    WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                        match existing.state.as_str() {
-                            "FAILED" | "CANCELLED" => {
-                                // Replacing a terminal prior is a fresh start.
-                                if reject_fresh_if_debounced {
-                                    return Err(HarvestError::DebounceFreshStart {
-                                        workflow_name: request.workflow_name.to_string(),
-                                        workflow_id: request.workflow_id.to_string(),
-                                    });
-                                }
-                                // Only these two explicitly abnormal states start fresh.
-                                let (started_wf, deferred) = replace_execution(
-                                    conn, existing, &row, &enqueue, exec_id, &request, now,
-                                )
-                                .await?;
-                                Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
-                            }
-                            _ => {
-                                // COMPLETED, TIMED_OUT, SUSPENDED, or any other
-                                // terminal state: return the existing execution
-                                // unchanged.
-                                Ok((
-                                    StartedWorkflowExecution::from_row(existing, false),
-                                    Vec::new(),
-                                    tx_deferred_checks,
-                                    Vec::new(),
-                                ))
-                            }
-                        }
-                    }
-
-                    WorkflowIdReusePolicy::TerminateIfRunning => {
-                        // TerminateIfRunning always starts fresh (replace). Gate
-                        // it before replacing so a debounced workflow is routed
-                        // to admission instead. The prior is terminal here (an
-                        // active prior takes the branch above), so no inline
-                        // cancel is needed.
-                        if reject_fresh_if_debounced {
-                            return Err(HarvestError::DebounceFreshStart {
-                                workflow_name: request.workflow_name.to_string(),
-                                workflow_id: request.workflow_id.to_string(),
-                            });
-                        }
-                        let (started_wf, extra_deferred) = replace_execution(
-                            conn, existing, &row, &enqueue, exec_id, &request, now,
-                        )
-                        .await?;
-                        Ok((started_wf, extra_deferred, tx_deferred_checks, Vec::new()))
-                    }
+                    .await?;
+                    let (started_wf, mut extra_deferred) =
+                        replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
+                            .await?;
+                    deferred.append(&mut extra_deferred);
+                    Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
                 }
             }
-        })
-        .await;
+        } else {
+            // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/
+            // TIMED_OUT/SUSPENDED): reuse axis only, byte-for-byte identical
+            // to the pre-#685 behavior.
+            match request.reuse_policy {
+                WorkflowIdReusePolicy::AllowDuplicate => Ok((
+                    StartedWorkflowExecution::from_row(existing, false),
+                    Vec::new(),
+                    tx_deferred_checks,
+                    Vec::new(),
+                )),
+
+                WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
+                    existing_exec_id: ExecutionId::from_uuid(existing.id),
+                    existing_state: existing.state,
+                }),
+
+                WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                    match existing.state.as_str() {
+                        "FAILED" | "CANCELLED" => {
+                            // Replacing a terminal prior is a fresh start.
+                            if reject_fresh_if_debounced {
+                                return Err(HarvestError::DebounceFreshStart {
+                                    workflow_name: request.workflow_name.to_string(),
+                                    workflow_id: request.workflow_id.to_string(),
+                                });
+                            }
+                            // Only these two explicitly abnormal states start fresh.
+                            let (started_wf, deferred) = replace_execution(
+                                conn, existing, &row, &enqueue, exec_id, &request, now,
+                            )
+                            .await?;
+                            Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
+                        }
+                        _ => {
+                            // COMPLETED, TIMED_OUT, SUSPENDED, or any other
+                            // terminal state: return the existing execution
+                            // unchanged.
+                            Ok((
+                                StartedWorkflowExecution::from_row(existing, false),
+                                Vec::new(),
+                                tx_deferred_checks,
+                                Vec::new(),
+                            ))
+                        }
+                    }
+                }
+
+                WorkflowIdReusePolicy::TerminateIfRunning => {
+                    // TerminateIfRunning always starts fresh (replace). Gate
+                    // it before replacing so a debounced workflow is routed
+                    // to admission instead. The prior is terminal here (an
+                    // active prior takes the branch above), so no inline
+                    // cancel is needed.
+                    if reject_fresh_if_debounced {
+                        return Err(HarvestError::DebounceFreshStart {
+                            workflow_name: request.workflow_name.to_string(),
+                            workflow_id: request.workflow_id.to_string(),
+                        });
+                    }
+                    let (started_wf, extra_deferred) =
+                        replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
+                            .await?;
+                    Ok((started_wf, extra_deferred, tx_deferred_checks, Vec::new()))
+                }
+            }
+        }
+    }))
+    .await;
 
     let mut cancel_metrics = pre_check_cancel_metrics;
 
@@ -1220,8 +1210,8 @@ pub async fn start_or_load_workflow_execution_idempotent(
     let new_exec_id = request.exec_id;
     let shard_id = request.shard_id();
 
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             IdempotentStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
@@ -1278,7 +1268,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
                     Ok((IdempotentStartOutcome::Started(started), ds, dc, cm))
                 }
             }
-        })
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -2099,8 +2089,8 @@ pub async fn cancel_workflow_execution_collect(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts, closed_children) = conn
-        .transaction::<_, HarvestError, _>(async |conn| {
+    let (cancel_result, deferred_starts, closed_children) =
+        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let execution = harvest_workflow_executions::table
                 .find(exec_id.as_uuid())
                 .select(WorkflowExecution::as_select())
@@ -2237,7 +2227,7 @@ pub async fn cancel_workflow_execution_collect(
                 deferred,
                 closed_children,
             ))
-        })
+        }))
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -2411,8 +2401,8 @@ pub async fn pause_workflow_execution(
     let reason = reason.map(ToOwned::to_owned);
 
     let paused_at = Utc::now();
-    let result = conn
-        .transaction::<PausedWorkflowExecution, HarvestError, _>(async |conn| {
+    let result = Box::pin(
+        conn.transaction::<PausedWorkflowExecution, HarvestError, _>(async |conn| {
             let reason = reason.clone();
             let actor = actor.clone();
             let execution = harvest_workflow_executions::table
@@ -2488,8 +2478,9 @@ pub async fn pause_workflow_execution(
                 workflow_name: execution.workflow_name,
                 queue_name: execution.queue_name,
             })
-        })
-        .await?;
+        }),
+    )
+    .await?;
 
     if result.newly_paused {
         metrics.record_workflow_paused(&result.workflow_name, &result.queue_name);
@@ -2730,8 +2721,8 @@ pub async fn resume_workflow_execution(
     };
 
     let resumed_at = Utc::now();
-    let result = conn
-        .transaction::<ResumedWorkflowExecution, HarvestError, _>(async |conn| {
+    let result = Box::pin(
+        conn.transaction::<ResumedWorkflowExecution, HarvestError, _>(async |conn| {
             let actor = actor.clone();
             let execution = harvest_workflow_executions::table
                 .find(exec_id.as_uuid())
@@ -2814,8 +2805,9 @@ pub async fn resume_workflow_execution(
                 workflow_name: execution.workflow_name,
                 queue_name: execution.queue_name,
             })
-        })
-        .await?;
+        }),
+    )
+    .await?;
 
     // A no-op resume never actually resumed anything: skip the duration
     // histogram so zero-length phantom samples don't skew percentiles
@@ -3266,8 +3258,8 @@ pub async fn terminate_workflow_execution_collect(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts, closed_children) = conn
-        .transaction::<_, HarvestError, _>(async |conn| {
+    let (cancel_result, deferred_starts, closed_children) =
+        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let execution = harvest_workflow_executions::table
                 .find(exec_id.as_uuid())
                 .select(WorkflowExecution::as_select())
@@ -3386,7 +3378,7 @@ pub async fn terminate_workflow_execution_collect(
                 deferred,
                 closed_children,
             ))
-        })
+        }))
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -3868,8 +3860,8 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
 ) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             SignalWithStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
@@ -4170,7 +4162,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                 deferred_checks,
                 cancel_metrics,
             ))
-        })
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -4504,8 +4496,8 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     // name (Codex P2; see `admit_update_event`), so the counter is labeled by
     // `workflow` + `queue` only.
     let queue_for_metric = request.queue_name.to_owned();
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             UpdateWithStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
@@ -4792,7 +4784,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                 deferred_checks,
                 cancel_metrics,
             ))
-        })
+        }))
         .await?;
 
     for start in deferred_starts {

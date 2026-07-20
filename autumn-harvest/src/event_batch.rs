@@ -196,8 +196,8 @@ pub async fn admit_batched_start(
     let payload = params.payload;
     let max_size = params.max_size;
 
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             BatchAdmitOutcome,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
@@ -354,7 +354,7 @@ pub async fn admit_batched_start(
                 deferred_checks,
                 cancel_metrics,
             ))
-        })
+        }))
         .await?;
 
     for check in &deferred_checks {
@@ -455,38 +455,37 @@ async fn fire_due_on_conn(
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
             Vec<(String, String)>,
-        )> = conn
-            .transaction(async |conn| {
-                let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
-                    diesel::sql_query(due_sql)
-                        .bind::<diesel::sql_types::Timestamptz, _>(now)
-                        .bind::<diesel::sql_types::BigInt, _>(1i64)
-                        .bind::<diesel::sql_types::Integer, _>(sid)
-                        .load(conn)
-                        .await
-                        .map_err(crate::error::database_error)?
-                } else {
-                    diesel::sql_query(due_sql)
-                        .bind::<diesel::sql_types::Timestamptz, _>(now)
-                        .bind::<diesel::sql_types::BigInt, _>(1i64)
-                        .load(conn)
-                        .await
-                        .map_err(crate::error::database_error)?
-                };
+        )> = Box::pin(conn.transaction(async |conn| {
+            let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
+                diesel::sql_query(due_sql)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::BigInt, _>(1i64)
+                    .bind::<diesel::sql_types::Integer, _>(sid)
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?
+            } else {
+                diesel::sql_query(due_sql)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::BigInt, _>(1i64)
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?
+            };
 
-                if let Some(row) = due_rows.into_iter().next() {
-                    match fire_claimed_batch_row(conn, row).await {
-                        Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
-                            Ok(Some((exec_id, deferred, checks, cancel_metrics)))
-                        }
-                        Ok(None) => Ok(None),
-                        Err(e) => Err(e),
+            if let Some(row) = due_rows.into_iter().next() {
+                match fire_claimed_batch_row(conn, row).await {
+                    Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
+                        Ok(Some((exec_id, deferred, checks, cancel_metrics)))
                     }
-                } else {
-                    Ok(None)
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
                 }
-            })
-            .await?;
+            } else {
+                Ok(None)
+            }
+        }))
+        .await?;
 
         if let Some((exec_id, deferred, checks, cancel_metrics)) = processed {
             fired_ids.push(exec_id);

@@ -753,7 +753,7 @@ async fn commit_workflow_execution_timeout(
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
 )> {
-    conn.transaction::<(
+    Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
@@ -816,7 +816,7 @@ async fn commit_workflow_execution_timeout(
         .await?;
         deferred.extend(triggers);
         Ok((true, deferred, closed_children))
-    })
+    }))
     .await
 }
 
@@ -835,56 +835,54 @@ async fn enforce_activity_timeout(
 
     // Did we actually append a timeout (vs. a no-op because the task already
     // moved on)? Only a real enforcement should count toward the breaker.
-    let enforced = conn
-        .transaction::<bool, HarvestError, _>(async |conn| {
-            let error = error.clone();
-            let (execution, history) =
-                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
-            let Some((state, row_schedule_to_close_at)) =
-                task_state_and_deadline_for_update(conn, task.id).await?
-            else {
-                return Ok(false);
-            };
-            if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
+    let enforced = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+        let error = error.clone();
+        let (execution, history) =
+            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+        let Some((state, row_schedule_to_close_at)) =
+            task_state_and_deadline_for_update(conn, task.id).await?
+        else {
+            return Ok(false);
+        };
+        if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
+            return Ok(false);
+        }
+        // Authoritative PAUSED re-check under the execution row lock
+        // (issue #609 post-review hardening, second bot-review round):
+        // the scan snapshot's PAUSED exclusions are non-locking, so a
+        // pause committing after the scan — or while this transaction
+        // waited on the lock `pause_workflow_execution` itself holds —
+        // must be honoured here or the timeout lands mid-pause. See
+        // `pause_suppresses_timeout_enforcement` for the per-reason
+        // scoping (schedule_to_close always; schedule_to_start only
+        // for a now-frozen row; heartbeat/start-to-close pause-blind).
+        if pause_suppresses_timeout_enforcement(
+            reason,
+            &execution.state,
+            row_schedule_to_close_at,
+            Utc::now(),
+        ) {
+            return Ok(false);
+        }
+        let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
+            Ok(Some(activity_id)) => activity_id,
+            Ok(None) => return Ok(false),
+            Err(missing_error) => {
+                let fallback = missing_error.to_string();
+                queue::fail_task(conn, task.id, &fallback).await?;
                 return Ok(false);
             }
-            // Authoritative PAUSED re-check under the execution row lock
-            // (issue #609 post-review hardening, second bot-review round):
-            // the scan snapshot's PAUSED exclusions are non-locking, so a
-            // pause committing after the scan — or while this transaction
-            // waited on the lock `pause_workflow_execution` itself holds —
-            // must be honoured here or the timeout lands mid-pause. See
-            // `pause_suppresses_timeout_enforcement` for the per-reason
-            // scoping (schedule_to_close always; schedule_to_start only
-            // for a now-frozen row; heartbeat/start-to-close pause-blind).
-            if pause_suppresses_timeout_enforcement(
-                reason,
-                &execution.state,
-                row_schedule_to_close_at,
-                Utc::now(),
-            ) {
-                return Ok(false);
-            }
-            let activity_id =
-                match pending_activity_id_for_task(&history.events, task, activity_name) {
-                    Ok(Some(activity_id)) => activity_id,
-                    Ok(None) => return Ok(false),
-                    Err(missing_error) => {
-                        let fallback = missing_error.to_string();
-                        queue::fail_task(conn, task.id, &fallback).await?;
-                        return Ok(false);
-                    }
-                };
-            let timeout_event = WorkflowEvent::ActivityTimedOut {
-                activity_id,
-                timeout_type: reason.timeout_type(),
-            };
-            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
-            queue::fail_task(conn, task.id, &error).await?;
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(true)
-        })
-        .await?;
+        };
+        let timeout_event = WorkflowEvent::ActivityTimedOut {
+            activity_id,
+            timeout_type: reason.timeout_type(),
+        };
+        store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+        queue::fail_task(conn, task.id, &error).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(true)
+    }))
+    .await?;
 
     // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
     // a protected downstream is a retryable, downstream-style failure that the
@@ -1083,158 +1081,164 @@ pub async fn force_fail_activity(
     let exec_id = execution_id_from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
-    conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(async |conn| {
-        // Lock ordering (harvest_task_queue convention, see the comment in
-        // `enforce_external_task_timeouts`): execution row FIRST, then the
-        // task row.
-        let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+    Box::pin(
+        conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(async |conn| {
+            // Lock ordering (harvest_task_queue convention, see the comment in
+            // `enforce_external_task_timeouts`): execution row FIRST, then the
+            // task row.
+            let (execution, history) =
+                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
 
-        let task: Option<TaskQueueItem> = dsl::harvest_task_queue
-            .filter(dsl::id.eq(task_id))
-            .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
-            .for_update()
-            .select(TaskQueueItem::as_select())
-            .first(conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?;
-        let Some(task) = task else {
-            return Err(HarvestError::NotFound(format!(
-                "activity task {task_id} not found for workflow {workflow_exec_id}"
-            )));
-        };
+            let task: Option<TaskQueueItem> = dsl::harvest_task_queue
+                .filter(dsl::id.eq(task_id))
+                .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
+                .for_update()
+                .select(TaskQueueItem::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let Some(task) = task else {
+                return Err(HarvestError::NotFound(format!(
+                    "activity task {task_id} not found for workflow {workflow_exec_id}"
+                )));
+            };
 
-        let classification =
-            classify_force_fail_target(&task.task_type, &task.state, task.error.as_deref());
+            let classification =
+                classify_force_fail_target(&task.task_type, &task.state, task.error.as_deref());
 
-        // Idempotent short-circuit — deliberately checked BEFORE the
-        // terminal-execution guard below. The common lifecycle of a
-        // successful force-fail is that the woken workflow consumes the
-        // forced `ActivityFailed` and seals its own run (often FAILED)
-        // within one poll cycle, so an operator/script retry after a
-        // lost response would otherwise flip from the documented
-        // idempotent no-op to the terminal 409. Both paths are
-        // zero-writes, so honouring idempotency here never grows a
-        // sealed run's history (PR #974 Codex review).
-        if classification == ForceFailClassification::AlreadyForced {
-            return Ok(ForceFailActivityOutcome {
-                task_id,
-                queue_name: task.queue_name.clone(),
-                activity_name: task.activity_name.clone().unwrap_or_default(),
-                forced: false,
-                already_forced: true,
-            });
-        }
+            // Idempotent short-circuit — deliberately checked BEFORE the
+            // terminal-execution guard below. The common lifecycle of a
+            // successful force-fail is that the woken workflow consumes the
+            // forced `ActivityFailed` and seals its own run (often FAILED)
+            // within one poll cycle, so an operator/script retry after a
+            // lost response would otherwise flip from the documented
+            // idempotent no-op to the terminal 409. Both paths are
+            // zero-writes, so honouring idempotency here never grows a
+            // sealed run's history (PR #974 Codex review).
+            if classification == ForceFailClassification::AlreadyForced {
+                return Ok(ForceFailActivityOutcome {
+                    task_id,
+                    queue_name: task.queue_name.clone(),
+                    activity_name: task.activity_name.clone().unwrap_or_default(),
+                    forced: false,
+                    already_forced: true,
+                });
+            }
 
-        // Terminal-execution guard: a sealed run's history must never
-        // grow another `ActivityFailed` after its terminal event (a plain
-        // workflow failure does NOT fail open activity rows, so a stray
-        // RUNNING row on a FAILED execution is reachable). Checked after
-        // the task-existence check so an unknown task id still reports
-        // `404` first, and after the zero-write idempotent already-forced
-        // short-circuit above so a retried fail-now stays idempotent even
-        // once the run seals.
-        if crate::erase::is_terminal_state(&execution.state) {
-            return Err(HarvestError::Config(format!(
-                "workflow execution {workflow_exec_id} is already terminal ({}); \
+            // Terminal-execution guard: a sealed run's history must never
+            // grow another `ActivityFailed` after its terminal event (a plain
+            // workflow failure does NOT fail open activity rows, so a stray
+            // RUNNING row on a FAILED execution is reachable). Checked after
+            // the task-existence check so an unknown task id still reports
+            // `404` first, and after the zero-write idempotent already-forced
+            // short-circuit above so a retried fail-now stays idempotent even
+            // once the run seals.
+            if crate::erase::is_terminal_state(&execution.state) {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {workflow_exec_id} is already terminal ({}); \
                  its activities cannot be force-failed",
-                execution.state
-            )));
-        }
+                    execution.state
+                )));
+            }
 
-        match classification {
-            ForceFailClassification::AlreadyForced => {
-                unreachable!(
-                    "AlreadyForced is short-circuited above, before the \
+            match classification {
+                ForceFailClassification::AlreadyForced => {
+                    unreachable!(
+                        "AlreadyForced is short-circuited above, before the \
                      terminal-execution guard"
-                );
-            }
-            ForceFailClassification::NotAnActivityTask => {
-                return Err(HarvestError::Config(format!(
-                    "task {task_id} is a '{}' task, not an activity task — only \
+                    );
+                }
+                ForceFailClassification::NotAnActivityTask => {
+                    return Err(HarvestError::Config(format!(
+                        "task {task_id} is a '{}' task, not an activity task — only \
                      in-flight activity tasks can be force-failed",
-                    task.task_type
-                )));
-            }
-            ForceFailClassification::NotRunning => {
-                return Err(HarvestError::Config(format!(
-                    "activity task {task_id} is in state '{}', not RUNNING — only \
+                        task.task_type
+                    )));
+                }
+                ForceFailClassification::NotRunning => {
+                    return Err(HarvestError::Config(format!(
+                        "activity task {task_id} is in state '{}', not RUNNING — only \
                      in-flight (RUNNING) activity tasks can be force-failed",
-                    task.state
-                )));
+                        task.state
+                    )));
+                }
+                ForceFailClassification::Forceable => {}
             }
-            ForceFailClassification::Forceable => {}
-        }
 
-        let Some(activity_name) = task.activity_name.clone() else {
-            return Err(HarvestError::Config(format!(
-                "activity task {task_id} carries no activity_name; its pending \
+            let Some(activity_name) = task.activity_name.clone() else {
+                return Err(HarvestError::Config(format!(
+                    "activity task {task_id} carries no activity_name; its pending \
                  history event cannot be resolved for a force-fail"
-            )));
-        };
+                )));
+            };
 
-        // History already carrying a terminal event for this activity
-        // while the row is still RUNNING is believed unreachable via
-        // engine paths (every terminal-event appender flips the row in
-        // the same locked transaction), but if it ever occurs — e.g. via
-        // manual surgery — appending here could double-terminal the
-        // activity. Refuse with a defensive-invariant `409` conflict,
-        // mirroring `enforce_activity_timeout`'s no-op treatment of the
-        // same edge; the stuck RUNNING row only reconciles if the
-        // in-flight worker attempt eventually returns.
-        let activity_id = match pending_activity_id_for_task(&history.events, &task, &activity_name)
-        {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                return Err(terminal_history_conflict(&activity_name, task_id));
-            }
-            // Legacy rows (`activity_id = NULL`) resolve through the
-            // name-based fallback, whose `NotFound` cannot distinguish
-            // "never scheduled" from "already terminal". Map the
-            // terminal-in-history case onto the same documented `409` as
-            // the `Ok(None)` branch above instead of letting it
-            // `?`-propagate as a `404`. `pending_activity_id_for_task`
-            // itself is deliberately unchanged — its other callers
-            // (worker finalize, broken-session reclaim) depend on the
-            // current contract.
-            Err(HarvestError::NotFound(_))
-                if task.activity_id.is_none()
-                    && named_activity_has_terminal_event(&history.events, &activity_name) =>
-            {
-                return Err(terminal_history_conflict(&activity_name, task_id));
-            }
-            Err(e) => return Err(e),
-        };
+            // History already carrying a terminal event for this activity
+            // while the row is still RUNNING is believed unreachable via
+            // engine paths (every terminal-event appender flips the row in
+            // the same locked transaction), but if it ever occurs — e.g. via
+            // manual surgery — appending here could double-terminal the
+            // activity. Refuse with a defensive-invariant `409` conflict,
+            // mirroring `enforce_activity_timeout`'s no-op treatment of the
+            // same edge; the stuck RUNNING row only reconciles if the
+            // in-flight worker attempt eventually returns.
+            let activity_id =
+                match pending_activity_id_for_task(&history.events, &task, &activity_name) {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        return Err(terminal_history_conflict(&activity_name, task_id));
+                    }
+                    // Legacy rows (`activity_id = NULL`) resolve through the
+                    // name-based fallback, whose `NotFound` cannot distinguish
+                    // "never scheduled" from "already terminal". Map the
+                    // terminal-in-history case onto the same documented `409` as
+                    // the `Ok(None)` branch above instead of letting it
+                    // `?`-propagate as a `404`. `pending_activity_id_for_task`
+                    // itself is deliberately unchanged — its other callers
+                    // (worker finalize, broken-session reclaim) depend on the
+                    // current contract.
+                    Err(HarvestError::NotFound(_))
+                        if task.activity_id.is_none()
+                            && named_activity_has_terminal_event(
+                                &history.events,
+                                &activity_name,
+                            ) =>
+                    {
+                        return Err(terminal_history_conflict(&activity_name, task_id));
+                    }
+                    Err(e) => return Err(e),
+                };
 
-        // Build the typed failure once and derive both persisted forms
-        // from it: the wire envelope stored on the task row, and the
-        // event fields decoded through `parse_error_payload_full` — the
-        // exact decoder `worker::finalize_activity_failure` uses, so the
-        // two recording paths cannot diverge.
-        let envelope = crate::failure::ActivityFailure::operator_force_failed(reason.as_deref())
-            .into_error_payload();
-        let parsed = crate::failure::parse_error_payload_full(&envelope);
-        let failed_event = WorkflowEvent::ActivityFailed {
-            activity_id,
-            error: parsed.message,
-            attempt: crate::worker::task_attempt(&task),
-            error_type: parsed.error_type,
-            non_retryable: parsed.non_retryable,
-            details: parsed.details,
-        };
-        store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
-        queue::fail_task(conn, task.id, &envelope).await?;
-        queue::wake_workflow_task(conn, exec_id).await?;
+            // Build the typed failure once and derive both persisted forms
+            // from it: the wire envelope stored on the task row, and the
+            // event fields decoded through `parse_error_payload_full` — the
+            // exact decoder `worker::finalize_activity_failure` uses, so the
+            // two recording paths cannot diverge.
+            let envelope =
+                crate::failure::ActivityFailure::operator_force_failed(reason.as_deref())
+                    .into_error_payload();
+            let parsed = crate::failure::parse_error_payload_full(&envelope);
+            let failed_event = WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: parsed.message,
+                attempt: crate::worker::task_attempt(&task),
+                error_type: parsed.error_type,
+                non_retryable: parsed.non_retryable,
+                details: parsed.details,
+            };
+            store::append_events(conn, exec_id, &[failed_event], history.next_event_id).await?;
+            queue::fail_task(conn, task.id, &envelope).await?;
+            queue::wake_workflow_task(conn, exec_id).await?;
 
-        Ok(ForceFailActivityOutcome {
-            task_id,
-            queue_name: task.queue_name,
-            activity_name,
-            forced: true,
-            already_forced: false,
-        })
-    })
+            Ok(ForceFailActivityOutcome {
+                task_id,
+                queue_name: task.queue_name,
+                activity_name,
+                forced: true,
+                already_forced: false,
+            })
+        }),
+    )
     .await
 }
 
@@ -1250,8 +1254,8 @@ async fn enforce_workflow_timeout(
     let history = store::load_history(conn, exec_id).await?;
     let workflow_event = WorkflowEvent::workflow_failed(error.clone());
 
-    let (deferred_starts, closed_children) = conn
-        .transaction::<_, HarvestError, _>(async |conn| {
+    let (deferred_starts, closed_children) =
+        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let error = error.clone();
             store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
             update_workflow_execution_timed_out(conn, exec_id, &error).await?;
@@ -1277,7 +1281,7 @@ async fn enforce_workflow_timeout(
                 .await?;
             }
             Ok((deferred, closed_children))
-        })
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -1392,114 +1396,112 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             timeout_type: TimeoutType::ScheduleToClose,
         };
 
-        let result = conn
-            .transaction::<bool, HarvestError, _>(async |conn| {
-                // Per-table lock-ordering convention (issue #609
-                // post-review hardening, third bot-review round):
-                //
-                //   harvest_external_tasks: task row → execution row
-                //   harvest_task_queue:     execution row → task row
-                //
-                // The external-task completion paths (`external_task.rs`'s
-                // `complete_externally`/`fail_externally`/`extend_deadline`)
-                // lock the task row first via `lock_task`, then lock the
-                // execution row inside `store::append_single_event` — so
-                // this scanner MUST lock the task row first too. An
-                // earlier revision took the execution row lock first,
-                // which was an ABBA inversion against a concurrent
-                // completion: Postgres deadlock-detects and aborts one of
-                // the two transactions, surfacing spurious errors to
-                // valid external-completion callers. (The task-queue
-                // enforcers — `enforce_activity_timeout`,
-                // `worker::record_schedule_to_close_activity_timeout` —
-                // follow the *opposite*, execution-first convention for
-                // `harvest_task_queue` rows; that is safe because no
-                // task-queue writer locks the task row and then the
-                // execution row, e.g. `queue::requeue_for_retry` touches
-                // only the task row. The one external-task writer that
-                // must run execution-first — resume's pause-span shift,
-                // `execution::shift_external_schedule_to_close_on_resume_query`,
-                // which lives inside the execution-locked resume
-                // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
-                // waits on a task row and cannot join a lock cycle.)
-                //
-                // The locked re-read below replaces trusting the scan
-                // snapshot (the pre-fix code re-verified it via filters
-                // on the claiming UPDATE instead).
-                let locked_row: Option<(String, chrono::DateTime<Utc>)> =
-                    harvest_external_tasks::table
-                        .find(task_id)
-                        .for_update()
-                        .select((
-                            harvest_external_tasks::state,
-                            harvest_external_tasks::schedule_to_close_at,
-                        ))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                let Some((task_state, deadline)) = locked_row else {
-                    // Row vanished after the scan (e.g. retention
-                    // cascade-deleted the owning execution): skip.
-                    return Ok(false);
-                };
-                // Guard against two races the scan snapshot cannot see:
-                // 1. complete/fail landed after our scan → state != PENDING
-                // 2. heartbeat (or a resume's pause-span shift, issue
-                //    #609) extended the deadline after our scan →
-                //    schedule_to_close_at is now in the future
-                // Either way: skip — no flip, no event, not counted.
-                if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
-                    return Ok(false);
-                }
+        let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            // Per-table lock-ordering convention (issue #609
+            // post-review hardening, third bot-review round):
+            //
+            //   harvest_external_tasks: task row → execution row
+            //   harvest_task_queue:     execution row → task row
+            //
+            // The external-task completion paths (`external_task.rs`'s
+            // `complete_externally`/`fail_externally`/`extend_deadline`)
+            // lock the task row first via `lock_task`, then lock the
+            // execution row inside `store::append_single_event` — so
+            // this scanner MUST lock the task row first too. An
+            // earlier revision took the execution row lock first,
+            // which was an ABBA inversion against a concurrent
+            // completion: Postgres deadlock-detects and aborts one of
+            // the two transactions, surfacing spurious errors to
+            // valid external-completion callers. (The task-queue
+            // enforcers — `enforce_activity_timeout`,
+            // `worker::record_schedule_to_close_activity_timeout` —
+            // follow the *opposite*, execution-first convention for
+            // `harvest_task_queue` rows; that is safe because no
+            // task-queue writer locks the task row and then the
+            // execution row, e.g. `queue::requeue_for_retry` touches
+            // only the task row. The one external-task writer that
+            // must run execution-first — resume's pause-span shift,
+            // `execution::shift_external_schedule_to_close_on_resume_query`,
+            // which lives inside the execution-locked resume
+            // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
+            // waits on a task row and cannot join a lock cycle.)
+            //
+            // The locked re-read below replaces trusting the scan
+            // snapshot (the pre-fix code re-verified it via filters
+            // on the claiming UPDATE instead).
+            let locked_row: Option<(String, chrono::DateTime<Utc>)> = harvest_external_tasks::table
+                .find(task_id)
+                .for_update()
+                .select((
+                    harvest_external_tasks::state,
+                    harvest_external_tasks::schedule_to_close_at,
+                ))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let Some((task_state, deadline)) = locked_row else {
+                // Row vanished after the scan (e.g. retention
+                // cascade-deleted the owning execution): skip.
+                return Ok(false);
+            };
+            // Guard against two races the scan snapshot cannot see:
+            // 1. complete/fail landed after our scan → state != PENDING
+            // 2. heartbeat (or a resume's pause-span shift, issue
+            //    #609) extended the deadline after our scan →
+            //    schedule_to_close_at is now in the future
+            // Either way: skip — no flip, no event, not counted.
+            if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
+                return Ok(false);
+            }
 
-                // THEN the execution row lock — the same lock
-                // `pause_workflow_execution`/`resume_workflow_execution`
-                // hold — so the PAUSED re-check, the external-task state
-                // flip, and the event append below all serialize with the
-                // pause path (issue #609 post-review hardening, second
-                // bot-review round): the pause-suppression guarantee is
-                // unchanged by the task-first reordering. A vanished
-                // execution row (None) proceeds and surfaces as
-                // `append_single_event`'s NotFound, matching the
-                // pre-existing behaviour.
-                let execution_state: Option<String> = harvest_workflow_executions::table
-                    .find(exec_uuid)
-                    .for_update()
-                    .select(harvest_workflow_executions::state)
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                if execution_state.as_deref().is_some_and(|state| {
-                    pause_suppresses_timeout_enforcement(
-                        &TimeoutReason::ScheduleToClose,
-                        state,
-                        None,
-                        Utc::now(),
-                    )
-                }) {
-                    // Pause won the race: leave the row PENDING and
-                    // untouched — the resume-time deadline shift covers it.
-                    return Ok(false);
-                }
+            // THEN the execution row lock — the same lock
+            // `pause_workflow_execution`/`resume_workflow_execution`
+            // hold — so the PAUSED re-check, the external-task state
+            // flip, and the event append below all serialize with the
+            // pause path (issue #609 post-review hardening, second
+            // bot-review round): the pause-suppression guarantee is
+            // unchanged by the task-first reordering. A vanished
+            // execution row (None) proceeds and surfaces as
+            // `append_single_event`'s NotFound, matching the
+            // pre-existing behaviour.
+            let execution_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_uuid)
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            if execution_state.as_deref().is_some_and(|state| {
+                pause_suppresses_timeout_enforcement(
+                    &TimeoutReason::ScheduleToClose,
+                    state,
+                    None,
+                    Utc::now(),
+                )
+            }) {
+                // Pause won the race: leave the row PENDING and
+                // untouched — the resume-time deadline shift covers it.
+                return Ok(false);
+            }
 
-                // The task row is locked and verified above, so a plain
-                // flip suffices — no re-filters needed.
-                diesel::update(harvest_external_tasks::table.find(task_id))
-                    .set((
-                        harvest_external_tasks::state.eq("TIMED_OUT"),
-                        harvest_external_tasks::updated_at.eq(Utc::now()),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+            // The task row is locked and verified above, so a plain
+            // flip suffices — no re-filters needed.
+            diesel::update(harvest_external_tasks::table.find(task_id))
+                .set((
+                    harvest_external_tasks::state.eq("TIMED_OUT"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                store::append_single_event(conn, exec_id, timeout_event).await?;
-                queue::wake_workflow_task(conn, exec_id).await?;
-                Ok(true)
-            })
-            .await;
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(true)
+        }))
+        .await;
 
         match result {
             Ok(true) => count += 1,
@@ -1827,7 +1829,7 @@ pub async fn enforce_external_signals_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -2018,7 +2020,7 @@ pub async fn enforce_external_signals_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            })
+            }))
             .await;
 
         match step_res {
@@ -2088,7 +2090,7 @@ pub async fn enforce_external_cancels_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = conn
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = Box::pin(conn
             .transaction::<Option<CancelStepOutcome>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -2281,7 +2283,7 @@ pub async fn enforce_external_cancels_outbox(
                 } else {
                     Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks)))
                 }
-            })
+            }))
             .await;
 
         match step_res {
@@ -2362,7 +2364,7 @@ pub async fn enforce_external_awaits_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -2556,7 +2558,7 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            })
+            }))
             .await;
 
         match step_res {
@@ -2854,8 +2856,8 @@ pub async fn enforce_workflow_history_ceiling(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
-        let (applied, deferred_starts, closed_children) = conn
-            .transaction::<(
+        let (applied, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
@@ -2931,7 +2933,7 @@ pub async fn enforce_workflow_history_ceiling(
                 .await?;
                 deferred.extend(triggers);
                 Ok((true, deferred, closed_children))
-            })
+            }))
             .await?;
 
         if !applied {

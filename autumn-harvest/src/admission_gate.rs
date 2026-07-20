@@ -923,7 +923,7 @@ pub mod db {
         let message_owned = message.map(str::to_owned);
         let actor_owned = actor.to_owned();
 
-        conn.transaction::<AdmissionGate, HarvestError, _>(async |conn| {
+        Box::pin(conn.transaction::<AdmissionGate, HarvestError, _>(async |conn| {
             use harvest_admission_gates::dsl as g;
 
             // Serialise concurrent gate creates so the count-check + insert is
@@ -975,7 +975,7 @@ pub mod db {
             row_to_gate(row).ok_or_else(|| {
                 HarvestError::Config("created gate row could not be decoded".to_string())
             })
-        })
+        }))
         .await
     }
 

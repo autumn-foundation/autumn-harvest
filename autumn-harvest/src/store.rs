@@ -234,8 +234,8 @@ pub async fn append_events_offloaded(
     // failed ref INSERT cannot leave events with offload envelopes but no
     // corresponding harvest_payload_refs rows (which would make those blobs
     // permanently invisible to the GC sweep).
-    let inserted = conn
-        .transaction::<usize, crate::error::HarvestError, _>(async |conn| {
+    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+        async |conn| {
             let inserted = diesel::insert_into(harvest_events::table)
                 .values(&rows)
                 .execute(conn)
@@ -245,8 +245,9 @@ pub async fn append_events_offloaded(
                 insert_payload_refs(conn, exec_id, &all_refs).await?;
             }
             Ok(inserted)
-        })
-        .await?;
+        },
+    ))
+    .await?;
 
     if let Some(last_event) = events.last() {
         crate::notify::notify_workflow_events_appended(
@@ -539,8 +540,8 @@ pub async fn admit_update_event(
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
-    let (workflow_name, queue_name) = conn
-        .transaction::<(String, String), crate::error::HarvestError, _>(async |conn| {
+    let (workflow_name, queue_name) = Box::pin(
+        conn.transaction::<(String, String), crate::error::HarvestError, _>(async |conn| {
             // Acquire a row-level lock so concurrent appenders serialize their
             // MAX(event_id) + INSERT pairs and the state check is consistent.
             let execution: WorkflowExecution = harvest_workflow_executions::table
@@ -589,8 +590,9 @@ pub async fn admit_update_event(
             };
             append_events(conn, exec_id, &[event], next_id).await?;
             Ok((execution.workflow_name, execution.queue_name))
-        })
-        .await?;
+        }),
+    )
+    .await?;
 
     // Post-commit: emit harvest.update.admitted exactly once (issue #684).
     if let Some(metrics) = metrics {

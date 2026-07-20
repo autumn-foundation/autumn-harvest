@@ -314,7 +314,7 @@ pub async fn complete_externally(
     token: ExternalActivityToken,
     output: serde_json::Value,
 ) -> HarvestResult<bool> {
-    conn.transaction::<bool, HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         let task = lock_task(conn, token).await?;
 
         if task.state != "PENDING" {
@@ -342,7 +342,7 @@ pub async fn complete_externally(
         crate::queue::wake_workflow_task(conn, exec_id).await?;
 
         Ok(true)
-    })
+    }))
     .await
 }
 
@@ -361,7 +361,7 @@ pub async fn fail_externally(
     error: String,
     retryable: bool,
 ) -> HarvestResult<bool> {
-    conn.transaction::<bool, HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         let task = lock_task(conn, token).await?;
 
         if task.state != "PENDING" {
@@ -390,7 +390,7 @@ pub async fn fail_externally(
         crate::queue::wake_workflow_task(conn, exec_id).await?;
 
         Ok(true)
-    })
+    }))
     .await
 }
 
@@ -408,7 +408,7 @@ pub async fn extend_deadline(
     token: ExternalActivityToken,
     extend_by_secs: u64,
 ) -> HarvestResult<()> {
-    conn.transaction::<(), HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let task = lock_task(conn, token).await?;
 
         if task.state != "PENDING" {
@@ -441,7 +441,7 @@ pub async fn extend_deadline(
         store::append_single_event(conn, exec_id, event).await?;
 
         Ok(())
-    })
+    }))
     .await
 }
 

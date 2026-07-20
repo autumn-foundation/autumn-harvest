@@ -513,7 +513,7 @@ pub async fn sync_completion_triggers(
     let active_ids: Vec<Uuid> = triggers.iter().map(|t| t.id).collect();
     let triggers = triggers.to_vec();
 
-    conn.transaction(async |tx| {
+    Box::pin(conn.transaction(async |tx| {
         // First, delete any static triggers that are no longer present in the builder's triggers list.
         if active_ids.is_empty() {
             diesel::delete(dsl::harvest_completion_triggers)
@@ -566,7 +566,7 @@ pub async fn sync_completion_triggers(
         }
 
         Ok(())
-    })
+    }))
     .await
 }
 
@@ -822,7 +822,7 @@ async fn relay_gate_checked_start(
     // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
     // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
     // is a separate connection whose own transaction commits independently.
-    let outcome = source_conn
+    let outcome = Box::pin(source_conn
         .transaction::<RelayOutcome, crate::error::HarvestError, _>(async |source_tx| {
             let claimed: Option<ClaimedId> = diesel::sql_query(
                 "SELECT id FROM harvest_completion_trigger_outbox \
@@ -909,7 +909,7 @@ async fn relay_gate_checked_start(
                     Ok(RelayOutcome::Delivered)
                 }
             }
-        })
+        }))
         .await?;
 
     // Record metrics ONLY after the claim transaction commits (a rollback must not

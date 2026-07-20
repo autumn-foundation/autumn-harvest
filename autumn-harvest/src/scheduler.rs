@@ -1742,7 +1742,7 @@ pub async fn update_workflow_schedule(
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::AsyncConnection;
 
-    conn.transaction(async |conn| {
+    Box::pin(conn.transaction(async |conn| {
         // FOR UPDATE: serialize this PATCH against a concurrent scheduler
         // tick (whose claim/advance/finalize UPDATEs take the row lock)
         // and against peer PATCHes. Without the lock, a full
@@ -1790,7 +1790,7 @@ pub async fn update_workflow_schedule(
                 }
             }
         }
-    })
+    }))
     .await
 }
 

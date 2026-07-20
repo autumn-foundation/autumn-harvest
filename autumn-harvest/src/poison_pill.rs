@@ -170,7 +170,7 @@ mod scanner {
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
 
-        conn.transaction::<bool, HarvestError, _>(async |conn| {
+        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
             let Some(worker_id) = worker else {
                 return Ok(false);
             };
@@ -217,7 +217,7 @@ mod scanner {
                 .await
                 .map_err(crate::error::database_error)?;
             Ok(true)
-        })
+        }))
         .await
     }
 
@@ -439,8 +439,8 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
-        let (acted, failed_workflow, deferred_starts, closed_children) = conn
-            .transaction::<(
+        let (acted, failed_workflow, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
@@ -493,7 +493,7 @@ mod scanner {
                     None => (None, Vec::new(), Vec::new()),
                 };
                 Ok((true, failed_workflow, deferred, closed_children))
-            })
+            }))
             .await?;
 
         if acted {

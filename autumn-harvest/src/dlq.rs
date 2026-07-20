@@ -533,7 +533,7 @@ pub async fn replay_dead_letter(
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
         let entry = dsl::harvest_dead_letters
             .find(dead_letter_id)
             .select(DeadLetter::as_select())
@@ -631,7 +631,7 @@ pub async fn replay_dead_letter(
         }
 
         Ok(task_id)
-    })
+    }))
     .await
 }
 
@@ -1018,118 +1018,121 @@ pub async fn redrive_dead_letter(
 ) -> HarvestResult<RedriveOutcome> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    conn.transaction::<RedriveOutcome, HarvestError, _>(async |conn| {
-        let Some(entry) = dsl::harvest_dead_letters
-            .find(dead_letter_id)
-            .select(DeadLetter::as_select())
-            .for_update()
-            .first(conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?
-        else {
-            // Already redriven (or discarded): idempotent no-op.
-            return Ok(RedriveOutcome::Skipped);
-        };
-
-        // Delegate a completion-callback dead letter (issue #605) to its
-        // own redrive primitive instead of erroring with "invalid
-        // task_type" (issue #921 review, Codex P2) -- see
-        // `redrive_callback_dead_letter`'s doc comment.
-        if entry.task_type.eq_ignore_ascii_case("callback") {
-            return match redrive_callback_dead_letter(
-                conn,
-                dead_letter_id,
-                entry.workflow_exec_id,
-                entry.original_task_id,
-            )
-            .await
-            {
-                Ok(delivery_id) => Ok(RedriveOutcome::Redriven(delivery_id)),
-                Err(HarvestError::NotFound(_)) => Ok(RedriveOutcome::Skipped),
-                Err(e) => Err(e),
+    Box::pin(
+        conn.transaction::<RedriveOutcome, HarvestError, _>(async |conn| {
+            let Some(entry) = dsl::harvest_dead_letters
+                .find(dead_letter_id)
+                .select(DeadLetter::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+            else {
+                // Already redriven (or discarded): idempotent no-op.
+                return Ok(RedriveOutcome::Skipped);
             };
-        }
 
-        let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
+            // Delegate a completion-callback dead letter (issue #605) to its
+            // own redrive primitive instead of erroring with "invalid
+            // task_type" (issue #921 review, Codex P2) -- see
+            // `redrive_callback_dead_letter`'s doc comment.
+            if entry.task_type.eq_ignore_ascii_case("callback") {
+                return match redrive_callback_dead_letter(
+                    conn,
+                    dead_letter_id,
+                    entry.workflow_exec_id,
+                    entry.original_task_id,
+                )
+                .await
+                {
+                    Ok(delivery_id) => Ok(RedriveOutcome::Redriven(delivery_id)),
+                    Err(HarvestError::NotFound(_)) => Ok(RedriveOutcome::Skipped),
+                    Err(e) => Err(e),
+                };
+            }
 
-        let mut params =
-            EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
-        params.workflow_exec_id = entry.workflow_exec_id;
-        params.activity_name = entry.activity_name.clone();
-        params.max_attempts = entry.attempts.max(1);
+            let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-        if let Some(exec_uuid) = entry.workflow_exec_id {
-            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-            let row: Option<(Option<String>, String, String)> =
-                exec_dsl::harvest_workflow_executions
-                    .find(exec_uuid)
-                    .select((
-                        exec_dsl::assigned_build_id,
-                        exec_dsl::workflow_name,
-                        exec_dsl::state,
-                    ))
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
+            let mut params =
+                EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
+            params.workflow_exec_id = entry.workflow_exec_id;
+            params.activity_name = entry.activity_name.clone();
+            params.max_attempts = entry.attempts.max(1);
 
-            let (build_id, workflow_name, state) = row
-                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_uuid}")))?;
-
-            match state.as_str() {
-                // Live execution already owns the work — converge state by
-                // deleting the stale DLQ row and report a skip rather than
-                // double-dispatching a second task.
-                "RUNNING" | "PAUSED" => {
-                    diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
-                        .execute(conn)
+            if let Some(exec_uuid) = entry.workflow_exec_id {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let row: Option<(Option<String>, String, String)> =
+                    exec_dsl::harvest_workflow_executions
+                        .find(exec_uuid)
+                        .select((
+                            exec_dsl::assigned_build_id,
+                            exec_dsl::workflow_name,
+                            exec_dsl::state,
+                        ))
+                        .for_update()
+                        .first(conn)
                         .await
+                        .optional()
                         .map_err(crate::error::database_error)?;
-                    return Ok(RedriveOutcome::Skipped);
-                }
-                // The load-bearing differentiator (AC #7): reopen a run
-                // sealed FAILED at quarantine time so it can resume.
-                "FAILED" => {
-                    let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
-                    crate::execution::reactivate_failed_execution(
-                        conn,
-                        exec_id,
-                        dead_letter_id,
-                        reason,
-                    )
-                    .await?;
-                }
-                // Non-FAILED terminal states are not resurrectable.
-                other => {
-                    return Err(HarvestError::Config(format!(
-                        "cannot redrive dead-letter {dead_letter_id}: owning execution \
+
+                let (build_id, workflow_name, state) = row.ok_or_else(|| {
+                    HarvestError::NotFound(format!("workflow execution {exec_uuid}"))
+                })?;
+
+                match state.as_str() {
+                    // Live execution already owns the work — converge state by
+                    // deleting the stale DLQ row and report a skip rather than
+                    // double-dispatching a second task.
+                    "RUNNING" | "PAUSED" => {
+                        diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        return Ok(RedriveOutcome::Skipped);
+                    }
+                    // The load-bearing differentiator (AC #7): reopen a run
+                    // sealed FAILED at quarantine time so it can resume.
+                    "FAILED" => {
+                        let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
+                        crate::execution::reactivate_failed_execution(
+                            conn,
+                            exec_id,
+                            dead_letter_id,
+                            reason,
+                        )
+                        .await?;
+                    }
+                    // Non-FAILED terminal states are not resurrectable.
+                    other => {
+                        return Err(HarvestError::Config(format!(
+                            "cannot redrive dead-letter {dead_letter_id}: owning execution \
                          {exec_uuid} is {other} (terminal, not resurrectable)"
-                    )));
+                        )));
+                    }
+                }
+
+                params.required_build_id = build_id;
+                if task_type == TaskType::Workflow
+                    && let Some(reg) = registry
+                    && let Some(info) = reg.workflows.get(&workflow_name)
+                    && let Some(policy) = &info.concurrency
+                {
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+                    params.max_concurrent = Some(policy.limit);
                 }
             }
 
-            params.required_build_id = build_id;
-            if task_type == TaskType::Workflow
-                && let Some(reg) = registry
-                && let Some(info) = reg.workflows.get(&workflow_name)
-                && let Some(policy) = &info.concurrency
-            {
-                params.concurrency_key =
-                    crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
-                params.max_concurrent = Some(policy.limit);
-            }
-        }
+            let task_id = crate::queue::enqueue(conn, &params).await?;
+            diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-        let task_id = crate::queue::enqueue(conn, &params).await?;
-        diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
-        Ok(RedriveOutcome::Redriven(task_id))
-    })
+            Ok(RedriveOutcome::Redriven(task_id))
+        }),
+    )
     .await
 }
 

@@ -742,7 +742,7 @@ async fn break_session_and_fail_members(
     use crate::event::WorkflowEvent;
     use crate::models::TaskQueueItem;
 
-    conn.transaction::<usize, HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
         use crate::schema::harvest_sessions::dsl as s;
         use crate::schema::harvest_task_queue::dsl as q;
 
@@ -823,7 +823,7 @@ async fn break_session_and_fail_members(
         }
 
         Ok(failed)
-    })
+    }))
     .await
 }
 

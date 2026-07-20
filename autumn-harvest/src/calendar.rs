@@ -414,7 +414,7 @@ pub async fn replace_calendar_exclusions(
         })
         .collect();
 
-    conn.transaction(async |tx| {
+    Box::pin(conn.transaction(async |tx| {
         diesel::delete(
             harvest_calendar_exclusions::table
                 .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
@@ -437,7 +437,7 @@ pub async fn replace_calendar_exclusions(
         }
 
         Ok(())
-    })
+    }))
     .await
 }
 

@@ -391,46 +391,48 @@ pub async fn publish_wasm_module(
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
-    conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
-        use crate::schema::harvest_wasm_modules::dsl as m;
+    Box::pin(
+        conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
+            use crate::schema::harvest_wasm_modules::dsl as m;
 
-        // Serialise concurrent publishes for the SAME activity name so the
-        // deactivate + upsert pair is atomic and the partial unique index
-        // (`WHERE active`) can never see two active rows mid-swap. The lock
-        // is transaction-scoped (auto-released on commit/rollback), and
-        // keyed on the activity name so distinct names never contend.
-        diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-            .bind::<diesel::sql_types::Text, _>(&name)
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // Serialise concurrent publishes for the SAME activity name so the
+            // deactivate + upsert pair is atomic and the partial unique index
+            // (`WHERE active`) can never see two active rows mid-swap. The lock
+            // is transaction-scoped (auto-released on commit/rollback), and
+            // keyed on the activity name so distinct names never contend.
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind::<diesel::sql_types::Text, _>(&name)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        // 1. Deactivate every currently-active version for this name.
-        diesel::update(m::harvest_wasm_modules.filter(m::activity_name.eq(&name)))
-            .filter(m::active.eq(true))
-            .set(m::active.eq(false))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // 1. Deactivate every currently-active version for this name.
+            diesel::update(m::harvest_wasm_modules.filter(m::activity_name.eq(&name)))
+                .filter(m::active.eq(true))
+                .set(m::active.eq(false))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        // 2. Upsert the requested version as active.
-        let new_row = crate::models::NewHarvestWasmModule {
-            hash: &hash_for_txn,
-            activity_name: &name,
-            wasm_bytes: bytes,
-            active: true,
-        };
-        diesel::insert_into(m::harvest_wasm_modules)
-            .values(&new_row)
-            .on_conflict((m::hash, m::activity_name))
-            .do_update()
-            .set((m::active.eq(true), m::published_at.eq(diesel::dsl::now)))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // 2. Upsert the requested version as active.
+            let new_row = crate::models::NewHarvestWasmModule {
+                hash: &hash_for_txn,
+                activity_name: &name,
+                wasm_bytes: bytes,
+                active: true,
+            };
+            diesel::insert_into(m::harvest_wasm_modules)
+                .values(&new_row)
+                .on_conflict((m::hash, m::activity_name))
+                .do_update()
+                .set((m::active.eq(true), m::published_at.eq(diesel::dsl::now)))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        Ok(())
-    })
+            Ok(())
+        }),
+    )
     .await?;
 
     Ok(hash)
@@ -480,56 +482,58 @@ pub async fn seed_wasm_module(
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
-    conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
-        use crate::schema::harvest_wasm_modules::dsl as m;
+    Box::pin(
+        conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
+            use crate::schema::harvest_wasm_modules::dsl as m;
 
-        // Serialise against a concurrent publish/seed for the SAME name so
-        // the "is there an active version?" check and the conditional
-        // activate are atomic. Same lock key as `publish_wasm_module`.
-        diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
-            .bind::<diesel::sql_types::Text, _>(&name)
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // Serialise against a concurrent publish/seed for the SAME name so
+            // the "is there an active version?" check and the conditional
+            // activate are atomic. Same lock key as `publish_wasm_module`.
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind::<diesel::sql_types::Text, _>(&name)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        // 1. Ensure the row exists (inactive if new, unchanged if already
-        //    present) so its bytes are always fetchable by hash. DO NOTHING
-        //    on conflict so an already-active row is never demoted.
-        let new_row = crate::models::NewHarvestWasmModule {
-            hash: &hash_for_txn,
-            activity_name: &name,
-            wasm_bytes: bytes,
-            active: false,
-        };
-        diesel::insert_into(m::harvest_wasm_modules)
-            .values(&new_row)
-            .on_conflict((m::hash, m::activity_name))
-            .do_nothing()
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+            // 1. Ensure the row exists (inactive if new, unchanged if already
+            //    present) so its bytes are always fetchable by hash. DO NOTHING
+            //    on conflict so an already-active row is never demoted.
+            let new_row = crate::models::NewHarvestWasmModule {
+                hash: &hash_for_txn,
+                activity_name: &name,
+                wasm_bytes: bytes,
+                active: false,
+            };
+            diesel::insert_into(m::harvest_wasm_modules)
+                .values(&new_row)
+                .on_conflict((m::hash, m::activity_name))
+                .do_nothing()
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
 
-        // 2. Activate the seeded version ONLY when no active version exists
-        //    for this name. Under the advisory lock the `NOT EXISTS` guard
-        //    cannot race a concurrent activation, so the partial unique
-        //    index (`WHERE active`) can never see two active rows. $2 is
-        //    referenced twice; Postgres binds it once.
-        diesel::sql_query(
-            "UPDATE harvest_wasm_modules SET active = true, published_at = now() \
+            // 2. Activate the seeded version ONLY when no active version exists
+            //    for this name. Under the advisory lock the `NOT EXISTS` guard
+            //    cannot race a concurrent activation, so the partial unique
+            //    index (`WHERE active`) can never see two active rows. $2 is
+            //    referenced twice; Postgres binds it once.
+            diesel::sql_query(
+                "UPDATE harvest_wasm_modules SET active = true, published_at = now() \
              WHERE hash = $1 AND activity_name = $2 \
              AND NOT EXISTS ( \
                  SELECT 1 FROM harvest_wasm_modules \
                  WHERE activity_name = $2 AND active \
              )",
-        )
-        .bind::<diesel::sql_types::Text, _>(&hash_for_txn)
-        .bind::<diesel::sql_types::Text, _>(&name)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
+            )
+            .bind::<diesel::sql_types::Text, _>(&hash_for_txn)
+            .bind::<diesel::sql_types::Text, _>(&name)
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
 
-        Ok(())
-    })
+            Ok(())
+        }),
+    )
     .await?;
 
     Ok(hash)

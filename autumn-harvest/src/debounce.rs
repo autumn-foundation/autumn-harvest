@@ -417,8 +417,8 @@ pub async fn admit_debounced_start(
     let queue_name = params.queue_name;
     let shard_id = params.shard_id;
 
-    let txn = conn
-        .transaction::<DebounceAdmitOutcome, AdmitTxnErr, _>(async |conn| {
+    let txn = Box::pin(
+        conn.transaction::<DebounceAdmitOutcome, AdmitTxnErr, _>(async |conn| {
             let row: UpsertRow = diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Uuid, _>(new_id)
                 .bind::<diesel::sql_types::Text, _>(workflow_name)
@@ -448,8 +448,9 @@ pub async fn admit_debounced_start(
                 pending_count: row.pending_count,
                 is_new_record: row.is_new_record,
             })
-        })
-        .await;
+        }),
+    )
+    .await;
 
     match txn {
         Ok(outcome) => Ok(Some(outcome)),
@@ -568,8 +569,8 @@ async fn fire_due_on_conn(
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<FiredDebounce> = conn
-        .transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(async |conn| {
+    let fired: Vec<FiredDebounce> = Box::pin(
+        conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(async |conn| {
             let now = Utc::now();
             let due_sql = "
                 SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
@@ -595,8 +596,9 @@ async fn fire_due_on_conn(
                 }
             }
             Ok(results)
-        })
-        .await?;
+        }),
+    )
+    .await?;
 
     Ok(fired)
 }

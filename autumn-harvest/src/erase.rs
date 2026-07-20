@@ -282,14 +282,16 @@ mod db {
         exec_id: ExecutionId,
         _reason: &str,
     ) -> HarvestResult<EraseOutcome> {
-        conn.transaction::<EraseOutcome, HarvestError, _>(async |conn| {
-            // A `visited` set guards the unified downward traversal against
-            // diamonds and any pathological `parent_id` cycle across the two
-            // child sources (`harvest_workflow_executions` and
-            // `harvest_execution_summaries`).
-            let mut visited: HashSet<Uuid> = HashSet::new();
-            erase_top_level(conn, exec_id, &mut visited).await
-        })
+        Box::pin(
+            conn.transaction::<EraseOutcome, HarvestError, _>(async |conn| {
+                // A `visited` set guards the unified downward traversal against
+                // diamonds and any pathological `parent_id` cycle across the two
+                // child sources (`harvest_workflow_executions` and
+                // `harvest_execution_summaries`).
+                let mut visited: HashSet<Uuid> = HashSet::new();
+                erase_top_level(conn, exec_id, &mut visited).await
+            }),
+        )
         .await
     }
 

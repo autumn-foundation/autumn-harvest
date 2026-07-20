@@ -12,7 +12,6 @@ use autumn_harvest::{
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use scoped_futures::ScopedFutureExt;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -109,32 +108,29 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 
     let output = serde_json::json!({"ok": true});
-    conn.transaction::<(), HarvestError, _>(|conn| {
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let output = output.clone();
-        async move {
-            autumn_harvest::store::append_events(
-                conn,
-                exec_id,
-                &[WorkflowEvent::WorkflowCompleted {
-                    output: output.clone(),
-                }],
-                1,
-            )
-            .await?;
+        autumn_harvest::store::append_events(
+            conn,
+            exec_id,
+            &[WorkflowEvent::WorkflowCompleted {
+                output: output.clone(),
+            }],
+            1,
+        )
+        .await?;
 
-            diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-                .set((
-                    dsl::state.eq("COMPLETED"),
-                    dsl::output.eq(Some(output)),
-                    dsl::completed_at.eq(Some(chrono::Utc::now())),
-                ))
-                .execute(conn)
-                .await
-                .map_err(autumn_harvest::error::database_error)?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
+        diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+            .set((
+                dsl::state.eq("COMPLETED"),
+                dsl::output.eq(Some(output)),
+                dsl::completed_at.eq(Some(chrono::Utc::now())),
+            ))
+            .execute(conn)
+            .await
+            .map_err(autumn_harvest::error::database_error)?;
+        Ok(())
+    }))
     .await
     .expect("workflow row should complete");
 }

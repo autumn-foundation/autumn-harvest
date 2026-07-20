@@ -71,7 +71,7 @@ pub async fn send_signal_idempotent(
     // collide across unrelated signals — treat it as no key (at-least-once).
     let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
 
-    conn.transaction::<bool, HarvestError, _>(async |conn| {
+    Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         let execution = harvest_workflow_executions::table
             .find(exec_id.as_uuid())
             .for_update()
@@ -143,7 +143,7 @@ pub async fn send_signal_idempotent(
 
         crate::queue::wake_workflow_task(conn, exec_id).await?;
         Ok(true)
-    })
+    }))
     .await
 }
 
