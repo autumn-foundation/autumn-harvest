@@ -3661,3 +3661,125 @@ async fn test_await_external_workflow_typed_deserialize_failure() {
         "typed await of an undeserializable output must surface HarvestError::Serialization: {result}"
     );
 }
+
+// ──────────────────────────── mutex (issue #691) ──────────────────────────────
+
+/// Acquire a durable mutex, run a trivial critical section, release, complete.
+fn mutex_acquire_release_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+        // Trivial critical-section step.
+        let out = json!({"held": true});
+        guard.release();
+        Ok(out)
+    })
+}
+
+/// Acquire a durable mutex and return — used to exercise the contended
+/// (withheld-grant) park path.
+fn mutex_acquire_only_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+        Ok(json!("acquired"))
+    })
+}
+
+/// Hold a mutex, then re-acquire the same key — a synchronous self-deadlock.
+fn mutex_self_deadlock_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // `_g1` is held across the second acquire (named, not `_`, so it is NOT
+        // dropped immediately).
+        let _g1 = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+        match ctx.mutex("k").acquire().await {
+            Ok(_) => Ok(json!("unexpected: second acquire succeeded")),
+            Err(e) if e.is_mutex_self_deadlock() => Err("self_deadlock".to_string()),
+            Err(e) => Err(format!("unexpected error: {e}")),
+        }
+    })
+}
+
+/// AC11 (issue #691): the harness auto-grants an uncontended mutex, the workflow
+/// runs its critical section, releases, and completes — with exactly one
+/// `MutexGranted` recorded and no `MutexReleased` event (release is event-less).
+#[tokio::test]
+async fn test_mutex_acquire_then_release_completes() {
+    let outcome = WorkflowTestEnv::new()
+        .run(mutex_acquire_release_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"held": true})),
+        "uncontended mutex workflow must complete: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    let grants = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::MutexGranted { key, .. } if key == "k"))
+        .count();
+    assert_eq!(grants, 1, "expected exactly one MutexGranted for key 'k'");
+}
+
+/// AC11 (issue #691): a mutex key marked contended via `with_mutex_contended`
+/// withholds the grant — the workflow parks (never completes) and no
+/// `MutexGranted` for that key is ever recorded.
+#[tokio::test]
+async fn test_mutex_contended_path_parks() {
+    let outcome = WorkflowTestEnv::new()
+        .with_mutex_contended("k")
+        .run(mutex_acquire_only_workflow, json!(null))
+        .await;
+
+    assert!(
+        outcome.result.is_err(),
+        "a contended mutex acquire must leave the workflow parked, not complete: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::MutexGranted { key, .. } if key == "k")),
+        "a withheld (contended) grant must never record a MutexGranted for 'k'"
+    );
+}
+
+/// AC7 (issue #691): re-acquiring a key the workflow already holds returns
+/// `HarvestError::MutexSelfDeadlock` synchronously — the workflow observes the
+/// typed error and exactly one `MutexGranted` (the first acquire) is recorded.
+#[tokio::test]
+async fn test_mutex_self_deadlock_in_test_env() {
+    let outcome = WorkflowTestEnv::new()
+        .run(mutex_self_deadlock_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Err("self_deadlock".to_string()),
+        "re-acquiring a held key must surface HarvestError::MutexSelfDeadlock: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    let grants = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::MutexGranted { .. }))
+        .count();
+    assert_eq!(
+        grants, 1,
+        "only the first (successful) acquire records a MutexGranted; the \
+         self-deadlocking second acquire fails synchronously before emitting one"
+    );
+}
