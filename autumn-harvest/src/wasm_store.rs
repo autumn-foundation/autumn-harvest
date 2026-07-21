@@ -378,7 +378,6 @@ pub async fn publish_wasm_module(
     bytes: &[u8],
 ) -> HarvestResult<String> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
-    use scoped_futures::ScopedFutureExt as _;
 
     if bytes.len() > MAX_WASM_MODULE_BYTES {
         return Err(crate::error::HarvestError::Config(format!(
@@ -392,8 +391,8 @@ pub async fn publish_wasm_module(
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
-    conn.transaction::<(), crate::error::HarvestError, _>(|conn| {
-        async move {
+    Box::pin(
+        conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
             use crate::schema::harvest_wasm_modules::dsl as m;
 
             // Serialise concurrent publishes for the SAME activity name so the
@@ -432,9 +431,8 @@ pub async fn publish_wasm_module(
                 .map_err(database_error)?;
 
             Ok(())
-        }
-        .scope_boxed()
-    })
+        }),
+    )
     .await?;
 
     Ok(hash)
@@ -471,7 +469,6 @@ pub async fn seed_wasm_module(
     bytes: &[u8],
 ) -> HarvestResult<String> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
-    use scoped_futures::ScopedFutureExt as _;
 
     if bytes.len() > MAX_WASM_MODULE_BYTES {
         return Err(crate::error::HarvestError::Config(format!(
@@ -485,8 +482,8 @@ pub async fn seed_wasm_module(
     let hash_for_txn = hash.clone();
     let name = activity_name.to_owned();
 
-    conn.transaction::<(), crate::error::HarvestError, _>(|conn| {
-        async move {
+    Box::pin(
+        conn.transaction::<(), crate::error::HarvestError, _>(async |conn| {
             use crate::schema::harvest_wasm_modules::dsl as m;
 
             // Serialise against a concurrent publish/seed for the SAME name so
@@ -522,11 +519,11 @@ pub async fn seed_wasm_module(
             //    referenced twice; Postgres binds it once.
             diesel::sql_query(
                 "UPDATE harvest_wasm_modules SET active = true, published_at = now() \
-                 WHERE hash = $1 AND activity_name = $2 \
-                 AND NOT EXISTS ( \
-                     SELECT 1 FROM harvest_wasm_modules \
-                     WHERE activity_name = $2 AND active \
-                 )",
+             WHERE hash = $1 AND activity_name = $2 \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM harvest_wasm_modules \
+                 WHERE activity_name = $2 AND active \
+             )",
             )
             .bind::<diesel::sql_types::Text, _>(&hash_for_txn)
             .bind::<diesel::sql_types::Text, _>(&name)
@@ -535,9 +532,8 @@ pub async fn seed_wasm_module(
             .map_err(database_error)?;
 
             Ok(())
-        }
-        .scope_boxed()
-    })
+        }),
+    )
     .await?;
 
     Ok(hash)

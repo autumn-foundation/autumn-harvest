@@ -835,6 +835,21 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         non_retryable: Option<bool>,
     },
+    /// A durable mutex was acquired (issue #691). Records exclusive access to
+    /// `key` with the monotonic fencing token `lock_seq`. This is the replay
+    /// anchor for `ctx.mutex(key).acquire()`.
+    ///
+    /// Release is EVENT-LESS bookkeeping (mirrors `SetCurrentDetails`) — there
+    /// is intentionally NO `MutexReleased` event, so no forward-scan skip-list
+    /// needs updating.
+    MutexGranted {
+        /// The lock key that was acquired.
+        key: String,
+        /// Monotonic fencing token minted for this grant.
+        lock_seq: i64,
+        /// Wall-clock instant the lock was granted.
+        acquired_at: DateTime<Utc>,
+    },
 }
 
 impl WorkflowEvent {
@@ -963,6 +978,7 @@ impl WorkflowEvent {
             Self::ExternalAwaitRequested { .. } => "ExternalAwaitRequested",
             Self::ExternalAwaitResolved { .. } => "ExternalAwaitResolved",
             Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
+            Self::MutexGranted { .. } => "MutexGranted",
         }
     }
 
@@ -1236,6 +1252,37 @@ mod tests {
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::ActivityScheduled { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn mutex_granted_round_trips() -> Result<(), serde_json::Error> {
+        // Issue #691: the durable-mutex replay anchor round-trips verbatim and
+        // carries the adjacently-tagged `"type":"MutexGranted"` discriminator.
+        let event = WorkflowEvent::MutexGranted {
+            key: "ledger:acct-42".into(),
+            lock_seq: 7,
+            acquired_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["type"], "MutexGranted");
+        assert_eq!(value["data"]["key"], "ledger:acct-42");
+        assert_eq!(value["data"]["lock_seq"], 7);
+        let back: WorkflowEvent = serde_json::from_value(value)?;
+        let WorkflowEvent::MutexGranted {
+            key,
+            lock_seq,
+            acquired_at,
+        } = back
+        else {
+            panic!("expected MutexGranted, got {}", event.type_name());
+        };
+        assert_eq!(key, "ledger:acct-42");
+        assert_eq!(lock_seq, 7);
+        assert_eq!(
+            acquired_at,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+        );
         Ok(())
     }
 

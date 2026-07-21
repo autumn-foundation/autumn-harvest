@@ -7,7 +7,6 @@ use chrono::Utc;
 use diesel::prelude::*;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use scoped_futures::ScopedFutureExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -388,6 +387,19 @@ pub enum WorkflowResetError {
     },
     #[error("continue-as-new histories cannot be reset in v1")]
     ContinueAsNew,
+    /// The source execution currently holds a durable mutex (issue #691).
+    ///
+    /// A reset forks a fresh execution and seals the source `TERMINATED`. If the
+    /// source still holds a mutex, the fork would either phantom-inherit the
+    /// grant (its replayed history carries the `MutexGranted` event without a
+    /// live lock row) or leave the source's lock un-released and its waiters
+    /// stranded. Rather than silently strip the event, the reset is rejected so
+    /// the operator can let the critical section finish (or cancel/terminate the
+    /// source, which releases the lock via the terminal sweep) and retry.
+    #[error(
+        "workflow execution {exec_id} holds durable mutex '{key}'; release it before resetting"
+    )]
+    HolderHoldsMutex { exec_id: ExecutionId, key: String },
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -719,6 +731,10 @@ pub async fn preview_workflow_reset(
     let mut request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
+    // A reset while the source holds a durable mutex would phantom-grant the
+    // lock to the fork; surface that in the preview so the operator sees the
+    // same rejection the actual reset would return (issue #691).
+    reject_if_source_holds_mutex(conn, exec_id).await?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
     // If a logical ResetPoint was specified, resolve it to a raw event id now.
@@ -749,83 +765,83 @@ pub async fn reset_workflow_execution(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let mut request = request.normalized();
-    let (res, deferred_starts, workflow_name, closed_children) = conn
-        .transaction::<(
+    let (res, deferred_starts, workflow_name, closed_children) =
+        Box::pin(conn.transaction::<(
             ResetResult,
             Vec<DeferredTriggerStart>,
             String,
             Vec<(ExecutionId, String)>,
-        ), WorkflowResetError, _>(|conn| {
-            async move {
-                let source = load_source_execution(conn, exec_id, true).await?;
-                validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
+        ), WorkflowResetError, _>(async |conn| {
+            let source = load_source_execution(conn, exec_id, true).await?;
+            validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
 
-                let rows = load_event_rows(conn, exec_id).await?;
-                let events = decode_events(&rows)?;
-                // Resolve a logical ResetPoint to a raw event id before validation.
-                if let Some(ref point) = request.reset_point.clone() {
-                    let resolved = resolve_reset_point(&events, point)
-                        .map_err(|reason| skip_reason_to_error(exec_id, reason))?;
-                    request.reset_to_event_id = Some(resolved);
-                }
-                let reset_event_id = request.reset_to_event_id.unwrap_or(0);
-                let plan = validate_reset_point(&events, reset_event_id)?;
-
-                let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-                let source_next_event_id =
-                    rows.last().map_or(0, |row| row.event_id.saturating_add(1));
-
-                let (deferred, closed_children) = terminate_source_execution(
-                    conn,
-                    exec_id,
-                    new_exec_id,
-                    &request,
-                    source_next_event_id,
-                )
-                .await?;
-                let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
-                copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
-                append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
-
-                let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
-                    conn,
-                    exec_id,
-                    &format!("workflow reset to {new_exec_id}: {}", request.reason),
-                )
-                .await?;
-                let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
-                let source_external_cancelled =
-                    cancel_pending_external_tasks(conn, exec_id).await?;
-                let signals_buffered =
-                    reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply)
-                        .await?;
-
-                enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
-
-                Ok((
-                    ResetResult {
-                        new_exec_id,
-                        reset_from_exec_id: exec_id,
-                        reset_to_event_id: reset_event_id,
-                        events_carried_over: plan.events_carried_over,
-                        source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
-                        source_timers_removed,
-                        source_signals_dropped: match request.signal_reapply {
-                            ResetSignalReapplyPolicy::Drop => signals_buffered,
-                            ResetSignalReapplyPolicy::Buffer => 0,
-                        },
-                        source_signals_buffered: match request.signal_reapply {
-                            ResetSignalReapplyPolicy::Drop => 0,
-                            ResetSignalReapplyPolicy::Buffer => signals_buffered,
-                        },
-                    },
-                    deferred,
-                    source.workflow_name,
-                    closed_children,
-                ))
+            let rows = load_event_rows(conn, exec_id).await?;
+            let events = decode_events(&rows)?;
+            // Resolve a logical ResetPoint to a raw event id before validation.
+            if let Some(ref point) = request.reset_point.clone() {
+                let resolved = resolve_reset_point(&events, point)
+                    .map_err(|reason| skip_reason_to_error(exec_id, reason))?;
+                request.reset_to_event_id = Some(resolved);
             }
-            .scope_boxed()
-        })
+            let reset_event_id = request.reset_to_event_id.unwrap_or(0);
+            let plan = validate_reset_point(&events, reset_event_id)?;
+
+            // Reject the reset while the source still holds a durable mutex
+            // (issue #691), before sealing the source or forking. Inside the
+            // transaction so the read is consistent with the seal that
+            // follows.
+            reject_if_source_holds_mutex(conn, exec_id).await?;
+
+            let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
+            let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
+
+            let (deferred, closed_children) = terminate_source_execution(
+                conn,
+                exec_id,
+                new_exec_id,
+                &request,
+                source_next_event_id,
+            )
+            .await?;
+            let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
+            copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
+            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
+
+            let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
+                conn,
+                exec_id,
+                &format!("workflow reset to {new_exec_id}: {}", request.reason),
+            )
+            .await?;
+            let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
+            let source_external_cancelled = cancel_pending_external_tasks(conn, exec_id).await?;
+            let signals_buffered =
+                reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
+
+            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
+
+            Ok((
+                ResetResult {
+                    new_exec_id,
+                    reset_from_exec_id: exec_id,
+                    reset_to_event_id: reset_event_id,
+                    events_carried_over: plan.events_carried_over,
+                    source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
+                    source_timers_removed,
+                    source_signals_dropped: match request.signal_reapply {
+                        ResetSignalReapplyPolicy::Drop => signals_buffered,
+                        ResetSignalReapplyPolicy::Buffer => 0,
+                    },
+                    source_signals_buffered: match request.signal_reapply {
+                        ResetSignalReapplyPolicy::Drop => 0,
+                        ResetSignalReapplyPolicy::Buffer => signals_buffered,
+                    },
+                },
+                deferred,
+                source.workflow_name,
+                closed_children,
+            ))
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -1167,6 +1183,32 @@ async fn count_unconsumed_signals(
     Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
+/// Reject a reset while the source execution still holds a durable mutex
+/// (issue #691).
+///
+/// A reset forks a fresh execution at a decision boundary and seals the source
+/// `TERMINATED`. Allowing that while the source holds a lock would either
+/// phantom-grant the mutex to the fork (the replayed `MutexGranted` event has no
+/// backing lock row) or strand the source's waiters. Guarded — when the mutex
+/// tables are absent this is a no-op (`holder_holds_any_mutex` returns `None`).
+///
+/// # Errors
+///
+/// Returns [`WorkflowResetError::HolderHoldsMutex`] when the source holds ≥1
+/// lock.
+async fn reject_if_source_holds_mutex(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+) -> Result<(), WorkflowResetError> {
+    if let Some(key) = crate::mutex::holder_holds_any_mutex(conn, source_exec_id).await? {
+        return Err(WorkflowResetError::HolderHoldsMutex {
+            exec_id: source_exec_id,
+            key,
+        });
+    }
+    Ok(())
+}
+
 async fn terminate_source_execution(
     conn: &mut AsyncPgConnection,
     source_exec_id: ExecutionId,
@@ -1218,6 +1260,16 @@ async fn terminate_source_execution(
         .execute(conn)
         .await
         .map_err(database_error)?;
+
+    // Defense-in-depth (issue #691): the caller rejects a reset while the source
+    // holds a mutex, so by the time we seal `TERMINATED` here the source should
+    // hold nothing — but sweep anyway so a lock acquired in a race window (or on
+    // a future caller that forgets the pre-check) is released and its waiters
+    // woken rather than stranded. Runs inside the reset transaction, so the
+    // per-key advisory locks hold across the sweep. A no-op when the mutex
+    // tables are absent (guarded).
+    crate::mutex::sweep_terminal_holder_and_wake(conn, source_exec_id).await?;
+
     let (deferred, closed_children) = apply_parent_close_cascade(conn, source_exec_id).await?;
 
     Ok((deferred, closed_children))

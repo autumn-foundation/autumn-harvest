@@ -252,7 +252,6 @@ mod db {
     use diesel_async::AsyncConnection;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
-    use scoped_futures::ScopedFutureExt as _;
     use uuid::Uuid;
 
     use crate::error::{HarvestError, HarvestResult, database_error};
@@ -283,17 +282,16 @@ mod db {
         exec_id: ExecutionId,
         _reason: &str,
     ) -> HarvestResult<EraseOutcome> {
-        conn.transaction::<EraseOutcome, HarvestError, _>(|conn| {
-            async move {
+        Box::pin(
+            conn.transaction::<EraseOutcome, HarvestError, _>(async |conn| {
                 // A `visited` set guards the unified downward traversal against
                 // diamonds and any pathological `parent_id` cycle across the two
                 // child sources (`harvest_workflow_executions` and
                 // `harvest_execution_summaries`).
                 let mut visited: HashSet<Uuid> = HashSet::new();
                 erase_top_level(conn, exec_id, &mut visited).await
-            }
-            .scope_boxed()
-        })
+            }),
+        )
         .await
     }
 

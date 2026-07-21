@@ -553,7 +553,8 @@ impl MermaidExporter {
                 }
                 WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::MarkerRecorded { .. }
-                | WorkflowEvent::SideEffectRecorded { .. } => {
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::MutexGranted { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -876,6 +877,9 @@ impl MermaidExporter {
             WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
                 let label = name.as_deref().unwrap_or(kind.as_str());
                 writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
+            }
+            WorkflowEvent::MutexGranted { key, .. } => {
+                writeln!(self.out, "    Note over WF: Mutex Acquired: {key}")?;
             }
             _ => unreachable!(),
         }

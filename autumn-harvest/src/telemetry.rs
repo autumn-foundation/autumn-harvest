@@ -524,6 +524,29 @@ pub const METRIC_SAGA_COMPENSATED: &str = "harvest.saga.compensated";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_SAGA_COMPENSATION_FAILED: &str = "harvest.saga.compensation_failed";
 
+/// Histogram: wall-clock seconds a workflow waited to acquire a durable mutex,
+/// from request (enqueued as a waiter) to grant (issue #691).
+///
+/// Labeled by `workflow` (workflow type name) only. The lock key is
+/// high-cardinality (often tenant/entity input), so per ADR-0001 §7 it is
+/// deliberately **not** a metric label. `execution.id` stays span-only.
+pub const METRIC_MUTEX_WAIT: &str = "harvest.mutex.wait_duration";
+
+/// Histogram: wall-clock seconds a durable mutex was held, from grant to
+/// release (issue #691).
+///
+/// Labeled by `workflow` (workflow type name) only — the lock key is
+/// deliberately **not** a label (ADR-0001 §7). `execution.id` stays span-only.
+pub const METRIC_MUTEX_HELD: &str = "harvest.mutex.held_duration";
+
+/// Gauge: the number of workflows waiting on a durable mutex key at the moment
+/// a grant is made (contention depth), i.e. the FIFO waiter-queue length for
+/// the key (issue #691).
+///
+/// Labeled by `workflow` (workflow type name) only — the lock key is
+/// deliberately **not** a label (ADR-0001 §7). `execution.id` stays span-only.
+pub const METRIC_MUTEX_CONTENTION: &str = "harvest.mutex.contention_depth";
+
 /// Histogram: wall-clock seconds a synthetic liveness-canary probe took from
 /// start-requested to terminal completion (issue #796).
 ///
@@ -2254,6 +2277,36 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.saga.compensation_failed{workflow, queue}`.
     fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    // ── Durable mutex (issue #691) ────────────────────────────────────────
+
+    /// A workflow acquired a durable mutex; record how long it waited from
+    /// request to grant (issue #691).
+    ///
+    /// Maps to the histogram [`METRIC_MUTEX_WAIT`] with label `workflow`. The
+    /// lock key is deliberately **not** a label (unbounded cardinality,
+    /// ADR-0001 §7).
+    fn record_mutex_wait(&self, workflow: &str, seconds: f64) {
+        let _ = (workflow, seconds);
+    }
+
+    /// A durable mutex was released; record how long it was held from grant to
+    /// release (issue #691).
+    ///
+    /// Maps to the histogram [`METRIC_MUTEX_HELD`] with label `workflow`. The
+    /// lock key is deliberately **not** a label (ADR-0001 §7).
+    fn record_mutex_held(&self, workflow: &str, seconds: f64) {
+        let _ = (workflow, seconds);
+    }
+
+    /// The FIFO waiter-queue depth for a durable mutex key at the moment of a
+    /// grant (contention depth, issue #691).
+    ///
+    /// Maps to the gauge [`METRIC_MUTEX_CONTENTION`] with label `workflow`. The
+    /// lock key is deliberately **not** a label (ADR-0001 §7).
+    fn record_mutex_contention(&self, workflow: &str, depth: u64) {
+        let _ = (workflow, depth);
     }
 
     // ── Synthetic liveness canary (issue #796) ────────────────────────────

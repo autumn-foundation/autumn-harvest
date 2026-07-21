@@ -414,32 +414,30 @@ pub async fn replace_calendar_exclusions(
         })
         .collect();
 
-    conn.transaction(|tx| {
-        Box::pin(async move {
-            diesel::delete(
-                harvest_calendar_exclusions::table
-                    .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
-            )
-            .execute(tx)
-            .await
-            .map_err(crate::error::database_error)?;
+    Box::pin(conn.transaction(async |tx| {
+        diesel::delete(
+            harvest_calendar_exclusions::table
+                .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
+        )
+        .execute(tx)
+        .await
+        .map_err(crate::error::database_error)?;
 
-            if !rows.is_empty() {
-                diesel::insert_into(harvest_calendar_exclusions::table)
-                    .values(&rows)
-                    .on_conflict((
-                        harvest_calendar_exclusions::calendar_name,
-                        harvest_calendar_exclusions::excluded_date,
-                    ))
-                    .do_nothing()
-                    .execute(tx)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+        if !rows.is_empty() {
+            diesel::insert_into(harvest_calendar_exclusions::table)
+                .values(&rows)
+                .on_conflict((
+                    harvest_calendar_exclusions::calendar_name,
+                    harvest_calendar_exclusions::excluded_date,
+                ))
+                .do_nothing()
+                .execute(tx)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
 
-            Ok(())
-        })
-    })
+        Ok(())
+    }))
     .await
 }
 

@@ -1741,60 +1741,56 @@ pub async fn update_workflow_schedule(
 ) -> HarvestResult<ScheduleUpdateOutcome> {
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::AsyncConnection;
-    use scoped_futures::ScopedFutureExt;
 
-    conn.transaction(|conn| {
-        async move {
-            // FOR UPDATE: serialize this PATCH against a concurrent scheduler
-            // tick (whose claim/advance/finalize UPDATEs take the row lock)
-            // and against peer PATCHes. Without the lock, a full
-            // claim→advance→clear-claim cycle could commit between this
-            // SELECT and the guarded UPDATE below, and the merge would write
-            // back the *stale* `next_run_at` (re-arming an already-fired slot
-            // → double fire), stale `buffered_runs`, and a stale `runs_started`
-            // basis for the #478 exhaustion reconciliation; two concurrent
-            // PATCHes would likewise silently lose one side's fields.
-            let existing: Option<HarvestSchedule> = dsl::harvest_schedules
-                .find(schedule_id)
-                .select(HarvestSchedule::as_select())
-                .for_update()
-                .first(conn)
+    Box::pin(conn.transaction(async |conn| {
+        // FOR UPDATE: serialize this PATCH against a concurrent scheduler
+        // tick (whose claim/advance/finalize UPDATEs take the row lock)
+        // and against peer PATCHes. Without the lock, a full
+        // claim→advance→clear-claim cycle could commit between this
+        // SELECT and the guarded UPDATE below, and the merge would write
+        // back the *stale* `next_run_at` (re-arming an already-fired slot
+        // → double fire), stale `buffered_runs`, and a stale `runs_started`
+        // basis for the #478 exhaustion reconciliation; two concurrent
+        // PATCHes would likewise silently lose one side's fields.
+        let existing: Option<HarvestSchedule> = dsl::harvest_schedules
+            .find(schedule_id)
+            .select(HarvestSchedule::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        let Some(existing) = existing else {
+            return Ok(ScheduleUpdateOutcome::NotFound);
+        };
+        if existing.dag_name.is_some() || existing.workflow_name.is_none() {
+            return Ok(ScheduleUpdateOutcome::DagSchedule);
+        }
+
+        // Validate the MERGED spec (e.g. new cron + existing timezone)
+        // before any write; a Config error rolls the transaction back.
+        let merged = merge_schedule_patch(&existing, patch)?;
+        crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
+
+        match apply_workflow_schedule_update(conn, &merged, &existing, true).await? {
+            AppliedScheduleUpdate::Updated(row) => Ok(ScheduleUpdateOutcome::Updated(row)),
+            AppliedScheduleUpdate::SkippedLiveClaim => {
+                // 0 rows can also mean the row vanished between our SELECT
+                // and UPDATE (concurrent delete) — distinguish it.
+                let still_exists: bool = diesel::select(diesel::dsl::exists(
+                    dsl::harvest_schedules.find(schedule_id),
+                ))
+                .get_result(conn)
                 .await
-                .optional()
                 .map_err(crate::error::database_error)?;
-            let Some(existing) = existing else {
-                return Ok(ScheduleUpdateOutcome::NotFound);
-            };
-            if existing.dag_name.is_some() || existing.workflow_name.is_none() {
-                return Ok(ScheduleUpdateOutcome::DagSchedule);
-            }
-
-            // Validate the MERGED spec (e.g. new cron + existing timezone)
-            // before any write; a Config error rolls the transaction back.
-            let merged = merge_schedule_patch(&existing, patch)?;
-            crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
-
-            match apply_workflow_schedule_update(conn, &merged, &existing, true).await? {
-                AppliedScheduleUpdate::Updated(row) => Ok(ScheduleUpdateOutcome::Updated(row)),
-                AppliedScheduleUpdate::SkippedLiveClaim => {
-                    // 0 rows can also mean the row vanished between our SELECT
-                    // and UPDATE (concurrent delete) — distinguish it.
-                    let still_exists: bool = diesel::select(diesel::dsl::exists(
-                        dsl::harvest_schedules.find(schedule_id),
-                    ))
-                    .get_result(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                    if still_exists {
-                        Ok(ScheduleUpdateOutcome::ClaimLive)
-                    } else {
-                        Ok(ScheduleUpdateOutcome::NotFound)
-                    }
+                if still_exists {
+                    Ok(ScheduleUpdateOutcome::ClaimLive)
+                } else {
+                    Ok(ScheduleUpdateOutcome::NotFound)
                 }
             }
         }
-        .scope_boxed()
-    })
+    }))
     .await
 }
 

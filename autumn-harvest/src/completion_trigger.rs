@@ -513,62 +513,60 @@ pub async fn sync_completion_triggers(
     let active_ids: Vec<Uuid> = triggers.iter().map(|t| t.id).collect();
     let triggers = triggers.to_vec();
 
-    conn.transaction(|tx| {
-        Box::pin(async move {
-            // First, delete any static triggers that are no longer present in the builder's triggers list.
-            if active_ids.is_empty() {
-                diesel::delete(dsl::harvest_completion_triggers)
-                    .filter(dsl::is_static.eq(true))
-                    .execute(tx)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            } else {
-                diesel::delete(dsl::harvest_completion_triggers)
-                    .filter(dsl::is_static.eq(true))
-                    .filter(dsl::id.ne_all(&active_ids))
-                    .execute(tx)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+    Box::pin(conn.transaction(async |tx| {
+        // First, delete any static triggers that are no longer present in the builder's triggers list.
+        if active_ids.is_empty() {
+            diesel::delete(dsl::harvest_completion_triggers)
+                .filter(dsl::is_static.eq(true))
+                .execute(tx)
+                .await
+                .map_err(crate::error::database_error)?;
+        } else {
+            diesel::delete(dsl::harvest_completion_triggers)
+                .filter(dsl::is_static.eq(true))
+                .filter(dsl::id.ne_all(&active_ids))
+                .execute(tx)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
 
-            for trigger in &triggers {
-                let db_row = NewCompletionTriggerDb {
-                    id: trigger.id,
-                    source_workflow_name: trigger.source_workflow_name.clone(),
-                    terminal_states: serde_json::to_value(&trigger.terminal_states)?,
-                    target_workflow_name: trigger.target_workflow_name.clone(),
-                    input_mapping: serde_json::to_value(&trigger.input_mapping)?,
-                    queue_name: trigger.queue_name.clone(),
-                    is_static: true,
-                    condition: trigger
-                        .condition
-                        .as_ref()
-                        .map(serde_json::to_value)
-                        .transpose()?,
-                };
+        for trigger in &triggers {
+            let db_row = NewCompletionTriggerDb {
+                id: trigger.id,
+                source_workflow_name: trigger.source_workflow_name.clone(),
+                terminal_states: serde_json::to_value(&trigger.terminal_states)?,
+                target_workflow_name: trigger.target_workflow_name.clone(),
+                input_mapping: serde_json::to_value(&trigger.input_mapping)?,
+                queue_name: trigger.queue_name.clone(),
+                is_static: true,
+                condition: trigger
+                    .condition
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?,
+            };
 
-                diesel::insert_into(dsl::harvest_completion_triggers)
-                    .values(&db_row)
-                    .on_conflict(dsl::id)
-                    .do_update()
-                    .set((
-                        dsl::source_workflow_name.eq(&db_row.source_workflow_name),
-                        dsl::terminal_states.eq(&db_row.terminal_states),
-                        dsl::target_workflow_name.eq(&db_row.target_workflow_name),
-                        dsl::input_mapping.eq(&db_row.input_mapping),
-                        dsl::queue_name.eq(&db_row.queue_name),
-                        dsl::is_static.eq(true),
-                        dsl::condition.eq(&db_row.condition),
-                        dsl::updated_at.eq(Utc::now()),
-                    ))
-                    .execute(tx)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+            diesel::insert_into(dsl::harvest_completion_triggers)
+                .values(&db_row)
+                .on_conflict(dsl::id)
+                .do_update()
+                .set((
+                    dsl::source_workflow_name.eq(&db_row.source_workflow_name),
+                    dsl::terminal_states.eq(&db_row.terminal_states),
+                    dsl::target_workflow_name.eq(&db_row.target_workflow_name),
+                    dsl::input_mapping.eq(&db_row.input_mapping),
+                    dsl::queue_name.eq(&db_row.queue_name),
+                    dsl::is_static.eq(true),
+                    dsl::condition.eq(&db_row.condition),
+                    dsl::updated_at.eq(Utc::now()),
+                ))
+                .execute(tx)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
 
-            Ok(())
-        })
-    })
+        Ok(())
+    }))
     .await
 }
 
@@ -799,7 +797,6 @@ async fn relay_gate_checked_start(
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, RunQueryDsl};
-    use scoped_futures::ScopedFutureExt;
 
     #[derive(diesel::QueryableByName)]
     struct ClaimedId {
@@ -825,40 +822,60 @@ async fn relay_gate_checked_start(
     // Claim the source outbox row `FOR UPDATE SKIP LOCKED` and hold the claim across
     // the whole relay (F-round19). `source_tx` is the claim transaction; `target_conn`
     // is a separate connection whose own transaction commits independently.
-    let outcome = source_conn
-        .transaction::<RelayOutcome, crate::error::HarvestError, _>(|source_tx| {
-            async move {
-                let claimed: Option<ClaimedId> = diesel::sql_query(
-                    "SELECT id FROM harvest_completion_trigger_outbox \
-                     WHERE id = $1 FOR UPDATE SKIP LOCKED",
-                )
-                .bind::<diesel::sql_types::Uuid, _>(outbox_id)
-                .get_result::<ClaimedId>(source_tx)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-                if claimed.is_none() {
-                    // A sibling relay path / peer replica owns this row right now.
-                    return Ok(RelayOutcome::Skipped);
-                }
+    let outcome = Box::pin(source_conn
+        .transaction::<RelayOutcome, crate::error::HarvestError, _>(async |source_tx| {
+            let claimed: Option<ClaimedId> = diesel::sql_query(
+                "SELECT id FROM harvest_completion_trigger_outbox \
+                 WHERE id = $1 FOR UPDATE SKIP LOCKED",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(outbox_id)
+            .get_result::<ClaimedId>(source_tx)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+            if claimed.is_none() {
+                // A sibling relay path / peer replica owns this row right now.
+                return Ok(RelayOutcome::Skipped);
+            }
 
-                // round-15 any-state existence check on the TARGET shard (separate
-                // connection; the source claim is held throughout). Exists in ANY
-                // state → the fire was already delivered → drop the row, count a
-                // bypass, leave fires `NULL`.
-                if crate::execution::execution_exists_by_key(
-                    target_conn,
-                    params.workflow_name,
-                    params.workflow_id,
+            // round-15 any-state existence check on the TARGET shard (separate
+            // connection; the source claim is held throughout). Exists in ANY
+            // state → the fire was already delivered → drop the row, count a
+            // bypass, leave fires `NULL`.
+            if crate::execution::execution_exists_by_key(
+                target_conn,
+                params.workflow_name,
+                params.workflow_id,
+            )
+            .await?
+            {
+                tracing::debug!(
+                    outbox_id = %outbox_id,
+                    workflow_name = %params.workflow_name,
+                    workflow_id = %params.workflow_id,
+                    "[completion_trigger] cross-shard relay: deterministic target already exists (any state); treating the stale outbox row as delivered"
+                );
+                diesel::delete(
+                    outbox_dsl::harvest_completion_trigger_outbox
+                        .filter(outbox_dsl::id.eq(outbox_id)),
                 )
-                .await?
-                {
-                    tracing::debug!(
-                        outbox_id = %outbox_id,
-                        workflow_name = %params.workflow_name,
-                        workflow_id = %params.workflow_id,
-                        "[completion_trigger] cross-shard relay: deterministic target already exists (any state); treating the stale outbox row as delivered"
-                    );
+                .execute(source_tx)
+                .await
+                .map_err(crate::error::database_error)?;
+                return Ok(RelayOutcome::Delivered);
+            }
+
+            match crate::execution::start_or_load_workflow_execution_with_metrics(
+                target_conn,
+                params,
+                metrics,
+                Some(crate::admission_gate::GateMode::CheckCached),
+            )
+            .await
+            {
+                Err(crate::error::HarvestError::AdmissionBlocked { reason, .. }) => {
+                    // The primitive already recorded the block count; the relay
+                    // only drops the outbox row + marks the fires row.
                     diesel::delete(
                         outbox_dsl::harvest_completion_trigger_outbox
                             .filter(outbox_dsl::id.eq(outbox_id)),
@@ -866,56 +883,33 @@ async fn relay_gate_checked_start(
                     .execute(source_tx)
                     .await
                     .map_err(crate::error::database_error)?;
-                    return Ok(RelayOutcome::Delivered);
+                    diesel::update(
+                        fires_dsl::harvest_completion_trigger_fires
+                            .filter(fires_dsl::source_exec_id.eq(source_exec_id))
+                            .filter(fires_dsl::trigger_id.eq(trigger_id)),
+                    )
+                    .set(fires_dsl::outcome.eq(Some("admission_blocked")))
+                    .execute(source_tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    Ok(RelayOutcome::Blocked { reason })
                 }
-
-                match crate::execution::start_or_load_workflow_execution_with_metrics(
-                    target_conn,
-                    params,
-                    metrics,
-                    Some(crate::admission_gate::GateMode::CheckCached),
-                )
-                .await
-                {
-                    Err(crate::error::HarvestError::AdmissionBlocked { reason, .. }) => {
-                        // The primitive already recorded the block count; the relay
-                        // only drops the outbox row + marks the fires row.
-                        diesel::delete(
-                            outbox_dsl::harvest_completion_trigger_outbox
-                                .filter(outbox_dsl::id.eq(outbox_id)),
-                        )
-                        .execute(source_tx)
-                        .await
-                        .map_err(crate::error::database_error)?;
-                        diesel::update(
-                            fires_dsl::harvest_completion_trigger_fires
-                                .filter(fires_dsl::source_exec_id.eq(source_exec_id))
-                                .filter(fires_dsl::trigger_id.eq(trigger_id)),
-                        )
-                        .set(fires_dsl::outcome.eq(Some("admission_blocked")))
-                        .execute(source_tx)
-                        .await
-                        .map_err(crate::error::database_error)?;
-                        Ok(RelayOutcome::Blocked { reason })
-                    }
-                    Err(e) => Err(e),
-                    Ok(_started) => {
-                        // Fresh start OR an idempotent attach to a still-active run:
-                        // either way the target IS started → DELIVERY. Delete the row,
-                        // leave fires `NULL`, count a bypass.
-                        diesel::delete(
-                            outbox_dsl::harvest_completion_trigger_outbox
-                                .filter(outbox_dsl::id.eq(outbox_id)),
-                        )
-                        .execute(source_tx)
-                        .await
-                        .map_err(crate::error::database_error)?;
-                        Ok(RelayOutcome::Delivered)
-                    }
+                Err(e) => Err(e),
+                Ok(_started) => {
+                    // Fresh start OR an idempotent attach to a still-active run:
+                    // either way the target IS started → DELIVERY. Delete the row,
+                    // leave fires `NULL`, count a bypass.
+                    diesel::delete(
+                        outbox_dsl::harvest_completion_trigger_outbox
+                            .filter(outbox_dsl::id.eq(outbox_id)),
+                    )
+                    .execute(source_tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                    Ok(RelayOutcome::Delivered)
                 }
             }
-            .scope_boxed()
-        })
+        }))
         .await?;
 
     // Record metrics ONLY after the claim transaction commits (a rollback must not
@@ -1163,6 +1157,17 @@ pub fn evaluate_triggers_for_execution<'a>(
         // no target matches this terminal state.
         crate::completion_callback::enqueue_completion_deliveries(conn, &execution, exec_id, state)
             .await?;
+
+        // Durable mutex terminal auto-release (issue #691): this is the single
+        // per-terminal-transition chokepoint (complete/fail/cancel/terminate/
+        // timeout/poison-pill), so releasing every lock a now-terminal holder
+        // held and waking the next waiters here covers every terminal path in
+        // one place. It runs inside this same terminal transaction, so the
+        // per-key `pg_advisory_xact_lock`s the release/wake take hold across the
+        // whole sweep. A no-op when the mutex tables are absent (guarded). The
+        // non-terminal nd-block path (issue #603) deliberately does NOT reach
+        // this function, so a blocked holder keeps its locks.
+        crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
 
         let triggers = triggers_dsl::harvest_completion_triggers
             .filter(triggers_dsl::source_workflow_name.eq(&execution.workflow_name))

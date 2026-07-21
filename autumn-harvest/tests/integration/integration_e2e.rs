@@ -38,7 +38,6 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use scoped_futures::ScopedFutureExt;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::path::Path;
@@ -4640,13 +4639,12 @@ async fn enqueue_inside_transaction_emits_notification_on_commit() {
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("send_email".to_string());
 
-    let task_id = conn
-        .transaction::<Uuid, HarvestError, _>(|conn| {
-            let params = params.clone();
-            async move { queue::enqueue(conn, &params).await }.scope_boxed()
-        })
-        .await
-        .expect("transactional enqueue should succeed");
+    let task_id = Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+        let params = params.clone();
+        queue::enqueue(conn, &params).await
+    }))
+    .await
+    .expect("transactional enqueue should succeed");
 
     let notification = listener
         .wait_for_notification(Duration::from_secs(2))

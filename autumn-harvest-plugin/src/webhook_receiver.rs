@@ -172,6 +172,8 @@ fn build_webhook_route(
         sunset_opt_out: false,
         repository: None,
         idempotency: autumn_web::RouteIdempotency::Direct,
+        // Inherit the global request-timeout deadline (autumn-web 0.6).
+        timeout: autumn_web::RouteTimeout::Inherit,
     }
 }
 

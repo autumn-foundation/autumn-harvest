@@ -4,7 +4,7 @@
 //! require Postgres or worker pools. This allows testing workflow logic,
 //! branching, and state manipulation instantly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -76,6 +76,12 @@ pub struct WorkflowSimulator {
     /// production `worker::ingest_due_timers_and_signals`/`load_pending_signals`)
     /// preserves the order signals were enqueued across different names.
     signals_to_send: Vec<(String, Value)>,
+    /// Mutex keys (issue #691) whose grant the simulator WITHHOLDS: an
+    /// `AcquireMutex` for a key in this set records nothing and makes no
+    /// progress (modelling a lock held by another contender). Mirrors
+    /// `WorkflowTestEnv::mutex_contended`; set via
+    /// [`with_mutex_contended`](Self::with_mutex_contended).
+    mutex_contended: HashSet<String>,
 }
 
 impl WorkflowSimulator {
@@ -90,7 +96,18 @@ impl WorkflowSimulator {
             activity_info_retry_policies: HashMap::new(),
             child_workflow_mocks: HashMap::new(),
             signals_to_send: Vec::new(),
+            mutex_contended: HashSet::new(),
         }
+    }
+
+    /// Mark a mutex `key` (issue #691) as already held, so the simulator
+    /// WITHHOLDS the grant: an `ctx.mutex(key).acquire()` for this key records
+    /// no `MutexGranted` and makes no progress. Mirrors
+    /// [`WorkflowTestEnv::with_mutex_contended`](crate::testing::WorkflowTestEnv::with_mutex_contended).
+    #[must_use]
+    pub fn with_mutex_contended(mut self, key: impl Into<String>) -> Self {
+        self.mutex_contended.insert(key.into());
+        self
     }
 
     /// Provide shared state to the workflow context.
@@ -566,7 +583,46 @@ impl WorkflowSimulator {
                     let _ = result_tx.send(Ok(()));
                     advanced = true;
                 }
+                // Durable mutex (issue #691), mirroring
+                // `WorkflowTestEnv::process_command`. Acquire is a SOLO
+                // suspension: withhold the grant for a contended key (no event,
+                // no progress → parked), otherwise auto-grant by recording a
+                // `MutexGranted` with a monotonic `lock_seq` (count of prior
+                // grants + 1) and the run's `WorkflowStarted` clock. Release is
+                // event-less bookkeeping (no progress).
+                WorkflowCommand::AcquireMutex { key, .. }
+                    if !self.mutex_contended.contains(&key) =>
+                {
+                    let lock_seq = i64::try_from(
+                        history
+                            .iter()
+                            .filter(|e| matches!(e, WorkflowEvent::MutexGranted { .. }))
+                            .count(),
+                    )
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1);
+                    // Deterministic clock: the run's `WorkflowStarted`
+                    // timestamp (history[0]). Only the key/`lock_seq` gate
+                    // replay matching; `acquired_at` is carried, not compared.
+                    let acquired_at = history
+                        .iter()
+                        .find_map(|e| match e {
+                            WorkflowEvent::WorkflowStarted { timestamp, .. } => Some(*timestamp),
+                            _ => None,
+                        })
+                        .unwrap_or_else(chrono::Utc::now);
+                    history.push(WorkflowEvent::MutexGranted {
+                        key,
+                        lock_seq,
+                        acquired_at,
+                    });
+                    advanced = true;
+                }
                 _ => {
+                    // `ReleaseMutex` (issue #691) is an event-less no-op here —
+                    // the harness has no lock table, so nothing is recorded and
+                    // no progress is made; it falls into this arm.
+                    //
                     // `WaitForSignal` is a no-op here: signals are ingested into
                     // history at task-prep (see the pre-dispatch drain in `run`,
                     // issue #775 Codex P2, mirroring production's
