@@ -169,3 +169,30 @@ the telemetry.md section below.
 - **DRIFT → FIX:** L65 `WorkerConfig::default().queues(vec![...])` → `.with_queues([...])`.
   There is **no bare `queues()` method** on `WorkerConfig` (only `with_queues`,
   builder.rs:3046). Repo-wide grep confirms this was the only `.queues(` occurrence in my area.
+
+### docs/telemetry.md — VERIFIED
+- Metric constants spot-checked against telemetry.rs (`harvest.retention.summary_deleted`,
+  `harvest.mutex.wait_duration`, `harvest.canary.roundtrip`, `harvest.schedule.overdue`,
+  `harvest.workflow.panic`, `harvest.update.duration`) — all OK. Catalogue is CI-cross-checked
+  by `dashboard_pack_docs.rs`. Includes all matrix "new metrics" (#782/#770/#752/#781/#801/#691/
+  #344/#607/#611-adjacent). No fix.
+- DEFERRED PINS **untouched**: L18 `autumn-harvest-plugin = { version = "0.4" ...}`, and
+  L94 `autumn-harvest = { version = "0.2" ...}` (a second resolvable pin NOT enumerated in
+  plan §6 but treated as deferred per R1/R2 — left as-is).
+
+### docs/streaming-progress.md — VERIFIED
+- `ctx.publish_progress`, `GET /workflows/{id}/stream` SSE, seq/dedupe contract, auth posture,
+  scope-vs-#473/#527/#324/#790 table (#791). Accurate. No fix.
+
+### docs/workflow-determinism-guide.md — FIX
+- **BROKEN LINK → FIX (AC6):** L62 `[WorkflowReplayer](file:///c:/Users/markm/autumn-harvest/docs/replay-verify.md)`
+  — an editor-inserted absolute local Windows filesystem path — replaced with the relative
+  `replay-verify.md`. Unambiguous bug regardless of org/version.
+- **ORG RENAME → FIX (partition-authorized):** 6 `github.com/madmax983/autumn-harvest/issues/N`
+  links (all harvest's OWN issue tracker, uniform mapping) → `github.com/autumn-foundation/...`.
+  Partition L59: "correct harvest's OWN repo/badge/DeepWiki links". These were the ONLY
+  `madmax983` occurrences in the entire area (concentrated in this one file); repo-wide there
+  are 41 (rest owned by Area 5's holistic sweep — mapping is idempotent so no conflict).
+- Content VERIFIED current: HVG010 (#600) + combinator functions (#799), HVG011/DET010 (#785),
+  DET011 (#799), `harvest det-check` CLI (#778), `ctx.metrics()` replay-safe metrics under
+  HVG007 (#758/#532), `ctx.patched()`/`deprecate_patch()` in the release playbook. No content fix.
