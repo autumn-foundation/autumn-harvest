@@ -700,7 +700,9 @@ impl Plugin for HarvestPlugin {
                 let api_state = startup_api_state.clone();
                 async move {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
-                    let res = start_harvest_runtime(&state, &slot, &api_state).await;
+                    // `start_harvest_runtime` returns a large future (clippy::large_futures under
+                    // the workspace pedantic lints); box it to keep this closure's future small.
+                    let res = Box::pin(start_harvest_runtime(&state, &slot, &api_state)).await;
                     match &res {
                         Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"

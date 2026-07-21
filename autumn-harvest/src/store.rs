@@ -12,7 +12,6 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use scoped_futures::ScopedFutureExt as _;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
@@ -235,22 +234,20 @@ pub async fn append_events_offloaded(
     // failed ref INSERT cannot leave events with offload envelopes but no
     // corresponding harvest_payload_refs rows (which would make those blobs
     // permanently invisible to the GC sweep).
-    let inserted = conn
-        .transaction::<usize, crate::error::HarvestError, _>(|conn| {
-            async move {
-                let inserted = diesel::insert_into(harvest_events::table)
-                    .values(&rows)
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                if !all_refs.is_empty() {
-                    insert_payload_refs(conn, exec_id, &all_refs).await?;
-                }
-                Ok(inserted)
+    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+        async |conn| {
+            let inserted = diesel::insert_into(harvest_events::table)
+                .values(&rows)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            if !all_refs.is_empty() {
+                insert_payload_refs(conn, exec_id, &all_refs).await?;
             }
-            .scope_boxed()
-        })
-        .await?;
+            Ok(inserted)
+        },
+    ))
+    .await?;
 
     if let Some(last_event) = events.last() {
         crate::notify::notify_workflow_events_appended(
@@ -543,63 +540,59 @@ pub async fn admit_update_event(
     use crate::schema::harvest_workflow_executions;
     use diesel::dsl::max;
 
-    let (workflow_name, queue_name) = conn
-        .transaction::<(String, String), crate::error::HarvestError, _>(|conn| {
-            async move {
-                // Acquire a row-level lock so concurrent appenders serialize their
-                // MAX(event_id) + INSERT pairs and the state check is consistent.
-                let execution: WorkflowExecution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .for_update()
-                    .select(WorkflowExecution::as_select())
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?
-                    .ok_or_else(|| {
-                        crate::error::HarvestError::NotFound(format!(
-                            "workflow execution {exec_id}"
-                        ))
-                    })?;
+    let (workflow_name, queue_name) = Box::pin(
+        conn.transaction::<(String, String), crate::error::HarvestError, _>(async |conn| {
+            // Acquire a row-level lock so concurrent appenders serialize their
+            // MAX(event_id) + INSERT pairs and the state check is consistent.
+            let execution: WorkflowExecution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(WorkflowExecution::as_select())
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .ok_or_else(|| {
+                    crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                })?;
 
-                // Reject updates submitted while the execution is paused with a
-                // dedicated error (issue #383). Updates may admit-and-mutate workflow
-                // state, so they are rejected rather than silently queued behind the
-                // pause — surfacing operator intent as a 409 at the API layer.
-                if execution.state == "PAUSED" {
-                    return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
-                }
-
-                // Reject the update if the execution is no longer running.
-                if execution.state != "RUNNING" {
-                    return Err(crate::error::HarvestError::UpdateRejected {
-                        reason: format!(
-                            "workflow {exec_id} is not RUNNING (state: {})",
-                            execution.state
-                        ),
-                    });
-                }
-
-                let max_id: Option<i32> = harvest_events::table
-                    .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-                    .select(max(harvest_events::event_id))
-                    .first(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                let next_id = max_id.map_or(0, |id| id.saturating_add(1));
-                let event = WorkflowEvent::UpdateAdmitted {
-                    update_id,
-                    name,
-                    input,
-                    timestamp: chrono::Utc::now(),
-                };
-                append_events(conn, exec_id, &[event], next_id).await?;
-                Ok((execution.workflow_name, execution.queue_name))
+            // Reject updates submitted while the execution is paused with a
+            // dedicated error (issue #383). Updates may admit-and-mutate workflow
+            // state, so they are rejected rather than silently queued behind the
+            // pause — surfacing operator intent as a 409 at the API layer.
+            if execution.state == "PAUSED" {
+                return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
             }
-            .scope_boxed()
-        })
-        .await?;
+
+            // Reject the update if the execution is no longer running.
+            if execution.state != "RUNNING" {
+                return Err(crate::error::HarvestError::UpdateRejected {
+                    reason: format!(
+                        "workflow {exec_id} is not RUNNING (state: {})",
+                        execution.state
+                    ),
+                });
+            }
+
+            let max_id: Option<i32> = harvest_events::table
+                .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+                .select(max(harvest_events::event_id))
+                .first(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            let next_id = max_id.map_or(0, |id| id.saturating_add(1));
+            let event = WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name,
+                input,
+                timestamp: chrono::Utc::now(),
+            };
+            append_events(conn, exec_id, &[event], next_id).await?;
+            Ok((execution.workflow_name, execution.queue_name))
+        }),
+    )
+    .await?;
 
     // Post-commit: emit harvest.update.admitted exactly once (issue #684).
     if let Some(metrics) = metrics {

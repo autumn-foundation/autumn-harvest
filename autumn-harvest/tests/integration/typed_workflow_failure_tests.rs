@@ -284,23 +284,21 @@ mod db_handle_surface {
             .non_retryable()
             .into_workflow_error_payload();
         let decoded = autumn_harvest::failure::decode_workflow_failure(&payload);
-        conn.transaction::<(), HarvestError, _>(|conn| {
+        Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
             let decoded = decoded.clone();
-            Box::pin(async move {
-                autumn_harvest::store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::workflow_failed_typed(&decoded)],
-                    1,
-                )
+            autumn_harvest::store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::workflow_failed_typed(&decoded)],
+                1,
+            )
+            .await?;
+            diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+                .set((dsl::state.eq("FAILED"), dsl::error.eq(&decoded.message)))
+                .execute(conn)
                 .await?;
-                diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-                    .set((dsl::state.eq("FAILED"), dsl::error.eq(&decoded.message)))
-                    .execute(conn)
-                    .await?;
-                Ok(())
-            })
-        })
+            Ok(())
+        }))
         .await
         .expect("seal typed failure");
     }

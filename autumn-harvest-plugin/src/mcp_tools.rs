@@ -927,12 +927,16 @@ fn build_tool_route(
             .map(|name| autumn_web::openapi::SchemaEntry {
                 name: leak(name),
                 kind: autumn_web::openapi::SchemaKind::Ref,
+                // Legacy short-name ref (no globally-unique identity); autumn-web 0.6.
+                identity: None,
             }),
         response: spec
             .response_component
             .map(|name| autumn_web::openapi::SchemaEntry {
                 name,
                 kind: autumn_web::openapi::SchemaKind::Ref,
+                // Legacy short-name ref (no globally-unique identity); autumn-web 0.6.
+                identity: None,
             }),
         success_status: 200,
         register_schemas: Some(register_harvest_mcp_schemas),
@@ -951,6 +955,8 @@ fn build_tool_route(
         sunset_opt_out: false,
         repository: None,
         idempotency: autumn_web::RouteIdempotency::Direct,
+        // Inherit the global request-timeout deadline (autumn-web 0.6).
+        timeout: autumn_web::RouteTimeout::Inherit,
     }
 }
 

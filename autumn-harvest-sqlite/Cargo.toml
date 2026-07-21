@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn-harvest"
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "README.md"
 keywords = ["workflow", "sqlite", "edge", "local-first", "autumn"]
 categories = ["asynchronous", "database", "embedded"]
@@ -18,7 +18,7 @@ default = []
 # The pure, backend-neutral determinism core: `default-features = false` drops
 # `db` (Diesel/Postgres) so only `run_workflow`, `WorkflowEvent`, the replay
 # engine, and `WorkflowContext` are pulled in.
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", default-features = false }
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -11,7 +11,6 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use scoped_futures::ScopedFutureExt;
 use uuid::Uuid;
 
 use crate::build_routing;
@@ -685,368 +684,351 @@ pub async fn start_or_load_workflow_execution_collect(
         enqueue.scheduled_at = target_start_time;
     }
 
-    let main_result = conn
-        .transaction::<(
-            StartedWorkflowExecution,
-            Vec<DeferredTriggerStart>,
-            Vec<(ExecutionId, String)>,
-            Vec<(String, String)>,
-        ), HarvestError, _>(|conn| {
-            let row = row;
-            let enqueue = enqueue.clone();
-            let request = request.clone();
-            // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the inner
-            // `async move` captures them directly from this closure's environment.
-            async move {
-                let mut tx_deferred_checks = Vec::new();
+    let main_result = Box::pin(conn.transaction::<(
+        StartedWorkflowExecution,
+        Vec<DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
+        Vec<(String, String)>,
+    ), HarvestError, _>(async |conn| {
+        let row = row;
+        let enqueue = enqueue.clone();
+        let request = request.clone();
+        // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the
+        // `async |conn|` closure captures them directly from the enclosing
+        // function's environment.
+        let mut tx_deferred_checks = Vec::new();
 
-                // Authoritative locked gate (issue #618, PR #1014). For every
-                // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
-                // above), take the `FOR UPDATE` lock on any non-sealed prior
-                // FIRST — before the INSERT — so the create-vs-attach decision the
-                // gate keys on is made on ONE stable, locked state. This is the
-                // move that closes the seal-under-lock TOCTOU: a prior that seals
-                // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
-                // and the start is excluded by the `for_update()` filter, so the
-                // fresh replacement it would otherwise leak is caught here. The
-                // lock is reused by the INSERT / `..._by_key_for_update` load
-                // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
-                // this never runs on the debounce path.
-                // Recompute the fast-path predicate from the (cloned) request:
-                // POINT 1 + the pre-check already applied the unlocked gate for the
-                // state-independent `terminate_via_pre_check` case, so skip it here.
-                // Every other policy (incl. conflict-driven Terminate with a
-                // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
-                // `UseExisting`/`Fail`) takes the locked read and keys the gate on
-                // the create-vs-attach decision for the LOCKED prior state.
-                let terminate_via_pre_check = request.reuse_policy
-                    == WorkflowIdReusePolicy::TerminateIfRunning
-                    && effective_active_conflict_behavior(
-                        request.reuse_policy,
-                        request.conflict_policy,
-                    ) == ActiveConflictBehavior::Terminate;
-                if let Some(mode) = gate
-                    && !terminate_via_pre_check
-                    && !reject_fresh_if_debounced
-                {
-                    let prior = try_load_active_execution_for_update(
-                        conn,
-                        request.workflow_name,
-                        request.workflow_id,
-                    )
-                    .await?;
-                    if start_will_create_new_execution(
-                        prior.as_ref().map(|e| e.state.as_str()),
-                        request.reuse_policy,
-                        request.conflict_policy,
-                    ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
-                        mode,
-                        request.workflow_name,
-                        request.queue_name,
-                        shard_id_value,
-                        request.owner,
-                    ) {
-                        record_start_gate_block(metrics, scope_kind, &reason);
-                        return Err(HarvestError::AdmissionBlocked { gate_id, reason });
-                    }
+        // Authoritative locked gate (issue #618, PR #1014). For every
+        // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
+        // above), take the `FOR UPDATE` lock on any non-sealed prior
+        // FIRST — before the INSERT — so the create-vs-attach decision the
+        // gate keys on is made on ONE stable, locked state. This is the
+        // move that closes the seal-under-lock TOCTOU: a prior that seals
+        // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
+        // and the start is excluded by the `for_update()` filter, so the
+        // fresh replacement it would otherwise leak is caught here. The
+        // lock is reused by the INSERT / `..._by_key_for_update` load
+        // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
+        // this never runs on the debounce path.
+        // Recompute the fast-path predicate from the (cloned) request:
+        // POINT 1 + the pre-check already applied the unlocked gate for the
+        // state-independent `terminate_via_pre_check` case, so skip it here.
+        // Every other policy (incl. conflict-driven Terminate with a
+        // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
+        // `UseExisting`/`Fail`) takes the locked read and keys the gate on
+        // the create-vs-attach decision for the LOCKED prior state.
+        let terminate_via_pre_check = request.reuse_policy
+            == WorkflowIdReusePolicy::TerminateIfRunning
+            && effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
+                == ActiveConflictBehavior::Terminate;
+        if let Some(mode) = gate
+            && !terminate_via_pre_check
+            && !reject_fresh_if_debounced
+        {
+            let prior = try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?;
+            if start_will_create_new_execution(
+                prior.as_ref().map(|e| e.state.as_str()),
+                request.reuse_policy,
+                request.conflict_policy,
+            ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
+                mode,
+                request.workflow_name,
+                request.queue_name,
+                shard_id_value,
+                request.owner,
+            ) {
+                record_start_gate_block(metrics, scope_kind, &reason);
+                return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+            }
+        }
+
+        // `on_conflict_do_nothing()` (no explicit target) lets Postgres
+        // arbitrate against the partial unique index installed by the
+        // continue-as-new migration, which only enforces uniqueness on
+        // rows whose state is not sealed (`CONTINUED_AS_NEW` or
+        // `TERMINATED`). A previously sealed continue-as-new chain or reset
+        // source therefore does not block reusing the same
+        // (workflow_name, workflow_id).
+        let inserted = diesel::insert_into(harvest_workflow_executions::table)
+            .values(&row)
+            .on_conflict_do_nothing()
+            .returning(WorkflowExecution::as_returning())
+            .get_result(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+
+        if let Some(execution) = inserted {
+            // Atomic debounce gate: this INSERT is a fresh start. For a
+            // debounced workflow that must go through debounce admission,
+            // roll it back and signal the caller (no TOCTOU — decided here
+            // under the inserted row, not via an unlocked pre-scan).
+            if reject_fresh_if_debounced {
+                return Err(HarvestError::DebounceFreshStart {
+                    workflow_name: request.workflow_name.to_string(),
+                    workflow_id: request.workflow_id.to_string(),
+                });
+            }
+            if request.start_at.is_some_and(|sa| sa < now) {
+                return Err(HarvestError::Config(
+                    "Requested start_at is in the past".to_string(),
+                ));
+            }
+            // Enforce the input cap only on the fresh-insert path. Duplicates
+            // never reach here so the reuse-policy outcome is unaffected.
+            if request.max_workflow_input_bytes > 0 {
+                let observed = serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
+                if observed > request.max_workflow_input_bytes {
+                    return Err(crate::error::HarvestError::PayloadTooLarge {
+                        kind: crate::error::PayloadKind::WorkflowInput,
+                        observed_bytes: observed,
+                        cap_bytes: request.max_workflow_input_bytes,
+                        workflow_type: request.workflow_name.to_string(),
+                        activity_name: None,
+                    });
                 }
+            }
+            // Resolve last-completion-result carryover (issue #488).
+            // Runs inside the same transaction on the same shard-local
+            // connection so the read is consistent with the just-inserted
+            // row. Excludes the new row (`id != exec_id`) as a safety
+            // guard — the new row has state RUNNING, not COMPLETED, so it
+            // can never match, but the explicit exclusion is defensive.
+            let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
+                resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for).await?
+            } else {
+                (None, None)
+            };
+            let started_event = WorkflowEvent::WorkflowStarted {
+                input: request.input.clone(),
+                timestamp: target_start_time,
+                last_completion_result: carryover_result,
+                last_error: carryover_error,
+                scheduled_time: request.scheduled_for,
+            };
+            store::append_events(conn, exec_id, &[started_event], 0).await?;
+            queue::enqueue(conn, &enqueue).await?;
+            return Ok((
+                StartedWorkflowExecution::from_row(execution, true),
+                Vec::new(),
+                tx_deferred_checks,
+                Vec::new(),
+            ));
+        }
 
-                // `on_conflict_do_nothing()` (no explicit target) lets Postgres
-                // arbitrate against the partial unique index installed by the
-                // continue-as-new migration, which only enforces uniqueness on
-                // rows whose state is not sealed (`CONTINUED_AS_NEW` or
-                // `TERMINATED`). A previously sealed continue-as-new chain or reset
-                // source therefore does not block reusing the same
-                // (workflow_name, workflow_id).
-                let inserted = diesel::insert_into(harvest_workflow_executions::table)
-                    .values(&row)
-                    .on_conflict_do_nothing()
-                    .returning(WorkflowExecution::as_returning())
-                    .get_result(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?;
+        // INSERT was a no-op: a NON-SEALED prior existed at INSERT time
+        // (the active-uniqueness partial index only covers non-sealed
+        // states). Lock that prior row to decide what to do.
+        //
+        // Seal-race retry (issue #685 review, Codex P2): under concurrent
+        // `terminate_existing` (or any replace-type) starts of the same
+        // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
+        // a concurrent winner has sealed the prior it locked
+        // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
+        // non-sealed filter) and inserted a fresh RUNNING replacement. The
+        // loser's first `FOR UPDATE` SELECT took its statement snapshot
+        // before the winner committed, blocks on the prior's row lock, and
+        // -- on the winner's commit -- sees the prior filtered out via
+        // EvalPlanQual while the winner's freshly-inserted row is invisible
+        // to that same statement's snapshot, so the load returns `None`.
+        //
+        // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
+        // so re-issuing the load after the winner has committed picks up the
+        // replacement RUNNING row and the start CONVERGES (last-writer-wins)
+        // instead of surfacing a transient `NotFound`. The loser holds no
+        // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
+        // never locks the conflicting row, and a `None` `FOR UPDATE` locks
+        // nothing -- so the retry is safe. Once a row IS found and
+        // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
+        // `replace_execution` cannot be sealed out from under us (a rival
+        // must first take the same lock, which blocks until we commit). Each
+        // retry's `FOR UPDATE` naturally blocks on the current lock holder,
+        // so this is not a busy-loop; the small backoff only guards the
+        // pathological "sealed without a replacement" case (e.g. a
+        // concurrent reset), where the cap falls back to the pre-existing
+        // `NotFound`.
+        //
+        // Non-racing requests never reach a `None` here (the prior is still
+        // non-sealed under the lock), so this is transparent to the common
+        // path across every reuse/conflict policy.
+        let existing = {
+            let mut existing: Option<WorkflowExecution> = None;
+            for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
+                match load_workflow_execution_by_key_for_update(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                )
+                .await
+                {
+                    Ok(row) => {
+                        existing = Some(row);
+                        break;
+                    }
+                    // Seal race: retry with a fresh statement snapshot until
+                    // the winner's replacement row is visible or the cap is
+                    // exhausted (then fall through to the terminal NotFound).
+                    Err(HarvestError::NotFound(_)) if attempt < SEAL_RACE_MAX_LOAD_RETRIES => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            SEAL_RACE_LOAD_BACKOFF_MS,
+                        ))
+                        .await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            match existing {
+                Some(row) => row,
+                None => {
+                    return Err(HarvestError::NotFound(format!(
+                        "workflow execution {}/{}",
+                        request.workflow_name, request.workflow_id
+                    )));
+                }
+            }
+        };
 
-                if let Some(execution) = inserted {
-                    // Atomic debounce gate: this INSERT is a fresh start. For a
-                    // debounced workflow that must go through debounce admission,
-                    // roll it back and signal the caller (no TOCTOU — decided here
-                    // under the inserted row, not via an unlocked pre-scan).
+        // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
+        // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
+        // axis; a terminal non-sealed prior is governed by the reuse axis
+        // exactly as before (the conflict axis has no effect there).
+        if is_active_conflict_state(&existing.state) {
+            match effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
+            {
+                // Return the existing running/paused execution unchanged —
+                // no new WorkflowStarted event, no task enqueued, no cancel.
+                ActiveConflictBehavior::Attach => Ok((
+                    StartedWorkflowExecution::from_row(existing, false),
+                    Vec::new(),
+                    tx_deferred_checks,
+                    Vec::new(),
+                )),
+
+                ActiveConflictBehavior::Fail => Err(HarvestError::AlreadyExists {
+                    existing_exec_id: ExecutionId::from_uuid(existing.id),
+                    existing_state: existing.state,
+                }),
+
+                // Cancel the active prior and start fresh (this is exactly
+                // the pre-#685 `TerminateIfRunning` active branch). Gate it
+                // before cancelling anything so a debounced workflow is
+                // routed to admission instead. PAUSED is active and occupies
+                // the uniqueness slot, so it must be cancelled before
+                // `replace_execution` seals it (issue #383). Reaching this
+                // point after the two-transaction pre-check cancel is the
+                // extreme-concurrency race where the prior is still active
+                // under the lock; we inline the cancel here so the new start
+                // is not silently blocked.
+                //
+                // Concurrency note (issue #685 review, FIX 4 + Codex P2):
+                // concurrent `terminate_existing` starts of the SAME
+                // `(workflow_name, workflow_id)` against one live prior are
+                // last-writer-wins and CONVERGE to a single surviving run.
+                // `terminate_existing` has no pre-check, so more contenders
+                // reach this inline branch than the pre-#685
+                // `TerminateIfRunning` path did; a loser that observed the
+                // winner seal the prior row it locked is retried internally
+                // by the seal-race loop around the load above (a fresh READ
+                // COMMITTED snapshot picks up the winner's replacement RUNNING
+                // row), so no transient `NotFound` is surfaced. It does NOT
+                // corrupt data, deadlock, or double-run (the seal + insert is
+                // transactional; `use_existing` never enters this branch).
+                ActiveConflictBehavior::Terminate => {
                     if reject_fresh_if_debounced {
                         return Err(HarvestError::DebounceFreshStart {
                             workflow_name: request.workflow_name.to_string(),
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
-                    if request.start_at.is_some_and(|sa| sa < now) {
-                        return Err(HarvestError::Config(
-                            "Requested start_at is in the past".to_string(),
-                        ));
-                    }
-                    // Enforce the input cap only on the fresh-insert path. Duplicates
-                    // never reach here so the reuse-policy outcome is unaffected.
-                    if request.max_workflow_input_bytes > 0 {
-                        let observed =
-                            serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
-                        if observed > request.max_workflow_input_bytes {
-                            return Err(crate::error::HarvestError::PayloadTooLarge {
-                                kind: crate::error::PayloadKind::WorkflowInput,
-                                observed_bytes: observed,
-                                cap_bytes: request.max_workflow_input_bytes,
-                                workflow_type: request.workflow_name.to_string(),
-                                activity_name: None,
-                            });
-                        }
-                    }
-                    // Resolve last-completion-result carryover (issue #488).
-                    // Runs inside the same transaction on the same shard-local
-                    // connection so the read is consistent with the just-inserted
-                    // row. Excludes the new row (`id != exec_id`) as a safety
-                    // guard — the new row has state RUNNING, not COMPLETED, so it
-                    // can never match, but the explicit exclusion is defensive.
-                    let (carryover_result, carryover_error) = if let Some(sched_id) =
-                        request.schedule_id
-                    {
-                        resolve_carryover(conn, sched_id, exec_id.as_uuid(), request.scheduled_for)
-                            .await?
-                    } else {
-                        (None, None)
-                    };
-                    let started_event = WorkflowEvent::WorkflowStarted {
-                        input: request.input.clone(),
-                        timestamp: target_start_time,
-                        last_completion_result: carryover_result,
-                        last_error: carryover_error,
-                        scheduled_time: request.scheduled_for,
-                    };
-                    store::append_events(conn, exec_id, &[started_event], 0).await?;
-                    queue::enqueue(conn, &enqueue).await?;
-                    return Ok((
-                        StartedWorkflowExecution::from_row(execution, true),
-                        Vec::new(),
-                        tx_deferred_checks,
-                        Vec::new(),
-                    ));
-                }
-
-                // INSERT was a no-op: a NON-SEALED prior existed at INSERT time
-                // (the active-uniqueness partial index only covers non-sealed
-                // states). Lock that prior row to decide what to do.
-                //
-                // Seal-race retry (issue #685 review, Codex P2): under concurrent
-                // `terminate_existing` (or any replace-type) starts of the same
-                // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
-                // a concurrent winner has sealed the prior it locked
-                // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
-                // non-sealed filter) and inserted a fresh RUNNING replacement. The
-                // loser's first `FOR UPDATE` SELECT took its statement snapshot
-                // before the winner committed, blocks on the prior's row lock, and
-                // -- on the winner's commit -- sees the prior filtered out via
-                // EvalPlanQual while the winner's freshly-inserted row is invisible
-                // to that same statement's snapshot, so the load returns `None`.
-                //
-                // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
-                // so re-issuing the load after the winner has committed picks up the
-                // replacement RUNNING row and the start CONVERGES (last-writer-wins)
-                // instead of surfacing a transient `NotFound`. The loser holds no
-                // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
-                // never locks the conflicting row, and a `None` `FOR UPDATE` locks
-                // nothing -- so the retry is safe. Once a row IS found and
-                // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
-                // `replace_execution` cannot be sealed out from under us (a rival
-                // must first take the same lock, which blocks until we commit). Each
-                // retry's `FOR UPDATE` naturally blocks on the current lock holder,
-                // so this is not a busy-loop; the small backoff only guards the
-                // pathological "sealed without a replacement" case (e.g. a
-                // concurrent reset), where the cap falls back to the pre-existing
-                // `NotFound`.
-                //
-                // Non-racing requests never reach a `None` here (the prior is still
-                // non-sealed under the lock), so this is transparent to the common
-                // path across every reuse/conflict policy.
-                let existing = {
-                    let mut existing: Option<WorkflowExecution> = None;
-                    for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
-                        match load_workflow_execution_by_key_for_update(
-                            conn,
-                            request.workflow_name,
-                            request.workflow_id,
-                        )
-                        .await
-                        {
-                            Ok(row) => {
-                                existing = Some(row);
-                                break;
-                            }
-                            // Seal race: retry with a fresh statement snapshot until
-                            // the winner's replacement row is visible or the cap is
-                            // exhausted (then fall through to the terminal NotFound).
-                            Err(HarvestError::NotFound(_))
-                                if attempt < SEAL_RACE_MAX_LOAD_RETRIES =>
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    SEAL_RACE_LOAD_BACKOFF_MS,
-                                ))
-                                .await;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    match existing {
-                        Some(row) => row,
-                        None => {
-                            return Err(HarvestError::NotFound(format!(
-                                "workflow execution {}/{}",
-                                request.workflow_name, request.workflow_id
-                            )));
-                        }
-                    }
-                };
-
-                // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
-                // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
-                // axis; a terminal non-sealed prior is governed by the reuse axis
-                // exactly as before (the conflict axis has no effect there).
-                if is_active_conflict_state(&existing.state) {
-                    match effective_active_conflict_behavior(
-                        request.reuse_policy,
-                        request.conflict_policy,
-                    ) {
-                        // Return the existing running/paused execution unchanged —
-                        // no new WorkflowStarted event, no task enqueued, no cancel.
-                        ActiveConflictBehavior::Attach => Ok((
-                            StartedWorkflowExecution::from_row(existing, false),
-                            Vec::new(),
-                            tx_deferred_checks,
-                            Vec::new(),
-                        )),
-
-                        ActiveConflictBehavior::Fail => Err(HarvestError::AlreadyExists {
-                            existing_exec_id: ExecutionId::from_uuid(existing.id),
-                            existing_state: existing.state,
-                        }),
-
-                        // Cancel the active prior and start fresh (this is exactly
-                        // the pre-#685 `TerminateIfRunning` active branch). Gate it
-                        // before cancelling anything so a debounced workflow is
-                        // routed to admission instead. PAUSED is active and occupies
-                        // the uniqueness slot, so it must be cancelled before
-                        // `replace_execution` seals it (issue #383). Reaching this
-                        // point after the two-transaction pre-check cancel is the
-                        // extreme-concurrency race where the prior is still active
-                        // under the lock; we inline the cancel here so the new start
-                        // is not silently blocked.
-                        //
-                        // Concurrency note (issue #685 review, FIX 4 + Codex P2):
-                        // concurrent `terminate_existing` starts of the SAME
-                        // `(workflow_name, workflow_id)` against one live prior are
-                        // last-writer-wins and CONVERGE to a single surviving run.
-                        // `terminate_existing` has no pre-check, so more contenders
-                        // reach this inline branch than the pre-#685
-                        // `TerminateIfRunning` path did; a loser that observed the
-                        // winner seal the prior row it locked is retried internally
-                        // by the seal-race loop around the load above (a fresh READ
-                        // COMMITTED snapshot picks up the winner's replacement RUNNING
-                        // row), so no transient `NotFound` is surfaced. It does NOT
-                        // corrupt data, deadlock, or double-run (the seal + insert is
-                        // transactional; `use_existing` never enters this branch).
-                        ActiveConflictBehavior::Terminate => {
-                            if reject_fresh_if_debounced {
-                                return Err(HarvestError::DebounceFreshStart {
-                                    workflow_name: request.workflow_name.to_string(),
-                                    workflow_id: request.workflow_id.to_string(),
-                                });
-                            }
-                            let tx_cancel_metrics =
-                                vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
-                            let mut deferred = inline_cancel(
-                                conn,
-                                ExecutionId::from_uuid(existing.id),
-                                &mut tx_deferred_checks,
-                            )
+                    let tx_cancel_metrics =
+                        vec![(existing.workflow_name.clone(), existing.queue_name.clone())];
+                    let mut deferred = inline_cancel(
+                        conn,
+                        ExecutionId::from_uuid(existing.id),
+                        &mut tx_deferred_checks,
+                    )
+                    .await?;
+                    let (started_wf, mut extra_deferred) =
+                        replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
                             .await?;
-                            let (started_wf, mut extra_deferred) = replace_execution(
-                                conn, existing, &row, &enqueue, exec_id, &request, now,
-                            )
-                            .await?;
-                            deferred.append(&mut extra_deferred);
-                            Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
-                        }
-                    }
-                } else {
-                    // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/
-                    // TIMED_OUT/SUSPENDED): reuse axis only, byte-for-byte identical
-                    // to the pre-#685 behavior.
-                    match request.reuse_policy {
-                        WorkflowIdReusePolicy::AllowDuplicate => Ok((
-                            StartedWorkflowExecution::from_row(existing, false),
-                            Vec::new(),
-                            tx_deferred_checks,
-                            Vec::new(),
-                        )),
-
-                        WorkflowIdReusePolicy::RejectDuplicate => {
-                            Err(HarvestError::AlreadyExists {
-                                existing_exec_id: ExecutionId::from_uuid(existing.id),
-                                existing_state: existing.state,
-                            })
-                        }
-
-                        WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                            match existing.state.as_str() {
-                                "FAILED" | "CANCELLED" => {
-                                    // Replacing a terminal prior is a fresh start.
-                                    if reject_fresh_if_debounced {
-                                        return Err(HarvestError::DebounceFreshStart {
-                                            workflow_name: request.workflow_name.to_string(),
-                                            workflow_id: request.workflow_id.to_string(),
-                                        });
-                                    }
-                                    // Only these two explicitly abnormal states start fresh.
-                                    let (started_wf, deferred) = replace_execution(
-                                        conn, existing, &row, &enqueue, exec_id, &request, now,
-                                    )
-                                    .await?;
-                                    Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
-                                }
-                                _ => {
-                                    // COMPLETED, TIMED_OUT, SUSPENDED, or any other
-                                    // terminal state: return the existing execution
-                                    // unchanged.
-                                    Ok((
-                                        StartedWorkflowExecution::from_row(existing, false),
-                                        Vec::new(),
-                                        tx_deferred_checks,
-                                        Vec::new(),
-                                    ))
-                                }
-                            }
-                        }
-
-                        WorkflowIdReusePolicy::TerminateIfRunning => {
-                            // TerminateIfRunning always starts fresh (replace). Gate
-                            // it before replacing so a debounced workflow is routed
-                            // to admission instead. The prior is terminal here (an
-                            // active prior takes the branch above), so no inline
-                            // cancel is needed.
-                            if reject_fresh_if_debounced {
-                                return Err(HarvestError::DebounceFreshStart {
-                                    workflow_name: request.workflow_name.to_string(),
-                                    workflow_id: request.workflow_id.to_string(),
-                                });
-                            }
-                            let (started_wf, extra_deferred) = replace_execution(
-                                conn, existing, &row, &enqueue, exec_id, &request, now,
-                            )
-                            .await?;
-                            Ok((started_wf, extra_deferred, tx_deferred_checks, Vec::new()))
-                        }
-                    }
+                    deferred.append(&mut extra_deferred);
+                    Ok((started_wf, deferred, tx_deferred_checks, tx_cancel_metrics))
                 }
             }
-            .scope_boxed()
-        })
-        .await;
+        } else {
+            // Terminal non-sealed prior (COMPLETED/FAILED/CANCELLED/
+            // TIMED_OUT/SUSPENDED): reuse axis only, byte-for-byte identical
+            // to the pre-#685 behavior.
+            match request.reuse_policy {
+                WorkflowIdReusePolicy::AllowDuplicate => Ok((
+                    StartedWorkflowExecution::from_row(existing, false),
+                    Vec::new(),
+                    tx_deferred_checks,
+                    Vec::new(),
+                )),
+
+                WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
+                    existing_exec_id: ExecutionId::from_uuid(existing.id),
+                    existing_state: existing.state,
+                }),
+
+                WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                    match existing.state.as_str() {
+                        "FAILED" | "CANCELLED" => {
+                            // Replacing a terminal prior is a fresh start.
+                            if reject_fresh_if_debounced {
+                                return Err(HarvestError::DebounceFreshStart {
+                                    workflow_name: request.workflow_name.to_string(),
+                                    workflow_id: request.workflow_id.to_string(),
+                                });
+                            }
+                            // Only these two explicitly abnormal states start fresh.
+                            let (started_wf, deferred) = replace_execution(
+                                conn, existing, &row, &enqueue, exec_id, &request, now,
+                            )
+                            .await?;
+                            Ok((started_wf, deferred, tx_deferred_checks, Vec::new()))
+                        }
+                        _ => {
+                            // COMPLETED, TIMED_OUT, SUSPENDED, or any other
+                            // terminal state: return the existing execution
+                            // unchanged.
+                            Ok((
+                                StartedWorkflowExecution::from_row(existing, false),
+                                Vec::new(),
+                                tx_deferred_checks,
+                                Vec::new(),
+                            ))
+                        }
+                    }
+                }
+
+                WorkflowIdReusePolicy::TerminateIfRunning => {
+                    // TerminateIfRunning always starts fresh (replace). Gate
+                    // it before replacing so a debounced workflow is routed
+                    // to admission instead. The prior is terminal here (an
+                    // active prior takes the branch above), so no inline
+                    // cancel is needed.
+                    if reject_fresh_if_debounced {
+                        return Err(HarvestError::DebounceFreshStart {
+                            workflow_name: request.workflow_name.to_string(),
+                            workflow_id: request.workflow_id.to_string(),
+                        });
+                    }
+                    let (started_wf, extra_deferred) =
+                        replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now)
+                            .await?;
+                    Ok((started_wf, extra_deferred, tx_deferred_checks, Vec::new()))
+                }
+            }
+        }
+    }))
+    .await;
 
     let mut cancel_metrics = pre_check_cancel_metrics;
 
@@ -1229,68 +1211,65 @@ pub async fn start_or_load_workflow_execution_idempotent(
     let new_exec_id = request.exec_id;
     let shard_id = request.shard_id();
 
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             IdempotentStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
             Vec<(String, String)>,
-        ), HarvestError, _>(|conn| {
+        ), HarvestError, _>(async |conn| {
             let request = request;
-            // `gate` and `metrics` are `Copy`; captured directly by the `async move`.
-            async move {
-                match crate::start_idempotency::reserve_start_idempotency(
-                    conn,
-                    request.workflow_name,
-                    idempotency_key,
-                    new_exec_id,
-                    shard_id,
-                    window_secs,
-                )
-                .await?
-                {
-                    crate::start_idempotency::StartIdempotencyReservation::Duplicate {
+            // `gate` and `metrics` are `Copy`; captured directly by the `async |conn|` closure.
+            match crate::start_idempotency::reserve_start_idempotency(
+                conn,
+                request.workflow_name,
+                idempotency_key,
+                new_exec_id,
+                shard_id,
+                window_secs,
+            )
+            .await?
+            {
+                crate::start_idempotency::StartIdempotencyReservation::Duplicate {
+                    exec_id,
+                    workflow_id,
+                    state,
+                } => Ok((
+                    IdempotentStartOutcome::Deduplicated {
                         exec_id,
                         workflow_id,
                         state,
-                    } => Ok((
-                        IdempotentStartOutcome::Deduplicated {
-                            exec_id,
-                            workflow_id,
-                            state,
-                        },
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )),
-                    crate::start_idempotency::StartIdempotencyReservation::Reserved => {
-                        let workflow_name = request.workflow_name;
-                        let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
-                            conn, request, true, false, metrics, gate,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                crate::start_idempotency::StartIdempotencyReservation::Reserved => {
+                    let workflow_name = request.workflow_name;
+                    let (started, ds, dc, cm) = start_or_load_workflow_execution_collect(
+                        conn, request, true, false, metrics, gate,
+                    )
+                    .await?;
+                    // The reserve wrote the claim pointing at `new_exec_id`.
+                    // If the reuse policy resolved this fresh-key start to an
+                    // *existing* run (e.g. AllowDuplicate attaching to a prior
+                    // workflow_id collision), `new_exec_id` was never inserted
+                    // — repoint the claim at the real run so a subsequent
+                    // same-key request deduplicates cleanly instead of hitting
+                    // the defensive reclaim path and re-running the start.
+                    if started.exec_id != new_exec_id {
+                        crate::start_idempotency::repoint_start_idempotency_claim(
+                            conn,
+                            workflow_name,
+                            idempotency_key,
+                            started.exec_id,
                         )
                         .await?;
-                        // The reserve wrote the claim pointing at `new_exec_id`.
-                        // If the reuse policy resolved this fresh-key start to an
-                        // *existing* run (e.g. AllowDuplicate attaching to a prior
-                        // workflow_id collision), `new_exec_id` was never inserted
-                        // — repoint the claim at the real run so a subsequent
-                        // same-key request deduplicates cleanly instead of hitting
-                        // the defensive reclaim path and re-running the start.
-                        if started.exec_id != new_exec_id {
-                            crate::start_idempotency::repoint_start_idempotency_claim(
-                                conn,
-                                workflow_name,
-                                idempotency_key,
-                                started.exec_id,
-                            )
-                            .await?;
-                        }
-                        Ok((IdempotentStartOutcome::Started(started), ds, dc, cm))
                     }
+                    Ok((IdempotentStartOutcome::Started(started), ds, dc, cm))
                 }
             }
-            .scope_boxed()
-        })
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -2111,154 +2090,145 @@ pub async fn cancel_workflow_execution_collect(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts, closed_children) = conn
-        .transaction::<_, HarvestError, _>(|conn| {
-            async move {
-                let execution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .select(WorkflowExecution::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?
-                    .ok_or_else(|| {
-                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                    })?;
-
-                // Cancellation beats pause (issue #383): a PAUSED execution
-                // is cancellable just like a RUNNING one; the transition to
-                // CANCELLED clears the pending pause record below.
-                let prior_state = execution.state.clone();
-                match execution.state.as_str() {
-                    "RUNNING" | "PAUSED" => {}
-                    "CANCELLED" => {
-                        return Ok((
-                            CancelledWorkflowExecution::idempotent(exec_id, execution),
-                            Vec::new(),
-                            Vec::new(),
-                        ));
-                    }
-                    state => {
-                        return Err(HarvestError::Config(format!(
-                            "workflow execution {exec_id} is already terminal ({state})"
-                        )));
-                    }
-                }
-
-                let deleted_pending = diesel::delete(
-                    crate::schema::harvest_task_queue::table
-                        .filter(
-                            crate::schema::harvest_task_queue::workflow_exec_id
-                                .eq(Some(exec_id.as_uuid())),
-                        )
-                        .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
-                        .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
-                        .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
-                )
-                .execute(conn)
+    let (cancel_result, deferred_starts, closed_children) =
+        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
                 .await
-                .map_err(database_error)?;
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-                let history = store::load_history(conn, exec_id).await?;
-                store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::WorkflowCancelled {
-                        reason: reason.clone(),
-                    }],
-                    history.next_event_id,
-                )
-                .await?;
-
-                let completed_at = Utc::now();
-                // Mirror resume_workflow_execution: if this execution was PAUSED,
-                // push sla_deadline_at forward by the pause span so the SLA scanner
-                // does not record a false breach for time spent paused before cancel
-                // (issue #383 × #487). Only extend a deadline that was still ahead
-                // when the pause began — a deadline already elapsed while RUNNING
-                // stays in the past so its breach is still observed by the scanner.
-                let new_sla_deadline_at = if prior_state == "PAUSED" {
-                    execution
-                        .sla_deadline_at
-                        .map(|d| match execution.paused_at {
-                            Some(p) if d > p => {
-                                d + (completed_at - p).max(chrono::Duration::zero())
-                            }
-                            _ => d,
-                        })
-                } else {
-                    execution.sla_deadline_at
-                };
-                let updated =
-                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-                        .set((
-                            harvest_workflow_executions::state.eq("CANCELLED"),
-                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                            harvest_workflow_executions::error.eq(Some(reason.clone())),
-                            harvest_workflow_executions::completed_at.eq(Some(completed_at)),
-                            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
-                            // Cancellation wins: clear the pending pause record.
-                            harvest_workflow_executions::paused_at
-                                .eq(None::<chrono::DateTime<Utc>>),
-                            harvest_workflow_executions::pause_reason.eq(None::<String>),
-                            harvest_workflow_executions::pause_actor.eq(None::<String>),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(database_error)?;
-
-                if updated == 0 {
+            // Cancellation beats pause (issue #383): a PAUSED execution
+            // is cancellable just like a RUNNING one; the transition to
+            // CANCELLED clears the pending pause record below.
+            let prior_state = execution.state.clone();
+            match execution.state.as_str() {
+                "RUNNING" | "PAUSED" => {}
+                "CANCELLED" => {
+                    return Ok((
+                        CancelledWorkflowExecution::idempotent(exec_id, execution),
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+                state => {
                     return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is no longer running"
+                        "workflow execution {exec_id} is already terminal ({state})"
                     )));
                 }
-
-                let failed_task_count = queue::fail_open_tasks_for_execution(
-                    conn,
-                    exec_id,
-                    &format!("workflow cancelled: {reason}"),
-                )
-                .await?;
-
-                let total_failed_or_deleted = deleted_pending + failed_task_count;
-                // Wake a parent blocked on this child's await (#787): cancelling
-                // an awaited child out-of-band must surface to the parent.
-                notify_awaited_parent_of_child_terminal(
-                    conn,
-                    exec_id,
-                    &execution,
-                    format!("child workflow cancelled: {reason}"),
-                )
-                .await?;
-                let (mut deferred, closed_children) =
-                    apply_parent_close_cascade(conn, exec_id).await?;
-                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::Cancelled,
-                    None,
-                )
-                .await?;
-                deferred.extend(triggers);
-
-                Ok((
-                    CancelledWorkflowExecution::newly_cancelled(
-                        exec_id,
-                        "CANCELLED",
-                        reason,
-                        total_failed_or_deleted,
-                        execution.workflow_name.clone(),
-                        execution.queue_name.clone(),
-                        prior_state,
-                    ),
-                    deferred,
-                    closed_children,
-                ))
             }
-            .scope_boxed()
-        })
+
+            let deleted_pending = diesel::delete(
+                crate::schema::harvest_task_queue::table
+                    .filter(
+                        crate::schema::harvest_task_queue::workflow_exec_id
+                            .eq(Some(exec_id.as_uuid())),
+                    )
+                    .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
+                    .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
+                    .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            let history = store::load_history(conn, exec_id).await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowCancelled {
+                    reason: reason.clone(),
+                }],
+                history.next_event_id,
+            )
+            .await?;
+
+            let completed_at = Utc::now();
+            // Mirror resume_workflow_execution: if this execution was PAUSED,
+            // push sla_deadline_at forward by the pause span so the SLA scanner
+            // does not record a false breach for time spent paused before cancel
+            // (issue #383 × #487). Only extend a deadline that was still ahead
+            // when the pause began — a deadline already elapsed while RUNNING
+            // stays in the past so its breach is still observed by the scanner.
+            let new_sla_deadline_at = if prior_state == "PAUSED" {
+                execution
+                    .sla_deadline_at
+                    .map(|d| match execution.paused_at {
+                        Some(p) if d > p => d + (completed_at - p).max(chrono::Duration::zero()),
+                        _ => d,
+                    })
+            } else {
+                execution.sla_deadline_at
+            };
+            let updated =
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+                    .set((
+                        harvest_workflow_executions::state.eq("CANCELLED"),
+                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                        harvest_workflow_executions::error.eq(Some(reason.clone())),
+                        harvest_workflow_executions::completed_at.eq(Some(completed_at)),
+                        harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+                        // Cancellation wins: clear the pending pause record.
+                        harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+                        harvest_workflow_executions::pause_reason.eq(None::<String>),
+                        harvest_workflow_executions::pause_actor.eq(None::<String>),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+            if updated == 0 {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {exec_id} is no longer running"
+                )));
+            }
+
+            let failed_task_count = queue::fail_open_tasks_for_execution(
+                conn,
+                exec_id,
+                &format!("workflow cancelled: {reason}"),
+            )
+            .await?;
+
+            let total_failed_or_deleted = deleted_pending + failed_task_count;
+            // Wake a parent blocked on this child's await (#787): cancelling
+            // an awaited child out-of-band must surface to the parent.
+            notify_awaited_parent_of_child_terminal(
+                conn,
+                exec_id,
+                &execution,
+                format!("child workflow cancelled: {reason}"),
+            )
+            .await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Cancelled,
+                None,
+            )
+            .await?;
+            deferred.extend(triggers);
+
+            Ok((
+                CancelledWorkflowExecution::newly_cancelled(
+                    exec_id,
+                    "CANCELLED",
+                    reason,
+                    total_failed_or_deleted,
+                    execution.workflow_name.clone(),
+                    execution.queue_name.clone(),
+                    prior_state,
+                ),
+                deferred,
+                closed_children,
+            ))
+        }))
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -2432,90 +2402,86 @@ pub async fn pause_workflow_execution(
     let reason = reason.map(ToOwned::to_owned);
 
     let paused_at = Utc::now();
-    let result = conn
-        .transaction::<PausedWorkflowExecution, HarvestError, _>(|conn| {
+    let result = Box::pin(
+        conn.transaction::<PausedWorkflowExecution, HarvestError, _>(async |conn| {
             let reason = reason.clone();
             let actor = actor.clone();
-            async move {
-                let execution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .select(WorkflowExecution::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?
-                    .ok_or_else(|| {
-                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                    })?;
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-                match execution.state.as_str() {
-                    "RUNNING" => {}
-                    "PAUSED" => {
-                        return Ok(PausedWorkflowExecution {
-                            exec_id,
-                            state: "PAUSED".to_string(),
-                            reason: execution.pause_reason,
-                            actor: execution.pause_actor.unwrap_or(actor),
-                            newly_paused: false,
-                            paused_at: execution.paused_at,
-                            workflow_name: execution.workflow_name,
-                            queue_name: execution.queue_name,
-                        });
-                    }
-                    state => {
-                        return Err(HarvestError::Config(format!(
-                            "workflow execution {exec_id} is already terminal ({state})"
-                        )));
-                    }
+            match execution.state.as_str() {
+                "RUNNING" => {}
+                "PAUSED" => {
+                    return Ok(PausedWorkflowExecution {
+                        exec_id,
+                        state: "PAUSED".to_string(),
+                        reason: execution.pause_reason,
+                        actor: execution.pause_actor.unwrap_or(actor),
+                        newly_paused: false,
+                        paused_at: execution.paused_at,
+                        workflow_name: execution.workflow_name,
+                        queue_name: execution.queue_name,
+                    });
                 }
-
-                let history = store::load_history(conn, exec_id).await?;
-                store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::WorkflowExecutionPaused {
-                        paused_at,
-                        reason: reason.clone(),
-                        actor: actor.clone(),
-                    }],
-                    history.next_event_id,
-                )
-                .await?;
-
-                let updated =
-                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                        .filter(harvest_workflow_executions::state.eq("RUNNING"))
-                        .set((
-                            harvest_workflow_executions::state.eq("PAUSED"),
-                            harvest_workflow_executions::paused_at.eq(Some(paused_at)),
-                            harvest_workflow_executions::pause_reason.eq(reason.clone()),
-                            harvest_workflow_executions::pause_actor.eq(Some(actor.clone())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(database_error)?;
-
-                if updated == 0 {
+                state => {
                     return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is no longer running"
+                        "workflow execution {exec_id} is already terminal ({state})"
                     )));
                 }
-
-                Ok(PausedWorkflowExecution {
-                    exec_id,
-                    state: "PAUSED".to_string(),
-                    reason,
-                    actor,
-                    newly_paused: true,
-                    paused_at: Some(paused_at),
-                    workflow_name: execution.workflow_name,
-                    queue_name: execution.queue_name,
-                })
             }
-            .scope_boxed()
-        })
-        .await?;
+
+            let history = store::load_history(conn, exec_id).await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowExecutionPaused {
+                    paused_at,
+                    reason: reason.clone(),
+                    actor: actor.clone(),
+                }],
+                history.next_event_id,
+            )
+            .await?;
+
+            let updated =
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                    .set((
+                        harvest_workflow_executions::state.eq("PAUSED"),
+                        harvest_workflow_executions::paused_at.eq(Some(paused_at)),
+                        harvest_workflow_executions::pause_reason.eq(reason.clone()),
+                        harvest_workflow_executions::pause_actor.eq(Some(actor.clone())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+            if updated == 0 {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {exec_id} is no longer running"
+                )));
+            }
+
+            Ok(PausedWorkflowExecution {
+                exec_id,
+                state: "PAUSED".to_string(),
+                reason,
+                actor,
+                newly_paused: true,
+                paused_at: Some(paused_at),
+                workflow_name: execution.workflow_name,
+                queue_name: execution.queue_name,
+            })
+        }),
+    )
+    .await?;
 
     if result.newly_paused {
         metrics.record_workflow_paused(&result.workflow_name, &result.queue_name);
@@ -2757,127 +2723,122 @@ pub async fn resume_workflow_execution(
     };
 
     let resumed_at = Utc::now();
-    let result = conn
-        .transaction::<ResumedWorkflowExecution, HarvestError, _>(|conn| {
+    let result = Box::pin(
+        conn.transaction::<ResumedWorkflowExecution, HarvestError, _>(async |conn| {
             let actor = actor.clone();
-            async move {
-                let execution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .select(WorkflowExecution::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?
-                    .ok_or_else(|| {
-                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                    })?;
-
-                if execution.state != "PAUSED" {
-                    // Success no-op (issue #609, AC7): idempotent operator
-                    // retry — see the function doc comment.
-                    return Ok(ResumedWorkflowExecution {
-                        exec_id,
-                        state: execution.state,
-                        actor,
-                        pause_duration_secs: 0.0,
-                        newly_resumed: false,
-                        workflow_name: execution.workflow_name,
-                        queue_name: execution.queue_name,
-                    });
-                }
-
-                let ResumeDeadlineShifts {
-                    pause_span,
-                    pause_duration_secs,
-                    new_deadline_at,
-                    new_sla_deadline_at,
-                } = resume_deadline_shifts(&execution, resumed_at);
-
-                let history = store::load_history(conn, exec_id).await?;
-                store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::WorkflowExecutionResumed {
-                        resumed_at,
-                        actor: actor.clone(),
-                    }],
-                    history.next_event_id,
-                )
-                .await?;
-
-                let updated =
-                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                        .filter(harvest_workflow_executions::state.eq("PAUSED"))
-                        .set((
-                            harvest_workflow_executions::state.eq("RUNNING"),
-                            harvest_workflow_executions::paused_at
-                                .eq(None::<chrono::DateTime<Utc>>),
-                            harvest_workflow_executions::pause_reason.eq(None::<String>),
-                            harvest_workflow_executions::pause_actor.eq(None::<String>),
-                            harvest_workflow_executions::deadline_at.eq(new_deadline_at),
-                            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(database_error)?;
-
-                if updated == 0 {
-                    return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is no longer paused"
-                    )));
-                }
-
-                // Refresh any durable-mutex leases this holder owns (issue
-                // #691). A PAUSED holder stops running decision cycles, so it
-                // stops renewing its leases; the lease-reclaim scanner skips
-                // PAUSED holders while paused, but on resume the lease may be
-                // stale, so push it forward now (inside the same transaction
-                // that flips PAUSED->RUNNING) to preserve mutual exclusion. A
-                // no-op when the mutex tables are absent (guarded).
-                // cancel/terminate are already covered by the terminal sweep in
-                // `evaluate_triggers_for_execution`. Best-effort — mirroring the
-                // per-cycle renewal at the top of `process_workflow_task`, a
-                // transient renewal failure is logged and tolerated rather than
-                // rolling back the resume (the TTL exceeds several decision
-                // cycles and the reclaim path re-checks under the advisory
-                // lock, so a healthy resume is never failed by a lease renewal
-                // hiccup; the resumed holder renews again on its next cycle).
-                if let Err(e) = crate::mutex::renew_leases_for_holder(
-                    conn,
-                    exec_id,
-                    crate::mutex::effective_mutex_lease_ttl(),
-                )
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
                 .await
-                {
-                    tracing::warn!(
-                        exec_id = %exec_id,
-                        error = %e,
-                        "failed to renew durable-mutex leases on resume (best-effort)"
-                    );
-                }
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-                shift_schedule_to_close_for_resume(conn, exec_id, pause_span).await?;
-
-                // Re-arm the executor: wake the parked workflow task so the
-                // workflow advances on its next decision attempt. Any timer that
-                // fired while paused, or signal queued during the pause, is
-                // processed when the woken task is claimed.
-                queue::wake_workflow_task(conn, exec_id).await?;
-
-                Ok(ResumedWorkflowExecution {
+            if execution.state != "PAUSED" {
+                // Success no-op (issue #609, AC7): idempotent operator
+                // retry — see the function doc comment.
+                return Ok(ResumedWorkflowExecution {
                     exec_id,
-                    state: "RUNNING".to_string(),
+                    state: execution.state,
                     actor,
-                    pause_duration_secs,
-                    newly_resumed: true,
+                    pause_duration_secs: 0.0,
+                    newly_resumed: false,
                     workflow_name: execution.workflow_name,
                     queue_name: execution.queue_name,
-                })
+                });
             }
-            .scope_boxed()
-        })
-        .await?;
+
+            let ResumeDeadlineShifts {
+                pause_span,
+                pause_duration_secs,
+                new_deadline_at,
+                new_sla_deadline_at,
+            } = resume_deadline_shifts(&execution, resumed_at);
+
+            let history = store::load_history(conn, exec_id).await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowExecutionResumed {
+                    resumed_at,
+                    actor: actor.clone(),
+                }],
+                history.next_event_id,
+            )
+            .await?;
+
+            let updated =
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .filter(harvest_workflow_executions::state.eq("PAUSED"))
+                    .set((
+                        harvest_workflow_executions::state.eq("RUNNING"),
+                        harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+                        harvest_workflow_executions::pause_reason.eq(None::<String>),
+                        harvest_workflow_executions::pause_actor.eq(None::<String>),
+                        harvest_workflow_executions::deadline_at.eq(new_deadline_at),
+                        harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+            if updated == 0 {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {exec_id} is no longer paused"
+                )));
+            }
+
+            // Refresh any durable-mutex leases this holder owns (issue
+            // #691). A PAUSED holder stops running decision cycles, so it
+            // stops renewing its leases; the lease-reclaim scanner skips
+            // PAUSED holders while paused, but on resume the lease may be
+            // stale, so push it forward now (inside the same transaction
+            // that flips PAUSED->RUNNING) to preserve mutual exclusion. A
+            // no-op when the mutex tables are absent (guarded).
+            // cancel/terminate are already covered by the terminal sweep in
+            // `evaluate_triggers_for_execution`. Best-effort — mirroring the
+            // per-cycle renewal at the top of `process_workflow_task`, a
+            // transient renewal failure is logged and tolerated rather than
+            // rolling back the resume (the TTL exceeds several decision
+            // cycles and the reclaim path re-checks under the advisory
+            // lock, so a healthy resume is never failed by a lease renewal
+            // hiccup; the resumed holder renews again on its next cycle).
+            if let Err(e) = crate::mutex::renew_leases_for_holder(
+                conn,
+                exec_id,
+                crate::mutex::effective_mutex_lease_ttl(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    exec_id = %exec_id,
+                    error = %e,
+                    "failed to renew durable-mutex leases on resume (best-effort)"
+                );
+            }
+
+            shift_schedule_to_close_for_resume(conn, exec_id, pause_span).await?;
+
+            // Re-arm the executor: wake the parked workflow task so the
+            // workflow advances on its next decision attempt. Any timer that
+            // fired while paused, or signal queued during the pause, is
+            // processed when the woken task is claimed.
+            queue::wake_workflow_task(conn, exec_id).await?;
+
+            Ok(ResumedWorkflowExecution {
+                exec_id,
+                state: "RUNNING".to_string(),
+                actor,
+                pause_duration_secs,
+                newly_resumed: true,
+                workflow_name: execution.workflow_name,
+                queue_name: execution.queue_name,
+            })
+        }),
+    )
+    .await?;
 
     // A no-op resume never actually resumed anything: skip the duration
     // histogram so zero-length phantom samples don't skew percentiles
@@ -3328,135 +3289,127 @@ pub async fn terminate_workflow_execution_collect(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts, closed_children) = conn
-        .transaction::<_, HarvestError, _>(|conn| {
-            async move {
-                let execution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .select(WorkflowExecution::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?
-                    .ok_or_else(|| {
-                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                    })?;
+    let (cancel_result, deferred_starts, closed_children) =
+        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            let execution = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
-                // Idempotent no-op against any already-terminal state
-                // (issue #504, AC #7): never append a duplicate terminal
-                // transition. `idempotent` returns the existing state with
-                // `newly_cancelled = false`.
-                if crate::erase::is_terminal_state(&execution.state) {
-                    return Ok((
-                        CancelledWorkflowExecution::idempotent(exec_id, execution),
-                        Vec::new(),
-                        Vec::new(),
-                    ));
-                }
-
-                let history = store::load_history(conn, exec_id).await?;
-                store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::WorkflowCancelled {
-                        reason: reason.clone(),
-                    }],
-                    history.next_event_id,
-                )
-                .await?;
-
-                let completed_at = Utc::now();
-                // Mirror cancel/resume: if this execution was PAUSED, push
-                // sla_deadline_at forward by the pause span so the SLA scanner
-                // does not record a false breach for time spent paused before
-                // terminate (issue #383 × #487). The scanner judges terminal rows
-                // by `sla_deadline_at < COALESCE(completed_at, NOW())`, so leaving
-                // a stale deadline that elapsed during the pause would count a
-                // suspended-clock run as breached. Only extend a deadline that was
-                // still ahead when the pause began — a deadline already elapsed
-                // while RUNNING stays in the past so its breach is still observed.
-                let new_sla_deadline_at = if execution.state == "PAUSED" {
-                    execution
-                        .sla_deadline_at
-                        .map(|d| match execution.paused_at {
-                            Some(p) if d > p => {
-                                d + (completed_at - p).max(chrono::Duration::zero())
-                            }
-                            _ => d,
-                        })
-                } else {
-                    execution.sla_deadline_at
-                };
-
-                // No state-precondition filter: operator override force-writes
-                // the live run to the sealed TERMINATED state.
-                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                    .set((
-                        harvest_workflow_executions::state.eq("TERMINATED"),
-                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                        harvest_workflow_executions::error.eq(Some(reason.clone())),
-                        harvest_workflow_executions::completed_at.eq(Some(completed_at)),
-                        harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
-                        // Clear active-pause metadata when terminating a paused
-                        // run so it doesn't appear terminal-and-paused (#383).
-                        harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
-                        harvest_workflow_executions::pause_reason.eq(None::<String>),
-                        harvest_workflow_executions::pause_actor.eq(None::<String>),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-
-                let failed_task_count = queue::fail_open_tasks_for_execution(
-                    conn,
-                    exec_id,
-                    &format!("workflow terminated: {reason}"),
-                )
-                .await?;
-                // Wake a parent blocked on this child's await (#787):
-                // force-terminating an awaited child out-of-band must surface
-                // to the parent so it does not park forever.
-                notify_awaited_parent_of_child_terminal(
-                    conn,
-                    exec_id,
-                    &execution,
-                    format!("child workflow terminated: {reason}"),
-                )
-                .await?;
-                let (mut deferred, closed_children) =
-                    apply_parent_close_cascade(conn, exec_id).await?;
-                // Force-terminate fires `Terminated` completion triggers, NOT
-                // `Cancelled` — a force-kill is distinct from a cooperative
-                // cancellation downstream (issue #504). Operators opt into
-                // terminate cascades by registering `terminal_states:
-                // ["Terminated"]`.
-                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::Terminated,
-                    None,
-                )
-                .await?;
-                deferred.extend(triggers);
-
-                let prior_state = execution.state.clone();
-                Ok((
-                    CancelledWorkflowExecution::newly_cancelled(
-                        exec_id,
-                        "TERMINATED",
-                        reason,
-                        failed_task_count,
-                        execution.workflow_name.clone(),
-                        execution.queue_name.clone(),
-                        prior_state,
-                    ),
-                    deferred,
-                    closed_children,
-                ))
+            // Idempotent no-op against any already-terminal state
+            // (issue #504, AC #7): never append a duplicate terminal
+            // transition. `idempotent` returns the existing state with
+            // `newly_cancelled = false`.
+            if crate::erase::is_terminal_state(&execution.state) {
+                return Ok((
+                    CancelledWorkflowExecution::idempotent(exec_id, execution),
+                    Vec::new(),
+                    Vec::new(),
+                ));
             }
-            .scope_boxed()
-        })
+
+            let history = store::load_history(conn, exec_id).await?;
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowCancelled {
+                    reason: reason.clone(),
+                }],
+                history.next_event_id,
+            )
+            .await?;
+
+            let completed_at = Utc::now();
+            // Mirror cancel/resume: if this execution was PAUSED, push
+            // sla_deadline_at forward by the pause span so the SLA scanner
+            // does not record a false breach for time spent paused before
+            // terminate (issue #383 × #487). The scanner judges terminal rows
+            // by `sla_deadline_at < COALESCE(completed_at, NOW())`, so leaving
+            // a stale deadline that elapsed during the pause would count a
+            // suspended-clock run as breached. Only extend a deadline that was
+            // still ahead when the pause began — a deadline already elapsed
+            // while RUNNING stays in the past so its breach is still observed.
+            let new_sla_deadline_at = if execution.state == "PAUSED" {
+                execution
+                    .sla_deadline_at
+                    .map(|d| match execution.paused_at {
+                        Some(p) if d > p => d + (completed_at - p).max(chrono::Duration::zero()),
+                        _ => d,
+                    })
+            } else {
+                execution.sla_deadline_at
+            };
+
+            // No state-precondition filter: operator override force-writes
+            // the live run to the sealed TERMINATED state.
+            diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                .set((
+                    harvest_workflow_executions::state.eq("TERMINATED"),
+                    harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                    harvest_workflow_executions::error.eq(Some(reason.clone())),
+                    harvest_workflow_executions::completed_at.eq(Some(completed_at)),
+                    harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+                    // Clear active-pause metadata when terminating a paused
+                    // run so it doesn't appear terminal-and-paused (#383).
+                    harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+                    harvest_workflow_executions::pause_reason.eq(None::<String>),
+                    harvest_workflow_executions::pause_actor.eq(None::<String>),
+                ))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+            let failed_task_count = queue::fail_open_tasks_for_execution(
+                conn,
+                exec_id,
+                &format!("workflow terminated: {reason}"),
+            )
+            .await?;
+            // Wake a parent blocked on this child's await (#787):
+            // force-terminating an awaited child out-of-band must surface
+            // to the parent so it does not park forever.
+            notify_awaited_parent_of_child_terminal(
+                conn,
+                exec_id,
+                &execution,
+                format!("child workflow terminated: {reason}"),
+            )
+            .await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            // Force-terminate fires `Terminated` completion triggers, NOT
+            // `Cancelled` — a force-kill is distinct from a cooperative
+            // cancellation downstream (issue #504). Operators opt into
+            // terminate cascades by registering `terminal_states:
+            // ["Terminated"]`.
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Terminated,
+                None,
+            )
+            .await?;
+            deferred.extend(triggers);
+
+            let prior_state = execution.state.clone();
+            Ok((
+                CancelledWorkflowExecution::newly_cancelled(
+                    exec_id,
+                    "TERMINATED",
+                    reason,
+                    failed_task_count,
+                    execution.workflow_name.clone(),
+                    execution.queue_name.clone(),
+                    prior_state,
+                ),
+                deferred,
+                closed_children,
+            ))
+        }))
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -3938,200 +3891,242 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
 ) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             SignalWithStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
             Vec<(String, String)>,
-        ), HarvestError, _>(|conn| {
+        ), HarvestError, _>(async |conn| {
             let request = request;
-            async move {
-                let mut deferred_starts = Vec::new();
-                let mut deferred_checks = Vec::new();
-                let mut cancel_metrics = Vec::new();
+            let mut deferred_starts = Vec::new();
+            let mut deferred_checks = Vec::new();
+            let mut cancel_metrics = Vec::new();
 
-                // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
-                // so escalation/reset paths on a new exec_id don't re-queue the signal.
-                if let Some(key) = request.idempotency_key.as_deref()
-                    && let Some(prior) = lookup_idempotent_signal_dedupe(
-                        conn,
-                        request.workflow_name,
-                        request.workflow_id,
-                        key,
-                    )
-                    .await?
+            // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
+            // so escalation/reset paths on a new exec_id don't re-queue the signal.
+            if let Some(key) = request.idempotency_key.as_deref()
+                && let Some(prior) = lookup_idempotent_signal_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    key,
+                )
+                .await?
+            {
+                return Ok((
+                    SignalWithStartOutcome {
+                        exec_id: ExecutionId::from_uuid(prior.id),
+                        workflow_name: prior.workflow_name,
+                        workflow_id: prior.workflow_id,
+                        state: prior.state,
+                        started_fresh: false,
+                        signal_delivered: false,
+                    },
+                    deferred_starts,
+                    deferred_checks,
+                    cancel_metrics,
+                ));
+            }
+
+            // 1. Resolve build routing policy for this queue (pre-lock lookup)
+            let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
+            let _effective_policy = policy.clone().map(|p| p.build_id);
+
+            // 2. Pre-cancel active execution under TerminateIfRunning before start,
+            // matching the pre-check pattern in start_or_load_workflow_execution.
+            // Runs in a savepoint: if the signal or start cap checks fail below,
+            // the cancellation is rolled back.
+            let mut pre_check_deferred = Vec::new();
+            if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+                && !request.reject_fresh_if_debounced
+                && let Some(prior) =
+                    try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
+                && matches!(prior.state.as_str(), "RUNNING" | "PAUSED")
+            {
+                let prior_exec_id = ExecutionId::from_uuid(prior.id);
+                match cancel_workflow_execution_collect(
+                    conn,
+                    prior_exec_id,
+                    "terminated by signal-with-start",
+                )
+                .await
                 {
-                    return Ok((
-                        SignalWithStartOutcome {
-                            exec_id: ExecutionId::from_uuid(prior.id),
-                            workflow_name: prior.workflow_name,
-                            workflow_id: prior.workflow_id,
-                            state: prior.state,
-                            started_fresh: false,
-                            signal_delivered: false,
-                        },
-                        deferred_starts,
-                        deferred_checks,
-                        cancel_metrics,
-                    ));
-                }
-
-                // 1. Resolve build routing policy for this queue (pre-lock lookup)
-                let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
-                let _effective_policy = policy.clone().map(|p| p.build_id);
-
-                // 2. Pre-cancel active execution under TerminateIfRunning before start,
-                // matching the pre-check pattern in start_or_load_workflow_execution.
-                // Runs in a savepoint: if the signal or start cap checks fail below,
-                // the cancellation is rolled back.
-                let mut pre_check_deferred = Vec::new();
-                if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
-                    && !request.reject_fresh_if_debounced
-                    && let Some(prior) =
-                        try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
-                    && matches!(prior.state.as_str(), "RUNNING" | "PAUSED")
-                {
-                    let prior_exec_id = ExecutionId::from_uuid(prior.id);
-                    match cancel_workflow_execution_collect(
-                        conn,
-                        prior_exec_id,
-                        "terminated by signal-with-start",
-                    )
-                    .await
-                    {
-                        Ok((_cancelled, mut deferred, mut checks, metrics_opt)) => {
-                            pre_check_deferred.append(&mut deferred);
-                            deferred_checks.append(&mut checks);
-                            if let Some(m) = metrics_opt {
-                                cancel_metrics.push(m);
-                            }
+                    Ok((_cancelled, mut deferred, mut checks, metrics_opt)) => {
+                        pre_check_deferred.append(&mut deferred);
+                        deferred_checks.append(&mut checks);
+                        if let Some(m) = metrics_opt {
+                            cancel_metrics.push(m);
                         }
-                        Err(HarvestError::NotFound(_)) => {}
-                        Err(e) => return Err(e),
                     }
+                    Err(HarvestError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
                 }
-                deferred_starts.append(&mut pre_check_deferred);
+            }
+            deferred_starts.append(&mut pre_check_deferred);
 
-                // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
-                // when the prior run is terminal so the signal always lands on a live
-                // execution ("no signal silently dropped" invariant from issue #244).
-                // For a debounced workflow, skip the upgrade: a terminal prior must not
-                // be escalated to a fresh start here — the reject check below routes it
-                // to debounce admission instead.
-                let effective_policy = if request.reject_fresh_if_debounced {
-                    request.reuse_policy
-                } else {
-                    resolve_effective_signal_with_start_policy(
+            // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
+            // when the prior run is terminal so the signal always lands on a live
+            // execution ("no signal silently dropped" invariant from issue #244).
+            // For a debounced workflow, skip the upgrade: a terminal prior must not
+            // be escalated to a fresh start here — the reject check below routes it
+            // to debounce admission instead.
+            let effective_policy = if request.reject_fresh_if_debounced {
+                request.reuse_policy
+            } else {
+                resolve_effective_signal_with_start_policy(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    request.reuse_policy,
+                )
+                .await?
+            };
+
+            let build_start_request =
+                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
+                    workflow_name: request.workflow_name,
+                    workflow_id: request.workflow_id,
+                    exec_id,
+                    input: request.input.clone(),
+                    parent_id: request.parent_id,
+                    queue_name: request.queue_name,
+                    execution_timeout: request.execution_timeout,
+                    memo: request.memo.clone(),
+                    search_attrs: request.search_attrs.clone(),
+                    reuse_policy: policy,
+                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                    trace_context: request.trace_context.clone(),
+                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                    // Chain-scoped lifetime cap (issue #617): forward the
+                    // request's fresh-origin chain cap + fleet-wide ceiling.
+                    // A signal-/update-with-start never inherits a chain
+                    // deadline — it always begins a fresh chain origin.
+                    chain_execution_timeout: request.chain_execution_timeout,
+                    max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
+                    inherited_chain_deadline_at: None,
+                    concurrency_key: request.concurrency_key.clone(),
+                    concurrency_limit: request.concurrency_limit,
+                    priority: Priority::default(),
+                    max_workflow_input_bytes: 0,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
+                    owner: request.owner,
+                    runbook_url: request.runbook_url,
+                    severity: request.severity,
+                    context_headers: request.context_headers.clone(),
+                    sla: request.sla,
+                    schedule_id: None,
+                    scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: request
+                        .workflow_retry_policy
+                        .clone()
+                        .and_then(|v| serde_json::from_value(v).ok()),
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
+                    origin: None,
+                    completion_callbacks: None,
+                    start_source: request
+                        .start_source_override
+                        .unwrap_or(crate::types::StartSource::SignalWithStart),
+                    start_source_ref: request
+                        .idempotency_key
+                        .as_deref()
+                        .or(Some(request.workflow_id)),
+                    started_by: None,
+                };
+
+            // For a debounced workflow, route the start through the no-spawn collect
+            // path with reject_fresh: a fresh start (including a TerminateIfRunning
+            // cancel+replace) returns DebounceFreshStart and rolls back WITHOUT
+            // cancelling a prior or spawning completion-trigger/parent-close
+            // follow-ups (issue #499). An attach returns the existing live run;
+            // its deferred list is empty and spawned defensively.
+            let started = if request.reject_fresh_if_debounced {
+                let (s, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
                         conn,
-                        request.workflow_name,
-                        request.workflow_id,
-                        request.reuse_policy,
+                        build_start_request(request.exec_id, effective_policy),
+                        true,
+                        true,
+                        metrics,
+                        None,
                     )
-                    .await?
-                };
+                    .await?;
+                deferred_starts.append(&mut deferred);
+                deferred_checks.append(&mut checks);
+                cancel_metrics.append(&mut metrics_list);
+                s
+            } else {
+                let (s, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        build_start_request(request.exec_id, effective_policy),
+                        true,
+                        false,
+                        metrics,
+                        gate,
+                    )
+                    .await?;
+                deferred_starts.append(&mut deferred);
+                deferred_checks.append(&mut checks);
+                cancel_metrics.append(&mut metrics_list);
+                s
+            };
 
-                let build_start_request =
-                    |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
-                        workflow_name: request.workflow_name,
-                        workflow_id: request.workflow_id,
-                        exec_id,
-                        input: request.input.clone(),
-                        parent_id: request.parent_id,
-                        queue_name: request.queue_name,
-                        execution_timeout: request.execution_timeout,
-                        memo: request.memo.clone(),
-                        search_attrs: request.search_attrs.clone(),
-                        reuse_policy: policy,
-                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: request.trace_context.clone(),
-                        max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                        // Chain-scoped lifetime cap (issue #617): forward the
-                        // request's fresh-origin chain cap + fleet-wide ceiling.
-                        // A signal-/update-with-start never inherits a chain
-                        // deadline — it always begins a fresh chain origin.
-                        chain_execution_timeout: request.chain_execution_timeout,
-                        max_workflow_chain_timeout_ceiling: request
-                            .max_workflow_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: request.concurrency_key.clone(),
-                        concurrency_limit: request.concurrency_limit,
-                        priority: Priority::default(),
-                        max_workflow_input_bytes: 0,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
-                        owner: request.owner,
-                        runbook_url: request.runbook_url,
-                        severity: request.severity,
-                        context_headers: request.context_headers.clone(),
-                        sla: request.sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
-                        workflow_retry_policy: request
-                            .workflow_retry_policy
-                            .clone()
-                            .and_then(|v| serde_json::from_value(v).ok()),
-                        retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
-                        origin: None,
-                        completion_callbacks: None,
-                        start_source: request
-                            .start_source_override
-                            .unwrap_or(crate::types::StartSource::SignalWithStart),
-                        start_source_ref: request
-                            .idempotency_key
-                            .as_deref()
-                            .or(Some(request.workflow_id)),
-                        started_by: None,
-                    };
+            // On fresh start only: enforce workflow input cap and schema (tx
+            // rollback on error). An attach never writes start_input, so neither
+            // check runs for it (issue #918 review — schema validation used to
+            // run unconditionally, pre-lock, in the HTTP handler, rejecting
+            // legitimate signal deliveries to an already-running execution
+            // whenever the signal payload didn't match the start-input schema).
+            if started.created {
+                check_sws_payload_cap(
+                    &request.input,
+                    crate::error::PayloadKind::WorkflowInput,
+                    request.max_workflow_input_bytes,
+                    request.workflow_name,
+                )?;
+                check_sws_input_schema(&request.input, request.workflow_info)?;
+            }
 
-                // For a debounced workflow, route the start through the no-spawn collect
-                // path with reject_fresh: a fresh start (including a TerminateIfRunning
-                // cancel+replace) returns DebounceFreshStart and rolls back WITHOUT
-                // cancelling a prior or spawning completion-trigger/parent-close
-                // follow-ups (issue #499). An attach returns the existing live run;
-                // its deferred list is empty and spawned defensively.
-                let started = if request.reject_fresh_if_debounced {
-                    let (s, mut deferred, mut checks, mut metrics_list) =
-                        start_or_load_workflow_execution_collect(
-                            conn,
-                            build_start_request(request.exec_id, effective_policy),
-                            true,
-                            true,
-                            metrics,
-                            None,
-                        )
-                        .await?;
-                    deferred_starts.append(&mut deferred);
-                    deferred_checks.append(&mut checks);
-                    cancel_metrics.append(&mut metrics_list);
-                    s
-                } else {
-                    let (s, mut deferred, mut checks, mut metrics_list) =
-                        start_or_load_workflow_execution_collect(
-                            conn,
-                            build_start_request(request.exec_id, effective_policy),
-                            true,
-                            false,
-                            metrics,
-                            gate,
-                        )
-                        .await?;
-                    deferred_starts.append(&mut deferred);
-                    deferred_checks.append(&mut checks);
-                    cancel_metrics.append(&mut metrics_list);
-                    s
-                };
-
-                // On fresh start only: enforce workflow input cap and schema (tx
-                // rollback on error). An attach never writes start_input, so neither
-                // check runs for it (issue #918 review — schema validation used to
-                // run unconditionally, pre-lock, in the HTTP handler, rejecting
-                // legitimate signal deliveries to an already-running execution
-                // whenever the signal payload didn't match the start-input schema).
-                if started.created {
+            // TOCTOU guard: if a concurrent transaction completed the run between
+            // the policy resolver's lock and our start, the start helper returns
+            // a terminal row. Escalate to TerminateIfRunning so the signal always
+            // lands on a live execution rather than being silently dropped.
+            // PAUSED is a non-terminal active state (issue #383): treat it like
+            // RUNNING here so a signal-with-start attaches to (and buffers the
+            // signal for) the paused run instead of cancelling and replacing it.
+            let started = if !matches!(started.state.as_str(), "RUNNING" | "PAUSED")
+                // For a debounced workflow, never escalate a terminal prior to a
+                // fresh start here — that fresh start must go through debounce
+                // admission. The reject check below catches the non-live outcome.
+                && !request.reject_fresh_if_debounced
+                && matches!(
+                    request.reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                ) {
+                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
+                let (fresh, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        build_start_request(
+                            fresh_exec_id,
+                            WorkflowIdReusePolicy::TerminateIfRunning,
+                        ),
+                        true,
+                        false,
+                        metrics,
+                        gate,
+                    )
+                    .await?;
+                deferred_starts.append(&mut deferred);
+                deferred_checks.append(&mut checks);
+                cancel_metrics.append(&mut metrics_list);
+                if fresh.created {
                     check_sws_payload_cap(
                         &request.input,
                         crate::error::PayloadKind::WorkflowInput,
@@ -4140,111 +4135,65 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     )?;
                     check_sws_input_schema(&request.input, request.workflow_info)?;
                 }
+                fresh
+            } else {
+                started
+            };
 
-                // TOCTOU guard: if a concurrent transaction completed the run between
-                // the policy resolver's lock and our start, the start helper returns
-                // a terminal row. Escalate to TerminateIfRunning so the signal always
-                // lands on a live execution rather than being silently dropped.
-                // PAUSED is a non-terminal active state (issue #383): treat it like
-                // RUNNING here so a signal-with-start attaches to (and buffers the
-                // signal for) the paused run instead of cancelling and replacing it.
-                let started = if !matches!(started.state.as_str(), "RUNNING" | "PAUSED")
-                    // For a debounced workflow, never escalate a terminal prior to a
-                    // fresh start here — that fresh start must go through debounce
-                    // admission. The reject check below catches the non-live outcome.
-                    && !request.reject_fresh_if_debounced
-                    && matches!(
-                        request.reuse_policy,
-                        WorkflowIdReusePolicy::AllowDuplicate
-                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                    ) {
-                    let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                    let (fresh, mut deferred, mut checks, mut metrics_list) =
-                        start_or_load_workflow_execution_collect(
-                            conn,
-                            build_start_request(
-                                fresh_exec_id,
-                                WorkflowIdReusePolicy::TerminateIfRunning,
-                            ),
-                            true,
-                            false,
-                            metrics,
-                            gate,
-                        )
-                        .await?;
-                    deferred_starts.append(&mut deferred);
-                    deferred_checks.append(&mut checks);
-                    cancel_metrics.append(&mut metrics_list);
-                    if fresh.created {
-                        check_sws_payload_cap(
-                            &request.input,
-                            crate::error::PayloadKind::WorkflowInput,
-                            request.max_workflow_input_bytes,
-                            request.workflow_name,
-                        )?;
-                        check_sws_input_schema(&request.input, request.workflow_info)?;
-                    }
-                    fresh
-                } else {
-                    started
-                };
-
-                // Atomic debounce gate (issue #499): under this transaction's lock, a
-                // debounced workflow may only *attach* to a live (RUNNING/PAUSED) prior.
-                // Any other outcome — a fresh insert (`created`) or a non-live prior the
-                // signal can't land on — would be a fresh start, so reject it and let the
-                // caller route to debounce admission. Rolls back any fresh insert above.
-                if request.reject_fresh_if_debounced
-                    && (started.created || !matches!(started.state.as_str(), "RUNNING" | "PAUSED"))
-                {
-                    return Err(HarvestError::DebounceFreshStart {
-                        workflow_name: request.workflow_name.to_string(),
-                        workflow_id: request.workflow_id.to_string(),
-                    });
-                }
-
-                // Check signal payload cap here — after start/attach/AlreadyExists
-                // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
-                // rather than 413 PayloadTooLarge when the payload happens to be oversized.
-                // PAUSED counts as live: the signal will be staged and delivered on resume.
-                if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
-                    check_sws_payload_cap(
-                        &request.signal_payload,
-                        crate::error::PayloadKind::SignalPayload,
-                        request.max_signal_payload_bytes,
-                        request.workflow_name,
-                    )?;
-                }
-
-                let signal_delivered = if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
-                    stage_signal_with_idempotency(
-                        conn,
-                        started.exec_id,
-                        request.signal_name,
-                        request.signal_payload,
-                        request.idempotency_key.as_deref(),
-                    )
-                    .await?
-                } else {
-                    false
-                };
-
-                Ok((
-                    SignalWithStartOutcome {
-                        exec_id: started.exec_id,
-                        workflow_name: started.workflow_name,
-                        workflow_id: started.workflow_id,
-                        state: started.state,
-                        started_fresh: started.created,
-                        signal_delivered,
-                    },
-                    deferred_starts,
-                    deferred_checks,
-                    cancel_metrics,
-                ))
+            // Atomic debounce gate (issue #499): under this transaction's lock, a
+            // debounced workflow may only *attach* to a live (RUNNING/PAUSED) prior.
+            // Any other outcome — a fresh insert (`created`) or a non-live prior the
+            // signal can't land on — would be a fresh start, so reject it and let the
+            // caller route to debounce admission. Rolls back any fresh insert above.
+            if request.reject_fresh_if_debounced
+                && (started.created || !matches!(started.state.as_str(), "RUNNING" | "PAUSED"))
+            {
+                return Err(HarvestError::DebounceFreshStart {
+                    workflow_name: request.workflow_name.to_string(),
+                    workflow_id: request.workflow_id.to_string(),
+                });
             }
-            .scope_boxed()
-        })
+
+            // Check signal payload cap here — after start/attach/AlreadyExists
+            // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
+            // rather than 413 PayloadTooLarge when the payload happens to be oversized.
+            // PAUSED counts as live: the signal will be staged and delivered on resume.
+            if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
+                check_sws_payload_cap(
+                    &request.signal_payload,
+                    crate::error::PayloadKind::SignalPayload,
+                    request.max_signal_payload_bytes,
+                    request.workflow_name,
+                )?;
+            }
+
+            let signal_delivered = if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
+                stage_signal_with_idempotency(
+                    conn,
+                    started.exec_id,
+                    request.signal_name,
+                    request.signal_payload,
+                    request.idempotency_key.as_deref(),
+                )
+                .await?
+            } else {
+                false
+            };
+
+            Ok((
+                SignalWithStartOutcome {
+                    exec_id: started.exec_id,
+                    workflow_name: started.workflow_name,
+                    workflow_id: started.workflow_id,
+                    state: started.state,
+                    started_fresh: started.created,
+                    signal_delivered,
+                },
+                deferred_starts,
+                deferred_checks,
+                cancel_metrics,
+            ))
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -4578,125 +4527,124 @@ pub async fn update_with_start_workflow_execution_with_metrics(
     // name (Codex P2; see `admit_update_event`), so the counter is labeled by
     // `workflow` + `queue` only.
     let queue_for_metric = request.queue_name.to_owned();
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             UpdateWithStartOutcome,
             Vec<DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
             Vec<(String, String)>,
-        ), HarvestError, _>(|conn| {
+        ), HarvestError, _>(async |conn| {
             let request = request;
-            async move {
-                let mut deferred_starts = Vec::new();
-                let mut deferred_checks = Vec::new();
-                let mut cancel_metrics = Vec::new();
+            let mut deferred_starts = Vec::new();
+            let mut deferred_checks = Vec::new();
+            let mut cancel_metrics = Vec::new();
 
-                // Cross-execution idempotency dedupe scoped to (workflow_name, workflow_id).
-                // When an idempotency key is provided we look up by the supplied update_id
-                // (callers should derive it deterministically from the key, e.g. UUIDv5).
-                if request.idempotency_key.is_some()
-                    && let Some(prior) = lookup_idempotent_update_dedupe(
-                        conn,
-                        request.workflow_name,
-                        request.workflow_id,
-                        &request.update_id,
-                    )
-                    .await?
-                {
-                    return Ok((
-                        UpdateWithStartOutcome {
-                            exec_id: prior.exec_id,
-                            workflow_name: prior.workflow_name,
-                            workflow_id: prior.workflow_id,
-                            state: prior.state,
-                            started_fresh: false,
-                            update_id: request.update_id,
-                            update_admitted: false,
-                        },
-                        deferred_starts,
-                        deferred_checks,
-                        cancel_metrics,
-                    ));
-                }
+            // Cross-execution idempotency dedupe scoped to (workflow_name, workflow_id).
+            // When an idempotency key is provided we look up by the supplied update_id
+            // (callers should derive it deterministically from the key, e.g. UUIDv5).
+            if request.idempotency_key.is_some()
+                && let Some(prior) = lookup_idempotent_update_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    &request.update_id,
+                )
+                .await?
+            {
+                return Ok((
+                    UpdateWithStartOutcome {
+                        exec_id: prior.exec_id,
+                        workflow_name: prior.workflow_name,
+                        workflow_id: prior.workflow_id,
+                        state: prior.state,
+                        started_fresh: false,
+                        update_id: request.update_id,
+                        update_admitted: false,
+                    },
+                    deferred_starts,
+                    deferred_checks,
+                    cancel_metrics,
+                ));
+            }
 
-                // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
-                // when the prior run is terminal so the update always lands on a live
-                // execution (mirrors the signal-with-start "no signal dropped" invariant).
-                // For a debounced workflow, skip the upgrade: we must not escalate a
-                // terminal prior to a fresh start here — the reject check below routes it
-                // to debounce admission instead.
-                let effective_policy = if request.reject_fresh_if_debounced {
-                    request.reuse_policy
-                } else {
-                    resolve_effective_signal_with_start_policy(
-                        conn,
-                        request.workflow_name,
-                        request.workflow_id,
-                        request.reuse_policy,
-                    )
-                    .await?
+            // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
+            // when the prior run is terminal so the update always lands on a live
+            // execution (mirrors the signal-with-start "no signal dropped" invariant).
+            // For a debounced workflow, skip the upgrade: we must not escalate a
+            // terminal prior to a fresh start here — the reject check below routes it
+            // to debounce admission instead.
+            let effective_policy = if request.reject_fresh_if_debounced {
+                request.reuse_policy
+            } else {
+                resolve_effective_signal_with_start_policy(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    request.reuse_policy,
+                )
+                .await?
+            };
+
+            let build_start_request =
+                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
+                    workflow_name: request.workflow_name,
+                    workflow_id: request.workflow_id,
+                    exec_id,
+                    input: request.input.clone(),
+                    parent_id: request.parent_id,
+                    queue_name: request.queue_name,
+                    execution_timeout: request.execution_timeout,
+                    memo: request.memo.clone(),
+                    search_attrs: request.search_attrs.clone(),
+                    reuse_policy: policy,
+                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                    trace_context: request.trace_context.clone(),
+                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                    // Chain-scoped lifetime cap (issue #617): forward the
+                    // request's fresh-origin chain cap + fleet-wide ceiling.
+                    // A signal-/update-with-start never inherits a chain
+                    // deadline — it always begins a fresh chain origin.
+                    chain_execution_timeout: request.chain_execution_timeout,
+                    max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
+                    inherited_chain_deadline_at: None,
+                    concurrency_key: request.concurrency_key.clone(),
+                    concurrency_limit: request.concurrency_limit,
+                    priority: Priority::default(),
+                    max_workflow_input_bytes: 0,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
+                    owner: request.owner,
+                    runbook_url: request.runbook_url,
+                    severity: request.severity,
+                    context_headers: request.context_headers.clone(),
+                    sla: request.sla,
+                    schedule_id: None,
+                    scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: request
+                        .workflow_retry_policy
+                        .clone()
+                        .and_then(|v| serde_json::from_value(v).ok()),
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
+                    origin: None,
+                    completion_callbacks: None,
+                    start_source: crate::types::StartSource::UpdateWithStart,
+                    start_source_ref: request
+                        .idempotency_key
+                        .as_deref()
+                        .or(Some(request.workflow_id)),
+                    started_by: None,
                 };
 
-                let build_start_request =
-                    |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
-                        workflow_name: request.workflow_name,
-                        workflow_id: request.workflow_id,
-                        exec_id,
-                        input: request.input.clone(),
-                        parent_id: request.parent_id,
-                        queue_name: request.queue_name,
-                        execution_timeout: request.execution_timeout,
-                        memo: request.memo.clone(),
-                        search_attrs: request.search_attrs.clone(),
-                        reuse_policy: policy,
-                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: request.trace_context.clone(),
-                        max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                        // Chain-scoped lifetime cap (issue #617): forward the
-                        // request's fresh-origin chain cap + fleet-wide ceiling.
-                        // A signal-/update-with-start never inherits a chain
-                        // deadline — it always begins a fresh chain origin.
-                        chain_execution_timeout: request.chain_execution_timeout,
-                        max_workflow_chain_timeout_ceiling: request
-                            .max_workflow_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: request.concurrency_key.clone(),
-                        concurrency_limit: request.concurrency_limit,
-                        priority: Priority::default(),
-                        max_workflow_input_bytes: 0,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
-                        owner: request.owner,
-                        runbook_url: request.runbook_url,
-                        severity: request.severity,
-                        context_headers: request.context_headers.clone(),
-                        sla: request.sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
-                        workflow_retry_policy: request
-                            .workflow_retry_policy
-                            .clone()
-                            .and_then(|v| serde_json::from_value(v).ok()),
-                        retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
-                        origin: None,
-                        completion_callbacks: None,
-                        start_source: crate::types::StartSource::UpdateWithStart,
-                        start_source_ref: request
-                            .idempotency_key
-                            .as_deref()
-                            .or(Some(request.workflow_id)),
-                        started_by: None,
-                    };
-
-                // Debounced workflow: route through the no-spawn collect path with
-                // reject_fresh so a fresh start (incl. TerminateIfRunning cancel+replace)
-                // rolls back via DebounceFreshStart without cancelling/spawning before
-                // the rejection (issue #499). Attach returns the existing live run.
-                let started = if request.reject_fresh_if_debounced {
-                    let (s, mut deferred, mut checks, mut metrics_list) = start_or_load_workflow_execution_collect(
+            // Debounced workflow: route through the no-spawn collect path with
+            // reject_fresh so a fresh start (incl. TerminateIfRunning cancel+replace)
+            // rolls back via DebounceFreshStart without cancelling/spawning before
+            // the rejection (issue #499). Attach returns the existing live run.
+            let started = if request.reject_fresh_if_debounced {
+                let (s, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
                         conn,
                         build_start_request(request.exec_id, effective_policy),
                         true,
@@ -4705,12 +4653,13 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         None,
                     )
                     .await?;
-                    deferred_starts.append(&mut deferred);
-                    deferred_checks.append(&mut checks);
-                    cancel_metrics.append(&mut metrics_list);
-                    s
-                } else {
-                    let (s, mut deferred, mut checks, mut metrics_list) = start_or_load_workflow_execution_collect(
+                deferred_starts.append(&mut deferred);
+                deferred_checks.append(&mut checks);
+                cancel_metrics.append(&mut metrics_list);
+                s
+            } else {
+                let (s, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
                         conn,
                         build_start_request(request.exec_id, effective_policy),
                         true,
@@ -4719,14 +4668,54 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         gate,
                     )
                     .await?;
-                    deferred_starts.append(&mut deferred);
-                    deferred_checks.append(&mut checks);
-                    cancel_metrics.append(&mut metrics_list);
-                    s
-                };
+                deferred_starts.append(&mut deferred);
+                deferred_checks.append(&mut checks);
+                cancel_metrics.append(&mut metrics_list);
+                s
+            };
 
-                // Enforce workflow input cap on fresh start.
-                if started.created {
+            // Enforce workflow input cap on fresh start.
+            if started.created {
+                check_sws_payload_cap(
+                    &request.input,
+                    crate::error::PayloadKind::WorkflowInput,
+                    request.max_workflow_input_bytes,
+                    request.workflow_name,
+                )?;
+            }
+
+            // TOCTOU guard: if a concurrent transaction completed the run between
+            // the policy resolver's lock and our start, escalate so the update lands.
+            // SUSPENDED is treated as RUNNING here (not a real DB state today, but
+            // defensive). PAUSED is a non-terminal active state; the update will be
+            // rejected by admit_update_event below (WorkflowPaused), rolling back.
+            let started = if !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED")
+                // Debounced workflow: never escalate a terminal prior to a fresh
+                // start here — route it to debounce admission via the check below.
+                && !request.reject_fresh_if_debounced
+                && matches!(
+                    request.reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                ) {
+                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
+                let (fresh, mut deferred, mut checks, mut metrics_list) =
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        build_start_request(
+                            fresh_exec_id,
+                            WorkflowIdReusePolicy::TerminateIfRunning,
+                        ),
+                        true,
+                        false,
+                        metrics,
+                        gate,
+                    )
+                    .await?;
+                deferred_starts.append(&mut deferred);
+                deferred_checks.append(&mut checks);
+                cancel_metrics.append(&mut metrics_list);
+                if fresh.created {
                     check_sws_payload_cap(
                         &request.input,
                         crate::error::PayloadKind::WorkflowInput,
@@ -4734,137 +4723,99 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         request.workflow_name,
                     )?;
                 }
+                fresh
+            } else {
+                started
+            };
 
-                // TOCTOU guard: if a concurrent transaction completed the run between
-                // the policy resolver's lock and our start, escalate so the update lands.
-                // SUSPENDED is treated as RUNNING here (not a real DB state today, but
-                // defensive). PAUSED is a non-terminal active state; the update will be
-                // rejected by admit_update_event below (WorkflowPaused), rolling back.
-                let started = if !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED")
-                    // Debounced workflow: never escalate a terminal prior to a fresh
-                    // start here — route it to debounce admission via the check below.
-                    && !request.reject_fresh_if_debounced
-                    && matches!(
-                        request.reuse_policy,
-                        WorkflowIdReusePolicy::AllowDuplicate
-                            | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                    ) {
-                    let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                    let (fresh, mut deferred, mut checks, mut metrics_list) = start_or_load_workflow_execution_collect(
-                        conn,
-                        build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
-                        true,
-                        false,
-                        metrics,
-                        gate,
-                    )
-                    .await?;
-                    deferred_starts.append(&mut deferred);
-                    deferred_checks.append(&mut checks);
-                    cancel_metrics.append(&mut metrics_list);
-                    if fresh.created {
-                        check_sws_payload_cap(
-                            &request.input,
-                            crate::error::PayloadKind::WorkflowInput,
-                            request.max_workflow_input_bytes,
-                            request.workflow_name,
-                        )?;
-                    }
-                    fresh
-                } else {
-                    started
-                };
+            // Atomic debounce gate (issue #499): a debounced workflow may only
+            // *attach* to a live (RUNNING/SUSPENDED/PAUSED) prior. A fresh insert
+            // (`created`) or a non-live prior would be a fresh start — reject and let
+            // the caller route to debounce admission. Rolls back any fresh insert.
+            if request.reject_fresh_if_debounced
+                && (started.created
+                    || !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED"))
+            {
+                return Err(HarvestError::DebounceFreshStart {
+                    workflow_name: request.workflow_name.to_string(),
+                    workflow_id: request.workflow_id.to_string(),
+                });
+            }
 
-                // Atomic debounce gate (issue #499): a debounced workflow may only
-                // *attach* to a live (RUNNING/SUSPENDED/PAUSED) prior. A fresh insert
-                // (`created`) or a non-live prior would be a fresh start — reject and let
-                // the caller route to debounce admission. Rolls back any fresh insert.
-                if request.reject_fresh_if_debounced
-                    && (started.created
-                        || !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED"))
-                {
-                    return Err(HarvestError::DebounceFreshStart {
-                        workflow_name: request.workflow_name.to_string(),
-                        workflow_id: request.workflow_id.to_string(),
-                    });
-                }
-
-                // Post-lock idempotency re-check: two concurrent calls with the same
-                // idempotency_key may both pass the early dedupe query (which runs before
-                // the execution row lock is acquired). After the lock is held, any prior
-                // admission committed by a racing transaction is now visible — re-check so
-                // the loser returns the cached outcome rather than admitting a second time.
-                if request.idempotency_key.is_some()
-                    && let Some(prior) = lookup_idempotent_update_dedupe(
-                        conn,
-                        request.workflow_name,
-                        request.workflow_id,
-                        &request.update_id,
-                    )
-                    .await?
-                {
-                    return Ok((
-                        UpdateWithStartOutcome {
-                            exec_id: prior.exec_id,
-                            workflow_name: prior.workflow_name,
-                            workflow_id: prior.workflow_id,
-                            state: prior.state,
-                            started_fresh: false,
-                            update_id: request.update_id,
-                            update_admitted: false,
-                        },
-                        deferred_starts,
-                        deferred_checks,
-                        cancel_metrics,
-                    ));
-                }
-
-                // Admit the update against the resolved execution.
-                //
-                // `admit_update_event` acquires a FOR UPDATE row lock and rejects:
-                //   - PAUSED   → HarvestError::WorkflowPaused (rolls back entire tx)
-                //   - non-RUNNING → HarvestError::UpdateRejected
-                //
-                // On fresh start the execution is RUNNING so admission succeeds.
-                // The admitted update is part of the same outer transaction as the
-                // WorkflowStarted event, so a crash never leaves a half-started
-                // execution with no admitted update.
-                // Pass `None`: this admission is part of the outer transaction,
-                // so update.admitted (issue #684) is emitted post-outer-commit
-                // below (gated on `outcome.update_admitted`) rather than at the
-                // inner savepoint, so a later outer rollback never over-counts.
-                store::admit_update_event(
+            // Post-lock idempotency re-check: two concurrent calls with the same
+            // idempotency_key may both pass the early dedupe query (which runs before
+            // the execution row lock is acquired). After the lock is held, any prior
+            // admission committed by a racing transaction is now visible — re-check so
+            // the loser returns the cached outcome rather than admitting a second time.
+            if request.idempotency_key.is_some()
+                && let Some(prior) = lookup_idempotent_update_dedupe(
                     conn,
-                    started.exec_id,
-                    request.update_id,
-                    request.update_name.clone(),
-                    request.update_args.clone(),
-                    None,
+                    request.workflow_name,
+                    request.workflow_id,
+                    &request.update_id,
                 )
-                .await?;
-
-                // Wake the workflow task. For fresh starts, `start_or_load_workflow_execution`
-                // already inserted a task queue row; wake_workflow_task is idempotent
-                // (it updates the wakeup timestamp) and harmless to call again.
-                queue::wake_workflow_task(conn, started.exec_id).await?;
-
-                Ok((
+                .await?
+            {
+                return Ok((
                     UpdateWithStartOutcome {
-                        exec_id: started.exec_id,
-                        workflow_name: started.workflow_name,
-                        workflow_id: started.workflow_id,
-                        state: started.state,
-                        started_fresh: started.created,
+                        exec_id: prior.exec_id,
+                        workflow_name: prior.workflow_name,
+                        workflow_id: prior.workflow_id,
+                        state: prior.state,
+                        started_fresh: false,
                         update_id: request.update_id,
-                        update_admitted: true,
+                        update_admitted: false,
                     },
                     deferred_starts,
                     deferred_checks,
                     cancel_metrics,
-                ))
+                ));
             }
-            .scope_boxed()
-        })
+
+            // Admit the update against the resolved execution.
+            //
+            // `admit_update_event` acquires a FOR UPDATE row lock and rejects:
+            //   - PAUSED   → HarvestError::WorkflowPaused (rolls back entire tx)
+            //   - non-RUNNING → HarvestError::UpdateRejected
+            //
+            // On fresh start the execution is RUNNING so admission succeeds.
+            // The admitted update is part of the same outer transaction as the
+            // WorkflowStarted event, so a crash never leaves a half-started
+            // execution with no admitted update.
+            // Pass `None`: this admission is part of the outer transaction,
+            // so update.admitted (issue #684) is emitted post-outer-commit
+            // below (gated on `outcome.update_admitted`) rather than at the
+            // inner savepoint, so a later outer rollback never over-counts.
+            store::admit_update_event(
+                conn,
+                started.exec_id,
+                request.update_id,
+                request.update_name.clone(),
+                request.update_args.clone(),
+                None,
+            )
+            .await?;
+
+            // Wake the workflow task. For fresh starts, `start_or_load_workflow_execution`
+            // already inserted a task queue row; wake_workflow_task is idempotent
+            // (it updates the wakeup timestamp) and harmless to call again.
+            queue::wake_workflow_task(conn, started.exec_id).await?;
+
+            Ok((
+                UpdateWithStartOutcome {
+                    exec_id: started.exec_id,
+                    workflow_name: started.workflow_name,
+                    workflow_id: started.workflow_id,
+                    state: started.state,
+                    started_fresh: started.created,
+                    update_id: request.update_id,
+                    update_admitted: true,
+                },
+                deferred_starts,
+                deferred_checks,
+                cancel_metrics,
+            ))
+        }))
         .await?;
 
     for start in deferred_starts {

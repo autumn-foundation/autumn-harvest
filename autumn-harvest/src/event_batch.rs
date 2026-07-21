@@ -196,169 +196,165 @@ pub async fn admit_batched_start(
     let payload = params.payload;
     let max_size = params.max_size;
 
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
-        .transaction::<(
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
             BatchAdmitOutcome,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
             Vec<(String, String)>,
-        ), HarvestError, _>(|conn| {
-            Box::pin(async move {
-                let row: UpsertBatchRow = diesel::sql_query(sql)
-                    .bind::<diesel::sql_types::Uuid, _>(new_id)
-                    .bind::<diesel::sql_types::Text, _>(&workflow_name)
-                    .bind::<diesel::sql_types::Text, _>(&batch_key)
-                    .bind::<diesel::sql_types::Text, _>(&workflow_id)
-                    .bind::<diesel::sql_types::Text, _>(&queue_name)
-                    .bind::<diesel::sql_types::Jsonb, _>(payload)
-                    .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
-                    .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
-                    .bind::<diesel::sql_types::Integer, _>(max_size as i32)
-                    .bind::<diesel::sql_types::Integer, _>(shard_id)
-                    .get_result(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+        ), HarvestError, _>(async |conn| {
+            let row: UpsertBatchRow = diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Uuid, _>(new_id)
+                .bind::<diesel::sql_types::Text, _>(&workflow_name)
+                .bind::<diesel::sql_types::Text, _>(&batch_key)
+                .bind::<diesel::sql_types::Text, _>(&workflow_id)
+                .bind::<diesel::sql_types::Text, _>(&queue_name)
+                .bind::<diesel::sql_types::Jsonb, _>(payload)
+                .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
+                .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
+                .bind::<diesel::sql_types::Integer, _>(max_size as i32)
+                .bind::<diesel::sql_types::Integer, _>(shard_id)
+                .get_result(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                let opts: DebounceStartOptions =
-                    serde_json::from_value(row.start_options.clone()).unwrap_or_default();
+            let opts: DebounceStartOptions =
+                serde_json::from_value(row.start_options.clone()).unwrap_or_default();
 
-                let max_allowed_bytes = opts.max_workflow_input_bytes.unwrap_or(10 * 1024 * 1024);
-                if u64::from(row.buffered_bytes.cast_unsigned()) > max_allowed_bytes {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: crate::error::PayloadKind::WorkflowInput,
-                        observed_bytes: row.buffered_bytes as u64,
-                        cap_bytes: max_allowed_bytes,
-                        workflow_type: workflow_name,
-                        activity_name: None,
-                    });
-                }
+            let max_allowed_bytes = opts.max_workflow_input_bytes.unwrap_or(10 * 1024 * 1024);
+            if u64::from(row.buffered_bytes.cast_unsigned()) > max_allowed_bytes {
+                return Err(HarvestError::PayloadTooLarge {
+                    kind: crate::error::PayloadKind::WorkflowInput,
+                    observed_bytes: row.buffered_bytes as u64,
+                    cap_bytes: max_allowed_bytes,
+                    workflow_type: workflow_name,
+                    activity_name: None,
+                });
+            }
 
-                let is_flushed = row.current_size >= row.max_size;
-                let (flushed_execution_id, pending_deferred, deferred_checks, cancel_metrics) =
-                    if is_flushed {
-                        let exec_id =
-                            ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
-                        let reuse_policy = opts
-                            .reuse_policy
-                            .as_deref()
-                            .and_then(parse_reuse_policy)
-                            .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
+            let is_flushed = row.current_size >= row.max_size;
+            let (flushed_execution_id, pending_deferred, deferred_checks, cancel_metrics) =
+                if is_flushed {
+                    let exec_id =
+                        ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
+                    let reuse_policy = opts
+                        .reuse_policy
+                        .as_deref()
+                        .and_then(parse_reuse_policy)
+                        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
 
-                        let execution_timeout = opts
-                            .execution_timeout_secs
-                            .and_then(chrono::Duration::try_seconds);
-                        let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-                        let max_execution_timeout_ceiling = opts
-                            .max_execution_timeout_ceiling_secs
-                            .and_then(chrono::Duration::try_seconds);
-                        // Chain-scoped lifetime cap captured at admission (#617).
-                        let chain_execution_timeout = opts
-                            .chain_execution_timeout_secs
-                            .and_then(chrono::Duration::try_seconds);
-                        let max_workflow_chain_timeout_ceiling = opts
-                            .max_workflow_chain_timeout_ceiling_secs
-                            .and_then(chrono::Duration::try_seconds);
-                        let priority = opts
-                            .priority
-                            .and_then(crate::types::Priority::from_i32)
-                            .unwrap_or_default();
+                    let execution_timeout = opts
+                        .execution_timeout_secs
+                        .and_then(chrono::Duration::try_seconds);
+                    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
+                    let max_execution_timeout_ceiling = opts
+                        .max_execution_timeout_ceiling_secs
+                        .and_then(chrono::Duration::try_seconds);
+                    // Chain-scoped lifetime cap captured at admission (#617).
+                    let chain_execution_timeout = opts
+                        .chain_execution_timeout_secs
+                        .and_then(chrono::Duration::try_seconds);
+                    let max_workflow_chain_timeout_ceiling = opts
+                        .max_workflow_chain_timeout_ceiling_secs
+                        .and_then(chrono::Duration::try_seconds);
+                    let priority = opts
+                        .priority
+                        .and_then(crate::types::Priority::from_i32)
+                        .unwrap_or_default();
 
-                        // Restore the provenance captured at admission (#740),
-                        // defaulting to `Batch` for a pre-#740 row.
-                        let batch_start_source = opts.start_source.as_deref().map_or(
-                            crate::types::StartSource::Batch,
-                            crate::types::StartSource::from_str,
-                        );
-                        let batch_start_source_ref = opts.start_source_ref.clone();
-                        let batch_started_by = opts.started_by.clone();
+                    // Restore the provenance captured at admission (#740),
+                    // defaulting to `Batch` for a pre-#740 row.
+                    let batch_start_source = opts.start_source.as_deref().map_or(
+                        crate::types::StartSource::Batch,
+                        crate::types::StartSource::from_str,
+                    );
+                    let batch_start_source_ref = opts.start_source_ref.clone();
+                    let batch_started_by = opts.started_by.clone();
 
-                        let params = crate::execution::StartWorkflowParams {
-                            workflow_name: &row.workflow_name,
-                            workflow_id: &row.workflow_id,
-                            exec_id,
-                            input: row
-                                .buffered_payloads
-                                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-                            parent_id: None,
-                            queue_name: &row.queue_name,
-                            execution_timeout,
-                            memo: opts.memo,
-                            search_attrs: opts.search_attrs,
-                            reuse_policy,
-                            conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                            trace_context: opts.trace_context,
-                            max_execution_timeout_ceiling,
-                            chain_execution_timeout,
-                            max_workflow_chain_timeout_ceiling,
-                            inherited_chain_deadline_at: None,
-                            concurrency_key: opts.concurrency_key,
-                            concurrency_limit: opts.concurrency_limit,
-                            priority,
-                            max_workflow_input_bytes: opts
-                                .max_workflow_input_bytes
-                                .unwrap_or(u64::MAX),
-                            start_at: None,
-                            delay: None,
-                            max_workflow_start_delay: None,
-                            owner: opts.owner.as_deref(),
-                            runbook_url: opts.runbook_url.as_deref(),
-                            severity: opts.severity.as_deref(),
-                            context_headers: opts.context_headers,
-                            sla,
-                            schedule_id: None,
-                            scheduled_for: None,
-                            workflow_attempt: 1,
-                            workflow_retry_policy: opts
-                                .workflow_retry_policy
-                                .clone()
-                                .and_then(|v| serde_json::from_value(v).ok()),
-                            retry_of_exec_id: None,
-                            max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
-                            origin: None,
-                            completion_callbacks: opts.completion_callbacks.clone(),
-                            start_source: batch_start_source,
-                            start_source_ref: batch_start_source_ref.as_deref(),
-                            started_by: batch_started_by.as_deref(),
-                        };
-
-                        let (started, deferred_starts, deferred_checks, cancel_metrics) =
-                            crate::execution::start_or_load_workflow_execution_collect(
-                                conn, params, true, false, None, None,
-                            )
-                            .await?;
-
-                        diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")
-                            .bind::<diesel::sql_types::Uuid, _>(row.id)
-                            .execute(conn)
-                            .await
-                            .map_err(crate::error::database_error)?;
-
-                        (
-                            Some(started.exec_id.to_string()),
-                            deferred_starts,
-                            deferred_checks,
-                            cancel_metrics,
-                        )
-                    } else {
-                        (None, Vec::new(), Vec::new(), Vec::new())
+                    let params = crate::execution::StartWorkflowParams {
+                        workflow_name: &row.workflow_name,
+                        workflow_id: &row.workflow_id,
+                        exec_id,
+                        input: row
+                            .buffered_payloads
+                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                        parent_id: None,
+                        queue_name: &row.queue_name,
+                        execution_timeout,
+                        memo: opts.memo,
+                        search_attrs: opts.search_attrs,
+                        reuse_policy,
+                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                        trace_context: opts.trace_context,
+                        max_execution_timeout_ceiling,
+                        chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling,
+                        inherited_chain_deadline_at: None,
+                        concurrency_key: opts.concurrency_key,
+                        concurrency_limit: opts.concurrency_limit,
+                        priority,
+                        max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
+                        owner: opts.owner.as_deref(),
+                        runbook_url: opts.runbook_url.as_deref(),
+                        severity: opts.severity.as_deref(),
+                        context_headers: opts.context_headers,
+                        sla,
+                        schedule_id: None,
+                        scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: opts
+                            .workflow_retry_policy
+                            .clone()
+                            .and_then(|v| serde_json::from_value(v).ok()),
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
+                        origin: None,
+                        completion_callbacks: opts.completion_callbacks.clone(),
+                        start_source: batch_start_source,
+                        start_source_ref: batch_start_source_ref.as_deref(),
+                        started_by: batch_started_by.as_deref(),
                     };
 
-                Ok((
-                    BatchAdmitOutcome {
-                        batch_key,
-                        workflow_id: row.workflow_id,
-                        fire_at: row.fire_at,
-                        pending_count: row.current_size,
-                        max_size: row.max_size.cast_unsigned() as usize,
-                        is_flushed,
-                        flushed_execution_id,
-                    },
-                    pending_deferred,
-                    deferred_checks,
-                    cancel_metrics,
-                ))
-            })
-        })
+                    let (started, deferred_starts, deferred_checks, cancel_metrics) =
+                        crate::execution::start_or_load_workflow_execution_collect(
+                            conn, params, true, false, None, None,
+                        )
+                        .await?;
+
+                    diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")
+                        .bind::<diesel::sql_types::Uuid, _>(row.id)
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
+                    (
+                        Some(started.exec_id.to_string()),
+                        deferred_starts,
+                        deferred_checks,
+                        cancel_metrics,
+                    )
+                } else {
+                    (None, Vec::new(), Vec::new(), Vec::new())
+                };
+
+            Ok((
+                BatchAdmitOutcome {
+                    batch_key,
+                    workflow_id: row.workflow_id,
+                    fire_at: row.fire_at,
+                    pending_count: row.current_size,
+                    max_size: row.max_size.cast_unsigned() as usize,
+                    is_flushed,
+                    flushed_execution_id,
+                },
+                pending_deferred,
+                deferred_checks,
+                cancel_metrics,
+            ))
+        }))
         .await?;
 
     for check in &deferred_checks {
@@ -459,40 +455,37 @@ async fn fire_due_on_conn(
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
             Vec<(String, String)>,
-        )> = conn
-            .transaction(|conn| {
-                Box::pin(async move {
-                    let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
-                        diesel::sql_query(due_sql)
-                            .bind::<diesel::sql_types::Timestamptz, _>(now)
-                            .bind::<diesel::sql_types::BigInt, _>(1i64)
-                            .bind::<diesel::sql_types::Integer, _>(sid)
-                            .load(conn)
-                            .await
-                            .map_err(crate::error::database_error)?
-                    } else {
-                        diesel::sql_query(due_sql)
-                            .bind::<diesel::sql_types::Timestamptz, _>(now)
-                            .bind::<diesel::sql_types::BigInt, _>(1i64)
-                            .load(conn)
-                            .await
-                            .map_err(crate::error::database_error)?
-                    };
+        )> = Box::pin(conn.transaction(async |conn| {
+            let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
+                diesel::sql_query(due_sql)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::BigInt, _>(1i64)
+                    .bind::<diesel::sql_types::Integer, _>(sid)
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?
+            } else {
+                diesel::sql_query(due_sql)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::BigInt, _>(1i64)
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?
+            };
 
-                    if let Some(row) = due_rows.into_iter().next() {
-                        match fire_claimed_batch_row(conn, row).await {
-                            Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
-                                Ok(Some((exec_id, deferred, checks, cancel_metrics)))
-                            }
-                            Ok(None) => Ok(None),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok(None)
+            if let Some(row) = due_rows.into_iter().next() {
+                match fire_claimed_batch_row(conn, row).await {
+                    Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
+                        Ok(Some((exec_id, deferred, checks, cancel_metrics)))
                     }
-                })
-            })
-            .await?;
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            } else {
+                Ok(None)
+            }
+        }))
+        .await?;
 
         if let Some((exec_id, deferred, checks, cancel_metrics)) = processed {
             fired_ids.push(exec_id);

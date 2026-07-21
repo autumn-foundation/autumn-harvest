@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn-harvest"
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
@@ -19,7 +19,6 @@ db = [
     "dep:diesel",
     "dep:diesel-async",
     "dep:diesel_migrations",
-    "dep:scoped-futures",
     "dep:tokio-postgres",
 ]
 testing = []
@@ -38,7 +37,7 @@ schema = ["dep:schemars"]
 wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.4.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.5.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -61,7 +60,6 @@ deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
-scoped-futures = { version = "0.1", optional = true }
 # 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
 # downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
 tokio-postgres = { version = "0.7.18", optional = true }

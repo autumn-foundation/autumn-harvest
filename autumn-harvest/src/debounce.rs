@@ -417,41 +417,40 @@ pub async fn admit_debounced_start(
     let queue_name = params.queue_name;
     let shard_id = params.shard_id;
 
-    let txn = conn
-        .transaction::<DebounceAdmitOutcome, AdmitTxnErr, _>(|conn| {
-            Box::pin(async move {
-                let row: UpsertRow = diesel::sql_query(sql)
-                    .bind::<diesel::sql_types::Uuid, _>(new_id)
-                    .bind::<diesel::sql_types::Text, _>(workflow_name)
-                    .bind::<diesel::sql_types::Text, _>(debounce_key)
-                    .bind::<diesel::sql_types::Text, _>(workflow_id)
-                    .bind::<diesel::sql_types::Text, _>(queue_name)
-                    .bind::<diesel::sql_types::Jsonb, _>(last_input)
-                    .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
-                    .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
-                    .bind::<diesel::sql_types::Timestamptz, _>(max_fire_at)
-                    .bind::<diesel::sql_types::Integer, _>(shard_id)
-                    .get_result(conn)
-                    .await?;
+    let txn = Box::pin(
+        conn.transaction::<DebounceAdmitOutcome, AdmitTxnErr, _>(async |conn| {
+            let row: UpsertRow = diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Uuid, _>(new_id)
+                .bind::<diesel::sql_types::Text, _>(workflow_name)
+                .bind::<diesel::sql_types::Text, _>(debounce_key)
+                .bind::<diesel::sql_types::Text, _>(workflow_id)
+                .bind::<diesel::sql_types::Text, _>(queue_name)
+                .bind::<diesel::sql_types::Jsonb, _>(last_input)
+                .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
+                .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(max_fire_at)
+                .bind::<diesel::sql_types::Integer, _>(shard_id)
+                .get_result(conn)
+                .await?;
 
-                // Roll back: a gated admission must not leave a committed row. The
-                // upsert held a row lock for the duration of this transaction, so a
-                // concurrent admission for the same key serialized behind it and
-                // never observed the rolled-back row.
-                if gate_active {
-                    return Err(AdmitTxnErr::Gated);
-                }
+            // Roll back: a gated admission must not leave a committed row. The
+            // upsert held a row lock for the duration of this transaction, so a
+            // concurrent admission for the same key serialized behind it and
+            // never observed the rolled-back row.
+            if gate_active {
+                return Err(AdmitTxnErr::Gated);
+            }
 
-                Ok(DebounceAdmitOutcome {
-                    debounce_key: row.debounce_key,
-                    workflow_id: row.workflow_id,
-                    fire_at: row.effective_fire_at,
-                    pending_count: row.pending_count,
-                    is_new_record: row.is_new_record,
-                })
+            Ok(DebounceAdmitOutcome {
+                debounce_key: row.debounce_key,
+                workflow_id: row.workflow_id,
+                fire_at: row.effective_fire_at,
+                pending_count: row.pending_count,
+                is_new_record: row.is_new_record,
             })
-        })
-        .await;
+        }),
+    )
+    .await;
 
     match txn {
         Ok(outcome) => Ok(Some(outcome)),
@@ -570,37 +569,36 @@ async fn fire_due_on_conn(
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<FiredDebounce> = conn
-        .transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(|conn| {
-            Box::pin(async move {
-                let now = Utc::now();
-                let due_sql = "
-                    SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
-                           last_input, start_options, shard_id
-                    FROM harvest_debounce
-                    WHERE effective_fire_at <= $1
-                    ORDER BY effective_fire_at ASC
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                ";
+    let fired: Vec<FiredDebounce> = Box::pin(
+        conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(async |conn| {
+            let now = Utc::now();
+            let due_sql = "
+                SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
+                       last_input, start_options, shard_id
+                FROM harvest_debounce
+                WHERE effective_fire_at <= $1
+                ORDER BY effective_fire_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            ";
 
-                let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                    .bind::<diesel::sql_types::Timestamptz, _>(now)
-                    .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
-                    .load(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+            let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                .bind::<diesel::sql_types::Timestamptz, _>(now)
+                .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                let mut results = Vec::with_capacity(due_rows.len());
-                for row in due_rows {
-                    if let Some(item) = fire_claimed_debounce_row(conn, row).await? {
-                        results.push(item);
-                    }
+            let mut results = Vec::with_capacity(due_rows.len());
+            for row in due_rows {
+                if let Some(item) = fire_claimed_debounce_row(conn, row).await? {
+                    results.push(item);
                 }
-                Ok(results)
-            })
-        })
-        .await?;
+            }
+            Ok(results)
+        }),
+    )
+    .await?;
 
     Ok(fired)
 }
