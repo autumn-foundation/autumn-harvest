@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-autumn-harvest = { version = "0.4.0", path = "../../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.5.0", path = "../../autumn-harvest", features = ["db", "testing"] }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

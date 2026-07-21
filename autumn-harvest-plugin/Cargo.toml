@@ -26,7 +26,7 @@ metrics = []
 
 
 [dependencies]
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", features = ["db", "testing"] }
 autumn-web = "0.5"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -54,7 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [dev-dependencies]
 autumn-web = { version = "0.5", features = ["test-support", "mcp"] }
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
