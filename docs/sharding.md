@@ -157,6 +157,14 @@ Per-key **activity** rate-limit buckets (`dyn-rate:{key_expr}:{resolved}` in `ha
 
 ---
 
+## Durable mutex is shard-local (issue #691)
+
+The durable named mutex `ctx.mutex(key).acquire()` (the `harvest_mutex_locks` / `harvest_mutex_waiters` tables) is enforced **within a shard**, exactly the same scope as the per-key concurrency limits above. The lock table, the FIFO waiter queue, and the `pg_advisory_xact_lock` that serializes each acquire/release/reclaim all live on the workflow's own shard, so "at most one holder per key" holds only among executions that resolve to that shard.
+
+**Consequence**: two workflows that must serialize on a shared resource must land on the **same** shard for the mutex to actually serialize them. Route all contending executions for a given lock key to a single shard (see the concurrency routing guidance above) — e.g. derive the mutex key from the same field you shard on. Cross-shard global mutual exclusion is **out of scope** for the same Postgres-native reasons as cross-shard concurrency and rate limits.
+
+---
+
 ## Cross-shard keyset pagination for `GET /workflows`
 
 When `page_size` (or `cursor` / `order`) is present on a `GET /workflows` request, the engine performs a **k-way merge** across all shards so the caller sees a single globally-ordered result set without knowing which shard each execution lives on.

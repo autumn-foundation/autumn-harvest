@@ -2090,6 +2090,8 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",
         WorkflowCommand::CancelTimer { .. } => "CancelTimer",
+        WorkflowCommand::AcquireMutex { .. } => "AcquireMutex",
+        WorkflowCommand::ReleaseMutex { .. } => "ReleaseMutex",
     }
 }
 

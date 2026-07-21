@@ -2955,6 +2955,16 @@ pub struct WorkerConfig {
     ///
     /// Defaults to **1 hour**. Override via `with_default_debounce_max_wait`.
     pub default_debounce_max_wait: Duration,
+    /// Lease TTL for a held durable mutex (`ctx.mutex`, issue #691).
+    ///
+    /// The lease scanner reclaims a lock whose lease has elapsed; the holder's
+    /// own decision cycles renew it forward. Must exceed the worst-case
+    /// wall-clock time a workflow spends inside a single held critical section
+    /// (the interval between decision cycles that renew the lease) — see the
+    /// `mutex` module's lease contract.
+    ///
+    /// Defaults to **60 seconds**. Override via `with_mutex_lease_ttl`.
+    pub mutex_lease_ttl: Duration,
     /// Opt-in adaptive dispatch-slot tuner (issue #548).
     ///
     /// When `Some`, both dispatch semaphores (`max_concurrent_workflows` /
@@ -3017,6 +3027,7 @@ impl Default for WorkerConfig {
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
             default_debounce_max_wait: DEFAULT_DEBOUNCE_MAX_WAIT,
+            mutex_lease_ttl: crate::mutex::DEFAULT_MUTEX_LEASE_TTL,
             slot_tuner: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
@@ -3364,6 +3375,18 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_default_debounce_max_wait(mut self, max_wait: Duration) -> Self {
         self.default_debounce_max_wait = max_wait;
+        self
+    }
+
+    /// Override the lease TTL for held durable mutexes (`ctx.mutex`, issue #691).
+    ///
+    /// Must exceed the worst-case wall-clock time a workflow spends inside a
+    /// single held critical section (the interval between decision cycles that
+    /// renew the lease); too short a TTL lets the scanner reclaim a lock while
+    /// its holder is still mid-critical-section. Defaults to **60 seconds**.
+    #[must_use]
+    pub const fn with_mutex_lease_ttl(mut self, ttl: Duration) -> Self {
+        self.mutex_lease_ttl = ttl;
         self
     }
 

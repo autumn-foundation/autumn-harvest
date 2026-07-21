@@ -130,17 +130,30 @@ async fn run_workflow_handler_cycle(
         Ok(fut) => fut,
         Err(message) => return HandlerCycleResult::Panicked(message),
     };
-    match tokio::time::timeout(
-        SUSPENSION_TIMEOUT,
-        std::panic::AssertUnwindSafe(handler_fut).catch_unwind(),
-    )
-    .await
-    {
+    // Issue #691 (durable mutex) TIMEOUT-GUARD FIX — the borrow is load-bearing.
+    //
+    // `tokio::time::timeout(dur, fut)` OWNS `fut`; on timeout the `Timeout`
+    // future is consumed by the `.await` and drops `fut` (and any `MutexGuard`
+    // the workflow holds across the suspension) BEFORE the `Err(_elapsed)` arm
+    // runs — so setting `suspending` in that arm would run too late, the guard's
+    // `Drop` would see `suspending == false`, push a `ReleaseMutex`, and free the
+    // lock under the still-parked holder (a mutual-exclusion break after the very
+    // first suspension). Instead we pin the future and pass `&mut guarded` so the
+    // `Timeout` owns only the reference; on timeout the reference is dropped but
+    // `guarded` (owning the suspended future + guard) lives to this function's
+    // scope exit, dropping only AFTER `ctx.set_suspending(true)` has run. A guard
+    // dropped mid-poll or at genuine completion still sees `suspending == false`
+    // (never set on the `Ok(..)` arms) and releases normally.
+    let mut guarded = std::pin::pin!(std::panic::AssertUnwindSafe(handler_fut).catch_unwind());
+    match tokio::time::timeout(SUSPENSION_TIMEOUT, &mut guarded).await {
         Ok(Ok(result)) => HandlerCycleResult::Returned(result),
         Ok(Err(panic_payload)) => {
             HandlerCycleResult::Panicked(crate::error::panic_message(panic_payload))
         }
-        Err(_elapsed) => HandlerCycleResult::Suspended,
+        Err(_elapsed) => {
+            ctx.set_suspending(true);
+            HandlerCycleResult::Suspended
+        }
     }
 }
 
@@ -243,6 +256,14 @@ pub enum QueryReplayOutcome {
 ///   timer+signal race shape (issue #600) this is a pure, deterministic function
 ///   of already-resolved history (the winner is fixed by recorded order), so it
 ///   is re-emitted identically on every replay and carries no new information.
+/// - [`ReleaseMutex`](WorkflowCommand::ReleaseMutex): a durable mutex release
+///   (issue #691) is event-less bookkeeping — a dropped [`MutexGuard`] always
+///   pushes exactly one release, deterministically, and it appends nothing to
+///   `harvest_events`. Like `CancelRaceLosers` it is re-emitted identically on
+///   every replay (the guard reconstructs from the recorded `MutexGranted`
+///   anchor), so a mutex-holding workflow that completes/continues with the
+///   guard dropped must NOT be flagged as "new commands emitted beyond recorded
+///   history" on the strict/canary replay path.
 ///
 /// This is the **single source of truth** for two callers that must agree, so
 /// the command classification is never re-enumerated by hand:
@@ -264,6 +285,7 @@ pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ReleaseMutex { .. }
     )
 }
 

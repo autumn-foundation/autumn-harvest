@@ -349,6 +349,9 @@ metric is emitted in the source code.
 | `harvest.update.completed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateCompleted` (name resolved from the `UpdateAdmitted` events in history) (issue #684) |
 | `harvest.update.failed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateFailed` (issue #684) |
 | `harvest.update.duration` | Histogram | `worker.rs` — `emit_update_result_metrics`, alongside `harvest.update.completed`/`failed` on the **same** post-commit path (the terminal/suspend `Persisted` arm and the two inline external-signal branches). Wall-clock seconds from the recorded `UpdateAdmitted.timestamp` to the terminal recording (`Utc::now()` at emit, clamped so a clock-skew negative delta records `0`). Rejected updates are excluded (no handler runs); an update whose admit is not in the loaded history skips the sample (the counter still fires). Shares the completed/failed counters' delivery semantics — exactly-once on the happy path; a crash after the persist commit but before the post-commit emit drops the sample (never a double-count) (issue #781) |
+| `harvest.mutex.wait_duration` | Histogram | `worker.rs` — `persist_mutex_acquire_park`, on grant: wall-clock seconds a workflow waited to acquire a durable mutex, from request (enqueued as a FIFO waiter) to grant (issue #691) |
+| `harvest.mutex.held_duration` | Histogram | `worker.rs` — `process_mutex_releases_from_commands`, on release: wall-clock seconds a durable mutex was held, from grant (`MutexGranted.acquired_at`) to release (drop / explicit / terminal sweep / lease reclaim) (issue #691) |
+| `harvest.mutex.contention_depth` | Gauge | `worker.rs` — `persist_mutex_acquire_park`, at the moment a grant is made: the FIFO waiter-queue length for the key (number of workflows waiting on that mutex key) (issue #691) |
 
 ### Label sets
 
@@ -388,6 +391,9 @@ metric is emitted in the source code.
 | `harvest.update.completed` | `workflow`, `name` (update name — inherently bounded: a completed update always ran a real handler), `queue` |
 | `harvest.update.failed` | `workflow`, `name` (update name, bounded — an unregistered name's handler-not-found failure → `__unregistered__`; real handlers, declarative or imperative, keep their name), `queue` |
 | `harvest.update.duration` | `workflow`, `name` (update name — bounded exactly as `update.completed`/`failed`; unregistered → `__unregistered__`), `queue`, `outcome` (`completed\|failed` — bounded; rejected excluded) |
+| `harvest.mutex.wait_duration` | `workflow` — the lock key is high-cardinality (often tenant/entity input) and is deliberately **not** a metric label (ADR-0001 §7) |
+| `harvest.mutex.held_duration` | `workflow` — the lock key is deliberately **not** a label (ADR-0001 §7) |
+| `harvest.mutex.contention_depth` | `workflow` — the lock key is deliberately **not** a label (ADR-0001 §7) |
 | `harvest.completion_trigger.skipped` | `trigger` (trigger UUID — same precedent as `harvest.completion_trigger.fires`), `reason` (`condition_unmet\|condition_invalid`) |
 | `harvest.activity.panic` | `activity`, `queue` |
 | `harvest.workflow.panic` | `workflow`, `queue` |
@@ -472,6 +478,17 @@ rate(harvest_worker_tuner_decisions_total{decision!="hold"}[5m])
 
 # Effective schedule run rate (runs - skips)
 rate(harvest_schedule_runs_total[1h]) - rate(harvest_schedule_skipped_total[1h])
+
+# p99 durable-mutex acquire wait per workflow (issue #691) — how long
+# contenders queue before entering the critical section.
+histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_mutex_wait_duration_bucket[5m])))
+
+# p99 durable-mutex held duration per workflow — long holds serialize peers
+# and are the first thing to look at when acquire waits climb.
+histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_mutex_held_duration_bucket[5m])))
+
+# Live durable-mutex contention depth (FIFO waiter-queue length at last grant).
+harvest_mutex_contention_depth{workflow="apply_ledger_op"}
 ```
 
 ## Full importable dashboard pack

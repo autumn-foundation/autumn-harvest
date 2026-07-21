@@ -165,6 +165,8 @@ mod loom_sync;
 /// Enabled by the `metrics-rs` cargo feature.
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
+/// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
+pub mod mutex;
 pub mod payload_codec;
 pub mod payload_store;
 pub mod poison_pill;
@@ -297,9 +299,9 @@ pub use completion_trigger::{
 };
 pub use context::{
     ActivityContext, AutoHeartbeatGuard, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
-    DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder,
-    RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand,
-    WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
+    DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard,
+    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
+    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
     is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
@@ -369,6 +371,10 @@ pub use info::{
 pub use interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
 };
+pub use mutex::{
+    DEFAULT_MUTEX_LEASE_TTL, MutexGrantOutcome, MutexWakeTarget, effective_mutex_lease_ttl,
+    set_mutex_lease_ttl,
+};
 pub use payload_codec::{
     CodecError, IdentityCodec, LossyDecodeOutcome, PayloadCodec, PayloadCodecs,
     UNDECODABLE_MARKER_KEY, UNDECODABLE_REASON_CODEC_ERROR, UNDECODABLE_REASON_INVALID_BASE64,
@@ -386,7 +392,8 @@ pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
     ChildOrTimerMatch, DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher,
-    PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch, TimerFireMatch,
+    MutexGrantMatch, PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch,
+    TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{
