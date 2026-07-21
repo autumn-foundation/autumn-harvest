@@ -10,7 +10,7 @@ agent a workflow as a correlated set of MCP tools so it can **start** durable
 work, **watch** it, and **steer** it — without the work being tied to the
 agent's fragile, short-lived session.
 
-Built on autumn-web 0.5's MCP layer (autumn#1117 tool exposure, autumn#1118
+Built on autumn-web 0.6's MCP layer (autumn#1117 tool exposure, autumn#1118
 streaming): tools are served at `AppBuilder::mount_mcp("/mcp")` over
 Streamable-HTTP JSON-RPC, and `tools/call` replays an in-process HTTP request
 through the real, authenticated handler pipeline.
