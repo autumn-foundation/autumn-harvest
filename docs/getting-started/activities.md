@@ -58,6 +58,32 @@ async fn import_records(ctx: &ActivityContext, source_url: String) -> Result<u64
 }
 ```
 
+### Automatic liveness heartbeats (issue #682)
+
+If an activity only needs the *liveness* signal — not a progress checkpoint —
+and its own work makes it awkward to call `ctx.heartbeat()` on a regular cadence
+(a single long blocking call, a tight CPU loop), start a background auto-heartbeat
+ticker instead of hand-rolling one. It requires the activity to declare a
+`heartbeat_timeout`:
+
+```rust
+#[activity(start_to_close = "10m", heartbeat_timeout = "30s")]
+async fn transcode(ctx: &ActivityContext, job: Job) -> Result<(), String> {
+    // Pings every ~10 s until the guard drops at end of scope.
+    let _hb = ctx.start_auto_heartbeat(std::time::Duration::from_secs(10))
+        .map_err(|e| e.to_string())?;
+    // ... or ctx.start_auto_heartbeat_default() to derive the interval from
+    // heartbeat_timeout ...
+    run_long_blocking_work(&job).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+```
+
+`start_auto_heartbeat` returns a `#[must_use]` RAII `AutoHeartbeatGuard` — bind
+it to a named local (`let _hb = ...`); binding to `_` drops it immediately and
+stops the ticker. Manual `ctx.heartbeat(payload)` calls still work alongside it
+and take over the checkpoint payload.
+
 ## Cooperative cancellation
 
 When an operator calls `cancel_workflow_execution`, harvest:
@@ -134,3 +160,22 @@ from the perspective of the in-flight activity context — it is loaded once at
 dispatch time and held in memory for the duration of the attempt.  The cancel
 path clears `heartbeat_details` on the task row so that a *fresh* retry (on a
 new worker claim) starts clean.  No action is required from the activity author.
+
+## Cross-cutting behavior — activity interceptors (issue #680)
+
+To add behavior around **every** activity — structured logging, custom metrics,
+header propagation, input/output shaping, test fault-injection — without editing
+each `#[activity]` function, register an ordered interceptor chain on the builder
+instead:
+
+```rust
+HarvestBuilder::new()
+    .activity_interceptor(LoggingMetricsInterceptor)   // first registered = outermost
+    // ...
+```
+
+Each interceptor implements the `ActivityInterceptor` trait and calls
+`next.run(input).await` to proceed to the next interceptor (or the handler); not
+calling it short-circuits. Interceptors wrap both regular and local activities;
+an interceptor `Err`/panic is contained exactly like a handler failure. See
+`examples/activity_interceptor.rs`.

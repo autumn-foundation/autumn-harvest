@@ -74,3 +74,76 @@ the telemetry.md section below.
   `is_workflow_non_retryable()` all verified in source.
 
 <!-- Remaining per-file findings appended below as agent evidence is integrated. -->
+
+---
+
+## Batch 2 (this worker, continuing from 6e8b6262)
+
+### Mechanical stale-pattern sweep across ALL area 1+2 docs — CLEAN
+- `rate_limit_saturated` (#611 rename → `_exhausted`): **0 hits** in my docs.
+- Failed-child `HarvestError::ActivityFailed{child-workflow:..}` (#767): only 1 hit,
+  `typed-workflow-failures.md:74`, and it is the deliberate *pre-#767* behavior note in
+  the "Behavior change (upgrading)" section — **correct, no fix**.
+- pause/resume `409` (#609 → 200): **0 stale hits** in operations/management-api.
+- `autumn-web 0.5` prose (non-pin): **0 hits** (mcp-tools already fixed to 0.6 in the
+  prior commit).
+- `0.4.0` narrative: **0 hits** in these docs (the only 0.4 refs are the DEFERRED Cargo
+  pins, left untouched).
+
+### docs/getting-started/03-durable-timers.md — VERIFIED
+- `start_timer` → `TimerHandle`, `cancel`/`reset`/`await_fire`, `TimerOutcome::{Fired,Cancelled}`,
+  `sleep_until` all confirmed in `context.rs`. No fix.
+
+### docs/getting-started/04-signals.md — VERIFIED
+- `await_condition`/`await_condition_timeout` (context.rs:7007/7015),
+  `signal_external_workflow_with_idempotency` (7437), `idempotency_key()` (11563),
+  plugin `.signals`/`.queries`/`.updates` (plugin.rs:201/208/215),
+  `SignalHandlerInfo::with_arg_schema_fn`/`with_schemas`/`validate_arg` (info.rs) all
+  confirmed. `/workflows/registered/{name}/interface` (#610). No fix.
+
+### docs/getting-started/07-reliability-knobs.md — VERIFIED
+- `should_continue_as_new` (3503), `deadline` (3082), `time_until_deadline` (3135);
+  builder `with_default_activity_retry_policy`/`with_default_activity_start_to_close`,
+  `history_continue_as_new_deadline_fraction` (1688), `max_workflow_chain_timeout` (1754);
+  `patched`/`deprecate_patch`/`version`; `METRIC_WORKFLOW_CHAIN_TIMEOUT`
+  (`harvest.workflow.chain_timeout`, telemetry.rs:351); `harvest concurrency status` CLI.
+  All confirmed. No fix.
+
+### docs/getting-started/08-dags-and-schedules.md — VERIFIED
+- DAG signal gates (`signal_gate`/`signal_gate_with_timeout`/`GateTimeoutAction`, #746),
+  node input binding (`input_from`/`_all`/`_aliased`, #702), dynamic mapping, MCP
+  exposure, `#[dag(mcp)]`, carryover (`last_completion_result`/`last_error`, #488) all
+  present and source-consistent. No fix.
+  - **REVIEW (out of area/scope, noted for Area 3):** in-place schedule update
+    `PATCH /admin/schedules/{id}` (#771) is not mentioned; the chapter says "Resume by
+    patching it back to active" generically. That's a management-API/Area-3 concern.
+
+### docs/getting-started/10-operations.md — VERIFIED
+- `dlq bulk-discard --activity-name` / `bulk-replay` / `dlq_reason` facets (#613),
+  `worker drain-preview`/`drain`, `concurrency status` CLI all confirmed. #685 conflict
+  policies section accurate (admin-auth-iff-can-cancel, deferred-start 400). No fix.
+
+### docs/getting-started/11-testing.md — VERIFIED
+- `WorkflowReplayer`, `WorkflowTestEnv`, `TestRunOutcome::{final_now,elapsed}`,
+  `queue_signal`, virtual-clock contract table incl. `receive_signal_timeout`. No fix.
+  - **GAP (minor, not fixed):** #541 "WorkflowSimulator honors RetryPolicy" — the
+    simulator retry-honoring detail isn't surfaced here; judged not a "reader expects it"
+    gap in the WorkflowTestEnv/Replayer chapter. Left.
+
+### docs/getting-started/12-webhooks.md — VERIFIED
+- `#[webhook(path=, starts=/signals=+signal_name=)]`, `webhooks![]`, `WebhookCtx`,
+  `.webhooks(...)` plugin method, response-shape table, `harvest.webhook.received/rejected`,
+  audit op `webhook.trigger`, #808 upstream-`Idempotency-Key`-not-a-start-key note. Accurate.
+  - **REVIEW:** `autumn_web::webhook::SignedWebhook` + `[security.webhooks]` are
+    autumn-web-0.6-surface *type/config path* references (not version strings). Left as-is;
+    a later phase verifies against the autumn-web-0.6 branch.
+
+### docs/getting-started/activities.md — FIX (coverage gaps closed)
+- **GAP → FIX:** added an "Automatic liveness heartbeats" callout to the Heartbeating
+  section pointing at `ctx.start_auto_heartbeat(interval)` / `start_auto_heartbeat_default()`
+  → `AutoHeartbeatGuard` (issue #682, confirmed context.rs:11838/11926). Requires
+  `heartbeat_timeout`; `#[must_use]` RAII guard.
+- **GAP → FIX:** added a "Cross-cutting behavior — activity interceptors" section pointing
+  at `HarvestBuilder::activity_interceptor(impl ActivityInterceptor)` (issue #680, confirmed
+  builder.rs:1520; example `examples/activity_interceptor.rs`). Neither had any prior
+  mention in activities.md, the natural home for both.
