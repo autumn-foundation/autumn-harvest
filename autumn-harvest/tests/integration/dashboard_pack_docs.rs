@@ -159,6 +159,12 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_canary_roundtrip_bucket",
     "harvest_canary_roundtrip_count",
     "harvest_canary_roundtrip_sum",
+    "harvest_mutex_wait_duration_bucket",
+    "harvest_mutex_wait_duration_count",
+    "harvest_mutex_wait_duration_sum",
+    "harvest_mutex_held_duration_bucket",
+    "harvest_mutex_held_duration_count",
+    "harvest_mutex_held_duration_sum",
     // --- gauges (bare) -------------------------------------------------------
     "harvest_queue_depth",
     "harvest_queue_oldest_pending_age",
@@ -175,6 +181,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_rate_limit_refill_rate",
     "harvest_concurrency_in_flight",
     "harvest_concurrency_deferred",
+    "harvest_mutex_contention_depth",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -240,6 +247,9 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         "harvest_update_duration",
         &["workflow", "name", "queue", "outcome"],
     ),
+    ("harvest_mutex_wait_duration", &["workflow"]),
+    ("harvest_mutex_held_duration", &["workflow"]),
+    ("harvest_mutex_contention_depth", &["workflow"]),
     (
         "harvest_activity_duration",
         &["activity", "queue", "status", "error_type"],

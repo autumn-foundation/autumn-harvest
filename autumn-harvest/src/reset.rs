@@ -387,6 +387,19 @@ pub enum WorkflowResetError {
     },
     #[error("continue-as-new histories cannot be reset in v1")]
     ContinueAsNew,
+    /// The source execution currently holds a durable mutex (issue #691).
+    ///
+    /// A reset forks a fresh execution and seals the source `TERMINATED`. If the
+    /// source still holds a mutex, the fork would either phantom-inherit the
+    /// grant (its replayed history carries the `MutexGranted` event without a
+    /// live lock row) or leave the source's lock un-released and its waiters
+    /// stranded. Rather than silently strip the event, the reset is rejected so
+    /// the operator can let the critical section finish (or cancel/terminate the
+    /// source, which releases the lock via the terminal sweep) and retry.
+    #[error(
+        "workflow execution {exec_id} holds durable mutex '{key}'; release it before resetting"
+    )]
+    HolderHoldsMutex { exec_id: ExecutionId, key: String },
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -718,6 +731,10 @@ pub async fn preview_workflow_reset(
     let mut request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
+    // A reset while the source holds a durable mutex would phantom-grant the
+    // lock to the fork; surface that in the preview so the operator sees the
+    // same rejection the actual reset would return (issue #691).
+    reject_if_source_holds_mutex(conn, exec_id).await?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
     // If a logical ResetPoint was specified, resolve it to a raw event id now.
@@ -768,6 +785,12 @@ pub async fn reset_workflow_execution(
             }
             let reset_event_id = request.reset_to_event_id.unwrap_or(0);
             let plan = validate_reset_point(&events, reset_event_id)?;
+
+            // Reject the reset while the source still holds a durable mutex
+            // (issue #691), before sealing the source or forking. Inside the
+            // transaction so the read is consistent with the seal that
+            // follows.
+            reject_if_source_holds_mutex(conn, exec_id).await?;
 
             let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
             let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
@@ -1160,6 +1183,32 @@ async fn count_unconsumed_signals(
     Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
+/// Reject a reset while the source execution still holds a durable mutex
+/// (issue #691).
+///
+/// A reset forks a fresh execution at a decision boundary and seals the source
+/// `TERMINATED`. Allowing that while the source holds a lock would either
+/// phantom-grant the mutex to the fork (the replayed `MutexGranted` event has no
+/// backing lock row) or strand the source's waiters. Guarded — when the mutex
+/// tables are absent this is a no-op (`holder_holds_any_mutex` returns `None`).
+///
+/// # Errors
+///
+/// Returns [`WorkflowResetError::HolderHoldsMutex`] when the source holds ≥1
+/// lock.
+async fn reject_if_source_holds_mutex(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+) -> Result<(), WorkflowResetError> {
+    if let Some(key) = crate::mutex::holder_holds_any_mutex(conn, source_exec_id).await? {
+        return Err(WorkflowResetError::HolderHoldsMutex {
+            exec_id: source_exec_id,
+            key,
+        });
+    }
+    Ok(())
+}
+
 async fn terminate_source_execution(
     conn: &mut AsyncPgConnection,
     source_exec_id: ExecutionId,
@@ -1211,6 +1260,16 @@ async fn terminate_source_execution(
         .execute(conn)
         .await
         .map_err(database_error)?;
+
+    // Defense-in-depth (issue #691): the caller rejects a reset while the source
+    // holds a mutex, so by the time we seal `TERMINATED` here the source should
+    // hold nothing — but sweep anyway so a lock acquired in a race window (or on
+    // a future caller that forgets the pre-check) is released and its waiters
+    // woken rather than stranded. Runs inside the reset transaction, so the
+    // per-key advisory locks hold across the sweep. A no-op when the mutex
+    // tables are absent (guarded).
+    crate::mutex::sweep_terminal_holder_and_wake(conn, source_exec_id).await?;
+
     let (deferred, closed_children) = apply_parent_close_cascade(conn, source_exec_id).await?;
 
     Ok((deferred, closed_children))

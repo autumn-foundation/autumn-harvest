@@ -41,7 +41,7 @@
 //! ```
 
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -109,6 +109,11 @@ pub enum NonDeterminismKind {
     /// executions drained (issue #768) — and was encountered by the next
     /// command at that cursor position.
     TimerCancelMismatch,
+    /// A durable-mutex acquire (issue #691) diverged from history — the workflow
+    /// issued a different `ctx.mutex(key).acquire()` (a different key, or an
+    /// acquire where history recorded another event) than the recorded
+    /// `MutexGranted` at that cursor position.
+    MutexGrantMismatch,
     /// The divergence could not be classified into a known category.
     Unknown,
 }
@@ -131,6 +136,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::VersionMarkerMismatch => write!(f, "VersionMarkerMismatch"),
             Self::PatchMarkerMismatch => write!(f, "PatchMarkerMismatch"),
             Self::TimerCancelMismatch => write!(f, "TimerCancelMismatch"),
+            Self::MutexGrantMismatch => write!(f, "MutexGrantMismatch"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -1835,6 +1841,12 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
     if actual.starts_with("TimerCancelled") {
         return NonDeterminismKind::TimerCancelMismatch;
     }
+    // A `MutexGranted` found where another event was expected (or an acquire of
+    // a different key) means a durable-mutex acquire (issue #691) diverged from
+    // history — classify specifically so the message points at the mutex acquire.
+    if actual.starts_with("MutexGranted") {
+        return NonDeterminismKind::MutexGrantMismatch;
+    }
     match kind_str {
         "activity" => NonDeterminismKind::ActivityScheduleMismatch,
         "timer-cancel" => NonDeterminismKind::TimerCancelMismatch,
@@ -3006,6 +3018,13 @@ pub struct WorkflowTestEnv {
     /// awaited target present here resolves to the typed `Err` branch. Takes
     /// precedence over `external_await_results` if both are set for a target.
     external_await_failures: HashMap<ExecutionId, ExternalAwaitFailureFixture>,
+    /// Mutex keys (issue #691) whose grant the harness WITHHOLDS: an
+    /// `AcquireMutex` for a key in this set records nothing and leaves the
+    /// workflow parked (the same "blocked on an unavailable event" signal an
+    /// unqueued `WaitForSignal` uses), modelling a lock already held by another
+    /// contender. A key NOT in this set is auto-granted. Populated via
+    /// [`with_mutex_contended`](Self::with_mutex_contended).
+    mutex_contended: HashSet<String>,
 }
 
 /// A canned `await_external_workflow` failure outcome (issue #757):
@@ -3050,6 +3069,7 @@ impl WorkflowTestEnv {
             parent_execution_id: None,
             external_await_results: HashMap::new(),
             external_await_failures: HashMap::new(),
+            mutex_contended: HashSet::new(),
         }
     }
 
@@ -3175,6 +3195,17 @@ impl WorkflowTestEnv {
     #[must_use]
     pub fn queue_signal(mut self, name: impl Into<String>, payload: Value) -> Self {
         self.queued_signals.push((name.into(), payload));
+        self
+    }
+
+    /// Mark a mutex `key` (issue #691) as already held, so the harness
+    /// WITHHOLDS the grant: an `ctx.mutex(key).acquire()` for this key never
+    /// records a `MutexGranted` and the workflow stays parked (modelling
+    /// contention with another holder). A key not marked contended is
+    /// auto-granted on first acquire.
+    #[must_use]
+    pub fn with_mutex_contended(mut self, key: impl Into<String>) -> Self {
+        self.mutex_contended.insert(key.into());
         self
     }
 
@@ -4206,9 +4237,43 @@ impl WorkflowTestEnv {
             // harness — appends no event, changes no history, drives no wait.
             | WorkflowCommand::PublishProgress { .. }
             | WorkflowCommand::ScheduleExternalActivity { .. }
+            // Release is EVENT-LESS bookkeeping (mirrors `SetCurrentDetails`,
+            // issue #691): the worker frees the lock in production, but the
+            // harness has no lock table, so nothing is recorded. No progress.
+            | WorkflowCommand::ReleaseMutex { .. }
             | WorkflowCommand::Complete { .. }
             | WorkflowCommand::Fail { .. }
             | WorkflowCommand::ContinueAsNew { .. } => Ok(false),
+
+            // Issue #691 (ctx.mutex): acquire is a SOLO suspension. When the key
+            // is marked contended (`with_mutex_contended`) the harness WITHHOLDS
+            // the grant — records nothing and leaves the workflow parked, the
+            // same "blocked on an unavailable event" signal an unqueued
+            // `WaitForSignal` uses. Otherwise auto-grant: record a synthetic
+            // `MutexGranted` with a monotonic `lock_seq` (count of prior grants
+            // in history + 1) and the harness's deterministic clock. Because
+            // acquire is solo, the grant is the resolving event and must land in
+            // `history` so the next replay cycle's `match_mutex_granted` consumes
+            // it and the workflow proceeds.
+            WorkflowCommand::AcquireMutex { key, .. } => {
+                if self.mutex_contended.contains(&key) {
+                    return Ok(false);
+                }
+                let lock_seq = i64::try_from(
+                    history
+                        .iter()
+                        .filter(|e| matches!(e, WorkflowEvent::MutexGranted { .. }))
+                        .count(),
+                )
+                .unwrap_or(i64::MAX)
+                .saturating_add(1);
+                history.push(WorkflowEvent::MutexGranted {
+                    key,
+                    lock_seq,
+                    acquired_at: self.simulated_now,
+                });
+                Ok(true)
+            }
         }
     }
 

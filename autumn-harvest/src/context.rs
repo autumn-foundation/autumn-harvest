@@ -666,6 +666,41 @@ pub enum WorkflowCommand {
         /// Stable id of the timer being cancelled.
         timer_id: TimerId,
     },
+
+    /// Acquire a durable mutex, suspending the workflow until it holds the lock
+    /// (issue #691).
+    ///
+    /// A SOLO suspension command mirroring [`WaitForSignal`](Self::WaitForSignal):
+    /// pushed by [`MutexHandle::acquire`] on the first live call (or a re-park).
+    /// The `result_tx` is only ever used as a suspension signal — the granted
+    /// `lock_seq` is recovered from the appended [`WorkflowEvent::MutexGranted`]
+    /// event on the resumed drive, never from this channel. Its batch MUST NOT
+    /// contain any activity/timer/child/signal command, so the `MutexGranted`
+    /// anchor lands at a clean resume cursor and the positional replay matcher
+    /// needs no forward-scan skip-list changes (the worker park wiring lands in a
+    /// later milestone).
+    AcquireMutex {
+        /// The lock key to acquire.
+        key: String,
+        /// Suspension-signal channel (the granted `lock_seq` is recovered from
+        /// the `MutexGranted` event, not this channel).
+        result_tx: oneshot::Sender<i64>,
+    },
+
+    /// Release a durable mutex the workflow holds (issue #691).
+    ///
+    /// EVENT-LESS bookkeeping (mirrors
+    /// [`SetCurrentDetails`](Self::SetCurrentDetails)): pushed by the
+    /// [`MutexGuard`]'s `Drop` / `release`. `lock_seq` is the fencing token from
+    /// the grant, so the worker's release matches `(holder_exec_id, lock_seq)`
+    /// and a stale (reclaimed-then-resumed) holder's release is a harmless 0-row
+    /// no-op (the worker release wiring lands in a later milestone).
+    ReleaseMutex {
+        /// The lock key to release.
+        key: String,
+        /// The fencing token minted for this grant.
+        lock_seq: i64,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -850,6 +885,15 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("CancelTimer")
                 .field("timer_id", timer_id)
                 .finish(),
+            Self::AcquireMutex { key, .. } => f
+                .debug_struct("AcquireMutex")
+                .field("key", key)
+                .finish_non_exhaustive(),
+            Self::ReleaseMutex { key, lock_seq } => f
+                .debug_struct("ReleaseMutex")
+                .field("key", key)
+                .field("lock_seq", lock_seq)
+                .finish(),
         }
     }
 }
@@ -972,6 +1016,175 @@ impl TimerHandle<'_> {
         self.context
             .await_timer_fire(&self.timer_id, self.duration_secs)
             .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ctx.mutex() — durable mutual-exclusion lock (issue #691)
+// ---------------------------------------------------------------------------
+
+/// A handle to a durable mutex key, returned by [`WorkflowContext::mutex`]
+/// (issue #691).
+///
+/// Call [`acquire`](Self::acquire) to durably suspend the workflow until it
+/// holds exclusive access to the key. Borrows the [`WorkflowContext`] for the
+/// handle's lifetime.
+#[must_use = "a mutex handle does nothing until `.acquire()` is called"]
+pub struct MutexHandle<'a> {
+    context: &'a WorkflowContext,
+    key: String,
+}
+
+impl<'a> MutexHandle<'a> {
+    /// The lock key this handle targets.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Durably acquire the lock, suspending until this workflow holds it.
+    ///
+    /// Returns a [`MutexGuard`] that holds the lock for the duration of its
+    /// scope; the lock is released when the guard is dropped, released
+    /// explicitly via [`MutexGuard::release`], or the holder reaches a terminal
+    /// state (the worker/terminal release wiring lands in a later milestone).
+    ///
+    /// Non-reentrant: re-acquiring a key this workflow already holds returns
+    /// [`HarvestError::MutexSelfDeadlock`] **synchronously** — checked *before*
+    /// any history match — so a self-deadlock never hangs and surfaces the same
+    /// typed error on the live frontier and on replay (issue #691, review P1).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::MutexSelfDeadlock`] if the workflow already holds `key`.
+    /// - [`HarvestError::NonDeterministic`] if recorded history diverges from the
+    ///   expected `MutexGranted` for this key.
+    pub async fn acquire(self) -> HarvestResult<MutexGuard<'a>> {
+        use crate::replay::MutexGrantMatch;
+
+        // Self-deadlock guard FIRST — before any positional history match — so a
+        // caught self-deadlock surfaces the SAME typed error on the live frontier
+        // and on replay, rather than parking on the live frontier but diverging
+        // on the resumed drive (issue #691, review P1).
+        if self.context.holds_mutex(&self.key) {
+            return Err(HarvestError::MutexSelfDeadlock {
+                key: self.key.clone(),
+            });
+        }
+
+        match self
+            .context
+            .match_history(|m| m.match_mutex_granted(&self.key))
+        {
+            // Already granted in recorded history (replay / resume): rebuild the
+            // held-set entry and hand back a guard. No command is pushed.
+            MutexGrantMatch::Granted { lock_seq, .. } => {
+                self.context.insert_held_mutex(&self.key);
+                Ok(MutexGuard {
+                    context: self.context,
+                    key: self.key,
+                    lock_seq,
+                    released: false,
+                })
+            }
+            // First live call (or a re-park): suspend on the acquire command.
+            // The granted `lock_seq` is recovered from the `MutexGranted` event
+            // appended on the resumed drive (this channel is only a suspension
+            // signal), so this future parks here and the executor re-drives the
+            // workflow from history — where the `Granted` arm above returns the
+            // guard (mirrors `await_external_workflow`'s inline-resolve park).
+            MutexGrantMatch::NoMatch => {
+                self.context
+                    .check_strict_replay_no_match(&format!("AcquireMutex({})", self.key))?;
+                let (tx, rx) = oneshot::channel();
+                self.context.push_command(WorkflowCommand::AcquireMutex {
+                    key: self.key.clone(),
+                    result_tx: tx,
+                });
+                let _ = rx.await;
+                std::future::pending::<HarvestResult<MutexGuard<'a>>>().await
+            }
+            MutexGrantMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.context.nd_error(
+                format!("mutex grant mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+        }
+    }
+}
+
+/// An RAII guard proving the workflow holds a durable mutex (issue #691).
+///
+/// Dropping the guard at scope exit releases the lock by pushing a
+/// [`WorkflowCommand::ReleaseMutex`] — UNLESS the workflow is suspending across
+/// the guard's lifetime, in which case the release is withheld so the lock stays
+/// held under the still-parked holder (see
+/// [`WorkflowContext::is_suspending`]). Call [`release`](Self::release) to
+/// release explicitly before the lexical scope ends.
+#[must_use = "dropping the guard releases the lock; hold it for the critical section"]
+pub struct MutexGuard<'a> {
+    context: &'a WorkflowContext,
+    key: String,
+    lock_seq: i64,
+    /// Set once the release has been resolved so `Drop` never double-releases
+    /// after an explicit [`release`](Self::release).
+    released: bool,
+}
+
+impl MutexGuard<'_> {
+    /// The lock key this guard holds.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The fencing token (`lock_seq`) minted for this grant.
+    #[must_use]
+    pub const fn lock_seq(&self) -> i64 {
+        self.lock_seq
+    }
+
+    /// Release the lock explicitly, consuming the guard.
+    ///
+    /// Equivalent to dropping the guard at end of scope, but lets the workflow
+    /// release before the critical section's lexical scope ends. The `Drop` that
+    /// follows is a no-op (the release has already been resolved).
+    pub fn release(mut self) {
+        self.do_release();
+    }
+
+    /// Resolve the release: push exactly one `ReleaseMutex` command and drop the
+    /// held-set entry, UNLESS the workflow is suspending across this guard (in
+    /// which case the lock must stay held under the parked holder — the
+    /// timeout-guard contract). Idempotent via the `released` flag.
+    fn do_release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        // Withhold the release while the holder is merely suspending; the lock
+        // stays held across the park (issue #691 timeout-guard contract). The
+        // guard is reconstructed on the next decision cycle, where
+        // `match_mutex_granted` re-matches the recorded `MutexGranted`.
+        if self.context.is_suspending() {
+            return;
+        }
+        self.context.remove_held_mutex(&self.key);
+        self.context.push_command(WorkflowCommand::ReleaseMutex {
+            key: self.key.clone(),
+            lock_seq: self.lock_seq,
+        });
+    }
+}
+
+impl Drop for MutexGuard<'_> {
+    fn drop(&mut self) {
+        self.do_release();
     }
 }
 
@@ -1863,6 +2076,27 @@ pub struct WorkflowContext {
     /// is caught by the `Armed`-state check in [`Self::timer`]). Cancel/reset
     /// consult it to guarantee they never delete a classic timer's durable row.
     classic_timer_ids: Mutex<std::collections::HashSet<String>>,
+    /// Set of durable-mutex keys this workflow currently holds (issue #691).
+    ///
+    /// Reconstructed fresh each decision cycle: a `MutexGranted` history match in
+    /// [`MutexHandle::acquire`] inserts the key, and the [`MutexGuard`]'s `Drop`
+    /// removes it. Consulted by [`holds_mutex`](Self::holds_mutex) so a
+    /// re-acquire of a key the workflow already holds returns
+    /// [`HarvestError::MutexSelfDeadlock`] synchronously instead of deadlocking.
+    ///
+    /// Locked with `.unwrap_or_else(std::sync::PoisonError::into_inner)` rather
+    /// than `.expect(...)` because a [`MutexGuard`]'s `Drop` — which mutates this
+    /// set — can run while the workflow task is unwinding under panic
+    /// containment (issue #782), when the lock may already be poisoned.
+    held_mutex_keys: Mutex<std::collections::HashSet<String>>,
+    /// Whether the current decision cycle is suspending (parking) rather than
+    /// completing (issue #691). Set to `true` by the executor's suspension arm
+    /// *before* the handler future (and any [`MutexGuard`] it holds across the
+    /// suspension) is dropped, so a guard dropped merely because the holder
+    /// parked does NOT push a `ReleaseMutex` command and free the lock under the
+    /// still-parked holder. A guard dropped mid-poll or at genuine completion
+    /// sees this `false` and releases normally.
+    suspending: std::sync::atomic::AtomicBool,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -2309,6 +2543,8 @@ impl WorkflowContext {
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
+            held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
+            suspending: std::sync::atomic::AtomicBool::new(false),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2454,6 +2690,8 @@ impl WorkflowContext {
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
+            held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
+            suspending: std::sync::atomic::AtomicBool::new(false),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2514,6 +2752,8 @@ impl WorkflowContext {
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
+            held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
+            suspending: std::sync::atomic::AtomicBool::new(false),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -5405,6 +5645,71 @@ impl WorkflowContext {
             .lock()
             .expect("classic_timer_ids lock poisoned")
             .contains(timer_id)
+    }
+
+    // ── Durable mutex (issue #691) ───────────────────────────────────────────
+
+    /// Obtain a handle to a durable mutex key.
+    ///
+    /// Call [`MutexHandle::acquire`] on the returned handle to durably suspend
+    /// the workflow until it holds exclusive access to `key`. Mutex coordination
+    /// is shard-local (contending workflows must resolve to the same shard) and
+    /// non-reentrant — see [`MutexHandle::acquire`].
+    pub fn mutex(&self, key: impl Into<String>) -> MutexHandle<'_> {
+        MutexHandle {
+            context: self,
+            key: key.into(),
+        }
+    }
+
+    /// Whether this workflow currently holds the durable mutex `key` (issue #691).
+    ///
+    /// Reconstructed each decision cycle from `MutexGranted` history matches, so
+    /// it is replay-stable. Consulted by [`MutexHandle::acquire`] to reject a
+    /// non-reentrant re-acquire with [`HarvestError::MutexSelfDeadlock`].
+    #[must_use]
+    pub fn holds_mutex(&self, key: &str) -> bool {
+        self.held_mutex_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
+    }
+
+    /// Record that this workflow now holds the durable mutex `key`
+    /// (issue #691). Called by [`MutexHandle::acquire`] on a `MutexGranted`
+    /// history match.
+    fn insert_held_mutex(&self, key: &str) {
+        self.held_mutex_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_string());
+    }
+
+    /// Record that this workflow no longer holds the durable mutex `key`
+    /// (issue #691). Called by [`MutexGuard`]'s release path.
+    fn remove_held_mutex(&self, key: &str) {
+        self.held_mutex_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+
+    /// Mark whether the current decision cycle is suspending (parking) rather
+    /// than completing (issue #691).
+    ///
+    /// Set to `true` by the executor's suspension arm *before* the handler
+    /// future — and any [`MutexGuard`] it holds across the suspension — is
+    /// dropped, so a guard dropped merely because the holder parked withholds its
+    /// `ReleaseMutex` and the lock stays held under the still-parked holder.
+    pub(crate) fn set_suspending(&self, suspending: bool) {
+        self.suspending
+            .store(suspending, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the current decision cycle is suspending (issue #691). Read by a
+    /// [`MutexGuard`]'s `Drop` to decide whether to withhold its release.
+    pub(crate) fn is_suspending(&self) -> bool {
+        self.suspending.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Cancel an author-controlled durable timer by id.

@@ -309,6 +309,11 @@ impl WorkerRuntimeConfig {
 
 impl From<WorkerConfig> for WorkerRuntimeConfig {
     fn from(cfg: WorkerConfig) -> Self {
+        // Publish the configured mutex lease TTL to the process-global static
+        // read by the acquire/renewal paths (issue #691), mirroring how
+        // `start_idempotency::set_purge_window_secs` threads a duration knob
+        // without a new field on every call site.
+        crate::mutex::set_mutex_lease_ttl(cfg.mutex_lease_ttl);
         if let Some(first_queue) = cfg.queues.as_slice().first()
             && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
             && lock.is_none()
@@ -1010,6 +1015,11 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
         WorkflowCommand::ArmTimer { .. } => "ArmTimer",
         WorkflowCommand::CancelTimer { .. } => "CancelTimer",
+        // Issue #691: durable mutex acquire (SOLO suspension park) / release
+        // (event-less bookkeeping). Dispatched via `should_handle_mutex_acquire`
+        // + `persist_mutex_acquire_park` / `process_mutex_releases_from_commands`.
+        WorkflowCommand::AcquireMutex { .. } => "AcquireMutex",
+        WorkflowCommand::ReleaseMutex { .. } => "ReleaseMutex",
     }
 }
 
@@ -1069,6 +1079,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
                 | WorkflowCommand::CancelTimer { .. }
+                | WorkflowCommand::ReleaseMutex { .. }
         )
     });
 
@@ -1090,8 +1101,41 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
                     | WorkflowCommand::CancelTimer { .. }
+                    | WorkflowCommand::ReleaseMutex { .. }
             )
         })
+}
+
+/// Whether this suspension batch is a durable mutex acquire (issue #691):
+/// exactly one `AcquireMutex` command, with every other command being pure
+/// event-less bookkeeping (`ReleaseMutex`/`RecordMarker`/side-effect/etc.).
+///
+/// `AcquireMutex` is deliberately in NO extractor ignore-list, so a mixed
+/// `AcquireMutex` + activity/timer/child/signal batch fails loud (it never
+/// reaches this predicate's exclusive path and instead falls through to the
+/// generic "unsupported commands" failure). The acquire is a SOLO durable
+/// suspension so the `MutexGranted` anchor lands at a clean resume cursor for
+/// the positional replay matcher.
+fn should_handle_mutex_acquire(commands: &[WorkflowCommand]) -> bool {
+    let mut acquire_count = 0usize;
+    for cmd in commands {
+        match cmd {
+            WorkflowCommand::AcquireMutex { .. } => acquire_count += 1,
+            WorkflowCommand::ReleaseMutex { .. }
+            | WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. } => {}
+            _ => return false,
+        }
+    }
+    acquire_count == 1
 }
 
 #[derive(Debug, Clone)]
@@ -1341,6 +1385,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
                 | WorkflowCommand::CancelTimer { .. }
+                | WorkflowCommand::ReleaseMutex { .. }
         )
     });
 
@@ -1371,7 +1416,8 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
-            | WorkflowCommand::CancelTimer { .. } => {}
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -1421,7 +1467,8 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
             | WorkflowCommand::ArmTimer { .. }
-            | WorkflowCommand::CancelTimer { .. } => {}
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -1480,6 +1527,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::CancelRaceLosers { .. }
                 | WorkflowCommand::ArmTimer { .. }
                 | WorkflowCommand::CancelTimer { .. }
+                | WorkflowCommand::ReleaseMutex { .. }
         )
     });
 
@@ -1508,6 +1556,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::CancelRaceLosers { .. }
                     | WorkflowCommand::ArmTimer { .. }
                     | WorkflowCommand::CancelTimer { .. }
+                    | WorkflowCommand::ReleaseMutex { .. }
             )
         })
         .collect();
@@ -1622,7 +1671,8 @@ fn extract_child_timeout_race(
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
-            | WorkflowCommand::CancelRaceLosers { .. } => {}
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ReleaseMutex { .. } => {}
             // Anything else (activity, activity wait, signal wait, external
             // activity/signal/cancel, detached spawn, arm/cancel timer) → not this
             // shape.
@@ -4757,6 +4807,221 @@ async fn persist_signal_wait_park(
         });
         if resolved {
             queue::wake_workflow_task(conn, exec_id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve every `ReleaseMutex` command in a suspension batch (issue #691).
+///
+/// Each `ReleaseMutex` is dispatched to the fenced `mutex::release_lock`, which
+/// deletes the lock row (matched on `holder_exec_id` + `lock_seq`), removes the
+/// holder's waiter row, and wakes the key's new head-of-line inline. Wrapped in
+/// a single transaction so each release's `pg_advisory_xact_lock` is held across
+/// its own delete + head-wake statements (an advisory-xact lock in autocommit
+/// mode releases after the first statement, defeating serialization). Keys are
+/// sorted so concurrent release batches take per-key advisory locks in a
+/// consistent order (no cross-key ABBA).
+///
+/// Idempotent by construction: the fence makes a re-run of an already-released
+/// lock a 0-row no-op, so this may be called from both the
+/// `handle_suspended_workflow` top-level sweep and an inline arm. Emits the
+/// `harvest.mutex.held_duration` metric per actually-released lock.
+async fn process_mutex_releases_from_commands(
+    conn: &mut AsyncPgConnection,
+    commands: &[WorkflowCommand],
+    holder_exec_id: ExecutionId,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    workflow_name: &str,
+) -> HarvestResult<()> {
+    let mut releases: Vec<(String, i64)> = commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::ReleaseMutex { key, lock_seq } => Some((key.clone(), *lock_seq)),
+            _ => None,
+        })
+        .collect();
+    if releases.is_empty() {
+        return Ok(());
+    }
+    releases.sort_by(|a, b| a.0.cmp(&b.0));
+    let metrics_enabled = metrics.is_enabled();
+
+    let held_secs = conn
+        .transaction::<Vec<f64>, HarvestError, _>(async |conn| {
+            let releases = releases.clone();
+            let mut held = Vec::new();
+            for (key, lock_seq) in releases {
+                if let Some(acquired_at) =
+                    crate::mutex::release_lock(conn, &key, holder_exec_id, lock_seq).await?
+                    && metrics_enabled
+                {
+                    #[allow(clippy::cast_precision_loss)]
+                    let secs =
+                        ((chrono::Utc::now() - acquired_at).num_milliseconds() as f64) / 1000.0;
+                    held.push(secs.max(0.0));
+                }
+            }
+            Ok(held)
+        })
+        .await?;
+
+    for secs in held_secs {
+        metrics.record_mutex_held(workflow_name, secs);
+    }
+    Ok(())
+}
+
+/// Persist a durable mutex acquire (issue #691). Mirrors `persist_signal_wait_park`'s
+/// txn + park + post-commit structure. The batch is a SOLO acquire: exactly one
+/// `AcquireMutex` plus pure event-less bookkeeping (verified by
+/// `should_handle_mutex_acquire`).
+///
+/// First resolves any `ReleaseMutex` commands in the batch (so a re-acquire of a
+/// just-freed key enqueues in FIFO order and a contender is woken), then attempts
+/// an advisory-first `try_grant_or_enqueue`:
+/// - `Granted` → append `MutexGranted`, park, and unconditionally self-wake so the
+///   next cycle replays and `match_mutex_granted` resolves the grant inline.
+/// - `Enqueued` → park capturing `had_wake_requested`; post-commit self-wake if a
+///   racing releaser's wake was captured OR the caller is now grantable-head.
+#[allow(clippy::too_many_lines)]
+async fn persist_mutex_acquire_park(
+    conn: &mut AsyncPgConnection,
+    detached_spawns: DetachedSpawnPersistence<'_>,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    commands: &[WorkflowCommand],
+    sticky: Option<queue::StickyHint<'_>>,
+) -> HarvestResult<()> {
+    enum MutexParkOutcome {
+        Granted {
+            wait_secs: Option<f64>,
+            depth: Option<u64>,
+        },
+        Enqueued {
+            had_wake_requested: bool,
+        },
+    }
+
+    let registry = detached_spawns.registry;
+    let metrics = registry.telemetry().metrics.clone();
+    let workflow_name = detached_spawns.parent_execution.workflow_name.clone();
+
+    // Resolve any releases FIRST (own transaction; advisory-xact locks held
+    // across each fenced release).
+    process_mutex_releases_from_commands(conn, commands, exec_id, metrics.as_ref(), &workflow_name)
+        .await?;
+
+    // The single AcquireMutex key (should_handle_mutex_acquire guarantees exactly one).
+    let key = commands
+        .iter()
+        .find_map(|c| match c {
+            WorkflowCommand::AcquireMutex { key, .. } => Some(key.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            HarvestError::Config(
+                "persist_mutex_acquire_park called without an AcquireMutex command".to_string(),
+            )
+        })?;
+
+    let ttl = crate::mutex::effective_mutex_lease_ttl();
+    let metrics_enabled = metrics.is_enabled();
+
+    let (deferred, park_outcome) = conn
+        .transaction::<(
+            Vec<crate::completion_trigger::DeferredTriggerStart>,
+            MutexParkOutcome,
+        ), HarvestError, _>(async |conn| {
+            let key = key.clone();
+            // Persist bookkeeping events (markers/side-effects/detached-spawn
+            // + interleaved timer-lifecycle) in command order, mirroring the
+            // signal-wait park.
+            let (mut timer_events, _min_fires_at) =
+                plan_timer_lifecycle(conn, exec_id, commands).await?;
+            let marker_events = pre_suspension_events_from_commands(commands, &mut timer_events);
+            let events_len = i32::try_from(marker_events.len()).unwrap_or(i32::MAX);
+            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+            detached_spawns.persist(conn, commands).await?;
+            let mut race_next_event_id = next_event_id.saturating_add(events_len);
+            let deferred = apply_race_loser_cancellations(
+                conn,
+                exec_id,
+                commands,
+                &mut race_next_event_id,
+                registry,
+            )
+            .await?;
+
+            // Advisory-first grant-or-enqueue for the acquire key.
+            let outcome = crate::mutex::try_grant_or_enqueue(conn, &key, exec_id, ttl).await?;
+            let park_outcome = match outcome {
+                crate::mutex::MutexGrantOutcome::Granted { lock_seq } => {
+                    // Best-effort wait/contention metrics while the waiter
+                    // row still exists (grant does not delete it).
+                    let (wait_secs, depth) = if metrics_enabled {
+                        match crate::mutex::waiter_wait_metrics(conn, &key, exec_id).await? {
+                            Some((requested_at, count)) => {
+                                #[allow(clippy::cast_precision_loss)]
+                                let secs = ((chrono::Utc::now() - requested_at).num_milliseconds()
+                                    as f64)
+                                    / 1000.0;
+                                (Some(secs.max(0.0)), u64::try_from(count).ok())
+                            }
+                            None => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    // Append MutexGranted at the correct next_event_id
+                    // (after the bookkeeping markers + any race-cancel events).
+                    let granted_event = WorkflowEvent::MutexGranted {
+                        key: key.clone(),
+                        lock_seq,
+                        acquired_at: chrono::Utc::now(),
+                    };
+                    store::append_single_event(conn, exec_id, granted_event).await?;
+                    // Park so the next cycle replays and drives the grant
+                    // inline (await inline-resolve pattern).
+                    let _ = queue::park_workflow_task(conn, task_id, sticky).await?;
+                    MutexParkOutcome::Granted { wait_secs, depth }
+                }
+                crate::mutex::MutexGrantOutcome::Enqueued => {
+                    let had_wake_requested =
+                        queue::park_workflow_task(conn, task_id, sticky).await?;
+                    MutexParkOutcome::Enqueued { had_wake_requested }
+                }
+            };
+            Ok((deferred, park_outcome))
+        })
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+
+    match park_outcome {
+        MutexParkOutcome::Granted { wait_secs, depth } => {
+            if metrics_enabled {
+                if let Some(secs) = wait_secs {
+                    metrics.record_mutex_wait(&workflow_name, secs);
+                }
+                if let Some(d) = depth {
+                    metrics.record_mutex_contention(&workflow_name, d);
+                }
+            }
+            // Unconditional post-commit self-wake so the next cycle drives the
+            // grant inline.
+            queue::wake_workflow_task(conn, exec_id).await?;
+        }
+        MutexParkOutcome::Enqueued { had_wake_requested } => {
+            // Mirror persist_signal_wait_park: a releaser/contender's wake that
+            // raced the park sets wake_requested (read+cleared by park); else
+            // re-check "is the lock free and am I head-of-line now?" and self-wake.
+            if had_wake_requested || crate::mutex::is_grantable_head(conn, &key, exec_id).await? {
+                queue::wake_workflow_task(conn, exec_id).await?;
+            }
         }
     }
     Ok(())
@@ -9250,6 +9515,28 @@ async fn handle_suspended_workflow(
     // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
     notify_progress_from_commands(conn, context.persistence.exec_id, commands).await;
 
+    // Issue #691: resolve any `ReleaseMutex` bookkeeping (an early `drop(guard)`)
+    // BEFORE the suspension shape is persisted, so a contender for the freed key
+    // is woken promptly and not deferred behind whatever this batch waits on. A
+    // no-op when the batch carries no `ReleaseMutex`.
+    if let Err(e) = process_mutex_releases_from_commands(
+        conn,
+        commands,
+        context.persistence.exec_id,
+        registry.telemetry().metrics.as_ref(),
+        &context.execution.workflow_name,
+    )
+    .await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+        )
+        .await;
+    }
+
     let sticky = context.persistence.sticky_hint();
     let detached_spawns = DetachedSpawnPersistence {
         registry,
@@ -9378,6 +9665,20 @@ async fn handle_suspended_workflow(
             context.persistence.task.id,
             commands,
             &scheduled,
+            sticky,
+        )
+        .await
+    } else if should_handle_mutex_acquire(commands) {
+        // Issue #691: durable mutex acquire — a SOLO suspension. Any co-batched
+        // ReleaseMutex was already resolved by the top-level sweep above; this
+        // re-resolves them idempotently then grants-or-enqueues the acquire key.
+        persist_mutex_acquire_park(
+            conn,
+            detached_spawns,
+            context.persistence.task.id,
+            context.persistence.exec_id,
+            context.persistence.next_event_id,
+            commands,
             sticky,
         )
         .await
@@ -9838,6 +10139,13 @@ async fn persist_workflow_continue_as_new(
         if updated == 0 {
             return Err(workflow_execution_transition_error(conn, exec_id).await?);
         }
+
+        // Issue #691: the predecessor is now terminal (CONTINUED_AS_NEW), so
+        // release every durable mutex it held and wake each freed key's new
+        // head-of-line before the successor starts. Runs inside the terminal
+        // seal transaction (the same chokepoint as the completion-trigger
+        // sweep); guarded, so a no-op when the feature/table is unused.
+        crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
 
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&new_row)
@@ -10490,6 +10798,12 @@ async fn suspended_command_event_count(
         );
         return Ok(bookkeeping_events.saturating_add(awaiting_event));
     }
+    // Issue #691: a durable mutex acquire appends at most one MutexGranted (on a
+    // grant; none on an enqueue). Count +1 conservatively — over-counting only
+    // nudges the history hard-cap check earlier, never masks an overflow.
+    if should_handle_mutex_acquire(commands) {
+        return Ok(bookkeeping_events.saturating_add(1));
+    }
 
     Ok(update_events.saturating_add(1))
 }
@@ -10785,6 +11099,27 @@ async fn process_workflow_task(
 
     let started_at = std::time::Instant::now();
 
+    // Issue #691: renew any durable-mutex leases this execution holds forward by
+    // the configured TTL on every holder decision cycle, so the lease scanner
+    // never reclaims a lock while its holder is still making progress. Guarded
+    // (a cheap no-op when the feature/table is unused, and a 0-row UPDATE for a
+    // non-holder). Best-effort — a transient renewal failure is tolerated (the
+    // TTL exceeds several decision cycles and the reclaim path re-checks under
+    // the advisory lock), so it never fails an otherwise-healthy workflow task.
+    if let Err(e) = crate::mutex::renew_leases_for_holder(
+        conn,
+        prepared.exec_id,
+        crate::mutex::effective_mutex_lease_ttl(),
+    )
+    .await
+    {
+        tracing::warn!(
+            exec_id = %prepared.exec_id,
+            error = %e,
+            "failed to renew durable-mutex leases for holder (best-effort)"
+        );
+    }
+
     // Drive the workflow in a loop so that local activities can be executed
     // inline without parking the task. Each iteration runs the workflow until
     // it suspends; if it suspends on a RunLocalActivity command the handler
@@ -10915,7 +11250,13 @@ async fn process_workflow_task(
             WorkflowOutcome::Suspended { commands }
                 if commands
                     .iter()
-                    .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. })) =>
+                    .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }))
+                    // Issue #691: a co-batched AcquireMutex must NOT resolve inline
+                    // here (it would bypass the solo-suspension mutex-park path and
+                    // diverge replay); fall through to the fail-loud generic path.
+                    && !commands
+                        .iter()
+                        .any(|c| matches!(c, WorkflowCommand::AcquireMutex { .. })) =>
             {
                 // Apply any search-attribute patches before running the local
                 // activity so that attributes are visible even if the worker
@@ -10925,6 +11266,19 @@ async fn process_workflow_task(
                 persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Fire ephemeral progress chunks (issue #791) — best-effort, before inline run.
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
+                // Issue #691 (FIX-B): resolve any ReleaseMutex bookkeeping (an
+                // early drop(guard)) BEFORE the inline local-activity re-drive so
+                // the release isn't deferred across the re-drive and a contender
+                // is granted the freed key while the local activity runs. No-op
+                // when the batch carries no ReleaseMutex.
+                process_mutex_releases_from_commands(
+                    conn,
+                    &commands,
+                    prepared.exec_id,
+                    telemetry.metrics.as_ref(),
+                    &prepared.execution.workflow_name,
+                )
+                .await?;
                 // Sync in-memory snapshot so a subsequent continue_as_new in the
                 // same task copies the patched attrs to the successor row.
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
@@ -11108,8 +11462,11 @@ async fn process_workflow_task(
                             | WorkflowCommand::UpsertSearchAttributes { .. }
                             | WorkflowCommand::SetCurrentDetails { .. }
                             | WorkflowCommand::PublishProgress { .. }
+                            | WorkflowCommand::ReleaseMutex { .. }
                     )
-                }) =>
+                }) && !commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::AcquireMutex { .. })) =>
             {
                 // Only enters this path when every non-bookkeeping command in the
                 // batch is a SignalExternalWorkflow (or RecordMarker). Mixed batches
@@ -11348,7 +11705,12 @@ async fn process_workflow_task(
                             | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                             | WorkflowCommand::AwaitExternalWorkflow { .. }
                     )
-                }) =>
+                }) && !commands
+                    .iter()
+                    // Issue #691: a co-batched AcquireMutex must fail loud, not
+                    // resolve inline through the mixed-external path (it would
+                    // bypass the solo-suspension mutex-park and diverge replay).
+                    .any(|c| matches!(c, WorkflowCommand::AcquireMutex { .. })) =>
             {
                 if let Err(e) = persist_update_result_commands(
                     conn,
@@ -11406,6 +11768,19 @@ async fn process_workflow_task(
                 }
                 // Fire ephemeral progress chunks (issue #791) — best-effort, never fails the cycle.
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
+                // Issue #691 (FIX-B): resolve any ReleaseMutex bookkeeping BEFORE
+                // this all-external-resolved-inline arm re-drives the workflow, so
+                // an early drop(guard) frees the key (and wakes a contender)
+                // instead of being deferred across the inline re-drive. No-op when
+                // the batch carries no ReleaseMutex.
+                process_mutex_releases_from_commands(
+                    conn,
+                    &commands,
+                    prepared.exec_id,
+                    telemetry.metrics.as_ref(),
+                    &prepared.execution.workflow_name,
+                )
+                .await?;
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
                     prepared.execution.search_attrs.take(),
                     &commands,
@@ -16858,6 +17233,7 @@ mod tests {
             workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             default_debounce_max_wait: Duration::from_secs(3600),
+            mutex_lease_ttl: crate::mutex::DEFAULT_MUTEX_LEASE_TTL,
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
             queue_weights: std::collections::HashMap::new(),
