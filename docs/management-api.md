@@ -2,6 +2,31 @@
 
 This document covers the HTTP management API mounted by `autumn-harvest-plugin`.
 
+## Full route registry
+
+This page is a **selective deep-dive** into a few high-traffic surfaces (SSE
+streaming, by-id addressing, listing, stack/describe, history pagination,
+updates, signal delivery), not an exhaustive endpoint list. The **authoritative,
+machine-readable registry of every route** — method, path, auth class, request
+and response fields — is [`docs/api-contract.json`](api-contract.json) (see
+[`api-contract-guide.md`](api-contract-guide.md) for how to consume it).
+
+New route families added in **0.5.0** (all in the contract; each has a CLI verb):
+
+- `GET /workflows/summaries` — tiered-retention summaries of expired runs (#752).
+- `GET /workflows/count` — grouped RUNNING/FAILED-per-type fleet snapshot (#544).
+- `GET /workflows/{id}/run-chain` — the ordered continue-as-new succession (#701).
+- `GET /workflows/{id}/timeline` — per-run wall-clock breakdown from history (#739).
+- `POST /workflows/{id}/legal-hold` / `.../legal-hold/release` — per-execution retention/erase hold (#747).
+- `POST /workflows/{id}/activities/{activity_exec_id}/fail-now` — force-fail one hung in-flight activity (#765).
+- `GET /workflows/{id}/completion-deliveries` + `.../redrive` — durable completion-callback deliveries (#605).
+- `PATCH /admin/schedules/{id}` — in-place cron/input edit without recreate (#771).
+- `GET /admin/status` — one-call rolled-up health verdict (#679).
+- `GET /admin/config` — redacted effective runtime config (#695).
+- `GET /admin/usage` — per-tenant/per-workflow historical usage report (#596).
+- `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
+- `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (#690).
+
 ## SSE Execution Event Stream
 
 ### Endpoint

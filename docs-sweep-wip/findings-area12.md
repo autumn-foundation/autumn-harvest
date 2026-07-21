@@ -196,3 +196,32 @@ the telemetry.md section below.
 - Content VERIFIED current: HVG010 (#600) + combinator functions (#799), HVG011/DET010 (#785),
   DET011 (#799), `harvest det-check` CLI (#778), `ctx.metrics()` replay-safe metrics under
   HVG007 (#758/#532), `ctx.patched()`/`deprecate_patch()` in the release playbook. No content fix.
+
+### docs/management-api.md — FIX (coverage) + VERIFIED
+- Content VERIFIED: SSE stream (#174), by-id addressing (#805), list filters + typed
+  search-attr predicates (#506/#159), stack heartbeat checkpoint (#503), history
+  pagination (#529), updates result API, signal delivery idempotency (#521/#753). Accurate.
+  No stale pause/resume 409 (the only pause/resume mention is the by-id delegation table).
+- **GAP → FIX:** the page had **no pointer to the authoritative route registry** and no
+  mention of the new-in-0.5.0 route families. Added a "Full route registry" section at the
+  top pointing at `docs/api-contract.json` + `api-contract-guide.md`, and listing 13 new
+  0.5.0 route families by method/path (all confirmed present in api-contract.json):
+  `/workflows/summaries` (#752), `/workflows/count` (#544), `/workflows/{id}/run-chain`
+  (#701), `/workflows/{id}/timeline` (#739), legal-hold (#747), fail-now (#765),
+  completion-deliveries (#605), `PATCH /admin/schedules/{id}` (#771), `/admin/status` (#679),
+  `/admin/config` (#695), `/admin/usage` (#596), workflow-types/reachability (#520),
+  `/dags/{name}/runs/{run_exec_id}` graph (#690). Deep per-route sections deferred (contract
+  is authoritative); this meets the "at least a mention" floor.
+
+### docs/saga.md — VERIFIED
+- #801 observability (both counters, exactly-once marker contract, per-unwind coherence,
+  cancel limitation), cancel-does-not-auto-compensate, idempotency + replay-determinism
+  contracts. Test paths correctly say `tests/integration/saga_tests.rs`. No fix.
+
+### docs/retry-jitter.md — FIX (stale test path)
+- **STALE PATH → FIX:** L45 `autumn-harvest/tests/replayer_tests.rs` →
+  `.../tests/integration/replayer_tests.rs` (the test suite was reorganized into
+  `tests/integration/`; the root file no longer exists — verified). API (`JitterPolicy`,
+  `with_jitter`, `next_delay_with_seed`, bench, quickstart bin) all confirmed.
+- Broad sweep of every `tests/NAME.rs` ref across all area docs: only this one was stale;
+  the two mcp-tools.md refs are correctly `autumn-harvest-plugin/tests/...` (exist).
