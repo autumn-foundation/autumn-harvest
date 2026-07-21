@@ -82,7 +82,7 @@ harvest workflow list --workflow-name billing_workflow
 For **DAG** schedules, inspect DAG runs via the management API:
 
 ```
-GET /admin/dags/<dag-name>/runs
+GET /dags/<dag-name>/runs
 ```
 
 Backfill-created DAG runs carry `"_harvest_run_source": "backfill"` in their `conf` field, distinguishing them from scheduler-tick runs.

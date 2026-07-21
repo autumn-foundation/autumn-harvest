@@ -29,7 +29,7 @@ that matches what you are deleting:
 | You are removing… | Use | Endpoint |
 |---|---|---|
 | **A whole `#[workflow]` handler** (delete/rename the function) | **This check** (type-level reachability, #520) | `GET /admin/workflow-types/reachability` |
-| **A worker build / deployment version** (build-id routing) | `build_reachability` (#171) | `GET /admin/build-reachability` |
+| **A worker build / deployment version** (build-id routing) | `build_reachability` (#171) | `GET /admin/build-routing` |
 | **A `ctx.version()` branch inside a handler** | Version-gate retirement (#?) | `GET /admin/version-gates/retirement-check` |
 
 - **This check** counts *non-terminal executions whose `workflow_name` names the
