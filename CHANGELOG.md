@@ -7,16 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-21
+
+### Upgraded
+
+- **Upgrade to autumn-web 0.6.0 / diesel-async 0.9** — the defining change of this release (landed via PR #1124). The plugin, CLI, and example crates move from autumn-web 0.5 to 0.6 and from diesel-async 0.8 to 0.9, keeping Harvest current with the companion web framework's latest lifecycle, routing, MCP, and Postgres-integration surface. All features folded into this 0.5.0 section below ship on top of that upgraded baseline.
+
 ### Added
 
 - Add typed workflow failures (issue #767). A `#[workflow]` can now return `Result<T, WorkflowFailure>` to carry a structured, replay-safe failure cause — a stable low-cardinality `error_type` class, optional structured `details`, and an advisory `non_retryable` hint — mirroring the typed `ActivityFailure` surface onto whole workflows. Opt-in and non-breaking: a workflow returning `Result<T, String>` (or any `E: ToString`) is byte-for-byte unchanged and decodes to `error_type = None`. New public `WorkflowFailure` builder (`::new`/`.with_details`/`.non_retryable`), the `harvest_workflow_failure_v1` wire envelope + tolerant `decode_workflow_failure`, macro opt-in detection (`workflow_returns_workflow_failure`), `HarvestError` accessors (`workflow_error_type`/`workflow_details`/`is_workflow_non_retryable`), and the typed handle surface (`TypedWorkflowHandle::result()`/`result_snapshot()`, `WorkflowHandle::terminal_typed_failure`). The `non_retryable` flag is an **advisory** classification hint for the caller / completion-trigger only — it is deliberately *not* a control input to the engine's workflow-level retry (#523) loop. No new `WorkflowEvent` variant, no migration (the typed fields are additive optional columns on the existing `WorkflowFailed`/`ChildWorkflowFailed` events).
-
-### Changed
-
-- **Behavior change (issue #767):** a failed **child** workflow now surfaces to its parent as `HarvestError::WorkflowFailed` (typed) instead of `HarvestError::ActivityFailed { name: "child-workflow:{name}" }`. The `child-workflow:{name}` name prefix is preserved. Downstream parent code that matched `ActivityFailed` for a child result — or called `.activity_error_type()`/`.activity_details()` on it — must switch to the `WorkflowFailed` variant and the `workflow_error_type()`/`workflow_details()`/`is_workflow_non_retryable()` accessors.
-- **Source-breaking additive public fields (issue #767):** `HarvestError::WorkflowFailed`, `WorkflowEvent::WorkflowFailed`, `WorkflowEvent::ChildWorkflowFailed`, `replay::HistoryMatch::Failed`, and `TypedWorkflowResult` each gained new fields (`error_type`/`details`/`non_retryable`, as applicable). Downstream code that exhaustively destructures any of these variants/structs must add `..`.
-
-### Added
 
 - Add activity execution interceptors (issue #680). Register an ordered middleware chain on `HarvestBuilder` with `.activity_interceptor(...)` (repeatable) that wraps **every** activity execution on the worker — regular and local — outermost-first, so cross-cutting behavior (structured logging, custom metrics, header propagation, input/output shaping, fault injection) is added once at registration time instead of per `#[activity]`. Object-safe `ActivityInterceptor` trait (no `async_trait`, mirroring `PayloadStore`/`HistoryArchiver`); an interceptor may observe, short-circuit (skip `next`), or transform input/result/error. Errors ride the same `Err(String)` typed-failure channel as a handler error (identical retry / circuit-breaker / DLQ handling), and a construction- or poll-time panic is contained as a retryable `HandlerPanic` (issue #782) so the worker never crashes and poison-pill accounting stays intact. Replay-safe by construction: interceptors run only on the live dispatch path, never during history replay, and the value the chain returns is exactly what is recorded. A zero-interceptor default is a byte-for-byte-unchanged direct handler call. A transactional activity (`ctx.run_transactional`) seals its own outcome atomically, so an interceptor observes but cannot transform its recorded result — the worker reads a self-commit flag so a post-interceptor transform can no longer trip the circuit breaker or record `Failed` on a committed `ActivityCompleted`. No new `WorkflowEvent` variant, no migration, no event-schema change.
 
@@ -41,9 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bootstrap loom concurrency model checking for the in-process state machines (PR #1007, testing infra). A contained `cfg(loom)` sync-primitive shim (`src/loom_sync.rs`) and four `#![cfg(loom)]`-gated models (`tests/loom_models.rs`) exhaustively explore the thread interleavings of the per-activity circuit breaker and the worker session-slot registry, proving the generation-fence / half-open-probe / capacity-bound invariants under concurrency. Runs on `workflow_dispatch` only (new `.github/workflows/loom.yml`), never in the required-status matrix. No production behavior change, no new `WorkflowEvent` variant, no migration.
 
 - Add in-place schedule update: `PATCH /api/harvest/admin/schedules/{id}` edits a schedule's cron expression, workflow input, queue, overlap/skip/catchup policies, jitter, calendar, `max_active_runs`, and #478 bounds (`end_at`/`max_runs`) without recreating it (issue #771). Previously the only way to change a schedule's cadence or input was DELETE + re-create, which minted a new `schedule_id` — breaking #488 last-completion-result carryover lineage, severing #534 run history, and opening a missed-fire window between the delete and the re-create. The PATCH is a partial update (only provided fields change; explicit JSON `null` clears a nullable field, absence preserves it), validates the fully merged spec with the create-path validators before any write, and applies inside a single `FOR UPDATE` transaction so an edit can never race a scheduler tick into firing the old spec (a live #350 fire claim returns `409`; an expired claim is fenced; the tick re-reads the fresh row after winning its claim). `workflow_name` is not editable (`400`), unknown body fields are rejected (`400`, `deny_unknown_fields`). Success recomputes `next_run_at` from the new expression anchored at now (never retroactively firing elapsed slots) and reconciles #478 exhaustion in both directions; paused schedules stay paused. New audit op `schedule.update` (route classified Mutating), additive `workflow_input` field on schedule list/get responses, CLI `harvest schedule update <id> [--cron ... --input-json ... --clear-end-at ...]`. No new `WorkflowEvent` variant, zero `harvest_events` writes, no migration.
+
 - Add operator force-fail for a single hung in-flight activity (issue #765). New admin-guarded `POST /workflows/{id}/activities/{activity_exec_id}/fail-now` route and `harvest workflow fail-activity <workflow_id> <activity_exec_id> [--reason <text>]` CLI subcommand complete the per-activity operator toolkit started by `retry-now` (issue #516): where `retry-now` skips a *backing-off* (PENDING) activity's backoff, `fail-now` force-fails an *in-flight* (RUNNING) one — an activity wedged against a dead downstream that will never heartbeat-timeout, or whose remaining retry curve the operator wants to stop dead. Appends `ActivityFailed` with the new stable `ERROR_TYPE_OPERATOR_FORCE_FAILED = "OperatorForceFailed"` error type through the existing recording path, skips every remaining retry attempt (non-retryable by construction), and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path — it is NOT terminated (workflow code can branch on the new `HarvestError::is_operator_force_failed()`). Idempotent: a repeat call on an already-forced task is a zero-write no-op success (`already_forced: true`). Guarded: `409` when the owning execution is already terminal, when the task is not RUNNING (or failed with a genuine non-forced error), when the id names a workflow task, or when history already carries a terminal event for the activity (including legacy `activity_id`-less rows); `404` for unknown ids / wrong workflow / local activities (no task-queue row). The operator-supplied `reason` is truncated server-side to 500 characters (mirroring erase-payloads) before being durably recorded. Audited under `activity.fail_now`. No new `WorkflowEvent` variant, no migration.
+
 - Close the pause/resume operator gaps on top of the issue #383 primitive (issue #609). New CLI subcommands `harvest workflow pause <execution_id> [--reason <text>]` and `harvest workflow resume <execution_id>`, mapping 1:1 onto the existing admin-guarded `POST /workflows/{id}/pause`/`/resume` routes (previously only schedule/DAG pause existed in the CLI). Additive response fields: `paused_at` on the pause response and `newly_resumed` on the resume response (both registered in `docs/api-contract.json`). **Behavior change**: resuming a non-paused (running or terminal) execution is now a `200` success no-op reporting `newly_resumed: false` with a zero pause duration, instead of a `409` — idempotent operator retry, mirroring terminate's `newly_terminated: false` precedent; `404` is kept for unknown ids. Pause now also suspends the per-activity cross-retry `schedule_to_close` clock (issue #378 interaction): the `ScheduleToClose` timeout scanner excludes tasks whose owning execution is `PAUSED` — both ordinary task-queue rows and external (`harvest_external_tasks`) tasks — the worker's retry path requeues instead of deadline-failing while paused and re-validates the row-current deadline under the execution row lock before failing a task terminally (so a concurrent resume's shift is never lost to a stale claim-time snapshot), and resume shifts `schedule_to_close_at` forward by the pause span for still-open task-queue and external-task rows. A `PENDING` activity row whose deadline elapses mid-pause is *frozen* (unclaimable, spared by the scanners) rather than timed out: the `ScheduleToStart` scanner carves out exactly those frozen rows — unfrozen pending activities of a paused execution stay claimable and enforced, and `start_to_close`/`heartbeat_timeout` stay pause-blind — and resume restores a frozen row's `scheduled_at` alongside its deadline so the first post-resume scan doesn't instantly kill it. New operator runbook `docs/runbooks/contain-runaway-execution.md` (pause/cancel/terminate decision matrix, what pause does and does not stop, deadline-shift semantics, the auto-resume ceiling) plus a `runaway-execution-containment` drill in `docs/runbooks/synthetic-incident-drills.md`. No new `WorkflowEvent` variant, no migration.
+
 - Add durable completion callbacks — push terminal results to a URL (issue #605). An embedder starting a workflow from their Autumn app previously had no push notification when it finishes, only `GET /workflows/{id}/result` polling (issue #527). An embedder can now register a completion callback target (URL + `EventFilter`: `CompletedOnly` / `AnyTerminal` / `States([...])`) either as a per-execution `completion_callbacks` start option or a `HarvestBuilder`-wide default (`completion_callback_default`/`_allowlist`/`_allow_http`/`_allow_ip_literals`/`_secret`/`_retry_policy`/`_deliverer`), and Harvest durably POSTs a fixed, HMAC-signed JSON envelope (`{delivery_id, execution_id, workflow_name, workflow_id, state, result?, error?, completed_at}` with `X-Harvest-Signature: sha256=<hex>` + `X-Harvest-Timestamp` headers) the moment the workflow reaches a terminal state. SSRF-guarded by default: HTTPS-only, allowlist-required (exact-host and `*.suffix` wildcard matching, IP-literal loopback/private/link-local/CGNAT/ULA blocking), validated both at registration (a non-allowlisted per-execution target is rejected `422` at the start route; a bad builder default fails `try_build()`) and again at enqueue time against the live policy. Delivery is itself durable execution: a new `harvest_completion_deliveries` table (one row per matched target, frozen envelope + retry-policy snapshot immune to later row mutation/retention) is enqueued inside the same terminal transaction every other terminal side effect already runs in, and a two-transaction shard-local scanner (folded into the existing timeout-checker poll loop — no new background task) retries with backoff (10 attempts, 30s initial, ×2, 600s cap by default) and dead-letters on exhaustion under a new typed `DeadLetterReason::CallbackDeliveryExhausted`. New management routes `GET /workflows/{id}/completion-deliveries` (list) and `POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive` (admin-guarded, audited, idempotent-shaped — resets the same `delivery_id` so a receiver's idempotency key still matches). New CLI: `harvest completion-delivery list <execution_id> [--state ...]` / `redrive <execution_id> <delivery_id>`. Core (`autumn-harvest`) defines a boxed-future `CompletionCallbackDeliverer` trait and ships no HTTP client (mirroring `PayloadStore`/`HistoryArchiver`); the plugin ships a `reqwest`-based default (`redirect::Policy::none()`, since an allowlisted host could otherwise 302 to an internal address and bypass the SSRF guard), auto-wired by `HarvestPlugin`/`HarvestRunner` and overridable. See `docs/completion-callbacks.md`. No new `WorkflowEvent` variant, no replay-determinism impact — `harvest_events` is untouched and a callback-less workflow behaves byte-for-byte identically to before this feature existed.
+
 - Add a first-class inbound HTTP webhook receiver primitive (issue #344). Harvest does not roll its own signature verification, timestamp tolerance, or replay protection — autumn-web 0.5's `[security.webhooks.endpoints]` / `SignedWebhook` layer already does that (Stripe/GitHub/Slack/generic HMAC presets, secret rotation, boot-time fail-fast on a missing/weak secret) — so `#[webhook]` maps an **already-verified** delivery onto a deterministic workflow trigger and dispatches it idempotently. New core module `autumn-harvest/src/webhook_trigger.rs` (`WebhookCtx`, `WebhookTarget::{Starts, SignalsWithStart}`, `WebhookTriggerInfo`, pure `validate_webhook_triggers`), new `#[webhook(path = "…", starts = "…" | signals = "…", signal_name = "…", queue = "…")]` macro + `webhooks![...]` collector (mirroring the `workflows!`/`activities!` family), and a new `autumn-harvest-plugin/src/webhook_receiver.rs` slice behind the existing `webhooks` cargo feature (`HarvestPlugin::webhooks(...)`, app-level route generation mirroring the `mcp_tools.rs` pattern from issue #597). Verification failures propagate autumn-web's own structured error (`401`/`400`/`409`/`503`); payload parse failures and mapping-function rejections return `400` with a distinguishable `error_code` (`parse_failed`/`mapping_rejected`/`missing_idempotency`); dispatch delegates to the existing `start_workflow`/`signal_with_start_workflow` handlers (so schema validation, the admission gate, debounce/SLA/execution-timeout resolution, and audit apply identically to a webhook-triggered start) and reshapes the response into `{"status": "accepted"|"idempotent_replay", "workflow_exec_id", "workflow_id"}` (`202`/`200`). `HarvestPlugin::build` fails fast (panics) on a duplicate binding path or a trigger targeting an unregistered workflow. New metrics `harvest.webhook.received`/`harvest.webhook.rejected` (bounded `path`/`outcome` labels) and audit operation `webhook.trigger` (dispatch attempts only — an unauthenticated sender can't generate audit rows by sending unsigned requests). Doc chapter `docs/getting-started/12-webhooks.md`, example `autumn-harvest-plugin/examples/webhook_receiver_quickstart.rs`. **No new `WorkflowEvent` variant, no migration, no `docs/api-contract.json` change** (webhook binding paths are user-defined app-level routes, invisible to the management-router manifests — same treatment as the MCP tool routes).
 
 - Expose `#[workflow]`s as durable MCP tools (issue #597). A single `#[workflow(mcp)]` opt-in (plus `HarvestPlugin::mcp_tools()` / `mcp_tools_at(prefix)` on the app side, under the new plugin `mcp` cargo feature) projects a workflow onto autumn-web 0.5's MCP layer as a correlated tool set: `start_{wf}` (returns the durable `execution_id` handle immediately — the work survives daemon restarts and does not require the agent to stay connected), `{wf}_status` (state / `current_details` progress / output / error by handle), `signal_{wf}` (async signal delivery, `Idempotency-Key` supported), `{wf}_watch` (streaming progress over MCP `notifications/progress`, driven by the shard's LISTEN/NOTIFY `harvest_events` channel — no polling), and one synchronous `{wf}_update_{name}` tool per `#[update(workflow = "…", mcp)]` handler. The `start_{wf}` tool's `inputSchema` is derived from the workflow's published `input_schema` (issue #373) via a process-global schema map drained by a static `ApiDoc::register_schemas` hook — no second, hand-maintained schema — and start input is validated against it at the tool edge before any storage access. Handlers delegate to the existing management-API primitives; every handle-taking tool verifies the execution belongs to its workflow (uniform 404, no cross-workflow existence oracle). Effectful-by-default safety: exposure is strictly opt-in, the mutating tools are never part of autumn-web's read-only `expose_all_as_mcp` hatch, tool calls replay the caller's credentials through the real handler pipeline (gate the endpoint with `secure_mcp`), and routes fail closed before the runtime starts. Known inherited gap: autumn-web 0.5 derives tool `annotations` from the HTTP verb, so mutating tools carry `readOnlyHint: false` but a literal `destructiveHint: true` is only emitted for DELETE routes — needs an autumn-web change to annotate POST tools. Gap-fills shipped along the way: `HarvestPlugin::updates()`/`queries()` now forward to the builder (previously `#[update]`/`#[query]` handlers could not be registered through the plugin at all), `HarvestBuilder` gains pre-build `workflow_infos()`/`update_handlers()`/`query_handlers()` accessors, and `RegisteredWorkflowRecord` (`GET /workflows/registered`) surfaces the new `mcp` flag (additive response field). New module `autumn-harvest-plugin/src/mcp_tools.rs` (pure descriptor layer + global schema map + route/handler layer), example `autumn-harvest-plugin/examples/mcp_tools_quickstart.rs`, doc page `docs/mcp-tools.md`. Determinism preserved by construction: exposure is an HTTP-edge concern — the `mcp` flag is never consulted by core execution. No new `WorkflowEvent` variant, no migration, no replay-determinism impact.
@@ -88,6 +91,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add workflow-type reachability check to gate safe handler removal (issue #520). New read-only `GET /admin/workflow-types/reachability` endpoint and `harvest workflow-types reachability [--type] [--json]` CLI subcommand report, per workflow type, how many non-terminal executions still depend on its handler and a `safe_to_remove` / `in_use` / `orphaned` verdict. The CLI exits `2` when any type is `orphaned` or the cross-shard answer is incomplete, so it is usable as a CI/deploy gate. No new `WorkflowEvent` variant, no migration.
 
+- Add deadline-aware continue-as-new for long-lived, low-event workflows (issue #772). `ctx.should_continue_as_new()` gains a second, independent trigger: it also returns `true` once a run has consumed a configurable fraction (default 0.8) of its `execution_timeout` budget, so an author can continue-as-new before the hard deadline truncates a healthy run. Additive `WorkflowContext`/replay logic — no new `WorkflowEvent` variant, no migration.
+
+- Add child-or-deadline waits for bounded sub-orchestrations (issue #779). `WorkflowContext::execute_child_workflow_timeout::<O>(info, input, timeout)` (and untyped `spawn_child_workflow_timeout`) bound a child-workflow await with a durable deadline, mirroring `receive_signal_timeout` one level up: `Ok(Some(output))` on child success, `Ok(None)` when the deadline fires first (the still-running child is request-cancelled), and `Err(_)` with the typed failure (#767) preserved on child failure. No new `WorkflowEvent` variant, no migration.
+
+- Add signal & update lifecycle metrics (issue #684). Six new additive no-op-default `MetricsRecorder` counters give first-class, alertable visibility into signal delivery/consumption and the update admit→complete/fail path, bridged in `metrics_rs_adapter`. No new `WorkflowEvent` variant, no migration, no macro-path change.
+
+- Add business-`workflow_id` HTTP addressing for existing workflows (issue #805). Every act-on-existing management route (`GET /workflows/{id}`, `/result`, signal/query/cancel/pause/resume/stack/children) gains a business-id form addressed by `(workflow_name, workflow_id)` alongside the existing `exec_id` routes (which stay byte-for-byte backward compatible), so an embedder can act on a workflow by the id it assigned and always reach the live run rather than a stale continue-as-new/reset predecessor.
+
+- Add the `harvest det-check` CLI, the runnable front door for the `det_check` determinism engine (issue #778). Exposes DET001–DET011 with `--format json`, 1-based columns, and one first-party hop of transitive reachability — flagging a non-deterministic call factored out of a `#[workflow]` body into a first-party helper the body calls directly, via a new `DetFinding.via_helper` attribution. Read-only source analysis: no `WorkflowEvent` variant, no migration, no runtime code touched.
+
+- Add workflow run metadata via `ctx.info()` (issue #698). One read-only, replay-safe accessor returns a `WorkflowExecutionInfo` bundling the run's system metadata (`execution_id`, `workflow_id`, `workflow_type`, `start_time`, `history_event_count`, `is_replaying`, `parent_execution_id`) — the identifiers operator surfaces key on, which author code previously could not read. Leaves zero `harvest_events` footprint. No new `WorkflowEvent` variant, no migration.
+
+- Add the `autumn-harvest-sqlite` companion crate (issue #1068). A new workspace member providing an embedded, single-writer SQLite backend for the workflow engine, targeting edge / local-first deployments; productizes the R&D feasibility spike as a separate companion crate, leaving the Postgres path completely untouched.
+
+- Add WASM-sandboxed polyglot activities inside the Rust worker (issue #965). An R&D spike (not a committed GA feature) proving an activity can run as a WASM-sandboxed, non-Rust module inside the Rust worker.
+
+- Add cause-targeted bulk DLQ replay/discard plus `dlq_reason`/`error_class` aggregate facets (issue #613). `GET /dead-letters/aggregate?group_by=dlq_reason` (or `error_class`) shows a flood's cause shape, and a facet's cause tuple feeds back into `POST /dead-letters/replay|discard` (and `harvest dlq replay/discard --dlq-reason poison_pill`) to act on exactly the counted cohort — a two-call incident runbook.
+
+- Add Vantage UI DAG run-graph page (issue #957) and execution timeline/Gantt page (issue #960), both server-rendered inline SVG in the plugin `ui.rs` (the Workers/DLQ precedent — no JS), read-only except one already-audited mutation. No new backend endpoint, no new `WorkflowEvent` variant, no migration, no core change.
+
+- Add a read-only operator role for least-privilege triage access (issue #776). One builder call promotes `autumn_harvest::audit`'s route classification to authz: a principal marked read-only reaches 100% of `RouteClass::ReadOnly` routes but gets 403 on every `Mutating` management route and every mutating MCP tool — replacing a custom reverse proxy for exposing status dashboards to support/on-call users.
+
+- Add published workflow interaction schema, `/interface` discovery, and boundary validation (issue #610). Extends the #373 input/output schema story to a workflow's signals, queries, and updates: each handler can publish an argument/response JSON Schema and description (new `SignalHandlerInfo`, schema-feature `with_schemas`, `signals![…]` collector, `#[query]`/`#[update]`/`#[signal]` `description =`), surfaced by the new read-only `GET /workflows/registered/{name}/interface`.
+
+- Add workflow start provenance (`StartSource`) across every start path (issue #740). Every execution now durably records what created it and from where, via a new bounded, non-`db`-gated `StartSource` enum (snake_case serialization; `from_str` falls back to `unknown` and never errors) threaded through `StartWorkflowParams`/`NewWorkflowExecution` and stamped at every start path — replacing reverse-engineering of `workflow_id` prefixes and hand-walking `parent_id`.
+
+- Add live workflow output streaming via `ctx.publish_progress` (issue #791). One replay-safe method — `WorkflowContext::publish_progress(chunk: impl Serialize)` — emits an ordered, author-defined business-content chunk from live workflow code, delivered to a subscriber over a new SSE route, so an AI agent / long-running import can push incremental output to a waiting client without an external message bus.
+
+- Add scoped API tokens plus rotation for the management API (issue #942). A first-class least-privilege credential layer: create/list/revoke scoped, optionally-expiring, individually-revocable tokens with every mutating operation attributable to a named actor. Entirely a plugin auth layer plus one additive config-table migration — no new `WorkflowEvent` variant, zero replay-determinism impact, `harvest_events` untouched.
+
+- Add a workflow-type reachability follow-up: representative samples, a top-level orphan summary, and a startup-read boot gate (issue #700). Closes the four re-scoped ACs on the shipped reachability check (#520). No new `WorkflowEvent` variant, no migration, no new route — read-path plus startup-read, entirely additive.
+
+- Add the `harvest new <name> [--path --force --template minimal]` project-scaffolding CLI subcommand (issue #692), generating a runnable starter Harvest project locally.
+
+- Add an auto-heartbeat guard for long-running activities (issue #682), so an activity that runs longer than its `heartbeat_timeout` but makes no manual heartbeat call is not spuriously timed out.
+
+- Add an active-workflow population gauge `harvest.workflow.active` (issue #770), a continuously-sampled gauge of currently-running workflow executions.
+
+- Add durable await of external workflows via `ctx.await_external_workflow` (issue #757), letting a running workflow durably block until an independently-started sibling reaches a terminal state and then read its typed result or terminal cause.
+
+- Add bounded / windowed activity fan-out (issue #750). Four new `WorkflowContext` methods add a `max_in_flight` window `W` to each existing fan-out shape (`execute_activity_fan_out_windowed`/`_collect_windowed`/`_raw_windowed`/`_collect_raw_windowed`), applying natural backpressure to workers and downstreams instead of scheduling every input at once — a pure `context.rs` scheduling change with no new `WorkflowEvent` variant, no migration, no worker/replay change.
+
+- Add a chain-scoped workflow lifetime cap (`chain_execution_timeout`, issue #617), distinct from the per-run `execution_timeout`: anchored at the first run's start and carried verbatim across every continue-as-new so a runaway loop cannot escape it by continuing-as-new, enforced by the existing timeout scanner and `WorkflowExecutionTimedOut` event. No new `WorkflowEvent` variant.
+
+- Add a single-execution replay diagnosis endpoint (issue #614): a new read-only, admin-gated `POST /api/harvest/workflows/{id}/replay-diagnosis` route.
+
+- Add `WorkflowIdConflictPolicy` for idempotent plain workflow starts (issue #685). Splits the overloaded `WorkflowIdReusePolicy` into two orthogonal axes (reuse for terminal priors, conflict for active priors) so an idempotent plain start can express "attach to a currently-running run" without abusing reuse semantics designed for terminal priors.
+
+- Add server-side overdue-schedule detection (issue #696). Since Harvest stores every schedule's `next_run_at` + cadence in Postgres, it now computes "overdue" authoritatively server-side and names which schedule is wedged and how late — replacing the brittle absence-of-runs inference. Read/observability slice over existing columns: no new `WorkflowEvent` variant, no migration.
+
+- Add per-key activity rate limits (issue #699). Extends the static per-activity rate limiter (#332) so an activity's bucket key is resolved per-execution from the workflow input via a dot-path — giving each tenant its own RPS bucket — via a new nested `#[activity(rate_limit(key = "input.tenant_id", rps = 50, burst = 10))]` attribute (rejected at compile time on `local = true` activities); the flat `rate_limit_*` attributes are unchanged.
+
+- Add DAG node input binding to pass data between graph nodes (issue #702). A `#[dag]` node's activity input can now be bound directly to one or more upstream node outputs — one builder call per data edge — so an extract→transform→load pipeline consumes each prior stage's output without flattening into a mega-activity or hand-threading through shared state.
+
+- Add a dry-run preview for batch operations (issue #769). `POST /api/harvest/batch-operations` (the fleet-wide Cancel/Terminate/Signal surface) gains an additive `dry_run: bool` (default false) so an operator sees the exact blast radius (count + a bounded sample) across all shards before committing.
+
+- Add an update admit→terminal latency histogram `harvest.update.duration` (issue #781), recording wall-clock seconds from an update's durable `UpdateAdmitted` to its terminal `UpdateCompleted`/`UpdateFailed` — the p99 latency companion to the #684 counters. No new `WorkflowEvent` variant, no migration, no macro-path change.
+
+- Add an opt-in built-in synthetic liveness canary (issue #796) that continuously probes the live start→dispatch→activity→durable-timer→complete path so a wedged pipeline is detected within one probe interval, with zero operator-authored workflow code — distinct from the #512 replay canary, which validates code changes rather than the running pipeline.
+
+### Changed
+
+- **Behavior change (issue #767):** a failed **child** workflow now surfaces to its parent as `HarvestError::WorkflowFailed` (typed) instead of `HarvestError::ActivityFailed { name: "child-workflow:{name}" }`. The `child-workflow:{name}` name prefix is preserved. Downstream parent code that matched `ActivityFailed` for a child result — or called `.activity_error_type()`/`.activity_details()` on it — must switch to the `WorkflowFailed` variant and the `workflow_error_type()`/`workflow_details()`/`is_workflow_non_retryable()` accessors.
+
+- **Source-breaking additive public fields (issue #767):** `HarvestError::WorkflowFailed`, `WorkflowEvent::WorkflowFailed`, `WorkflowEvent::ChildWorkflowFailed`, `replay::HistoryMatch::Failed`, and `TypedWorkflowResult` each gained new fields (`error_type`/`details`/`non_retryable`, as applicable). Downstream code that exhaustively destructures any of these variants/structs must add `..`.
+
+- Make the admission gate authoritative across all in-process workflow-start producers (issue #618). The #377 gate is now either gated or explicitly, observably exempt on every producer: completion triggers reach the shared gate cache via a new process-global static and a block records a clean, exactly-once resolved-skip (`outcome = 'admission_blocked'`) that never rolls back the source terminal; the outbox relay is exempt-by-design and counts a new `harvest.admission.bypassed{producer}` metric; and `GET /admin/gates` now returns a discoverable per-producer contract. No new `WorkflowEvent` variant, no migration.
+
+- Harden the admission gate on the throttle scanner: fire-time gate check plus reuse-policy-aware batch bypass (issue #1053). The throttle scanner now re-checks the admission gate immediately before firing a deferred start and, on a match, blocks-and-re-defers the row (refunds the reserved token, bumps `deferred_at` for cross-key fairness, counts `harvest.admission.blocked`) — a deliberate contract change so a throttle `202` now means "will run when tokens allow AND the gate is open at fire time"; `throttle` moves from `gated_at_admission` to `gated_at_relay` in the producer contract. No new `WorkflowEvent` variant, no migration.
+
+- Harden `autumn-harvest-sqlite` v0.1 (issue #1068): freeze activity defaults, complete the `WorkflowIdReusePolicy` matrix, and add race fairness. Confined to the `autumn-harvest-sqlite` crate — zero core changes.
+
+- Return partial availability for cross-shard fan-out read endpoints (issue #756). A single unreachable shard no longer turns every cross-shard read into a whole-request `500`; these endpoints now collect-and-continue, returning `200 OK` with the reachable shards' union, a machine-readable `unavailable_shards`, and a `status` verdict. Writes keep strict failure semantics, and the single-execution business-id resolver keeps its `503`-to-avoid-false-`404` behavior.
+
 ### Fixed
 
 - Reject `0.0.0.0/8` and `198.18.0.0/15` callback targets in the completion-callback SSRF guard (issue #605 hardening, PR #1006). The validator previously blocked the bare `0.0.0.0` but not the rest of `0.0.0.0/8` (which routes to localhost on Linux) nor the `198.18.0.0/15` benchmarking range; both are now rejected as `SsrfRejection::IpNotRoutable` (IPv6 v4-mapped forms inherit the fix through the existing canonicalization), closing two IP-literal bypasses surfaced by the new PR #1004 property/fuzz coverage. Validator + tests only — no new rejection code, no `WorkflowEvent` variant, no migration, no API/wire change.
@@ -95,6 +172,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix the workflow `/stack` endpoint's `pending_local_activities` list (PR #1022, issues #773/#608). Three defects, all in the same fold in `autumn-harvest-plugin/src/api.rs`: (1) it read the event's `activity_id`/`name` at the top level of the adjacently-tagged `event_data` envelope instead of under `.data`, so the list was always empty; (2) it never consumed the terminal `LocalActivityExhausted` event, so a caught-and-continued exhausted local activity stayed listed forever; (3) with the read-path decoder (#608) active it decoded a removed entry's `last_failure` before the terminal-remove arm dropped it, writing a spurious `payload.decode_read` audit row for un-surfaced data. Fixed: read under `.data`, treat `LocalActivityExhausted` as a terminal close, and decode `last_failure` only for surviving entries in a single post-fold pass. No public API change, no new `WorkflowEvent` variant, no migration.
 
 - Fix a test-fixture schema omission that reddened `trunk-dev` (PR #1022, issue #767). Two `db_handle_surface` typed-workflow-failure tests built their testcontainers schema from a hand-rolled `INIT_SQL` list that omitted the `20260709000001_harvest_legal_hold` migration (issue #747), so once `WorkflowExecution::as_select()` selected the new `legal_hold_*` columns, loading any execution row errored (`column ... legal_hold_set_at does not exist`) and the handle surfaced `Database(...)` instead of the typed `WorkflowFailed`. Added the missing migration to the include list — test-fixture only, no production code change.
+
+- Fix an inline-resolved mixed timer + external-op wake latency bug (issue #678). A `select!{ timer(3600s), signal_external_workflow(target) }` (or `request_cancel_external_workflow`) whose external target lives on the same shard could park its timer for the full timer duration instead of resolving on the external branch that had already completed.
+
+- Fix two #476 signal-or-deadline race follow-ups ported from the #779 child-timeout twin. A timer-retention leak on signal-win (the still-armed `__signal_timeout` durable timer was left `fired=false` forever, pinning the run against retention) now pushes a gated `CancelRaceLosers` teardown; and a canary-frontier false non-determinism (`match_signal_or_timer`'s `InProgress` arm erroring under strict replay for a parked race) is now suppressed at the canary frontier. Supersedes the stale Phase 3.24 note about the armed timer leaking. No new `WorkflowEvent` variant, no migration.
+
+- Fix an inline-resolved external-op wake bug across every standard mixed-suspension shape (issue #1034, follow-up to #678). A workflow racing `signal_external_workflow`/`request_cancel_external_workflow` against a non-timer branch in one decision cycle, with the target on the same shard, failed to wake on the inline-resolved external terminal (a latency bug, and for one shape an indefinite hang).
+
+- Fix a policy-blind admission-gate bypass on the single-start throttle route (issue #607). The committed-prior idempotent-retry bypass treated any non-sealed prior as an attach, letting a reuse policy that actually creates a fresh replacement (`allow_duplicate_failed_only`/`terminate_if_running`) slip an armed gate via the token-empty deferred path; the bypass is now reuse-policy-aware and skips the gate only when the start will not create a new execution.
+
+- Fix query-replay suspension misclassification so a spinning terminal query returns `408`, not `410` (issue #612). `executor::drive_query_replay` inferred workflow suspension from a custom waker flag assuming `tokio::task::yield_now()` wakes synchronously, but inside a tokio runtime `yield_now` defers its wake to the scheduler — so a genuinely-spinning terminal query was misread as a command-suspension.
+
+- Fix a race-primitive canary replay false-positive on interleaved bookkeeping siblings (issue #1048). A canary replay of an in-flight `wait_for_signal_timeout`/`spawn_child_workflow_timeout` race started concurrently with a bookkeeping side effect incorrectly reported `NonDeterminismDetected`, because the inline canary-frontier guard misread the momentarily-rewound cursor as "not at frontier".
+
+- Fix a pre-existing replay limitation where interleaved sibling terminals broke forward-scan matchers (issue #1071). An ideal, correct history that interleaves a sibling terminal (e.g. a timer-first `tokio::join!(timer, activity)` mixed suspension) next to the event a matcher scans for falsely failed with `NonDeterminismDetected(EarlyCompletion)`; the forward scans now tolerate the interleaved sibling.
+
+- Fix `match_signal` to cross only its own deadline timer during replay (issue #1071 follow-up). The interleaved-sibling arm added in #1084 crossed any reserved `__signal_timeout:*` timer keyed only on the prefix, so a plain `wait_for_signal("a")` racing a `receive_signal_timeout("b", …)` in one batch advanced the cursor past a foreign signal's deadline events without a rewind, causing a spurious strict-replay divergence.
+
+- Enforce the start-route capability-precise admin gate before the fail-closed runtime check (issue #685 follow-up). After #1100 reordered the gate to run after both policy parses (which sit after the runtime check), the no-DB security test regressed; the gate is moved back ahead of the runtime check, restoring the intended ordering (not a live-deployment security hole in a running deployment).
+
+- Fix with-start keyed committed-replay validation ordering (issue #1092 follow-up). `signal_with_start_workflow`/`update_with_start_workflow` ran fresh-start-only validation (payload/schema #610, `start_input` schema #373, the #684 validator) before idempotency dedup, so a retry of an already-committed keyed with-start was rejected `400`/`422` whenever validation had tightened between the original delivery and the retry; an early read-only committed-replay probe now short-circuits to the documented no-op first.
+
+### Internal
+
+- Add a test INIT_SQL bundle migration-drift guard (PR #1031) so a hand-maintained `include_str!` schema bundle that misses a new migration column becomes a hard CI error instead of a runtime-only failure, plus a drift-proof shared schema bundle and fixes for the concrete known gaps. No product-code behavior change.
+
+- Wire three previously-never-run db-gated core integration suites (`workflow_retry_tests`, `completion_callback_tests`, `event_batch_tests`) into Docker-backed CI (PR #1037), fixing 5 test-harness bugs each already contradicted by a passing sibling. No product-code behavior change.
+
+- Replace ~35 copy-pasted per-suite CI `cargo test` steps with one manifest-driven integration-suite runner (`.github/ci/run-suites.sh` + a merge-safe `integration-suites.txt`), so adding a suite is one sorted manifest line with no `ci.yml` edit.
+
+- Document a pre-existing child-timeout hard-cap deadline-cleanup known limitation (PR #1041, follow-up to #1029): if the parent hits its event-history hard cap on the same cycle the deadline branch resolves, the seal bypasses `persist_terminal_outcome_commands` and drops the `CancelRaceLosers` cleanup, leaving the over-deadline child un-cancelled. Docs-only.
+
+- Sweep 87 db-gated integration-test fixtures off hand-rolled `concat!(include_str!(...))` migration bundles onto the paved-path `autumn_harvest::full_migrations_sql()` helper (PR #1045, net −9918 lines), deleting stale bundles that had drifted 8–71 migrations behind. No product-code behavior change.
+
+- Guard against reintroducing hand-rolled migration bundles (PR #1049): a no-DB guard in `migration_hygiene.rs` fails if any test file contains a hand-rolled migration `include_str!` outside a small commented allowlist, making the `full_migrations_sql()` paved path self-enforcing. No product-code behavior change.
+
+- Fix three pre-existing test-harness failures and move the now-green `metrics_integration` suite onto a real CI run row (PR #1050): a stale `FAILED`-vs-nd-`RUNNING` assertion, a microsecond/nanosecond timestamp self-comparison flake, and a nonexistent-column snapshot. No production code changed.
+
+- Heal the batch-route gate-bypass test after the #1085/#1053/#1073 merge burst (PR #1093). Test-code-only.
+
+- Heal two RED `trunk-dev` failures after a merge burst (PR #1094). Tooling only.
+
+- Add `StartSource` fields to the `ui_integration` test literals after the #1095 × #1085 semantic merge conflict (PR #1096). Test-code-only, no production code changed.
+
+- Gate the `webhook_receiver_integration` plugin suite into CI and fix its `TestApp::plugin` deadlock (PR #1097), un-`#[ignore]`ing 5 of 6 tests and wiring the suite into the manifest to run against Docker Postgres. Test-harness change only — no production webhook code touched.
+
+- Add an honest competitor comparison page `docs/comparison.md` (issue #963) positioning autumn-harvest against Temporal, DBOS, Inngest, Hatchet, and Restate, naming harvest's own gaps plainly. Docs-only.
+
+- Publish the admission gate to the process-global cache in the keyed-replay gate test to fix trunk-red (issue #618/#808). Test-only fix — no production code changed.
+
+- De-flake the `nd_blocked_cycle_does_not_emit_signal_unhandled` engine test (Refs #1074). Test-code-only.
 
 ## [0.4.0] - 2026-06-16
 
@@ -258,16 +385,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Issue #227: Typed activity failure surface with error classification (#299)([511ea8e](https://github.com/madmax983/autumn-harvest/commit/511ea8e44c0e2261cdcd53a87a65cf08c0c7c1d2))
 
-
 ### Fixed
 
 - **plugin:** Require auth for cancel and dead-letter endpoints (#316)([50e7c3e](https://github.com/madmax983/autumn-harvest/commit/50e7c3ef092a1f6b49c3c32ea9720fb5bb5389c3))
 
-
 ### Performance
 
 - Pre-allocate markers vector to reduce heap allocations (#290)([23f0796](https://github.com/madmax983/autumn-harvest/commit/23f0796e6d1d441973cd43645b58257d8229fc06))
-
 
 ### Miscellaneous
 
@@ -412,7 +536,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add DAG visualization exporters for Mermaid and DOT (#17)([3cfdec9](https://github.com/madmax983/autumn-harvest/commit/3cfdec96e21f52059ccd09af11f8ed7041aba398))
 
-
 ### Fixed
 
 - Route DLQ UI actions through audited bulk API (#286)([30e01dd](https://github.com/madmax983/autumn-harvest/commit/30e01dd44335e858417f0312f375f626635423a7))
@@ -441,7 +564,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fix retry backoff calculation panic on negative floats and NaN (#16)([6eb93b6](https://github.com/madmax983/autumn-harvest/commit/6eb93b68cd1fa8776595b23b73af479b29c7d733))
 
-
 ### Changed
 
 - **worker:** Extract helper methods from `run_with_listener` (#258)([ba5da61](https://github.com/madmax983/autumn-harvest/commit/ba5da61e6622148a7f4ccec323669cb54f9fc7b7))
@@ -449,7 +571,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Simplify context history matching and worker execution error handling (#116)([f163e67](https://github.com/madmax983/autumn-harvest/commit/f163e6757515e4b78582abf85e649826fb56c131))
 
 - **plugin:** Render Vantage dashboard with maud + autumn-web extractors (#101)([875830e](https://github.com/madmax983/autumn-harvest/commit/875830e51a60407a16dd68d3af488183c1786be4))
-
 
 ### Documentation
 
@@ -467,7 +588,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add Vantage specification for Saga Primitives (#18)([0cc01fe](https://github.com/madmax983/autumn-harvest/commit/0cc01fed2dea12ed2ce076ae230a1fd5d0ee3cf4))
 
-
 ### Testing
 
 - **error:** Add unit tests for HarvestError Display formatting (#215)([d326df5](https://github.com/madmax983/autumn-harvest/commit/d326df50a4e7d6be7142c4bf492567fa3d0d5f6d))
@@ -477,7 +597,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **saga:** Add comprehensive unit tests for Saga compensation logic (#44)([72d5760](https://github.com/madmax983/autumn-harvest/commit/72d5760b1217909d79342ac9a5242bc3a672b57d))
 
 - Improve test coverage for Error, Info, and Saga modules (#40)([48f5a37](https://github.com/madmax983/autumn-harvest/commit/48f5a377dd024b65c2782447fca4407ad3577e2a))
-
 
 ### Miscellaneous
 
@@ -547,7 +666,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **types:** Add WorkflowId, ExecutionId, ActivityExecId, TimerId, WorkerId newtypes([e1b26a7](https://github.com/madmax983/autumn-harvest/commit/e1b26a7ba371fcf07c1d1d5143f0bb2b593f277c))
 
-
 ### Fixed
 
 - **plugin:** Explicitly enable autumn-harvest db feature([2603761](https://github.com/madmax983/autumn-harvest/commit/2603761b1a7008077f51ce5023deff0f023c4ef9))
@@ -576,7 +694,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **types:** Const fn on as_uuid, add as_str to TimerId and WorkerId([5fe02cb](https://github.com/madmax983/autumn-harvest/commit/5fe02cb46f3b8114aa35eabf311731513ddbccd6))
 
-
 ### Documentation
 
 - Add README and crates.io metadata for first publish([74dbbb9](https://github.com/madmax983/autumn-harvest/commit/74dbbb912eb4f3d430c209c1ef98fb36e830785e))
@@ -587,7 +704,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add CLAUDE.md with architecture overview and development guide([48675e7](https://github.com/madmax983/autumn-harvest/commit/48675e777c46cbfa0701477aaccf18a1044dad7b))
 
-
 ### Testing
 
 - Fix clippy doc_markdown warnings in replay tests([2ee4667](https://github.com/madmax983/autumn-harvest/commit/2ee466788daae3300818a5fda85ee3856ceda493))
@@ -597,7 +713,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add replay engine correctness tests including non-determinism detection([c624524](https://github.com/madmax983/autumn-harvest/commit/c6245246344cc3beea5e95da8910ffa065d9b0f9))
 
 - Add end-to-end integration tests for workflow lifecycle([c81bcc7](https://github.com/madmax983/autumn-harvest/commit/c81bcc75effb9db41f6aee875d3786c1ff2109ba))
-
 
 ### Miscellaneous
 

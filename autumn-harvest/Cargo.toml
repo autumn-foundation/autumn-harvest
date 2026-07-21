@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn-harvest"
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
@@ -37,7 +37,7 @@ schema = ["dep:schemars"]
 wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.4.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.5.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
