@@ -693,8 +693,9 @@ pub async fn start_or_load_workflow_execution_collect(
         let row = row;
         let enqueue = enqueue.clone();
         let request = request.clone();
-        // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the inner
-        // `async move` captures them directly from this closure's environment.
+        // `gate`, `metrics`, and `shard_id_value` are all `Copy`, so the
+        // `async |conn|` closure captures them directly from the enclosing
+        // function's environment.
         let mut tx_deferred_checks = Vec::new();
 
         // Authoritative locked gate (issue #618, PR #1014). For every
@@ -1218,7 +1219,7 @@ pub async fn start_or_load_workflow_execution_idempotent(
             Vec<(String, String)>,
         ), HarvestError, _>(async |conn| {
             let request = request;
-            // `gate` and `metrics` are `Copy`; captured directly by the `async move`.
+            // `gate` and `metrics` are `Copy`; captured directly by the `async |conn|` closure.
             match crate::start_idempotency::reserve_start_idempotency(
                 conn,
                 request.workflow_name,

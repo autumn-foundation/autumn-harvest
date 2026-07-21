@@ -42,7 +42,6 @@ diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }
 futures = { workspace = true }
-scoped-futures = "0.1"
 tower = "0.5"
 # Radix-tree route matcher (same crate axum 0.8 uses internally) — the read-only
 # operator role (issue #776) matches a request's nest-stripped path against
