@@ -31,6 +31,9 @@ For a chapter-by-chapter walkthrough — first workflow, durable timers, signals
 child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
 
+Upgrading an existing deployment? See the
+[0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md).
+
 Need a real reference instead of the tiny hello-world path? See:
 
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
