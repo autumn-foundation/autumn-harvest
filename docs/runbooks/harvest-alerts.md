@@ -573,7 +573,7 @@ The response distinguishes `matched` (total filtered), `redriven`,
 ### Verify a redrive
 
 - The owning execution flips `FAILED → RUNNING`
-  (`harvest workflow show <execution_id>`); a single `WorkflowRedriven` event is
+  (`harvest workflow get <execution_id>`); a single `WorkflowRedriven` event is
   appended after the superseded `WorkflowFailed`.
 - The `harvest.dlq.redriven{queue, outcome}` counter increments once per row
   (one of `redriven` / `skipped` / `failed`).
