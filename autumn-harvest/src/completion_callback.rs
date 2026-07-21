@@ -2442,7 +2442,6 @@ async fn apply_outcome(
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
-    use diesel_async::scoped_futures::ScopedFutureExt;
 
     use crate::schema::harvest_completion_deliveries::dsl;
 
@@ -2501,8 +2500,8 @@ async fn apply_outcome(
             last_status,
             last_error,
         } => {
-            conn.transaction::<_, crate::error::HarvestError, _>(|conn| {
-                async move {
+            Box::pin(
+                conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                     let entry =
                         dead_letter_entry_with_current_payload(conn, row, last_status).await?;
 
@@ -2527,9 +2526,8 @@ async fn apply_outcome(
                         crate::dlq::dead_letter(conn, &entry).await?;
                     }
                     Ok(())
-                }
-                .scope_boxed()
-            })
+                }),
+            )
             .await?;
         }
     }
@@ -2883,15 +2881,14 @@ pub async fn redrive_delivery(
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
-    use diesel_async::scoped_futures::ScopedFutureExt;
 
     use crate::schema::harvest_completion_deliveries::dsl;
     use crate::schema::harvest_dead_letters::dsl as dlq_dsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    conn.transaction::<DeliveryRedriveOutcome, crate::error::HarvestError, _>(|conn| {
-        async move {
+    Box::pin(
+        conn.transaction::<DeliveryRedriveOutcome, crate::error::HarvestError, _>(async |conn| {
             let current: Option<(String, i32)> = dsl::harvest_completion_deliveries
                 .find(delivery_id)
                 .filter(dsl::workflow_exec_id.eq(exec_uuid))
@@ -2943,8 +2940,7 @@ pub async fn redrive_delivery(
             .map_err(crate::error::database_error)?;
 
             Ok(DeliveryRedriveOutcome::Redriven)
-        }
-        .scope_boxed()
-    })
+        }),
+    )
     .await
 }

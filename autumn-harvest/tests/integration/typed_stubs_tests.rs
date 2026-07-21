@@ -136,26 +136,24 @@ async fn test_typed_workflow_client_stubs() {
     let exec_id = handle.exec_id();
     let completed_output = serde_json::json!("user 1337: subscription active with value 42");
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let completed_output = completed_output.clone();
-        Box::pin(async move {
-            autumn_harvest::store::append_events(
-                conn,
-                exec_id,
-                &[WorkflowEvent::WorkflowCompleted {
-                    output: completed_output.clone(),
-                }],
-                1,
-            )
-            .await?;
+        autumn_harvest::store::append_events(
+            conn,
+            exec_id,
+            &[WorkflowEvent::WorkflowCompleted {
+                output: completed_output.clone(),
+            }],
+            1,
+        )
+        .await?;
 
-            diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-                .set((dsl::state.eq("COMPLETED"), dsl::output.eq(completed_output)))
-                .execute(conn)
-                .await?;
-            Ok(())
-        })
-    })
+        diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+            .set((dsl::state.eq("COMPLETED"), dsl::output.eq(completed_output)))
+            .execute(conn)
+            .await?;
+        Ok(())
+    }))
     .await
     .unwrap();
 

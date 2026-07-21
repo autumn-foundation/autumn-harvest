@@ -1183,100 +1183,98 @@ async fn run_shard_tick(
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
         let cuts_inner = override_cuts.clone();
-        let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
-            Box::pin(async move {
-                // Push each row's exact per-type effective cutoff into the
-                // predicate (issue #737, PR #990 review): the correlated
-                // `unnest` subquery resolves the override cutoff for this row's
-                // workflow_name, falling through COALESCE to the global cutoff
-                // ($3) or, when there is no global age, to `'-infinity'` — so a
-                // non-overridden never-delete type is never selected. Only
-                // genuinely-eligible rows are returned, so a long-retained
-                // type's not-yet-eligible backlog can neither consume the batch
-                // budget nor starve newer expired rows of a shorter policy.
-                //
-                // Two query-string variants keep the bind numbering unambiguous:
-                // with a global age the fallback is bound as $3; without one it
-                // is the `'-infinity'` literal and the cursor/limit binds shift
-                // down by one.
-                let sql = if global_fallback.is_some() {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
-                     FROM harvest_workflow_executions
-                     WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-                       AND completed_at IS NOT NULL
-                       AND sticky_worker_id IS NULL
-                       AND completed_at < COALESCE(
-                           (SELECT ov.cut
-                              FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
-                             WHERE ov.nm = harvest_workflow_executions.workflow_name),
-                           $3)
-                       AND (
-                           $4 IS NULL
-                           OR completed_at > $4
-                           OR (completed_at = $4 AND id > $5)
-                       )
-                     ORDER BY completed_at ASC, id ASC
-                     LIMIT $6
-                     FOR UPDATE SKIP LOCKED"
-                } else {
-                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
-                     FROM harvest_workflow_executions
-                     WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-                       AND completed_at IS NOT NULL
-                       AND sticky_worker_id IS NULL
-                       AND completed_at < COALESCE(
-                           (SELECT ov.cut
-                              FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
-                             WHERE ov.nm = harvest_workflow_executions.workflow_name),
-                           '-infinity'::timestamptz)
-                       AND (
-                           $3 IS NULL
-                           OR completed_at > $3
-                           OR (completed_at = $3 AND id > $4)
-                       )
-                     ORDER BY completed_at ASC, id ASC
-                     LIMIT $5
-                     FOR UPDATE SKIP LOCKED"
-                };
-                // Bind order maps to $1..$N regardless of textual position. The
-                // override arrays ($1/$2) are always bound; $3 is the global
-                // fallback only in the global-age variant.
-                let query = diesel::sql_query(sql)
-                    .bind::<Array<Text>, _>(names_inner)
-                    .bind::<Array<Timestamptz>, _>(cuts_inner);
-                let rows = if let Some(fallback) = global_fallback {
-                    query
-                        .bind::<Timestamptz, _>(fallback)
-                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                        .load::<CandidateExecution>(conn)
-                        .await
-                } else {
-                    query
-                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                        .load::<CandidateExecution>(conn)
-                        .await
-                }
-                .map_err(database_error)?;
-
-                if !rows.is_empty() {
-                    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
-                    diesel::update(
-                        harvest_workflow_executions::table
-                            .filter(harvest_workflow_executions::id.eq_any(ids)),
-                    )
-                    .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
-                    .execute(conn)
+        let candidates = Box::pin(conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
+            // Push each row's exact per-type effective cutoff into the
+            // predicate (issue #737, PR #990 review): the correlated
+            // `unnest` subquery resolves the override cutoff for this row's
+            // workflow_name, falling through COALESCE to the global cutoff
+            // ($3) or, when there is no global age, to `'-infinity'` — so a
+            // non-overridden never-delete type is never selected. Only
+            // genuinely-eligible rows are returned, so a long-retained
+            // type's not-yet-eligible backlog can neither consume the batch
+            // budget nor starve newer expired rows of a shorter policy.
+            //
+            // Two query-string variants keep the bind numbering unambiguous:
+            // with a global age the fallback is bound as $3; without one it
+            // is the `'-infinity'` literal and the cursor/limit binds shift
+            // down by one.
+            let sql = if global_fallback.is_some() {
+                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
+                 FROM harvest_workflow_executions
+                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                   AND completed_at IS NOT NULL
+                   AND sticky_worker_id IS NULL
+                   AND completed_at < COALESCE(
+                       (SELECT ov.cut
+                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                       $3)
+                   AND (
+                       $4 IS NULL
+                       OR completed_at > $4
+                       OR (completed_at = $4 AND id > $5)
+                   )
+                 ORDER BY completed_at ASC, id ASC
+                 LIMIT $6
+                 FOR UPDATE SKIP LOCKED"
+            } else {
+                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id
+                 FROM harvest_workflow_executions
+                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                   AND completed_at IS NOT NULL
+                   AND sticky_worker_id IS NULL
+                   AND completed_at < COALESCE(
+                       (SELECT ov.cut
+                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                       '-infinity'::timestamptz)
+                   AND (
+                       $3 IS NULL
+                       OR completed_at > $3
+                       OR (completed_at = $3 AND id > $4)
+                   )
+                 ORDER BY completed_at ASC, id ASC
+                 LIMIT $5
+                 FOR UPDATE SKIP LOCKED"
+            };
+            // Bind order maps to $1..$N regardless of textual position. The
+            // override arrays ($1/$2) are always bound; $3 is the global
+            // fallback only in the global-age variant.
+            let query = diesel::sql_query(sql)
+                .bind::<Array<Text>, _>(names_inner)
+                .bind::<Array<Timestamptz>, _>(cuts_inner);
+            let rows = if let Some(fallback) = global_fallback {
+                query
+                    .bind::<Timestamptz, _>(fallback)
+                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    .load::<CandidateExecution>(conn)
                     .await
-                    .map_err(database_error)?;
-                }
+            } else {
+                query
+                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    .load::<CandidateExecution>(conn)
+                    .await
+            }
+            .map_err(database_error)?;
 
-                Ok(rows)
-            })
-        })
+            if !rows.is_empty() {
+                let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+                diesel::update(
+                    harvest_workflow_executions::table
+                        .filter(harvest_workflow_executions::id.eq_any(ids)),
+                )
+                .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            }
+
+            Ok(rows)
+        }))
         .await?;
 
         // Release the checked-out connection immediately back to the pool
@@ -1784,241 +1782,239 @@ async fn delete_candidate_execution(
 ) -> HarvestResult<CandidateDeleteOutcome> {
     // Copy the policy into the transaction closure (it is `Copy`).
     let summary = summary.copied();
-    conn.transaction::<_, HarvestError, _>(|conn| {
-        Box::pin(async move {
-            let mut summarized = false;
-            // ── Authoritative legal-hold re-check under a row lock (issue #747
-            // BLOCKER 1) ─────────────────────────────────────────────────────
-            // The candidate SELECT read the hold columns then committed and
-            // released its lock BEFORE archival + delete, so a hold placed via
-            // `set_legal_hold` in that window would otherwise be missed and the
-            // held execution deleted. Reading the hold columns FOR UPDATE here,
-            // as the FIRST statement of the delete transaction, closes that
-            // window absolutely: it serializes against `set_legal_hold`'s own
-            // locking read/update, so a hold committed before this SELECT is
-            // seen (→ abort the delete), and a hold committing after must wait
-            // for this delete tx to finish — by which point the row is gone and
-            // the operator's `set_legal_hold` observes a missing row (404). If
-            // the hold is active, abort the delete entirely: do NOT touch
-            // payload_refs or blobs.
-            //
-            // Tiered/summary retention (issue #752): when a summary policy is
-            // set, the SAME FOR UPDATE row lock loads the demotion source
-            // columns (identity, timing, shard, search-attrs, and — opt-in —
-            // result/error payload) so the summary INSERT is atomic with the
-            // legal-hold re-check and the delete. There is never a window where
-            // both the execution and its summary are absent, and a rollback
-            // (e.g. a delete error below) discards the summary too, so no
-            // orphan can result. The summary INSERT happens AFTER the hold
-            // re-check (a held row is never summarized) and BEFORE the deletes.
-            if let Some(policy) = summary {
-                let row: Option<SummarySourceRow> = harvest_workflow_executions::table
-                    .find(candidate_id)
-                    .select((
-                        harvest_workflow_executions::legal_hold_set_at,
-                        harvest_workflow_executions::legal_hold_until,
-                        harvest_workflow_executions::workflow_name,
-                        harvest_workflow_executions::workflow_id,
-                        harvest_workflow_executions::state,
-                        harvest_workflow_executions::started_at,
-                        harvest_workflow_executions::completed_at,
-                        harvest_workflow_executions::shard_id,
-                        harvest_workflow_executions::output,
-                        harvest_workflow_executions::error,
-                        harvest_workflow_executions::search_attrs,
-                        harvest_workflow_executions::parent_id,
-                    ))
-                    .for_update()
-                    .first::<SummarySourceRow>(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?;
+    Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        let mut summarized = false;
+        // ── Authoritative legal-hold re-check under a row lock (issue #747
+        // BLOCKER 1) ─────────────────────────────────────────────────────
+        // The candidate SELECT read the hold columns then committed and
+        // released its lock BEFORE archival + delete, so a hold placed via
+        // `set_legal_hold` in that window would otherwise be missed and the
+        // held execution deleted. Reading the hold columns FOR UPDATE here,
+        // as the FIRST statement of the delete transaction, closes that
+        // window absolutely: it serializes against `set_legal_hold`'s own
+        // locking read/update, so a hold committed before this SELECT is
+        // seen (→ abort the delete), and a hold committing after must wait
+        // for this delete tx to finish — by which point the row is gone and
+        // the operator's `set_legal_hold` observes a missing row (404). If
+        // the hold is active, abort the delete entirely: do NOT touch
+        // payload_refs or blobs.
+        //
+        // Tiered/summary retention (issue #752): when a summary policy is
+        // set, the SAME FOR UPDATE row lock loads the demotion source
+        // columns (identity, timing, shard, search-attrs, and — opt-in —
+        // result/error payload) so the summary INSERT is atomic with the
+        // legal-hold re-check and the delete. There is never a window where
+        // both the execution and its summary are absent, and a rollback
+        // (e.g. a delete error below) discards the summary too, so no
+        // orphan can result. The summary INSERT happens AFTER the hold
+        // re-check (a held row is never summarized) and BEFORE the deletes.
+        if let Some(policy) = summary {
+            let row: Option<SummarySourceRow> = harvest_workflow_executions::table
+                .find(candidate_id)
+                .select((
+                    harvest_workflow_executions::legal_hold_set_at,
+                    harvest_workflow_executions::legal_hold_until,
+                    harvest_workflow_executions::workflow_name,
+                    harvest_workflow_executions::workflow_id,
+                    harvest_workflow_executions::state,
+                    harvest_workflow_executions::started_at,
+                    harvest_workflow_executions::completed_at,
+                    harvest_workflow_executions::shard_id,
+                    harvest_workflow_executions::output,
+                    harvest_workflow_executions::error,
+                    harvest_workflow_executions::search_attrs,
+                    harvest_workflow_executions::parent_id,
+                ))
+                .for_update()
+                .first::<SummarySourceRow>(conn)
+                .await
+                .optional()
+                .map_err(database_error)?;
 
-                // `None` = row concurrently deleted: nothing to summarize; the
-                // deletes below are harmless no-ops (matches the hold-only
-                // path's missing-row behavior).
-                if let Some((
-                    set_at,
-                    until,
+            // `None` = row concurrently deleted: nothing to summarize; the
+            // deletes below are harmless no-ops (matches the hold-only
+            // path's missing-row behavior).
+            if let Some((
+                set_at,
+                until,
+                workflow_name,
+                workflow_id,
+                state,
+                started_at,
+                completed_at,
+                shard_id,
+                output,
+                error,
+                search_attrs,
+                parent_id,
+            )) = row
+            {
+                if legal_hold_active(set_at, until, now) {
+                    return Ok(CandidateDeleteOutcome::SkippedHeld);
+                }
+                // completed_at is NOT NULL by the candidate query's WHERE
+                // clause; fall back to started_at defensively so the NOT
+                // NULL summary column always has a value.
+                let completed = completed_at.unwrap_or(started_at);
+                // Clamp at 0: a `completed_at` before `started_at` (clock
+                // skew across nodes) must never produce a negative duration.
+                let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
+                // Payload capture is opt-in (AC3): a policy with capture
+                // disabled leaves result/error NULL.
+                let (result, error_out) = if policy.capture_payload {
+                    (
+                        cap_result_payload(output, policy.max_payload_bytes),
+                        cap_error_text(error.as_deref(), policy.max_payload_bytes),
+                    )
+                } else {
+                    (None, None)
+                };
+                // Codec caveat (issue #752): the summary stores the
+                // `output`/`search_attrs` COLUMNS verbatim — these are
+                // codec-ENCODED at rest (the same columns #608's
+                // `decode_workflow_execution_fields` decodes on read). So
+                // encryption-at-rest is preserved: the longer-retained
+                // summary tier can never hold plaintext that the event
+                // history encrypts.
+                let new_summary = NewExecutionSummary {
+                    execution_id: candidate_id,
                     workflow_name,
                     workflow_id,
                     state,
                     started_at,
-                    completed_at,
+                    completed_at: completed,
+                    duration_ms,
                     shard_id,
-                    output,
-                    error,
                     search_attrs,
+                    result,
+                    error: error_out,
                     parent_id,
-                )) = row
-                {
-                    if legal_hold_active(set_at, until, now) {
-                        return Ok(CandidateDeleteOutcome::SkippedHeld);
-                    }
-                    // completed_at is NOT NULL by the candidate query's WHERE
-                    // clause; fall back to started_at defensively so the NOT
-                    // NULL summary column always has a value.
-                    let completed = completed_at.unwrap_or(started_at);
-                    // Clamp at 0: a `completed_at` before `started_at` (clock
-                    // skew across nodes) must never produce a negative duration.
-                    let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
-                    // Payload capture is opt-in (AC3): a policy with capture
-                    // disabled leaves result/error NULL.
-                    let (result, error_out) = if policy.capture_payload {
-                        (
-                            cap_result_payload(output, policy.max_payload_bytes),
-                            cap_error_text(error.as_deref(), policy.max_payload_bytes),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    // Codec caveat (issue #752): the summary stores the
-                    // `output`/`search_attrs` COLUMNS verbatim — these are
-                    // codec-ENCODED at rest (the same columns #608's
-                    // `decode_workflow_execution_fields` decodes on read). So
-                    // encryption-at-rest is preserved: the longer-retained
-                    // summary tier can never hold plaintext that the event
-                    // history encrypts.
-                    let new_summary = NewExecutionSummary {
-                        execution_id: candidate_id,
-                        workflow_name,
-                        workflow_id,
-                        state,
-                        started_at,
-                        completed_at: completed,
-                        duration_ms,
-                        shard_id,
-                        search_attrs,
-                        result,
-                        error: error_out,
-                        parent_id,
-                    };
-                    // ON CONFLICT DO NOTHING makes the demotion idempotent
-                    // across a retried delete tx.
-                    let inserted = diesel::insert_into(harvest_execution_summaries::table)
-                        .values(&new_summary)
-                        .on_conflict(harvest_execution_summaries::execution_id)
-                        .do_nothing()
-                        .execute(conn)
-                        .await
-                        .map_err(database_error)?;
-                    summarized = inserted > 0;
-                }
-            } else {
-                // Summary retention disabled: byte-for-byte the pre-#752
-                // hold-only re-check.
-                let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
-                    .find(candidate_id)
-                    .select((
-                        harvest_workflow_executions::legal_hold_set_at,
-                        harvest_workflow_executions::legal_hold_until,
-                    ))
-                    .for_update()
-                    .first::<HoldTimestamps>(conn)
+                };
+                // ON CONFLICT DO NOTHING makes the demotion idempotent
+                // across a retried delete tx.
+                let inserted = diesel::insert_into(harvest_execution_summaries::table)
+                    .values(&new_summary)
+                    .on_conflict(harvest_execution_summaries::execution_id)
+                    .do_nothing()
+                    .execute(conn)
                     .await
-                    .optional()
                     .map_err(database_error)?;
-                if let Some((set_at, until)) = hold
-                    && legal_hold_active(set_at, until, now)
-                {
-                    return Ok(CandidateDeleteOutcome::SkippedHeld);
-                }
+                summarized = inserted > 0;
             }
-
-            // Orphan the deleted parent's terminal children so their `parent_id`
-            // does not dangle to a gone row. Tiered/summary retention (issue
-            // #752): when a summary policy is set, this null-out is SKIPPED so
-            // the child→parent lineage survives deletion. A terminal child is
-            // independently retention-eligible and may be summarized in a LATER
-            // transaction than its parent; if we nulled its `parent_id` here,
-            // its own demotion would capture a NULL parent and the #495 PII-erase
-            // cascade (which reaches a demoted child summary via
-            // `harvest_execution_summaries.parent_id`) could never find it.
-            // Preserving the link makes the cascade order-independent regardless
-            // of whether the parent or child is processed first. The retained
-            // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
-            // `should_skip_candidate` only reads `parent_id` downward).
-            if summary.is_none() {
-                diesel::update(
-                    harvest_workflow_executions::table
-                        .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
-                        .filter(harvest_workflow_executions::state.eq_any([
-                            "COMPLETED",
-                            "FAILED",
-                            "CANCELLED",
-                            "TIMED_OUT",
-                            "CONTINUED_AS_NEW",
-                            "TERMINATED",
-                        ])),
-                )
-                .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
-                .execute(conn)
+        } else {
+            // Summary retention disabled: byte-for-byte the pre-#752
+            // hold-only re-check.
+            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
+                .find(candidate_id)
+                .select((
+                    harvest_workflow_executions::legal_hold_set_at,
+                    harvest_workflow_executions::legal_hold_until,
+                ))
+                .for_update()
+                .first::<HoldTimestamps>(conn)
                 .await
+                .optional()
                 .map_err(database_error)?;
+            if let Some((set_at, until)) = hold
+                && legal_hold_active(set_at, until, now)
+            {
+                return Ok(CandidateDeleteOutcome::SkippedHeld);
             }
+        }
 
-            // `task_type = 'CALLBACK'` dead letters (issue #605) are
-            // excluded here (issue #921 review, Codex P2): a CALLBACK
-            // dead-letter row only ever exists for a delivery that reached
-            // `FAILED`, and the completion-deliveries delete just below
-            // deliberately keeps every non-`DELIVERED` (i.e. `FAILED`)
-            // delivery row around for redrive -- deleting its DLQ entry
-            // here would drop it from the `GET /dead-letters` / aggregate
-            // discovery surface while the delivery row itself (and its
-            // redrive path) still exists, breaking the advertised "find
-            // failures via DLQ" operator workflow for any callback failure
-            // that outlives the owning workflow's retention window. A
-            // redrive already deletes its own DLQ row on success, so this
-            // exclusion cannot leak an entry whose delivery was resolved.
-            diesel::delete(
-                harvest_dead_letters::table
-                    .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id)))
-                    .filter(harvest_dead_letters::task_type.ne("CALLBACK")),
-            )
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-
-            // `harvest_completion_deliveries.workflow_exec_id` has no `ON
-            // DELETE CASCADE` (issue #605 code review). Only `DELIVERED`
-            // rows are deleted here — a fully successful delivery has
-            // nothing left to do, so it is safe cleanup exactly like
-            // `harvest_dead_letters` above. A `PENDING`/`INFLIGHT`/`FAILED`
-            // row is deliberately left alone (PR #921 review, Codex): its
-            // `payload` is frozen precisely so delivery does not depend on
-            // the execution row surviving, and this execution reaching its
-            // retention age has no bearing on whether its callback still
-            // needs to be retried or is awaiting an operator's redrive.
-            // Known limitation: once its owning execution is collected, a
-            // surviving non-`DELIVERED` row references a `workflow_exec_id`
-            // that no longer exists (there is no FK to violate, so this is
-            // safe) and this retention pass will never revisit that exact
-            // execution again — so even if the delivery later resolves to
-            // `DELIVERED`, nothing currently deletes it. A future dedicated
-            // delivery-retention policy, scoped to this table's own age/
-            // state rather than its owning execution's, would be needed to
-            // reclaim those rows; out of scope here, where the goal is only
-            // to stop retention from destroying a delivery that hasn't
-            // finished yet.
-            diesel::delete(
-                harvest_completion_deliveries::table
-                    .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id))
-                    .filter(harvest_completion_deliveries::state.eq("DELIVERED")),
-            )
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-
-            diesel::delete(
+        // Orphan the deleted parent's terminal children so their `parent_id`
+        // does not dangle to a gone row. Tiered/summary retention (issue
+        // #752): when a summary policy is set, this null-out is SKIPPED so
+        // the child→parent lineage survives deletion. A terminal child is
+        // independently retention-eligible and may be summarized in a LATER
+        // transaction than its parent; if we nulled its `parent_id` here,
+        // its own demotion would capture a NULL parent and the #495 PII-erase
+        // cascade (which reaches a demoted child summary via
+        // `harvest_execution_summaries.parent_id`) could never find it.
+        // Preserving the link makes the cascade order-independent regardless
+        // of whether the parent or child is processed first. The retained
+        // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
+        // `should_skip_candidate` only reads `parent_id` downward).
+        if summary.is_none() {
+            diesel::update(
                 harvest_workflow_executions::table
-                    .filter(harvest_workflow_executions::id.eq(candidate_id)),
+                    .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
+                    .filter(harvest_workflow_executions::state.eq_any([
+                        "COMPLETED",
+                        "FAILED",
+                        "CANCELLED",
+                        "TIMED_OUT",
+                        "CONTINUED_AS_NEW",
+                        "TERMINATED",
+                    ])),
             )
+            .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
             .execute(conn)
             .await
             .map_err(database_error)?;
-            Ok(CandidateDeleteOutcome::Deleted { summarized })
-        })
-    })
+        }
+
+        // `task_type = 'CALLBACK'` dead letters (issue #605) are
+        // excluded here (issue #921 review, Codex P2): a CALLBACK
+        // dead-letter row only ever exists for a delivery that reached
+        // `FAILED`, and the completion-deliveries delete just below
+        // deliberately keeps every non-`DELIVERED` (i.e. `FAILED`)
+        // delivery row around for redrive -- deleting its DLQ entry
+        // here would drop it from the `GET /dead-letters` / aggregate
+        // discovery surface while the delivery row itself (and its
+        // redrive path) still exists, breaking the advertised "find
+        // failures via DLQ" operator workflow for any callback failure
+        // that outlives the owning workflow's retention window. A
+        // redrive already deletes its own DLQ row on success, so this
+        // exclusion cannot leak an entry whose delivery was resolved.
+        diesel::delete(
+            harvest_dead_letters::table
+                .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id)))
+                .filter(harvest_dead_letters::task_type.ne("CALLBACK")),
+        )
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+        // `harvest_completion_deliveries.workflow_exec_id` has no `ON
+        // DELETE CASCADE` (issue #605 code review). Only `DELIVERED`
+        // rows are deleted here — a fully successful delivery has
+        // nothing left to do, so it is safe cleanup exactly like
+        // `harvest_dead_letters` above. A `PENDING`/`INFLIGHT`/`FAILED`
+        // row is deliberately left alone (PR #921 review, Codex): its
+        // `payload` is frozen precisely so delivery does not depend on
+        // the execution row surviving, and this execution reaching its
+        // retention age has no bearing on whether its callback still
+        // needs to be retried or is awaiting an operator's redrive.
+        // Known limitation: once its owning execution is collected, a
+        // surviving non-`DELIVERED` row references a `workflow_exec_id`
+        // that no longer exists (there is no FK to violate, so this is
+        // safe) and this retention pass will never revisit that exact
+        // execution again — so even if the delivery later resolves to
+        // `DELIVERED`, nothing currently deletes it. A future dedicated
+        // delivery-retention policy, scoped to this table's own age/
+        // state rather than its owning execution's, would be needed to
+        // reclaim those rows; out of scope here, where the goal is only
+        // to stop retention from destroying a delivery that hasn't
+        // finished yet.
+        diesel::delete(
+            harvest_completion_deliveries::table
+                .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id))
+                .filter(harvest_completion_deliveries::state.eq("DELIVERED")),
+        )
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+        diesel::delete(
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::id.eq(candidate_id)),
+        )
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(CandidateDeleteOutcome::Deleted { summarized })
+    }))
     .await
 }
 
@@ -2483,8 +2479,8 @@ mod legal_hold_db {
         // read-modify-write against a concurrent set/release (and against the
         // retention delete-tx re-check), rather than releasing at statement end
         // in autocommit mode.
-        conn.transaction::<LegalHoldOutcome, HarvestError, _>(|conn| {
-            Box::pin(async move {
+        Box::pin(
+            conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
                 let (set_at, until, cur_reason, cur_actor) =
                     load_hold_for_update(conn, exec_id).await?;
 
@@ -2532,8 +2528,8 @@ mod legal_hold_db {
                     newly_held: active,
                     released: false,
                 })
-            })
-        })
+            }),
+        )
         .await
     }
 
@@ -2555,8 +2551,8 @@ mod legal_hold_db {
         // Read + update in one transaction (issue #747 MINOR 1) so the
         // `FOR UPDATE` lock holds across the clear, serializing against a
         // concurrent set/release.
-        conn.transaction::<LegalHoldOutcome, HarvestError, _>(|conn| {
-            Box::pin(async move {
+        Box::pin(
+            conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
                 let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
 
                 let was_set = set_at.is_some();
@@ -2587,8 +2583,8 @@ mod legal_hold_db {
                     newly_held: false,
                     released: was_set,
                 })
-            })
-        })
+            }),
+        )
         .await
     }
 }

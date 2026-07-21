@@ -19,7 +19,6 @@ db = [
     "dep:diesel",
     "dep:diesel-async",
     "dep:diesel_migrations",
-    "dep:scoped-futures",
     "dep:tokio-postgres",
 ]
 testing = []
@@ -61,7 +60,6 @@ deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
-scoped-futures = { version = "0.1", optional = true }
 # 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
 # downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
 tokio-postgres = { version = "0.7.18", optional = true }

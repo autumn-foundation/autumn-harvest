@@ -20,7 +20,6 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
-use scoped_futures::ScopedFutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
@@ -754,73 +753,70 @@ async fn commit_workflow_execution_timeout(
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(ExecutionId, String)>,
 )> {
-    conn.transaction::<(
+    Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
-    ), HarvestError, _>(|conn| {
+    ), HarvestError, _>(async |conn| {
         let timeout_event = timeout_event.clone();
         let error_msg = error_msg.to_owned();
-        async move {
-            // Re-check state under lock to guard against concurrent completion.
-            let current_state: Option<String> = harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .for_update()
-                .select(harvest_workflow_executions::state)
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-
-            match current_state.as_deref() {
-                Some("RUNNING") => {}
-                _ => return Ok((false, Vec::new(), Vec::new())),
-            }
-
-            store::append_single_event(conn, exec_id, timeout_event).await?;
-            update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
-
-            let _rows = diesel::update(
-                harvest_task_queue::table
-                    .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                    .filter(
-                        harvest_task_queue::state
-                            .eq("PENDING")
-                            .or(harvest_task_queue::state.eq("RUNNING")),
-                    ),
-            )
-            .set((
-                harvest_task_queue::state.eq("FAILED"),
-                harvest_task_queue::error.eq(Some(&error_msg)),
-                harvest_task_queue::completed_at.eq(Some(Utc::now())),
-            ))
-            .execute(conn)
+        // Re-check state under lock to guard against concurrent completion.
+        let current_state: Option<String> = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .for_update()
+            .select(harvest_workflow_executions::state)
+            .first(conn)
             .await
+            .optional()
             .map_err(crate::error::database_error)?;
 
-            if let Some(parent_uuid) = parent_uuid {
-                wake_parent_for_child_timeout(
-                    conn,
-                    execution_id_from_uuid(parent_uuid),
-                    exec_id,
-                    &error_msg,
-                )
-                .await?;
-            }
+        match current_state.as_deref() {
+            Some("RUNNING") => {}
+            _ => return Ok((false, Vec::new(), Vec::new())),
+        }
 
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+        store::append_single_event(conn, exec_id, timeout_event).await?;
+        update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+        let _rows = diesel::update(
+            harvest_task_queue::table
+                .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                .filter(
+                    harvest_task_queue::state
+                        .eq("PENDING")
+                        .or(harvest_task_queue::state.eq("RUNNING")),
+                ),
+        )
+        .set((
+            harvest_task_queue::state.eq("FAILED"),
+            harvest_task_queue::error.eq(Some(&error_msg)),
+            harvest_task_queue::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        if let Some(parent_uuid) = parent_uuid {
+            wake_parent_for_child_timeout(
                 conn,
+                execution_id_from_uuid(parent_uuid),
                 exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                metrics,
+                &error_msg,
             )
             .await?;
-            deferred.extend(triggers);
-            Ok((true, deferred, closed_children))
         }
-        .scope_boxed()
-    })
+
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::TimedOut,
+            metrics,
+        )
+        .await?;
+        deferred.extend(triggers);
+        Ok((true, deferred, closed_children))
+    }))
     .await
 }
 
@@ -839,60 +835,54 @@ async fn enforce_activity_timeout(
 
     // Did we actually append a timeout (vs. a no-op because the task already
     // moved on)? Only a real enforcement should count toward the breaker.
-    let enforced = conn
-        .transaction::<bool, HarvestError, _>(|conn| {
-            let error = error.clone();
-            async move {
-                let (execution, history) =
-                    lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
-                let Some((state, row_schedule_to_close_at)) =
-                    task_state_and_deadline_for_update(conn, task.id).await?
-                else {
-                    return Ok(false);
-                };
-                if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
-                    return Ok(false);
-                }
-                // Authoritative PAUSED re-check under the execution row lock
-                // (issue #609 post-review hardening, second bot-review round):
-                // the scan snapshot's PAUSED exclusions are non-locking, so a
-                // pause committing after the scan — or while this transaction
-                // waited on the lock `pause_workflow_execution` itself holds —
-                // must be honoured here or the timeout lands mid-pause. See
-                // `pause_suppresses_timeout_enforcement` for the per-reason
-                // scoping (schedule_to_close always; schedule_to_start only
-                // for a now-frozen row; heartbeat/start-to-close pause-blind).
-                if pause_suppresses_timeout_enforcement(
-                    reason,
-                    &execution.state,
-                    row_schedule_to_close_at,
-                    Utc::now(),
-                ) {
-                    return Ok(false);
-                }
-                let activity_id =
-                    match pending_activity_id_for_task(&history.events, task, activity_name) {
-                        Ok(Some(activity_id)) => activity_id,
-                        Ok(None) => return Ok(false),
-                        Err(missing_error) => {
-                            let fallback = missing_error.to_string();
-                            queue::fail_task(conn, task.id, &fallback).await?;
-                            return Ok(false);
-                        }
-                    };
-                let timeout_event = WorkflowEvent::ActivityTimedOut {
-                    activity_id,
-                    timeout_type: reason.timeout_type(),
-                };
-                store::append_events(conn, exec_id, &[timeout_event], history.next_event_id)
-                    .await?;
-                queue::fail_task(conn, task.id, &error).await?;
-                queue::wake_workflow_task(conn, exec_id).await?;
-                Ok(true)
+    let enforced = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+        let error = error.clone();
+        let (execution, history) =
+            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+        let Some((state, row_schedule_to_close_at)) =
+            task_state_and_deadline_for_update(conn, task.id).await?
+        else {
+            return Ok(false);
+        };
+        if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
+            return Ok(false);
+        }
+        // Authoritative PAUSED re-check under the execution row lock
+        // (issue #609 post-review hardening, second bot-review round):
+        // the scan snapshot's PAUSED exclusions are non-locking, so a
+        // pause committing after the scan — or while this transaction
+        // waited on the lock `pause_workflow_execution` itself holds —
+        // must be honoured here or the timeout lands mid-pause. See
+        // `pause_suppresses_timeout_enforcement` for the per-reason
+        // scoping (schedule_to_close always; schedule_to_start only
+        // for a now-frozen row; heartbeat/start-to-close pause-blind).
+        if pause_suppresses_timeout_enforcement(
+            reason,
+            &execution.state,
+            row_schedule_to_close_at,
+            Utc::now(),
+        ) {
+            return Ok(false);
+        }
+        let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
+            Ok(Some(activity_id)) => activity_id,
+            Ok(None) => return Ok(false),
+            Err(missing_error) => {
+                let fallback = missing_error.to_string();
+                queue::fail_task(conn, task.id, &fallback).await?;
+                return Ok(false);
             }
-            .scope_boxed()
-        })
-        .await?;
+        };
+        let timeout_event = WorkflowEvent::ActivityTimedOut {
+            activity_id,
+            timeout_type: reason.timeout_type(),
+        };
+        store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+        queue::fail_task(conn, task.id, &error).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(true)
+    }))
+    .await?;
 
     // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
     // a protected downstream is a retryable, downstream-style failure that the
@@ -1091,8 +1081,8 @@ pub async fn force_fail_activity(
     let exec_id = execution_id_from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
-    conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(|conn| {
-        async move {
+    Box::pin(
+        conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(async |conn| {
             // Lock ordering (harvest_task_queue convention, see the comment in
             // `enforce_external_task_timeouts`): execution row FIRST, then the
             // task row.
@@ -1147,7 +1137,7 @@ pub async fn force_fail_activity(
             if crate::erase::is_terminal_state(&execution.state) {
                 return Err(HarvestError::Config(format!(
                     "workflow execution {workflow_exec_id} is already terminal ({}); \
-                     its activities cannot be force-failed",
+                 its activities cannot be force-failed",
                     execution.state
                 )));
             }
@@ -1156,20 +1146,20 @@ pub async fn force_fail_activity(
                 ForceFailClassification::AlreadyForced => {
                     unreachable!(
                         "AlreadyForced is short-circuited above, before the \
-                         terminal-execution guard"
+                     terminal-execution guard"
                     );
                 }
                 ForceFailClassification::NotAnActivityTask => {
                     return Err(HarvestError::Config(format!(
                         "task {task_id} is a '{}' task, not an activity task — only \
-                         in-flight activity tasks can be force-failed",
+                     in-flight activity tasks can be force-failed",
                         task.task_type
                     )));
                 }
                 ForceFailClassification::NotRunning => {
                     return Err(HarvestError::Config(format!(
                         "activity task {task_id} is in state '{}', not RUNNING — only \
-                         in-flight (RUNNING) activity tasks can be force-failed",
+                     in-flight (RUNNING) activity tasks can be force-failed",
                         task.state
                     )));
                 }
@@ -1179,7 +1169,7 @@ pub async fn force_fail_activity(
             let Some(activity_name) = task.activity_name.clone() else {
                 return Err(HarvestError::Config(format!(
                     "activity task {task_id} carries no activity_name; its pending \
-                     history event cannot be resolved for a force-fail"
+                 history event cannot be resolved for a force-fail"
                 )));
             };
 
@@ -1247,9 +1237,8 @@ pub async fn force_fail_activity(
                 forced: true,
                 already_forced: false,
             })
-        }
-        .scope_boxed()
-    })
+        }),
+    )
     .await
 }
 
@@ -1265,39 +1254,34 @@ async fn enforce_workflow_timeout(
     let history = store::load_history(conn, exec_id).await?;
     let workflow_event = WorkflowEvent::workflow_failed(error.clone());
 
-    let (deferred_starts, closed_children) = conn
-        .transaction::<_, HarvestError, _>(|conn| {
+    let (deferred_starts, closed_children) =
+        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             let error = error.clone();
-            async move {
-                store::append_events(conn, exec_id, &[workflow_event], history.next_event_id)
-                    .await?;
-                update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-                queue::fail_task(conn, task.id, &error).await?;
-                let (mut deferred, closed_children) =
-                    apply_parent_close_cascade(conn, exec_id).await?;
-                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                Some(metrics),
+            )
+            .await?;
+            deferred.extend(triggers);
+            if execution.parent_close_policy.is_none()
+                && let Some(parent_uuid) = execution.parent_id
+            {
+                wake_parent_for_child_timeout(
                     conn,
+                    execution_id_from_uuid(parent_uuid),
                     exec_id,
-                    crate::completion_trigger::TerminalState::TimedOut,
-                    Some(metrics),
+                    &error,
                 )
                 .await?;
-                deferred.extend(triggers);
-                if execution.parent_close_policy.is_none()
-                    && let Some(parent_uuid) = execution.parent_id
-                {
-                    wake_parent_for_child_timeout(
-                        conn,
-                        execution_id_from_uuid(parent_uuid),
-                        exec_id,
-                        &error,
-                    )
-                    .await?;
-                }
-                Ok((deferred, closed_children))
             }
-            .scope_boxed()
-        })
+            Ok((deferred, closed_children))
+        }))
         .await?;
 
     for start in deferred_starts {
@@ -1412,117 +1396,112 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             timeout_type: TimeoutType::ScheduleToClose,
         };
 
-        let result = conn
-            .transaction::<bool, HarvestError, _>(|conn| {
-                async move {
-                    // Per-table lock-ordering convention (issue #609
-                    // post-review hardening, third bot-review round):
-                    //
-                    //   harvest_external_tasks: task row → execution row
-                    //   harvest_task_queue:     execution row → task row
-                    //
-                    // The external-task completion paths (`external_task.rs`'s
-                    // `complete_externally`/`fail_externally`/`extend_deadline`)
-                    // lock the task row first via `lock_task`, then lock the
-                    // execution row inside `store::append_single_event` — so
-                    // this scanner MUST lock the task row first too. An
-                    // earlier revision took the execution row lock first,
-                    // which was an ABBA inversion against a concurrent
-                    // completion: Postgres deadlock-detects and aborts one of
-                    // the two transactions, surfacing spurious errors to
-                    // valid external-completion callers. (The task-queue
-                    // enforcers — `enforce_activity_timeout`,
-                    // `worker::record_schedule_to_close_activity_timeout` —
-                    // follow the *opposite*, execution-first convention for
-                    // `harvest_task_queue` rows; that is safe because no
-                    // task-queue writer locks the task row and then the
-                    // execution row, e.g. `queue::requeue_for_retry` touches
-                    // only the task row. The one external-task writer that
-                    // must run execution-first — resume's pause-span shift,
-                    // `execution::shift_external_schedule_to_close_on_resume_query`,
-                    // which lives inside the execution-locked resume
-                    // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
-                    // waits on a task row and cannot join a lock cycle.)
-                    //
-                    // The locked re-read below replaces trusting the scan
-                    // snapshot (the pre-fix code re-verified it via filters
-                    // on the claiming UPDATE instead).
-                    let locked_row: Option<(String, chrono::DateTime<Utc>)> =
-                        harvest_external_tasks::table
-                            .find(task_id)
-                            .for_update()
-                            .select((
-                                harvest_external_tasks::state,
-                                harvest_external_tasks::schedule_to_close_at,
-                            ))
-                            .first(conn)
-                            .await
-                            .optional()
-                            .map_err(crate::error::database_error)?;
-                    let Some((task_state, deadline)) = locked_row else {
-                        // Row vanished after the scan (e.g. retention
-                        // cascade-deleted the owning execution): skip.
-                        return Ok(false);
-                    };
-                    // Guard against two races the scan snapshot cannot see:
-                    // 1. complete/fail landed after our scan → state != PENDING
-                    // 2. heartbeat (or a resume's pause-span shift, issue
-                    //    #609) extended the deadline after our scan →
-                    //    schedule_to_close_at is now in the future
-                    // Either way: skip — no flip, no event, not counted.
-                    if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
-                        return Ok(false);
-                    }
+        let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            // Per-table lock-ordering convention (issue #609
+            // post-review hardening, third bot-review round):
+            //
+            //   harvest_external_tasks: task row → execution row
+            //   harvest_task_queue:     execution row → task row
+            //
+            // The external-task completion paths (`external_task.rs`'s
+            // `complete_externally`/`fail_externally`/`extend_deadline`)
+            // lock the task row first via `lock_task`, then lock the
+            // execution row inside `store::append_single_event` — so
+            // this scanner MUST lock the task row first too. An
+            // earlier revision took the execution row lock first,
+            // which was an ABBA inversion against a concurrent
+            // completion: Postgres deadlock-detects and aborts one of
+            // the two transactions, surfacing spurious errors to
+            // valid external-completion callers. (The task-queue
+            // enforcers — `enforce_activity_timeout`,
+            // `worker::record_schedule_to_close_activity_timeout` —
+            // follow the *opposite*, execution-first convention for
+            // `harvest_task_queue` rows; that is safe because no
+            // task-queue writer locks the task row and then the
+            // execution row, e.g. `queue::requeue_for_retry` touches
+            // only the task row. The one external-task writer that
+            // must run execution-first — resume's pause-span shift,
+            // `execution::shift_external_schedule_to_close_on_resume_query`,
+            // which lives inside the execution-locked resume
+            // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
+            // waits on a task row and cannot join a lock cycle.)
+            //
+            // The locked re-read below replaces trusting the scan
+            // snapshot (the pre-fix code re-verified it via filters
+            // on the claiming UPDATE instead).
+            let locked_row: Option<(String, chrono::DateTime<Utc>)> = harvest_external_tasks::table
+                .find(task_id)
+                .for_update()
+                .select((
+                    harvest_external_tasks::state,
+                    harvest_external_tasks::schedule_to_close_at,
+                ))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let Some((task_state, deadline)) = locked_row else {
+                // Row vanished after the scan (e.g. retention
+                // cascade-deleted the owning execution): skip.
+                return Ok(false);
+            };
+            // Guard against two races the scan snapshot cannot see:
+            // 1. complete/fail landed after our scan → state != PENDING
+            // 2. heartbeat (or a resume's pause-span shift, issue
+            //    #609) extended the deadline after our scan →
+            //    schedule_to_close_at is now in the future
+            // Either way: skip — no flip, no event, not counted.
+            if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
+                return Ok(false);
+            }
 
-                    // THEN the execution row lock — the same lock
-                    // `pause_workflow_execution`/`resume_workflow_execution`
-                    // hold — so the PAUSED re-check, the external-task state
-                    // flip, and the event append below all serialize with the
-                    // pause path (issue #609 post-review hardening, second
-                    // bot-review round): the pause-suppression guarantee is
-                    // unchanged by the task-first reordering. A vanished
-                    // execution row (None) proceeds and surfaces as
-                    // `append_single_event`'s NotFound, matching the
-                    // pre-existing behaviour.
-                    let execution_state: Option<String> = harvest_workflow_executions::table
-                        .find(exec_uuid)
-                        .for_update()
-                        .select(harvest_workflow_executions::state)
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                    if execution_state.as_deref().is_some_and(|state| {
-                        pause_suppresses_timeout_enforcement(
-                            &TimeoutReason::ScheduleToClose,
-                            state,
-                            None,
-                            Utc::now(),
-                        )
-                    }) {
-                        // Pause won the race: leave the row PENDING and
-                        // untouched — the resume-time deadline shift covers it.
-                        return Ok(false);
-                    }
+            // THEN the execution row lock — the same lock
+            // `pause_workflow_execution`/`resume_workflow_execution`
+            // hold — so the PAUSED re-check, the external-task state
+            // flip, and the event append below all serialize with the
+            // pause path (issue #609 post-review hardening, second
+            // bot-review round): the pause-suppression guarantee is
+            // unchanged by the task-first reordering. A vanished
+            // execution row (None) proceeds and surfaces as
+            // `append_single_event`'s NotFound, matching the
+            // pre-existing behaviour.
+            let execution_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_uuid)
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            if execution_state.as_deref().is_some_and(|state| {
+                pause_suppresses_timeout_enforcement(
+                    &TimeoutReason::ScheduleToClose,
+                    state,
+                    None,
+                    Utc::now(),
+                )
+            }) {
+                // Pause won the race: leave the row PENDING and
+                // untouched — the resume-time deadline shift covers it.
+                return Ok(false);
+            }
 
-                    // The task row is locked and verified above, so a plain
-                    // flip suffices — no re-filters needed.
-                    diesel::update(harvest_external_tasks::table.find(task_id))
-                        .set((
-                            harvest_external_tasks::state.eq("TIMED_OUT"),
-                            harvest_external_tasks::updated_at.eq(Utc::now()),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
+            // The task row is locked and verified above, so a plain
+            // flip suffices — no re-filters needed.
+            diesel::update(harvest_external_tasks::table.find(task_id))
+                .set((
+                    harvest_external_tasks::state.eq("TIMED_OUT"),
+                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                    store::append_single_event(conn, exec_id, timeout_event).await?;
-                    queue::wake_workflow_task(conn, exec_id).await?;
-                    Ok(true)
-                }
-                .scope_boxed()
-            })
-            .await;
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(true)
+        }))
+        .await;
 
         match result {
             Ok(true) => count += 1,
@@ -1850,201 +1829,198 @@ pub async fn enforce_external_signals_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
-            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(|conn| {
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
+            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                async move {
-                    let sql = "SELECT e.* FROM harvest_events e \
-                               INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                               WHERE e.event_type = 'ExternalSignalRequested' \
-                                 AND execs.state = 'RUNNING' \
-                                 AND execs.shard_id = ANY($1) \
-                                 AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
-                                 AND NOT (e.id = ANY($2)) \
-                                 AND NOT EXISTS ( \
-                                     SELECT 1 FROM harvest_events res \
-                                     WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                       AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
-                                       AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
-                                 ) \
-                               LIMIT 1 \
-                               FOR UPDATE OF e SKIP LOCKED";
+                let sql = "SELECT e.* FROM harvest_events e \
+                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                           WHERE e.event_type = 'ExternalSignalRequested' \
+                             AND execs.state = 'RUNNING' \
+                             AND execs.shard_id = ANY($1) \
+                             AND (e.event_data->'data'->>'signal_id') IS NOT NULL \
+                             AND NOT (e.id = ANY($2)) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM harvest_events res \
+                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                   AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                                   AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                             ) \
+                           LIMIT 1 \
+                           FOR UPDATE OF e SKIP LOCKED";
 
-                    let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
-                        .get_result(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
+                let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                    .get_result(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
 
-                    let Some(row) = row_opt else {
-                        return Ok(None);
-                    };
+                let Some(row) = row_opt else {
+                    return Ok(None);
+                };
 
-                    let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+                let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
 
-                    let event = match codecs.decode_event(row.event_data.clone()) {
-                        Ok(WorkflowEvent::ExternalSignalRequested {
-                            signal_id,
-                            target,
-                            signal_name,
-                            payload,
-                            idempotency_key,
-                        }) => (signal_id, target, signal_name, payload, idempotency_key),
-                        Ok(other) => {
-                            tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
-                            return Ok(Some((false, Some(row.id))));
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "outbox sweep: failed to decode event_data");
-                            return Ok(Some((false, Some(row.id))));
-                        }
-                    };
+                let event = match codecs.decode_event(row.event_data.clone()) {
+                    Ok(WorkflowEvent::ExternalSignalRequested {
+                        signal_id,
+                        target,
+                        signal_name,
+                        payload,
+                        idempotency_key,
+                    }) => (signal_id, target, signal_name, payload, idempotency_key),
+                    Ok(other) => {
+                        tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
+                        return Ok(Some((false, Some(row.id))));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "outbox sweep: failed to decode event_data");
+                        return Ok(Some((false, Some(row.id))));
+                    }
+                };
 
-                    let (signal_id, target, signal_name, payload, idempotency_key) = event;
+                let (signal_id, target, signal_name, payload, idempotency_key) = event;
 
-                    let age = Utc::now() - row.timestamp;
-                    let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                        .map_or(chrono::Duration::MAX, |d| d);
-                    let grace_expired = age > grace_chrono;
+                let age = Utc::now() - row.timestamp;
+                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
+                    .map_or(chrono::Duration::MAX, |d| d);
+                let grace_expired = age > grace_chrono;
 
-                    // A NotFound delivery attempt only becomes a permanent
-                    // `target_unknown` failure once the grace window has elapsed.
-                    // Within the window we leave the row pending (retried next
-                    // sweep) so a target that starts slightly after the request —
-                    // or that the outbox first sees after worker downtime/backlog —
-                    // is still signalled rather than wrongly reported unknown.
-                    let not_found_terminal = || {
-                        grace_expired.then(|| WorkflowEvent::ExternalSignalFailed {
-                            signal_id,
-                            reason_code: "target_unknown".to_string(),
-                        })
-                    };
+                // A NotFound delivery attempt only becomes a permanent
+                // `target_unknown` failure once the grace window has elapsed.
+                // Within the window we leave the row pending (retried next
+                // sweep) so a target that starts slightly after the request —
+                // or that the outbox first sees after worker downtime/backlog —
+                // is still signalled rather than wrongly reported unknown.
+                let not_found_terminal = || {
+                    grace_expired.then(|| WorkflowEvent::ExternalSignalFailed {
+                        signal_id,
+                        reason_code: "target_unknown".to_string(),
+                    })
+                };
 
-                    // Try to route target using the config's sharded pool if configured
-                    let active_sharded_pool = sharded_pool
-                        .clone()
-                        .or_else(|| {
-                            crate::shard::GLOBAL_SHARDED_POOL.read().ok()
-                                .and_then(|lock| lock.clone())
-                        });
-
-                    let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                        if let (Some(t_pool), Some(c_pool)) = (
-                            pool.exact_pool_for_execution(target),
-                            pool.exact_pool_for_execution(caller_exec_id),
-                        ) {
-                            std::ptr::eq(t_pool, c_pool)
-                        } else {
-                            false
-                        }
+                // Try to route target using the config's sharded pool if configured
+                let active_sharded_pool = sharded_pool
+                    .clone()
+                    .or_else(|| {
+                        crate::shard::GLOBAL_SHARDED_POOL.read().ok()
+                            .and_then(|lock| lock.clone())
                     });
 
-                    let terminal_opt = if same_pool {
-                        match crate::signal::send_signal_idempotent(
-                            conn,
-                            target,
-                            &signal_name,
-                            payload.clone(),
-                            idempotency_key.as_deref(),
-                        )
-                        .await
-                        {
-                            // Delivered or deduped (idempotency-key collision):
-                            // both mean the signal landed exactly once.
-                            Ok(_delivered_or_deduped) => {
-                                Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
-                            }
-                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                            Err(HarvestError::Database(e)) => {
-                                tracing::error!(error = %e, "outbox sweep: db error during local signal delivery");
-                                None
-                            }
-                            Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                                signal_id,
-                                reason_code: "target_terminal".to_string(),
-                            }),
-                        }
+                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                    if let (Some(t_pool), Some(c_pool)) = (
+                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for_execution(caller_exec_id),
+                    ) {
+                        std::ptr::eq(t_pool, c_pool)
                     } else {
-                        // Different pools, so we must have a target_pool resolved
-                        let Some(pool) = active_sharded_pool
-                            .as_ref()
-                            .and_then(|p| p.exact_pool_for_execution(target))
-                        else {
-                            tracing::warn!(
-                                target_shard = %target.shard(),
-                                "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
-                            );
+                        false
+                    }
+                });
+
+                let terminal_opt = if same_pool {
+                    match crate::signal::send_signal_idempotent(
+                        conn,
+                        target,
+                        &signal_name,
+                        payload.clone(),
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    {
+                        // Delivered or deduped (idempotency-key collision):
+                        // both mean the signal landed exactly once.
+                        Ok(_delivered_or_deduped) => {
+                            Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                        }
+                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(error = %e, "outbox sweep: db error during local signal delivery");
+                            None
+                        }
+                        Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                            signal_id,
+                            reason_code: "target_terminal".to_string(),
+                        }),
+                    }
+                } else {
+                    // Different pools, so we must have a target_pool resolved
+                    let Some(pool) = active_sharded_pool
+                        .as_ref()
+                        .and_then(|p| p.exact_pool_for_execution(target))
+                    else {
+                        tracing::warn!(
+                            target_shard = %target.shard(),
+                            "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
+                        );
+                        return Ok(Some((false, Some(row.id))));
+                    };
+
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
                             return Ok(Some((false, Some(row.id))));
-                        };
-
-                        let mut target_conn = match pool.get().await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::error!(error = %e, "outbox sweep: failed to acquire target connection");
-                                return Ok(Some((false, Some(row.id))));
-                            }
-                        };
-
-                        match crate::signal::send_signal_idempotent(
-                            &mut target_conn,
-                            target,
-                            &signal_name,
-                            payload.clone(),
-                            idempotency_key.as_deref(),
-                        )
-                        .await
-                        {
-                            // Delivered or deduped (idempotency-key collision):
-                            // both mean the signal landed exactly once.
-                            Ok(_delivered_or_deduped) => {
-                                Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
-                            }
-                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                            Err(HarvestError::Database(e)) => {
-                                tracing::error!(error = %e, "outbox sweep: db error during remote signal delivery");
-                                None
-                            }
-                            Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                                signal_id,
-                                reason_code: "target_terminal".to_string(),
-                            }),
                         }
                     };
 
-                    if let Some(terminal_event) = terminal_opt {
-                        let outcome = match &terminal_event {
-                            WorkflowEvent::ExternalSignalDelivered { .. } => "delivered",
-                            _ => "failed",
-                        };
-                        let reason_code = match &terminal_event {
-                            WorkflowEvent::ExternalSignalFailed {
-                                reason_code, ..
-                            } => Some(reason_code.clone()),
-                            _ => None,
-                        };
-
-                        let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                        store::append_events(
-                            conn,
-                            caller_exec_id,
-                            &[terminal_event],
-                            history.next_event_id,
-                        )
-                        .await?;
-                        queue::wake_workflow_task(conn, caller_exec_id).await?;
-
-                        metrics.record_external_signal_sent(outcome, reason_code.as_deref());
-                        Ok(Some((true, None)))
-                    } else {
-                        Ok(Some((false, Some(row.id))))
+                    match crate::signal::send_signal_idempotent(
+                        &mut target_conn,
+                        target,
+                        &signal_name,
+                        payload.clone(),
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    {
+                        // Delivered or deduped (idempotency-key collision):
+                        // both mean the signal landed exactly once.
+                        Ok(_delivered_or_deduped) => {
+                            Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                        }
+                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(error = %e, "outbox sweep: db error during remote signal delivery");
+                            None
+                        }
+                        Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                            signal_id,
+                            reason_code: "target_terminal".to_string(),
+                        }),
                     }
+                };
+
+                if let Some(terminal_event) = terminal_opt {
+                    let outcome = match &terminal_event {
+                        WorkflowEvent::ExternalSignalDelivered { .. } => "delivered",
+                        _ => "failed",
+                    };
+                    let reason_code = match &terminal_event {
+                        WorkflowEvent::ExternalSignalFailed {
+                            reason_code, ..
+                        } => Some(reason_code.clone()),
+                        _ => None,
+                    };
+
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    store::append_events(
+                        conn,
+                        caller_exec_id,
+                        &[terminal_event],
+                        history.next_event_id,
+                    )
+                    .await?;
+                    queue::wake_workflow_task(conn, caller_exec_id).await?;
+
+                    metrics.record_external_signal_sent(outcome, reason_code.as_deref());
+                    Ok(Some((true, None)))
+                } else {
+                    Ok(Some((false, Some(row.id))))
                 }
-                .scope_boxed()
-            })
+            }))
             .await;
 
         match step_res {
@@ -2114,203 +2090,200 @@ pub async fn enforce_external_cancels_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = conn
-            .transaction::<Option<CancelStepOutcome>, HarvestError, _>(|conn| {
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = Box::pin(conn
+            .transaction::<Option<CancelStepOutcome>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                async move {
-                    let sql = "SELECT e.* FROM harvest_events e \
-                               INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                               WHERE e.event_type = 'ExternalCancelRequested' \
-                                 AND execs.state = 'RUNNING' \
-                                 AND execs.shard_id = ANY($1) \
-                                 AND (e.event_data->'data'->>'cancel_id') IS NOT NULL \
-                                 AND NOT (e.id = ANY($2)) \
-                                 AND NOT EXISTS ( \
-                                     SELECT 1 FROM harvest_events res \
-                                     WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                       AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
-                                       AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
-                                 ) \
-                               LIMIT 1 \
-                               FOR UPDATE OF e SKIP LOCKED";
+                let sql = "SELECT e.* FROM harvest_events e \
+                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                           WHERE e.event_type = 'ExternalCancelRequested' \
+                             AND execs.state = 'RUNNING' \
+                             AND execs.shard_id = ANY($1) \
+                             AND (e.event_data->'data'->>'cancel_id') IS NOT NULL \
+                             AND NOT (e.id = ANY($2)) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM harvest_events res \
+                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                   AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
+                                   AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
+                             ) \
+                           LIMIT 1 \
+                           FOR UPDATE OF e SKIP LOCKED";
 
-                    let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
-                        .get_result(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
+                let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                    .get_result(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
 
-                    let Some(row) = row_opt else {
-                        return Ok(None);
-                    };
+                let Some(row) = row_opt else {
+                    return Ok(None);
+                };
 
-                    let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+                let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
 
-                    let (cancel_id, target) = match codecs.decode_event(row.event_data.clone()) {
-                        Ok(WorkflowEvent::ExternalCancelRequested { cancel_id, target }) => {
-                            (cancel_id, target)
-                        }
-                        Ok(other) => {
-                            tracing::error!(event = ?other, "cancel outbox sweep: query returned non-ExternalCancelRequested event");
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "cancel outbox sweep: failed to decode event_data");
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
-                        }
-                    };
+                let (cancel_id, target) = match codecs.decode_event(row.event_data.clone()) {
+                    Ok(WorkflowEvent::ExternalCancelRequested { cancel_id, target }) => {
+                        (cancel_id, target)
+                    }
+                    Ok(other) => {
+                        tracing::error!(event = ?other, "cancel outbox sweep: query returned non-ExternalCancelRequested event");
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "cancel outbox sweep: failed to decode event_data");
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                    }
+                };
 
-                    let age = Utc::now() - row.timestamp;
-                    let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                        .map_or(chrono::Duration::MAX, |d| d);
-                    let grace_expired = age > grace_chrono;
+                let age = Utc::now() - row.timestamp;
+                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
+                    .map_or(chrono::Duration::MAX, |d| d);
+                let grace_expired = age > grace_chrono;
 
-                    // A NotFound delivery attempt only becomes a permanent
-                    // `target_unknown` failure once the grace window has elapsed.
-                    // Within the window we leave the row pending (retried next
-                    // sweep) so a target that starts slightly after the request —
-                    // or that the outbox first sees after worker downtime/backlog —
-                    // is still cancelled rather than wrongly reported unknown.
-                    // (issue #492)
-                    let not_found_terminal = || {
-                        grace_expired.then(|| WorkflowEvent::ExternalCancelFailed {
-                            cancel_id,
-                            reason_code: "target_unknown".to_string(),
-                        })
-                    };
+                // A NotFound delivery attempt only becomes a permanent
+                // `target_unknown` failure once the grace window has elapsed.
+                // Within the window we leave the row pending (retried next
+                // sweep) so a target that starts slightly after the request —
+                // or that the outbox first sees after worker downtime/backlog —
+                // is still cancelled rather than wrongly reported unknown.
+                // (issue #492)
+                let not_found_terminal = || {
+                    grace_expired.then(|| WorkflowEvent::ExternalCancelFailed {
+                        cancel_id,
+                        reason_code: "target_unknown".to_string(),
+                    })
+                };
 
-                    let active_sharded_pool = sharded_pool
-                        .clone()
-                        .or_else(|| {
-                            crate::shard::GLOBAL_SHARDED_POOL.read().ok()
-                                .and_then(|lock| lock.clone())
-                        });
-
-                    let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                        if let (Some(t_pool), Some(c_pool)) = (
-                            pool.exact_pool_for_execution(target),
-                            pool.exact_pool_for_execution(caller_exec_id),
-                        ) {
-                            std::ptr::eq(t_pool, c_pool)
-                        } else {
-                            false
-                        }
+                let active_sharded_pool = sharded_pool
+                    .clone()
+                    .or_else(|| {
+                        crate::shard::GLOBAL_SHARDED_POOL.read().ok()
+                            .and_then(|lock| lock.clone())
                     });
 
-                    // Completion-trigger / cascade follow-up starts + terminal
-                    // metrics from a same-pool cancellation, spawned/recorded only
-                    // after this step transaction commits (issue #492). The
-                    // cross-shard branch cancels on an independent target
-                    // connection, so its triggers spawn correctly against that
-                    // connection's own committed transaction and need no deferral.
-                    let mut deferred_starts: Vec<
-                        crate::completion_trigger::DeferredTriggerStart,
-                    > = Vec::new();
-                    let mut cancel_metrics: Vec<(String, String)> = Vec::new();
-                    let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
-
-                    let terminal_opt = if same_pool {
-                        match cancel_workflow_execution_collect(
-                            conn,
-                            target,
-                            "cancelled by external request",
-                        )
-                        .await
-                        {
-                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                            Err(HarvestError::Database(e)) => {
-                                tracing::error!(error = %e, "cancel outbox sweep: db error");
-                                None
-                            }
-                            Ok((_cancelled, deferred, checks, metrics_opt)) => {
-                                deferred_starts.extend(deferred);
-                                deferred_checks.extend(checks);
-                                if let Some(m) = metrics_opt {
-                                    cancel_metrics.push(m);
-                                }
-                                Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                            }
-                            // Other Err (already terminal) = no-op success.
-                            Err(_) => {
-                                Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                            }
-                        }
+                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                    if let (Some(t_pool), Some(c_pool)) = (
+                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for_execution(caller_exec_id),
+                    ) {
+                        std::ptr::eq(t_pool, c_pool)
                     } else {
-                        let Some(pool) = active_sharded_pool
-                            .as_ref()
-                            .and_then(|p| p.exact_pool_for_execution(target))
-                        else {
-                            tracing::warn!(
-                                target_shard = %target.shard(),
-                                "cancel outbox sweep: target shard not configured locally; skipping"
-                            );
+                        false
+                    }
+                });
+
+                // Completion-trigger / cascade follow-up starts + terminal
+                // metrics from a same-pool cancellation, spawned/recorded only
+                // after this step transaction commits (issue #492). The
+                // cross-shard branch cancels on an independent target
+                // connection, so its triggers spawn correctly against that
+                // connection's own committed transaction and need no deferral.
+                let mut deferred_starts: Vec<
+                    crate::completion_trigger::DeferredTriggerStart,
+                > = Vec::new();
+                let mut cancel_metrics: Vec<(String, String)> = Vec::new();
+                let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
+
+                let terminal_opt = if same_pool {
+                    match cancel_workflow_execution_collect(
+                        conn,
+                        target,
+                        "cancelled by external request",
+                    )
+                    .await
+                    {
+                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(error = %e, "cancel outbox sweep: db error");
+                            None
+                        }
+                        Ok((_cancelled, deferred, checks, metrics_opt)) => {
+                            deferred_starts.extend(deferred);
+                            deferred_checks.extend(checks);
+                            if let Some(m) = metrics_opt {
+                                cancel_metrics.push(m);
+                            }
+                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                        }
+                        // Other Err (already terminal) = no-op success.
+                        Err(_) => {
+                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                        }
+                    }
+                } else {
+                    let Some(pool) = active_sharded_pool
+                        .as_ref()
+                        .and_then(|p| p.exact_pool_for_execution(target))
+                    else {
+                        tracing::warn!(
+                            target_shard = %target.shard(),
+                            "cancel outbox sweep: target shard not configured locally; skipping"
+                        );
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                    };
+
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
                             return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
-                        };
-
-                        let mut target_conn = match pool.get().await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
-                                return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
-                            }
-                        };
-
-                        match cancel_workflow_execution(
-                            &mut target_conn,
-                            target,
-                            "cancelled by external request",
-                            metrics,
-                        )
-                        .await
-                        {
-                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                            Err(HarvestError::Database(e)) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "cancel outbox sweep: db error (remote shard)"
-                                );
-                                None
-                            }
-                            // Ok or other Err (already terminal) = no-op success.
-                            Ok(_) | Err(_) => {
-                                Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                            }
                         }
                     };
 
-                    if let Some(terminal_event) = terminal_opt {
-                        let outcome = match &terminal_event {
-                            WorkflowEvent::ExternalCancelDelivered { .. } => "delivered",
-                            _ => "failed",
-                        };
-                        let reason_code = match &terminal_event {
-                            WorkflowEvent::ExternalCancelFailed { reason_code, .. } => {
-                                Some(reason_code.clone())
-                            }
-                            _ => None,
-                        };
-
-                        let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                        store::append_events(
-                            conn,
-                            caller_exec_id,
-                            &[terminal_event],
-                            history.next_event_id,
-                        )
-                        .await?;
-                        queue::wake_workflow_task(conn, caller_exec_id).await?;
-                        metrics.record_external_cancel_sent(outcome, reason_code.as_deref());
-                        Ok(Some((true, None, deferred_starts, cancel_metrics, deferred_checks)))
-                    } else {
-                        Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks)))
+                    match cancel_workflow_execution(
+                        &mut target_conn,
+                        target,
+                        "cancelled by external request",
+                        metrics,
+                    )
+                    .await
+                    {
+                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(
+                                error = %e,
+                                "cancel outbox sweep: db error (remote shard)"
+                            );
+                            None
+                        }
+                        // Ok or other Err (already terminal) = no-op success.
+                        Ok(_) | Err(_) => {
+                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                        }
                     }
+                };
+
+                if let Some(terminal_event) = terminal_opt {
+                    let outcome = match &terminal_event {
+                        WorkflowEvent::ExternalCancelDelivered { .. } => "delivered",
+                        _ => "failed",
+                    };
+                    let reason_code = match &terminal_event {
+                        WorkflowEvent::ExternalCancelFailed { reason_code, .. } => {
+                            Some(reason_code.clone())
+                        }
+                        _ => None,
+                    };
+
+                    let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    store::append_events(
+                        conn,
+                        caller_exec_id,
+                        &[terminal_event],
+                        history.next_event_id,
+                    )
+                    .await?;
+                    queue::wake_workflow_task(conn, caller_exec_id).await?;
+                    metrics.record_external_cancel_sent(outcome, reason_code.as_deref());
+                    Ok(Some((true, None, deferred_starts, cancel_metrics, deferred_checks)))
+                } else {
+                    Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks)))
                 }
-                .scope_boxed()
-            })
+            }))
             .await;
 
         match step_res {
@@ -2391,204 +2364,201 @@ pub async fn enforce_external_awaits_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
-            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(|conn| {
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
+            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
-                async move {
-                    let sql = "SELECT e.* FROM harvest_events e \
-                               INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
-                               WHERE e.event_type = 'ExternalAwaitRequested' \
-                                 AND execs.state = 'RUNNING' \
-                                 AND execs.shard_id = ANY($1) \
-                                 AND (e.event_data->'data'->>'await_id') IS NOT NULL \
-                                 AND NOT (e.id = ANY($2)) \
-                                 AND NOT EXISTS ( \
-                                     SELECT 1 FROM harvest_events res \
-                                     WHERE res.workflow_exec_id = e.workflow_exec_id \
-                                       AND res.event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed') \
-                                       AND res.event_data->'data'->>'await_id' = e.event_data->'data'->>'await_id' \
-                                 ) \
-                               LIMIT 1 \
-                               FOR UPDATE OF e SKIP LOCKED";
+                let sql = "SELECT e.* FROM harvest_events e \
+                           INNER JOIN harvest_workflow_executions execs ON e.workflow_exec_id = execs.id \
+                           WHERE e.event_type = 'ExternalAwaitRequested' \
+                             AND execs.state = 'RUNNING' \
+                             AND execs.shard_id = ANY($1) \
+                             AND (e.event_data->'data'->>'await_id') IS NOT NULL \
+                             AND NOT (e.id = ANY($2)) \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM harvest_events res \
+                                 WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                   AND res.event_type IN ('ExternalAwaitResolved', 'ExternalAwaitFailed') \
+                                   AND res.event_data->'data'->>'await_id' = e.event_data->'data'->>'await_id' \
+                             ) \
+                           LIMIT 1 \
+                           FOR UPDATE OF e SKIP LOCKED";
 
-                    let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
-                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
-                        .get_result(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
+                let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                    .get_result(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
 
-                    let Some(row) = row_opt else {
-                        return Ok(None);
-                    };
+                let Some(row) = row_opt else {
+                    return Ok(None);
+                };
 
-                    let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+                let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
 
-                    let (await_id, target) = match codecs.decode_event(row.event_data.clone()) {
-                        Ok(WorkflowEvent::ExternalAwaitRequested { await_id, target }) => {
-                            (await_id, target)
-                        }
-                        Ok(other) => {
-                            tracing::error!(event = ?other, "await outbox sweep: query returned non-ExternalAwaitRequested event");
-                            return Ok(Some((false, Some(row.id))));
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "await outbox sweep: failed to decode event_data");
-                            return Ok(Some((false, Some(row.id))));
-                        }
-                    };
+                let (await_id, target) = match codecs.decode_event(row.event_data.clone()) {
+                    Ok(WorkflowEvent::ExternalAwaitRequested { await_id, target }) => {
+                        (await_id, target)
+                    }
+                    Ok(other) => {
+                        tracing::error!(event = ?other, "await outbox sweep: query returned non-ExternalAwaitRequested event");
+                        return Ok(Some((false, Some(row.id))));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "await outbox sweep: failed to decode event_data");
+                        return Ok(Some((false, Some(row.id))));
+                    }
+                };
 
-                    let age = Utc::now() - row.timestamp;
-                    let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
-                        .map_or(chrono::Duration::MAX, |d| d);
-                    let grace_expired = age > grace_chrono;
+                let age = Utc::now() - row.timestamp;
+                let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
+                    .map_or(chrono::Duration::MAX, |d| d);
+                let grace_expired = age > grace_chrono;
 
-                    let active_sharded_pool = sharded_pool
-                        .clone()
-                        .or_else(|| {
-                            crate::shard::GLOBAL_SHARDED_POOL.read().ok()
-                                .and_then(|lock| lock.clone())
-                        });
-
-                    let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
-                        if let (Some(t_pool), Some(c_pool)) = (
-                            pool.exact_pool_for_execution(target),
-                            pool.exact_pool_for_execution(caller_exec_id),
-                        ) {
-                            std::ptr::eq(t_pool, c_pool)
-                        } else {
-                            false
-                        }
+                let active_sharded_pool = sharded_pool
+                    .clone()
+                    .or_else(|| {
+                        crate::shard::GLOBAL_SHARDED_POOL.read().ok()
+                            .and_then(|lock| lock.clone())
                     });
 
-                    // Map the reader's 3-state result to the awaiter's terminal
-                    // event, if any. The reader distinguishes NotYetTerminal from
-                    // NotFound directly, so no separate existence probe is needed:
-                    // NotFound only becomes a permanent `target_unknown` once the
-                    // grace window elapses (matching the cancel outbox, issue #492).
-                    let resolve =
-                        |result: crate::execution::ExternalAwaitReadResult| -> Option<WorkflowEvent> {
-                            use crate::execution::{ExternalAwaitOutcome, ExternalAwaitReadResult};
-                            match result {
-                                ExternalAwaitReadResult::Terminal(
-                                    ExternalAwaitOutcome::Completed(output),
-                                ) => Some(WorkflowEvent::ExternalAwaitResolved { await_id, output }),
-                                ExternalAwaitReadResult::Terminal(
-                                    ExternalAwaitOutcome::Terminal {
-                                        reason_code,
-                                        message,
-                                        error_type,
-                                        details,
-                                        non_retryable,
-                                    },
-                                ) => Some(WorkflowEvent::ExternalAwaitFailed {
-                                    await_id,
+                let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
+                    if let (Some(t_pool), Some(c_pool)) = (
+                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for_execution(caller_exec_id),
+                    ) {
+                        std::ptr::eq(t_pool, c_pool)
+                    } else {
+                        false
+                    }
+                });
+
+                // Map the reader's 3-state result to the awaiter's terminal
+                // event, if any. The reader distinguishes NotYetTerminal from
+                // NotFound directly, so no separate existence probe is needed:
+                // NotFound only becomes a permanent `target_unknown` once the
+                // grace window elapses (matching the cancel outbox, issue #492).
+                let resolve =
+                    |result: crate::execution::ExternalAwaitReadResult| -> Option<WorkflowEvent> {
+                        use crate::execution::{ExternalAwaitOutcome, ExternalAwaitReadResult};
+                        match result {
+                            ExternalAwaitReadResult::Terminal(
+                                ExternalAwaitOutcome::Completed(output),
+                            ) => Some(WorkflowEvent::ExternalAwaitResolved { await_id, output }),
+                            ExternalAwaitReadResult::Terminal(
+                                ExternalAwaitOutcome::Terminal {
                                     reason_code,
                                     message,
                                     error_type,
                                     details,
                                     non_retryable,
-                                }),
-                                // Still running/paused → pending (retry next sweep).
-                                ExternalAwaitReadResult::NotYetTerminal => None,
-                                // Not found → `target_unknown` only after grace.
-                                ExternalAwaitReadResult::NotFound => {
-                                    grace_expired.then(|| WorkflowEvent::ExternalAwaitFailed {
-                                        await_id,
-                                        reason_code: "target_unknown".to_string(),
-                                        message: None,
-                                        error_type: None,
-                                        details: None,
-                                        non_retryable: None,
-                                    })
-                                }
+                                },
+                            ) => Some(WorkflowEvent::ExternalAwaitFailed {
+                                await_id,
+                                reason_code,
+                                message,
+                                error_type,
+                                details,
+                                non_retryable,
+                            }),
+                            // Still running/paused → pending (retry next sweep).
+                            ExternalAwaitReadResult::NotYetTerminal => None,
+                            // Not found → `target_unknown` only after grace.
+                            ExternalAwaitReadResult::NotFound => {
+                                grace_expired.then(|| WorkflowEvent::ExternalAwaitFailed {
+                                    await_id,
+                                    reason_code: "target_unknown".to_string(),
+                                    message: None,
+                                    error_type: None,
+                                    details: None,
+                                    non_retryable: None,
+                                })
                             }
-                        };
-
-                    // Read the target's outcome on the correct connection. A
-                    // transient DB read error must NOT propagate — that would
-                    // abort the whole `enforce_timeouts_once` sweep for this tick
-                    // (starving completion-triggers/debounce/throttle, which run
-                    // after this pass). Mirror the cancel outbox: log and leave
-                    // the row pending so the sweep continues and retries next
-                    // tick (issue #757 review, P2-b).
-                    let read_result = if same_pool {
-                        match crate::execution::read_external_await_outcome(conn, target).await {
-                            Ok(r) => r,
-                            Err(HarvestError::Database(e)) => {
-                                tracing::error!(error = %e, "await outbox sweep: db error reading target; leaving pending");
-                                return Ok(Some((false, Some(row.id))));
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    } else {
-                        let Some(pool) = active_sharded_pool
-                            .as_ref()
-                            .and_then(|p| p.exact_pool_for_execution(target))
-                        else {
-                            tracing::warn!(
-                                target_shard = %target.shard(),
-                                "await outbox sweep: target shard not configured locally; skipping"
-                            );
-                            return Ok(Some((false, Some(row.id))));
-                        };
-                        let mut target_conn = match pool.get().await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::error!(error = %e, "await outbox sweep: failed to acquire target connection");
-                                return Ok(Some((false, Some(row.id))));
-                            }
-                        };
-                        match crate::execution::read_external_await_outcome(&mut target_conn, target)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(HarvestError::Database(e)) => {
-                                tracing::error!(error = %e, "await outbox sweep: db error reading target (remote shard); leaving pending");
-                                return Ok(Some((false, Some(row.id))));
-                            }
-                            Err(e) => return Err(e),
                         }
                     };
 
-                    let terminal_opt = resolve(read_result);
-
-                    if let Some(terminal_event) = terminal_opt {
-                        // Take the awaiter row lock — the SAME serialization point
-                        // the inline path uses — then re-check history for a
-                        // terminal already recorded for this await_id (issue #757
-                        // review, P1): the inline re-park path may have resolved it
-                        // between our claim-time NOT EXISTS filter and this lock.
-                        // If present, skip the duplicate append (the inline path
-                        // owns the awaiter's own wake/resolution).
-                        let history =
-                            lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                        let already_resolved = history.events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
-                            | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
-                            _ => false,
-                        });
-                        if already_resolved {
+                // Read the target's outcome on the correct connection. A
+                // transient DB read error must NOT propagate — that would
+                // abort the whole `enforce_timeouts_once` sweep for this tick
+                // (starving completion-triggers/debounce/throttle, which run
+                // after this pass). Mirror the cancel outbox: log and leave
+                // the row pending so the sweep continues and retries next
+                // tick (issue #757 review, P2-b).
+                let read_result = if same_pool {
+                    match crate::execution::read_external_await_outcome(conn, target).await {
+                        Ok(r) => r,
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(error = %e, "await outbox sweep: db error reading target; leaving pending");
                             return Ok(Some((false, Some(row.id))));
                         }
-                        store::append_events(
-                            conn,
-                            caller_exec_id,
-                            &[terminal_event],
-                            history.next_event_id,
-                        )
-                        .await?;
-                        queue::wake_workflow_task(conn, caller_exec_id).await?;
-                        Ok(Some((true, None)))
-                    } else {
-                        Ok(Some((false, Some(row.id))))
+                        Err(e) => return Err(e),
                     }
+                } else {
+                    let Some(pool) = active_sharded_pool
+                        .as_ref()
+                        .and_then(|p| p.exact_pool_for_execution(target))
+                    else {
+                        tracing::warn!(
+                            target_shard = %target.shard(),
+                            "await outbox sweep: target shard not configured locally; skipping"
+                        );
+                        return Ok(Some((false, Some(row.id))));
+                    };
+                    let mut target_conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "await outbox sweep: failed to acquire target connection");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                    };
+                    match crate::execution::read_external_await_outcome(&mut target_conn, target)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(HarvestError::Database(e)) => {
+                            tracing::error!(error = %e, "await outbox sweep: db error reading target (remote shard); leaving pending");
+                            return Ok(Some((false, Some(row.id))));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                let terminal_opt = resolve(read_result);
+
+                if let Some(terminal_event) = terminal_opt {
+                    // Take the awaiter row lock — the SAME serialization point
+                    // the inline path uses — then re-check history for a
+                    // terminal already recorded for this await_id (issue #757
+                    // review, P1): the inline re-park path may have resolved it
+                    // between our claim-time NOT EXISTS filter and this lock.
+                    // If present, skip the duplicate append (the inline path
+                    // owns the awaiter's own wake/resolution).
+                    let history =
+                        lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
+                    let already_resolved = history.events.iter().any(|e| match e {
+                        WorkflowEvent::ExternalAwaitResolved { await_id: a, .. }
+                        | WorkflowEvent::ExternalAwaitFailed { await_id: a, .. } => *a == await_id,
+                        _ => false,
+                    });
+                    if already_resolved {
+                        return Ok(Some((false, Some(row.id))));
+                    }
+                    store::append_events(
+                        conn,
+                        caller_exec_id,
+                        &[terminal_event],
+                        history.next_event_id,
+                    )
+                    .await?;
+                    queue::wake_workflow_task(conn, caller_exec_id).await?;
+                    Ok(Some((true, None)))
+                } else {
+                    Ok(Some((false, Some(row.id))))
                 }
-                .scope_boxed()
-            })
+            }))
             .await;
 
         match step_res {
@@ -2754,8 +2724,8 @@ pub async fn enforce_timeouts_once(
     // in `conn.transaction(...)` keeps every advisory-xact lock alive until the
     // transaction commits.
     count += conn
-        .transaction::<usize, HarvestError, _>(|conn| {
-            async move { crate::mutex::reclaim_expired_leases_and_wake(conn).await }.scope_boxed()
+        .transaction::<usize, HarvestError, _>(async |conn| {
+            crate::mutex::reclaim_expired_leases_and_wake(conn).await
         })
         .await?;
     Ok(count)
@@ -2905,87 +2875,84 @@ pub async fn enforce_workflow_history_ceiling(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
-        let (applied, deferred_starts, closed_children) = conn
-            .transaction::<(
+        let (applied, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
-            ), HarvestError, _>(|conn| {
+            ), HarvestError, _>(async |conn| {
                 let fail_event = fail_event.clone();
                 let error_msg = error_msg.clone();
-                async move {
-                    // Re-check state under FOR UPDATE to guard against concurrent
-                    // completion or a duplicate scanner tick.
-                    let current_state: Option<String> = harvest_workflow_executions::table
-                        .find(row.id)
-                        .for_update()
-                        .select(harvest_workflow_executions::state)
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
+                // Re-check state under FOR UPDATE to guard against concurrent
+                // completion or a duplicate scanner tick.
+                let current_state: Option<String> = harvest_workflow_executions::table
+                    .find(row.id)
+                    .for_update()
+                    .select(harvest_workflow_executions::state)
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
 
-                    if current_state.as_deref() != Some("RUNNING") {
-                        return Ok((false, Vec::new(), Vec::new()));
-                    }
+                if current_state.as_deref() != Some("RUNNING") {
+                    return Ok((false, Vec::new(), Vec::new()));
+                }
 
-                    store::append_single_event(conn, exec_id, fail_event).await?;
+                store::append_single_event(conn, exec_id, fail_event).await?;
 
-                    // Transition to FAILED state.
-                    diesel::update(harvest_workflow_executions::table.find(row.id))
-                        .set((
-                            harvest_workflow_executions::state.eq("FAILED"),
-                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                            harvest_workflow_executions::error.eq(Some(error_msg.clone())),
-                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-
-                    // Cancel outstanding task queue rows.
-                    diesel::update(
-                        harvest_task_queue::table
-                            .filter(harvest_task_queue::workflow_exec_id.eq(row.id))
-                            .filter(
-                                harvest_task_queue::state
-                                    .eq("PENDING")
-                                    .or(harvest_task_queue::state.eq("RUNNING")),
-                            ),
-                    )
+                // Transition to FAILED state.
+                diesel::update(harvest_workflow_executions::table.find(row.id))
                     .set((
-                        harvest_task_queue::state.eq("FAILED"),
-                        harvest_task_queue::error.eq(Some(&error_msg)),
-                        harvest_task_queue::completed_at.eq(Some(Utc::now())),
+                        harvest_workflow_executions::state.eq("FAILED"),
+                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                        harvest_workflow_executions::error.eq(Some(error_msg.clone())),
+                        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
                     ))
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
 
-                    if let Some(parent_uuid) = parent_uuid {
-                        wake_parent_for_child_timeout(
-                            conn,
-                            execution_id_from_uuid(parent_uuid),
-                            exec_id,
-                            &error_msg,
-                        )
-                        .await?;
-                    }
+                // Cancel outstanding task queue rows.
+                diesel::update(
+                    harvest_task_queue::table
+                        .filter(harvest_task_queue::workflow_exec_id.eq(row.id))
+                        .filter(
+                            harvest_task_queue::state
+                                .eq("PENDING")
+                                .or(harvest_task_queue::state.eq("RUNNING")),
+                        ),
+                )
+                .set((
+                    harvest_task_queue::state.eq("FAILED"),
+                    harvest_task_queue::error.eq(Some(&error_msg)),
+                    harvest_task_queue::completed_at.eq(Some(Utc::now())),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                    let (mut deferred, closed_children) =
-                        apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                if let Some(parent_uuid) = parent_uuid {
+                    wake_parent_for_child_timeout(
                         conn,
+                        execution_id_from_uuid(parent_uuid),
                         exec_id,
-                        crate::completion_trigger::TerminalState::Failed,
-                        Some(metrics),
+                        &error_msg,
                     )
                     .await?;
-                    deferred.extend(triggers);
-                    Ok((true, deferred, closed_children))
                 }
-                .scope_boxed()
-            })
+
+                let (mut deferred, closed_children) =
+                    apply_parent_close_cascade(conn, exec_id).await?;
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Failed,
+                    Some(metrics),
+                )
+                .await?;
+                deferred.extend(triggers);
+                Ok((true, deferred, closed_children))
+            }))
             .await?;
 
         if !applied {

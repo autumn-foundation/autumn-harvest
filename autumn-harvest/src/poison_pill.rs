@@ -108,7 +108,6 @@ mod scanner {
     use diesel_async::AsyncConnection;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
-    use scoped_futures::ScopedFutureExt;
     use tokio_util::sync::CancellationToken;
 
     use super::{ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision};
@@ -171,57 +170,54 @@ mod scanner {
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
 
-        conn.transaction::<bool, HarvestError, _>(|conn| {
-            async move {
-                let Some(worker_id) = worker else {
-                    return Ok(false);
-                };
-                // Lock the row and re-verify it is still the same orphan.
-                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
-                    .find(task_id)
-                    .for_update()
-                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                match current {
-                    Some((state, Some(wid), strikes))
-                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                    _ => return Ok(false),
-                }
-                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                    return Ok(false);
-                }
-
-                diesel::update(dsl::harvest_task_queue.find(task_id))
-                    .set((
-                        dsl::state.eq("PENDING"),
-                        dsl::worker_id.eq(None::<String>),
-                        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-                        dsl::sticky_worker_id.eq(None::<String>),
-                        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-                        // Clear the dead attempt's heartbeat timestamp so the
-                        // fresh attempt is not immediately timed out by the
-                        // COALESCE(last_heartbeat_at, started_at) scanner.
-                        // heartbeat_details is preserved so a retry can still
-                        // read the last flushed checkpoint.
-                        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-                        // Clear the previous error: crashes don't leave a
-                        // meaningful error string, and the stale message from an
-                        // earlier clean failure would otherwise appear as
-                        // previous_failure() on the next attempt.
-                        dsl::error.eq(None::<String>),
-                        dsl::crash_strikes.eq(new_strikes),
-                        dsl::scheduled_at.eq(Utc::now()),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                Ok(true)
+        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            let Some(worker_id) = worker else {
+                return Ok(false);
+            };
+            // Lock the row and re-verify it is still the same orphan.
+            let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                .find(task_id)
+                .for_update()
+                .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            match current {
+                Some((state, Some(wid), strikes))
+                    if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
+                _ => return Ok(false),
             }
-            .scope_boxed()
-        })
+            if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                return Ok(false);
+            }
+
+            diesel::update(dsl::harvest_task_queue.find(task_id))
+                .set((
+                    dsl::state.eq("PENDING"),
+                    dsl::worker_id.eq(None::<String>),
+                    dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+                    dsl::sticky_worker_id.eq(None::<String>),
+                    dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+                    // Clear the dead attempt's heartbeat timestamp so the
+                    // fresh attempt is not immediately timed out by the
+                    // COALESCE(last_heartbeat_at, started_at) scanner.
+                    // heartbeat_details is preserved so a retry can still
+                    // read the last flushed checkpoint.
+                    dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+                    // Clear the previous error: crashes don't leave a
+                    // meaningful error string, and the stale message from an
+                    // earlier clean failure would otherwise appear as
+                    // previous_failure() on the next attempt.
+                    dsl::error.eq(None::<String>),
+                    dsl::crash_strikes.eq(new_strikes),
+                    dsl::scheduled_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Ok(true)
+        }))
         .await
     }
 
@@ -443,66 +439,61 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
-        let (acted, failed_workflow, deferred_starts, closed_children) = conn
-            .transaction::<(
+        let (acted, failed_workflow, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
-            ), HarvestError, _>(|conn| {
-                async move {
-                    let Some(worker_id) = worker else {
-                        return Ok((false, None, Vec::new(), Vec::new()));
-                    };
-                    let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
-                        .find(task_id)
-                        .for_update()
-                        .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                    match current {
-                        Some((state, Some(wid), strikes))
-                            if state == "RUNNING"
-                                && wid == worker_id
-                                && strikes == prior_strikes => {}
-                        _ => return Ok((false, None, Vec::new(), Vec::new())),
-                    }
-                    if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                        return Ok((false, None, Vec::new(), Vec::new()));
-                    }
-
-                    dead_letter(conn, &entry).await?;
-
-                    diesel::update(dsl::harvest_task_queue.find(task_id))
-                        .set((
-                            dsl::state.eq("FAILED"),
-                            dsl::worker_id.eq(None::<String>),
-                            dsl::crash_strikes.eq(new_strikes),
-                            dsl::error.eq(Some(error.clone())),
-                            dsl::completed_at.eq(Some(Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-
-                    let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
-                        Some(exec_uuid) => {
-                            fail_owning_workflow(
-                                conn,
-                                execution_id_from_uuid(exec_uuid),
-                                &error,
-                                Some(metrics),
-                            )
-                            .await?
-                        }
-                        None => (None, Vec::new(), Vec::new()),
-                    };
-                    Ok((true, failed_workflow, deferred, closed_children))
+            ), HarvestError, _>(async |conn| {
+                let Some(worker_id) = worker else {
+                    return Ok((false, None, Vec::new(), Vec::new()));
+                };
+                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                    .find(task_id)
+                    .for_update()
+                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                match current {
+                    Some((state, Some(wid), strikes))
+                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
+                    _ => return Ok((false, None, Vec::new(), Vec::new())),
                 }
-                .scope_boxed()
-            })
+                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                    return Ok((false, None, Vec::new(), Vec::new()));
+                }
+
+                dead_letter(conn, &entry).await?;
+
+                diesel::update(dsl::harvest_task_queue.find(task_id))
+                    .set((
+                        dsl::state.eq("FAILED"),
+                        dsl::worker_id.eq(None::<String>),
+                        dsl::crash_strikes.eq(new_strikes),
+                        dsl::error.eq(Some(error.clone())),
+                        dsl::completed_at.eq(Some(Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
+                    Some(exec_uuid) => {
+                        fail_owning_workflow(
+                            conn,
+                            execution_id_from_uuid(exec_uuid),
+                            &error,
+                            Some(metrics),
+                        )
+                        .await?
+                    }
+                    None => (None, Vec::new(), Vec::new()),
+                };
+                Ok((true, failed_workflow, deferred, closed_children))
+            }))
             .await?;
 
         if acted {

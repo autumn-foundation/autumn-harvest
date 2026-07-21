@@ -1190,92 +1190,90 @@ async fn fire_due_on_conn(
 
     // Claim + fire + delete the whole due batch in one transaction so each
     // `FOR UPDATE SKIP LOCKED` lock is held until its row is deleted (or left).
-    let fired: Vec<FiredThrottle> = conn
-        .transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(|conn| {
-            Box::pin(async move {
-                let now = Utc::now();
-                // Per-key-fair claim (code review P1, issue #607): a flat
-                // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
-                // large backlog monopolize every scanner tick (its rows are
-                // always the globally oldest), starving newer rows under other
-                // keys indefinitely. The `candidates` CTE caps how many rows a
-                // single `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
-                // before the outer LIMIT applies. Postgres forbids `FOR UPDATE`
-                // in the same query block as a window function, so the lock
-                // must be taken on the outer, window-function-free SELECT
-                // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
-                // `candidates` is pre-filtered to rows that are actually
-                // examinable this tick -- either already past their
-                // `schedule_to_start` deadline (must be examined so AC-c can
-                // time them out), or whose bucket's *snapshot* token level
-                // (`LEAST(burst, tokens + elapsed*refill_rate)`) currently
-                // shows >= 1.0 available (a genuinely exhausted bucket is
-                // excluded from the candidate set entirely, at any scale --
-                // code review, issue #607). Without this pre-filter, enough
-                // concurrently-exhausted keys can permanently occupy the
-                // entire batch with rows that can never fire regardless of
-                // ordering: this round's earlier fix (rank-then-date
-                // ordering) only bounded the damage to the first
-                // `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys --
-                // beyond that many, their rank-1 rows alone still fill the
-                // whole budget on every tick, starving a ready key forever.
-                // A row whose bucket happens to be missing (a data anomaly;
-                // `reserve_or_defer` always creates the bucket before
-                // inserting the pending row, so this should not occur in
-                // practice) is conservatively still treated as a candidate,
-                // matching this query's pre-existing behavior for that case
-                // -- `try_consume_rate_limit_token` naturally leaves it
-                // parked (not deleted) when there is truly no bucket to debit.
-                // `selected` then orders the *pre-filtered* candidates by
-                // per-key rank first, `deferred_at` second, still capping
-                // one key at `THROTTLE_FIRE_PER_KEY_CAP` so several
-                // simultaneously-ready keys share the batch fairly. Postgres
-                // forbids `FOR UPDATE` in the same query block as a window
-                // function, so the lock must be taken on the outer,
-                // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
-                // `FOR UPDATE`).
-                let due_sql = "
-                    WITH candidates AS (
-                        SELECT t.id, t.deferred_at,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY t.bucket_key ORDER BY t.deferred_at ASC
-                               ) AS rn
-                        FROM harvest_start_throttle t
-                        LEFT JOIN harvest_rate_limit_buckets b ON b.key = t.bucket_key
-                        WHERE (t.expires_at IS NOT NULL AND t.expires_at < NOW())
-                           OR b.key IS NULL
-                           OR LEAST(
-                                  b.burst,
-                                  b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate
-                              ) >= 1.0
-                    ),
-                    selected AS (
-                        SELECT id FROM candidates WHERE rn <= $1
-                        ORDER BY rn ASC, deferred_at ASC LIMIT $2
-                    )
-                    SELECT t.id, t.workflow_name, t.throttle_key, t.bucket_key, t.workflow_id,
-                           t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id
+    let fired: Vec<FiredThrottle> = Box::pin(conn
+        .transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(async |conn| {
+            let now = Utc::now();
+            // Per-key-fair claim (code review P1, issue #607): a flat
+            // `ORDER BY deferred_at ASC LIMIT N` lets one throttle key with a
+            // large backlog monopolize every scanner tick (its rows are
+            // always the globally oldest), starving newer rows under other
+            // keys indefinitely. The `candidates` CTE caps how many rows a
+            // single `bucket_key` can contribute (THROTTLE_FIRE_PER_KEY_CAP)
+            // before the outer LIMIT applies. Postgres forbids `FOR UPDATE`
+            // in the same query block as a window function, so the lock
+            // must be taken on the outer, window-function-free SELECT
+            // (`FOR UPDATE OF t`, not a bare `FOR UPDATE`).
+            // `candidates` is pre-filtered to rows that are actually
+            // examinable this tick -- either already past their
+            // `schedule_to_start` deadline (must be examined so AC-c can
+            // time them out), or whose bucket's *snapshot* token level
+            // (`LEAST(burst, tokens + elapsed*refill_rate)`) currently
+            // shows >= 1.0 available (a genuinely exhausted bucket is
+            // excluded from the candidate set entirely, at any scale --
+            // code review, issue #607). Without this pre-filter, enough
+            // concurrently-exhausted keys can permanently occupy the
+            // entire batch with rows that can never fire regardless of
+            // ordering: this round's earlier fix (rank-then-date
+            // ordering) only bounded the damage to the first
+            // `THROTTLE_FIRE_BATCH_SIZE` distinct exhausted keys --
+            // beyond that many, their rank-1 rows alone still fill the
+            // whole budget on every tick, starving a ready key forever.
+            // A row whose bucket happens to be missing (a data anomaly;
+            // `reserve_or_defer` always creates the bucket before
+            // inserting the pending row, so this should not occur in
+            // practice) is conservatively still treated as a candidate,
+            // matching this query's pre-existing behavior for that case
+            // -- `try_consume_rate_limit_token` naturally leaves it
+            // parked (not deleted) when there is truly no bucket to debit.
+            // `selected` then orders the *pre-filtered* candidates by
+            // per-key rank first, `deferred_at` second, still capping
+            // one key at `THROTTLE_FIRE_PER_KEY_CAP` so several
+            // simultaneously-ready keys share the batch fairly. Postgres
+            // forbids `FOR UPDATE` in the same query block as a window
+            // function, so the lock must be taken on the outer,
+            // window-function-free SELECT (`FOR UPDATE OF t`, not a bare
+            // `FOR UPDATE`).
+            let due_sql = "
+                WITH candidates AS (
+                    SELECT t.id, t.deferred_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY t.bucket_key ORDER BY t.deferred_at ASC
+                           ) AS rn
                     FROM harvest_start_throttle t
-                    JOIN selected s ON s.id = t.id
-                    ORDER BY t.deferred_at ASC
-                    FOR UPDATE OF t SKIP LOCKED
-                ";
-                let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                    .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
-                    .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
-                    .load(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                    LEFT JOIN harvest_rate_limit_buckets b ON b.key = t.bucket_key
+                    WHERE (t.expires_at IS NOT NULL AND t.expires_at < NOW())
+                       OR b.key IS NULL
+                       OR LEAST(
+                              b.burst,
+                              b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate
+                          ) >= 1.0
+                ),
+                selected AS (
+                    SELECT id FROM candidates WHERE rn <= $1
+                    ORDER BY rn ASC, deferred_at ASC LIMIT $2
+                )
+                SELECT t.id, t.workflow_name, t.throttle_key, t.bucket_key, t.workflow_id,
+                       t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id
+                FROM harvest_start_throttle t
+                JOIN selected s ON s.id = t.id
+                ORDER BY t.deferred_at ASC
+                FOR UPDATE OF t SKIP LOCKED
+            ";
+            let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_PER_KEY_CAP)
+                .bind::<diesel::sql_types::BigInt, _>(THROTTLE_FIRE_BATCH_SIZE)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
 
-                let mut results = Vec::with_capacity(due_rows.len());
-                for row in due_rows {
-                    if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics).await? {
-                        results.push(item);
-                    }
+            let mut results = Vec::with_capacity(due_rows.len());
+            for row in due_rows {
+                if let Some(item) = fire_claimed_throttle_row(conn, row, now, metrics).await? {
+                    results.push(item);
                 }
-                Ok(results)
-            })
-        })
+            }
+            Ok(results)
+        }))
         .await?;
 
     Ok(fired)
