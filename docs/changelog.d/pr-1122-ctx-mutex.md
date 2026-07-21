@@ -16,7 +16,7 @@
 
 **Non-reentrant.** Re-acquiring a key this execution already holds returns `HarvestError::MutexSelfDeadlock` **synchronously** (checked *before* any history match), so a self-deadlock surfaces the same typed error live and on replay rather than hanging.
 
-**Migration** `20260714000000_harvest_mutex_locks`: `harvest_mutex_locks` (lock table), `harvest_mutex_waiters` (BIGSERIAL FIFO queue), `harvest_mutex_lock_seq` sequence. **No other migration.**
+**Migration** `20260714000001_harvest_mutex_locks`: `harvest_mutex_locks` (lock table), `harvest_mutex_waiters` (BIGSERIAL FIFO queue), `harvest_mutex_lock_seq` sequence. **No other migration.**
 
 **Metrics** (issue #691; `workflow` is the **only** label — the lock key is high-cardinality tenant/entity input and is deliberately *not* a metric label per ADR-0001 §7; `execution.id` stays span-only): `harvest.mutex.wait_duration` (histogram — request→grant wait), `harvest.mutex.held_duration` (histogram — grant→release), `harvest.mutex.contention_depth` (gauge — FIFO waiter-queue length at grant). All three are bridged in `metrics_rs_adapter`, catalogued in `docs/telemetry.md` and ADR-0001 §7, and paneled in `docs/dashboards/starter-pack-v0.1.0.json` (Durable mutex row).
 
