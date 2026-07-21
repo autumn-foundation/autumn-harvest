@@ -2743,6 +2743,7 @@ async fn shift_schedule_to_close_for_resume(
 ///
 /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
 /// - [`HarvestError::Database`] for persistence failures.
+#[allow(clippy::too_many_lines)]
 pub async fn resume_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2832,18 +2833,29 @@ pub async fn resume_workflow_execution(
                 // stops renewing its leases; the lease-reclaim scanner skips
                 // PAUSED holders while paused, but on resume the lease may be
                 // stale, so push it forward now (inside the same transaction
-                // that flips PAUSED->RUNNING) to preserve mutual exclusion —
-                // otherwise the very next scanner tick could reclaim a lock the
-                // resumed holder still believes it holds. A no-op when the
-                // mutex tables are absent (guarded). cancel/terminate are
-                // already covered by the terminal sweep in
-                // `evaluate_triggers_for_execution`.
-                crate::mutex::renew_leases_for_holder(
+                // that flips PAUSED->RUNNING) to preserve mutual exclusion. A
+                // no-op when the mutex tables are absent (guarded).
+                // cancel/terminate are already covered by the terminal sweep in
+                // `evaluate_triggers_for_execution`. Best-effort — mirroring the
+                // per-cycle renewal at the top of `process_workflow_task`, a
+                // transient renewal failure is logged and tolerated rather than
+                // rolling back the resume (the TTL exceeds several decision
+                // cycles and the reclaim path re-checks under the advisory
+                // lock, so a healthy resume is never failed by a lease renewal
+                // hiccup; the resumed holder renews again on its next cycle).
+                if let Err(e) = crate::mutex::renew_leases_for_holder(
                     conn,
                     exec_id,
                     crate::mutex::effective_mutex_lease_ttl(),
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(
+                        exec_id = %exec_id,
+                        error = %e,
+                        "failed to renew durable-mutex leases on resume (best-effort)"
+                    );
+                }
 
                 shift_schedule_to_close_for_resume(conn, exec_id, pause_span).await?;
 

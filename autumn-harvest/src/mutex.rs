@@ -26,12 +26,38 @@
 //!
 //! What the engine cannot fence is the **author's external side effects**. The
 //! lease TTL must exceed the worst-case wall-clock time a workflow spends inside
-//! a single held step (the interval between decision cycles that renew the
-//! lease). If the TTL is too short, the scanner may reclaim a lock while the
-//! original holder is still mid-critical-section, admitting a second holder that
-//! runs concurrently against whatever external resource the lock was protecting.
-//! This is the standard lease-lock trade-off; pick a TTL comfortably above the
-//! longest expected held step. See [`DEFAULT_MUTEX_LEASE_TTL`] (60s default).
+//! a single held step — concretely, the **interval between the lease-renewing
+//! decision cycles** of the holder. Renewal happens per decision cycle (and on
+//! resume from pause); a lock held across a **single long region that spans no
+//! such cycle** — one long-running activity, a child workflow, or an nd-block
+//! backoff longer than the TTL — can have its lease expire and be reclaimed by
+//! a waiter while the original holder still believes it holds the lock,
+//! admitting a second holder that runs concurrently against whatever external
+//! resource the lock was protecting. Hold locks across **short** critical
+//! regions; if a region must span a long durable step, raise the TTL above that
+//! step's worst-case duration. This is the standard lease-lock trade-off. See
+//! [`DEFAULT_MUTEX_LEASE_TTL`] (60s default).
+//!
+//! # Behavior notes
+//!
+//! - **Held-duration metric.** `harvest.mutex.held_duration` is measured on
+//!   **explicit guard drop / `.release()`** (a normal region exit). A lock held
+//!   all the way to a terminal state is freed by the **terminal sweep**, which
+//!   does not measure held-duration, so a lock never explicitly released does
+//!   not contribute to this histogram.
+//! - **No mixed suspension batch.** `acquire()` is its own suspension shape;
+//!   `tokio::join!(ctx.mutex(k).acquire(), <other await>)` (racing an acquire
+//!   against another durable await in one decision cycle) is **rejected** — the
+//!   worker fails the mixed suspension batch loud rather than silently
+//!   corrupting. Acquire the lock in its own suspension, then do the other work.
+//! - **`ctx.race()` interop (known limitation).** Calling
+//!   `ctx.mutex(k).acquire()` in the **same decision cycle** immediately after
+//!   `ctx.race()` can nd-block when a race loser is still in-flight at
+//!   resolution. This is a **pre-existing `ctx.race()` (issue #600)
+//!   replay-consumption limitation** affecting **any** follow-on durable command
+//!   (a plain activity as much as an acquire), not something specific to mutex.
+//!   Until #600 is fixed, interpose a state-consulting call between the race and
+//!   the acquire, or await the race in a **prior** cycle before acquiring.
 //!
 //! # Advisory-first lock ordering (deadlock avoidance)
 //!
