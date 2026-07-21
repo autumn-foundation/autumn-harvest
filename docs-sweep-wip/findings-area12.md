@@ -147,3 +147,25 @@ the telemetry.md section below.
   at `HarvestBuilder::activity_interceptor(impl ActivityInterceptor)` (issue #680, confirmed
   builder.rs:1520; example `examples/activity_interceptor.rs`). Neither had any prior
   mention in activities.md, the natural home for both.
+
+### docs/getting-started/01,02,06,09 — VERIFIED
+- 01: `harvest new` callout (prior commit) correct; deferred pins L26-28
+  (`autumn-harvest="0.4"`/`plugin="0.4"`/`autumn-web="0.5"`) VERIFIED UNTOUCHED. REVIEW
+  (0.6-sensitive, pre-existing): zero-route hello-world `main.rs` may need `.routes(...)`
+  under autumn-web (the scaffold template adds one) — left.
+- 02: `#[activity]` attr table, `execute_activity_raw`, plugin registration — accurate.
+- 06: #808 `idempotency_key` vs `workflow_id`, #521/#753 signal dedup, `ctx.idempotency_key()`
+  (11563) + `subkey` (types.rs:1056), `start_idempotency_window` (builder.rs:1777) — all confirmed.
+- 09: `with_queues`/`with_queue_weights`/`with_label`/`with_labels` (builder.rs 3046/3072/3346/3353),
+  `requires` attr, `capable_of`, eligibility endpoint, `harvest.queue.dispatched` — accurate.
+
+### docs/getting-started/05-child-workflows.md — FIX (coverage)
+- **GAP → FIX:** added a "Bounding and fanning out children" section pointing at
+  `execute_child_workflow_timeout` (#779, context.rs:6780; example `child_with_timeout.rs`)
+  and `spawn_child_workflow_fan_out` (#601, context.rs:8954; example `fanout_child_workflows.rs`).
+  Both are matrix-targeted at Ch.5 and had no prior mention.
+
+### docs/getting-started/07-reliability-knobs.md — FIX (API drift)
+- **DRIFT → FIX:** L65 `WorkerConfig::default().queues(vec![...])` → `.with_queues([...])`.
+  There is **no bare `queues()` method** on `WorkerConfig` (only `with_queues`,
+  builder.rs:3046). Repo-wide grep confirms this was the only `.queues(` occurrence in my area.
