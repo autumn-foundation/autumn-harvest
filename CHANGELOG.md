@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-21
+
+### Upgraded
+
+- **Upgrade to autumn-web 0.6.0 / diesel-async 0.9** — the defining change of this release (landed via PR #1124). The plugin, CLI, and example crates move from autumn-web 0.5 to 0.6 and from diesel-async 0.8 to 0.9, keeping Harvest current with the companion web framework's latest lifecycle, routing, MCP, and Postgres-integration surface. All features folded into this 0.5.0 section below ship on top of that upgraded baseline.
+
 ### Added
 
 - Add typed workflow failures (issue #767). A `#[workflow]` can now return `Result<T, WorkflowFailure>` to carry a structured, replay-safe failure cause — a stable low-cardinality `error_type` class, optional structured `details`, and an advisory `non_retryable` hint — mirroring the typed `ActivityFailure` surface onto whole workflows. Opt-in and non-breaking: a workflow returning `Result<T, String>` (or any `E: ToString`) is byte-for-byte unchanged and decodes to `error_type = None`. New public `WorkflowFailure` builder (`::new`/`.with_details`/`.non_retryable`), the `harvest_workflow_failure_v1` wire envelope + tolerant `decode_workflow_failure`, macro opt-in detection (`workflow_returns_workflow_failure`), `HarvestError` accessors (`workflow_error_type`/`workflow_details`/`is_workflow_non_retryable`), and the typed handle surface (`TypedWorkflowHandle::result()`/`result_snapshot()`, `WorkflowHandle::terminal_typed_failure`). The `non_retryable` flag is an **advisory** classification hint for the caller / completion-trigger only — it is deliberately *not* a control input to the engine's workflow-level retry (#523) loop. No new `WorkflowEvent` variant, no migration (the typed fields are additive optional columns on the existing `WorkflowFailed`/`ChildWorkflowFailed` events).
