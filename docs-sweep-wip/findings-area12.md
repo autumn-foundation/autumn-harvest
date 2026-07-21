@@ -225,3 +225,72 @@ the telemetry.md section below.
   `with_jitter`, `next_delay_with_seed`, bench, quickstart bin) all confirmed.
 - Broad sweep of every `tests/NAME.rs` ref across all area docs: only this one was stale;
   the two mcp-tools.md refs are correctly `autumn-harvest-plugin/tests/...` (exist).
+
+### docs/sharding.md — VERIFIED
+- Per-key concurrency shard-local scope (#247), `GET /admin/concurrency`, `GET /admin/usage`
+  (#596) with metric semantics, debounce shard-local (#499), per-key activity rate limits
+  (#699), durable mutex shard-local (#691, `harvest_mutex_locks`/`harvest_mutex_waiters`),
+  cross-shard keyset pagination + `search_attr_filter` pushdown (#506), add-a-shard runbook
+  (#522). Narrative concept doc, matches CLAUDE.md. No fix.
+
+### docs/completion-callbacks.md — VERIFIED
+- Matches Phase 3.46 (#605) exactly: SSRF validator (HTTPS-only + allowlist), HMAC envelope
+  + headers, `harvest_completion_deliveries`, at-least-once/`delivery_id`, retry/backoff/DLQ,
+  `CompletionCallbackDeliverer` trait, list/redrive routes, CLI, builder-config table. No fix.
+
+### docs/completion-triggers.md — VERIFIED
+- Matches Phase 3.48: output guards (#810, operator set, caps, fail-closed, exactly-once
+  skip, rollout ordering), `Outcome` input mapping (#748), `Terminated` terminal state (#504),
+  `harvest.completion_trigger.fires`/`.skipped` metrics, admin API. Very thorough. No fix.
+
+### docs/transactional-activities.md — VERIFIED
+- `ctx.run_transactional` (context.rs:12123), idempotency guard, restrictions (final-expr,
+  no local-activity, no test-ctx, heartbeat, retry). `ctx.idempotency_key()` exists
+  (context.rs:11563). Interceptor self-commit interaction (#680) consistent. No fix.
+
+### docs/sticky-routing.md — VERIFIED
+- Phase 3.11 (#235): `StickyRoutingConfig`, `WorkerConfig::with_sticky_routing`, `lease_ttl`,
+  hard-exclusion-during-lease semantics, cache_hit/cache_miss metrics, `workflow_cache_size`
+  default 1000 (builder.rs:3009), build-id/shard/continue-as-new interactions. No fix.
+
+### docs/search-attributes.md — VERIFIED
+- `ctx.upsert_search_attrs` merge semantics, reserved keys (`exec_id`/`workflow_name`/
+  `shard_id`/`status`/`run_id` + `_harvest` prefix), replay-safety, `BatchFilter`,
+  `search_attr_filter` op grammar (#506), GIN durability. No fix.
+  (Note: #603 also reserves six ND diagnostic keys under `_harvest`-adjacent names via
+  `RESERVED_SEARCH_ATTR_KEYS` — internal, not user-facing; not worth adding to the doc.)
+
+### docs/replay-verify.md — VERIFIED (contains DEFERRED PIN L29 — untouched)
+- `ReplayVerifier` (testing.rs:2271), `verify_all`/`fixtures_dir`/`into_ci_report`/
+  `into_ci_report_with_threshold`/`allow_unregistered`, `ReportFormat` (Text/JUnit/Json/
+  GitHub), exit codes 0/1/2, `--fail-on rate=`, GH Actions snippet, #251 perf budget. All
+  confirmed. **L29 `autumn-harvest = { version = "0.3" }` is a DEFERRED PIN — NOT edited.**
+
+### docs/api-contract-guide.md — FIX (contract_version drift) + REVIEW
+- **DRIFT → FIX:** L37 said `contract_version` is "currently `"1"`" but the live
+  `docs/api-contract.json` has `contract_version: "2"`. Corrected to `"2"`.
+- **REVIEW:** L14 `"version": "0.4.0"` is an illustrative example that currently MATCHES the
+  live contract file (`version: 0.4.0`); PR #1125's crate bump will move both to 0.5.0. Left
+  as-is (editing to 0.5.0 now would be wrong until #1125 lands). Flag for the version-bump PR.
+
+### docs/calendars.md — FIX (non-compiling snippet)
+- **DRIFT → FIX:** the `WorkflowSchedule` builder snippet used `.with_timezone("...")`, but
+  no such method exists on `WorkflowSchedule` (verified full method list, policy.rs:975-1241).
+  Timezone is expressed via the `Schedule::CronInTimezone { expr, tz }` variant. Rewrote the
+  snippet to construct `CronInTimezone` in `WorkflowSchedule::new`. (The HTTP-API `timezone`
+  JSON field is a plugin-side field and is correct.)
+- VERIFIED: migration `20260519000000_harvest_calendar_awareness`, `SkipPolicy`
+  Skip/RunNextBusinessDay/RunPrevBusinessDay, `is_excluded_date`/`apply_skip_policy` pure fns,
+  all calendar CRUD + preview routes present in api-contract.json, `with_calendar`/
+  `with_skip_policy` builders. observability `reason="calendar"`.
+
+### docs/archival.md — FIX (imprecise error/method claim)
+- **DRIFT → FIX:** the retention-override comment claimed "`.build()` fails with
+  `HarvestBuilderError::UnknownRetentionOverrideWorkflow`" — but `build()` PANICS
+  (`try_build().expect(...)`, builder.rs:1934); only `try_build()` returns the error. Both
+  variants exist: `UnknownRetentionOverrideWorkflow` (unknown type, builder.rs:2243) and
+  `InvalidRetention` (bad value, builder.rs:1951). Rewrote the comment to state `build()`
+  panics / `try_build()` returns the typed error, and named both variants.
+- VERIFIED: `HistoryArchiver` trait shape, zero-loss guarantee, `RetentionConfig::with_max_age`/
+  `with_workflow_override` (#737)/`with_audit_retention_days`/`with_schedule_decision_retention_days`,
+  `harvest.retention.deleted{workflow}` label (#737), `history_archiver` builder method.

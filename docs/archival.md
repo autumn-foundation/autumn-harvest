@@ -168,8 +168,10 @@ let retention_config = RetentionConfig::with_max_age(Duration::from_secs(7 * 24 
     // Per-workflow-type overrides (issue #737): a type without an override
     // falls back to the global default; a type with neither is never deleted.
     // Each override name MUST match a registered `#[workflow]` type (added via
-    // `.workflows(workflows![...])` on the same builder); otherwise `.build()`
-    // fails with `HarvestBuilderError::UnknownRetentionOverrideWorkflow`.
+    // `.workflows(workflows![...])` on the same builder); otherwise `build()`
+    // panics (or `try_build()` returns
+    // `HarvestBuilderError::UnknownRetentionOverrideWorkflow`), and an
+    // out-of-range override value yields `HarvestBuilderError::InvalidRetention`.
     .with_workflow_override("compliance_report", Duration::from_secs(365 * 24 * 60 * 60)) // keep 1 year
     .with_workflow_override("ephemeral_ping", Duration::from_secs(60 * 60)) // keep 1 hour
     .with_audit_retention_days(90)

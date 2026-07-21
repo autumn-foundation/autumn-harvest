@@ -33,7 +33,7 @@ jq '[.routes[] | select(.read_only == true and .category == "admin") | .path]' \
 | Top-level key | Meaning |
 |---|---|
 | `version` | Crate version this contract was published with |
-| `contract_version` | Contract schema version (currently `"1"`) |
+| `contract_version` | Contract schema version (currently `"2"`) |
 | `compatibility` | Breaking vs. non-breaking change rules |
 | `routes` | Array of route entries |
 
