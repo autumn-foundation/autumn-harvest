@@ -1,4 +1,4 @@
-# ADR 0002: Event payload codec boundary
+# ADR 0003: Event payload codec boundary
 
 ## Status
 Accepted

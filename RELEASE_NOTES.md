@@ -1,3 +1,10 @@
+<!--
+0.5.0: release notes for 0.5.0 are authored by the release process. See
+CHANGELOG.md for the folded 0.5.0 entry and docs/upgrading/0.5.0.md for the
+upgrade guide (source-breaking changes, dependency bumps, behavior changes).
+This file below is retained for the 0.4.0 and earlier history.
+-->
+
 ## [0.4.0] - 2026-06-16
 
 ### Added
