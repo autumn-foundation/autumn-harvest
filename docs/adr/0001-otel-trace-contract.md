@@ -2,7 +2,7 @@
 
 **Status**: Accepted  
 **Date**: 2026-05-01  
-**Issue**: [#93](https://github.com/madmax983/autumn-harvest/issues/93)
+**Issue**: [#93](https://github.com/autumn-foundation/autumn-harvest/issues/93)
 
 ---
 

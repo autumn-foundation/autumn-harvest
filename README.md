@@ -2,11 +2,11 @@
 
 [![Crates.io](https://img.shields.io/crates/v/autumn-harvest.svg)](https://crates.io/crates/autumn-harvest)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![CI](https://github.com/madmax983/autumn-harvest/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn-harvest/actions/workflows/ci.yml)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/madmax983/autumn-harvest)
+[![CI](https://github.com/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn-harvest/actions/workflows/ci.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn-harvest)
 
 Postgres-backed durable workflow engine for Rust, designed as a companion to the
-[Autumn](https://github.com/madmax983/autumn) web framework. Provides
+[Autumn](https://github.com/autumn-foundation/autumn) web framework. Provides
 event-sourced workflow execution with activities, signals, timers, child
 workflows, and DAG scheduling — Temporal-style durability semantics with a
 single-Postgres operational footprint.
@@ -909,7 +909,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.4.0 wraps the Phase 4 surface plus additive management API contract
+Version 0.5.0 wraps the Phase 4 surface plus additive management API contract
 coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
 workflow result waiting, dead-letter list/replay/aggregation endpoints,

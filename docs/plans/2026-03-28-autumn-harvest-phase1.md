@@ -48,7 +48,7 @@ edition = "2024"
 rust-version = "1.86.0"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/madmax983/autumn-harvest"
+repository = "https://github.com/autumn-foundation/autumn-harvest"
 
 [workspace.dependencies]
 # Core
