@@ -2573,6 +2573,130 @@ pub async fn claimable_pending_demand_by_queue(
         .collect())
 }
 
+/// One row per queue that has claimable pending work, carrying the total
+/// claimable-pending count plus a bounded, oldest-first sample of the execution
+/// ids behind that demand (issue #774).
+///
+/// Unlike [`ClaimablePendingDemand`] (which breaks demand down per
+/// capability/build/sticky constraint for the shard-health coverage gate),
+/// this collapses to exactly one row per queue: the per-queue answer to
+/// "does this queue have work and, if it turns out to be uncovered, which
+/// executions are stranded on it?"
+///
+/// `sample_execution_ids` is capped and ordered `scheduled_at ASC, id ASC`
+/// (oldest-first, so an operator sees the longest-waiting stranded work first).
+/// It excludes the (rare, defensive) NULL-`workflow_exec_id` rows the claimable
+/// predicate admits — those still contribute to `pending_count` but have no
+/// execution id to sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQueueDemand {
+    /// Queue name.
+    pub queue_name: String,
+    /// Total number of claimable pending tasks on this queue.
+    pub pending_count: i64,
+    /// Bounded, oldest-first sample of execution ids behind the demand.
+    pub sample_execution_ids: Vec<Uuid>,
+}
+
+/// Per-queue claimable-pending demand with a bounded execution-id sample
+/// (issue #774).
+///
+/// Mirrors **exactly** the claim-time WHERE discipline of
+/// [`claimable_pending_demand_by_queue`] (expired `schedule_to_close_at`,
+/// PAUSED-workflow-task exclusion, concurrency-cap saturation, and the
+/// rate-limit gate with the circuit-breaker exemption), but groups only by
+/// `queue_name` — producing one row per queue with the total claimable count
+/// and a `sample_cap`-bounded, oldest-first (`scheduled_at ASC, id ASC`) sample
+/// of the execution ids behind it. It is the demand input to the queue-coverage
+/// diff (issue #774): a queue here with zero live pollers is uncovered.
+///
+/// `circuit_breaker_activities` mirrors `claim_task`'s `$5` parameter (see
+/// [`claimable_pending_demand_by_queue`]); pass an empty slice when no breakers
+/// are configured. `sample_cap` bounds the per-queue sample; a value `<= 0`
+/// returns no samples.
+///
+/// This is a read-only query: it claims nothing, mutates no state, and appends
+/// no [`crate::event::WorkflowEvent`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn pending_demand_by_queue_with_samples(
+    conn: &mut AsyncPgConnection,
+    circuit_breaker_activities: &[String],
+    sample_cap: usize,
+) -> HarvestResult<Vec<PendingQueueDemand>> {
+    #[derive(diesel::QueryableByName)]
+    struct DemandSampleRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        pending_count: i64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Array<diesel::sql_types::Uuid>>)]
+        sample_execution_ids: Option<Vec<Uuid>>,
+    }
+
+    let cap = i64::try_from(sample_cap).unwrap_or(i64::MAX);
+    // `$2::int` is the array-slice upper bound; the sample excludes NULL exec ids
+    // (a FILTER'd ARRAY_AGG over an all-NULL group yields SQL NULL -> None -> []).
+    let rows: Vec<DemandSampleRow> = diesel::sql_query(
+        "SELECT tq.queue_name, \
+                COUNT(*)::BIGINT AS pending_count, \
+                (ARRAY_AGG(tq.workflow_exec_id ORDER BY tq.scheduled_at ASC, tq.id ASC) \
+                    FILTER (WHERE tq.workflow_exec_id IS NOT NULL))[1:$2::int] \
+                    AS sample_execution_ids \
+         FROM harvest_task_queue tq \
+         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
+         WHERE tq.state = 'PENDING' \
+           AND tq.scheduled_at <= NOW() \
+           AND ( \
+               tq.schedule_to_close_at IS NULL \
+               OR tq.schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               tq.task_type <> 'workflow' \
+               OR tq.workflow_exec_id IS NULL \
+               OR e.id IS NULL \
+               OR e.state <> 'PAUSED' \
+           ) \
+           AND ( \
+               tq.concurrency_key IS NULL \
+               OR tq.concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = tq.concurrency_key \
+                     AND inner_q.task_type = tq.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < tq.concurrency_cap \
+           ) \
+           AND ( \
+               tq.rate_limit_key IS NULL \
+               OR tq.activity_name = ANY($1) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = tq.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
+         GROUP BY tq.queue_name",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(cap).unwrap_or(i32::MAX))
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingQueueDemand {
+            queue_name: r.queue_name,
+            pending_count: r.pending_count,
+            sample_execution_ids: r.sample_execution_ids.unwrap_or_default(),
+        })
+        .collect())
+}
+
 /// Back-fill effective capability requirements for un-snapshotted activity rows.
 ///
 /// `claim_task` skips an activity row with NULL `required_capabilities` for any

@@ -519,6 +519,63 @@ pub async fn list_workers(
     Ok(apply_worker_filters(results, filters))
 }
 
+/// Names of queues polled by at least one **live** worker (issue #774).
+///
+/// A worker counts as live when its `last_heartbeat_at` is within
+/// `stale_threshold` (the same freshness discipline as
+/// [`WorkerHealth::classify`]) **and** its status is not `Stopped` — so a
+/// `Draining` worker counts (it is still draining its polled queues), unlike
+/// the shard-health coverage gate (issue #522), which deliberately requires
+/// the stricter Healthy + `Active`. This looser AC1 definition (issue #774,
+/// building on issue #522) is intentional: a queue with live pollers — even
+/// draining ones — is not "uncovered". Build-incompatible (issue #171) or
+/// saturated (issue #531) pollers still count as covering here; only *zero*
+/// live pollers makes a queue uncovered.
+///
+/// Returns the union of every live worker's polled queue names. Malformed
+/// (non-array) `queues` payloads are skipped by the `jsonb_typeof` guard.
+///
+/// This is a read-only query.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn live_polled_queue_names(
+    conn: &mut AsyncPgConnection,
+    stale_threshold: Duration,
+) -> HarvestResult<std::collections::HashSet<String>> {
+    #[derive(diesel::QueryableByName)]
+    struct QueueNameRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+    }
+
+    // `WorkerHealth::classify` treats a worker as fresh when elapsed
+    // (`Utc::now() - last_heartbeat_at`) is <= `stale_threshold`, i.e.
+    // `last_heartbeat_at >= now - stale_threshold`. Compute the cutoff in Rust
+    // and bind it (sub-second precision is irrelevant for a heartbeat window)
+    // to avoid interval-binding awkwardness. Clock skew (worker slightly ahead)
+    // yields a future `last_heartbeat_at`, still `>= cutoff` — a fresh worker
+    // is never misclassified, matching `classify`.
+    let secs = i64::try_from(stale_threshold.as_secs()).unwrap_or(i64::MAX);
+    let cutoff = Utc::now() - chrono::Duration::seconds(secs);
+
+    let rows: Vec<QueueNameRow> = diesel::sql_query(
+        "SELECT DISTINCT q.queue_name \
+         FROM harvest_workers w \
+         CROSS JOIN LATERAL jsonb_array_elements_text(w.queues) AS q(queue_name) \
+         WHERE w.status <> 'Stopped' \
+           AND w.last_heartbeat_at >= $1 \
+           AND jsonb_typeof(w.queues) = 'array'",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| r.queue_name).collect())
+}
+
 /// Get a single worker detail row.
 ///
 /// # Errors

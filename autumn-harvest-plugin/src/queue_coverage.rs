@@ -24,7 +24,11 @@
 //! uncovered exclusively on an unreachable shard cannot appear.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use autumn_harvest::error::HarvestResult;
+use autumn_harvest::{queue, workers};
+use diesel_async::AsyncPgConnection;
 use serde::Serialize;
 
 use crate::shard_fanout::{self, FanoutStatus, ShardObservation, UnavailableShard};
@@ -131,6 +135,53 @@ pub fn build_queue_coverage_response(
         uncovered_queues,
         unavailable_shards,
     }
+}
+
+/// Per-shard uncovered-queue diff: queues with claimable pending work that no
+/// live worker on this shard polls (issue #774).
+///
+/// Reads the shard's claimable-pending demand with execution-id samples
+/// ([`queue::pending_demand_by_queue_with_samples`]) and the set of queues
+/// polled by a live worker ([`workers::live_polled_queue_names`], AC1: fresh
+/// heartbeat within `stale_threshold` and status not `Stopped`, so `Draining`
+/// counts), then returns the demand queues **not** in the live-polled set as
+/// [`QueueCandidate`]s. This is the per-shard row the cross-shard fan-out
+/// (wired in a later milestone) calls, feeding
+/// [`build_queue_coverage_response`].
+///
+/// `circuit_breaker_activities` mirrors `claim_task`'s breaker-exempt set (see
+/// [`queue::pending_demand_by_queue_with_samples`]); `sample_cap` bounds the
+/// per-shard sample size.
+///
+/// This is a read-only diff over two read-only queries.
+///
+/// # Errors
+///
+/// Returns [`HarvestResult`] error on database failure of either read.
+pub async fn shard_uncovered_candidates(
+    conn: &mut AsyncPgConnection,
+    circuit_breaker_activities: &[String],
+    stale_threshold: Duration,
+    sample_cap: usize,
+) -> HarvestResult<Vec<QueueCandidate>> {
+    let demand =
+        queue::pending_demand_by_queue_with_samples(conn, circuit_breaker_activities, sample_cap)
+            .await?;
+    let covered = workers::live_polled_queue_names(conn, stale_threshold).await?;
+
+    Ok(demand
+        .into_iter()
+        .filter(|d| !covered.contains(&d.queue_name))
+        .map(|d| QueueCandidate {
+            queue_name: d.queue_name,
+            pending_count: d.pending_count,
+            sample_execution_ids: d
+                .sample_execution_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
