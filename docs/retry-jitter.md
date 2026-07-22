@@ -42,7 +42,7 @@ cargo run -p quickstart --bin retry-jitter-example
 
 Replay determinism for jitter-derived timer durations is covered by
 `replay_jitter_timer_is_exact_and_deterministic` in
-`autumn-harvest/tests/replayer_tests.rs`.
+`autumn-harvest/tests/integration/replayer_tests.rs`.
 
 ## Benchmark success metric
 

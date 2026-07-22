@@ -62,7 +62,7 @@ the 60 s default cap.
 spin up a worker that subscribes to it:
 
 ```rust
-WorkerConfig::default().queues(vec!["default", "email-workers"])
+WorkerConfig::default().with_queues(["default", "email-workers"])
 ```
 
 Useful when one activity class (e.g. PDF rendering) needs its own resource

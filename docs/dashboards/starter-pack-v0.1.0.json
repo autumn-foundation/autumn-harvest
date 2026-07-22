@@ -3885,7 +3885,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
+            "content": "### Deployment preflight\n\n**Alert: harvest_preflight_failed** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nDeployment readiness is failing or repeatedly warning, so new workflow starts may land on a misconfigured Harvest runtime.\n\n**First action:**\n\n```\nharvest preflight --output json\n```\n\n**API:** `GET /api/harvest/admin/preflight`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_preflight_failed](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_preflight_failed)"
           }
         },
         {
@@ -3900,7 +3900,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
+            "content": "### Worker fleet coverage\n\n**Alert: harvest_no_active_workers** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nHarvest has work that requires a queue or shard, but no active worker can claim it.\n\n**First action:**\n\n```\nharvest worker health --output json\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_active_workers](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_active_workers)"
           }
         },
         {
@@ -3915,7 +3915,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
+            "content": "### Worker fleet saturation\n\n**Alert: harvest_worker_saturation** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA worker fleet is present but not healthy enough to drain the queue at the expected rate. The Overview *Worker slot utilization* panel and the Queues & workers row are the closest native-metric proxies.\n\n**First action:**\n\n```\nharvest worker list --status Active --output json\n```\n\n**API:** `GET /api/harvest/workers`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_worker_saturation](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_worker_saturation)"
           }
         },
         {
@@ -3930,7 +3930,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
+            "content": "### Shard readiness\n\n**Alert: harvest_shard_unready** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nA shard cannot safely accept or drain workflow work, or the readiness report is partial.\n\n**First action:**\n\n```\nharvest shard health --fail-on-unready --output json\n```\n\n**API:** `GET /api/harvest/admin/shards/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_shard_unready](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_shard_unready)"
           }
         },
         {
@@ -3945,7 +3945,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution_id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](https://github.com/madmax983/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
+            "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** — no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution_id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
           }
         }
       ]

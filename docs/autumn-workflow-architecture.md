@@ -5,7 +5,7 @@
 *Version 0.1 — Draft*
 *March 2026*
 
-**Release status note (0.4.0):** DAG scheduling, signals, queries, the
+**Release status note (0.5.0):** DAG scheduling, signals, queries, the
 management API, dead-letter list/replay endpoints, durable workflow
 cancellation, pause/resume controls, DLQ aggregation, DAG retry from failed
 nodes, timezone-aware cron schedules, scaling signals, and metrics endpoints

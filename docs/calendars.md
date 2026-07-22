@@ -52,10 +52,15 @@ When `calendar` is `null` (the default) no filtering is applied and all fires di
 ```rust
 use autumn_harvest::prelude::*;
 
-let schedule = WorkflowSchedule::new("generate_payroll", Schedule::Cron("0 9 * * 1".into()))
-    .with_timezone("America/New_York")
-    .with_calendar(Some("us-federal-holidays".into()))
-    .with_skip_policy(SkipPolicy::RunNextBusinessDay);
+let schedule = WorkflowSchedule::new(
+    "generate_payroll",
+    Schedule::CronInTimezone {
+        expr: "0 9 * * 1".into(),
+        tz: "America/New_York".into(),
+    },
+)
+.with_calendar(Some("us-federal-holidays".into()))
+.with_skip_policy(SkipPolicy::RunNextBusinessDay);
 ```
 
 ---
