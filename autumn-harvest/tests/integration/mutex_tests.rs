@@ -427,7 +427,12 @@ fn race_slow_activity<'a>(
             .expect("witness state must be registered")
             .clone();
         witness.mark_race_loser_started();
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Long enough that the loser is durably still-in-flight (its
+        // `ActivityStarted` recorded, no terminal) for the entire window in
+        // which the winner completes and the follow-on decision cycle runs, so
+        // the #1126 in-flight-loser condition is reliably reproduced rather than
+        // racing the loser's own completion.
+        tokio::time::sleep(Duration::from_secs(15)).await;
         Ok(json!({"provider": "slow"}))
     })
 }

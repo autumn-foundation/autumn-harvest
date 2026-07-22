@@ -9468,6 +9468,11 @@ impl WorkflowContext {
             let mut activities = Vec::new();
             let mut children = Vec::new();
             for dispatch in to_dispatch {
+                // Skip the winner: its own progress-frontier events are consumed
+                // by the terminal-settling path (`settle_terminal` /
+                // `scan_activity_terminal`) that resolved it this cycle, so the
+                // winner never has an unconsumed `ActivityStarted` to strand. Only
+                // the still-open LOSER branches need `consume_race_loser_frontier`.
                 if dispatch.index == winner_index {
                     continue;
                 }
@@ -20642,6 +20647,227 @@ mod tests {
             "issue #1126: a follow-on command after a race with an in-flight \
              loser must land cleanly (NoMatch = fresh dispatch), not diverge on \
              the loser's leftover ActivityStarted: {follow_on:?}"
+        );
+        Ok(())
+    }
+
+    /// Issue #1126: a single race with MORE THAN ONE in-flight loser resolves
+    /// cleanly — exercising the multi-id `contains` loop in
+    /// `consume_race_loser_frontier`. Both losers' `ActivityStarted` events must
+    /// be consumed so a follow-on command lands at the frontier (`NoMatch`)
+    /// rather than diverging on the first loser's leftover started event.
+    #[tokio::test]
+    async fn race_with_multiple_in_flight_losers_does_not_wedge_a_follow_on_command()
+    -> Result<(), HarvestError> {
+        let winner_id = ActivityExecId::new();
+        let loser1_id = ActivityExecId::new();
+        let loser2_id = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "a"});
+
+        // Live resolving cycle: the winner (branch 0) completed; both losers
+        // (branches 1 and 2) were scheduled AND started but have no terminal.
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(3u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser1_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser2_id,
+                name: "fetch_c".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: loser1_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: loser2_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: winner_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: winner_id,
+                output: winner_output.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .activity_raw("fetch_c", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(winner.index, 0, "branch a resolved first and must win");
+
+        // Both still-open losers are queued for cancellation.
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. }
+                    if activities.contains(&loser1_id) && activities.contains(&loser2_id)
+            )),
+            "both still-open losers must be queued for cancellation: {commands:?}"
+        );
+
+        // Neither loser's leftover in-flight ActivityStarted may strand the
+        // cursor: the follow-on lands cleanly on the live frontier.
+        let follow_on = ctx.match_history(|m| m.match_activity("next_step"));
+        assert!(
+            matches!(follow_on, HistoryMatch::NoMatch),
+            "issue #1126: a follow-on command after a race with TWO in-flight \
+             losers must land cleanly (NoMatch), not diverge: {follow_on:?}"
+        );
+        Ok(())
+    }
+
+    /// Issue #1126: two races each with a live in-flight loser, resolved in the
+    /// SAME decision cycle (the `futures::join!(race1, race2)` shape). This pins
+    /// the reviewer-flagged cursor-advance interaction: `consume_race_loser_frontier`
+    /// must consume ONLY its own race's loser events (id-scoped) and leave the
+    /// cursor positioned so the SECOND race matches its own marker/branches and a
+    /// follow-on command lands cleanly. Pre-fix, race1's stranded loser
+    /// `ActivityStarted` wedges race2's follow-on (`Diverged` → nd-block).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn join_of_two_races_each_with_an_in_flight_loser_does_not_wedge_a_follow_on_command()
+    -> Result<(), HarvestError> {
+        let r1_win = ActivityExecId::new();
+        let r1_los = ActivityExecId::new();
+        let r2_win = ActivityExecId::new();
+        let r2_los = ActivityExecId::new();
+        let r1_out = serde_json::json!({"race": 1});
+        let r2_out = serde_json::json!({"race": 2});
+
+        // `join!`-shape history: both races' open markers + all four schedules
+        // are recorded up front (one suspension batch), then the started /
+        // completed events arrive interleaved, each race's winner completing
+        // while its own loser is still merely started.
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r1_win,
+                name: "r1a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r1_los,
+                name: "r1b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race:2".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r2_win,
+                name: "r2a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: r2_los,
+                name: "r2b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r1_los,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r1_win,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: r1_win,
+                output: r1_out.clone(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r2_los,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: r2_win,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: r2_win,
+                output: r2_out.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // Resolve both races in turn (sequential `.run()` mirrors what `join!`
+        // records: each race independently consults the same shared history).
+        let w1 = ctx
+            .race()
+            .activity_raw("r1a", Value::Null, "default")
+            .activity_raw("r1b", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(w1.index, 0, "race 1 branch a wins");
+        assert_eq!(w1.value, r1_out);
+
+        let w2 = ctx
+            .race()
+            .activity_raw("r2a", Value::Null, "default")
+            .activity_raw("r2b", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(w2.index, 0, "race 2 branch a wins");
+        assert_eq!(w2.value, r2_out);
+
+        // Each race must have queued cancellation for its OWN loser only.
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![r1_los]
+            )),
+            "race 1's loser must be queued for cancellation: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![r2_los]
+            )),
+            "race 2's loser must be queued for cancellation: {commands:?}"
+        );
+
+        // Neither race's in-flight loser events stranded the cursor: the
+        // follow-on command after BOTH races lands cleanly at the frontier.
+        let follow_on = ctx.match_history(|m| m.match_activity("next_step"));
+        assert!(
+            matches!(follow_on, HistoryMatch::NoMatch),
+            "issue #1126: a follow-on command after join!(race1, race2) with \
+             in-flight losers in both must land cleanly (NoMatch), not diverge \
+             on a stranded loser ActivityStarted: {follow_on:?}"
         );
         Ok(())
     }

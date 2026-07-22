@@ -5341,6 +5341,14 @@ impl HistoryMatcher {
                     {
                         self.consumed_out_of_order_events.insert(scan);
                     }
+                    // Defensive: a losing CHILD branch resolves as
+                    // `ChildInProgress`, whose `match_child_workflow` already
+                    // advances the cursor PAST the child's own
+                    // `ChildWorkflowStarted` (a child has no separate started
+                    // event to strand the way an activity does), so in practice
+                    // this arm is unreachable today. Kept so a future child-race
+                    // shape that leaves a child's start unconsumed is handled
+                    // by the same in-cycle consume rather than nd-blocking.
                     WorkflowEvent::ChildWorkflowStarted { child_id, .. }
                         if loser_child_ids.contains(child_id) =>
                     {
