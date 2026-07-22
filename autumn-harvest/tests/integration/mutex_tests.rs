@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use autumn_harvest::context::{ActivityContext, SharedState, WorkflowContext};
@@ -36,7 +36,7 @@ use autumn_harvest::reset::{
     ResetSignalReapplyPolicy, WorkflowResetError, WorkflowResetRequest, preview_workflow_reset,
     reset_workflow_execution,
 };
-use autumn_harvest::telemetry::NoOpMetrics;
+use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{
     ExecutionId, Priority, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
@@ -65,6 +65,11 @@ struct Witness {
     order: std::sync::Mutex<Vec<String>>,
     /// total critical sections entered (any key)
     entered: AtomicI64,
+    /// #1126 barrier: the losing race branch has begun executing (its
+    /// `ActivityStarted` is already durably recorded before the handler body
+    /// runs), so the fast winner may complete while the loser is still
+    /// in-flight — reproducing the "loser in-flight at resolution" condition.
+    race_loser_started: AtomicBool,
 }
 
 impl Witness {
@@ -85,6 +90,15 @@ impl Witness {
     fn order(&self) -> Vec<String> {
         self.order.lock().unwrap().clone()
     }
+
+    /// UFCS: `diesel_async::RunQueryDsl`'s blanket impl shadows the inherent
+    /// `AtomicBool::load`/`store` here (same reason as `entered` above).
+    fn race_loser_has_started(&self) -> bool {
+        AtomicBool::load(&self.race_loser_started, Ordering::SeqCst)
+    }
+    fn mark_race_loser_started(&self) {
+        AtomicBool::store(&self.race_loser_started, true, Ordering::SeqCst);
+    }
 }
 
 fn shared_state(witness: Arc<Witness>) -> SharedState {
@@ -94,6 +108,31 @@ fn shared_state(witness: Arc<Witness>) -> SharedState {
         Box::new(witness) as Box<dyn std::any::Any + Send + Sync>,
     );
     Arc::new(map)
+}
+
+/// Records the `harvest.workflow.nondeterministic_block` counter (issue #603 /
+/// #1126). The counter fires monotonically on every nd-block *entry* and is NOT
+/// un-fired when the run later recovers and `nd_blocked_at` is cleared — so it
+/// is the reliable, timing-independent signal that a TRANSIENT nd-block ever
+/// occurred, which a post-hoc `nd_blocked_at IS NULL` check cannot see.
+#[derive(Default)]
+struct RecordingMetrics {
+    nd_blocks: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl RecordingMetrics {
+    fn nd_block_count(&self) -> usize {
+        self.nd_blocks.lock().unwrap().len()
+    }
+}
+
+impl MetricsRecorder for RecordingMetrics {
+    fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
+        self.nd_blocks
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), queue.to_string()));
+    }
 }
 
 // ─────────────────────────────── activities ───────────────────────────────
@@ -348,9 +387,127 @@ fn act(
     }
 }
 
-/// Full registry with every workflow/activity used by these tests + the witness.
-fn full_registry(witness: Arc<Witness>) -> Arc<HandlerRegistry> {
-    Arc::new(HandlerRegistry::with_state(
+// ─────────────────────── #1126 race regression pieces ─────────────────────
+
+/// The FAST (winning) race branch. Spins until the slow loser branch has begun
+/// executing, then returns immediately — so the winner completes while the
+/// loser is genuinely in-flight (its `ActivityStarted` recorded, no terminal),
+/// reproducing issue #1126. Bounded so a bug can never hang the test.
+fn race_fast_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let witness = ctx
+            .state::<Arc<Witness>>()
+            .expect("witness state must be registered")
+            .clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !witness.race_loser_has_started() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("race_fast: loser never started (barrier timeout)".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(json!({"provider": "fast"}))
+    })
+}
+
+/// The SLOW (losing) race branch. Signals that it has started (its
+/// `ActivityStarted` is already durable by the time the handler body runs),
+/// then sleeps long enough to remain in-flight at race resolution — it is
+/// cancelled by the winner's `CancelRaceLosers` before it would finish.
+fn race_slow_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let witness = ctx
+            .state::<Arc<Witness>>()
+            .expect("witness state must be registered")
+            .clone();
+        witness.mark_race_loser_started();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(json!({"provider": "slow"}))
+    })
+}
+
+/// Trivial follow-on activity for the race→activity regression. Bumps the
+/// `entered` counter so the test can assert it actually ran.
+fn after_race_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let witness = ctx
+            .state::<Arc<Witness>>()
+            .expect("witness state must be registered")
+            .clone();
+        witness.entered.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"ok": true}))
+    })
+}
+
+/// #1126: race a fast winner against a slow (in-flight) loser, then issue a
+/// plain durable activity in the SAME decision cycle. Pre-fix this nd-blocked
+/// on the loser's leftover `ActivityStarted`; post-fix it completes cleanly.
+fn race_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("race_fast", json!({}), "default")
+            .activity_raw("race_slow", json!({}), "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("after_race", json!({"winner": winner.index}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"winner_index": winner.index}))
+    })
+}
+
+/// #1126 flagship: race a fast winner against a slow (in-flight) loser, then
+/// `ctx.mutex(key).acquire()` in the SAME decision cycle + a critical section.
+/// This is the exact pattern that was documented as a known limitation on
+/// `ctx.mutex` (issue #691) and is now regression coverage.
+fn race_then_mutex_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let key = input["key"].as_str().unwrap_or("k").to_string();
+        let label = input["label"].as_str().unwrap_or("").to_string();
+        let winner = ctx
+            .race()
+            .activity_raw("race_fast", json!({}), "default")
+            .activity_raw("race_slow", json!({}), "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        let guard = ctx
+            .mutex(key.clone())
+            .acquire()
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw(
+            "critical_section",
+            json!({"key": key, "label": label}),
+            "default",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        guard.release();
+        Ok(json!({"winner_index": winner.index}))
+    })
+}
+
+/// The workflow + activity handler lists shared by every registry constructor.
+fn registry_handlers() -> (Vec<WorkflowInfo>, Vec<ActivityInfo>) {
+    (
         vec![
             wf("contend", contend_workflow),
             wf("hold_wait_signal", hold_wait_signal_workflow),
@@ -359,12 +516,42 @@ fn full_registry(witness: Arc<Witness>) -> Arc<HandlerRegistry> {
             wf("co_batch", co_batch_workflow),
             wf("early_release_local", early_release_local_workflow),
             wf("release_then_wait", release_then_wait_workflow),
+            wf("race_then_activity", race_then_activity_workflow),
+            wf("race_then_mutex", race_then_mutex_workflow),
         ],
         vec![
             act("critical_section", false, critical_section_activity),
             act("noop_local", true, noop_local_activity),
+            act("race_fast", false, race_fast_activity),
+            act("race_slow", false, race_slow_activity),
+            act("after_race", false, after_race_activity),
         ],
+    )
+}
+
+/// Full registry with every workflow/activity used by these tests + the witness.
+fn full_registry(witness: Arc<Witness>) -> Arc<HandlerRegistry> {
+    let (workflows, activities) = registry_handlers();
+    Arc::new(HandlerRegistry::with_state(
+        workflows,
+        activities,
         shared_state(witness),
+    ))
+}
+
+/// Like [`full_registry`] but wires a `MetricsRecorder` so a test can assert on
+/// engine metrics (issue #1126 uses `record_workflow_nondeterministic_block`).
+fn full_registry_with_metrics(
+    witness: Arc<Witness>,
+    metrics: Arc<dyn MetricsRecorder + Send + Sync>,
+) -> Arc<HandlerRegistry> {
+    let (workflows, activities) = registry_handlers();
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
+    Arc::new(HandlerRegistry::with_state_and_telemetry(
+        workflows,
+        activities,
+        shared_state(witness),
+        telemetry,
     ))
 }
 
@@ -461,6 +648,27 @@ async fn exec_error(url: &str, exec_id: ExecutionId) -> Option<String> {
         .await
         .expect("error query")
         .error
+}
+
+/// Whether the execution was non-terminally nd-blocked (issue #603) — set when
+/// a replay divergence wedges the run. Used by the #1126 regression tests to
+/// prove the follow-on command did NOT diverge.
+async fn nd_blocked(url: &str, exec_id: ExecutionId) -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        blocked: bool,
+    }
+    let mut conn = connect(url).await;
+    diesel::sql_query(
+        "SELECT (nd_blocked_at IS NOT NULL) AS blocked \
+         FROM harvest_workflow_executions WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<Row>(&mut conn)
+    .await
+    .expect("nd_blocked query")
+    .blocked
 }
 
 /// The current holder of `key`, if any (from `harvest_mutex_locks`).
@@ -646,6 +854,30 @@ where
     worker.shutdown();
     let _ = handle.await;
     out
+}
+
+/// Run a worker wired with a `RecordingMetrics` recorder for the duration of
+/// `body`; returns `(body_output, metrics)` so a test can assert on engine
+/// metrics (issue #1126: the nd-block counter).
+async fn with_worker_metrics<F, Fut, T>(
+    url: &str,
+    witness: Arc<Witness>,
+    concurrency: usize,
+    body: F,
+) -> (T, Arc<RecordingMetrics>)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let metrics = Arc::new(RecordingMetrics::default());
+    let registry = full_registry_with_metrics(witness, Arc::clone(&metrics) as Arc<_>);
+    let worker = build_runtime_worker("mutex-worker", concurrency, concurrency, registry);
+    let pool = build_test_pool(url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+    let out = body().await;
+    worker.shutdown();
+    let _ = handle.await;
+    (out, metrics)
 }
 
 /// Set the process-global mutex lease TTL and restore the default afterwards.
@@ -1425,6 +1657,97 @@ async fn reset_after_release_succeeds() {
     assert!(
         result.is_ok(),
         "reset after mutex release must succeed: {result:?}"
+    );
+    reset_lease_ttl();
+}
+
+// ─────────────────────────── #1126 regression tests ───────────────────────
+
+/// Issue #1126: a plain durable activity issued in the SAME decision cycle
+/// immediately after `ctx.race()` resolves — with a losing branch still
+/// in-flight — must NOT nd-block.
+///
+/// The deterministic oracle is the `harvest.workflow.nondeterministic_block`
+/// counter (issue #603), captured by a `RecordingMetrics` recorder. Pre-fix,
+/// the follow-on `match_activity` diverges on the loser's leftover
+/// `ActivityStarted`, so the run enters an nd-block (counter fires ≥ 1) that
+/// only clears once the loser eventually finishes — a `nd_blocked_at IS NULL`
+/// check at COMPLETED time cannot see that transient block, but the monotonic
+/// counter can. Post-fix the follow-on lands cleanly and the counter stays 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn race_followon_activity_does_not_nd_block() {
+    let (url, _c) = setup().await;
+    let witness = Arc::new(Witness::default());
+
+    let (exec_id, metrics) = with_worker_metrics(&url, Arc::clone(&witness), 8, || async {
+        let id = start(&url, "race_then_activity", "race-act-1", json!({})).await;
+        wait_for_state(&url, id, "COMPLETED", Duration::from_secs(90)).await;
+        id
+    })
+    .await;
+
+    assert_eq!(
+        metrics.nd_block_count(),
+        0,
+        "race->activity in one cycle must not nd-block (issue #1126); \
+         the follow-on command diverged on the loser's leftover ActivityStarted"
+    );
+    assert!(
+        !nd_blocked(&url, exec_id).await,
+        "the completed run must not be left nd-blocked"
+    );
+    // The fast branch (index 0) won and the follow-on activity ran.
+    assert!(
+        witness.entered() >= 1,
+        "the follow-on after_race activity must have executed"
+    );
+}
+
+/// Issue #1126 flagship: `ctx.mutex(key).acquire()` issued in the SAME decision
+/// cycle immediately after `ctx.race()` resolves (loser in-flight) reaches
+/// COMPLETED without ever nd-blocking. This flips the `ctx.race()` interop
+/// documented on `ctx.mutex` (issue #691 / PR #1122) from a known limitation to
+/// regression coverage. Uses the same monotonic nd-block-counter oracle as the
+/// activity case, plus asserts the mutex ran its critical section exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn race_followon_mutex_acquire_does_not_nd_block() {
+    set_lease_ttl(60);
+    let (url, _c) = setup().await;
+    let witness = Arc::new(Witness::default());
+
+    let key = "race-mutex-key";
+    let (exec_id, metrics) = with_worker_metrics(&url, Arc::clone(&witness), 8, || async {
+        let id = start(
+            &url,
+            "race_then_mutex",
+            "race-mutex-1",
+            json!({"key": key, "label": "wf"}),
+        )
+        .await;
+        wait_for_state(&url, id, "COMPLETED", Duration::from_secs(90)).await;
+        id
+    })
+    .await;
+
+    assert_eq!(
+        metrics.nd_block_count(),
+        0,
+        "race->mutex.acquire in one cycle must not nd-block \
+         (issue #1126, flips the #691 known limitation)"
+    );
+    assert!(
+        !nd_blocked(&url, exec_id).await,
+        "the completed run must not be left nd-blocked"
+    );
+    assert_eq!(
+        witness.max_seen(key),
+        1,
+        "the mutex critical section must have run exactly once for key {key}"
+    );
+    // The lock must be released on completion (no dangling holder).
+    assert!(
+        lock_holder(&url, key).await.is_none(),
+        "mutex must be released after the workflow completes"
     );
     reset_lease_ttl();
 }
