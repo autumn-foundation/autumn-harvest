@@ -2551,7 +2551,11 @@ async fn replay_race_with_in_flight_loser_and_follow_on_activity_succeeds() {
     let replayer = build_replayer();
 
     let report = replayer
-        .replay_from_snapshot(make_snapshot("race_then_activity_workflow", exec_id, events))
+        .replay_from_snapshot(make_snapshot(
+            "race_then_activity_workflow",
+            exec_id,
+            events,
+        ))
         .await;
 
     assert!(

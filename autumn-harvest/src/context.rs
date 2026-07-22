@@ -9478,6 +9478,16 @@ impl WorkflowContext {
                     children.push(id);
                 }
             }
+            // Issue #1126: the loser branches that resolved as `*InProgress`
+            // this cycle have their synthetic terminal appended only at persist
+            // time (via the `CancelRaceLosers` command below), so their
+            // in-flight progress-frontier events (`ActivityStarted` /
+            // `ActivityHeartbeat`, or a child's `ChildWorkflowStarted`) are left
+            // unconsumed straddling the matcher cursor. Consume them in-cycle so
+            // a follow-on positional durable command in the SAME decision cycle
+            // (a plain activity, `ctx.mutex(k).acquire()`, a timer, ...) lands
+            // cleanly instead of diverging on the leftover event -> nd-block.
+            self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
             if !activities.is_empty() || !children.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
                     activities,
@@ -20556,7 +20566,7 @@ mod tests {
     /// follow-on positional durable command in the same decision cycle (a plain
     /// activity, `ctx.mutex(k).acquire()`, a timer, etc.) diverges on that
     /// leftover event -> nd-block -> permanent wedge. This asserts the follow-on
-    /// `match_activity` lands cleanly (NoMatch = fresh dispatch at the live
+    /// `match_activity` lands cleanly (`NoMatch` = fresh dispatch at the live
     /// frontier) rather than `Diverged`.
     #[tokio::test]
     async fn race_with_in_flight_activity_loser_does_not_wedge_a_follow_on_command()
