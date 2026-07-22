@@ -9615,3 +9615,107 @@ async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministicall
         other => panic!("expected WorkflowFailed (clean reproduction), got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1126 — ctx.race() nd-blocks the next durable command when a loser is
+// still in-flight at resolution.
+//
+// When `ctx.race()` resolves with a losing branch still in-flight, that loser's
+// `ActivityScheduled` is recorded but left UNCONSUMED in `HistoryMatcher`. The
+// synthetic loser `ActivityFailed` ("lost race to a sibling branch") is appended
+// only at PERSIST time, invisible to the current cycle's matcher, so the NEXT
+// follow-on durable command in the same cycle diverges on the unconsumed loser
+// event => #603 nd-block => permanent wedge. NOT mutex-specific.
+//
+// RED reproducer: the history is exactly the state recorded when the divergence
+// occurs — the race has resolved (winner completed, loser still scheduled with
+// NO terminal), but the winner marker, the loser's synthetic terminal, and the
+// follow-on activity's schedule were all NEVER persisted because the cycle
+// diverged. The handler races two activities then dispatches a THIRD, follow-on
+// activity; strict replay of this history must reach the follow-on suspension
+// cleanly (`ReplaySucceeded`), not diverge on the loser's unconsumed schedule.
+// ---------------------------------------------------------------------------
+
+/// Race two activities, then dispatch a follow-on activity (the command that
+/// nd-blocks today because the losing branch's schedule is unconsumed).
+fn race_with_inflight_loser_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        // Follow-on durable command in the SAME cycle: this is where the run
+        // nd-blocks today, on the losing branch's unconsumed ActivityScheduled.
+        let after = ctx
+            .execute_activity_raw("after_race", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "winner": winner.value, "after": after }))
+    })
+}
+
+/// The history recorded at the moment the divergence occurs: the race resolved
+/// (winner b completed, loser a still scheduled with NO terminal), but the
+/// winner marker / loser terminal / follow-on schedule were never persisted.
+fn race_with_inflight_loser_then_activity_history() -> Vec<WorkflowEvent> {
+    let loser_id = ActivityExecId::new();
+    let winner_id = ActivityExecId::new();
+    vec![
+        interleaved_started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "race:1".to_string(),
+            details: Value::from(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: loser_id,
+            name: "fetch_a".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: winner_id,
+            name: "fetch_b".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: winner_id,
+            output: serde_json::json!({ "provider": "b" }),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn race_with_inflight_loser_then_activity_replays_succeeded() {
+    // Issue #1126: after a race resolves with a loser still in-flight, the next
+    // durable command (a follow-on activity) must reach its suspension cleanly.
+    // Today the loser's unconsumed ActivityScheduled makes the follow-on
+    // `match_activity` diverge (#603 nd-block => permanent wedge).
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "race_with_inflight_loser_then_activity",
+            race_with_inflight_loser_then_activity_workflow,
+        )
+        .replay_from_events(race_with_inflight_loser_then_activity_history())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1126: a race resolved with a still-in-flight loser must let the \
+         next follow-on durable command reach its suspension — the loser's \
+         unconsumed ActivityScheduled must not diverge the follow-on \
+         match_activity:\n{report}"
+    );
+}
+
+// TODO(green): add race->mutex follow-on variant
+// (`ctx.mutex(k).acquire()` after the race), which records a MutexGranted event
+// and reproduces the identical nd-block on the mutex-acquire match head. The
+// plain-activity variant above is sufficient to prove RED; the mutex variant
+// needs the MutexGranted fixture shape and will be added in the GREEN phase.
