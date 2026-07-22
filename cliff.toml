@@ -39,6 +39,7 @@ sort_commits = "newest"
 
 commit_parsers = [
   { message = "^docs: update CHANGELOG\\.md", skip = true },
+  { message = "^chore: changelog", skip = true },
   { message = "^chore: release notes", skip = true },
   { message = "^chore\\(release\\)", skip = true },
   { message = "^Merge pull request", skip = true },

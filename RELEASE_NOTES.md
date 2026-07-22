@@ -9,6 +9,8 @@ This file below is retained for the 0.4.0 and earlier history.
 
 ### Added
 
+- Add last-completion-result carryover for scheduled workflows (issue #488) (#677)([16e7334](https://github.com/madmax983/autumn-harvest/commit/16e7334933d115b7e767c8a9a2d256ee479a0092))
+
 - Add external workflow cancellation primitive (issue #492) (#676)([33595ff](https://github.com/madmax983/autumn-harvest/commit/33595ff5890efeb75c95a71f0f6281ddb0fdc9a8))
 
 - Add soft SLA breach detection for workflow executions (issue #487) (#671)([f85ba1b](https://github.com/madmax983/autumn-harvest/commit/f85ba1b28526f02d060fd5533cbf5aaf236ec00c))
@@ -170,6 +172,32 @@ This file below is retained for the 0.4.0 and earlier history.
 
 ### Fixed
 
+- Propagate WorkflowInfo defaults to scheduled, child, and trigger-now starts; fix false SLA breach on cancel-while-paused([ea6c173](https://github.com/madmax983/autumn-harvest/commit/ea6c173c6f543193a05548c56ca146df56cd844c))
+
+- Signal/update-with-start inherit info execution_timeout, update-with-start runs validator, typed stub resolves concurrency([2a54431](https://github.com/madmax983/autumn-harvest/commit/2a5443119bf5bb2fecd0500da03e61710423dc96))
+
+- DAG trigger-now uses pick_for_dag, workflow backfill gate uses actual default shard([f8fe156](https://github.com/madmax983/autumn-harvest/commit/f8fe156261a881d0833e9364d3d9a66f436df6c3))
+
+- Auth guard on trigger route, atomic batch pre-validation, DAG backfill gates, rate-limit reporting([5710a1d](https://github.com/madmax983/autumn-harvest/commit/5710a1da9a1e913b6af1a67263063b433f8b56f5))
+
+- Gate bypass covers all non-terminal states, rate-limit upsert propagates to all shards([6d9ffa5](https://github.com/madmax983/autumn-harvest/commit/6d9ffa5bb55954c4a553e86835f2a4a77cb9b969))
+
+- Three Codex round-5 issues (P1 backfill gate, P2 input caps, P2 contract)([0d204ad](https://github.com/madmax983/autumn-harvest/commit/0d204ad4b6b7e0cfe020f29a8464a87e7fe04d0e))
+
+- Clippy option_if_let_else in batch-start validation([df1ffc7](https://github.com/madmax983/autumn-harvest/commit/df1ffc7f29c28e629a861b213bd80c58b214fdc9))
+
+- Five Codex round-4 P2 issues([2860cab](https://github.com/madmax983/autumn-harvest/commit/2860cab91a023f32d9de04d43e433f73b01cb7ab))
+
+- Fix claim_task SQL column bug and address Codex review comments([874c6b7](https://github.com/madmax983/autumn-harvest/commit/874c6b7f46ba2d744bbb3b6cb1ea7e4491caa8ee))
+
+- Fix four more correctness bugs flagged in second Codex review([ce6a8be](https://github.com/madmax983/autumn-harvest/commit/ce6a8be2b8c8b05c9a05f8cd4e380084cbf5ce2a))
+
+- Fix three correctness bugs flagged in Codex review([ab2d896](https://github.com/madmax983/autumn-harvest/commit/ab2d896786415b58eb0ccf691f0d2abc849c5c17))
+
+- SSE parser correctness — colon-split and multi-line data concatenation([eb30fc9](https://github.com/madmax983/autumn-harvest/commit/eb30fc9a8f5eb813c23be6b9ef2c9ec110803fa2))
+
+- Remove duplicate sla field in cross_workflow_cancel_tests struct literals([7d67847](https://github.com/madmax983/autumn-harvest/commit/7d67847a25a6cb7699f3307dd49fd8c4355687f2))
+
 - **plugin:** Require auth for cancel and dead-letter endpoints (#316)([50e7c3e](https://github.com/madmax983/autumn-harvest/commit/50e7c3ef092a1f6b49c3c32ea9720fb5bb5389c3))
 
 
@@ -178,6 +206,20 @@ This file below is retained for the 0.4.0 and earlier history.
 - Pre-allocate markers vector to reduce heap allocations (#290)([23f0796](https://github.com/madmax983/autumn-harvest/commit/23f0796e6d1d441973cd43645b58257d8229fc06))
 
 
+### Styling
+
+- Fix rustfmt for STATUS_FAILED tuple literal([48edd58](https://github.com/madmax983/autumn-harvest/commit/48edd582ecab4c21307f6fe38ac07b3546cc95dd))
+
+- Cargo fmt fixes for Codex review changes([959e78b](https://github.com/madmax983/autumn-harvest/commit/959e78bbab67058e6481da392cf9786debc1fbb6))
+
+
+### Testing
+
+- Set admin auth boundary in api_trigger_preserves_dag_metadata([3691aba](https://github.com/madmax983/autumn-harvest/commit/3691abaec63768eab11a9020829cc73aa8f94e0c))
+
+
 ### Miscellaneous
+
+- Cargo clean before plugin lib tests to avoid disk exhaustion([d41207d](https://github.com/madmax983/autumn-harvest/commit/d41207d2a7b49af2b3bffd8e3def5e9dc2838292))
 
 - Fix changelog (#300)([512796c](https://github.com/madmax983/autumn-harvest/commit/512796c4ae1c1a365e24b2958d9869f8a787e174))
