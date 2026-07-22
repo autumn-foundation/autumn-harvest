@@ -854,6 +854,19 @@ pub struct WorkflowSchedule {
     /// schedule. `None` = no deadline enforced (today's behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_timeout: Option<std::time::Duration>,
+    /// Chain-scoped lifetime cap for this schedule (issue #617). Distinct from
+    /// [`execution_timeout`](Self::execution_timeout): anchored at the first run's
+    /// start and carried verbatim across every continue-as-new.
+    ///
+    /// **Currently inert** — at exact parity with [`execution_timeout`](Self::execution_timeout),
+    /// this per-schedule value is NOT persisted on `harvest_schedules` and NOT
+    /// read by the scheduler tick. The *functional* schedule-level chain default
+    /// is delivered by the workflow-type `#[workflow(chain_execution_timeout = "…")]`
+    /// attribute (inherited through `WorkflowInfo` at tick time), plus the
+    /// fleet-wide ceiling ([`HarvestBuilder::max_workflow_chain_timeout`]). The
+    /// builder method is kept for API symmetry with #243's third surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_execution_timeout: Option<std::time::Duration>,
     /// Optional named calendar to consult before each firing.
     ///
     /// When `Some("us-federal-holidays")`, the scheduler looks up the
@@ -908,6 +921,43 @@ pub struct WorkflowSchedule {
     /// no behavior change for unmodified schedules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catchup_policy: Option<CatchupPolicy>,
+    /// Default retry policy for runs started by this schedule (issue #523).
+    ///
+    /// When `Some`, each run started by this schedule uses this as its retry policy
+    /// (unless the workflow type declares its own default or the start API provides
+    /// a per-start override). `None` (the default) disables schedule-level retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
+    /// Register this schedule on **every writable shard** rather than the single
+    /// shard chosen by rendezvous hashing / the default shard (issue #796).
+    ///
+    /// `false` (the default) preserves today's behaviour exactly: a non-DAG
+    /// schedule is pinned to `router.default_shard()` and a DAG schedule to its
+    /// rendezvous shard. When `true`, the scheduler upserts one
+    /// `harvest_schedules` row per writable shard (one row per shard database,
+    /// so the `UNIQUE(workflow_name)` constraint is not violated) and each
+    /// shard's fire mints an execution on that shard.
+    ///
+    /// **Supported only for DAG schedules and the built-in synthetic liveness
+    /// canary** (names starting with `__harvest_canary_probe`, issue #796, AC4).
+    /// The canary sets this so a single write-blocked/dead shard surfaces as a
+    /// failing/stale probe for that shard.
+    ///
+    /// For any other (plain, non-DAG) workflow this flag is **rejected at build
+    /// time** (`HarvestBuilderError::AllWritableShardsUnsupported`). The reason:
+    /// registration honours the flag for any schedule, but the fire path
+    /// (`scheduled_fire_encodes_shard`) only encodes the shard id into the minted
+    /// `ExecutionId` for DAGs and canaries — it derives that decision purely from
+    /// the workflow name and DAG-ness of the persisted `harvest_schedules` row,
+    /// which carries no `all_writable_shards` column. So a plain workflow opting
+    /// in would register on every writable shard yet mint every execution with
+    /// `ExecutionId::new()` (the router's default shard), producing duplicate
+    /// runs on the default shard and cross-shard write inconsistency. Making it
+    /// general-purpose would require persisting the flag as a `harvest_schedules`
+    /// column — a migration — which issue #796 (AC10) deliberately avoids; the
+    /// canary/DAG path stays migration-free via name-based shard encoding.
+    #[serde(default)]
+    pub all_writable_shards: bool,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -936,13 +986,29 @@ impl WorkflowSchedule {
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
             execution_timeout: None,
+            chain_execution_timeout: None,
             calendar: None,
             skip_policy: SkipPolicy::Skip,
             consecutive_failure_limit: None,
             end_at: None,
             max_runs: None,
             catchup_policy: None,
+            retry_policy: None,
+            all_writable_shards: false,
         }
+    }
+
+    /// Register this schedule on every writable shard (issue #796).
+    ///
+    /// Opt-in per-writable-shard coverage: the scheduler upserts one row per
+    /// writable shard and each shard's fire mints an execution on that shard.
+    /// The default (`false`) pins the schedule to a single shard exactly as
+    /// today. Used by the built-in synthetic liveness canary so a single
+    /// dead/write-blocked shard surfaces as a failing probe for that shard.
+    #[must_use]
+    pub const fn with_all_writable_shards(mut self) -> Self {
+        self.all_writable_shards = true;
+        self
     }
 
     /// Set the per-run execution timeout for this schedule.
@@ -955,10 +1021,35 @@ impl WorkflowSchedule {
         self
     }
 
+    /// Set the chain-scoped lifetime cap for this schedule (issue #617).
+    ///
+    /// **Currently inert** — mirroring #243's [`with_execution_timeout`](Self::with_execution_timeout),
+    /// the value set here is NOT persisted on `harvest_schedules` and NOT read by
+    /// the scheduler tick. To give scheduled runs a chain cap, declare it on the
+    /// workflow type via `#[workflow(chain_execution_timeout = "…")]` (inherited
+    /// through `WorkflowInfo` at tick) and/or set the fleet-wide ceiling with
+    /// [`HarvestBuilder::max_workflow_chain_timeout`]. This builder method is kept
+    /// for API symmetry with #243's third surface.
+    #[must_use]
+    pub const fn with_chain_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.chain_execution_timeout = Some(timeout);
+        self
+    }
+
     /// Set the JSON input passed to each scheduled run.
     #[must_use]
     pub fn with_input(mut self, input: serde_json::Value) -> Self {
         self.input = input;
+        self
+    }
+
+    /// Set the task queue each scheduled run is dispatched onto.
+    ///
+    /// Defaults to `"default"`. Used by the built-in synthetic liveness canary
+    /// (issue #796) to route each per-queue probe onto the queue it exercises.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue: impl Into<String>) -> Self {
+        self.queue_name = queue.into();
         self
     }
 
@@ -1128,6 +1219,29 @@ impl WorkflowSchedule {
         self.max_runs = if max == 0 { None } else { Some(max) };
         self
     }
+
+    /// Set a remaining-action budget for this schedule (issue #543).
+    ///
+    /// An alias for [`with_max_runs`](Self::with_max_runs) — `max_runs`/`runs_started`
+    /// on `harvest_schedules` already implement the "declare a firing budget, decrement
+    /// exactly-once per actually-started run under the HA claim (#350), never consumed
+    /// by a suppressed firing" contract issue #543 asks for. This method exists so
+    /// callers can spell the intent as "N actions remaining" without needing to know
+    /// the underlying total-budget representation.
+    #[must_use]
+    pub const fn with_limited_actions(self, limit: u32) -> Self {
+        self.with_max_runs(limit)
+    }
+
+    /// Set a default retry policy for runs started by this schedule (issue #523).
+    ///
+    /// Each run started by this schedule will use this as its retry policy
+    /// (unless overridden by a per-start API call). `None` disables retry.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
 }
 
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
@@ -1243,10 +1357,118 @@ pub fn compute_jitter_offset(
     Duration::from_nanos(hash % jitter_nanos)
 }
 
+/// Resolve the effective activity retry policy at schedule time (issue #620).
+///
+/// Precedence, highest first:
+///   call-site override → activity `#[activity(retry = …)]` default →
+///   builder-level default (`WorkerConfig::with_default_activity_retry_policy`).
+///
+/// Returns `None` when nothing is set anywhere, preserving today's implicit
+/// fallback (the enqueue path's own `max_attempts` default). Opt-in: an unset
+/// builder default is a pure no-op via `.or(None)`.
+///
+/// The sole non-test consumer is the `db`-gated worker dispatch path; unused
+/// under `--no-default-features` (the pure precedence is still test-covered).
+#[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn resolve_effective_retry(
+    call: Option<RetryPolicy>,
+    activity: Option<RetryPolicy>,
+    builder: Option<RetryPolicy>,
+) -> Option<RetryPolicy> {
+    call.or(activity).or(builder)
+}
+
+/// Resolve the effective activity `start_to_close` at schedule time (issue #620).
+///
+/// Same precedence as [`resolve_effective_retry`]: call-site override →
+/// activity default → builder default. `None` when unset (no timeout enforced),
+/// preserving today's behaviour.
+///
+/// The sole non-test consumer is the `db`-gated worker dispatch path; unused
+/// under `--no-default-features` (the pure precedence is still test-covered).
+#[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn resolve_effective_start_to_close(
+    call: Option<Duration>,
+    activity: Option<Duration>,
+    builder: Option<Duration>,
+) -> Option<Duration> {
+    call.or(activity).or(builder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── Builder-level activity default floor (issue #620) ─────────────────────
+    //
+    // RED PHASE: `resolve_effective_retry` / `resolve_effective_start_to_close`
+    // do not exist yet — these tests fail to COMPILE against the missing
+    // `crate::policy` symbols until the green phase adds them. The precedence
+    // the green phase must implement is:
+    //   call-site override  →  activity default  →  builder default  →  None
+    // i.e. `call.or(activity).or(builder)`.
+
+    #[test]
+    fn resolve_effective_retry_precedence() {
+        // Distinct policies so the returned identity is unambiguous.
+        let call = RetryPolicy::fixed(5, Duration::from_millis(10));
+        let activity = RetryPolicy::fixed(2, Duration::from_millis(10));
+        let builder = RetryPolicy::fixed(9, Duration::from_millis(10));
+
+        // All three present → call-site wins.
+        assert_eq!(
+            resolve_effective_retry(Some(call), Some(activity.clone()), Some(builder.clone()))
+                .map(|p| p.max_attempts),
+            Some(5),
+        );
+
+        // No call-site → activity default wins over builder default.
+        assert_eq!(
+            resolve_effective_retry(None, Some(activity), Some(builder.clone()))
+                .map(|p| p.max_attempts),
+            Some(2),
+        );
+
+        // No call-site, no activity default → builder default applies.
+        assert_eq!(
+            resolve_effective_retry(None, None, Some(builder)).map(|p| p.max_attempts),
+            Some(9),
+        );
+
+        // Nothing set anywhere → None (implicit fallback handled downstream).
+        assert!(resolve_effective_retry(None, None, None).is_none());
+    }
+
+    #[test]
+    fn resolve_effective_start_to_close_precedence() {
+        let call = Duration::from_secs(5);
+        let activity = Duration::from_secs(30);
+        let builder = Duration::from_secs(300);
+
+        // All three present → call-site wins.
+        assert_eq!(
+            resolve_effective_start_to_close(Some(call), Some(activity), Some(builder)),
+            Some(call),
+        );
+
+        // No call-site → activity default wins over builder default.
+        assert_eq!(
+            resolve_effective_start_to_close(None, Some(activity), Some(builder)),
+            Some(activity),
+        );
+
+        // No call-site, no activity default → builder default applies.
+        assert_eq!(
+            resolve_effective_start_to_close(None, None, Some(builder)),
+            Some(builder),
+        );
+
+        // Nothing set anywhere → None (no timeout enforced).
+        assert_eq!(resolve_effective_start_to_close(None, None, None), None);
+    }
 
     // ── Schedule jitter ───────────────────────────────────────────────────────
 
@@ -1498,6 +1720,52 @@ mod tests {
         assert!(TriggerRule::AllDone.should_run(&[]));
     }
 
+    // ── Bounded schedules (issue #543 / #478) ───────────────────────────────────
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_sets_max_runs() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_limited_actions(5);
+        assert_eq!(sched.max_runs, Some(5));
+    }
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_zero_normalises_to_none() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_limited_actions(0);
+        assert_eq!(
+            sched.max_runs, None,
+            "limited_actions(0) must behave identically to max_runs(0) — no limit, \
+             not an unfireable schedule"
+        );
+    }
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_matches_with_max_runs() {
+        let via_limited = WorkflowSchedule::new("my_wf", Schedule::Manual).with_limited_actions(3);
+        let via_max_runs = WorkflowSchedule::new("my_wf", Schedule::Manual).with_max_runs(3);
+        assert_eq!(via_limited.max_runs, via_max_runs.max_runs);
+    }
+
+    #[test]
+    fn workflow_schedule_end_at_and_limited_actions_default_to_none() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert_eq!(sched.end_at, None);
+        assert_eq!(
+            sched.max_runs, None,
+            "unbounded by default — today's behaviour"
+        );
+    }
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_composes_with_jitter_and_overlap() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_limited_actions(10)
+            .with_jitter(Duration::from_secs(60))
+            .with_overlap_policy(OverlapPolicy::CancelOther);
+        assert_eq!(sched.max_runs, Some(10));
+        assert_eq!(sched.jitter, Duration::from_secs(60));
+        assert_eq!(sched.overlap_policy, OverlapPolicy::CancelOther);
+    }
+
     // ── SkipPolicy ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1619,6 +1887,44 @@ mod tests {
     fn workflow_schedule_with_buffer_all_max_sets_field() {
         let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_buffer_all_max(50);
         assert_eq!(sched.buffer_all_max, 50);
+    }
+
+    #[test]
+    fn workflow_schedule_all_writable_shards_defaults_to_false() {
+        // AC1: opt-in only — the default preserves single-shard placement.
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert!(!sched.all_writable_shards);
+    }
+
+    #[test]
+    fn workflow_schedule_with_all_writable_shards_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_all_writable_shards();
+        assert!(sched.all_writable_shards);
+    }
+
+    #[test]
+    fn workflow_schedule_all_writable_shards_serde_back_compat() {
+        // #[serde(default)]: a schedule serialized before issue #796 (no
+        // `all_writable_shards` key) must deserialize to `false`.
+        let legacy = r#"{
+            "workflow_name": "my_wf",
+            "dag_name": null,
+            "schedule": "Manual",
+            "input": null,
+            "catchup": false,
+            "max_active_runs": 1,
+            "paused": false,
+            "queue_name": "default"
+        }"#;
+        let sched: WorkflowSchedule =
+            serde_json::from_str(legacy).expect("legacy schedule JSON must deserialize");
+        assert!(!sched.all_writable_shards);
+
+        // Round-trip preserves an opted-in schedule.
+        let opted = WorkflowSchedule::new("my_wf", Schedule::Manual).with_all_writable_shards();
+        let json = serde_json::to_string(&opted).expect("serialize");
+        let back: WorkflowSchedule = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.all_writable_shards);
     }
 
     #[test]

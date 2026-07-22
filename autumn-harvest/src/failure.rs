@@ -28,6 +28,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::policy::RetryPolicy;
+
 /// Stable error-type name for circuit-breaker short-circuit failures (issue #369).
 ///
 /// Synthesised when an activity's circuit breaker is open. Workflow authors
@@ -35,6 +37,129 @@ use serde::{Deserialize, Serialize};
 /// filter metrics by it. A circuit-open failure is always non-retryable for the
 /// in-flight attempt.
 pub const ERROR_TYPE_CIRCUIT_OPEN: &str = "CircuitOpen";
+
+/// Stable error-type name for worker-session breakage (issue #606).
+///
+/// Synthesised by the broken-session scanner for every PENDING/RUNNING
+/// member-activity task belonging to a session whose host worker died or
+/// drained (or whose lease expired). Always non-retryable — a hard-pinned
+/// session activity can never fail over to a different worker, so retrying
+/// in place would loop forever against a dead host.
+pub const ERROR_TYPE_SESSION_BROKEN: &str = "SessionBroken";
+
+/// Stable error-type name for operator-forced activity failures (issue #765).
+///
+/// Synthesised by [`crate::timeout::force_fail_activity`] when an operator
+/// force-fails a hung in-flight activity via the management API. Workflow
+/// authors match on this in their `Err` arm (or via
+/// [`HarvestError::is_operator_force_failed`](crate::error::HarvestError::is_operator_force_failed))
+/// to tell an operator intervention apart from a genuine activity error.
+/// Always non-retryable: the override skips every remaining retry attempt
+/// regardless of retry policy.
+///
+/// This error type is engine-reserved for the operator force-fail endpoint:
+/// activity code that fabricates it (returns an `ActivityFailure` carrying
+/// this type itself) will make a later fail-now call misreport
+/// `already_forced: true` instead of the documented `409` — harmless at the
+/// state-machine level (the idempotent branch performs zero writes) but
+/// misleading in the response.
+pub const ERROR_TYPE_OPERATOR_FORCE_FAILED: &str = "OperatorForceFailed";
+
+/// Stable error-type name for a **contained handler panic** (issue #782).
+///
+/// Synthesised by the engine when an `#[activity]` or `#[workflow]` handler
+/// future panics (unwinds) instead of returning a clean `Err`. The panic is
+/// caught at the dispatch boundary and re-routed into the normal failure path
+/// carrying this error type:
+///
+/// - An **activity** handler panic becomes a *retryable* [`ActivityFailure`]
+///   (same path as `Err(String)`) — it honours the activity's retry policy and,
+///   if retries exhaust, dead-letters as ordinary retry-exhaustion (never a
+///   poison-pill quarantine).
+/// - A **workflow** handler panic becomes a [`WorkflowFailure`], re-dispatched
+///   with capped backoff up to `WorkerConfig::workflow_panic_max_attempts`
+///   before failing the run terminally.
+///
+/// This error type is **engine-reserved** (like [`ERROR_TYPE_CIRCUIT_OPEN`],
+/// [`ERROR_TYPE_SESSION_BROKEN`], and [`ERROR_TYPE_OPERATOR_FORCE_FAILED`]):
+/// handler code that fabricates a failure carrying this type itself is
+/// classified identically to a genuine caught panic on the *terminal* path,
+/// but never triggers the workflow panic-retry loop — that loop is gated on the
+/// engine-internal caught-panic flag, not on the error-type string — so an
+/// author cannot use it to manufacture extra retries.
+pub const ERROR_TYPE_HANDLER_PANIC: &str = "HandlerPanic";
+
+/// Stable error-type name for a WASM activity denied a host capability
+/// (issue #965).
+///
+/// Synthesised when a sandboxed WebAssembly guest imports a host function it
+/// was not granted (e.g. clock, randomness, an env key outside its allowlist,
+/// or filesystem/network — which are not grantable in this spike, so any
+/// import naming them is unsatisfied). Instantiation fails deterministically,
+/// so the outcome is **non-retryable**: a denied capability cannot succeed on a
+/// later attempt without a policy change.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_SANDBOX_DENIED: &str = "SandboxDenied";
+
+/// Stable error-type name for a WASM activity that exhausted a resource budget
+/// (issue #965).
+///
+/// Synthesised when a guest exceeds its CPU fuel, memory ceiling, or wall-clock
+/// deadline. **Retryable**: a larger budget or a less-loaded worker may let the
+/// same input succeed, so the engine honours the activity's retry policy.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_RESOURCE_EXHAUSTED: &str = "ResourceExhausted";
+
+/// Stable error-type name for a WASM guest trap or ABI violation (issue #965).
+///
+/// Synthesised for a guest-side trap (`unreachable`, out-of-bounds access
+/// inside the guest, a bad export signature) or a host-observed ABI violation
+/// (an out-of-range output pointer/length, non-JSON output, a missing `run`
+/// export). **Retryable** — it mirrors the legacy `Err(String)` classification,
+/// so a transient guest fault is retried under the activity's policy.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_TRAP: &str = "WasmTrap";
+
+/// Stable error-type name for a resolvable-but-absent WASM module (issue #965).
+///
+/// Synthesised by the storage layer when no active module row exists for the
+/// requested activity. **Non-retryable**: without a published module the
+/// activity can never run, so retrying in place is pointless — the fix is to
+/// publish (or re-activate) a module version.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_MODULE_UNAVAILABLE: &str = "WasmModuleUnavailable";
+
+/// Stable error-type name for a corrupt or uncompilable WASM module
+/// (issue #965).
+///
+/// Synthesised when a resolved module's bytes fail their content-integrity
+/// check (claimed hash mismatch) or fail to compile. **Non-retryable**: the
+/// stored bytes are bad, so every attempt against the same module version
+/// fails identically — the fix is to republish a valid module.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_MODULE_INVALID: &str = "WasmModuleInvalid";
+
+/// Stable error-type name for a transient failure resolving a WASM module
+/// (issue #965).
+///
+/// Synthesised when the module lookup itself fails for a transient reason (a
+/// database error during resolution). **Retryable**: the module may well be
+/// present and valid; the resolution just failed transiently, so the engine
+/// honours the activity's retry policy.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED: &str = "WasmModuleLookupFailed";
+
+/// Stable error-type name for a WASM guest whose returned output exceeds the
+/// host's maximum output-buffer size (issue #965 review round 8).
+///
+/// Synthesised when the guest's `(out_ptr, out_len)` claims more bytes than
+/// [`crate::wasm_activities::WASM_MAX_OUTPUT_BYTES`], *before* the host parses
+/// the buffer as JSON — so an oversized (but in-bounds) buffer never balloons
+/// host parse CPU/memory. **Non-retryable**: an oversized output is a
+/// deterministic guest bug that produces the same size on every attempt, so
+/// retrying in place is pointless.
+#[cfg(feature = "wasm-activities")]
+pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
 
 /// Typed failure carrier for activity handlers.
 ///
@@ -126,6 +251,125 @@ impl ActivityFailure {
             )
         };
         Self::non_retryable(ERROR_TYPE_CIRCUIT_OPEN, message).with_details(details)
+    }
+
+    /// Construct the non-retryable failure used when an operator force-fails
+    /// a hung in-flight activity (issue #765).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_OPERATOR_FORCE_FAILED`] and the
+    /// failure is non-retryable so every remaining retry attempt is skipped —
+    /// the whole point of the override is to stop the retry curve dead and
+    /// hand the outcome to the workflow's own failure/compensation path.
+    /// The operator-supplied `reason` (if any) is appended to the message and
+    /// carried in `details.reason` so workflow code and audit trails can read
+    /// it back.
+    ///
+    /// [`ERROR_TYPE_OPERATOR_FORCE_FAILED`] is engine-reserved for the
+    /// force-fail endpoint: activity code that fabricates this failure itself
+    /// will make a later fail-now call misreport `already_forced: true`
+    /// instead of the documented `409` (harmless — zero writes — but
+    /// misleading).
+    #[must_use]
+    pub fn operator_force_failed(reason: Option<&str>) -> Self {
+        let mut details = serde_json::json!({ "forced_by_operator": true });
+        let message = reason.map_or_else(
+            || "activity force-failed by operator".to_string(),
+            |reason| {
+                details["reason"] = serde_json::json!(reason);
+                format!("activity force-failed by operator: {reason}")
+            },
+        );
+        Self::non_retryable(ERROR_TYPE_OPERATOR_FORCE_FAILED, message).with_details(details)
+    }
+
+    /// Construct the non-retryable failure used when a sandboxed WASM guest is
+    /// denied a host capability (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_SANDBOX_DENIED`] and the failure
+    /// is non-retryable: a denied capability cannot be granted by a retry, so
+    /// the in-flight attempt terminates immediately and the workflow's own
+    /// failure/compensation path takes over.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn sandbox_denied(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_SANDBOX_DENIED, detail)
+    }
+
+    /// Construct the retryable failure used when a sandboxed WASM guest exceeds
+    /// its resource budget — CPU fuel, memory, or wall-clock deadline
+    /// (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_RESOURCE_EXHAUSTED`] and the
+    /// failure is retryable: a larger budget or a less-loaded worker may let the
+    /// same input succeed, so the engine honours the activity's retry policy.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn resource_exhausted(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_RESOURCE_EXHAUSTED, detail)
+    }
+
+    /// Construct the retryable failure used for a WASM guest trap or ABI
+    /// violation (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_TRAP`] and the failure is
+    /// retryable, mirroring the legacy `Err(String)` classification: a guest
+    /// trap, a bad-ABI response, or non-JSON output is retried under the
+    /// activity's policy.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_trap(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_WASM_TRAP, detail)
+    }
+
+    /// Construct the non-retryable failure used when a WASM guest's returned
+    /// output exceeds the host's maximum output-buffer size
+    /// (issue #965 review round 8).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_OUTPUT_TOO_LARGE`] and the
+    /// failure is non-retryable: an oversized output is a deterministic guest
+    /// bug that produces the same size on every attempt, so retrying is
+    /// pointless. Raised *before* the host deserializes the buffer, so an
+    /// oversized (but in-bounds) output never balloons host parse CPU/memory.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_output_too_large(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_OUTPUT_TOO_LARGE, detail)
+    }
+
+    /// Construct the non-retryable failure used when no active WASM module row
+    /// exists for the requested activity (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_MODULE_UNAVAILABLE`] and the
+    /// failure is non-retryable: without a published module the activity can
+    /// never run.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_unavailable(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_MODULE_UNAVAILABLE, detail)
+    }
+
+    /// Construct the non-retryable failure used when a WASM module's bytes fail
+    /// their content-integrity check or fail to compile (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_MODULE_INVALID`] and the
+    /// failure is non-retryable: the stored bytes are bad, so every attempt
+    /// against the same module version fails identically.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_invalid(detail: impl Into<String>) -> Self {
+        Self::non_retryable(ERROR_TYPE_WASM_MODULE_INVALID, detail)
+    }
+
+    /// Construct the retryable failure used when resolving a WASM module fails
+    /// for a transient reason, such as a database error (issue #965).
+    ///
+    /// The `error_type` is always [`ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED`] and
+    /// the failure is retryable: the module may be present and valid; only the
+    /// resolution failed transiently.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_lookup_failed(detail: impl Into<String>) -> Self {
+        Self::retryable(ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED, detail)
     }
 }
 
@@ -249,6 +493,267 @@ pub fn parse_error_payload_full(payload: &str) -> ActivityFailure {
             details: None,
             non_retryable: false,
         }
+    }
+}
+
+/// Whether `error` is non-retryable under the shared retry-termination rule
+/// (issue #227): the typed payload's own `non_retryable` flag, or the
+/// resolved policy's `non_retryable_errors` list (which also matches legacy
+/// `Err(String)` values the typed flag never sees). Used by the `db`-gated
+/// live worker's retry/circuit-breaker classification (`worker.rs`); the
+/// DB-less `WorkflowSimulator` test harness (`simulator.rs`) calls
+/// [`classify_activity_error`] directly instead, so the two callers share
+/// one rule without pulling `worker.rs` into a `--no-default-features` build.
+#[cfg(feature = "db")]
+#[must_use]
+pub(crate) fn failure_is_non_retryable(error: &str, retry_policy: Option<&RetryPolicy>) -> bool {
+    classify_activity_error(error, retry_policy).1
+}
+
+/// Parse `error` once and return both the recovered [`ActivityFailure`]
+/// (equivalent to [`parse_error_payload_full`]) and whether it is
+/// non-retryable (equivalent to [`failure_is_non_retryable`]), without
+/// deserializing the wire payload twice.
+#[must_use]
+pub(crate) fn classify_activity_error(
+    error: &str,
+    retry_policy: Option<&RetryPolicy>,
+) -> (ActivityFailure, bool) {
+    let typed = parse_typed_payload(error);
+    let non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable)
+        || retry_policy.is_some_and(|policy| {
+            let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+            policy.is_non_retryable(typed_error_type, error)
+        });
+    let failure = typed.unwrap_or_else(|| ActivityFailure {
+        error_type: "Error".to_string(),
+        message: error.to_string(),
+        details: None,
+        non_retryable: false,
+    });
+    (failure, non_retryable)
+}
+
+// ---------------------------------------------------------------------------
+// Typed workflow failures (issue #767)
+// ---------------------------------------------------------------------------
+
+/// Typed failure carrier for workflow handlers.
+///
+/// Mirrors [`ActivityFailure`] onto the workflow surface: a workflow author
+/// can return `Err(WorkflowFailure::new("ValidationRejected", "…"))` to signal
+/// a stable, low-cardinality error-type name (and optional structured details)
+/// that operators and result-awaiting callers can classify without parsing the
+/// human-readable message.
+///
+/// ## Backward compatibility
+///
+/// `From<String>` / `From<&str>` produce a `WorkflowFailure` with
+/// `error_type = "Error"`, so every workflow that today returns `Err(String)`
+/// continues to compile and behave identically. Untyped failures decode back
+/// to `error_type = None` (see [`decode_workflow_failure`]).
+///
+/// `"Error"` is the **reserved untyped sentinel** and must not be used as a
+/// typed `error_type` class: a genuine envelope whose class is literally
+/// `"Error"` collapses back to `error_type = None` on decode (mirroring the
+/// activity `"Error"` legacy convention). Its other fields (`details`,
+/// `non_retryable`) are still preserved.
+///
+/// ## Builder note
+///
+/// Unlike [`ActivityFailure::non_retryable`] (a constructor taking a type and
+/// message), [`WorkflowFailure::non_retryable`] is a **builder** that flips the
+/// flag on an existing value and returns `self`, so it chains after
+/// [`WorkflowFailure::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowFailure {
+    /// A stable, low-cardinality error-type name used for classification and
+    /// policy matching (e.g. `"ValidationRejected"`, `"BudgetExceeded"`).
+    pub error_type: String,
+    /// Human-readable description of the failure.
+    pub message: String,
+    /// Optional structured details serialised alongside the failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    /// Advisory failure-classification hint read by the caller /
+    /// completion-trigger (via [`HarvestError::is_workflow_non_retryable`]).
+    ///
+    /// This flag is **not** a control input to the engine's workflow-level retry
+    /// (#523) loop — a typed workflow `non_retryable` is deliberately *not*
+    /// consulted by the retry scheduler, per issue #767 scope. It is a hint for
+    /// downstream classification only, never a gate on whether the run retries.
+    ///
+    /// To *halt* the retry loop for a specific failure class, list its
+    /// [`error_type`](Self::error_type) in the workflow's
+    /// [`RetryPolicy::non_retryable_errors`](crate::RetryPolicy::non_retryable_errors):
+    /// the scheduler matches that class list against the decoded `error_type`,
+    /// so the `error_type` (not this `non_retryable` flag) is the retry-control
+    /// knob for a typed workflow failure.
+    ///
+    /// [`HarvestError::is_workflow_non_retryable`]: crate::HarvestError::is_workflow_non_retryable
+    pub non_retryable: bool,
+}
+
+impl WorkflowFailure {
+    /// Construct a retryable workflow failure carrying a stable error-type name.
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_type: error_type.into(),
+            message: message.into(),
+            details: None,
+            non_retryable: false,
+        }
+    }
+
+    /// Attach optional structured details to this failure.
+    #[must_use]
+    pub fn with_details(mut self, value: serde_json::Value) -> Self {
+        self.details = Some(value);
+        self
+    }
+
+    /// Mark this failure as non-retryable (builder — flips the flag, returns
+    /// `self`). Chains after [`WorkflowFailure::new`].
+    ///
+    /// The flag is an **advisory classification hint** for the caller /
+    /// completion-trigger, not a control input to the engine's workflow-level
+    /// retry (#523) loop — the retry scheduler does not consult it (issue #767
+    /// scope). Setting it does not prevent the run from retrying. To halt the
+    /// retry loop for this failure's class, add its `error_type` to the
+    /// workflow's [`RetryPolicy::non_retryable_errors`](crate::RetryPolicy::non_retryable_errors)
+    /// instead — the scheduler matches that list against the decoded `error_type`.
+    #[must_use]
+    pub const fn non_retryable(mut self) -> Self {
+        self.non_retryable = true;
+        self
+    }
+}
+
+impl std::fmt::Display for WorkflowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.error_type, self.message)
+    }
+}
+
+impl From<String> for WorkflowFailure {
+    fn from(message: String) -> Self {
+        Self::new("Error", message)
+    }
+}
+
+impl From<&str> for WorkflowFailure {
+    fn from(message: &str) -> Self {
+        Self::new("Error", message)
+    }
+}
+
+/// Trait that lets the macro-generated workflow dispatch shim serialise both
+/// `String` and `WorkflowFailure` errors into the engine's wire format without
+/// runtime type-checking.
+///
+/// `String` passes through unchanged (legacy path).
+/// `WorkflowFailure` is serialised to a `harvest_workflow_failure_v1` JSON
+/// envelope so the engine can recover `error_type`, `details`, and
+/// `non_retryable` when writing the `WorkflowFailed` event.
+pub trait IntoWorkflowErrorString {
+    /// Convert this error into the string payload carried on the engine's
+    /// internal `Result<serde_json::Value, String>` boundary.
+    fn into_workflow_error_payload(self) -> String;
+}
+
+impl IntoWorkflowErrorString for String {
+    fn into_workflow_error_payload(self) -> String {
+        self
+    }
+}
+
+impl IntoWorkflowErrorString for WorkflowFailure {
+    fn into_workflow_error_payload(self) -> String {
+        // WorkflowFailure has no maps with non-string keys, so to_string never
+        // fails — but if it ever does, fall back to the Display string rather
+        // than panicking on the worker hot path.
+        let fallback = self.to_string();
+        serde_json::to_string(&WorkflowWirePayload::WorkflowFailureV1(self)).unwrap_or(fallback)
+    }
+}
+
+/// Wire-format envelope for `WorkflowFailure` payloads.
+///
+/// The explicit `harvest_workflow_failure_v1` discriminator prevents collision
+/// with legacy workflows that happen to return JSON-shaped error strings. Only
+/// payloads emitted by [`IntoWorkflowErrorString`] are routed through the typed
+/// path; every other string stays on the legacy untyped fallback.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WorkflowWirePayload {
+    #[serde(rename = "harvest_workflow_failure_v1")]
+    WorkflowFailureV1(WorkflowFailure),
+}
+
+/// Decoded view of a workflow failure payload.
+///
+/// The `Option` fields are the load-bearing back-compat signal: a genuine
+/// `harvest_workflow_failure_v1` envelope decodes to `Some(..)` typed fields,
+/// while any legacy plain string (including JSON that happens to share
+/// `WorkflowFailure`'s shape) decodes to `None` for every typed field so the
+/// engine records no synthetic `error_type` for pre-#767 failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedWorkflowFailure {
+    /// Human-readable failure message (always present).
+    pub message: String,
+    /// Stable error-type name — `Some` only for genuine typed envelopes.
+    pub error_type: Option<String>,
+    /// Structured details — `Some` only for genuine typed envelopes.
+    pub details: Option<serde_json::Value>,
+    /// Non-retryable flag — `Some` only for genuine typed envelopes.
+    pub non_retryable: Option<bool>,
+}
+
+/// Decode a workflow failure payload string.
+///
+/// A well-formed `harvest_workflow_failure_v1` envelope decodes to its typed
+/// fields; every other string decodes to `message = payload`, with all typed
+/// fields `None` (the untyped back-compat path).
+///
+/// The string `"Error"` is the reserved untyped sentinel (mirroring the
+/// activity `"Error"` legacy convention): a genuine envelope whose
+/// `error_type` is literally `"Error"` collapses `error_type` to `None` so it
+/// classifies identically to a legacy untyped failure. The other typed fields
+/// (`message`, `details`, `non_retryable`) are preserved independently — only
+/// `error_type` is affected by the sentinel collapse.
+#[must_use]
+pub fn decode_workflow_failure(payload: &str) -> DecodedWorkflowFailure {
+    if let Ok(WorkflowWirePayload::WorkflowFailureV1(failure)) =
+        serde_json::from_str::<WorkflowWirePayload>(payload)
+    {
+        DecodedWorkflowFailure {
+            message: failure.message,
+            // `"Error"` is the reserved untyped sentinel: collapse it to `None`
+            // so a genuine typed failure whose class is literally `"Error"`
+            // classifies the same live, on replay, and when stored. Preserve the
+            // other typed fields independently.
+            error_type: (failure.error_type != "Error").then_some(failure.error_type),
+            details: failure.details,
+            non_retryable: Some(failure.non_retryable),
+        }
+    } else {
+        DecodedWorkflowFailure {
+            message: payload.to_string(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+}
+
+/// Returns `Some(WorkflowFailure)` only for genuine typed-wire-format payloads.
+///
+/// Returns `None` for legacy plain-string payloads (no
+/// `harvest_workflow_failure_v1` envelope).
+#[must_use]
+pub fn parse_workflow_typed_payload(payload: &str) -> Option<WorkflowFailure> {
+    match serde_json::from_str::<WorkflowWirePayload>(payload) {
+        Ok(WorkflowWirePayload::WorkflowFailureV1(failure)) => Some(failure),
+        Err(_) => None,
     }
 }
 
@@ -416,5 +921,410 @@ mod tests {
         let (error_type, non_retryable, _) = parse_error_payload(&payload);
         assert_eq!(error_type, "CircuitOpen");
         assert!(non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_matches_parse_error_payload_full_for_legacy() {
+        let (failure, non_retryable) = classify_activity_error("connection refused", None);
+        assert_eq!(failure, parse_error_payload_full("connection refused"));
+        assert!(!non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_matches_parse_error_payload_full_for_typed() {
+        let payload =
+            ActivityFailure::retryable("UpstreamTimeout", "gateway timed out").into_error_payload();
+        let (failure, non_retryable) = classify_activity_error(&payload, None);
+        assert_eq!(failure, parse_error_payload_full(&payload));
+        assert!(!non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_honours_typed_non_retryable_flag() {
+        let payload =
+            ActivityFailure::non_retryable("InvalidInput", "bad request").into_error_payload();
+        let (failure, non_retryable) = classify_activity_error(&payload, None);
+        assert!(non_retryable);
+        assert_eq!(failure.error_type, "InvalidInput");
+    }
+
+    #[test]
+    fn classify_activity_error_honours_policy_non_retryable_errors_list() {
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 5,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 1.0,
+            max_interval: std::time::Duration::from_secs(1),
+            non_retryable_errors: vec!["bad input".to_string()],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let (_, non_retryable) = classify_activity_error("bad input", Some(&policy));
+        assert!(non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_legacy_never_matches_policy_error_synthetic_type() {
+        // Regression guard for issue #227: a policy listing "Error" (the
+        // synthetic legacy error_type) must not halt retries on every
+        // untyped `Err(String)` failure.
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 5,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 1.0,
+            max_interval: std::time::Duration::from_secs(1),
+            non_retryable_errors: vec!["Error".to_string()],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let (_, non_retryable) = classify_activity_error("some transient failure", Some(&policy));
+        assert!(!non_retryable);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn failure_is_non_retryable_delegates_to_classify_activity_error() {
+        let payload = ActivityFailure::non_retryable("X", "y").into_error_payload();
+        assert!(failure_is_non_retryable(&payload, None));
+        assert!(!failure_is_non_retryable("plain string", None));
+    }
+
+    // ── operator force-fail (issue #765) ──────────────────────────────────
+
+    #[test]
+    fn operator_force_failed_is_non_retryable_typed_failure() {
+        let f = ActivityFailure::operator_force_failed(None);
+        assert_eq!(f.error_type, ERROR_TYPE_OPERATOR_FORCE_FAILED);
+        assert_eq!(f.error_type, "OperatorForceFailed");
+        assert!(
+            f.non_retryable,
+            "operator force-fail must skip all remaining retries"
+        );
+        assert_eq!(f.message, "activity force-failed by operator");
+    }
+
+    #[test]
+    fn operator_force_failed_appends_reason_to_message_and_details() {
+        let f = ActivityFailure::operator_force_failed(Some("stuck on dead downstream"));
+        assert_eq!(
+            f.message,
+            "activity force-failed by operator: stuck on dead downstream"
+        );
+        let details = f.details.expect("details carry the operator context");
+        assert_eq!(details["forced_by_operator"], true);
+        assert_eq!(details["reason"], "stuck on dead downstream");
+    }
+
+    #[test]
+    fn operator_force_failed_without_reason_omits_reason_detail() {
+        let f = ActivityFailure::operator_force_failed(None);
+        let details = f.details.expect("details carry the operator context");
+        assert_eq!(details["forced_by_operator"], true);
+        assert!(
+            details.get("reason").is_none(),
+            "no reason given → no reason detail"
+        );
+    }
+
+    #[test]
+    fn operator_force_failed_round_trips_through_wire_format() {
+        // Replay safety: the synthesised failure must survive the same wire
+        // envelope every other typed failure uses, so the recorded
+        // ActivityFailed event reproduces the OperatorForceFailed outcome on
+        // replay and `parse_error_payload_full` (the exact decoder
+        // `finalize_activity_failure` uses) recovers it losslessly.
+        let payload =
+            ActivityFailure::operator_force_failed(Some("incident INC-42")).into_error_payload();
+        assert!(payload.contains("harvest_activity_failure_v1"));
+        let full = parse_error_payload_full(&payload);
+        assert_eq!(full.error_type, ERROR_TYPE_OPERATOR_FORCE_FAILED);
+        assert!(full.non_retryable);
+        assert_eq!(
+            full.message,
+            "activity force-failed by operator: incident INC-42"
+        );
+        assert_eq!(
+            full.details.expect("details survive the envelope")["reason"],
+            "incident INC-42"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn operator_force_failed_is_non_retryable_regardless_of_retry_policy() {
+        // The override stops retrying regardless of retry policy (issue #765
+        // AC): even a generous policy that lists nothing as non-retryable must
+        // classify the forced failure as terminal.
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 100,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 2.0,
+            max_interval: std::time::Duration::from_secs(60),
+            non_retryable_errors: vec![],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let payload = ActivityFailure::operator_force_failed(None).into_error_payload();
+        assert!(failure_is_non_retryable(&payload, Some(&policy)));
+        assert!(failure_is_non_retryable(&payload, None));
+    }
+
+    // ── typed workflow failures (issue #767) ──────────────────────────────
+
+    #[test]
+    fn workflow_failure_new_defaults_retryable() {
+        let f = WorkflowFailure::new("ValidationRejected", "bad input");
+        assert_eq!(f.error_type, "ValidationRejected");
+        assert_eq!(f.message, "bad input");
+        assert!(!f.non_retryable);
+        assert!(f.details.is_none());
+    }
+
+    #[test]
+    fn workflow_failure_builder_chain() {
+        let f = WorkflowFailure::new("BudgetExceeded", "over cap")
+            .with_details(serde_json::json!({"limit": 100}))
+            .non_retryable();
+        assert_eq!(f.error_type, "BudgetExceeded");
+        assert!(f.non_retryable);
+        assert_eq!(f.details, Some(serde_json::json!({"limit": 100})));
+    }
+
+    #[test]
+    fn workflow_failure_envelope_round_trips() {
+        let original = WorkflowFailure::new("PermanentValidation", "bad data")
+            .with_details(serde_json::json!({"field": "amount"}))
+            .non_retryable();
+        let payload = original.clone().into_workflow_error_payload();
+        assert!(payload.contains("harvest_workflow_failure_v1"));
+        let decoded = decode_workflow_failure(&payload);
+        assert_eq!(decoded.message, "bad data");
+        assert_eq!(decoded.error_type, Some("PermanentValidation".to_string()));
+        assert_eq!(decoded.non_retryable, Some(true));
+        assert_eq!(
+            decoded.details,
+            Some(serde_json::json!({"field": "amount"}))
+        );
+        assert_eq!(parse_workflow_typed_payload(&payload), Some(original));
+    }
+
+    #[test]
+    fn decode_plain_string_yields_all_none() {
+        let decoded = decode_workflow_failure("boom");
+        assert_eq!(decoded.message, "boom");
+        assert!(decoded.error_type.is_none());
+        assert!(decoded.details.is_none());
+        assert!(decoded.non_retryable.is_none());
+        // Look-alike JSON stays untyped too (no discriminator).
+        let look_alike = r#"{"error_type":"X","message":"y","non_retryable":true}"#;
+        let decoded = decode_workflow_failure(look_alike);
+        assert_eq!(decoded.message, look_alike);
+        assert!(decoded.error_type.is_none());
+        assert!(parse_workflow_typed_payload(look_alike).is_none());
+    }
+
+    #[test]
+    fn decode_error_sentinel_class_yields_none_error_type() {
+        // A genuine typed envelope whose class is literally the reserved
+        // `"Error"` sentinel collapses `error_type` to `None`, but preserves
+        // `non_retryable` and `details` independently.
+        let payload = WorkflowFailure::new("Error", "x")
+            .non_retryable()
+            .with_details(serde_json::json!({"a": 1}))
+            .into_workflow_error_payload();
+        let decoded = decode_workflow_failure(&payload);
+        assert_eq!(decoded.message, "x");
+        assert_eq!(decoded.error_type, None);
+        assert_eq!(decoded.non_retryable, Some(true));
+        assert_eq!(decoded.details, Some(serde_json::json!({"a": 1})));
+    }
+
+    #[test]
+    fn workflow_failure_display() {
+        let f = WorkflowFailure::new("ValidationRejected", "bad value");
+        assert_eq!(f.to_string(), "ValidationRejected: bad value");
+    }
+
+    #[test]
+    fn into_workflow_error_payload_for_string_is_passthrough() {
+        let s = "simple error".to_string();
+        assert_eq!(s.into_workflow_error_payload(), "simple error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Contained handler-panic envelope round-trips (issue #782)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handler_panic_error_type_constant_has_correct_name() {
+        assert_eq!(ERROR_TYPE_HANDLER_PANIC, "HandlerPanic");
+    }
+
+    #[test]
+    fn activity_handler_panic_envelope_round_trips_error_type() {
+        // A contained activity panic is a *retryable* typed failure carrying
+        // the engine-reserved HandlerPanic error type (issue #782 AC1).
+        let payload =
+            ActivityFailure::retryable(ERROR_TYPE_HANDLER_PANIC, "boom").into_error_payload();
+        let full = parse_error_payload_full(&payload);
+        assert_eq!(full.error_type, ERROR_TYPE_HANDLER_PANIC);
+        assert_eq!(full.message, "boom");
+        assert!(
+            !full.non_retryable,
+            "a contained activity panic must be retryable so it follows the retry policy"
+        );
+    }
+
+    #[test]
+    fn workflow_handler_panic_envelope_round_trips_error_type() {
+        // A contained workflow panic is encoded as a typed WorkflowFailure so
+        // the terminal WorkflowFailed event carries the HandlerPanic class
+        // (issue #782 AC2). This is exactly what the #523 exclusion guard keys
+        // on to avoid also firing a fresh-execution retry.
+        let payload = WorkflowFailure::new(ERROR_TYPE_HANDLER_PANIC, "boom")
+            .non_retryable()
+            .into_workflow_error_payload();
+        let decoded = decode_workflow_failure(&payload);
+        assert_eq!(
+            decoded.error_type.as_deref(),
+            Some(ERROR_TYPE_HANDLER_PANIC)
+        );
+        assert_eq!(decoded.message, "boom");
+        assert_eq!(decoded.non_retryable, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // WASM activity failure constructors (issue #965)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn sandbox_denied_is_non_retryable_with_stable_error_type() {
+        let f = ActivityFailure::sandbox_denied("import env::fs_read not granted");
+        assert_eq!(f.error_type, ERROR_TYPE_SANDBOX_DENIED);
+        assert_eq!(f.error_type, "SandboxDenied");
+        assert!(
+            f.non_retryable,
+            "a denied capability cannot succeed on retry"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn resource_exhausted_is_retryable_with_stable_error_type() {
+        let f = ActivityFailure::resource_exhausted("cpu fuel exhausted");
+        assert_eq!(f.error_type, ERROR_TYPE_RESOURCE_EXHAUSTED);
+        assert_eq!(f.error_type, "ResourceExhausted");
+        assert!(!f.non_retryable, "a larger budget may let a retry succeed");
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_trap_is_retryable_with_stable_error_type() {
+        let f = ActivityFailure::wasm_trap("guest hit unreachable");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_TRAP);
+        assert_eq!(f.error_type, "WasmTrap");
+        assert!(
+            !f.non_retryable,
+            "wasm trap mirrors the legacy Err(String) path"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_unavailable_is_non_retryable() {
+        let f = ActivityFailure::wasm_module_unavailable("no active module for activity");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_MODULE_UNAVAILABLE);
+        assert_eq!(f.error_type, "WasmModuleUnavailable");
+        assert!(f.non_retryable);
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_invalid_is_non_retryable() {
+        let f = ActivityFailure::wasm_module_invalid("bytes fail integrity check");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_MODULE_INVALID);
+        assert_eq!(f.error_type, "WasmModuleInvalid");
+        assert!(f.non_retryable);
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_module_lookup_failed_is_retryable() {
+        let f = ActivityFailure::wasm_module_lookup_failed("transient db error");
+        assert_eq!(f.error_type, ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED);
+        assert_eq!(f.error_type, "WasmModuleLookupFailed");
+        assert!(
+            !f.non_retryable,
+            "a transient lookup error may resolve on retry"
+        );
+    }
+
+    /// Every WASM failure constructor must round-trip through the shared
+    /// `harvest_activity_failure_v1` wire envelope so a recorded `ActivityFailed`
+    /// event reproduces the same classification on replay.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_failures_round_trip_through_wire_format() {
+        let cases: Vec<(ActivityFailure, &str, bool)> = vec![
+            (
+                ActivityFailure::sandbox_denied("denied"),
+                ERROR_TYPE_SANDBOX_DENIED,
+                true,
+            ),
+            (
+                ActivityFailure::resource_exhausted("fuel"),
+                ERROR_TYPE_RESOURCE_EXHAUSTED,
+                false,
+            ),
+            (
+                ActivityFailure::wasm_trap("trap"),
+                ERROR_TYPE_WASM_TRAP,
+                false,
+            ),
+            (
+                ActivityFailure::wasm_module_unavailable("none"),
+                ERROR_TYPE_WASM_MODULE_UNAVAILABLE,
+                true,
+            ),
+            (
+                ActivityFailure::wasm_module_invalid("bad"),
+                ERROR_TYPE_WASM_MODULE_INVALID,
+                true,
+            ),
+            (
+                ActivityFailure::wasm_module_lookup_failed("transient"),
+                ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED,
+                false,
+            ),
+        ];
+        for (failure, want_type, want_non_retryable) in cases {
+            let payload = failure.into_error_payload();
+            assert!(
+                payload.contains("harvest_activity_failure_v1"),
+                "{want_type} must use the typed wire envelope"
+            );
+            let (error_type, non_retryable, _) = parse_error_payload(&payload);
+            assert_eq!(error_type, want_type);
+            assert_eq!(non_retryable, want_non_retryable, "{want_type}");
+        }
+    }
+
+    /// A WASM failure's `non_retryable` flag is intrinsic to the constructor and
+    /// is honoured regardless of any retry policy the activity carries.
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn wasm_non_retryable_failures_ignore_policy() {
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 10,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 2.0,
+            max_interval: std::time::Duration::from_secs(60),
+            non_retryable_errors: vec![],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let payload = ActivityFailure::sandbox_denied("denied").into_error_payload();
+        let (_, non_retryable) = classify_activity_error(&payload, Some(&policy));
+        assert!(
+            non_retryable,
+            "sandbox_denied is non-retryable regardless of policy"
+        );
     }
 }

@@ -28,90 +28,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260611000001_harvest_stalled_workflow_index/up.sql"
-    )
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 type HarvestApiApp = axum::Router;
 
@@ -121,7 +40,7 @@ fn test_app_state() -> AppState {
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -190,8 +109,12 @@ async fn seed_stalled_workflow(
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -206,7 +129,17 @@ async fn seed_stalled_workflow(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .expect("seed workflow");

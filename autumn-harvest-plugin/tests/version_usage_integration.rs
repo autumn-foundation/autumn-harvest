@@ -113,6 +113,7 @@ fn two_shard_router() -> ShardRouter {
 
 fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(pool);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -179,6 +180,8 @@ async fn insert_version_execution_with_markers(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id,
@@ -189,6 +192,8 @@ async fn insert_version_execution_with_markers(
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -204,6 +209,14 @@ async fn insert_version_execution_with_markers(
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -232,6 +245,7 @@ async fn insert_version_execution_with_markers(
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     events.extend(markers.iter().map(|(change_id, recorded_version)| {
         WorkflowEvent::MarkerRecorded {

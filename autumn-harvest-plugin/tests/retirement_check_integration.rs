@@ -113,6 +113,7 @@ fn two_shard_router() -> ShardRouter {
 
 fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(pool);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -161,6 +162,8 @@ async fn insert_versioned_execution(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id,
@@ -171,6 +174,8 @@ async fn insert_versioned_execution(
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -186,6 +191,14 @@ async fn insert_versioned_execution(
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -215,6 +228,7 @@ async fn insert_versioned_execution(
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: format!("version:{change_id}"),
@@ -240,6 +254,8 @@ async fn insert_execution_without_marker(
         .await
         .expect("failed to connect to test database");
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id,
@@ -250,6 +266,8 @@ async fn insert_execution_without_marker(
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -265,6 +283,14 @@ async fn insert_execution_without_marker(
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -294,6 +320,7 @@ async fn insert_execution_without_marker(
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &events, 0)
         .await

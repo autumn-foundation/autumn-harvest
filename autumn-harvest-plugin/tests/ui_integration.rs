@@ -5,14 +5,17 @@ use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::context::{DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowHistoryPolicy};
+use autumn_harvest::dag::DagBuilder;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::NewHarvestEvent;
-use autumn_harvest::scheduler::SchedulerMonitor;
+use autumn_harvest::prelude::{ActivityContext, activities, activity, dag, dags, workflows};
+use autumn_harvest::scheduler::{RegisteredDag, SchedulerMonitor, compile_dag_catalog};
 use autumn_harvest::schema::{
     harvest_dead_letters, harvest_events, harvest_task_queue, harvest_workflow_executions,
 };
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::shard::ShardedDbPool;
+use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -36,130 +39,13 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -213,7 +99,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(INIT_SQL)
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }
@@ -258,7 +144,7 @@ async fn setup_n_shard_databases(container: &ContainerAsync<Postgres>, n: usize)
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
             .await
             .expect("shard connection");
-        conn.batch_execute(INIT_SQL)
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("apply migrations");
         urls.push(url);
@@ -273,12 +159,18 @@ fn test_app_state_without_database() -> AppState {
 fn echo_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "echo_workflow",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -288,6 +180,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))
@@ -377,8 +270,12 @@ async fn insert_workflow_on_url(
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -395,7 +292,17 @@ async fn insert_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .expect("workflow insert should succeed");
@@ -726,6 +633,7 @@ async fn insert_test_worker(
 fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
     let pool = build_test_pool(database_url);
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     api_state.install(HarvestApiRuntime::new(
         echo_registry(),
@@ -1051,8 +959,7 @@ async fn ui_dead_letters_summary_invalid_group_by_returns_400() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
 
-    let (status, _body) =
-        fetch_html(&app, "/ui/dead-letters?view=summary&group_by=tenant_id").await;
+    let (status, _body) = fetch_html(&app, "/dead-letters?view=summary&group_by=tenant_id").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1076,7 +983,7 @@ async fn ui_dead_letters_summary_regroups_on_selected_dimension() {
     );
     // Seed inserts ACTIVITY on shard0 and WORKFLOW on shard1.
     assert!(
-        html.contains("ACTIVITY") && html.contains("WORKFLOW"),
+        html.contains("activity") && html.contains("workflow"),
         "task_type groups should render both kinds: {html}"
     );
 }
@@ -2138,8 +2045,12 @@ async fn insert_child_workflow_on_url(
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -2156,7 +2067,17 @@ async fn insert_child_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .expect("child workflow insert should succeed");
@@ -2477,6 +2398,43 @@ async fn detail_page_blocked_on_panel_for_running_workflow() {
     );
 }
 
+/// Detail page renders the latest heartbeat checkpoint payload for a running
+/// heartbeating activity (issue #503).
+#[tokio::test]
+async fn detail_page_renders_heartbeat_checkpoint() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "blocked_wf", "blocked-hb").await;
+
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let task_id = uuid::Uuid::new_v4();
+    let sql = format!(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, \
+             attempt, max_attempts, scheduled_at, started_at, last_heartbeat_at, heartbeat_details) \
+         VALUES \
+            ('{task_id}', 'default', 'activity', '{exec_uuid}', 'pipeline', \
+             '{{}}', 'RUNNING', 0, 0, 3, NOW(), NOW(), NOW(), \
+             '{{\"processed\": 4500, \"total\": 10000}}'::jsonb)",
+        exec_uuid = exec_id.as_uuid()
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert heartbeating task");
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Checkpoint"),
+        "pending-activities table should have a Checkpoint column: {html}"
+    );
+    assert!(
+        html.contains("processed") && html.contains("4500"),
+        "the latest heartbeat checkpoint payload should be rendered: {html}"
+    );
+}
+
 /// Cancel action in the UI redirects back to the detail page with a flash message.
 #[tokio::test]
 async fn detail_page_cancel_action_redirects_with_flash() {
@@ -2511,6 +2469,170 @@ async fn detail_page_cancel_action_redirects_with_flash() {
     assert!(
         !location.ends_with("flash="),
         "flash param must be non-empty: {location}"
+    );
+}
+
+/// Read the persisted state of a workflow execution directly from its shard DB.
+async fn read_execution_state(database_url: &str, exec_id: ExecutionId) -> String {
+    let mut conn = AsyncPgConnection::establish(database_url).await.unwrap();
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .expect("execution row should exist")
+}
+
+/// Terminate action on a RUNNING execution seals it as TERMINATED and redirects
+/// back to the detail page with a flash message (issue #788).
+#[tokio::test]
+async fn detail_page_terminate_action_seals_terminated() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-1",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/terminate"),
+        "reason=wedged+run",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "terminate action must redirect (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains(&exec_id.to_string()) || location.contains("workflows"),
+        "redirect must go to the workflow detail page: {location}"
+    );
+    assert!(
+        location.contains("flash") && !location.ends_with("flash="),
+        "redirect must carry a non-empty flash message: {location}"
+    );
+
+    let state = read_execution_state(&database_url, exec_id).await;
+    assert_eq!(
+        state, "TERMINATED",
+        "terminate must seal the execution as TERMINATED"
+    );
+}
+
+/// The detail page renders an enabled Terminate form (not the old placeholder)
+/// for a RUNNING execution (issue #788).
+#[tokio::test]
+async fn detail_page_terminate_button_enabled_when_running() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-2",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("/terminate"),
+        "running execution should expose a Terminate form posting to /terminate: {html}"
+    );
+    assert!(
+        !html.contains("Not yet available"),
+        "the disabled Terminate placeholder must be gone: {html}"
+    );
+}
+
+/// The Terminate button is disabled once the execution is terminal, mirroring
+/// the Pause gate (issue #788).
+#[tokio::test]
+async fn detail_page_terminate_button_disabled_when_terminal() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-3",
+    )
+    .await;
+
+    // First terminate seals it TERMINATED.
+    let app = build_single_shard_ui_app(&database_url);
+    let _ = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/terminate"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(
+        read_execution_state(&database_url, exec_id).await,
+        "TERMINATED"
+    );
+
+    // Now the detail page must render Terminate as disabled.
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    let term_idx = html
+        .find(">Terminate<")
+        .or_else(|| html.find("Terminate</button>"))
+        .expect("detail page should contain a Terminate button");
+    // The opening <button ... disabled ...> tag precedes the label; scan back to it.
+    let tag_start = html[..term_idx].rfind("<button").expect("button tag");
+    assert!(
+        html[tag_start..term_idx].contains("disabled"),
+        "Terminate button must be disabled for a terminal execution: {}",
+        &html[tag_start..term_idx]
+    );
+}
+
+/// Terminating one execution does not touch a second concurrent execution
+/// (collateral-isolation parity with #504).
+#[tokio::test]
+async fn detail_page_terminate_only_affects_target() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let target = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-t",
+    )
+    .await;
+    let bystander = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-b",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let _ = post_form(
+        &app,
+        &format!("/workflows/{target}/terminate"),
+        String::new(),
+    )
+    .await;
+
+    assert_eq!(
+        read_execution_state(&database_url, target).await,
+        "TERMINATED",
+        "target must be terminated"
+    );
+    assert_eq!(
+        read_execution_state(&database_url, bystander).await,
+        "RUNNING",
+        "bystander execution must be untouched"
     );
 }
 
@@ -2689,12 +2811,18 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                mcp: false,
                 name: "cust_wf",
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2704,6 +2832,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }],
             vec![],
         )
@@ -2815,6 +2944,7 @@ async fn ui_trigger_preserves_dag_metadata() {
         owner: Some("ui-team"),
         runbook_url: Some("http://ui-runbook"),
         severity: Some("sev3"),
+        mcp: false,
     };
 
     let dag_catalog =
@@ -2822,12 +2952,18 @@ async fn ui_trigger_preserves_dag_metadata() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: dag_name,
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2836,6 +2972,7 @@ async fn ui_trigger_preserves_dag_metadata() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -2896,4 +3033,1631 @@ async fn load_latest_workflow_execution_by_name_from_url(
         .await
         .optional()
         .expect("failed to load workflow rows by workflow name")
+}
+
+// ── Read-path payload decoding in the Vantage UI (issue #608) ────────────────
+//
+// Seeding note: engine write paths use identity codecs, so envelope-bearing
+// rows are synthesized directly (an envelope is just JSON; identity
+// persistence stores it verbatim). No Docker in the authoring sandbox — these
+// tests are compile-checked only, per the #543/#544/#601 precedent.
+
+#[derive(Debug)]
+struct ReverseCodec608;
+
+impl autumn_harvest::payload_codec::PayloadCodec for ReverseCodec608 {
+    fn codec_id(&self) -> &'static str {
+        "reverse"
+    }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        let mut v = raw.to_vec();
+        v.reverse();
+        Ok(v)
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        let mut v = encoded.to_vec();
+        v.reverse();
+        Ok(v)
+    }
+}
+
+fn decode_test_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+    let mut codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs.set_default(Arc::new(ReverseCodec608));
+    codecs
+}
+
+/// Builds a well-formed `reverse` codec envelope for `plain` via the public
+/// `encode_event` round-trip (no base64 dep needed in this test crate).
+fn envelope_608(plain: &Value) -> Value {
+    let event = autumn_harvest::WorkflowEvent::WorkflowCompleted {
+        output: plain.clone(),
+    };
+    let encoded = decode_test_codecs()
+        .encode_event(&event)
+        .expect("encode event");
+    encoded["data"]["output"].clone()
+}
+
+/// Single-shard API+UI app with read-path decoding enabled (issue #608):
+/// admin boundary + codec registry mirrored + the opt-in flag set.
+fn build_decode_enabled_api_with_ui_app(database_url: &str) -> axum::Router {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    // Codec registry mirror + deployment opt-in (issue #608).
+    api_state.set_payload_codecs(decode_test_codecs());
+    api_state.set_decode_payloads_on_read(true);
+    api_state.install_storage_pool(HarvestDbPool::from(build_test_pool(database_url)));
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+
+    autumn_harvest_plugin::harvest_api_router(api_state.clone())
+        .nest("/ui", harvest_ui_router(api_state))
+        .with_state(test_app_state_without_database())
+}
+
+async fn count_decode_audit_rows(database_url: &str) -> i64 {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for audit count");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_PAYLOAD_DECODE_READ))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count decode audit rows")
+}
+
+/// The `source` column of every `payload.decode_read` audit row — UI page
+/// renders must attribute their rows to `SOURCE_UI` like every other audit
+/// row ui.rs writes.
+async fn decode_audit_sources(database_url: &str) -> Vec<String> {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for audit sources");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_PAYLOAD_DECODE_READ))
+        .select(harvest_audit_log::source)
+        .load(&mut conn)
+        .await
+        .expect("failed to load decode audit sources")
+}
+
+/// Issue #608 (DLQ UI): the dead-letter page renders the decoded task input
+/// and error instead of ciphertext, and the plaintext page render is audited.
+#[tokio::test]
+async fn dlq_ui_page_renders_decoded_payloads_and_audits() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    // Seed one dead letter whose input is a codec envelope and whose TEXT
+    // error is a stringified envelope.
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "encrypted_workflow",
+        "dlq-decode-1",
+    )
+    .await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for dead-letter insert");
+    autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(exec_id.as_uuid()),
+            activity_name: Some("charge_card".to_string()),
+            input: envelope_608(&json!({"card": "pii-dlq-input"})),
+            error: serde_json::to_string(&envelope_608(&json!("declined: pii-dlq-error")))
+                .expect("serialize envelope"),
+            attempts: 3,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .expect("dead-letter insert should succeed");
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, "/ui/dead-letters").await;
+    assert_eq!(status, StatusCode::OK, "DLQ page should render: {html}");
+    assert!(
+        html.contains("pii-dlq-input"),
+        "DLQ row input must render decoded plaintext: {html}"
+    );
+    assert!(
+        html.contains("pii-dlq-error"),
+        "DLQ row error must render decoded plaintext: {html}"
+    );
+    assert!(
+        !html.contains("_harvest_codec_envelope"),
+        "DLQ page must not render raw envelopes: {html}"
+    );
+
+    assert!(
+        count_decode_audit_rows(&database_url).await >= 1,
+        "a DLQ page render that decoded payloads must write a payload.decode_read audit row"
+    );
+}
+
+/// Issue #608 (workflow detail UI): the detail page renders the decoded
+/// workflow input instead of the stored envelope.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn workflow_detail_ui_renders_decoded_input() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    // A workflow whose stored input is a codec envelope (identity persistence
+    // stores the envelope object verbatim).
+    let input_envelope = envelope_608(&json!({"user": "pii-detail-input"}));
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "encrypted_workflow",
+            workflow_id: "detail-decode-1",
+            exec_id,
+            input: input_envelope.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .expect("workflow insert should succeed");
+
+    // Blocked-on panel + timeline fixtures (issue #608, AC4): an
+    // envelope-bearing timeline event, a pending activity whose stored
+    // heartbeat checkpoint is an envelope, and an unconsumed signal whose
+    // payload is an envelope. The panel renders the checkpoint and the
+    // timeline renders each event's data; the blocked-on activity *input*
+    // and signal *payload* are never rendered, so they are deliberately NOT
+    // decoded (PR #936 review, round 5) — their plaintext must not appear
+    // anywhere in the page.
+    {
+        // `load_history_undecoded`: the seeded `WorkflowStarted` input is a
+        // "reverse"-codec envelope, and the strict `load_history` (identity-only
+        // registry) hard-errors `UnknownPayloadCodec` on it — the exact
+        // strict-loader behavior PR #936 round 2 documented. The raw loader is
+        // the correct fixture tool for reading `next_event_id` here.
+        let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        autumn_harvest::store::append_events(
+            &mut conn,
+            exec_id,
+            &[autumn_harvest::WorkflowEvent::ActivityScheduled {
+                activity_id: autumn_harvest::types::ActivityExecId::new(),
+                name: "charge_card".to_string(),
+                input: envelope_608(&json!({"card": "pii-detail-event"})),
+                queue: "default".to_string(),
+            }],
+            history.next_event_id,
+        )
+        .await
+        .expect("append timeline event");
+
+        let mut params = autumn_harvest::queue::EnqueueParams::new(
+            "default",
+            autumn_harvest::queue::TaskType::Activity,
+            envelope_608(&json!({"card": "pii-detail-task-input"})),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some("charge_card".to_string());
+        autumn_harvest::queue::enqueue(&mut conn, &params)
+            .await
+            .expect("seed pending activity task");
+        diesel::update(
+            harvest_task_queue::table
+                .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+        )
+        .set((
+            harvest_task_queue::heartbeat_details.eq(Some(envelope_608(
+                &json!({"progress": "pii-detail-checkpoint"}),
+            ))),
+            harvest_task_queue::last_heartbeat_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed heartbeat checkpoint");
+
+        autumn_harvest::signal::send_signal(
+            &mut conn,
+            exec_id,
+            "approval",
+            envelope_608(&json!({"approver": "pii-detail-signal"})),
+        )
+        .await
+        .expect("seed pending signal");
+    }
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+
+    let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("pii-detail-input"),
+        "workflow detail must render the decoded input: {html}"
+    );
+    assert!(
+        html.contains("pii-detail-event"),
+        "the timeline must render decoded event payloads: {html}"
+    );
+    assert!(
+        html.contains("pii-detail-checkpoint"),
+        "the blocked-on panel must render the decoded heartbeat checkpoint: {html}"
+    );
+    assert!(
+        !html.contains("_harvest_codec_envelope"),
+        "workflow detail must not render the raw envelope: {html}"
+    );
+    // Hidden fields are not decoded (PR #936 round 5): their plaintext never
+    // reaches the page.
+    assert!(
+        !html.contains("pii-detail-task-input"),
+        "the never-rendered pending-activity input must not be decoded: {html}"
+    );
+    assert!(
+        !html.contains("pii-detail-signal"),
+        "the never-rendered pending-signal payload must not be decoded: {html}"
+    );
+
+    // UI-originated decode rows carry `source: ui`, matching every other
+    // audit row ui.rs writes.
+    let sources = decode_audit_sources(&database_url).await;
+    assert!(
+        !sources.is_empty() && sources.iter().all(|s| s == "ui"),
+        "UI decode audit rows must carry source=ui: {sources:?}"
+    );
+
+    // The stored row keeps its ciphertext (read-path only, append-only safe).
+    let stored_input: Value = autumn_harvest::schema::harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::schema::harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("load stored input");
+    assert_eq!(
+        stored_input, input_envelope,
+        "stored input must remain ciphertext after the decoded render"
+    );
+}
+
+/// Issue #608 / PR #936 round 5: a detail render whose *only* envelopes live
+/// in fields the page never displays — the pending-activity `input`, the
+/// pending-signal payload, and the attempts/signals panel event copies
+/// (isolated from the timeline via `?event_page=1`) — must do zero decode
+/// work and write NO `payload.decode_read` audit row.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_envelopes() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for workflow insert");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "encrypted_workflow",
+            workflow_id: "detail-decode-hidden-1",
+            exec_id,
+            // A plain, already-decoded input: the rendered fields carry no
+            // envelopes at all in this fixture.
+            input: json!({"user": "plain-input"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .expect("workflow insert should succeed");
+
+    // Hidden-surface envelopes only: an attempts-panel activity event and a
+    // signals-panel signal event (kept off the requested timeline page via
+    // `?event_page=1`), a pending activity whose `input` is an envelope (no
+    // heartbeat checkpoint), and an unconsumed signal with an envelope
+    // payload.
+    {
+        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        autumn_harvest::store::append_events(
+            &mut conn,
+            exec_id,
+            &[
+                autumn_harvest::WorkflowEvent::ActivityScheduled {
+                    activity_id: autumn_harvest::types::ActivityExecId::new(),
+                    name: "charge_card".to_string(),
+                    input: envelope_608(&json!({"card": "pii-hidden-event-input"})),
+                    queue: "default".to_string(),
+                },
+                autumn_harvest::WorkflowEvent::SignalReceived {
+                    signal_name: "approval".to_string(),
+                    payload: envelope_608(&json!({"approver": "pii-hidden-event-signal"})),
+                },
+            ],
+            history.next_event_id,
+        )
+        .await
+        .expect("append hidden-panel events");
+
+        let mut params = autumn_harvest::queue::EnqueueParams::new(
+            "default",
+            autumn_harvest::queue::TaskType::Activity,
+            envelope_608(&json!({"card": "pii-hidden-task-input"})),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some("charge_card".to_string());
+        autumn_harvest::queue::enqueue(&mut conn, &params)
+            .await
+            .expect("seed pending activity task");
+
+        autumn_harvest::signal::send_signal(
+            &mut conn,
+            exec_id,
+            "approval",
+            envelope_608(&json!({"approver": "pii-hidden-signal"})),
+        )
+        .await
+        .expect("seed pending signal");
+    }
+
+    let app = build_decode_enabled_api_with_ui_app(&database_url);
+
+    // event_page=1 → the timeline page is empty (offset 100 past the seeded
+    // events), so the only envelope-bearing copies the handler holds are the
+    // hidden ones.
+    let (status, html) = fetch_html(&app, &format!("/ui/workflows/{exec_id}?event_page=1")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        !html.contains("pii-hidden-"),
+        "no hidden-field plaintext may appear in the page: {html}"
+    );
+    assert!(
+        !html.contains("_harvest_codec_envelope"),
+        "no raw envelope may appear in the page: {html}"
+    );
+
+    assert_eq!(
+        count_decode_audit_rows(&database_url).await,
+        0,
+        "a render whose only envelopes are hidden fields must not write a \
+         payload.decode_read audit row"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #957 — Vantage DAG run graph view
+//
+// These exercise the enhanced `GET /dags/{dag_name}` page (server-rendered inline
+// SVG built from `dag_graph::build_run_graph`, the same in-process call the #690
+// API handler makes) plus the 3-click retry flow (node → dry-run confirm →
+// admin-gated commit) that delegates to the shipped #366 retry endpoint via the
+// extracted `retry_dag_run_inner`. Docker-backed (testcontainers); compile-checked
+// in sandboxes without Docker, run on Linux CI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[activity(queue = "default")]
+async fn dag957_step_a(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+#[activity(queue = "default")]
+async fn dag957_step_b(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+#[activity(queue = "default")]
+async fn dag957_step_c(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+#[activity(queue = "default")]
+async fn dag957_step_d(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
+/// Linear: `dag957_step_a` -> `dag957_step_b` -> `dag957_step_c`
+#[dag(default_queue = "default")]
+fn dag957_linear(dag: &mut DagBuilder) {
+    let a = dag.activity(dag957_step_a);
+    let b = dag.activity(dag957_step_b).upstream(&a);
+    let _c = dag.activity(dag957_step_c).upstream(&b);
+}
+
+/// Fan-out: a -> {b, c} -> d
+#[dag(default_queue = "default")]
+fn dag957_fanout(dag: &mut DagBuilder) {
+    let a = dag.activity(dag957_step_a);
+    let b = dag.activity(dag957_step_b).upstream(&a);
+    let c = dag.activity(dag957_step_c).upstream(&a);
+    let _d = dag.activity(dag957_step_d).upstream(&b).upstream(&c);
+}
+
+fn dag957_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        workflows![dag957_linear, dag957_fanout],
+        activities![dag957_step_a, dag957_step_b, dag957_step_c, dag957_step_d],
+    ))
+}
+
+/// A hand-built classic (non-unified) `RegisteredDag`; `compile_dag_catalog`
+/// rejects classic DAGs, so a hand-built definition is the only way to register
+/// one for the degraded-state test.
+fn dag957_classic(name: &str) -> RegisteredDag {
+    let mut builder = DagBuilder::new();
+    let _a = builder.activity(dag957_step_a);
+    let definition = builder.build().expect("classic dag builds");
+    RegisteredDag {
+        name: name.to_string(),
+        module: "test".to_string(),
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default".to_string()),
+        is_unified: false,
+        definition,
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::default(),
+        buffer_all_max: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    }
+}
+
+/// A large (>200-task) unified DAG built by hand so the ≥200-node scrollable
+/// fallback can be exercised without declaring 200 activity fns.
+fn dag957_large(name: &str) -> RegisteredDag {
+    let mut builder = DagBuilder::new();
+    for _ in 0..220 {
+        let _ = builder.activity(dag957_step_a);
+    }
+    let definition = builder.build().expect("large dag builds");
+    RegisteredDag {
+        name: name.to_string(),
+        module: "test".to_string(),
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default".to_string()),
+        is_unified: true,
+        definition,
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::default(),
+        buffer_all_max: 0,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    }
+}
+
+fn build_dag957_ui_app(
+    database_url: &str,
+    admin: bool,
+    extra: Vec<(String, RegisteredDag)>,
+) -> axum::Router {
+    let pool = build_test_pool(database_url);
+    let mut catalog =
+        compile_dag_catalog(dags![dag957_linear, dag957_fanout]).expect("dag catalog compiles");
+    for (name, dag) in extra {
+        catalog.insert(name, dag);
+    }
+    let api_state = HarvestApiState::new();
+    if admin {
+        api_state.set_admin_auth_boundary(true);
+    }
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    api_state.install(HarvestApiRuntime::new(
+        dag957_registry(),
+        Arc::new(catalog),
+        Arc::new(Vec::new()),
+        Some("dag957-ui-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    harvest_ui_router(api_state).with_state(test_app_state_without_database())
+}
+
+fn dag957_sched(name: &str, id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityScheduled {
+        activity_id: id,
+        name: name.to_string(),
+        input: json!({ "dag_task": name }),
+        queue: "default".to_string(),
+    }
+}
+fn dag957_started(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityStarted {
+        activity_id: id,
+        worker_id: autumn_harvest::types::WorkerId::new("worker-1"),
+    }
+}
+const fn dag957_completed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityCompleted {
+        activity_id: id,
+        output: Value::Null,
+    }
+}
+fn dag957_failed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityFailed {
+        activity_id: id,
+        error: "transient S3 500\nstack trace line".to_string(),
+        attempt: 1,
+        error_type: "S3Error".to_string(),
+        non_retryable: false,
+        details: None,
+    }
+}
+
+async fn dag957_seed_run(
+    database_url: &str,
+    dag_name: &'static str,
+    workflow_id: &str,
+    events: Vec<autumn_harvest::WorkflowEvent>,
+    state: &str,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for dag957 seed");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: dag_name,
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .expect("seed workflow");
+
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
+        .await
+        .expect("append seed events");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq(state))
+        .execute(&mut conn)
+        .await
+        .expect("set state");
+    exec_id
+}
+
+async fn dag957_audit_rows(database_url: &str, operation: &str, source: &str) -> i64 {
+    use autumn_harvest::schema::harvest_audit_log;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for audit count");
+    harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq(operation.to_string()))
+        .filter(harvest_audit_log::source.eq(source.to_string()))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count audit rows")
+}
+
+// I-A
+#[tokio::test]
+async fn ui_dag_run_graph_renders_mixed_status_run() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    // a succeeded, b failed, c pending. Run FAILED.
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-mixed", events, "FAILED").await;
+
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_linear?run={exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(html.contains("<svg"), "inline svg present: {html}");
+    assert!(html.contains("dag957_step_a"));
+    assert!(html.contains("dag957_step_b"));
+    assert!(html.contains("dag957_step_c"));
+    // Status fills for the three distinct statuses present in the run.
+    assert!(html.contains("#166534"), "succeeded fill present"); // Succeeded
+    assert!(html.contains("#991b1b"), "failed fill present"); // Failed
+}
+
+// I-B
+#[tokio::test]
+async fn ui_dag_run_graph_node_panel_shows_failure_detail() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-panel", events, "FAILED").await;
+
+    // node index 1 == dag957_step_b (failed).
+    let (status, html) =
+        fetch_html(&app, &format!("/dags/dag957_linear?run={exec_id}&node=1")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(html.contains("S3Error"), "error_type shown: {html}");
+    assert!(html.contains("transient S3 500"), "first-line error shown");
+    assert!(
+        html.contains("/retry"),
+        "retry link offered for the failed node"
+    );
+    assert!(html.contains("from_node=dag957_step_b"));
+}
+
+// I-C
+#[tokio::test]
+async fn ui_dag_retry_confirm_lists_widened_nodes() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-confirm", events, "FAILED").await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    // Retrying from b widens to b + its downstream closure (c).
+    assert!(
+        html.contains("dag957_step_b"),
+        "widened list names the source node"
+    );
+    assert!(
+        html.contains("dag957_step_c"),
+        "widened list names the downstream node"
+    );
+    assert!(html.contains("reason"), "reason field present");
+    assert!(
+        html.to_lowercase().contains("confirm"),
+        "a confirm control is present: {html}"
+    );
+}
+
+// I-D
+#[tokio::test]
+async fn ui_dag_retry_commit_starts_new_run_and_audits() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_failed(ib),
+        autumn_harvest::WorkflowEvent::workflow_failed("dag failed"),
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-commit", events, "FAILED").await;
+
+    let (status, headers, _body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_b&reason=retry+via+vantage",
+    )
+    .await;
+    assert!(status.is_redirection(), "commit redirects; got {status}");
+    let location = headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        location.contains("flash="),
+        "redirect carries a flash: {location}"
+    );
+
+    // Audit row written under OP_DAG_RETRY with source=ui.
+    let count = dag957_audit_rows(
+        &url,
+        autumn_harvest::audit::OP_DAG_RETRY,
+        autumn_harvest::audit::SOURCE_UI,
+    )
+    .await;
+    assert!(count >= 1, "a dag.retry audit row from the UI must exist");
+}
+
+// I-E
+#[tokio::test]
+async fn ui_dag_retry_error_renders_human_message() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    // A COMPLETED run cannot be retried (409, "DAG run succeeded ...").
+    let ia = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-done", events, "COMPLETED").await;
+
+    let (status, html) = fetch_html(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry?from_node=dag957_step_a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("succeeded"),
+        "the 409 conflict renders as a human message: {html}"
+    );
+    assert!(
+        !html.contains("\"message\""),
+        "no raw JSON body is shown to the operator: {html}"
+    );
+}
+
+// I-F
+#[tokio::test]
+async fn ui_dag_run_graph_classic_dag_degraded() {
+    let (url, _c) = setup_test_database_url().await;
+    let classic = dag957_classic("dag957_classic");
+    let app = build_dag957_ui_app(&url, true, vec![("dag957_classic".to_string(), classic)]);
+
+    let (status, html) = fetch_html(&app, "/dags/dag957_classic").await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("No topology available for classic DAG runs"),
+        "classic DAGs render the degraded message: {html}"
+    );
+}
+
+// I-G
+#[tokio::test]
+async fn ui_dag_retry_requires_admin() {
+    let (url, _c) = setup_test_database_url().await;
+    // No admin boundary → the retry route layer rejects before any handler runs.
+    let app = build_dag957_ui_app(&url, false, vec![]);
+    let bogus = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let (status, _headers, _body) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{bogus}/retry"),
+        "from_node=dag957_step_b&reason=x",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// I-H
+#[tokio::test]
+async fn ui_dag_run_graph_large_dag_scrollable() {
+    let (url, _c) = setup_test_database_url().await;
+    let large = dag957_large("dag957_large");
+    let app = build_dag957_ui_app(&url, true, vec![("dag957_large".to_string(), large)]);
+
+    let exec_id = dag957_seed_run(&url, "dag957_large", "graph-large", vec![], "RUNNING").await;
+
+    // Issue #957 success metric: the graph view renders a large run (here 220
+    // nodes, well past the 100-node budget) in < 1 s server-side. Mirrors the
+    // sibling #960 J-G perf test and the workers-page precedent.
+    let start = std::time::Instant::now();
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_large?run={exec_id}")).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+    assert!(
+        html.contains("dag-graph-scroll"),
+        "a large DAG uses the scrollable container, not a disabled render: {html}"
+    );
+    assert!(html.contains("Large DAG"), "a large-DAG note is shown");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "220-node DAG graph renders server-side in < 1s (took {elapsed:?})"
+    );
+}
+
+// I-I
+#[tokio::test]
+async fn ui_dag_run_graph_unknown_run_returns_404_message() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    let ia = autumn_harvest::ActivityExecId::new();
+    // A genuinely-valid run of this DAG exists — the unknown `?run=` must NOT be
+    // silently substituted for it.
+    let valid = dag957_seed_run(
+        &url,
+        "dag957_linear",
+        "graph-fallback",
+        vec![
+            dag957_sched("dag957_step_a", ia),
+            dag957_started(ia),
+            dag957_completed(ia),
+        ],
+        "RUNNING",
+    )
+    .await;
+
+    // Issue #957 AC7: an explicitly-provided-but-unknown run id renders the 404
+    // message, never a silent fallback to a different run.
+    let bogus = ExecutionId::new_for_shard(ShardId::new(0));
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_linear?run={bogus}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown present `?run=` renders the 404 message: {html}"
+    );
+    // The 404 body must not silently render the valid run's graph in its place.
+    assert!(
+        !html.contains("<svg"),
+        "no substitute graph is rendered for an unknown run: {html}"
+    );
+    assert!(
+        !html.contains(&valid.to_string()),
+        "the valid run is not silently substituted: {html}"
+    );
+
+    // Sanity: the same DAG page WITHOUT `?run=` still defaults to the latest run
+    // and renders normally (omitted-run behavior is preserved).
+    let (default_status, default_html) = fetch_html(&app, "/dags/dag957_linear").await;
+    assert_eq!(
+        default_status,
+        StatusCode::OK,
+        "omitted `?run=` still renders: {default_html}"
+    );
+    assert!(
+        default_html.contains("dag957_step_a"),
+        "omitted `?run=` defaults to the latest run's graph: {default_html}"
+    );
+}
+
+// I-J — a real `skipped` node (via the #482 `dag_skip:` marker path, exactly as
+// `build_run_graph`/#690 read it) renders distinctly from a `pending` node end-
+// to-end, exercising #957 AC6 ("pending vs skipped visually distinct") through
+// the whole `build_run_graph` → SVG pipeline rather than the helpers in isolation.
+#[tokio::test]
+async fn ui_dag_run_graph_skipped_node_distinct_from_pending() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    // Fan-out: a -> {b, c} -> d. a and b succeed; c is condition-skipped (#482);
+    // d is never reached (RUNNING) → pending. So c renders `skipped`, d `pending`.
+    let (ia, ib) = (
+        autumn_harvest::ActivityExecId::new(),
+        autumn_harvest::ActivityExecId::new(),
+    );
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        dag957_sched("dag957_step_b", ib),
+        dag957_started(ib),
+        dag957_completed(ib),
+        // A #482 data-dependent skip of node index 2 (dag957_step_c, upstream a=0).
+        autumn_harvest::WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:2".to_string(),
+            details: json!({ "task": "dag957_step_c", "upstreams": [0] }),
+        },
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_fanout", "graph-skip", events, "RUNNING").await;
+
+    let (status, html) = fetch_html(&app, &format!("/dags/dag957_fanout?run={exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {html}");
+
+    // The node rect fill attribute is node-specific (the legend swatch uses a
+    // `style="background:…"` attribute, never `fill="…"`), so these prove the
+    // node itself carries the Skipped vs Pending status — distinct fills.
+    assert!(
+        html.contains("fill=\"#475569\""),
+        "the skipped node renders with the Skipped fill: {html}"
+    );
+    assert!(
+        html.contains("fill=\"#334155\""),
+        "the pending node renders with the (distinct) Pending fill: {html}"
+    );
+    // Icon-per-status carries the accessible, colour-independent cue on the node
+    // label text: `↳ dag957_step_c` (Skipped) vs `○ dag957_step_d` (Pending).
+    assert!(
+        html.contains("↳ dag957_step_c"),
+        "skipped node label carries the Skipped icon+name: {html}"
+    );
+    assert!(
+        html.contains("○ dag957_step_d"),
+        "pending node label carries the (distinct) Pending icon+name: {html}"
+    );
+}
+
+// I-K — index-alignment invariant (security review nit-1). `build_run_graph`
+// returns nodes in `def.tasks()` order, so `nodes[i]` ↔ `tasks()[i]` ↔ the index
+// used by `execution_levels()` (columns) and the SVG's `?node=i` anchors. A
+// future reorder in `build_run_graph` or the DAG topology would silently mis-map
+// a node's status/edges onto the wrong box; this pins the alignment the whole
+// render depends on. Pure — no DB (uses `DagBuilder` + `build_run_graph`, which
+// this integration test file already links).
+#[test]
+fn dag957_build_run_graph_nodes_align_with_task_indices() {
+    use autumn_harvest_plugin::dag_graph::build_run_graph;
+
+    // Fan-out: a -> {b, c} -> d — distinct upstream sets per node so a swap
+    // would be caught.
+    let mut builder = DagBuilder::new();
+    let a = builder.activity(dag957_step_a);
+    let b = builder.activity(dag957_step_b).upstream(&a);
+    let c = builder.activity(dag957_step_c).upstream(&a);
+    let _d = builder.activity(dag957_step_d).upstream(&b).upstream(&c);
+    let def = builder.build().expect("fanout dag builds");
+
+    let nodes = build_run_graph(&def, &[], "RUNNING");
+
+    assert_eq!(nodes.len(), def.tasks().len(), "exactly one node per task");
+    for (i, task) in def.tasks().iter().enumerate() {
+        assert_eq!(
+            nodes[i].node_name, task.activity_name,
+            "node[{i}] name aligns with tasks()[{i}]"
+        );
+        // `depends_on` names must resolve to this task's upstream indices —
+        // proving the drawn edge set corresponds to the same task position.
+        let mut expected: Vec<String> = task
+            .upstreams
+            .iter()
+            .map(|&u| def.tasks()[u].activity_name.clone())
+            .collect();
+        let mut actual = nodes[i].depends_on.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "node[{i}] depends_on aligns with its upstream task names"
+        );
+    }
+    // Every execution-level task index is a valid node index, covering all
+    // nodes exactly once (columns map to real nodes).
+    let mut covered: Vec<usize> = def
+        .execution_levels()
+        .iter()
+        .flat_map(|level| level.iter().copied())
+        .collect();
+    covered.sort_unstable();
+    assert_eq!(
+        covered,
+        (0..nodes.len()).collect::<Vec<_>>(),
+        "execution levels cover every node index exactly once"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #960 — Vantage execution timeline / Gantt view
+//
+// These exercise the standalone `GET /workflows/{id}/timeline` page (server-
+// rendered inline SVG built from `autumn_harvest::derive_timeline`, the same
+// in-process call the #739 API handler makes) plus the pause/ND-block bands
+// sourced from the execution row and the "Timeline" tab link on the detail
+// page. Docker-backed (testcontainers); compile-checked in sandboxes without
+// Docker, run on Linux CI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Set an event row's wall-clock timestamp so the derived timeline has
+/// meaningful, spread-out durations (events default to `NOW()` on insert).
+async fn tl960_set_event_ts(
+    database_url: &str,
+    exec_id: ExecutionId,
+    event_id: i32,
+    ts: chrono::DateTime<chrono::Utc>,
+) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for event-ts update");
+    let sql = format!(
+        "UPDATE harvest_events SET timestamp = '{}' WHERE workflow_exec_id = '{}' AND event_id = {}",
+        ts.to_rfc3339(),
+        exec_id.as_uuid(),
+        event_id,
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("update event timestamp");
+}
+
+/// Seed a plain workflow run with the given events (appended after the
+/// `WorkflowStarted` at event 1), spread across wall-clock time starting at
+/// `base`, then apply the state/column overrides. Returns the exec id and the
+/// number of appended events.
+#[allow(clippy::too_many_arguments)]
+async fn tl960_seed_run(
+    database_url: &str,
+    workflow_id: &str,
+    events: Vec<autumn_harvest::WorkflowEvent>,
+    base: chrono::DateTime<chrono::Utc>,
+    step_ms: i64,
+    state: &str,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    pause_reason: Option<&str>,
+    pause_actor: Option<&str>,
+    nd_blocked_at: Option<chrono::DateTime<chrono::Utc>>,
+    nd_block_reason: Option<&str>,
+    current_details: Option<&str>,
+) -> ExecutionId {
+    let exec_id =
+        insert_workflow_on_url(database_url, ShardId::new(0), "echo_workflow", workflow_id).await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for tl960 seed");
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    let start_event_id = history.next_event_id;
+    let count = i32::try_from(events.len()).unwrap();
+    store::append_events(&mut conn, exec_id, &events, start_event_id)
+        .await
+        .expect("append tl960 events");
+
+    // Anchor the WorkflowStarted (event 1) to `base` and spread the rest.
+    tl960_set_event_ts(database_url, exec_id, 1, base).await;
+    for offset in 0..count {
+        let ts = base + chrono::Duration::milliseconds((i64::from(offset) + 1) * step_ms);
+        tl960_set_event_ts(database_url, exec_id, start_event_id + offset, ts).await;
+    }
+
+    // Apply the row overrides (state, completion, pause/ND-block, current_details).
+    let mut sets: Vec<String> = vec![format!("state = '{state}'")];
+    sets.push(format!("started_at = '{}'", base.to_rfc3339()));
+    if let Some(c) = completed_at {
+        sets.push(format!("completed_at = '{}'", c.to_rfc3339()));
+    }
+    if let Some(p) = paused_at {
+        sets.push(format!("paused_at = '{}'", p.to_rfc3339()));
+    }
+    if let Some(r) = pause_reason {
+        sets.push(format!("pause_reason = '{r}'"));
+    }
+    if let Some(a) = pause_actor {
+        sets.push(format!("pause_actor = '{a}'"));
+    }
+    if let Some(nd) = nd_blocked_at {
+        sets.push(format!("nd_blocked_at = '{}'", nd.to_rfc3339()));
+    }
+    if let Some(r) = nd_block_reason {
+        sets.push(format!("nd_block_reason = '{r}'"));
+    }
+    if let Some(cd) = current_details {
+        sets.push(format!("current_details = '{cd}'"));
+    }
+    let sql = format!(
+        "UPDATE harvest_workflow_executions SET {} WHERE id = '{}'",
+        sets.join(", "),
+        exec_id.as_uuid(),
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("apply tl960 row overrides");
+    exec_id
+}
+
+fn tl960_act_sched(
+    name: &str,
+    id: autumn_harvest::ActivityExecId,
+) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityScheduled {
+        activity_id: id,
+        name: name.to_string(),
+        input: json!({}),
+        queue: "default".to_string(),
+    }
+}
+fn tl960_act_started(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityStarted {
+        activity_id: id,
+        worker_id: autumn_harvest::types::WorkerId::new("tl-worker"),
+    }
+}
+const fn tl960_act_completed(id: autumn_harvest::ActivityExecId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityCompleted {
+        activity_id: id,
+        output: Value::Null,
+    }
+}
+fn tl960_act_failed(
+    id: autumn_harvest::ActivityExecId,
+    attempt: u32,
+) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ActivityFailed {
+        activity_id: id,
+        error: "transient failure".to_string(),
+        attempt,
+        error_type: "Transient".to_string(),
+        non_retryable: false,
+        details: None,
+    }
+}
+fn tl960_timer_started(id: &str) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::TimerStarted {
+        timer_id: autumn_harvest::types::TimerId::new(id),
+        duration_secs: 60,
+    }
+}
+fn tl960_timer_fired(id: &str) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::TimerFired {
+        timer_id: autumn_harvest::types::TimerId::new(id),
+    }
+}
+fn tl960_child_started(child: ExecutionId, name: &str) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ChildWorkflowStarted {
+        child_id: child,
+        workflow_name: name.to_string(),
+        input: json!({}),
+    }
+}
+const fn tl960_child_completed(child: ExecutionId) -> autumn_harvest::WorkflowEvent {
+    autumn_harvest::WorkflowEvent::ChildWorkflowCompleted {
+        child_id: child,
+        output: Value::Null,
+    }
+}
+
+// J-A
+#[tokio::test]
+async fn ui_timeline_renders_activity_timer_pause_ndblock() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
+    // so `derive_timeline` reports attempt = 2 → a "×2" badge. Plus a durable timer.
+    let a = autumn_harvest::ActivityExecId::new();
+    let t_id = "wait_gate";
+    let events = vec![
+        tl960_act_sched("charge_card", a),
+        tl960_act_started(a),
+        tl960_act_failed(a, 1),
+        tl960_act_started(a),
+        tl960_act_failed(a, 2),
+        tl960_act_started(a),
+        tl960_act_completed(a),
+        tl960_timer_started(t_id),
+        tl960_timer_fired(t_id),
+    ];
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-a",
+        events,
+        base,
+        1000,
+        "RUNNING",
+        None,
+        Some(base + chrono::Duration::seconds(4)),
+        Some("incident-4821"),
+        Some("oncall@corp"),
+        Some(base + chrono::Duration::seconds(6)),
+        Some("expected ActivityScheduled got TimerStarted"),
+        None,
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK, "timeline renders: {html}");
+    assert!(html.contains("<svg"), "inline svg present");
+    assert!(html.contains("charge_card"), "activity span present");
+    assert!(html.contains("×2"), "retry attempt badge visible: {html}");
+    assert!(html.contains("wait_gate"), "timer span present");
+    assert!(html.contains("Timer"), "timer lane label present");
+    // Pause band + reason/actor.
+    assert!(html.contains("gantt-pause-band"), "pause band present");
+    assert!(html.contains("incident-4821"), "pause reason labelled");
+    assert!(html.contains("oncall@corp"), "pause actor labelled");
+    // ND marker + runbook path (surfaced as code/text, not a clickable link —
+    // the runbook is a repo path, not a served URL).
+    assert!(html.contains("gantt-nd-marker"), "ND marker present");
+    assert!(
+        html.contains("docs/runbooks/nondeterminism-block.md"),
+        "runbook path surfaced: {html}"
+    );
+    assert!(
+        !html.contains("href=\"docs/runbooks/nondeterminism-block.md\""),
+        "runbook path is not a dead relative link: {html}"
+    );
+}
+
+// J-B
+#[tokio::test]
+async fn ui_timeline_split_only_when_present() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // An activity WITH ActivityStarted → wait/exec split. A child workflow → no split.
+    let a = autumn_harvest::ActivityExecId::new();
+    let child = ExecutionId::new_for_shard(ShardId::new(0));
+    let events = vec![
+        tl960_act_sched("split_activity", a),
+        tl960_act_started(a),
+        tl960_act_completed(a),
+        tl960_child_started(child, "sub_flow"),
+        tl960_child_completed(child),
+    ];
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-b",
+        events,
+        base,
+        1000,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(6)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Started activity → wait + exec segments.
+    assert!(
+        html.contains("gantt-seg-wait"),
+        "wait segment present: {html}"
+    );
+    assert!(html.contains("gantt-seg-exec"), "exec segment present");
+    // Child → single undivided span.
+    assert!(
+        html.contains("gantt-seg-whole"),
+        "child renders one whole span"
+    );
+    assert!(
+        html.contains("sub_flow")
+            || html.contains("ChildWorkflow")
+            || html.contains("Child workflow")
+    );
+}
+
+// J-C
+#[tokio::test]
+async fn ui_timeline_slowest_highlight_and_rollup() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // A quick activity then a much slower one (the slowest step).
+    let a1 = autumn_harvest::ActivityExecId::new();
+    let a2 = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        tl960_act_sched("quick", a1),
+        tl960_act_completed(a1),
+        tl960_act_sched("slow_bottleneck", a2),
+        tl960_act_completed(a2),
+    ];
+    // event offsets (step_ms=1000): sched(quick)@1s, complete(quick)@2s,
+    // sched(slow)@3s, complete(slow)@4s → but that makes both 1s. Use explicit
+    // widening below by pushing the slow completion far out via a large step.
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-c",
+        events,
+        base,
+        3000,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(20)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    // Push the slow activity's completion far out so it dominates.
+    tl960_set_event_ts(
+        &database_url,
+        exec_id,
+        5,
+        base + chrono::Duration::seconds(20),
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Rollup header present.
+    assert!(
+        html.contains("Total") || html.contains("wall-clock") || html.contains("Wall-clock"),
+        "rollup header: {html}"
+    );
+    assert!(html.contains("slow_bottleneck"), "slowest step named");
+    // Slowest span anchor + highlight.
+    assert!(html.contains("id=\"slowest\""), "slowest anchor present");
+    assert!(
+        html.contains("gantt-span-slowest"),
+        "slowest highlight present"
+    );
+}
+
+// J-D
+#[tokio::test]
+async fn ui_timeline_inflight_open_span_and_current_details() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // A running execution with a scheduled-but-not-completed activity.
+    let a = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        tl960_act_sched("in_flight_activity", a),
+        tl960_act_started(a),
+    ];
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-d",
+        events,
+        base,
+        1000,
+        "RUNNING",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("step 2/3: awaiting downstream"),
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("gantt-span-open"),
+        "in-flight open span present: {html}"
+    );
+    assert!(
+        html.contains("step 2/3: awaiting downstream"),
+        "current_details shown in header"
+    );
+}
+
+// J-E
+#[tokio::test]
+async fn ui_timeline_unknown_execution_404() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    // A random exec id has no execution row (mirrors a classic DAG run, which is
+    // not on the execution path) → 404.
+    let bogus = ExecutionId::new_for_shard(ShardId::new(0));
+    let (status, _html) = fetch_html(&app, &format!("/workflows/{bogus}/timeline")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown execution → 404");
+}
+
+// J-F
+#[tokio::test]
+async fn ui_detail_page_has_timeline_link() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T14:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let a = autumn_harvest::ActivityExecId::new();
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-f",
+        vec![tl960_act_sched("a", a), tl960_act_completed(a)],
+        base,
+        1000,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(3)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("/timeline") && html.to_lowercase().contains("timeline"),
+        "detail page links to the timeline view: {html}"
+    );
+}
+
+// J-G (perf)
+#[tokio::test]
+async fn ui_timeline_200_steps_under_1s() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T15:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // 200 activities (400 events: sched + complete each).
+    let mut events = Vec::with_capacity(400);
+    for _ in 0..200 {
+        let id = autumn_harvest::ActivityExecId::new();
+        events.push(tl960_act_sched("step", id));
+        events.push(tl960_act_completed(id));
+    }
+    let exec_id = tl960_seed_run(
+        &database_url,
+        "tl-g",
+        events,
+        base,
+        100,
+        "COMPLETED",
+        Some(base + chrono::Duration::seconds(60)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let start = std::time::Instant::now();
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}/timeline")).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("<svg"), "renders the gantt");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "200-step timeline renders server-side in < 1s (took {elapsed:?})"
+    );
 }

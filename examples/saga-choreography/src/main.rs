@@ -163,12 +163,14 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
                 target: target_id,
                 signal_name: "onboarding_outcome".to_string(),
                 payload: json!({ "cancelled": true }),
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered { signal_id },
             WorkflowEvent::WorkflowCompleted {
@@ -188,12 +190,14 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
                 target: target_id,
                 signal_name: "onboarding_outcome".to_string(),
                 payload: json!({ "cancelled": true }),
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalFailed {
                 signal_id,
@@ -214,6 +218,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: act1,
@@ -259,6 +264,10 @@ mod tests {
             execution_id: exec_id,
             events,
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         WorkflowReplayer::new()

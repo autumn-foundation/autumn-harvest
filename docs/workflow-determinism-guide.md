@@ -36,8 +36,8 @@ let rule = rule_by_id("HVG001").unwrap();
 
 Since version 0.3.0, the `#[workflow]` attribute macro automatically scans the annotated function body at compile-time to enforce these guardrails:
 
-- **Hard Blockers** (`HVG001` through `HVG008`): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
-- **Warnings** (`HVG009`): Emit standard deprecation compiler warnings (`note = "..."`) at the exact log macro site to encourage migration without breaking CI or blocking local development.
+- **Hard Blockers** (`HVG001` through `HVG008`, `HVG010`, and `HVG011` when the flagged loop schedules commands): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
+- **Warnings** (`HVG009`, and `HVG011` when the flagged loop is command-free): Emit standard deprecation compiler warnings (`note = "..."`) at the exact site to encourage migration without breaking CI or blocking local development.
 
 ### Suppressing compile-time guardrails
 
@@ -59,7 +59,7 @@ The flag also supports explicit boolean syntax:
 ```
 
 > [!NOTE]
-> The compile-time linter performs a shallow AST traversal (matching path segments and patterns). It is designed to catch the most common patterns, but it does not replace runtime verification. Always run [WorkflowReplayer](file:///c:/Users/markm/autumn-harvest/docs/replay-verify.md) tests for critical production workflows.
+> The compile-time linter performs a shallow AST traversal (matching path segments and patterns). It is designed to catch the most common patterns, but it does not replace runtime verification. Always run [WorkflowReplayer](replay-verify.md) tests for critical production workflows.
 
 ---
 
@@ -207,9 +207,25 @@ I/O is non-idempotent: replaying it sends duplicate requests, corrupts database 
 | **Disallowed** | `static COUNTER: AtomicU64 = AtomicU64::new(0); COUNTER.fetch_add(1, Ordering::Relaxed);` |
 | **Disallowed** | `lazy_static! { static ref REGISTRY: Mutex<Vec<String>> = ...; } REGISTRY.lock().push(...)` |
 | **Allowed** | Accumulate state in local variables across `ctx.timer()` and activity boundaries |
-| **Allowed** | Emit metrics/updates inside activities, not in workflow code |
+| **Allowed** | `ctx.metrics().counter(...)` / `ctx.metrics().histogram(...)` (replay-safe) for workflow-body metrics |
+| **Allowed** | Emit other side-channel updates (non-metric writes to external systems) inside activities, not in workflow code |
 
 Global mutations are re-applied on every replay, causing double-counting or inconsistent state across workers.
+
+For business metrics specifically, do **not** reach for a global registry or a
+raw `metrics::counter!(...)` call — use the sanctioned replay-safe primitive
+instead: `ctx.metrics().counter/gauge/histogram` on both `WorkflowContext` and
+`ActivityContext` (issue #532). Workflow-side emission is suppressed while
+`ctx.is_replaying()` is true, so a counter incremented once in workflow code
+increments the backend exactly once no matter how many replay cycles the
+executor runs; activity-side emission fires on every attempt (each retry is a
+separate execution). Names are auto-namespaced under `harvest.user.*`, label
+keys must stay low-cardinality (`execution.id`/`workflow.id` as a label is a
+rejected anti-pattern, ADR-0001 §7), and delivery is best-effort
+at-least-once across a worker crash — a crash after the emission but before
+the next event commits re-emits for the re-executed segment. See the "Custom
+workflow/activity metrics" section of `docs/telemetry.md` and
+`examples/business_metrics.rs`.
 
 ---
 
@@ -309,6 +325,135 @@ HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break det
 
 ---
 
+### HVG010 — `tokio::select!` / `futures::select!` over ctx awaitables (HardBlocker)
+
+| | Example |
+|---|---|
+| **Disallowed** | `tokio::select! { r = ctx.timer("t", 60) => {}, s = ctx.wait_for_signal("approve") => {} }` |
+| **Disallowed** | `futures::select! { a = fut_a.fuse() => {}, b = fut_b.fuse() => {} }` |
+| **Disallowed** | `futures::future::select(fut_a, fut_b).await` (also `select_all` / `select_ok` / `try_select`) |
+| **Allowed** | `ctx.race().timer(Duration::from_secs(60)).signal("approve").run().await?` |
+| **Allowed** | `ctx.race().activity_raw("fetch_a", input, "q").activity_raw("fetch_b", input, "q").run().await?` |
+
+HVG010 flags both the select **macros** (`tokio::select!`, `futures::select!`, `futures::select_biased!`) and their function-call siblings, the `futures::future::{select, select_all, select_ok, try_select}` **combinators** (issue #799) — they carry the identical footgun. (Inside an `#[activity]` body `select!` is fine: only the activity's recorded *result* matters, not its internal control flow, so activities may race freely.)
+
+Harvest already sanctions `futures::join!`/`futures::try_join!` for wait-**all** concurrency (see HVG005 above: "Harvest records each branch's result durably and re-joins them correctly on replay"). There is no equivalent sanction for wait-**first** — `select!` is a double footgun in a replay engine:
+
+1. **Non-deterministic winner.** The branch that wins depends on poll/arrival order on whichever worker happens to be replaying. A replayed history can pick a *different* branch than the original live run and diverge, since `select!` has no durable record of which branch actually completed first.
+2. **No durable cancellation of the losers.** Dropping the losing branches' futures does not durably cancel the underlying work: a scheduled activity keeps running to completion on its worker (and its eventual `ActivityCompleted`/`ActivityFailed` event lands in history unconsumed), and a durable timer row in `harvest_timers` stays live indefinitely.
+
+`ctx.race()` (issue #600) is the deterministic alternative: it records the winning branch via the existing `MarkerRecorded` event (no new `WorkflowEvent` variant — the same idiom `execute_activity_fan_out` already uses for its count marker), so replay always resolves the identical winner, and it durably cancels every losing branch — a still-open activity's task row is cancelled and a synthetic terminal is recorded, a losing child workflow is cancelled via the same primitive `ctx.request_cancel_external_workflow` uses, and a losing durable timer row is removed.
+
+**Migration example:**
+
+```rust
+// Before — non-deterministic winner, losers leak
+#[workflow]
+async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, String> {
+    tokio::select! {                                            // ← HVG010
+        a = ctx.execute_activity_raw("fetch_primary", req.clone(), "default") => a.map_err(|e| e.to_string()),
+        b = ctx.execute_activity_raw("fetch_fallback", req, "default") => b.map_err(|e| e.to_string()),
+    }
+}
+
+// After — deterministic winner, loser durably cancelled
+#[workflow]
+async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, String> {
+    let winner = ctx
+        .race()
+        .activity_raw("fetch_primary", req.clone(), "default")
+        .activity_raw("fetch_fallback", req, "default")
+        .run()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(winner.value)
+}
+```
+
+`ctx.race()` currently supports three shapes in one call: a homogeneous race of activity branches, a homogeneous race of child-workflow branches, or exactly one timer branch paired with exactly one signal branch (a thin wrapper over `receive_signal_timeout`/`wait_for_signal_timeout`, issue #476). Mixing branch kinds (e.g. an activity racing a timer in the same call) is out of scope for this slice and returns `HarvestError::Config` — bound an individual activity with its own `start_to_close`/`schedule_to_close` timeout, or compose a separate `receive_signal_timeout`, to express a deadline-bounded branch instead. See the `WorkflowContext::race` rustdoc for the full determinism contract.
+
+#### Guardrail severity
+
+HVG010 is a **HardBlocker**: an unguarded `select!` over ctx-managed awaitables can silently diverge a replay or leak in-flight activities/timers, both of which are worse than a build failure.
+
+#### Heuristic pre-check vs. authoritative guardrail
+
+The compile-time HVG010 proc-macro guardrail (syn-based, operating on the parsed AST) is the **authoritative** gate — it always hard-blocks these forms, including turbofished calls like `future::select::<_, _>(a, b)` (it strips path arguments before matching). Its `det_check` twin (`DET011`) is a best-effort **text** pre-check that mirrors the guardrail so problems surface early in review or CI without a full build; being text-based it can lag on exotic syntax (turbofish, unusual spacing, multi-line calls). When the two disagree, trust the compile-time guardrail — it is the safety net — and reach for the escape hatch (`#[workflow(allow_nondeterministic_apis)]`, or a `// harvest-suppress: DET011 "reason"` comment for `det_check`) only when the race is provably safe.
+
+---
+
+### HVG011 — `HashMap`/`HashSet` iteration order (HardBlocker*, command-aware)
+
+> **Rule-ID note:** issue #785's text proposed HVG010, but HVG010 was already permanently assigned to SelectMacro (issue #600) and rule IDs are never reused — the iteration-order rule ships as **HVG011** in the catalog/macro lint and **DET010** in `det_check`.
+
+| | Example |
+|---|---|
+| **Disallowed** | `for (k, v) in &my_hash_map { ctx.execute_activity_raw(...).await?; }` |
+| **Disallowed** | `for key in my_hash_map.keys() { ... }` (also `.values()`, `.iter()`, `.drain()`, `.into_iter()`, `.into_keys()`, `.into_values()`) |
+| **Allowed** | Iterate a `BTreeMap`/`BTreeSet` instead — deterministic key order |
+| **Allowed** | `let mut keys: Vec<_> = map.keys().cloned().collect(); keys.sort(); for k in keys { ... }` |
+| **Allowed** | Point lookups on a `HashMap`/`HashSet` that is never iterated |
+
+`HashMap`/`HashSet` iteration order is hash-randomized per process (`RandomState` seeds differ across workers and restarts), so a replay on another worker can visit the entries in a different order than the original run. When the loop body schedules commands (`ctx.execute_activity*`, `ctx.spawn_child_workflow*`, `ctx.execute_local_activity*`, `ctx.timer`, `ctx.side_effect`), the command sequence is recorded in history **in iteration order** — a reordered replay produces a different command sequence and diverges (non-determinism error / nd-block, issue #603 semantics).
+
+#### Guardrail severity
+
+HVG011 is command-aware: the macro lint and `det_check` inspect the loop body. A loop that schedules commands (`ctx.execute_activity*`, `ctx.spawn_child_workflow*`, `ctx.execute_local_activity*`, `ctx.timer`, `ctx.side_effect`, `ctx.race`) is a **HardBlocker** (compile error / `DetSeverity::Error`); a command-free loop is downgraded to a **Warning** (deprecation-note mechanism, like HVG009), since it only risks leaking the non-deterministic order into workflow-local state that a later branch might observe.
+
+**Syntactic boundary (deliberately narrow, false positives are the top risk):** only *locally `let`-bound* collections are tracked — hash-typed via an explicit type annotation whose root type is `HashMap`/`HashSet` (`let m: HashMap<K, V> = …`; a nested mention like `Vec<HashMap<..>>` or `Option<HashMap<..>>` does not track), a constructor call (`HashMap::new()`, `HashSet::from(..)`, `default`, `with_capacity` variants), or a `.collect::<HashMap<..>>()` turbofish (including the fallible `.collect::<Result<HashMap<..>, E>>()?` / `Option`-wrapped forms). Binding tracking is **lexically scoped**: re-binding the same ident to a non-hash type shadows it for that binding's scope, an inner-block hash binding never leaks past the block exit, and (in the macro lint) match-arm patterns, closure parameters, destructuring `let`s, and for-loop patterns all shadow outer tracked idents. Only a bare tracked ident, `&ident` / `&mut ident`, or exactly one argument-free iteration method call on it is flagged — longer chains (`map.keys().sorted()`) are never flagged, so already-sorted iterators always pass. Function parameters and struct fields are never flagged.
+
+**Surface divergences (line-based `det_check` vs. syn-based macro lint):** the macro lint is scope-exact; `det_check`'s line-based pass can still over-flag an ident re-bound by a *match-arm pattern* or a *closure parameter* (pattern masking there is not tractable line-by-line — suppress with `// harvest-suppress: DET010 "reason"` when intended), and misses a `for` header split across lines (`for (k, v) in` / `&m`) — the macro lint catches that shape. `det_check` also shares the pre-existing DET001–DET009 lexer caveat that the continuation lines of a multi-line string literal are lexed as code and can perturb binding tracking.
+
+**Migration example:**
+
+```rust
+// Before — breaks replay: debit order follows the randomized hash order
+#[workflow]
+async fn settle(ctx: &WorkflowContext, input: Value) -> Result<(), String> {
+    let mut amounts: HashMap<String, u64> = HashMap::new();
+    // ... populate from input ...
+    for (account, amount) in &amounts {                          // ← HVG011
+        ctx.execute_activity_raw("debit", json!({ "account": account, "amount": amount }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// After (option A) — BTreeMap: deterministic key order
+#[workflow]
+async fn settle(ctx: &WorkflowContext, input: Value) -> Result<(), String> {
+    let mut amounts: BTreeMap<String, u64> = BTreeMap::new();
+    // ... populate from input ...
+    for (account, amount) in &amounts {                          // deterministic ✓
+        ctx.execute_activity_raw("debit", json!({ "account": account, "amount": amount }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// After (option B) — keep the HashMap, iterate sorted keys
+#[workflow]
+async fn settle(ctx: &WorkflowContext, input: Value) -> Result<(), String> {
+    let mut amounts: HashMap<String, u64> = HashMap::new();
+    // ... populate from input ...
+    let mut accounts: Vec<String> = amounts.keys().cloned().collect();
+    accounts.sort();
+    for account in accounts {                                    // deterministic ✓
+        let amount = amounts[&account];
+        ctx.execute_activity_raw("debit", json!({ "account": account, "amount": amount }), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+```
+
+**Suppression:** in `det_check`, place `// harvest-suppress: DET010 "reason"` — or the guardrail-catalog spelling `// harvest-suppress: HVG011 "reason"`, honored as an alias — on the `for` line or the standalone comment line above it (echoed into `DetCheckReport::suppressions` with whichever id you wrote, for auditability). The macro lint has no per-site suppression — only the whole-function `#[workflow(allow_nondeterministic_apis)]` escape hatch, which bypasses HVG011 like every other rule. Iteration inside a `ctx.side_effect(..)` closure is not flagged by the compile-time macro lint (the closure's value is recorded once and replayed verbatim); the `det_check` scanner may still surface a DET010 Warning there — suppress with `// harvest-suppress: DET010 "reason"` if intended.
+
+---
+
 ## Machine-readable findings and suppressions
 
 `GuardrailFinding` and `GuardrailSuppression` both implement `serde::Serialize`/`Deserialize` and can be serialized to JSON for CI reports or external tooling.
@@ -355,14 +500,135 @@ assert_eq!(err, GuardrailSuppressionError::EmptyRuleId);
 
 ---
 
+## Running the check in CI
+
+The `det_check` engine ships behind a runnable front door: the **`harvest det-check`** CLI subcommand ([issue #778](https://github.com/autumn-foundation/autumn-harvest/issues/778)). It statically flags non-deterministic API calls reachable from your `#[workflow]` bodies — including through **one hop** of first-party helper functions the body calls directly — so you catch replay foot-guns at PR/CI time instead of post-deploy when in-flight executions DLQ.
+
+```console
+# Scan the current directory (default). Directories are scanned recursively;
+# `target` and hidden directories (`.git`, …) are skipped.
+$ harvest det-check
+
+# Scan specific paths (files or directories).
+$ harvest det-check src examples
+
+# Machine-readable output for CI consumption.
+$ harvest det-check --format json src
+
+# Also fail on warnings (DET005/DET009 and command-free DET010).
+$ harvest det-check --deny-warnings src
+
+# Audit the escape-hatch inventory: list every active suppression.
+$ harvest det-check --list-suppressions src
+```
+
+### Flags and exit-code contract
+
+| Flag | Effect |
+|------|--------|
+| `[PATHS...]` | Source paths to scan. Default: `.` (current directory). |
+| `--format text\|json` | Output format. `text` (default) prints `file:line:col DETxxx  (safe alternative: …)`, one line per finding, with a transitive finding also naming `[in helper `H` reached from workflow `W`]`, followed by a `suppressed:` audit footer. `json` emits a full `DetCheckReport` (findings + suppressions). |
+| `--deny-warnings` | Also gate (exit `1`) when any warning-severity finding is present. |
+| `--list-suppressions` | Print every active `harvest-suppress` with its reason and location, then exit `0`. |
+
+Exit codes: **`0`** when there are no hard-blocker findings; **`1`** when any `Error`-severity finding is present. Warning-severity findings (DET005 process reads, DET009 bare tracing, and a command-free DET010 loop) never fail the build unless `--deny-warnings` is passed. The findings (or JSON) are always printed to stdout *before* the non-zero exit, so CI logs are self-explanatory.
+
+### Transitive coverage and its boundary
+
+A hard-blocker call located in a first-party function that a `#[workflow]` body reaches **via a direct free-function call** is flagged, naming both the offending site and the workflow entry point. The boundary deliberately mirrors the `#[workflow]` compile-time lint ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) — the following are **out of scope** and are *not* detected:
+
+- **`#[activity]` bodies** — activities are allowed to be non-deterministic by design and are never scanned (directly or via reachability).
+- **Method calls** (`x.helper()`) and path-qualified calls (`m::helper()`) — only bare free-function calls (`helper()`) are resolved. This is the trait-dispatch / receiver boundary #386 also draws.
+- **Two or more hops** — reachability follows exactly one hop. A workflow → `helper_a` → `helper_b` (violation) chain is *not* flagged.
+- Third-party crates, trait-object dispatch, function pointers, and closures captured by reference.
+
+The catalog docs continue to own the "you must also avoid this transitively beyond one first-party hop" warning. Everything det-check skips here is a false-*negative* that the compile-time `#[workflow]` guardrail ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) **also** misses — #386 is likewise **body-only**, so it does *not* hard-block a non-deterministic call hidden inside a helper det-check skips (closing that body-only blind spot is exactly what det-check's one-hop pass partially does). det-check deliberately mirrors #386's boundary for what it *attempts* to analyze, and #386 remains the complementary compile-time check for **direct-in-body** violations — but neither is the net for these transitive skips. That net is the **runtime** determinism detection: `harvest-replay` / `WorkflowReplayer` run against recorded histories in tests/CI (post-hoc, once a history exists), and the live `HistoryMatcher` non-determinism check at execution time (which surfaces as a DLQ'd run) — plus manual code review.
+
+### Known limitations (conservative, safe-direction)
+
+`det_check` is a fast text pre-filter, not the authoritative gate. Its reachability resolution deliberately errs toward **missing** a transitive violation rather than reporting a false one — every case below is a false-*negative* (never a false-positive). These transitive false-negatives are **not** caught by the compile-time `#[workflow]` HVG guardrail ([issue #386](https://github.com/autumn-foundation/autumn-harvest/issues/386)) either: #386 is itself **body-only** — it scans only the annotated workflow body, so it does *not* hard-block a non-deterministic call hidden inside a helper det_check skips (that same body-only blind spot is exactly what det_check's one-hop pass was built to partially close). The backstop for what static analysis can't resolve is the **runtime** determinism detection — `WorkflowReplayer` / `harvest-replay` against recorded histories in tests/CI, and the live `HistoryMatcher` non-determinism check at execution time (which DLQs the run) — plus manual code review. When in doubt, trust `WorkflowReplayer` and a careful read of the helper, not the compile-time guardrail (which cannot see into these helpers).
+
+- **Module scope vs. methods.** `#[workflow]` entry points and their first-party helpers are resolved at **module scope** — top level *and* inside `mod NAME { … }` blocks, at any nesting depth. Methods declared inside `impl`/`trait` blocks are **never** indexed as free helpers and a call to one (`self.method()`, `Type::method()`) is never resolved (the #386 method-exclusion boundary).
+- **One-hop resolution is same-module only.** A bare call `helper()` resolves to a first-party helper **only when that helper is declared in the caller's own module** (same file + `module_path`) — the one case a bare call provably reaches without an import the line-based scanner cannot see. A helper in a **different module or file** (reached via a `use` import, including an aliased `use ... as helper`) is **not** resolved; it is treated as ambiguous and skipped (a safe false-negative). This is deliberate: the text front-door cannot resolve `use` imports/aliases, so *any* cross-module resolution keeps producing false positives on innocent imported/aliased code — and for a CI gate a false positive (failing CI on innocent code) is the worst outcome, outranking marginal recall. Even a **globally unique** helper name is not resolved cross-module. This ends the Codex round-4 (same-file-different-module) and round-5 (aliased-import, globally-unique) false-positive family structurally. A **block-local `use` import inside the workflow body** rebinds a same-module name too (a `use crate::x::helper;` in the body makes `helper()` resolve to the import, not a sibling `fn helper`); such imports are added to the shadow set below so this last same-module rebind vector no longer false-positives (a module/file-level `use` + a same-name `fn` is itself a compile error, so a block-local `use` is the only way to shadow a same-module helper — Codex r6). Because the compile-time `#[workflow]` guardrail (#386) is itself body-only, it does *not* catch a violation inside such a skipped cross-module/imported helper either; `WorkflowReplayer` (and the live `HistoryMatcher` at execution time) is the backstop for this false-negative, not #386.
+- **Local shadowing (by binding kind, matching Rust scoping).** A call whose name is bound by the caller — a fn-pointer / closure **parameter**, a local **closure** binding, a shadowing `let`, a **block-local `use` import** (simple, `as`-aliased, or grouped; an unnameable glob `use ...::*;` suppresses conservatively), or a **block-local `fn NAME(...)` item** — is treated as the local/import/nested-fn, not a same-named free helper. `#[workflow(fn ...)]` fn-pointer params and closures are exactly the forms #386 excludes. A nested `fn NAME(` **declaration** is itself never miscounted as a call — its own name token, preceded by the `fn` keyword, is skipped by the call collector (Codex r10). Suppression differs by binding kind, matching Rust scoping: **params** bind for the whole body and always suppress; a **`let`** shadow is **source-order + column-aware** — it suppresses a call on a strictly-later source line, or a **same-line** call whose column is past the binding's statement-terminating `;` (the point the binding enters scope). A call that runs *before* the binding is in scope still resolves to (and is scanned as) the free helper: `let helper = ...; helper();` suppresses the trailing call, while the RHS of `let bad = bad();` (before the `;`) and a pre-shadow `bad(); let bad = ...;` call (before the binding) both stay flagged; a **body-local `use` import** (and glob) and a **body-local `fn` item** shadow the name for the **whole body**, *not* source-order — a Rust block `use`/`fn` item is in scope for the entire enclosing block regardless of textual position, so a bare call may **precede** the `use`/`fn` and still resolve to it (Codex r7/r10). Adding a `use`/glob/`fn` to the shadow set only ever suppresses *more*, so it introduces no new false-positive. Residual safe false-negatives: a `let` shadow bound in an inner block that has already closed before an outer call still suppresses that call (source-order, not full brace-scope tracking); **block-local `use`/`fn` items are treated as whole-body shadows, not brace-scoped** — a nested-block `use`/`fn` that Rust confines to that inner block still suppresses a same-named call in a sibling or outer block *after* it (a line-based-granularity boundary; precise block-scoping would add brace-range-per-item machinery and risk reopening the ordering false-*positive* the whole-body treatment was chosen to eliminate, so it is declined in favor of the zero-false-positive whole-body rule); and if a body both shadows a name *and* legitimately calls a real free fn of that name, that call is conservatively skipped. Every case here is a false-*negative* (under-reports, never over-reports); the runtime replay net (`WorkflowReplayer` / the live `HistoryMatcher`) plus manual review is the backstop.
+- **Path-qualified one-hop calls.** `self::helper()`, `crate::mod::helper()`, and `super::helper()` are **not** resolved — only bare-ident calls (`helper()`, including a turbofish `helper::<T>()`) are matched, and only against a helper in the caller's own module (see "One-hop resolution is same-module only" above). A `use`-imported or aliased call therefore never resolves, because its real target is always in another module the scanner cannot follow. Resolving qualified / associated-function (`Type::assoc()`) calls would risk associated-function/method false positives, which is exactly the #386 boundary.
+- **Call-form gaps.** Space-before-paren (`helper ()`) call forms are not matched by the one-hop resolver. (Turbofish calls — `helper::<T>()`, including nested generics — *are* resolved.)
+
+### Flag scope
+
+`det-check` has its **own local** `--format text|json` flag and **ignores** the CLI's global network flags (`--base-url`, `--output`, auth) — it is read-only source analysis that never touches the management API, so those flags do not apply. `--format` controls only how the `DetCheckReport` (or, with `--list-suppressions`, the suppression inventory) is rendered.
+
+### Relationship to DET010 / DET011
+
+`det-check` surfaces the **entire** shared `det_check` engine, including **DET010** (`HashMap`/`HashSet` iteration order, [issue #785](https://github.com/autumn-foundation/autumn-harvest/issues/785)) and **DET011** (`select!` / futures-select combinators, [issue #799](https://github.com/autumn-foundation/autumn-harvest/issues/799)). The `det-check` CLI slice ([issue #778](https://github.com/autumn-foundation/autumn-harvest/issues/778)) adds **no new** `HashMap`/data-structure linting — those rules pre-exist. Listing "HashMap iteration" as out-of-scope for #778 means this slice adds no such *new* rule, **not** that the CLI hides the engine's existing DET010 output — a `HashMap`-iteration hard blocker is reported by `det-check` exactly as DET010.
+
+### GitHub Actions
+
+```yaml
+name: determinism
+on: [pull_request]
+jobs:
+  det-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Runs the CLI over the whole repo (default `.`) and fails the job on any
+      # hard blocker. Build artifacts (`target`), hidden directories, and the
+      # trybuild `compile_fail/` fixtures are skipped automatically.
+      - name: harvest det-check
+        run: cargo run -q -p autumn-harvest-cli --bin harvest -- det-check
+```
+
+The command exits non-zero on a hard blocker, so the step fails the job automatically — no extra shell plumbing needed. Add `--deny-warnings` to the run line to also fail on warnings. The argless form scans the repo root; in a larger downstream workspace where you want to scope the scan, enumerate specific crate `src` directories instead (e.g. `det-check crate-a/src crate-b/src`).
+
+### Pre-commit hook
+
+Drop this into `.git/hooks/pre-commit` (make it executable with `chmod +x`):
+
+```sh
+#!/bin/sh
+# Block commits that introduce a workflow-determinism hard blocker.
+if ! cargo run -q -p autumn-harvest-cli --bin harvest -- det-check; then
+    echo "det-check found determinism hard blockers — fix them or add a" >&2
+    echo "// harvest-suppress: DETxxx \"reason\" comment (see the guide)." >&2
+    exit 1
+fi
+```
+
+The shipped tree passes the check: a bare `harvest det-check` at the repo root reports zero hard-blocker findings (the deliberately non-deterministic trybuild fixtures under `autumn-harvest/tests/compile_fail/` are *true* positives that exist to be rejected by the compile-time guardrail — the scanner skips that directory, along with `target` and any hidden directory, automatically).
+
+---
+
 ## Composing with the release playbook
 
 The determinism rule catalog is an early-stage guardrail, not the final proof of replay safety. The recommended release sequence:
 
 1. **Determinism check** (this catalog): catch obvious footguns before any workflow has history.
-2. **History export** ([issue #169](https://github.com/madmax983/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
+2. **History export** ([issue #169](https://github.com/autumn-foundation/autumn-harvest/issues/169)): export event histories from staging as replay fixtures.
 3. **WorkflowReplayer** (`autumn_harvest::testing::WorkflowReplayer`): verify the new code replays all exported fixtures without divergence.
-4. **Version gate** (`ctx.version()`): use version gates for intentional non-determinism across deploys, and retire old gates after the fleet has fully rolled forward.
+4. **Patch gate** (`ctx.patched()` / `ctx.deprecate_patch()`, with `ctx.version()` as the multi-version escape hatch): fence intentional non-determinism across deploys behind `ctx.patched(id)` for the common two-state change, deprecate the gate with `ctx.deprecate_patch(id)` once pre-patch runs have drained, and delete it after the marker-bearing runs drain too. Reach for `ctx.version()` only when a gate needs more than two concurrent versions.
 5. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
 
 Each layer catches a different class of problem. All five together provide defence-in-depth for safe rolling deploys.
+
+---
+
+## Update Handlers and Determinism
+
+Workflow Update Handlers allow external clients to interact with running workflows and receive synchronous results (issue #140). However, update handlers run asynchronously and their lifecycles are decoupled from the main workflow function.
+
+### Orphaned Update Handlers
+
+If a workflow completes (or fails, times out, is cancelled/terminated) while update handlers are still in progress, these updates become **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
+
+### Waiting for Update Handlers to Complete
+
+To prevent orphaned updates and ensure all clients receive their results, you can gate the workflow completion by waiting for all admitted update handlers to resolve using the `WorkflowContext::all_handlers_finished()` and `WorkflowContext::unfinished_update_handler_count()` helpers inside your workflow logic:
+
+```rust
+// Block workflow completion until all update handlers are resolved.
+ctx.await_condition(|| ctx.all_handlers_finished()).await;
+```
+
+This ensures a clean exit and prevents unhandled update requests from being aborted.

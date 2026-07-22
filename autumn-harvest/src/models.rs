@@ -10,12 +10,15 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_admission_gates, harvest_audit_log, harvest_backfill_log, harvest_batch_jobs,
-    harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
-    harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
-    harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_workers, harvest_workflow_executions,
+    harvest_admission_gates, harvest_api_tokens, harvest_audit_log, harvest_backfill_log,
+    harvest_batch_jobs, harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions,
+    harvest_calendars, harvest_completion_deliveries, harvest_completion_trigger_fires,
+    harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
+    harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
+    harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
+    harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -94,6 +97,14 @@ pub struct WorkflowExecution {
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
     pub deadline_at: Option<DateTime<Utc>>,
+    /// Chain-scoped lifetime cap DURATION (issue #617). Distinct from the per-run
+    /// `execution_timeout`: anchored at the chain-origin start and carried verbatim
+    /// across every continue-as-new. `None` = no chain cap configured.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC chain deadline (issue #617). Computed at the chain-origin start
+    /// as `started_at + chain_execution_timeout` and copied verbatim into every
+    /// continue-as-new successor (never recomputed). `None` = no chain cap.
+    pub chain_deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -136,6 +147,73 @@ pub struct WorkflowExecution {
     /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
     /// this, not `completed_at`. `None` for manual starts.
     pub scheduled_for: Option<DateTime<Utc>>,
+    /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
+    pub workflow_attempt: i32,
+    /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
+    pub retry_of_exec_id: Option<Uuid>,
+    /// Dispatch origin (issue #534): `scheduled` / `backfill` / `manual_trigger` for
+    /// schedule-attributed runs, `None` for all non-scheduled runs. Metadata only.
+    pub origin: Option<String>,
+    /// Wall-clock of the most recent replay-non-determinism block observation
+    /// (issue #603). `None` = not blocked; state stays RUNNING while blocked.
+    pub nd_blocked_at: Option<DateTime<Utc>>,
+    /// Divergence error string from the most recent blocked cycle (issue #603).
+    pub nd_block_reason: Option<String>,
+    /// Consecutive block entries for the current divergence incident (issue
+    /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
+    pub nd_block_count: i32,
+    /// Per-execution completion-callback targets (issue #605): a JSON array
+    /// of `{url, filter}` objects. `None` = no per-execution targets; the
+    /// effective set is still the union with any builder-wide defaults.
+    pub completion_callbacks: Option<serde_json::Value>,
+    /// Predecessor execution in a continue-as-new chain (issue #701). `None` for
+    /// the first run in a chain and for all non-continued runs.
+    pub continued_from_exec_id: Option<Uuid>,
+    /// The first (origin) execution of this continue-as-new chain (issue #701).
+    /// Set on every successor to the chain head. `None` for the origin run and
+    /// all non-continued runs.
+    pub first_exec_id: Option<Uuid>,
+    /// Wall-clock the per-execution legal hold was placed (issue #747).
+    /// `None` = no hold. A hold is ACTIVE when this is non-`None` and
+    /// `legal_hold_until` is `None` or in the future; an active hold exempts
+    /// this execution's history from retention deletion and PII erasure.
+    pub legal_hold_set_at: Option<DateTime<Utc>>,
+    /// Optional auto-expiry for the legal hold (issue #747). `None` =
+    /// indefinite; a past value means the hold is inactive again.
+    pub legal_hold_until: Option<DateTime<Utc>>,
+    /// Operator-supplied justification for the legal hold (issue #747).
+    pub legal_hold_reason: Option<String>,
+    /// Principal that placed the legal hold (issue #747, audit trail).
+    pub legal_hold_actor: Option<String>,
+    /// Workflow-start provenance classifier (issue #740): a bounded `snake_case`
+    /// source string. `None` for pre-upgrade rows, reported as "unknown" in the
+    /// serialized form. Distinct from `origin` (issue #534); never read on replay.
+    #[serde(serialize_with = "serialize_start_source_or_unknown")]
+    pub start_source: Option<String>,
+    /// Optional correlation reference for the start source (issue #740), e.g. the
+    /// triggering execution id or schedule id. `None` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_source_ref: Option<String>,
+    /// Optional human/operator attribution for the start (issue #740). `None`
+    /// when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
+}
+
+/// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /
+/// unclassified) row as the literal `"unknown"` string (issue #740, AC4).
+// `serialize_with` requires the `&Option<String>` signature exactly.
+#[allow(clippy::ref_option)]
+fn serialize_start_source_or_unknown<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_deref().unwrap_or("unknown"))
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -154,6 +232,11 @@ pub struct NewWorkflowExecution<'a> {
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// NULL = no deadline enforced.
     pub deadline_at: Option<DateTime<Utc>>,
+    /// Chain-scoped lifetime cap DURATION (issue #617). `None` = no chain cap.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC chain deadline (issue #617). Anchored at the chain-origin
+    /// start and carried verbatim across continue-as-new. `None` = no chain cap.
+    pub chain_deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     /// Build ID from the active build policy for this queue at start time.
@@ -174,6 +257,32 @@ pub struct NewWorkflowExecution<'a> {
     /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
     /// this, not `completed_at`. `None` for manual starts.
     pub scheduled_for: Option<DateTime<Utc>>,
+    /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
+    pub workflow_attempt: i32,
+    /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
+    pub retry_of_exec_id: Option<Uuid>,
+    /// Dispatch origin (issue #534): `scheduled` / `backfill` / `manual_trigger` for
+    /// schedule-attributed runs, `None` for all non-scheduled runs. Metadata only.
+    pub origin: Option<&'a str>,
+    /// Per-execution completion-callback targets (issue #605). `None` = none configured.
+    pub completion_callbacks: Option<serde_json::Value>,
+    /// Predecessor execution in a continue-as-new chain (issue #701). `None`
+    /// except when inserting a continue-as-new successor.
+    pub continued_from_exec_id: Option<Uuid>,
+    /// First (origin) execution of this continue-as-new chain (issue #701).
+    /// `None` except when inserting a continue-as-new successor.
+    pub first_exec_id: Option<Uuid>,
+    /// Workflow-start provenance classifier (issue #740): a bounded `snake_case`
+    /// source string. `None` = unclassified. Distinct from `origin` (issue #534).
+    pub start_source: Option<&'a str>,
+    /// Optional correlation reference for the start source (issue #740). `None`
+    /// when absent.
+    pub start_source_ref: Option<&'a str>,
+    /// Optional human/operator attribution for the start (issue #740). `None`
+    /// when absent.
+    pub started_by: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -208,6 +317,30 @@ pub struct NewHarvestEvent<'a> {
     pub event_id: i32,
     pub event_type: &'a str,
     pub event_data: serde_json::Value,
+}
+
+// ── PayloadRef ────────────────────────────────────────────────────────────────
+
+/// A reference from a workflow execution to an offloaded payload blob (issue #524).
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_payload_refs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestPayloadRef {
+    pub blob_key: String,
+    pub workflow_exec_id: Uuid,
+    pub store_id: String,
+    pub byte_len: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for recording a new offloaded-payload reference.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_payload_refs)]
+pub struct NewHarvestPayloadRef {
+    pub blob_key: String,
+    pub workflow_exec_id: Uuid,
+    pub store_id: String,
+    pub byte_len: i64,
 }
 
 // ── TaskQueueItem ─────────────────────────────────────────────────────────────
@@ -276,6 +409,21 @@ pub struct TaskQueueItem {
     /// Ambient context headers propagated from the parent workflow (issue #481).
     #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
+    /// Row insert time (issue #501 review). `None` for pre-upgrade rows; the
+    /// schedule-to-start SLI uses `GREATEST(scheduled_at, created_at)` as the true
+    /// eligibility (an immediate task's backdated `scheduled_at` is corrected to its
+    /// insert time, a delayed/retried task keeps its explicit future `scheduled_at`)
+    /// and falls back to `scheduled_at` when this is `None`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
+    /// hardening). See `wake_workflow_task`/`park_workflow_task` in `queue.rs`.
+    #[serde(default)]
+    pub wake_requested: bool,
+    /// Worker session this activity belongs to (issue #606). `None` for an
+    /// ordinary activity dispatch.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -314,6 +462,9 @@ pub struct NewTaskQueueItem<'a> {
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     pub context_headers: Option<serde_json::Value>,
+    /// Worker session this activity belongs to (issue #606). `None` for an
+    /// ordinary activity dispatch.
+    pub session_id: Option<Uuid>,
 }
 
 /// Database representation of a rate limit bucket.
@@ -428,6 +579,8 @@ pub struct HarvestSchedule {
     pub last_catchup_dropped: i32,
     /// Timestamp of the most recent recovery tick that produced drops (issue #484). NULL = none yet.
     pub last_catchup_at: Option<DateTime<Utc>>,
+    /// Default retry policy for runs started by this schedule (issue #523). NULL = no retry.
+    pub retry_policy: Option<serde_json::Value>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -621,6 +774,11 @@ pub struct HarvestWorker {
     pub deployment_name: Option<String>,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: serde_json::Value,
+    /// Advertised worker-session capacity (issue #606). `0` = sessions
+    /// disabled on this worker (the default).
+    pub max_concurrent_sessions: i32,
+    /// Sessions currently `ACTIVE` on this worker (issue #606).
+    pub in_use_sessions: i32,
 }
 
 /// Insert struct for registering a new worker process.
@@ -639,6 +797,9 @@ pub struct NewHarvestWorker<'a> {
     pub deployment_name: Option<&'a str>,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: serde_json::Value,
+    /// Advertised worker-session capacity (issue #606). `0` = sessions
+    /// disabled on this worker (the default).
+    pub max_concurrent_sessions: i32,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────
@@ -724,6 +885,56 @@ pub struct NewAuditRecord<'a> {
     pub source: &'a str,
 }
 
+// ── ApiToken ──────────────────────────────────────────────────────────────────
+
+/// A single scoped API token for the management API (issue #942).
+///
+/// **Never serialized as an API response.** This struct holds `token_hash`; the
+/// management API responds with the metadata-only `TokenView` DTO
+/// (`autumn-harvest-plugin`), which structurally cannot hold the hash or the
+/// plaintext secret. `Debug` is derived but the hash is a non-reversible
+/// SHA-256, not the secret.
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = harvest_api_tokens)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ApiToken {
+    pub id: Uuid,
+    pub name: String,
+    pub token_hash: String,
+    pub scope: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_by: String,
+}
+
+/// Insert struct for minting a new API token (issue #942).
+///
+/// A manual `Debug` impl redacts `token_hash` so a mint site logging this
+/// struct cannot leak the lookup key.
+#[derive(Insertable)]
+#[diesel(table_name = harvest_api_tokens)]
+pub struct NewApiToken<'a> {
+    pub name: &'a str,
+    pub token_hash: &'a str,
+    pub scope: &'a str,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_by: &'a str,
+}
+
+impl std::fmt::Debug for NewApiToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewApiToken")
+            .field("name", &self.name)
+            .field("token_hash", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .field("created_by", &self.created_by)
+            .finish()
+    }
+}
+
 // ── BuildPolicy ───────────────────────────────────────────────────────────────
 
 /// Active build policy for a task queue (issue #171).
@@ -739,6 +950,10 @@ pub struct HarvestBuildPolicy {
     pub deployment_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Ramp target build (issue #604). `None` = no ramp configured.
+    pub target_build_id: Option<String>,
+    /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
+    pub ramp_percent: Option<i32>,
 }
 
 /// Insert struct for a new build policy.
@@ -875,6 +1090,8 @@ pub struct CompletionTriggerDb {
     pub is_static: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Optional output guard AST (issue #810). NULL = unconditional.
+    pub condition: Option<serde_json::Value>,
 }
 
 /// Insertable model for registering/creating a completion trigger.
@@ -888,6 +1105,8 @@ pub struct NewCompletionTriggerDb {
     pub input_mapping: serde_json::Value,
     pub queue_name: Option<String>,
     pub is_static: bool,
+    /// Optional output guard AST (issue #810). NULL = unconditional.
+    pub condition: Option<serde_json::Value>,
 }
 
 /// Queryable model representing a fired completion trigger event instance.
@@ -898,6 +1117,9 @@ pub struct CompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
     pub fired_at: DateTime<Utc>,
+    /// NULL = fired; `condition_unmet` / `condition_invalid` =
+    /// resolved-skipped by the output guard (issue #810).
+    pub outcome: Option<String>,
 }
 
 /// Insertable model for registering a fired completion trigger.
@@ -906,6 +1128,8 @@ pub struct CompletionTriggerFireDb {
 pub struct NewCompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
+    /// NULL = fired; Some(reason) = resolved-skipped (issue #810).
+    pub outcome: Option<String>,
 }
 
 /// Queryable model representing a deferred completion trigger outbox task.
@@ -982,4 +1206,310 @@ pub struct NewAdmissionGateRow<'a> {
     pub message: Option<&'a str>,
     pub created_by: &'a str,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+// ── CompletionDelivery ───────────────────────────────────────────────────────
+
+/// A durable completion-callback delivery row (issue #605).
+///
+/// One row per `(workflow_exec_id, callback_index)`, enqueued inside the
+/// terminal transaction and drained by the `fire_due_completion_deliveries`
+/// scanner.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_completion_deliveries)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionDelivery {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub shard_id: i32,
+    pub callback_index: i32,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub target_url: String,
+    pub event_filter: serde_json::Value,
+    pub terminal_state: String,
+    /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on every
+    /// attempt, including redeliveries.
+    pub payload: serde_json::Value,
+    /// `PENDING` | `INFLIGHT` | `DELIVERED` | `FAILED`.
+    pub state: String,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    /// Frozen `RetryPolicy` JSON at enqueue time.
+    pub retry_policy: serde_json::Value,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_status: Option<i32>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// Insert struct for enqueuing a new completion-callback delivery.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_deliveries)]
+pub struct NewCompletionDelivery<'a> {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub shard_id: i32,
+    pub callback_index: i32,
+    pub workflow_name: &'a str,
+    pub workflow_id: &'a str,
+    pub target_url: &'a str,
+    pub event_filter: serde_json::Value,
+    pub terminal_state: &'a str,
+    pub payload: serde_json::Value,
+    pub max_attempts: i32,
+    pub retry_policy: serde_json::Value,
+    pub next_attempt_at: DateTime<Utc>,
+}
+
+/// Changeset applied by the scanner after claiming a batch of due rows
+/// (transitions `PENDING`/`INFLIGHT` -> `INFLIGHT`, bumps `attempt`, and
+/// sets a short in-flight lease on `next_attempt_at`).
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_completion_deliveries)]
+pub struct CompletionDeliveryClaim {
+    pub state: String,
+    pub attempt: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Changeset applied after a delivery attempt completes, recording the
+/// outcome ([`crate::completion_callback::OutcomeAction`]).
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_completion_deliveries)]
+pub struct CompletionDeliveryOutcomeUpdate {
+    pub state: String,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_status: Option<i32>,
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+// ── Worker sessions (issue #606) ───────────────────────────────────────────
+
+/// A worker session row from `harvest_sessions`.
+///
+/// Derives `QueryableByName` (alongside the ORM-path `Queryable`) so the
+/// broken-session scanner's raw `LEFT JOIN` candidate scan
+/// ([`crate::sessions::broken_session_candidates_query`]) can load rows
+/// directly, mirroring `TaskQueueItem`'s identical dual-path precedent.
+#[derive(
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[diesel(table_name = harvest_sessions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestSession {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub host_worker_id: String,
+    pub queue_name: String,
+    /// `ACTIVE`, `BROKEN`, or `COMPLETED`.
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub broken_at: Option<DateTime<Utc>>,
+    pub broken_reason: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Insert struct for a newly acquired worker session.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_sessions)]
+pub struct NewHarvestSession<'a> {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub host_worker_id: &'a str,
+    pub queue_name: &'a str,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Changeset for refreshing a session's lease (issue #606).
+///
+/// Applied after each member-activity completion so a long-running,
+/// legitimate session isn't reaped by the broken-session scanner's
+/// lease-expiry check.
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_sessions)]
+pub struct SessionLeaseRefresh {
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Changeset applied by the broken-session scanner (issue #606).
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_sessions)]
+pub struct SessionBrokenUpdate {
+    pub state: String,
+    pub broken_at: DateTime<Utc>,
+    pub broken_reason: String,
+}
+
+/// Changeset applied by `Session::complete()`'s release activity.
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_sessions)]
+pub struct SessionCompletedUpdate {
+    pub state: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+// ── Execution summary (issue #752) ──────────────────────────────────────────────
+
+/// A compact summary of a terminal execution demoted by the retention janitor
+/// (issue #752), read from `harvest_execution_summaries`.
+#[derive(
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[diesel(table_name = harvest_execution_summaries)]
+#[diesel(primary_key(execution_id))]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ExecutionSummary {
+    pub execution_id: Uuid,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: Option<i64>,
+    pub shard_id: i32,
+    pub search_attrs: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    /// Parent execution UUID for a child-workflow summary, else `None`
+    /// (issue #752). Links a demoted child to its parent for the #495 PII-erase
+    /// cascade.
+    pub parent_id: Option<Uuid>,
+    pub summarized_at: DateTime<Utc>,
+}
+
+/// Insert struct for a newly written execution summary (issue #752).
+///
+/// `summarized_at` is omitted so Postgres fills its `DEFAULT NOW()`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_execution_summaries)]
+pub struct NewExecutionSummary {
+    pub execution_id: Uuid,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: Option<i64>,
+    pub shard_id: i32,
+    pub search_attrs: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    /// Parent execution UUID when demoting a child workflow, else `None`
+    /// (issue #752).
+    pub parent_id: Option<Uuid>,
+}
+
+// ── WASM activity module storage (issue #965) ───────────────────────────────
+
+/// A content-addressed WASM activity module row from `harvest_wasm_modules`
+/// (issue #965).
+///
+/// Reads carry the full `wasm_bytes` blob; callers that only need to know which
+/// version is active should prefer the hash-only resolution helpers in
+/// [`crate::wasm_store`] to avoid loading the bytes.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_wasm_modules)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestWasmModule {
+    pub hash: String,
+    pub activity_name: String,
+    pub wasm_bytes: Vec<u8>,
+    pub active: bool,
+    pub published_at: DateTime<Utc>,
+}
+
+/// Insert struct for publishing a WASM activity module version (issue #965).
+///
+/// `published_at` is omitted so Postgres fills its `DEFAULT now()`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_wasm_modules)]
+pub struct NewHarvestWasmModule<'a> {
+    pub hash: &'a str,
+    pub activity_name: &'a str,
+    pub wasm_bytes: &'a [u8],
+    pub active: bool,
+}
+
+// ── Durable mutex locks (issue #691) ────────────────────────────────────────
+
+/// A currently-held durable mutex lock row from `harvest_mutex_locks`
+/// (issue #691).
+///
+/// Derives `QueryableByName` (alongside the ORM-path `Queryable`) so the
+/// advisory-locked grant/release/reclaim/renewal helpers in
+/// [`crate::mutex`] can load rows directly via raw `sql_query`, mirroring
+/// `HarvestSession`'s dual-path precedent.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_mutex_locks)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestMutexLock {
+    pub lock_key: String,
+    pub holder_exec_id: Uuid,
+    pub lock_seq: i64,
+    pub acquired_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+/// Insert struct for granting a durable mutex lock (issue #691).
+///
+/// `acquired_at` is omitted so Postgres fills its `DEFAULT NOW()`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_mutex_locks)]
+pub struct NewHarvestMutexLock {
+    pub lock_key: String,
+    pub holder_exec_id: Uuid,
+    pub lock_seq: i64,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+/// A FIFO waiter row from `harvest_mutex_waiters` (issue #691). The BIGSERIAL
+/// `id` encodes request order; the smallest id for a key wins the next grant.
+#[derive(
+    Debug, Clone, Queryable, QueryableByName, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_mutex_waiters)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestMutexWaiter {
+    pub id: i64,
+    pub lock_key: String,
+    pub waiter_exec_id: Uuid,
+    pub requested_at: DateTime<Utc>,
+}
+
+/// Insert struct for enqueuing a durable mutex waiter (issue #691).
+///
+/// `id` (BIGSERIAL) and `requested_at` (`DEFAULT NOW()`) are omitted so
+/// Postgres fills them.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_mutex_waiters)]
+pub struct NewHarvestMutexWaiter {
+    pub lock_key: String,
+    pub waiter_exec_id: Uuid,
 }

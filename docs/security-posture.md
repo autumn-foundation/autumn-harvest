@@ -58,14 +58,26 @@ HarvestPlugin::new()
     .api("/api/harvest")
 ```
 
+### Read-only operator tier (least-privilege triage)
+
+For a support/on-call/status-dashboard principal that should **read but not
+mutate**, mount with `api_with_role_auth` instead of `api_with_auth` — a single
+call that adds a class-aware enforcement layer giving `403 Forbidden` on every
+mutating management route (and every mutating [MCP tool](./mcp-tools.md), when
+`mcp_tools()` is enabled) to any principal your middleware marks read-only,
+while leaving 100% of the read surface reachable. See **[the read-only operator
+role guide](./operator-role.md)** for the Session claim contract, the
+fail-closed guarantee, the MCP-tool coverage, and the `/ui` limitation.
+
 ### Production (host-app authentication)
 
 Mount the API with the host application's authentication middleware. The
 `api_with_auth` method applies any Tower middleware layer to the **entire**
-router — all 48 management API routes, the embedded Vantage UI (`/ui/*`), and
+router — every management API route, the embedded Vantage UI (`/ui/*`), and
 all CLI-compatible endpoints are wrapped together because `harvest_ui_router` is
 nested into the same Axum router before the middleware layer is added (see
-`HarvestPlugin::build` in the plugin source).
+`HarvestPlugin::build` in the plugin source). The same layer is also applied to
+every generated MCP tool route.
 
 Pass any Tower `Layer`-compatible middleware. Two common shapes are shown below.
 
@@ -144,6 +156,109 @@ authentication for `GET /api/harvest/health` at the infrastructure layer.
 
 ---
 
+## Scoped API tokens (built-in, opt-in — issue #942)
+
+The postures above delegate authentication entirely to the host application. As
+an alternative or complement, Harvest ships a first-class, least-privilege token
+layer for the management API: create / list / revoke scoped, optionally-expiring,
+individually-revocable API tokens, with every mutating operation attributable to
+a named actor. It is a `autumn-harvest-plugin` auth layer plus one additive
+config-table migration (`20260713000000_harvest_api_tokens`) — no new
+`WorkflowEvent` variant, no change to `harvest_events`, no replay-determinism
+impact. The deterministic execution core is untouched.
+
+### Enabling it
+
+Token auth is **off by default** (byte-for-byte identical to today) and turned on
+with a single builder call:
+
+```rust
+let plugin = HarvestPlugin::new(/* … */)
+    .enable_api_tokens();
+```
+
+This installs a token verification + scope-enforcement layer on the nested
+`harvest_api_router`.
+
+### Composed vs. standalone mode
+
+- **Composed** — layer tokens *on top of* your existing `api_with_auth` admin
+  boundary. An already-admin caller mints the first token normally through the
+  API. Token auth **composes with**, never replaces, `api_with_auth`.
+- **Standalone (tokens-only)** — scoped API tokens are the *only* auth, with no
+  embedder admin boundary. See "First-token bootstrap" below for the
+  chicken-and-egg case.
+
+### Auth ordering
+
+The layer inspects the `Authorization: Bearer` value:
+
+- A bearer that **begins with `hvst_`** is treated as a Harvest token and
+  verified (hash the presented secret, one indexed `SELECT`). A claimed `hvst_`
+  bearer that cannot be verified because the store is unavailable is rejected
+  `503` — never trusted unverified.
+- A bearer that **does not begin with `hvst_`** (or an absent bearer) is passed
+  through untouched, so `api_with_auth` still runs. Token auth composes with the
+  embedder's own middleware rather than short-circuiting it.
+
+### Scopes (read / mutate)
+
+A token carries `read` or `mutate`, derived from the same
+`audit::CLASSIFIED_ROUTES` taxonomy the read-only operator tier uses (no second
+route taxonomy). The gate **fails closed**: an unclassified path resolves to
+`Mutating` and is denied to a `read` token. A `read` token is rejected `403` on
+every mutating route and admitted on every read-only route.
+
+### Routes (admin-gated, audited)
+
+| Route | Method | Effect |
+|---|---|---|
+| `/api/harvest/admin/tokens` | `POST` | Create a token → `201`, audited `token.create`. The plaintext secret is returned **exactly once** and never persists. |
+| `/api/harvest/admin/tokens` | `GET` | List tokens (metadata-only DTO — structurally cannot hold the hash/secret). |
+| `/api/harvest/admin/tokens/{id}` | `DELETE` | Revoke a token → audited `token.revoke`. |
+
+Wire format: a secret is opaque `hvst_<base64url(32 random bytes)>`. Only
+`token_hash = hex(SHA256(secret))` is stored (UNIQUE-indexed).
+
+### First-token bootstrap (standalone mode)
+
+In pure standalone mode there is a chicken-and-egg gap: `POST /admin/tokens` is
+an admin-gated mutation, so minting a token requires a previously-minted token.
+`harvest token bootstrap` closes it — an **offline seed** CLI that opens no DB
+connection and issues no HTTP request. It prints a fresh secret **once** and the
+exact `INSERT INTO harvest_api_tokens (...)` statement (embedding only the hash,
+never the secret) for the operator — who already holds DB access, the trust
+anchor — to run out-of-band. It defaults `--scope` to `mutate` so the seed token
+can mint the rest through the API. A bootstrap-seeded token authenticates
+byte-for-byte identically to a route-minted one (shared core hashing helper).
+
+### Rotation, expiry, and actor attribution
+
+- Optional `expires_at`; an expired or revoked token is rejected `401` on the
+  **next request** (there is no grant cache — every request re-queries the
+  table). Rotate by create-replacement → cut over → revoke old.
+- On a verified token, the layer strips any inbound `x-harvest-actor` and injects
+  `token:{id}`, so every audited mutation is attributed to the token (never the
+  secret/hash) and a caller cannot spoof a different actor. The `token:` actor
+  namespace is reserved.
+
+### Operational caveats
+
+- **Standalone-token mode should sit behind a rate-limiting proxy.** With
+  `enable_api_tokens()` as the only auth, any `hvst_` bearer triggers one indexed
+  lookup before authentication (inherent to any bearer scheme). Front the API
+  with a per-source rate-limiting proxy to bound unauthenticated lookup floods.
+- **A compromised `mutate` token can mint replacement tokens** (the 2-level
+  read/mutate model has no scope that grants mutation but withholds token
+  management — fine-grained RBAC is out of scope). Revoking a leaked `mutate`
+  token is insufficient on its own: also audit the `created_by` provenance and
+  revoke the entire lineage of tokens it minted.
+
+CLI: `harvest token create | list | revoke` (plus a client-side `rotate`
+convenience) and the offline `harvest token bootstrap`.
+
+---
+
 ## CLI token semantics
 
 The Harvest CLI supports `--token <value>` and the `HARVEST_TOKEN` environment
@@ -186,6 +301,14 @@ the `actor` field. When the host application populates this header after
 successful authentication (e.g., from a validated JWT subject claim), the audit
 trail reflects the real operator identity. When no auth is configured, `actor`
 defaults to `"anonymous"`.
+
+Data-governance operations follow the same posture: **per-execution legal hold**
+(`POST /workflows/{id}/legal-hold` / `…/legal-hold/release`, issue #747) and
+**targeted PII erasure** (`POST /workflows/{id}/erase-payloads`, issue #495) are
+admin-gated mutating routes, audited under `legal_hold.set` / `legal_hold.release`
+and `workflow.erase_payloads`. A legal hold exempts a single execution's history
+from the retention janitor and from PII erasure until released — see
+[`docs/archival.md`](archival.md) for the retention/erasure lifecycle.
 
 ---
 

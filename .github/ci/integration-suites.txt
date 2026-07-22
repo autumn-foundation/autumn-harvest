@@ -1,0 +1,113 @@
+# CI integration-suite manifest — the single source of truth for which
+# per-suite `cargo test` runs CI executes. One suite per line. Read by
+# `.github/ci/run-suites.sh` (which the `test` job invokes) and cross-checked
+# by `autumn-harvest/tests/integration/ci_run_coverage.rs`.
+#
+# Adding a suite = add ONE sorted line here. No `ci.yml` edit, no ALLOWLIST
+# edit for a wired suite. This file is `merge=union` (see `.gitattributes`), so
+# two PRs each appending a line both land with no textual conflict; a
+# union-merge duplicate/reorder is caught (never a conflict) by
+# `manifest_is_sorted_and_unique`, fixed with:
+#   LC_ALL=C sort -o .github/ci/integration-suites.txt \
+#     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
+#     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
+# (or simply keep the header on top and `LC_ALL=C sort -u` the data lines).
+#
+# Columns (whitespace-separated; `-` = none/absent):
+#   osclass   crate                    target       features            filter
+#
+#   osclass  = linux       -> run on Linux, serial (`--test-threads=1`) against
+#                            live Docker Postgres; also compile-checked on every
+#                            OS (plugin rows via `compile` mode; core rows via
+#                            the blanket core `--no-run` step in ci.yml).
+#              allos       -> run on all 3 OSes, parallel, no live DB. For
+#                            `autumn-harvest` `integration` rows the runner adds
+#                            `--no-default-features` (strips the default `db`,
+#                            since allos has no Postgres).
+#              compileonly -> `--no-run` compile-check on all OSes, never
+#                            executed (env-gated or all-`#[ignore]`d).
+#   crate    = autumn-harvest | autumn-harvest-plugin
+#   target   = the `--test <target>` binary (core suites use `integration`).
+#   features = comma-list passed as `--features <v>`, or `-`.
+#   filter   = positional filter after `--`, or `-` for the whole target. A
+#              partial `module::test` filter is allowed verbatim (it does NOT
+#              credit the whole module in the coverage guard).
+#
+# `--test-threads=1` and `--no-run` are DERIVED from `osclass` by the runner and
+# are never written here — this is what keeps the `--test-threads=1`-after-`--`
+# ordering correct by construction.
+#
+# osclass      crate                    target                           features                   filter
+allos        autumn-harvest         integration                      testing                    -
+allos        autumn-harvest         integration                      testing,metrics-rs         metrics_rs_adapter
+allos        autumn-harvest         property                         db                         -
+allos        autumn-harvest-plugin  contract_regression              -                          -
+allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
+allos        autumn-harvest-plugin  gate_no_global_install           -                          -
+allos        autumn-harvest-plugin  security                         -                          -
+allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
+compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
+compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
+linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
+linux        autumn-harvest         integration                      -                          activity_default_floor_tests
+linux        autumn-harvest         integration                      -                          activity_interceptor_tests
+linux        autumn-harvest         integration                      -                          admission_gate_authoritative
+linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
+linux        autumn-harvest         integration                      -                          canary_tests
+linux        autumn-harvest         integration                      -                          chain_timeout_tests
+linux        autumn-harvest         integration                      -                          child_timeout_tests
+linux        autumn-harvest         integration                      -                          completion_callback_tests
+linux        autumn-harvest         integration                      -                          cross_workflow_await_tests
+linux        autumn-harvest         integration                      -                          cross_workflow_signal_tests
+linux        autumn-harvest         integration                      -                          event_batch_tests
+linux        autumn-harvest         integration                      -                          force_fail
+linux        autumn-harvest         integration                      -                          integration_e2e
+linux        autumn-harvest         integration                      -                          metrics_integration
+linux        autumn-harvest         integration                      -                          mutex_tests
+linux        autumn-harvest         integration                      -                          panic_containment_tests
+linux        autumn-harvest         integration                      -                          rate_limit_key
+linux        autumn-harvest         integration                      -                          retention_overrides_tests
+linux        autumn-harvest         integration                      -                          retention_summary_tests
+linux        autumn-harvest         integration                      -                          schedule_runs_tests
+linux        autumn-harvest         integration                      -                          scheduler_overdue_tests
+linux        autumn-harvest         integration                      -                          start_idempotency_tests
+linux        autumn-harvest         integration                      -                          start_source_tests
+linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
+linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
+linux        autumn-harvest         integration                      -                          workflow_retry_tests
+linux        autumn-harvest         integration                      testing                    nd_block
+linux        autumn-harvest         integration                      testing                    worker_session_tests
+linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
+linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
+linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
+linux        autumn-harvest-plugin  batch_operations_integration     -                          -
+linux        autumn-harvest-plugin  build_ramp_integration           -                          -
+linux        autumn-harvest-plugin  by_id_integration                -                          -
+linux        autumn-harvest-plugin  canary_integration               -                          -
+linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
+linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
+linux        autumn-harvest-plugin  dag_run_graph_integration        -                          -
+linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
+linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
+linux        autumn-harvest-plugin  eligibility_tests                -                          -
+linux        autumn-harvest-plugin  fail_now_integration             -                          -
+linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -
+linux        autumn-harvest-plugin  interface_schema_integration     -                          -
+linux        autumn-harvest-plugin  legal_hold_integration           -                          -
+linux        autumn-harvest-plugin  progress_stream_integration      -                          -
+linux        autumn-harvest-plugin  query_integration                -                          -
+linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
+linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
+linux        autumn-harvest-plugin  replay_diagnosis_integration     -                          -
+linux        autumn-harvest-plugin  run_chain_integration            -                          -
+linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
+linux        autumn-harvest-plugin  start_idempotency_integration    -                          -
+linux        autumn-harvest-plugin  start_source_integration         -                          -
+linux        autumn-harvest-plugin  start_throttle_integration       -                          -
+linux        autumn-harvest-plugin  status_summary_integration       -                          -
+linux        autumn-harvest-plugin  timeline_integration             -                          -
+linux        autumn-harvest-plugin  token_auth_integration           -                          -
+linux        autumn-harvest-plugin  ui_integration                   -                          -
+linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
+linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
+linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -

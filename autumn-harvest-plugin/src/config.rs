@@ -48,6 +48,34 @@ pub struct HarvestReadinessConfig {
     pub require_shard_readiness: bool,
 }
 
+/// What to do when workflow-type reachability finds an orphaned type at
+/// startup (issue #700 AC4).
+///
+/// An *orphaned* type has ≥1 non-terminal execution whose `#[workflow]` handler
+/// is no longer registered in this build — those runs would wedge in permanent
+/// replay failure. This action defaults to `Warn` (non-breaking): mixed fleets
+/// mid-rollout must not crash-loop just because an old handler was removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OrphanStartupAction {
+    /// Skip the check entirely.
+    Off,
+    /// Log a warning naming the orphaned types, then continue (default).
+    #[default]
+    Warn,
+    /// Refuse startup (return an error) when orphaned types are present and the
+    /// cross-shard report is complete. A partial/unavailable report degrades to
+    /// `Warn` so a transient shard outage never crash-loops boot.
+    Fail,
+}
+
+/// Boot-time startup gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HarvestStartupConfig {
+    /// Action to take when orphaned workflow types are detected at startup.
+    pub orphaned_workflows: OrphanStartupAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -57,6 +85,7 @@ pub struct HarvestRuntimeConfig {
     pub outbox: HarvestOutboxConfig,
     pub batch: HarvestBatchConfig,
     pub readiness: HarvestReadinessConfig,
+    pub startup: HarvestStartupConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -139,6 +168,9 @@ impl HarvestRuntimeConfig {
         if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
             self.readiness.require_shard_readiness = require_shard_readiness;
         }
+        if let Some(orphaned_workflows) = partial.startup.orphaned_workflows {
+            self.startup.orphaned_workflows = orphaned_workflows;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -206,6 +238,12 @@ impl HarvestRuntimeConfig {
             self.readiness.require_shard_readiness = parse_bool(
                 "AUTUMN_HARVEST_READINESS__REQUIRE_SHARD_READINESS",
                 &require_shard_readiness,
+            )?;
+        }
+        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
+            self.startup.orphaned_workflows = parse_orphan_startup_action(
+                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
+                &orphaned_workflows,
             )?;
         }
 
@@ -279,6 +317,7 @@ impl Default for HarvestRuntimeConfig {
             outbox: HarvestOutboxConfig::default(),
             batch: HarvestBatchConfig::default(),
             readiness: HarvestReadinessConfig::default(),
+            startup: HarvestStartupConfig::default(),
         }
     }
 }
@@ -325,6 +364,8 @@ struct PartialHarvestRuntimeConfig {
     batch: PartialHarvestBatchConfig,
     #[serde(default)]
     readiness: PartialHarvestReadinessConfig,
+    #[serde(default)]
+    startup: PartialHarvestStartupConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,6 +396,11 @@ struct PartialHarvestBatchConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialHarvestReadinessConfig {
     require_shard_readiness: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestStartupConfig {
+    orphaned_workflows: Option<OrphanStartupAction>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -408,6 +454,23 @@ fn parse_mode(value: &str) -> Result<HarvestMode, ConfigError> {
         "external" => Ok(HarvestMode::External),
         _ => Err(ConfigError::Validation(format!(
             "invalid harvest mode {value:?}; expected one of: embedded, split, external"
+        ))),
+    }
+}
+
+/// Parse an [`OrphanStartupAction`] from an environment override.
+///
+/// Case-insensitive (`off`/`warn`/`fail` in any casing). The error message
+/// names the `orphaned_workflows` field so an operator can find it regardless
+/// of the (uppercase) env-var key. TOML values are lowercase-only via
+/// `#[serde(rename_all = "lowercase")]`, matching the `HarvestMode` precedent.
+fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAction, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => Ok(OrphanStartupAction::Off),
+        "warn" => Ok(OrphanStartupAction::Warn),
+        "fail" => Ok(OrphanStartupAction::Fail),
+        _ => Err(ConfigError::Validation(format!(
+            "invalid orphaned_workflows value for {key}: {value:?}; expected one of: off, warn, fail"
         ))),
     }
 }
@@ -660,6 +723,79 @@ require_shard_readiness = false
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
 
         assert!(config.readiness.require_shard_readiness);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_defaults_to_warn() {
+        let env = MockEnv::new();
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+        assert_eq!(config.startup.orphaned_workflows, OrphanStartupAction::Warn);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_from_toml() {
+        let dir = unique_temp_dir("harvest-config-startup-toml");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+        assert_eq!(config.startup.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_from_env() {
+        let dir = unique_temp_dir("harvest-config-startup-env");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "warn"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "off");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
+        assert_eq!(config.startup.orphaned_workflows, OrphanStartupAction::Off);
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_rejects_unknown_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "explode");
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("unknown orphaned_workflows value must fail validation");
+        assert!(
+            error.to_string().contains("orphaned_workflows"),
+            "expected orphaned_workflows validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn startup_orphaned_workflows_rejects_unknown_value_from_toml() {
+        // Sibling of the env-path test above: the TOML path must also reject an
+        // unknown value (serde deserialization error), never silently default.
+        let dir = unique_temp_dir("harvest-config-startup-toml-reject");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "explode"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("unknown orphaned_workflows TOML value must fail to load");
+        let message = error.to_string();
+        assert!(
+            message.contains("explode") || message.contains("orphaned_workflows"),
+            "expected the TOML deserialization error to reference the bad value \
+             or the field, got {error}"
+        );
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

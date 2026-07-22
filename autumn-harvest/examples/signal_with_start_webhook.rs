@@ -94,6 +94,9 @@ async fn handle_webhook_after(
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
             signal_name: "stripe.subscription_created",
@@ -111,6 +114,16 @@ async fn handle_webhook_after(
             context_headers: None,
 
             sla: None,
+            workflow_retry_policy: None,
+            max_workflow_attempts_ceiling: None,
+            reject_fresh_if_debounced: false,
+            // This example has no published input schema to validate against;
+            // see docs/getting-started/12-webhooks.md for how a webhook-facing
+            // app wires its own WorkflowInfo through this field.
+            workflow_info: None,
+            // Fresh-start provenance (issue #740); default records
+            // StartSource::SignalWithStart.
+            start_source_override: None,
         },
     )
     .await?;

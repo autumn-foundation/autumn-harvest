@@ -10,7 +10,7 @@
 
 use uuid::Uuid;
 
-use crate::types::{ExecutionId, ExternalCancelId, ExternalSignalId};
+use crate::types::{ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId};
 
 // ---------------------------------------------------------------------------
 // PayloadKind
@@ -77,6 +77,11 @@ pub enum TimeoutType {
     /// Total wall-clock execution time from `WorkflowStarted` to terminal state
     /// exceeded the configured `execution_timeout` (issue #243).
     WorkflowExecution,
+    /// Total chain-scoped wall-clock lifetime — anchored at the FIRST run's start
+    /// and carried verbatim across every continue-as-new — exceeded the configured
+    /// `chain_execution_timeout` (issue #617). Distinct from
+    /// [`Self::WorkflowExecution`], which is per-run and re-anchored on each CAN.
+    WorkflowChain,
 }
 
 impl std::fmt::Display for TimeoutType {
@@ -87,6 +92,7 @@ impl std::fmt::Display for TimeoutType {
             Self::ScheduleToClose => write!(f, "ScheduleToClose"),
             Self::Heartbeat => write!(f, "Heartbeat"),
             Self::WorkflowExecution => write!(f, "WorkflowExecution"),
+            Self::WorkflowChain => write!(f, "WorkflowChain"),
         }
     }
 }
@@ -134,12 +140,30 @@ pub enum HarvestError {
     },
 
     /// A workflow execution failed permanently.
+    ///
+    /// The typed fields (issue #767) carry a decoded
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) when the workflow
+    /// returned one; they are `None` for untyped `Err(String)` failures.
     #[error("workflow failed: {name}: {reason}")]
     WorkflowFailed {
         /// The name of the failed workflow.
         name: String,
-        /// The reason string describing the failure.
+        /// The reason string describing the failure (human-readable message).
         reason: String,
+        /// Stable error-type name from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
+        /// untyped failures.
+        error_type: Option<String>,
+        /// Structured details from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
+        /// untyped failures.
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable classification hint from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure); `None` for
+        /// untyped failures. This is a hint for the caller / completion-trigger,
+        /// **not** a control input to the engine's workflow-level retry (#523)
+        /// loop (issue #767 scope).
+        non_retryable: Option<bool>,
     },
 
     /// The engine detected non-deterministic behavior during workflow replay.
@@ -178,6 +202,26 @@ pub enum HarvestError {
     #[error("workflow paused: {0}")]
     WorkflowPaused(ExecutionId),
 
+    /// Returned (under the start transaction's `FOR UPDATE` lock) when a start
+    /// would create a **fresh** execution for a workflow that has a debounce
+    /// policy, via an entry point that does not itself perform debounce
+    /// admission (the fresh path of plain start, signal-with-start,
+    /// update-with-start, or batch start). The caller routes this to debounce
+    /// admission (plain start) or rejects the request (signal/update/batch).
+    /// Because the decision is made under the lock, an attach/idempotent call
+    /// (no fresh execution created) never raises it — closing the TOCTOU of an
+    /// unlocked pre-scan (issue #499).
+    #[error(
+        "workflow '{workflow_name}' (id '{workflow_id}') has a debounce policy; \
+         a fresh start must go through debounce admission, not this endpoint"
+    )]
+    DebounceFreshStart {
+        /// The workflow type name.
+        workflow_name: String,
+        /// The requested workflow id.
+        workflow_id: String,
+    },
+
     /// A Saga compensation sequence failed while trying to rollback.
     #[error(
         "saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}"
@@ -187,6 +231,22 @@ pub enum HarvestError {
         original: String,
         /// The list of errors encountered during compensation steps.
         compensation_errors: Vec<String>,
+    },
+
+    /// The workflow's published input schema (issue #373) rejected
+    /// `start_input` on a **genuine fresh start** initiated through
+    /// [`crate::execution::signal_with_start_workflow_execution`].
+    ///
+    /// Raised from inside the start transaction's `FOR UPDATE` lock, only
+    /// when the call actually creates a new execution -- a call that merely
+    /// attaches to an already-running execution never validates `start_input`
+    /// (it's never written), closing the TOCTOU window a caller-side,
+    /// pre-lock check would otherwise need to work around. Carries the same
+    /// structured violations `POST /workflows/{name}/start` returns.
+    #[error("input validation failed: {} violation(s)", violations.len())]
+    InputValidationFailed {
+        /// The schema violations reported by `WorkflowInfo::validate_input`.
+        violations: Vec<crate::info::SchemaViolation>,
     },
 
     /// A timeout occurred for a workflow, activity, or execution component.
@@ -212,6 +272,15 @@ pub enum HarvestError {
         /// The codec identifier stored on the event payload.
         id: String,
     },
+
+    /// A payload-store operation (offload `put`, fetch `get`, or `delete`)
+    /// failed, or an offloaded payload could not be reconstructed (issue #524).
+    ///
+    /// Covers external-store I/O errors, an unknown `store_id` on read, and a
+    /// content-checksum mismatch between the fetched blob and the recorded
+    /// reference envelope (which would otherwise silently corrupt replay).
+    #[error("payload offload error: {0}")]
+    PayloadOffload(String),
 
     /// A task queue reached its maximum capacity.
     #[error("task queue is full (queue: {queue}, depth: {depth})")]
@@ -266,7 +335,9 @@ pub enum HarvestError {
     /// - The key is empty or longer than 64 characters.
     /// - The key contains characters outside `[a-zA-Z0-9_-]`.
     /// - The key is engine-reserved (`exec_id`, `workflow_name`, `shard_id`,
-    ///   `status`, `run_id`) or starts with the `_harvest` prefix.
+    ///   `status`, `run_id`, or the six replay-non-determinism diagnostic keys
+    ///   `failure_cause`/`event_index`/`expected`/`actual`/`workflow_type`/
+    ///   `build_id`, issue #603) or starts with the `_harvest` prefix.
     /// - The value is a JSON object or array (only primitives and null allowed).
     #[error("invalid search attribute: {reason}")]
     InvalidSearchAttribute {
@@ -313,6 +384,23 @@ pub enum HarvestError {
         query_name: String,
         /// Configured timeout in milliseconds.
         timeout_ms: u64,
+    },
+
+    /// The execution row exists and is terminal, but its recorded history can
+    /// no longer be replayed to reconstruct final state for a post-mortem query
+    /// (issue #612). This happens when the history was pruned by retention,
+    /// released on reset (`TERMINATED`), or had its payloads erased (issue #495).
+    ///
+    /// This is **distinct** from [`NotFound`][Self::NotFound] (row gone → 404):
+    /// here the row is present but its history is unqueryable, so returning a
+    /// partial/empty/erased answer would be misleading. Surfaces as `410 Gone`
+    /// at the management API layer.
+    #[error("history unavailable: {reason} ({exec_id})")]
+    HistoryUnavailable {
+        /// The execution whose history cannot be queried.
+        exec_id: ExecutionId,
+        /// Human-readable reason (e.g. "pruned by retention", "payloads erased").
+        reason: String,
     },
 
     /// A payload exceeded the configured size cap at a write boundary.
@@ -397,7 +485,86 @@ pub enum HarvestError {
         /// Machine-readable failure reason (`"target_unknown"` or `"self_cancel"`).
         reason_code: String,
     },
+
+    /// A `ctx.await_external_workflow(...)` call could not observe the target's
+    /// terminal outcome (issue #757) — a **transport** failure, distinct from a
+    /// target that reached a non-`COMPLETED` terminal state (which surfaces as a
+    /// typed [`WorkflowFailed`](HarvestError::WorkflowFailed) carrying the
+    /// target's own terminal cause).
+    ///
+    /// `reason_code` is one of:
+    /// - `"self_await"` — the target is the calling workflow's own `ExecutionId`.
+    /// - `"target_unknown"` — no execution matching `target` was found within
+    ///   the configured grace window.
+    #[error("external await of {target} failed: {reason_code} (await_id={await_id})")]
+    ExternalAwaitFailed {
+        /// The `ExternalAwaitId` recorded in the initiating event (nil UUID for
+        /// the immediate `self_await` rejection, which records no history).
+        await_id: ExternalAwaitId,
+        /// The target workflow execution ID.
+        target: ExecutionId,
+        /// Machine-readable failure reason (`"self_await"` or `"target_unknown"`).
+        reason_code: String,
+    },
+
+    /// `ctx.create_session(...)` could not acquire a host worker within the
+    /// configured acquisition timeout (issue #606).
+    ///
+    /// No worker on `queue` advertised a free session slot
+    /// (`max_concurrent_sessions`) before the deadline. Author-catchable —
+    /// the workflow may retry `create_session` or fall back to plain
+    /// activities.
+    #[error("session {session_id} acquisition timed out after {timeout_ms}ms on queue '{queue}'")]
+    SessionAcquireTimeout {
+        /// The session identity that failed to acquire a host.
+        session_id: crate::types::SessionId,
+        /// The queue the acquisition was attempted on.
+        queue: String,
+        /// The configured acquisition timeout, in milliseconds.
+        timeout_ms: u64,
+    },
+
+    /// A worker session's host worker died or drained mid-session (issue
+    /// #606).
+    ///
+    /// Distinct from an ordinary activity failure: partial local state
+    /// (a downloaded file, a warmed cache) may be lost, so this is
+    /// deliberately never silently retried onto a different worker. The
+    /// workflow author must re-establish the session and restart the
+    /// affected steps.
+    #[error("session {session_id} broken: {reason}")]
+    SessionBroken {
+        /// The broken session's identity.
+        session_id: crate::types::SessionId,
+        /// Why the session was declared broken (e.g. "host worker lost
+        /// heartbeat", "host worker draining", "session lease expired").
+        reason: String,
+    },
+
+    /// A workflow tried to re-acquire a durable mutex key it already holds
+    /// (issue #691).
+    ///
+    /// Durable mutexes are non-reentrant: acquiring a key the same workflow
+    /// already holds would deadlock (the holder can never release while it is
+    /// blocked waiting for itself), so `ctx.mutex(key).acquire()` returns this
+    /// synchronously instead of parking. Author-catchable.
+    #[error("workflow already holds mutex '{key}'; re-acquiring the same key would deadlock")]
+    MutexSelfDeadlock {
+        /// The lock key the workflow already holds.
+        key: String,
+    },
 }
+
+/// The Postgres constraint name backing the `harvest_events`
+/// `UNIQUE (workflow_exec_id, event_id)` table constraint.
+///
+/// Auto-generated by Postgres from the inline `UNIQUE (workflow_exec_id,
+/// event_id)` constraint in migration `20260409000000_harvest_initial`, and
+/// stable across deployments. Used to classify a transient wake-event-ingest
+/// event-id conflict (issue #779) — see
+/// [`HarvestError::is_event_id_unique_violation`].
+pub(crate) const EVENTS_EVENT_ID_UNIQUE_CONSTRAINT: &str =
+    "harvest_events_workflow_exec_id_event_id_key";
 
 impl HarvestError {
     /// Build a [`NonDeterministic`](HarvestError::NonDeterministic) error variant.
@@ -500,6 +667,140 @@ impl HarvestError {
     pub fn is_circuit_open(&self) -> bool {
         self.activity_error_type() == Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN)
     }
+
+    /// `true` if this is an activity failure synthesised because an operator
+    /// force-failed the hung in-flight activity (issue #765).
+    ///
+    /// ```rust,ignore
+    /// if err.is_operator_force_failed() { /* compensate */ }
+    /// ```
+    #[must_use]
+    pub fn is_operator_force_failed(&self) -> bool {
+        self.activity_error_type() == Some(crate::failure::ERROR_TYPE_OPERATOR_FORCE_FAILED)
+    }
+
+    /// Construct a [`WorkflowFailed`](HarvestError::WorkflowFailed) by decoding a
+    /// workflow failure payload, recovering the typed `error_type` / `details` /
+    /// `non_retryable` from a [`WorkflowFailure`](crate::failure::WorkflowFailure)
+    /// wire envelope (issue #767). A legacy `Err(String)` payload decodes to
+    /// `None` typed fields.
+    #[must_use]
+    pub fn workflow_failed(name: impl Into<String>, payload: &str) -> Self {
+        let decoded = crate::failure::decode_workflow_failure(payload);
+        Self::WorkflowFailed {
+            name: name.into(),
+            reason: decoded.message,
+            error_type: decoded.error_type,
+            details: decoded.details,
+            non_retryable: decoded.non_retryable,
+        }
+    }
+
+    /// Construct an untyped [`WorkflowFailed`](HarvestError::WorkflowFailed): the
+    /// typed fields default to `None` (issue #767).
+    #[must_use]
+    pub fn workflow_failed_untyped(name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::WorkflowFailed {
+            name: name.into(),
+            reason: reason.into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+
+    /// If this is a [`WorkflowFailed`](HarvestError::WorkflowFailed), return its
+    /// stable error-type class from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure). `None` for untyped
+    /// failures or other variants.
+    #[must_use]
+    pub fn workflow_error_type(&self) -> Option<&str> {
+        match self {
+            Self::WorkflowFailed { error_type, .. } => error_type.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// If this is a [`WorkflowFailed`](HarvestError::WorkflowFailed), return the
+    /// structured `details` carried by a typed failure. `None` for untyped
+    /// failures or other variants.
+    #[must_use]
+    pub const fn workflow_details(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::WorkflowFailed { details, .. } => details.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// `true` if this is a [`WorkflowFailed`](HarvestError::WorkflowFailed)
+    /// carrying a typed non-retryable [`WorkflowFailure`](crate::failure::WorkflowFailure).
+    /// `false` for untyped failures or other variants.
+    ///
+    /// This is an **advisory** classification hint for the caller /
+    /// completion-trigger — it is not a retry control input; the engine's
+    /// workflow-level retry (#523) loop never consults it (issue #767 scope).
+    /// To gate the retry loop on a failure class, list its `error_type` in the
+    /// workflow's `RetryPolicy::non_retryable_errors` — the scheduler matches
+    /// that list against the decoded `error_type`, not against this flag.
+    #[must_use]
+    pub fn is_workflow_non_retryable(&self) -> bool {
+        match self {
+            Self::WorkflowFailed { non_retryable, .. } => non_retryable.unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this is a
+    /// [`MutexSelfDeadlock`](HarvestError::MutexSelfDeadlock) — a workflow
+    /// re-acquiring a durable mutex key it already holds (issue #691).
+    #[must_use]
+    pub const fn is_mutex_self_deadlock(&self) -> bool {
+        matches!(self, Self::MutexSelfDeadlock { .. })
+    }
+
+    /// If this is an [`ExternalAwaitFailed`](HarvestError::ExternalAwaitFailed)
+    /// **transport** failure (issue #757), return its machine-readable
+    /// `reason_code` (`"self_await"` or `"target_unknown"`). `None` for other
+    /// variants — a target that reached a non-`COMPLETED` terminal state
+    /// surfaces as a typed [`WorkflowFailed`](HarvestError::WorkflowFailed), not
+    /// this variant.
+    #[must_use]
+    pub const fn external_await_reason_code(&self) -> Option<&str> {
+        match self {
+            Self::ExternalAwaitFailed { reason_code, .. } => Some(reason_code.as_str()),
+            _ => None,
+        }
+    }
+
+    /// `true` if this is a database error caused by a UNIQUE violation on the
+    /// `harvest_events (workflow_exec_id, event_id)` constraint
+    /// (`harvest_events_workflow_exec_id_event_id_key`) — issue #779.
+    ///
+    /// This is a **transient, self-inflicted** conflict, not a logic error. The
+    /// worker's wake-event ingest (`ingest_due_timers_and_signals`) appends
+    /// `TimerFired`/`SignalReceived` at a `next_event_id` precomputed from an
+    /// earlier history load, with no execution-row lock and no `MAX(event_id)`
+    /// recompute. A concurrent `append_single_event` writer — timeout
+    /// enforcement (`timeout.rs`), external-task completion (`external_task.rs`),
+    /// or the issue #779 child-timeout deadline materializer — can commit an
+    /// event at that same `event_id` first, and the ingest's batch insert then
+    /// hits this unique constraint.
+    ///
+    /// The correct response is to **re-drive the parent workflow task**, not to
+    /// terminally fail a healthy run: a fresh history load advances
+    /// `next_event_id` past the winner's already-committed event and an
+    /// already-`fired` timer is excluded from the next ingest, so the retry
+    /// provably cannot re-hit the same conflict — convergent in a single retry,
+    /// with no infinite loop.
+    ///
+    /// Matched on the exact Postgres constraint name embedded in the
+    /// duplicate-key error message. A genuine/unrelated database error, or a
+    /// unique violation on any *other* constraint, does not match and still
+    /// fails as before.
+    #[must_use]
+    pub fn is_event_id_unique_violation(&self) -> bool {
+        matches!(self, Self::Database(msg) if msg.contains(EVENTS_EVENT_ID_UNIQUE_CONSTRAINT))
+    }
 }
 
 /// Standard result type for internal harvest engine operations.
@@ -524,6 +825,67 @@ pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
     HarvestError::Database(e.to_string())
 }
 
+/// Extracts a human-readable message from a caught panic payload.
+///
+/// Shared by every `std::panic::catch_unwind` call site that guards a
+/// user-supplied handler closure (query, declarative query, and signal
+/// handlers) so the `&str` / `String` / "unknown panic" fallback chain is
+/// defined exactly once.
+///
+/// Deliberately takes `payload` **by value** rather than by reference
+/// (`#[allow(clippy::needless_pass_by_value)]`): `Box<dyn Any + Send>` itself
+/// satisfies the blanket `impl<T: 'static> Any for T`, so a caller passing
+/// `&e` for `e: Box<dyn Any + Send>` to a by-reference `&(dyn Any + Send)`
+/// parameter can silently coerce by unsizing the *outer* `Box` (which *is*
+/// `Any`) rather than deref-coercing to the *inner* erased payload --
+/// `downcast_ref` then always misses and this always falls through to
+/// `"unknown panic"`. Taking the `Box` by value forces every call site to
+/// pass the exact value `catch_unwind` produced, with no coercion ambiguity.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::error::panic_message;
+///
+/// let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+/// assert_eq!(panic_message(payload), "boom");
+/// ```
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Contain a panic raised while **constructing** a handler future (issue #782).
+///
+/// The poll-time `catch_unwind` at each dispatch site wraps only the *future*
+/// returned by a handler `fn`. But a hand-written `WorkflowInfo`/`ActivityInfo`
+/// handler (a supported surface — the public `handler` fields,
+/// `WorkflowReplayer::register_fn`, etc.) may run synchronous work (an
+/// `unwrap()`, a `panic!()`) **before** returning its boxed future; that work
+/// runs when the handler is *called*, before the returned future is ever polled,
+/// so the poll-time guard does not cover it and the panic would otherwise unwind
+/// the spawned worker task uncaught — bypassing the `HandlerPanic` conversion and
+/// leaving the task on the poison-pill path. Wrapping the construction call here
+/// closes that gap uniformly. Macro-generated handlers put the whole body inside
+/// the returned async block, so this only ever fires for hand-written handlers.
+///
+/// Returns `Ok(fut)` with the constructed future, or `Err(message)` with the
+/// extracted panic message (via [`panic_message`]) on a construction-phase panic.
+///
+/// `AssertUnwindSafe` is sound: on a construction panic the future is never
+/// produced and any context the closure borrowed is dropped without further use.
+pub(crate) fn catch_construct<F, Fut>(construct: F) -> Result<Fut, String>
+where
+    F: FnOnce() -> Fut,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(construct)).map_err(panic_message)
+}
+
 #[cfg(feature = "db")]
 impl From<diesel::result::Error> for HarvestError {
     fn from(value: diesel::result::Error) -> Self {
@@ -534,6 +896,48 @@ impl From<diesel::result::Error> for HarvestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_message_extracts_str_literal_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted boom"));
+        assert_eq!(panic_message(payload), "formatted boom");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_unknown_payload_type() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(panic_message(payload), "unknown panic");
+    }
+
+    #[test]
+    fn panic_message_matches_a_real_caught_panic() {
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("real panic")))
+                .unwrap_err();
+        assert_eq!(panic_message(payload), "real panic");
+    }
+
+    #[test]
+    fn catch_construct_returns_the_constructed_value_when_no_panic() {
+        // Issue #782 / PR #1012 review: on the happy path the constructed value
+        // (a future, in practice) is passed through unchanged.
+        let out: Result<u32, String> = catch_construct(|| 7_u32);
+        assert_eq!(out, Ok(7));
+    }
+
+    #[test]
+    fn catch_construct_contains_a_construction_phase_panic() {
+        // A panic raised while constructing the value is caught and its message
+        // extracted, rather than unwinding the caller.
+        let out: Result<u32, String> = catch_construct(|| panic!("construct boom"));
+        assert_eq!(out, Err("construct boom".to_string()));
+    }
 
     #[test]
     fn activity_cancelled_variant_exists_and_displays_correctly() {
@@ -639,6 +1043,61 @@ mod tests {
         }
     }
 
+    // ── transient wake-event-ingest event-id conflict classifier (issue #779) ──
+
+    #[test]
+    fn is_event_id_unique_violation_matches_the_events_constraint() {
+        // The Display form of a Postgres unique-violation error carries the
+        // exact constraint name; `database_error` preserves it verbatim in the
+        // `HarvestError::Database` string. This is the real message shape the
+        // ingest sees when a concurrent append_single_event took its stale
+        // next_event_id first.
+        let err = database_error(
+            "duplicate key value violates unique constraint \
+             \"harvest_events_workflow_exec_id_event_id_key\"",
+        );
+        assert!(
+            err.is_event_id_unique_violation(),
+            "an event-id unique violation must be classified as transient; got: {err}"
+        );
+    }
+
+    #[test]
+    fn is_event_id_unique_violation_rejects_other_unique_constraints() {
+        // A unique violation on a DIFFERENT constraint (e.g. the executions
+        // uniqueness index) must NOT be swept into the transient-conflict
+        // requeue path — it still fails as before.
+        let err = database_error(
+            "duplicate key value violates unique constraint \
+             \"uq_harvest_workflow_executions_active_name_id\"",
+        );
+        assert!(
+            !err.is_event_id_unique_violation(),
+            "a unique violation on an unrelated constraint must not be classified transient"
+        );
+    }
+
+    #[test]
+    fn is_event_id_unique_violation_rejects_genuine_database_errors() {
+        // A genuine, unrelated database error must fail as today.
+        let err = database_error("connection refused");
+        assert!(!err.is_event_id_unique_violation());
+        let err2 = database_error("deadlock detected");
+        assert!(!err2.is_event_id_unique_violation());
+    }
+
+    #[test]
+    fn is_event_id_unique_violation_rejects_non_database_variants() {
+        // A non-Database HarvestError never matches — the classifier must not
+        // over-broaden across variants.
+        assert!(!HarvestError::NotFound("x".into()).is_event_id_unique_violation());
+        assert!(!HarvestError::Config("x".into()).is_event_id_unique_violation());
+        assert!(
+            !HarvestError::workflow_failed_untyped("wf", "boom").is_event_id_unique_violation()
+        );
+        assert!(!HarvestError::non_deterministic_simple("drift").is_event_id_unique_violation());
+    }
+
     #[test]
     fn harvest_error_activity_failed_display() {
         let e = HarvestError::ActivityFailed {
@@ -671,10 +1130,28 @@ mod tests {
     }
 
     #[test]
+    fn activity_failed_decodes_typed_operator_force_failed_payload() {
+        // Issue #765 AC: the workflow can read a distinct failure cause to
+        // tell an operator-forced failure apart from a genuine activity error.
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let payload = ActivityFailure::operator_force_failed(Some("wedged on dead downstream"))
+            .into_error_payload();
+        let e = HarvestError::activity_failed("charge_card", 1, &payload);
+        assert_eq!(e.activity_error_type(), Some("OperatorForceFailed"));
+        assert!(e.is_operator_force_failed());
+        assert!(!e.is_circuit_open());
+        let details = e
+            .activity_details()
+            .expect("OperatorForceFailed carries details");
+        assert_eq!(details["reason"], "wedged on dead downstream");
+    }
+
+    #[test]
     fn activity_failed_legacy_string_is_error_type_error() {
         let e = HarvestError::activity_failed("send_email", 2, "connection refused");
         assert_eq!(e.activity_error_type(), Some("Error"));
         assert!(!e.is_circuit_open());
+        assert!(!e.is_operator_force_failed());
         assert!(e.activity_details().is_none());
         // The human message is preserved as the source.
         assert!(e.to_string().contains("connection refused"));
@@ -682,13 +1159,86 @@ mod tests {
 
     #[test]
     fn harvest_error_workflow_failed_display() {
-        let e = HarvestError::WorkflowFailed {
-            name: "test_workflow".into(),
-            reason: "logic error".into(),
-        };
+        let e = HarvestError::workflow_failed_untyped("test_workflow", "logic error");
         let msg = e.to_string();
         assert!(msg.contains("test_workflow"));
         assert!(msg.contains("logic error"));
+    }
+
+    // ── typed workflow failures (issue #767) ──────────────────────────────
+
+    #[test]
+    fn workflow_error_type_returns_type_for_typed_failure() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload =
+            WorkflowFailure::new("ValidationRejected", "bad").into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("wf", &payload);
+        assert_eq!(e.workflow_error_type(), Some("ValidationRejected"));
+        assert!(e.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn workflow_error_type_none_for_untyped() {
+        let e = HarvestError::workflow_failed("wf", "plain");
+        assert!(e.workflow_error_type().is_none());
+        assert!(e.workflow_details().is_none());
+        assert!(!e.is_workflow_non_retryable());
+        assert!(e.to_string().contains("plain"));
+    }
+
+    #[test]
+    fn workflow_details_returns_details() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload = WorkflowFailure::new("X", "y")
+            .with_details(serde_json::json!({"code": 42}))
+            .into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("wf", &payload);
+        let details = e.workflow_details().expect("typed failure carries details");
+        assert_eq!(details["code"], 42);
+    }
+
+    #[test]
+    fn is_workflow_non_retryable_true_for_non_retryable_envelope() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload = WorkflowFailure::new("Permanent", "no")
+            .non_retryable()
+            .into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("wf", &payload);
+        assert!(e.is_workflow_non_retryable());
+    }
+
+    #[test]
+    fn workflow_failed_decodes_envelope() {
+        use crate::failure::{IntoWorkflowErrorString, WorkflowFailure};
+        let payload = WorkflowFailure::new("BudgetExceeded", "over cap")
+            .with_details(serde_json::json!({"limit": 100}))
+            .non_retryable()
+            .into_workflow_error_payload();
+        let e = HarvestError::workflow_failed("billing", &payload);
+        match &e {
+            HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(name, "billing");
+                assert_eq!(reason, "over cap");
+                assert_eq!(error_type.as_deref(), Some("BudgetExceeded"));
+                assert_eq!(*details, Some(serde_json::json!({"limit": 100})));
+                assert_eq!(*non_retryable, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn workflow_error_type_none_for_other_variants() {
+        let e = HarvestError::Cancelled("stop".into());
+        assert!(e.workflow_error_type().is_none());
+        assert!(e.workflow_details().is_none());
+        assert!(!e.is_workflow_non_retryable());
     }
 
     #[test]
@@ -820,5 +1370,54 @@ mod tests {
         };
         assert!(e.to_string().contains("target_unknown"));
         assert!(e.to_string().contains("notify"));
+    }
+
+    #[test]
+    fn harvest_error_session_acquire_timeout_display() {
+        use crate::types::SessionId;
+        let session_id = SessionId::new();
+        let e = HarvestError::SessionAcquireTimeout {
+            session_id,
+            queue: "gpu-workers".into(),
+            timeout_ms: 30_000,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("gpu-workers"));
+        assert!(msg.contains("30000") || msg.contains("30 s") || msg.contains("30000ms"));
+        assert!(msg.contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn harvest_error_session_broken_display() {
+        use crate::types::SessionId;
+        let session_id = SessionId::new();
+        let e = HarvestError::SessionBroken {
+            session_id,
+            reason: "host worker lost heartbeat".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("host worker lost heartbeat"));
+        assert!(msg.contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn session_acquire_timeout_is_distinct_from_session_broken() {
+        use crate::types::SessionId;
+        let session_id = SessionId::new();
+        let timeout = HarvestError::SessionAcquireTimeout {
+            session_id,
+            queue: "default".into(),
+            timeout_ms: 1000,
+        };
+        let broken = HarvestError::SessionBroken {
+            session_id,
+            reason: "reason".into(),
+        };
+        assert_ne!(timeout.to_string(), broken.to_string());
+        assert!(!matches!(
+            broken,
+            HarvestError::SessionAcquireTimeout { .. }
+        ));
+        assert!(!matches!(timeout, HarvestError::SessionBroken { .. }));
     }
 }

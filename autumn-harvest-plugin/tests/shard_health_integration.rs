@@ -156,12 +156,18 @@ fn build_three_shard_pool(shard0_url: &str, shard1_url: &str, shard2_url: &str) 
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
+        batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -170,6 +176,7 @@ fn workflow_info() -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -191,6 +198,7 @@ fn activity_info(queue: Option<&'static str>) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -222,6 +230,7 @@ fn runtime_for(
 
 fn api_state(pool: HarvestDbPool, runtime: HarvestApiRuntime) -> HarvestApiState {
     let state = HarvestApiState::new();
+    state.set_admin_auth_boundary(true);
     state.install_storage_pool(pool);
     state.install(runtime);
     state.set_worker_stale_threshold(Duration::from_secs(10));
@@ -245,6 +254,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[&str],
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .expect("worker registration should succeed");

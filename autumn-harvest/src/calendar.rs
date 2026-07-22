@@ -414,32 +414,30 @@ pub async fn replace_calendar_exclusions(
         })
         .collect();
 
-    conn.transaction(|tx| {
-        Box::pin(async move {
-            diesel::delete(
-                harvest_calendar_exclusions::table
-                    .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
-            )
-            .execute(tx)
-            .await
-            .map_err(crate::error::database_error)?;
+    Box::pin(conn.transaction(async |tx| {
+        diesel::delete(
+            harvest_calendar_exclusions::table
+                .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name)),
+        )
+        .execute(tx)
+        .await
+        .map_err(crate::error::database_error)?;
 
-            if !rows.is_empty() {
-                diesel::insert_into(harvest_calendar_exclusions::table)
-                    .values(&rows)
-                    .on_conflict((
-                        harvest_calendar_exclusions::calendar_name,
-                        harvest_calendar_exclusions::excluded_date,
-                    ))
-                    .do_nothing()
-                    .execute(tx)
-                    .await
-                    .map_err(crate::error::database_error)?;
-            }
+        if !rows.is_empty() {
+            diesel::insert_into(harvest_calendar_exclusions::table)
+                .values(&rows)
+                .on_conflict((
+                    harvest_calendar_exclusions::calendar_name,
+                    harvest_calendar_exclusions::excluded_date,
+                ))
+                .do_nothing()
+                .execute(tx)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
 
-            Ok(())
-        })
-    })
+        Ok(())
+    }))
     .await
 }
 
@@ -643,6 +641,36 @@ mod tests {
                 false
             ),
             Some(date("2026-08-05"))
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_next_exceeds_365_days_returns_none() {
+        let start_date = date("2026-01-01");
+        let mut exc = Vec::new();
+        // Exclude start_date and the next 365 days
+        for i in 0..=365 {
+            exc.push(start_date + chrono::Duration::days(i));
+        }
+
+        assert_eq!(
+            apply_skip_policy(start_date, SkipPolicy::RunNextBusinessDay, &exc, false),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_prev_exceeds_365_days_returns_none() {
+        let start_date = date("2026-12-31");
+        let mut exc = Vec::new();
+        // Exclude start_date and the previous 365 days
+        for i in 0..=365 {
+            exc.push(start_date - chrono::Duration::days(i));
+        }
+
+        assert_eq!(
+            apply_skip_policy(start_date, SkipPolicy::RunPrevBusinessDay, &exc, false),
+            None
         );
     }
 

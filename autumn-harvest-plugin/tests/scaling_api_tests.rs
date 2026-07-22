@@ -106,12 +106,18 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
+        batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -120,6 +126,7 @@ fn workflow_info() -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -161,6 +168,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[&str],
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .expect("worker registration should succeed");

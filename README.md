@@ -2,11 +2,11 @@
 
 [![Crates.io](https://img.shields.io/crates/v/autumn-harvest.svg)](https://crates.io/crates/autumn-harvest)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![CI](https://github.com/madmax983/autumn-harvest/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn-harvest/actions/workflows/ci.yml)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/madmax983/autumn-harvest)
+[![CI](https://github.com/autumn-foundation/autumn-harvest/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn-harvest/actions/workflows/ci.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn-harvest)
 
 Postgres-backed durable workflow engine for Rust, designed as a companion to the
-[Autumn](https://github.com/madmax983/autumn) web framework. Provides
+[Autumn](https://github.com/autumn-foundation/autumn) web framework. Provides
 event-sourced workflow execution with activities, signals, timers, child
 workflows, and DAG scheduling — Temporal-style durability semantics with a
 single-Postgres operational footprint.
@@ -19,6 +19,10 @@ with durable history, signal-driven waits, queryable state, and scheduled DAGs.
 If you've reached for Temporal, Cadence, or Inngest from a Rust service, this is
 the same shape with one fewer service to operate.
 
+Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
+honest, evidence-linked [comparison page](docs/comparison.md) — it names
+harvest's own gaps, not just its strengths.
+
 ## Quick example
 
 Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examples/quickstart/)).
@@ -26,6 +30,9 @@ Try it end-to-end: `cargo run -p quickstart` (see [`examples/quickstart/`](examp
 For a chapter-by-chapter walkthrough — first workflow, durable timers, signals,
 child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
+
+Upgrading an existing deployment? See the
+[0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md).
 
 Need a real reference instead of the tiny hello-world path? See:
 
@@ -905,7 +912,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.4.0 wraps the Phase 4 surface plus additive management API contract
+Version 0.5.0 wraps the Phase 4 surface plus additive management API contract
 coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
 workflow result waiting, dead-letter list/replay/aggregation endpoints,

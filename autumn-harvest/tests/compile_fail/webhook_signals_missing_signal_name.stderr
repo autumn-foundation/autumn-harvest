@@ -1,0 +1,5 @@
+error: #[webhook] `signals = "workflow_name"` requires `signal_name = "..."`
+ --> tests/compile_fail/webhook_signals_missing_signal_name.rs:5:1
+  |
+5 | fn map_payment(_ctx: &WebhookCtx, evt: serde_json::Value) -> Result<WorkflowId, String> {
+  | ^^

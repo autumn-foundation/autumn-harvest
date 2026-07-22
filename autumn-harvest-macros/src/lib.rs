@@ -7,12 +7,14 @@
 use proc_macro::TokenStream;
 
 mod activity;
+mod attr_util;
 mod collect;
 mod dag;
 pub(crate) mod determinism_lint;
 mod query;
 mod signal;
 mod update;
+mod webhook;
 mod workflow;
 
 /// Parse a human-readable byte-size string into a `u64` byte count (issue #252).
@@ -147,9 +149,58 @@ pub fn update(attr: TokenStream, item: TokenStream) -> TokenStream {
     update::update_macro(attr.into(), item.into()).into()
 }
 
+/// Marks a synchronous function as an inbound webhook trigger mapping
+/// function (issue #344).
+///
+/// Signature verification, timestamp tolerance, replay protection, and secret
+/// rotation are handled entirely by autumn-web 0.5's
+/// `[security.webhooks.endpoints]` / `SignedWebhook` extractor, upstream of
+/// this macro -- `#[webhook]` only maps an already-verified delivery to a
+/// deterministic workflow trigger.
+///
+/// Generates a companion function
+/// `__autumn_webhook_info_{fn_name}() -> WebhookTriggerInfo` and a public
+/// alias `{fn_name}_info()`, for use with `webhooks![…]` and
+/// `HarvestPlugin::webhooks(…)`.
+///
+/// # Attributes
+///
+/// - `path = "/hooks/..."` (**required**) — the exact HTTP path this webhook
+///   binds to.
+/// - Exactly one of `starts = "workflow_name"` or `signals = "workflow_name"`
+///   (the latter requires `signal_name = "..."`).
+/// - `queue = "..."` (optional) — task-queue override.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_harvest::prelude::*;
+///
+/// #[derive(serde::Deserialize)]
+/// struct StripeEvent { id: String }
+///
+/// #[webhook(path = "/hooks/stripe", starts = "subscription_flow")]
+/// fn map_stripe(_ctx: &WebhookCtx, evt: StripeEvent) -> Result<WorkflowId, String> {
+///     Ok(WorkflowId::new(format!("stripe-{}", evt.id)))
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn webhook(attr: TokenStream, item: TokenStream) -> TokenStream {
+    webhook::webhook_macro(attr.into(), item.into()).into()
+}
+
 /// Marks a function as a Harvest workflow signal handler.
 ///
-/// Generates a typed signal sender method `signal_[signal_name]` on the sibling `[WorkflowName]Stub` struct.
+/// Generates a typed signal sender method `signal_[signal_name]` on the sibling
+/// `[WorkflowName]Stub` struct, plus a companion function
+/// `__autumn_signal_handler_info_{fn_name}() -> SignalHandlerInfo` and a public
+/// alias `{fn_name}_info()` for interface discovery (issue #610).
+///
+/// # Attributes
+///
+/// - `workflow = "name"` (**required**) — the workflow this signal belongs to.
+/// - `description = "…"` (optional) — human-readable description surfaced by the
+///   management API.
 #[proc_macro_attribute]
 pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     signal::signal_macro(attr.into(), item.into()).into()
@@ -199,6 +250,34 @@ pub fn queries(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn updates(input: TokenStream) -> TokenStream {
     collect::updates_macro(input.into()).into()
+}
+
+/// Collects multiple signal handler functions into a `Vec<SignalHandlerInfo>`
+/// (issue #610).
+///
+/// Each name must have been annotated with `#[signal(workflow = "…")]`.
+///
+/// # Example
+///
+/// ```ignore
+/// let ss: Vec<SignalHandlerInfo> = signals![cancel, pause];
+/// ```
+#[proc_macro]
+pub fn signals(input: TokenStream) -> TokenStream {
+    collect::signals_macro(input.into()).into()
+}
+
+/// Collects multiple `#[webhook]` mapping functions into a
+/// `Vec<WebhookTriggerInfo>` (issue #344).
+///
+/// # Example
+///
+/// ```ignore
+/// let hooks: Vec<WebhookTriggerInfo> = webhooks![map_stripe, map_github];
+/// ```
+#[proc_macro]
+pub fn webhooks(input: TokenStream) -> TokenStream {
+    collect::webhooks_macro(input.into()).into()
 }
 
 pub(crate) struct WorkflowPath {

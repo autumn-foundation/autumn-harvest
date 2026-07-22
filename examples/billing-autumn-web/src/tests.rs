@@ -110,8 +110,8 @@ async fn billing_checkout_happy_path_uses_saga_child_signal_version_and_timer() 
     )));
     assert!(result.history.iter().any(|event| matches!(
         event,
-        WorkflowEvent::MarkerRecorded { name, .. }
-            if name == "side_effect:subscription-id"
+        WorkflowEvent::SideEffectRecorded { name: Some(name), .. }
+            if name == "subscription-id"
     )));
     assert!(result.history.iter().any(|event| matches!(
         event,

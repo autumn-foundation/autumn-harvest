@@ -5,19 +5,23 @@ members = [
     "autumn-harvest-macros",
     "autumn-harvest-cli",
     "autumn-harvest-redis",
+    "autumn-harvest-sqlite",
     "examples/billing-autumn-web",
     "examples/quickstart",
     "examples/saga-choreography",
     "examples/standalone-runner",
 ]
+# The cargo-fuzz harness is nightly + libFuzzer-only and must never be built by
+# the root workspace resolver. It also declares its own `[workspace]` root.
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
-version = "0.4.0"
+version = "0.5.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/madmax983/autumn-harvest"
+repository = "https://github.com/autumn-foundation/autumn-harvest"
 
 [workspace.dependencies]
 # Core
@@ -35,7 +39,7 @@ rand = "0.8"
 
 # Database
 diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "64-column-tables"] }
-diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
+diesel-async = { version = "0.9", features = ["deadpool", "postgres"] }
 diesel_migrations = "2"
 deadpool = "0.13"
 
@@ -47,20 +51,32 @@ proc-macro2 = "1"
 # Redis
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "streams", "script"] }
 
+# SQLite (embedded, single-writer edge backend — bundled builds SQLite from
+# source so no system libsqlite3 and no Docker are required for tests).
+rusqlite = { version = "0.39", features = ["bundled"] }
+
 # Dev / test
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
+proptest = "1.11.0"
+
+[workspace.lints.rust]
+# `loom` is a custom cfg set only by `RUSTFLAGS="--cfg loom"` for the loom
+# model-checking target (autumn-harvest/tests/loom_models.rs). Registering it
+# here stops `unexpected_cfgs` from firing on the `#[cfg(loom)]` shim in
+# `autumn-harvest/src/loom_sync.rs` under normal (`-D warnings`) builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
 [profile.dev.package.bollard-stubs]
-opt-level = 2
+opt-level = 0
 debug = false
 
 [profile.dev.package.bollard]
-opt-level = 2
+opt-level = 0
 debug = false
 
 

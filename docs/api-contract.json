@@ -1,6 +1,6 @@
 {
-  "version": "0.4.0",
-  "contract_version": "1",
+  "version": "0.5.0",
+  "contract_version": "2",
   "description": "Versioned machine-readable contract for the Harvest management API. Update this file and CHANGELOG.md whenever a route is added, removed, renamed, or its request/response shape changes.",
   "compatibility": {
     "additive_response_fields_allowed": true,
@@ -21,7 +21,8 @@
       "Adding a new optional request body field",
       "Adding a new read-only route",
       "Narrowing an existing error response to be more specific"
-    ]
+    ],
+    "conditional_shape_note": "Issue #756 partial-availability carve-out to \"Changing the type of a response field\": the cross-shard list read endpoints GET /workflows (non-paginated), GET /workers, GET /admin/schedules, GET /dead-letters, and GET /dags return a CONDITIONAL 200 shape — a bare JSON array when every expected shard is reachable (status == complete), or a degraded object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } when a shard is unavailable. This is NOT a breaking change to any currently-successful response: the all-reachable array is byte-for-byte identical to the pre-#756 shape, and the object form only replaces what was previously a whole-request 500 (a failed, non-successful response), so no client that received a successful response before can observe a changed type. The paginated GET /workflows object shape and the aggregate/health object endpoints (GET /dead-letters/aggregate, GET /workers/health) instead gain status/unavailable_shards as always-present ADDITIVE fields (a non-breaking change)."
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
@@ -31,7 +32,7 @@
       "path": "/workflows",
       "category": "workflow",
       "read_only": true,
-      "description": "List workflow executions with optional filters.",
+      "description": "List workflow executions with optional filters. Supports keyset cursor pagination (issue #498).",
       "params": [
         {
           "name": "state",
@@ -50,36 +51,245 @@
           "in": "query",
           "required": false,
           "repeated": true,
-          "description": "Search attribute filter in key:value form. May be repeated."
+          "description": "Search attribute filter in key:value form (exact-match string equality). May be repeated."
+        },
+        {
+          "name": "search_attr_filter",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Typed comparison/set predicate over search attributes in key:op:value form, op in {eq, ne, gt, gte, lt, lte, in, exists} (issue #506). Repeatable; ANDed. Numeric values compare numerically, booleans as booleans, else strings. Comparison ops require a numeric value. Malformed predicates and nested .-paths return 400. Backed by the existing idx_harvest_we_search GIN index (no migration)."
         },
         {
           "name": "limit",
           "in": "query",
           "required": false,
-          "description": "Maximum number of results to return."
+          "description": "Maximum number of results to return (legacy; use page_size for paginated access)."
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "required": false,
+          "description": "Number of results per page (1\u2013200). Activates the paginated response envelope {workflows, next_cursor}."
         },
         {
           "name": "cursor",
           "in": "query",
           "required": false,
-          "description": "Opaque pagination cursor from a previous response."
+          "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Sort direction: 'asc' (oldest first) or 'desc' (newest first, default). Activates the paginated response envelope."
+        },
+        {
+          "name": "started_after",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is after this RFC 3339 timestamp (e.g. 2026-01-01T00:00:00Z)."
+        },
+        {
+          "name": "started_before",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is before this RFC 3339 timestamp."
+        },
+        {
+          "name": "exec_id_prefix",
+          "in": "query",
+          "required": false,
+          "description": "Case-insensitive prefix match on the execution UUID string."
         },
         {
           "name": "sla_breached",
           "in": "query",
           "required": false,
           "description": "When 'true', return only executions whose soft SLA has been breached (issue #487)."
+        },
+        {
+          "name": "nd_blocked",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', return only RUNNING executions currently blocked on replay non-determinism (issue #603). Each row carries nd_blocked_at / nd_block_reason / nd_block_count plus the structured divergence diagnostic (failure_cause, expected, actual, event_index, workflow_type, build_id) in search_attrs."
+        },
+        {
+          "name": "legal_hold",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', return only executions currently under an active legal hold (issue #747): legal_hold_set_at IS NOT NULL AND (legal_hold_until IS NULL OR legal_hold_until > now)."
+        },
+        {
+          "name": "start_source",
+          "in": "query",
+          "required": false,
+          "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
         }
       ],
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": true,
+        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged."
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid filter value."
+          "description": "Invalid filter value, bad RFC 3339 timestamp, or unknown order direction."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/count",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Grouped execution-count fleet snapshot (issue #544): counts harvest_workflow_executions rows grouped by state and/or workflow_name across all shards, computed with a per-shard SQL GROUP BY and summed in-process. Eventually-consistent point-in-time snapshot; no replay or ordering guarantee under concurrent writes. An unreachable shard is named in unavailable_shards rather than failing the call wholesale.",
+      "params": [
+        {
+          "name": "group_by",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated grouping dimensions: state, workflow_name, or state,workflow_name. Defaults to state."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by registered workflow name (applied before grouping)."
+        },
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Comma-separated or repeated execution states (e.g. RUNNING,FAILED) to include (applied before grouping)."
+        },
+        {
+          "name": "started_after",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is on or after this RFC 3339 timestamp."
+        },
+        {
+          "name": "started_before",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is on or before this RFC 3339 timestamp."
+        },
+        {
+          "name": "limit_groups",
+          "in": "query",
+          "required": false,
+          "description": "Cap on returned (state, workflow_name) groups (default 50, max 500); long tail rolls into a single group with other:true."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "groups",
+          "total",
+          "truncated",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid parameter value (unknown group_by dimension, unknown state, malformed timestamp, or out-of-range limit_groups)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/summaries",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List tiered/summary-retention execution summaries (issue #752): compact, queryable rows the retention janitor demotes a hard-deleted terminal execution into instead of losing it entirely. Admin-guarded (summaries may carry retained/redacted payloads). Cross-shard fan-out with the same keyset-cursor pagination contract as GET /workflows (issue #498), ordered by (completed_at DESC, execution_id DESC). Each item carries summarized:true and history_available:false so it is unambiguously distinguishable from a live execution. An unreachable shard fails the call (matching GET /workflows).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by registered workflow name (exact match)."
+        },
+        {
+          "name": "workflow_id",
+          "in": "query",
+          "required": false,
+          "description": "Filter by workflow ID (exact match)."
+        },
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Comma-separated or repeated terminal states (e.g. COMPLETED,FAILED)."
+        },
+        {
+          "name": "completed_after",
+          "in": "query",
+          "required": false,
+          "description": "Filter to summaries whose completed_at is on or after this RFC 3339 timestamp."
+        },
+        {
+          "name": "completed_before",
+          "in": "query",
+          "required": false,
+          "description": "Filter to summaries whose completed_at is on or before this RFC 3339 timestamp."
+        },
+        {
+          "name": "search_attr",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Search-attribute containment filter in key:value form (JSONB @> exact-match). May be repeated; ANDed."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results to return (default 50, max 500). page_size is accepted as an alias."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Sort direction: 'desc' (default, newest-first) or 'asc'. Any other value returns 400. Threaded through both the ordering and the keyset cursor comparison, matching GET /workflows (issue #498)."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "description": "JSON object {\"summaries\": [...], \"next_cursor\": <string|null>}. Each summary carries execution_id, workflow_name, workflow_id, state, started_at, completed_at, duration_ms, shard_id, search_attrs, result, error, summarized_at, plus summarized:true and history_available:false."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid parameter value (unknown state, malformed timestamp, malformed search_attr, malformed cursor, or non-numeric limit)."
+        },
+        {
+          "status": 401,
+          "description": "Admin authorization required."
         },
         {
           "status": 500,
@@ -110,7 +320,10 @@
           "history",
           "external_handoffs",
           "last_completion_result",
-          "last_error"
+          "last_error",
+          "scheduled_time",
+          "history_truncated",
+          "history_endpoint"
         ]
       },
       "error_responses": [
@@ -123,6 +336,64 @@
           "description": "Database error."
         }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/history",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Paginated, filterable event history for a single workflow execution (issue #529). Cursor is the harvest_events.id (BIGSERIAL); absent next_cursor means last page.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum events per page (1\u20131000, default 100)."
+        },
+        {
+          "name": "after",
+          "in": "query",
+          "required": false,
+          "description": "Exclusive cursor anchor (harvest_events.id). Opaque \u2014 treat as a string; absent means start from the first event."
+        },
+        {
+          "name": "event_type",
+          "in": "query",
+          "required": false,
+          "description": "Repeatable. Filter to matching event type discriminators (e.g. TimerStarted, ActivityCompleted). Unknown names yield an empty page."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "events",
+          "next_cursor",
+          "total_events",
+          "last_event_id"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed cursor or non-integer limit."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
     },
     {
       "method": "GET",
@@ -141,13 +412,13 @@
           "name": "wait",
           "in": "query",
           "required": false,
-          "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s and is capped by the server, default 30s."
+          "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s. Values above the server ceiling (default 30s, configurable via set_workflow_result_max_wait) are silently clamped \u2014 not rejected with 400."
         }
       ],
       "request_body": null,
       "success_response": {
         "status": 200,
-        "note": "Returns 204 No Content with Retry-After when the execution is still running after the wait window.",
+        "note": "Returns 204 No Content with Retry-After: 1 when the execution is still running after the wait window. A CONTINUED_AS_NEW predecessor transparently resolves to the final successor's output rather than returning the sentinel state.",
         "fields": [
           "state",
           "output",
@@ -310,8 +581,10 @@
           "pending_signals",
           "buffered_signals",
           "pending_child_workflows",
+          "checkpoints_truncated_for_budget",
           "last_event_id"
-        ]
+        ],
+        "notes": "Each entry in pending_activities and pending_local_activities carries an optional nested last_failure object (issue #773) \u2014 {error_type, error, attempt, non_retryable, failed_at?, details?} \u2014 omitted entirely when the activity has never failed, so healthy-run responses stay byte-identical to pre-#773 builds. It answers \"why is this activity retrying?\" alongside the next_retry_at countdown without a second round-trip. Availability of the fields differs by activity kind because retryable failures are not event-sourced (an AC2-vs-AC5 reconciliation; #773 adds no migration): for a backing-off REGULAR (task-queue) activity \u2014 the primary case \u2014 last_failure is sourced from the harvest_task_queue.error column that queue::requeue_for_retry sets on each retryable failure (no ActivityFailed event is appended), so error and attempt are present, error_type defaults to \"Error\", non_retryable is false, and failed_at/details are omitted (the task row has no failure timestamp or structured detail); for LOCAL activities (and any event-sourced failure) last_failure is sourced from the most recent LocalActivityFailed event and includes failed_at (the event timestamp), with error_type \"Error\", non_retryable false, and no details. When read-path payload decoding (issue #608) is active for the request, last_failure.error is tolerantly decoded like every other payload field."
       },
       "error_responses": [
         {
@@ -323,6 +596,181 @@
           "description": "Database error."
         }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/timeline",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Reconstruct a single execution's timeline (per-step durations, busy-vs-wait split, slowest step) purely from recorded history; no new events are appended and no state is recomputed. Surfaces only durations, names, ids, and outcomes \u2014 never any input/output/payload/error/value field \u2014 so read-path payload decoding (issue #608) is a no-op and is skipped. Classic DAG runs are not on the execution path and return 404; unified DAG runs lower onto the standard execution path and return 200 like any workflow execution. The wait_ms/exec_ms split is present ONLY for regular activity steps that recorded a claim/start timestamp; it is null for child_workflow, local_activity, external activities (issue #92 \u2014 these render as activity steps with no split), timer, signal_wait, side_effect, and for activities with no recorded start. total_ms is always present. Rollup attribution: a started activity's queue-wait split goes to rollup.wait_ms and its exec split to rollup.busy_ms; a regular activity (one reporting an attempt) with a null split never started (pending or a schedule-to-start timeout) so its whole total_ms is queue-wait and goes to rollup.wait_ms; external activities, child_workflow, local_activity, and side_effect totals go to rollup.busy_ms; timer and signal_wait totals go to rollup.wait_ms. For a retried activity, wait_ms spans all prior attempts' execution and backoff, not only queue wait \u2014 treat it as an upper bound on queue wait. Known limitation: the full event history is loaded with no LIMIT (bounded by workflow continue-as-new discipline, the \u2264500-event target), so a run with a very large history makes this read proportionally expensive.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "exec_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "steps",
+          "rollup"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/run-chain",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Reconstruct the ordered continue-as-new run chain that {id} belongs to, resolvable from ANY member (origin, a middle run, or the live/final tail). A workflow that calls continue_as_new forks forward into a fresh exec_id sharing its workflow_id and shard; over a long-lived self-continuing workflow this produces a chain of executions, and this endpoint returns all of them oldest-first as a flat list so one logical run's whole history is discoverable from a single member. The chain lives entirely on one shard (a successor inherits the predecessor's shard), so this is one shard-local gather, never a cross-shard fan-out. No new events are appended and no state is recomputed. Post-feature (issue #701) rows carry back-link columns (continued_from_exec_id, first_exec_id) so the chain resolves in one indexed query; legacy rows written before the feature carry no back-links and are gathered best-effort by forward-walking WorkflowContinuedAsNew events (bounded), with head_unknown=true when the true origin cannot be proven from the available rows. head_unknown=false for a fully post-feature chain and for a standalone never-continued run (runs has exactly one entry). Each run reports exec_id, run_id, sequence (zero-based chain ordinal), state, started_at, completed_at, outcome (collapsed terminal label), and continued_to_exec_id (the next ordered run's exec_id; null for the tail). continued_to_exec_id is derived purely from ordering so it stays correct for legacy chains that never stored a forward index. Documented graceful degradation: in a mixed chain (legacy prefix then post-feature suffix) resolved from a post-feature member, the boundary run is reported as the confirmed head and its truly-first legacy predecessors are unreachable.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID of any member of the chain."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "head_unknown",
+          "workflow_id",
+          "runs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/replay-diagnosis",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Replay ONE execution's recorded history against the currently-registered #[workflow] handler on this node and return a structured determinism verdict (issue #614). POST is used instead of GET because it drives a replay of the workflow function; this route never writes workflow events and performs no writes (read-only, admin-gated). The DB connection is dropped before user code is driven, and the replay is pure in-memory replay. Answers 'will — or did — this run diverge under the code deployed right now?': useful for a PAUSED or non-determinism-blocked RUNNING run (the divergence object mirrors the #603 block diagnostic: kind/event_index/expected/actual), or a terminal FAILED run for retroactive forensics. The verdict is one of: clean (message 'no divergence under current code'), diverged (with a divergence object), workflow_failed (with a failure object), not_registered (the workflow type is not registered on this node), or not_replayable_dag (a classic DAG is not on the replay path). All five verdicts return 200 — the diagnosis, not the HTTP status, carries the answer. The replay runs in canary mode, so a healthy in-flight run parked mid-flight (a PAUSED/RUNNING frontier suspension) is correctly reported clean rather than a false diverged; a terminal run externally sealed mid-await (TIMED_OUT/cancelled/terminated) is likewise clean. The replay is bounded by WorkerConfig::query_timeout; the query_timeout bound applies to async-yielding replays, and a workflow that busy-loops synchronously without ever awaiting is out of scope, exactly as for the live executor.",
+      "idempotency": "Read-only (no events written, no state recomputed); safe to retry.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_name",
+          "state",
+          "diagnosis",
+          "events_replayed",
+          "divergence",
+          "failure",
+          "summary",
+          "message"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 408,
+          "description": "Replay exceeded the bounded budget (WorkerConfig::query_timeout)."
+        },
+        {
+          "status": 410,
+          "description": "History unavailable (terminal executions only): the recorded history is truncated before its terminal seal (pruned by retention or released on reset), or the payloads were PII-erased (issue #495). Both would yield a misleading verdict, so they are refused, mirroring the #612 terminal-query path."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/stream",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Server-Sent Events stream of the EPHEMERAL live-output progress chunks a running workflow publishes via ctx.publish_progress (issue #791). Chunks are ordered over Postgres LISTEN/NOTIFY with sub-second delivery. This is a best-effort side channel: chunks are never recorded in harvest_events, never replayed, and there is NO backfill on (re)connect — a subscriber that connects after a chunk was published will not see it (chunk content may be non-deterministic precisely because it is never stored). Each SSE message carries id (a monotonic, epoch-prefixed seq — a gap means a missed chunk) plus event:progress and data (the raw chunk JSON, NOT re-wrapped). A final event:end frame is emitted when the execution reaches a terminal state and the stream then closes; event:error is sent if the LISTEN connection drops. Keepalive :ping comments keep proxies from idling the connection; the terminal-close poll cadence is a modest default bounded by the configured SSE keepalive interval. AUTH: this route inherits the management API's configured auth middleware (HarvestPlugin::api_with_auth); it is deliberately NOT admin-gated (AC5 — end-users stream their own workflows). If no api_with_auth middleware is configured the route is open — embedders exposing streams to untrusted end-users should configure api_with_auth or front it with their own auth. The engine only checks that the execution exists (else 404) — exec_id is effectively a bearer capability for this run's live chunk CONTENT, so embedders exposing sensitive output MUST add per-execution authorization. Each subscriber holds one dedicated (non-pooled) Postgres LISTEN connection for the stream's lifetime; embedders should rate-limit and/or cap concurrent streams per user to avoid DB connection exhaustion (a global concurrent-stream cap is a possible future enhancement).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "note": "Content-Type: text/event-stream. Frames: event:progress (data = the published chunk JSON, id = monotonic seq), a terminal event:end, or event:error. If the execution is already terminal at connect, a single event:end frame is sent and the stream closes. SEQ CLIENT CONTRACT: id is a monotonic per-execution LOGICAL-POSITION identity (not a per-chunk counter). Subscribers should dedupe by seq (keep-first) for at-most-once-per-position display, and use forward seq JUMPS to detect gaps after reconnect. A re-driven workflow position re-emits the SAME seq (best-effort); a re-emitted chunk MAY carry different content for non-deterministic chunks — the first-delivered is canonical. seq is per exec_id; a continue-as-new successor is a new exec_id on a new stream whose seq restarts. Chunks may be DROPPED best-effort under back-pressure (slow client) — the monotonic seq lets the client detect the resulting gap.",
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 503,
+          "description": "Progress streaming is unavailable server-side (retriable): either the LISTEN/NOTIFY notification URL is not configured, or that notification database is unreachable (LISTEN connect failed)."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
     },
     {
       "method": "POST",
@@ -381,7 +829,12 @@
           {
             "name": "reuse_policy",
             "required": false,
-            "description": "Duplicate-id policy: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+            "description": "Duplicate-id policy for a TERMINAL prior run: allow_duplicate, reject_duplicate, allow_duplicate_failed_only, or terminate_if_running. Orthogonal to conflict_policy (issue #685), which governs an ACTIVE prior."
+          },
+          {
+            "name": "conflict_policy",
+            "required": false,
+            "description": "How to handle a collision with a currently-ACTIVE (RUNNING/PAUSED) prior run (issue #685). Orthogonal to reuse_policy (which governs terminal priors). One of: unspecified (default — each reuse policy's native active behavior, byte-for-byte identical to today), fail (409 AlreadyExists), use_existing (return the existing run, 200, no new WorkflowStarted), terminate_existing (cancel the active prior and start fresh, 201). Sending the field (even 'unspecified') surfaces a started_fresh boolean in the response (true = fresh run created, false = attached to the existing run); omitting it keeps the response byte-for-byte identical to today. terminate_existing requires admin authentication, because it can cancel a live prior; the other values (unspecified, fail, use_existing) do not — except that unspecified inherits the reuse policy's native behavior, so reuse_policy=terminate_if_running with an omitted/unspecified conflict_policy still requires admin. Not supported combined with a throttle/debounce/batch policy — the start is deferred and has no active prior to resolve at request time (400). An unknown value returns 400."
           },
           {
             "name": "start_at",
@@ -392,27 +845,70 @@
             "name": "delay",
             "required": false,
             "description": "Delay duration before starting the workflow (e.g. \"10s\", \"5m\")."
+          },
+          {
+            "name": "batch_key",
+            "required": false,
+            "description": "Optional event batching group key. Fold trigger starts into a single run inputting a JSON array of all payloads."
+          },
+          {
+            "name": "batch_max_size",
+            "required": false,
+            "description": "Maximum batch size to trigger immediate flush."
+          },
+          {
+            "name": "batch_max_wait",
+            "required": false,
+            "description": "Maximum wait duration from first trigger before flushing the batch (e.g. \"30s\", \"5m\")."
+          },
+          {
+            "name": "completion_callbacks",
+            "required": false,
+            "description": "Per-execution completion-callback targets (issue #605): a JSON array of {url, filter} objects. Each target's URL is validated against the operator-configured SSRF host allowlist before admission; a non-allowlisted target rejects the start with 422."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Request-scoped idempotency key (issue #808). Two starts carrying the same key within the retention window (default 24h) converge on exactly one execution: the first creates it, the second returns the same execution_id as a no-op (200, no second WorkflowStarted, no second task). Dedup scope is (workflow_name, idempotency_key), independent of workflow_id, and short-circuits the reuse_policy matrix. A committed keyed replay short-circuits to the 200 no-op before fresh-start-only validations (input-schema #373, completion-callback SSRF #605, delay/start_at) and before the admission gate #377, returning the original execution regardless of the retry's body; a genuinely fresh keyed start (no live claim) still runs every validation and the gate. The `Idempotency-Key` request header takes precedence over this body field; a present-but-empty key returns 400. Mutually exclusive with a throttle/debounce/batch policy (400 if combined). Shard routing: a keyed start with an OMITTED (auto-generated) workflow_id routes by the key so same-key retries co-locate and dedup; a keyed start with an EXPLICIT workflow_id routes by workflow_id (preserving the reuse_policy matrix and the shard-local (workflow_name, workflow_id) uniqueness invariant). For dedup to converge across a delivery's retries, be consistent about supplying vs. omitting workflow_id."
           }
         ]
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 when conflict_policy=use_existing attaches to an ACTIVE (RUNNING/PAUSED) prior (issue #685); returns 201 when conflict_policy=terminate_existing cancels the active prior and starts fresh. When the request sends a conflict_policy field (even 'unspecified'), the response includes started_fresh (true = created a new run, false = attached to the existing run); omitting conflict_policy omits started_fresh so the response is byte-for-byte identical to today. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
           "workflow_id",
-          "state"
+          "state",
+          "debounced",
+          "debounce_key",
+          "fire_at",
+          "pending_count",
+          "batched",
+          "flushed",
+          "batch_key",
+          "max_size",
+          "started_fresh",
+          "deduplicated"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, when input exceeds the workflow input cap, when idempotency_key is empty, when idempotency_key is combined with a throttle/debounce/batch policy (issue #808), when conflict_policy is an unknown value, or when a non-default conflict_policy is combined with a throttle/debounce/batch policy (issue #685)."
+        },
+        {
+          "status": 401,
+          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior — i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations — e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail — cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
         },
         {
           "status": 409,
-          "description": "Duplicate workflow_id with conflicting reuse policy."
+          "description": "Duplicate workflow_id with conflicting reuse policy, or conflict_policy=fail over an ACTIVE (RUNNING/PAUSED) prior (issue #685)."
+        },
+        {
+          "status": 503,
+          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts). A retry of an already-successful idempotency_key start (issue #808) bypasses the gate and returns the existing execution as a 200 no-op instead, since it is not fresh admission; a genuinely fresh keyed start is still gated."
         },
         {
           "status": 500,
@@ -611,13 +1107,27 @@
         "status": 201,
         "note": "Returns 200 when an existing live execution is attached rather than a fresh one started.",
         "fields": [
-          { "name": "execution_id" },
-          { "name": "workflow_name" },
-          { "name": "workflow_id" },
-          { "name": "state" },
-          { "name": "started_fresh" },
-          { "name": "update_id" },
-          { "name": "result" }
+          {
+            "name": "execution_id"
+          },
+          {
+            "name": "workflow_name"
+          },
+          {
+            "name": "workflow_id"
+          },
+          {
+            "name": "state"
+          },
+          {
+            "name": "started_fresh"
+          },
+          {
+            "name": "update_id"
+          },
+          {
+            "name": "result"
+          }
         ]
       },
       "error_responses": [
@@ -697,6 +1207,54 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{id}/terminate",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force-terminate a single workflow execution. The forceful sibling of cancel: seals a live run in the TERMINATED state unilaterally (no workflow-body cooperation required), fails outstanding task-queue rows, and runs the parent-close cascade. Result-awaiting callers observe a terminal failure carrying the supplied reason, distinguishable from a normal FAILED. Interrupting an already-executing hot workflow task is the domain of the workflow-task timeout (#494), not terminate.",
+      "idempotency": "Idempotent: terminating an already-terminal execution (COMPLETED/FAILED/CANCELLED/TIMED_OUT/TERMINATED/CONTINUED_AS_NEW) is a non-mutating no-op that appends no second terminal transition and returns newly_terminated=false.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable termination reason recorded on the execution and in the audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "newly_terminated",
+          "failed_task_count"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/pause",
       "category": "workflow",
       "read_only": false,
@@ -717,7 +1275,7 @@
           {
             "name": "reason",
             "required": false,
-            "description": "Human-readable pause reason (max 500 chars) recorded in audit log."
+            "description": "Human-readable pause reason (max 500 chars) recorded on the execution row (pause_reason) and the WorkflowExecutionPaused history event."
           }
         ]
       },
@@ -729,7 +1287,8 @@
           "state",
           "reason",
           "actor",
-          "newly_paused"
+          "newly_paused",
+          "paused_at"
         ]
       },
       "error_responses": [
@@ -756,8 +1315,8 @@
       "path": "/workflows/{id}/resume",
       "category": "workflow",
       "read_only": false,
-      "description": "Resume a paused workflow execution, re-arming command dispatch and waking the parked task.",
-      "idempotency": "Not idempotent: only an execution in the PAUSED state can be resumed (409 otherwise).",
+      "description": "Resume a paused workflow execution, re-arming command dispatch and waking the parked task. Resuming a non-paused (running or terminal) execution is a success no-op reporting newly_resumed=false.",
+      "idempotency": "Idempotent: resuming a non-paused execution is a 200 no-op (newly_resumed=false); nothing is mutated.",
       "params": [
         {
           "name": "id",
@@ -778,7 +1337,58 @@
           "execution_id",
           "state",
           "actor",
-          "pause_duration_secs"
+          "pause_duration_secs",
+          "newly_resumed"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/erase-payloads",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Tombstone all payload-bearing fields (input, output, payload, details, value, last_completion_result) in every event row, the execution row, and signal rows for a terminal workflow execution. Cascades to terminal child executions on the same shard. Requires the execution to be in a terminal state (COMPLETED, FAILED, CANCELLED, TIMED_OUT, CONTINUED_AS_NEW, or TERMINATED).",
+      "idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable erasure reason (e.g. GDPR Art. 17 request ID), recorded in audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "events_scrubbed",
+          "fields_tombstoned",
+          "execution_row_scrubbed",
+          "signals_scrubbed",
+          "children",
+          "skipped_children",
+          "failures"
         ]
       },
       "error_responses": [
@@ -788,7 +1398,343 @@
         },
         {
           "status": 409,
-          "description": "Execution is not in the PAUSED state."
+          "description": "Execution is not in a terminal state, or is under an active legal hold (issue #747) \u2014 erasure is rejected until the hold is released or expires."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/legal-hold",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Place (or refresh) a per-execution legal hold (issue #747). An active hold exempts the execution's event history from retention deletion (issue #737) and from PII erasure (issue #495) until the hold is released or auto-expires. Additive nullable columns only; shard-local (routed via the execution UUID). Admin-only, audited under legal_hold.set.",
+      "idempotency": "Idempotent: if an active hold already exists, its provenance is left unchanged and newly_held=false is returned (no write). A previously-set-but-expired hold is refreshed.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Operator-supplied justification for the hold (e.g. litigation hold case number), recorded in legal_hold_reason and the audit log. Truncated to 500 characters."
+          },
+          {
+            "name": "hold_until",
+            "required": false,
+            "description": "Optional RFC3339 auto-expiry. Omit for an indefinite hold released only by an explicit release call."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "held",
+          "legal_hold_reason",
+          "legal_hold_actor",
+          "legal_hold_set_at",
+          "legal_hold_until",
+          "newly_held",
+          "released"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id or hold_until (not RFC3339)."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/legal-hold/release",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Release a per-execution legal hold (issue #747): NULLs all four legal_hold_* columns so the execution becomes eligible for retention and PII erasure again. Admin-only, audited under legal_hold.release.",
+      "idempotency": "Idempotent: releasing an execution with no hold set returns released=false (200 no-op).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "held",
+          "legal_hold_reason",
+          "legal_hold_actor",
+          "legal_hold_set_at",
+          "legal_hold_until",
+          "newly_held",
+          "released"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force a backing-off activity to retry immediately by advancing its scheduled_at to NOW() and waking an idle worker via pg_notify. Only PENDING tasks (including those waiting out exponential backoff) can be advanced. Local activities run inline and have no task-queue row \u2014 this endpoint does not apply to them.",
+      "idempotency": "Idempotent: calling on an already-eligible task (scheduled_at <= now) returns advanced=false and performs no update. Calling twice after advancing also returns advanced=false on the second call.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "activity_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "activity_exec_id",
+          "queue",
+          "next_retry_at",
+          "advanced",
+          "already_eligible"
+        ],
+        "field_notes": {
+          "advanced": "true when scheduled_at was moved to immediate eligibility; false otherwise. Note: advanced=true means scheduled_at was updated, not that the task will be dispatched immediately \u2014 per-queue rate-limit buckets and concurrency caps in claim_task can still defer actual dispatch.",
+          "already_eligible": "Only meaningful when advanced=false. true=task was already claimable (idempotent no-op). false=a concurrent worker claimed the task between the SELECT and UPDATE (task is now RUNNING).",
+          "next_retry_at": "The backdated scheduled_at written to the task when advanced=true (immediately claimable). null when advanced=false."
+        }
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution or activity task not found, including task belonging to a different workflow, or activity_exec_id is not a valid UUID. Note: external-handoff activity IDs are a different id-space from task-queue PKs; passing one will return 404."
+        },
+        {
+          "status": 409,
+          "description": "Task is not in PENDING state (e.g. currently RUNNING or already terminal)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/activities/{activity_exec_id}/fail-now",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force-fail exactly one hung in-flight (RUNNING) activity task. Appends ActivityFailed with the distinct error_type 'OperatorForceFailed' through the existing recording path (no new event variant), marks the task row FAILED with the typed failure envelope, and wakes the parked workflow task so the owning workflow advances to its own failure/compensation path -- it is NOT terminated. Remaining retry attempts are skipped regardless of retry policy (the forced failure is non-retryable by construction), and a late result from the worker still running the activity is ignored (no double-apply). Only RUNNING activity tasks of a non-terminal execution are force-failable. Note: if the owning workflow has a workflow-level retry policy (issue #523) and propagates this error to workflow failure, the run is retried fresh and the activity re-dispatched -- use cancel/terminate instead if the goal is to stop the run. Local activities run inline and have no task-queue row -- this endpoint does not apply to them (404).",
+      "idempotency": "Idempotent: re-issuing the call on an already-forced task (FAILED with the OperatorForceFailed envelope) is a no-op success returning forced=false, already_forced=true, with zero writes and no second terminal event. Idempotency wins over the terminal-execution guard: a retry issued after the woken workflow has consumed the forced failure and sealed its own run (the expected aftermath of a successful force-fail) still returns the no-op success rather than the terminal 409.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "activity_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable reason recorded in the forced ActivityFailed event's message and details (e.g. an incident id). Truncated server-side to 500 characters."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "activity_exec_id",
+          "activity_name",
+          "queue",
+          "forced",
+          "already_forced",
+          "error_type"
+        ],
+        "field_notes": {
+          "forced": "true when this call performed the force-fail; false when a prior force-fail was detected (idempotent no-op).",
+          "already_forced": "true when the task was already force-failed by an earlier call -- zero writes were performed.",
+          "error_type": "Always 'OperatorForceFailed' -- the distinct failure cause workflow code can match on (HarvestError::is_operator_force_failed) to tell an operator intervention apart from a genuine activity error."
+        }
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed workflow execution id, or malformed JSON request body."
+        },
+        {
+          "status": 404,
+          "description": "Execution or activity task not found, including a task belonging to a different workflow, or activity_exec_id is not a valid UUID. Local activities have no task-queue row and return 404. Note: external-handoff activity IDs are a different id-space from task-queue PKs; passing one will return 404."
+        },
+        {
+          "status": 409,
+          "description": "Task is not force-failable: the owning execution is already terminal (COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED) and the task is not already-forced (an already-forced task returns the idempotent 202 no-op even on a sealed run), the task is not in RUNNING state (e.g. PENDING backing-off, COMPLETED, or FAILED with a genuine non-forced error), the id names a workflow task rather than an activity task, or history already carries a terminal event for the activity."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/completion-deliveries",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List completion-callback deliveries (issue #605) for an execution, ordered by callback_index, including PENDING/INFLIGHT/DELIVERED/FAILED rows. Read-only; no audit record, matching GET /dead-letters.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "delivery_id",
+          "callback_index",
+          "target_url",
+          "terminal_state",
+          "state",
+          "attempt",
+          "max_attempts",
+          "next_attempt_at",
+          "last_status",
+          "last_error",
+          "created_at",
+          "delivered_at"
+        ],
+        "field_notes": {
+          "state": "PENDING | INFLIGHT | DELIVERED | FAILED.",
+          "last_status": "The HTTP status code of the most recent delivery attempt, if any.",
+          "last_error": "The transport error or non-2xx summary of the most recent delivery attempt, if any.",
+          "delivered_at": "Set only once the delivery reaches DELIVERED."
+        },
+        "note": "Response is a JSON array of these row objects, not a single object."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Manually redrive a dead-lettered completion-callback delivery (issue #605) after the receiver endpoint is fixed. Admin-guarded. Self-contained: resets only the harvest_completion_deliveries row (same delivery_id, fresh retry budget starting at attempt 0) and clears its harvest_dead_letters entry; never touches harvest_workflow_executions or the DLQ task-reactivation path.",
+      "idempotency": "Idempotent-shaped: redriving a delivery that is not currently FAILED returns 200 with outcome=\"not_failed\" instead of erroring. A delivery already reset to PENDING will not be re-redriven by a repeat call.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "delivery_id",
+          "in": "path",
+          "required": true,
+          "description": "Completion-delivery row UUID, as returned by GET /workflows/{id}/completion-deliveries."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "delivery_id",
+          "outcome",
+          "current_state"
+        ],
+        "field_notes": {
+          "outcome": "\"redriven\" (202) or \"not_failed\" (200) \u2014 the not_failed case reuses this same field list on a 200 response.",
+          "current_state": "Only present when outcome=\"not_failed\"; the delivery's actual current state."
+        },
+        "note": "Status is 202 when outcome=\"redriven\" and 200 when outcome=\"not_failed\"; the field set is identical either way."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found, or delivery_id is unknown / not a valid UUID."
         },
         {
           "status": 500,
@@ -823,8 +1769,13 @@
         "fields": [
           {
             "name": "reset_to_event_id",
-            "required": true,
-            "description": "Event sequence number to reset to."
+            "required": false,
+            "description": "Event sequence number to reset to. Required when reset_point is absent; mutually exclusive with reset_point."
+          },
+          {
+            "name": "reset_point",
+            "required": false,
+            "description": "Logical reset anchor resolved per-execution at reset time. One of: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"}, {\"type\":\"last_workflow_task\"}. Required when reset_to_event_id is absent; mutually exclusive with reset_to_event_id."
           },
           {
             "name": "reason",
@@ -876,8 +1827,8 @@
       "path": "/workflows/{id}/signal/{signal_name}",
       "category": "workflow",
       "read_only": false,
-      "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON).",
-      "idempotency": "Not idempotent: each call delivers a distinct signal event to the workflow.",
+      "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON). Supply an exactly-once delivery key out-of-band via the Idempotency-Key header or the idempotency_key query param (issue #521).",
+      "idempotency": "Optional exactly-once delivery: when an Idempotency-Key header (or idempotency_key query param) is supplied, repeated deliveries with the same key for the same execution land exactly one SignalReceived event \u2014 the response reports signal_delivered=false for the deduped retries. Dedupe scope is shard-local, keyed on (execution_id, idempotency_key). Omitting the key reproduces the legacy at-least-once behavior (every call delivers a distinct signal event).",
       "params": [
         {
           "name": "id",
@@ -890,6 +1841,18 @@
           "in": "path",
           "required": true,
           "description": "Registered signal handler name."
+        },
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": false,
+          "description": "Exactly-once delivery key (issue #521). Wins over the idempotency_key query param when both are present. A present but empty or non-UTF-8 value is rejected with 400 rather than degraded to at-least-once."
+        },
+        {
+          "name": "idempotency_key",
+          "in": "query",
+          "required": false,
+          "description": "Exactly-once delivery key (issue #521). Lower precedence than the Idempotency-Key header."
         }
       ],
       "request_body": {
@@ -899,9 +1862,10 @@
         "fields": []
       },
       "success_response": {
-        "status": 200,
+        "status": 202,
         "fields": [
-          "ok"
+          "ok",
+          "signal_delivered"
         ]
       },
       "error_responses": [
@@ -1184,7 +2148,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": true,
+        "description": "On the happy path (all shards reachable) a bare JSON array of DAG summary objects (backward compatible). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard-derived DAGs as an object { \"dags\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. In-memory-registered DAGs are always present regardless of shard reachability."
       },
       "error_responses": [
         {
@@ -1226,6 +2191,72 @@
         {
           "status": 500,
           "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/dags/{dag_name}/runs/{run_exec_id}",
+      "category": "dag",
+      "read_only": true,
+      "description": "DAG run graph view (issue #690): the run's node topology annotated with per-node status/timing/attempts/error, reconstructed purely from the registered DagDefinition and recorded history. Admin-guarded, read-only. Unified DAGs only. No new event variant, no migration, no writes.",
+      "params": [
+        {
+          "name": "dag_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered (unified) DAG name."
+        },
+        {
+          "name": "run_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Execution id of the DAG run to inspect."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "run_exec_id",
+            "description": "The DAG run execution id."
+          },
+          {
+            "name": "dag_name",
+            "description": "The DAG name."
+          },
+          {
+            "name": "state",
+            "description": "The run's execution state (e.g. RUNNING, FAILED, COMPLETED)."
+          },
+          {
+            "name": "started_at",
+            "description": "When the run started."
+          },
+          {
+            "name": "finished_at",
+            "description": "When the run finished (omitted while still running)."
+          },
+          {
+            "name": "nodes",
+            "description": "Array of node entries: node_name, kind (activity | gate \u2014 a 'gate' is a signal/timer gate node, issue #746, that awaits a named signal instead of dispatching an activity), status (succeeded/failed/timed_out/cancelled/running/pending/skipped/waiting \u2014 'waiting' is a gate that has been reached but not yet resolved by its signal or deadline on a live run), depends_on (upstream node names), started_at, finished_at, attempts, and error_type + error (first line, truncated) when failed. Gate nodes report attempts 0 and no timing/error fields."
+          }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The named DAG is a classic (non-unified) DAG with no DagDefinition topology to annotate, or run_exec_id is not a parseable execution id (JSON body: 'invalid execution id'). The unknown-DAG and classic-DAG checks run before the id parse, so an unparseable id is reached only for a valid unified DAG name."
+        },
+        {
+          "status": 404,
+          "description": "Unknown DAG name, or run_exec_id is not a run of that DAG."
+        },
+        {
+          "status": 503,
+          "description": "Database error (transient / service unavailable)."
         }
       ]
     },
@@ -1281,14 +2312,38 @@
         "note": "Returns 200 (not 201) when dry_run is true: the plan is computed and returned without any write, and new_run_exec_id / events_carried_over are omitted.",
         "free_form": false,
         "fields": [
-          { "name": "dry_run", "description": "True for a dry-run preview." },
-          { "name": "dag_name", "description": "The DAG name." },
-          { "name": "source_run_exec_id", "description": "The source DAG run execution id." },
-          { "name": "reset_to_event_id", "description": "Resolved 0-based reset event id passed to the #148 reset." },
-          { "name": "nodes_to_re_execute", "description": "Nodes that will re-execute on the new run." },
-          { "name": "nodes_carried_over", "description": "Nodes whose recorded results are carried over." },
-          { "name": "new_run_exec_id", "description": "The forked DAG run execution id (omitted on dry run)." },
-          { "name": "events_carried_over", "description": "Number of carried-over events on the new run (omitted on dry run)." }
+          {
+            "name": "dry_run",
+            "description": "True for a dry-run preview."
+          },
+          {
+            "name": "dag_name",
+            "description": "The DAG name."
+          },
+          {
+            "name": "source_run_exec_id",
+            "description": "The source DAG run execution id."
+          },
+          {
+            "name": "reset_to_event_id",
+            "description": "Resolved 0-based reset event id passed to the #148 reset."
+          },
+          {
+            "name": "nodes_to_re_execute",
+            "description": "Nodes that will re-execute on the new run."
+          },
+          {
+            "name": "nodes_carried_over",
+            "description": "Nodes whose recorded results are carried over."
+          },
+          {
+            "name": "new_run_exec_id",
+            "description": "The forked DAG run execution id (omitted on dry run)."
+          },
+          {
+            "name": "events_carried_over",
+            "description": "Number of carried-over events on the new run (omitted on dry run)."
+          }
         ]
       },
       "error_responses": [
@@ -1415,7 +2470,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": true,
+        "description": "Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
       },
       "error_responses": [
         {
@@ -1429,13 +2485,13 @@
       "path": "/dead-letters/aggregate",
       "category": "dlq",
       "read_only": true,
-      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, and/or a derived failure_signature, returning per-group counts and representative sample IDs merged across shards.",
+      "description": "Root-cause aggregation for DLQ triage: group dead-letter entries by workflow_name, activity_name, queue_name, task_type, time_bucket, a derived failure_signature, a derived dlq_reason class, and/or a derived error_class, returning per-group counts and representative sample IDs merged across shards.",
       "params": [
         {
           "name": "group_by",
           "in": "query",
           "required": true,
-          "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, or failure_signature. Repeats build a hierarchical key."
+          "description": "Repeatable grouping dimension: workflow_name, activity_name, queue_name, task_type, time_bucket, failure_signature, dlq_reason, or error_class. Repeats build a hierarchical key."
         },
         {
           "name": "time_bucket",
@@ -1499,7 +2555,9 @@
           "total",
           "filtered_total",
           "groups",
-          "truncated"
+          "truncated",
+          "status",
+          "unavailable_shards"
         ]
       },
       "error_responses": [
@@ -1536,6 +2594,16 @@
             "description": "Filter by workflow name."
           },
           {
+            "name": "queue_name",
+            "required": false,
+            "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
+          },
+          {
+            "name": "min_attempts",
+            "required": false,
+            "description": "Only replay entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
             "name": "failed_after",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only replay entries failed after this time."
@@ -1544,6 +2612,21 @@
             "name": "failed_before",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only replay entries failed before this time."
+          },
+          {
+            "name": "error_class",
+            "required": false,
+            "description": "Filter by derived error class (compute-on-read, exact match; e.g. CircuitOpen, PoisonPill)."
+          },
+          {
+            "name": "dlq_reason",
+            "required": false,
+            "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
+          },
+          {
+            "name": "failure_signature",
+            "required": false,
+            "description": "Filter by derived failure signature (compute-on-read, exact match)."
           },
           {
             "name": "limit",
@@ -1602,6 +2685,16 @@
             "description": "Filter by workflow name."
           },
           {
+            "name": "queue_name",
+            "required": false,
+            "description": "Filter by task queue name (exact match; SQL-expressible). Lets an operator reproduce a queue-scoped aggregate facet exactly."
+          },
+          {
+            "name": "min_attempts",
+            "required": false,
+            "description": "Only discard entries with at least this many attempts (SQL-expressible). Mirrors the aggregate endpoint's min_attempts filter."
+          },
+          {
             "name": "failed_after",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only discard entries failed after this time."
@@ -1610,6 +2703,21 @@
             "name": "failed_before",
             "required": false,
             "description": "RFC 3339 timestamp \u2014 only discard entries failed before this time."
+          },
+          {
+            "name": "error_class",
+            "required": false,
+            "description": "Filter by derived error class (compute-on-read, exact match; e.g. CircuitOpen, PoisonPill)."
+          },
+          {
+            "name": "dlq_reason",
+            "required": false,
+            "description": "Filter by derived DLQ reason class (compute-on-read, exact match; e.g. poison_pill, retry_exhaustion)."
+          },
+          {
+            "name": "failure_signature",
+            "required": false,
+            "description": "Filter by derived failure signature (compute-on-read, exact match)."
           },
           {
             "name": "limit",
@@ -1681,6 +2789,88 @@
         {
           "status": 500,
           "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/dlq/redrive",
+      "category": "dlq",
+      "read_only": false,
+      "description": "Redrive (re-enqueue) dead-lettered tasks matching a filter, with a fresh retry budget, after deploying a fix. Owning executions sealed FAILED are reactivated to RUNNING and resume from existing history append-only.",
+      "idempotency": "Idempotent: redriving an already-redriven entry (or one whose execution has progressed) is a no-op reported as skipped, never a duplicate enqueue.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "queue",
+            "required": false,
+            "description": "Filter by the original task queue name."
+          },
+          {
+            "name": "workflow_name",
+            "required": false,
+            "description": "Filter by the owning execution's workflow name."
+          },
+          {
+            "name": "dead_lettered_after",
+            "required": false,
+            "description": "RFC 3339 timestamp \u2014 only redrive entries dead-lettered at or after this time."
+          },
+          {
+            "name": "dead_lettered_before",
+            "required": false,
+            "description": "RFC 3339 timestamp \u2014 only redrive entries dead-lettered before this time."
+          },
+          {
+            "name": "error_contains",
+            "required": false,
+            "description": "Case-insensitive substring match on the dead-letter error text."
+          },
+          {
+            "name": "dead_letter_ids",
+            "required": false,
+            "description": "Explicit set of dead-letter UUIDs to redrive."
+          },
+          {
+            "name": "max",
+            "required": false,
+            "description": "Maximum number of entries to redrive in this call (default 100, max 1000)."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, return the matched count and a bounded sample without re-enqueuing."
+          },
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Optional operator reason recorded on the WorkflowRedriven event."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "matched",
+          "redriven",
+          "skipped",
+          "failed",
+          "ids",
+          "dry_run",
+          "failures"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty or invalid filter."
+        },
+        {
+          "status": 500,
+          "description": "Database error, or all matched entries failed to redrive."
         }
       ]
     },
@@ -1868,7 +3058,8 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": true,
+        "description": "Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
       },
       "error_responses": [
         {
@@ -1922,7 +3113,9 @@
           "stale",
           "draining",
           "by_queue",
-          "by_shard"
+          "by_shard",
+          "status",
+          "unavailable_shards"
         ]
       },
       "error_responses": [
@@ -2128,14 +3321,30 @@
             "name": "created_by",
             "required": false,
             "description": "Optional caller identity for audit."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, resolve the filter across all shards and return a read-only 200 preview of the blast radius (matched_count, per_shard, sample) instead of submitting a job. Performs zero writes and no audit row (issue #769)."
           }
         ]
       },
       "success_response": {
         "status": 202,
         "fields": [
-          "batch_job_id"
-        ]
+          "batch_job_id",
+          "dry_run",
+          "action",
+          "filter",
+          "matched_count",
+          "per_shard",
+          "sample",
+          "sample_cap",
+          "sample_truncated",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Polymorphic response. A real submit (dry_run false/omitted) returns 202 Accepted with {batch_job_id}. When dry_run is true, returns 200 with a read-only preview: {dry_run:true, action, filter (the normalized filter echoed back), matched_count, per_shard (array of {shard_id, matched_count} summing to matched_count), sample (array of up to sample_cap {execution_id, workflow_name, state} rows ordered by id ascending, global across all shards), sample_cap (100), sample_truncated (matched_count > sample.len()), status ('complete'|'partial'), unavailable_shards (array of {shard_id, reason}, omitted when empty)}. Partial-shard degradation (mirrors POST /workflows/batch_reset): when a shard is unreachable the preview returns 200 with status='partial' naming the unavailable shard instead of failing with a 500 — and matched_count is then a LOWER BOUND over reachable shards only. A dry_run is admin-only (this route is Mutating) and does NOT validate signal_name/payload — the real submit may still 400. An empty/criteria-less filter is rejected 400 with the same guard as a real submit."
       },
       "error_responses": [
         {
@@ -2221,6 +3430,33 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/workflows/registered/{name}/interface",
+      "category": "discovery",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Enumerate a registered workflow type's published interaction surface: its signal, query, and update handlers, each with an optional argument/response JSON Schema and description. Returns a WorkflowInterfaceRecord { signals, queries, updates }; each array is sorted by handler name (deterministic across calls), and handlers without a published schema omit the arg_schema/response_schema/description fields. Signals always omit response_schema. Returns 404 when the name is unknown (issue #610).",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Workflow type not registered."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/workflows/batch_start",
       "category": "batch",
@@ -2256,6 +3492,77 @@
         {
           "status": 413,
           "description": "Request exceeds max_items_per_batch or max_total_bytes."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/batch_reset",
+      "category": "batch",
+      "read_only": false,
+      "description": "Reset a cohort of workflow executions to a shared semantic point. Resolves the logical anchor per execution and returns a per-execution outcome list. preview=true resolves points without forking (issue #538).",
+      "idempotency": "Not idempotent. Each call forks the matched cohort. Use preview=true to plan first.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "filter",
+            "required": true,
+            "description": "BatchFilter identifying the cohort. Must not be empty."
+          },
+          {
+            "name": "reset_point",
+            "required": true,
+            "description": "Logical anchor: {type: event_id, event_id: N} | {type: first_activity_run, activity_name: S} | {type: last_workflow_task}."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable recovery reason stamped on each fork."
+          },
+          {
+            "name": "operator_id",
+            "required": true,
+            "description": "Operator identity recorded in the audit log."
+          },
+          {
+            "name": "signal_reapply",
+            "required": false,
+            "description": "Signal re-apply policy for forked executions: drop (default) | buffer."
+          },
+          {
+            "name": "preview",
+            "required": false,
+            "description": "true = dry-run: resolve per-execution points without forking."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "preview",
+          "total",
+          "reset_count",
+          "skipped_count",
+          "items",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty filter or cohort exceeds DEFAULT_BATCH_RESET_MAX_COHORT (1000)."
+        },
+        {
+          "status": 401,
+          "description": "Missing or invalid admin credentials."
         },
         {
           "status": 500,
@@ -2545,6 +3852,75 @@
     },
     {
       "method": "GET",
+      "path": "/admin/status",
+      "category": "admin",
+      "read_only": true,
+      "description": "Rolled-up management health summary (issue #679): composes five existing read models (workers, shards, dead-letters, queues, stalled workflows) into one JSON document with a single worst-of verdict (healthy/degraded/critical). Composes, never duplicates, per-domain check semantics. Each subsystem carries headline numbers, bounded reason_codes, and a drill_down management-API path (present only when non-healthy). An unreachable shard degrades the affected subsystems and is named in unavailable_shards rather than failing the call wholesale. Thresholds are starter defaults, not universal SLOs.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "subsystems",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Database or shard connectivity error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/config",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the resolved effective runtime configuration of the fleet, secret-free. Secret-bearing configuration (LISTEN/NOTIFY database URLs, per-shard notification URLs, and the sharded pool handle) is surfaced only as presence booleans and counts \u2014 never a value \u2014 so a connection string can never appear in the response. Durations are reported as whole milliseconds with a _ms suffix; unset Option ceilings serialize as explicit JSON null. Top-level sections: worker (resolved WorkerConfig), payload_caps (size caps + server-side ceilings), shard_topology (readable/writable/default shards), features (compiled-in core-crate feature flags), pool (resolved database pool sizing).",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "worker",
+          "payload_caps",
+          "shard_topology",
+          "features",
+          "pool"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Harvest runtime is not started (effective-config snapshot not yet captured)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/canary",
+      "category": "admin",
+      "read_only": true,
+      "description": "Synthetic liveness canary freshness report (issue #796). Reports, per (queue, shard), the age of the most recent COMPLETED built-in probe run so an operator or staleness alert can tell a live pipeline from a wedged one (workers polling but never completing, a stalled scheduler tick, a write-blocked shard). The probe grid is the configured probe queues × the router's writable shards, so a write-blocked or empty shard surfaces as a stale probe rather than being silently absent. Each probes[] entry carries queue, shard, last_success_at, age_of_last_success_secs, last_roundtrip_ms, success_count, failure_count, and stale (true when the last success is older than the staleness window or there has been no success). Fans out across shards; an unreachable shard is named in unavailable_shards and drops status to partial/unavailable rather than failing the call wholesale. When the canary is disabled an empty complete report is returned. Distinct from the #512 replay canary (POST /admin/workflows/replay-canary), which validates code changes by replaying histories.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "staleness_window_secs",
+          "probes",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
       "path": "/admin/version-gates/usage",
       "category": "admin",
       "read_only": true,
@@ -2662,6 +4038,40 @@
     },
     {
       "method": "GET",
+      "path": "/admin/workflow-types/reachability",
+      "category": "admin",
+      "read_only": true,
+      "description": "Report per-workflow-type handler reachability so an operator can gate safe handler removal (issue #520). Counts non-terminal executions per workflow type across all shards and joins against the in-memory handler registry to assign each type a verdict of safe_to_remove, in_use, or orphaned. Each item carries a bounded sample_execution_ids array (issue #700, cap 5) of representative non-terminal execution ids so an operator can drill into stuck runs. Two top-level fields orphaned (bool) and total_orphaned_executions (count of stranded executions across orphaned-verdict types) let a CI/CD gate assert 'zero orphans' against a single field.",
+      "params": [
+        {
+          "name": "workflow_type",
+          "in": "query",
+          "required": false,
+          "description": "Narrow the report to a single workflow type. Still returns the full object (non_terminal_count = 0 + safe_to_remove when none found)."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "filter",
+          "orphaned",
+          "total_orphaned_executions",
+          "items",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Harvest runtime not started (registry unavailable). The handler registry is required to resolve the 'registered' flag; start the Harvest runtime before querying reachability."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/retention",
       "category": "admin",
       "read_only": true,
@@ -2701,11 +4111,177 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/admin/workflows/replay-canary",
+      "category": "admin",
+      "read_only": false,
+      "description": "Run the replay canary over a fanned-out sample of currently running executions to verify replay determinism.",
+      "idempotency": "Idempotent: running the canary does not mutate any workflow or system state.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "sample_size",
+            "required": true,
+            "description": "Maximum number of running workflow executions to sample."
+          },
+          {
+            "name": "workflow_name",
+            "required": false,
+            "description": "Optional filter to limit samples to a specific workflow type."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "Optional filter to limit samples to a specific task queue."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "verdict",
+          "sampled",
+          "replay_succeeded",
+          "replay_failed",
+          {
+            "name": "details",
+            "type": "array",
+            "description": "An array of CanaryFailureDetail objects documenting specific replay mismatch details. Each object has: execution_id (string), workflow_name (string), kind (string, optional), expected (string, optional), actual (string, optional), event_index (integer, optional), and error (string)."
+          },
+          {
+            "name": "summary_by_type",
+            "type": "object",
+            "description": "A map from workflow type name to CanaryTypeSummary objects. Each summary object has: sampled (integer), replay_succeeded (integer), and replay_failed (integer)."
+          },
+          "truncated"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database or runtime error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/admin/concurrency",
       "category": "admin",
       "read_only": true,
       "description": "Return per-activity concurrency statistics: configured cap, currently in-flight, and queued counts for each concurrency key.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/usage",
+      "category": "admin",
+      "read_only": true,
+      "description": "Historical per-tenant/per-workflow usage report (issue #596): the historical companion to the point-in-time GET /admin/concurrency endpoint. Aggregates already-durable data (harvest_workflow_executions + harvest_events) over a required [from, to] window, grouped by workflow_name (default) or a search_attr:<key> tenant key, fanned out and summed across every shard. workflow_starts counts by started_at in the window; completed/failed/cancelled/timed_out count by completed_at in the window and matching terminal state; activity_executions counts ActivityStarted events (one per dispatch attempt) in the window; activity_executions_failed counts terminal ActivityFailed/ActivityTimedOut events in the window; activity_compute_seconds sums each activity's final-attempt start-to-terminal wall-clock span for terminal events in the window. Local and externally-completed activities are excluded (no ActivityStarted event). Executions lacking the requested search_attr key are grouped under the literal group \"(unattributed)\" rather than dropped. An unreachable shard is named in unavailable_shards rather than failing the call wholesale.",
+      "params": [
+        {
+          "name": "from",
+          "in": "query",
+          "required": true,
+          "description": "Inclusive lower bound of the aggregation window: RFC 3339 timestamp or relative duration like 24h."
+        },
+        {
+          "name": "to",
+          "in": "query",
+          "required": true,
+          "description": "Inclusive upper bound of the aggregation window: RFC 3339 timestamp or relative duration like 24h."
+        },
+        {
+          "name": "group_by",
+          "in": "query",
+          "required": false,
+          "description": "workflow_name (default) or search_attr:<key> (e.g. search_attr:tenant_id) to bucket by a tenant key carried on executions."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "from",
+          "to",
+          "group_by",
+          "groups",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Missing from/to, malformed timestamp, from after to, window wider than the configurable ceiling (default 90 days, names the ceiling), or an unrecognized group_by dimension."
+        },
+        {
+          "status": 413,
+          "description": "The merged group count exceeds the configurable cap (default 10,000, names the cap and the actual count); narrow the window or choose a lower-cardinality group_by key. A hard failure rather than a silent rollup, since a chargeback report must never drop a low-volume tenant's data."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/debounce",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return all pending debounce records across all shards. Each record represents a burst of triggers for a (workflow_name, debounce_key) that has not yet fired. Fields: workflow_name, debounce_key, workflow_id, queue_name, effective_fire_at (current projected deadline), max_fire_at (cap), pending_count (number of admitted requests), shard_id, created_at, updated_at.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/start-throttle",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the per-(workflow_name, throttle_key) deferred-start backlog across all shards (issue #607). Each group represents starts that were paced by a start throttle and durably deferred because the per-key token bucket was empty; they are admitted later by the throttle scanner as tokens refill. Fields: workflow_name, throttle_key (\"\" for an unkeyed/global-per-workflow throttle), deferred_count, oldest_deferred_at, shard_id. Sorted by deferred_count descending. Lets an operator confirm a throttle is active and watch the backlog drain.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/batches/pending",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Return all pending event batch records across all shards. Each record represents a pending batch of start triggers for a (workflow_name, batch_key) that has not yet fired. Fields: workflow_name, batch_key, workflow_id, queue_name, current_size, max_size, fire_at (projected deadline), shard_id, created_at, updated_at.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -3004,12 +4580,17 @@
           {
             "name": "input_mapping",
             "required": false,
-            "description": "Input projection mapping."
+            "description": "Input projection mapping. Adjacently tagged (type/data). One of: Passthrough, Static(value), Projection(dotted-path), or Outcome{projection} (issue #748) which assembles a terminal-outcome envelope {terminal_state, source_exec_id, source_workflow_id, source_workflow_name, output, error} from the recorded source execution \u2014 use for failure-routed triggers whose source has a null output; projection optionally plucks one dotted field (e.g. \"error\") from the envelope."
           },
           {
             "name": "queue_name",
             "required": false,
             "description": "Target queue name override."
+          },
+          {
+            "name": "condition",
+            "required": false,
+            "description": "Optional bounded output-guard condition AST (issue #810); the trigger fires only when it evaluates true against the source workflow's recorded output. Unknown operators, malformed paths, or over-cap trees are rejected with 400."
           }
         ]
       },
@@ -3023,7 +4604,8 @@
           "input_mapping",
           "queue_name",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "condition"
         ]
       },
       "error_responses": [
@@ -3048,7 +4630,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), and last_catchup_at (timestamp of most recent recovery tick)."
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), last_catchup_at (timestamp of most recent recovery tick), overdue (issue #696: true when an active schedule is past its own cadence grace = cadence step + jitter + scheduler tick; false for paused/auto-paused/manual/exhausted/at-capacity schedules), and overdue_by_secs (now - next_run_at in whole seconds when overdue, else null). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results as an object { \"<items>\": [...], \"status\": \"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }] } instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the legacy response shape is unchanged."
       },
       "error_responses": [
         {
@@ -3088,10 +4670,13 @@
           "max_active_runs",
           "catchup",
           "last_backfill",
+          "workflow_input",
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
-          "last_catchup_at"
+          "last_catchup_at",
+          "overdue",
+          "overdue_by_secs"
         ]
       },
       "error_responses": [
@@ -3190,16 +4775,169 @@
           "max_active_runs",
           "catchup",
           "last_backfill",
+          "workflow_input",
           "catchup_policy_effective",
           "catchup_window_secs",
           "catchup_dropped_last_recovery",
-          "last_catchup_at"
+          "last_catchup_at",
+          "overdue",
+          "overdue_by_secs"
         ]
       },
       "error_responses": [
         {
           "status": 400,
           "description": "Invalid cron expression or missing required fields."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/admin/schedules/{id}",
+      "category": "schedule",
+      "read_only": false,
+      "description": "Partially update an existing workflow schedule in place (issue #771). Only provided fields change; the schedule_id is never changed, so #488 carryover lineage, the sched:{schedule_id}: workflow-id namespace, and run history are preserved. The workflow type is NOT editable (400). DAG schedules are owned by PATCH /dags/{dag_name} (400). Nullable fields (calendar, consecutive_failure_limit, end_at, max_runs, catchup_policy, retry_policy) are tri-state: omitting the field leaves it unchanged, an explicit JSON null clears it. The merged spec is validated before any write, so a 400 writes nothing. Changing the schedule expression recomputes next_run_at anchored at now (elapsed slots are never retroactively fired); other edits preserve the pending next_run_at. Anti-race with the scheduler tick: an edit is rejected 409 while a fire claim is live, an expired claim is fenced (token nulled) so a straggler fire cannot finalize over the edit, and a tick that wins its claim re-reads the row before firing, so a fire that lands concurrently with the edit always dispatches the committed new input/queue/policies.",
+      "idempotency": "Idempotent for identical bodies: re-applying the same partial update converges on the same row state. Returns 409 while a scheduler replica holds a live fire claim on the row (the claim lease is bounded at ~30 s); retry shortly.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Schedule UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "schedule_expr",
+            "required": false,
+            "description": "New schedule expression: bare cron, 'cron:<expr>', 'cron_tz:<tz>:<expr>', 'interval:<secs>', or 'manual'."
+          },
+          {
+            "name": "timezone",
+            "required": false,
+            "description": "New IANA timezone for the cron expression. Provided without schedule_expr it re-anchors the stored cron expression; ignored for interval/manual schedules."
+          },
+          {
+            "name": "input",
+            "required": false,
+            "description": "New workflow input payload: any non-null JSON value. JSON null leaves the input unchanged (null is the one JSON value that cannot be stored as the input via this route)."
+          },
+          {
+            "name": "catchup",
+            "required": false,
+            "description": "New legacy catchup bool; ignored when a catchup_policy is stored or provided."
+          },
+          {
+            "name": "max_active_runs",
+            "required": false,
+            "description": "New maximum concurrent scheduled runs."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "New task queue name for scheduled runs."
+          },
+          {
+            "name": "jitter_secs",
+            "required": false,
+            "description": "New jitter window in seconds; 0 disables jitter (issue #240)."
+          },
+          {
+            "name": "overlap_policy",
+            "required": false,
+            "description": "New overlap policy: skip, buffer_one, buffer_all, cancel_other, terminate_other (issue #241)."
+          },
+          {
+            "name": "buffer_all_max",
+            "required": false,
+            "description": "New maximum buffered slots under buffer_all (issue #241)."
+          },
+          {
+            "name": "calendar",
+            "required": false,
+            "description": "New named calendar (issue #337). Tri-state: omit = unchanged, explicit null = detach the calendar."
+          },
+          {
+            "name": "skip_policy",
+            "required": false,
+            "description": "New calendar skip policy: skip, run_next_business_day, run_prev_business_day (issue #337)."
+          },
+          {
+            "name": "consecutive_failure_limit",
+            "required": false,
+            "description": "New auto-pause threshold (issue #360). Tri-state: omit = unchanged, explicit null = disable auto-pause."
+          },
+          {
+            "name": "end_at",
+            "required": false,
+            "description": "New absolute UTC cutoff (issue #478). Tri-state: omit = unchanged, explicit null = remove the cutoff. Raising a limit on an exhausted schedule clears the exhaustion."
+          },
+          {
+            "name": "max_runs",
+            "required": false,
+            "description": "New total run budget (issue #478). Tri-state: omit = unchanged, explicit null (or 0) = remove the budget."
+          },
+          {
+            "name": "catchup_policy",
+            "required": false,
+            "description": "New bounded catchup policy: skip_all, most_recent, window, unbounded (issue #484). Tri-state: omit = unchanged, explicit null = clear (fall back to the legacy catchup bool)."
+          },
+          {
+            "name": "catchup_window_secs",
+            "required": false,
+            "description": "Window length in seconds for catchup_policy = window; re-windows an already-'window' policy when sent alone, ignored for other modes (issue #484)."
+          },
+          {
+            "name": "retry_policy",
+            "required": false,
+            "description": "New schedule-level workflow retry policy (issue #523). Tri-state: omit = unchanged, explicit null = clear."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "kind",
+          "name",
+          "schedule_expr",
+          "is_paused",
+          "paused_at",
+          "paused_by",
+          "pause_reason",
+          "next_run_at",
+          "last_run_at",
+          "max_active_runs",
+          "catchup",
+          "last_backfill",
+          "workflow_input",
+          "catchup_policy_effective",
+          "catchup_window_secs",
+          "catchup_dropped_last_recovery",
+          "last_catchup_at",
+          "overdue",
+          "overdue_by_secs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed schedule id, unknown/typo'd body field (the body is rejected with deny-unknown-fields semantics), workflow_name present in the body (not editable), DAG schedule row, invalid cron/interval expression or timezone, unknown overlap/skip/catchup policy, unknown calendar, or a timezone-only patch on a row whose stored schedule expression is unparseable. Nothing is written."
+        },
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 409,
+          "description": "The schedule is firing right now (a scheduler replica holds a live fire claim); retry shortly."
         },
         {
           "status": 500,
@@ -3641,18 +5379,66 @@
       "request_body": {
         "free_form": false,
         "fields": [
-          { "name": "schedule_expr", "type": "string", "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)." },
-          { "name": "timezone", "type": "string", "description": "IANA timezone for cron evaluation. Defaults to UTC." },
-          { "name": "catchup", "type": "boolean", "description": "Whether missed fires should be caught up. Informational only in preview; defaults to false." },
-          { "name": "max_active_runs", "type": "integer", "description": "Maximum concurrent runs. Used to set would_skip_if_active. Defaults to 1." },
-          { "name": "paused", "type": "boolean", "description": "If true, returns empty entries with is_paused=true." },
-          { "name": "jitter_secs", "type": "integer", "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter." },
-          { "name": "overlap_policy", "type": "string", "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip." },
-          { "name": "buffer_all_max", "type": "integer", "description": "Max buffered slots under buffer_all. Defaults to 100." },
-          { "name": "calendar", "type": "string", "description": "Optional named calendar for exclusion filtering. Returns 400 if not found." },
-          { "name": "skip_policy", "type": "string", "description": "One of: skip, run_next_business_day, run_prev_business_day. Defaults to skip." },
-          { "name": "count", "type": "integer", "description": "Number of entries to return. Defaults to 10, max 100." },
-          { "name": "from", "type": "string", "description": "ISO-8601 UTC start instant. Defaults to now." }
+          {
+            "name": "schedule_expr",
+            "type": "string",
+            "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)."
+          },
+          {
+            "name": "timezone",
+            "type": "string",
+            "description": "IANA timezone for cron evaluation. Defaults to UTC."
+          },
+          {
+            "name": "catchup",
+            "type": "boolean",
+            "description": "Whether missed fires should be caught up. Informational only in preview; defaults to false."
+          },
+          {
+            "name": "max_active_runs",
+            "type": "integer",
+            "description": "Maximum concurrent runs. Used to set would_skip_if_active. Defaults to 1."
+          },
+          {
+            "name": "paused",
+            "type": "boolean",
+            "description": "If true, returns empty entries with is_paused=true."
+          },
+          {
+            "name": "jitter_secs",
+            "type": "integer",
+            "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter."
+          },
+          {
+            "name": "overlap_policy",
+            "type": "string",
+            "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip."
+          },
+          {
+            "name": "buffer_all_max",
+            "type": "integer",
+            "description": "Max buffered slots under buffer_all. Defaults to 100."
+          },
+          {
+            "name": "calendar",
+            "type": "string",
+            "description": "Optional named calendar for exclusion filtering. Returns 400 if not found."
+          },
+          {
+            "name": "skip_policy",
+            "type": "string",
+            "description": "One of: skip, run_next_business_day, run_prev_business_day. Defaults to skip."
+          },
+          {
+            "name": "count",
+            "type": "integer",
+            "description": "Number of entries to return. Defaults to 10, max 100."
+          },
+          {
+            "name": "from",
+            "type": "string",
+            "description": "ISO-8601 UTC start instant. Defaults to now."
+          }
         ]
       },
       "success_response": {
@@ -3704,10 +5490,26 @@
       "read_only": true,
       "description": "List schedule-decision records (fire/skip/overlap/catchup outcomes) across all schedules.",
       "params": [
-        { "name": "schedule_id", "type": "string", "description": "Filter by schedule UUID." },
-        { "name": "decision", "type": "string", "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)." },
-        { "name": "reason", "type": "string", "description": "Filter by reason label." },
-        { "name": "limit", "type": "integer", "description": "Maximum number of records to return. Defaults to 50." }
+        {
+          "name": "schedule_id",
+          "type": "string",
+          "description": "Filter by schedule UUID."
+        },
+        {
+          "name": "decision",
+          "type": "string",
+          "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)."
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "description": "Filter by reason label."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum number of records to return. Defaults to 50."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -3716,8 +5518,82 @@
         "fields": []
       },
       "error_responses": [
-        { "status": 400, "description": "Invalid schedule_id UUID." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 400,
+          "description": "Invalid schedule_id UUID."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/schedules/{id}/runs",
+      "category": "schedule",
+      "read_only": true,
+      "description": "List the workflow executions a schedule launched, newest-slot-first (ordered by scheduled_for, falling back to started_at for slot-less manual fires), each with its terminal state, a collapsed outcome (completed/failed/timed_out/cancelled/terminated/running), the first line of the error for terminally-failed runs, and the dispatch origin (scheduled/backfill/manual_trigger). Echoes the schedule's next_run_at and a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing. 404s an unknown schedule id.",
+      "params": [
+        {
+          "name": "state",
+          "type": "string",
+          "description": "Filter by execution state (repeatable, or comma-separated), e.g. FAILED,TIMED_OUT."
+        },
+        {
+          "name": "origin",
+          "type": "string",
+          "description": "Filter by dispatch origin: scheduled, backfill, or manual_trigger (repeatable)."
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "description": "Inclusive lower bound on started_at: RFC 3339 timestamp or relative duration like 24h."
+        },
+        {
+          "name": "until",
+          "type": "string",
+          "description": "Exclusive upper bound on started_at: RFC 3339 timestamp or relative duration."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum runs to return (default 20, clamped 1-200). A value above 200 is clamped and reported via the echoed limit and next_cursor; a limit below 1 or non-integer is a 400."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "description": "Opaque keyset cursor from a prior response's next_cursor for the next page."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          "schedule_id",
+          "status",
+          "next_run_at",
+          "runs",
+          "summary",
+          "limit",
+          "next_cursor",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed schedule id, or invalid state, origin, since/until, limit, or cursor."
+        },
+        {
+          "status": 404,
+          "description": "Unknown schedule id: no schedule with that id was found and every shard was reachable, so its absence is authoritative."
+        },
+        {
+          "status": 503,
+          "description": "Indeterminate existence (retryable): the schedule id was not found and at least one shard is unreachable, so its absence cannot be confirmed. Retry once shards recover."
+        }
       ]
     },
     {
@@ -3727,9 +5603,21 @@
       "read_only": true,
       "description": "List schedule-decision records for a specific schedule.",
       "params": [
-        { "name": "decision", "type": "string", "description": "Filter by decision kind." },
-        { "name": "reason", "type": "string", "description": "Filter by reason label." },
-        { "name": "limit", "type": "integer", "description": "Maximum number of records to return. Defaults to 50." }
+        {
+          "name": "decision",
+          "type": "string",
+          "description": "Filter by decision kind."
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "description": "Filter by reason label."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum number of records to return. Defaults to 50."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -3738,8 +5626,14 @@
         "fields": []
       },
       "error_responses": [
-        { "status": 404, "description": "Schedule not found." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4096,11 +5990,19 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": ["policies", "reachability", "diverged_queues", "shard_errors"],
+        "fields": [
+          "policies",
+          "reachability",
+          "diverged_queues",
+          "shard_errors"
+        ],
         "notes": "diverged_queues lists queue names whose active build_id differs across shards, indicating a partial-write incident. shard_errors lists shards that could not be reached."
       },
       "error_responses": [
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4115,18 +6017,45 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "queue_name", "required": true, "description": "Task queue to configure the build policy for." },
-          { "name": "build_id", "required": true, "description": "Build ID to assign to new workflow starts on this queue." },
-          { "name": "deployment_name", "required": false, "description": "Optional human-readable deployment label." }
+          {
+            "name": "queue_name",
+            "required": true,
+            "description": "Task queue to configure the build policy for."
+          },
+          {
+            "name": "build_id",
+            "required": true,
+            "description": "Build ID to assign to new workflow starts on this queue."
+          },
+          {
+            "name": "deployment_name",
+            "required": false,
+            "description": "Optional human-readable deployment label."
+          }
         ]
       },
       "success_response": {
         "status": 200,
-        "fields": ["id", "queue_name", "build_id", "deployment_name", "created_at", "updated_at"]
+        "fields": [
+          "id",
+          "queue_name",
+          "build_id",
+          "deployment_name",
+          "created_at",
+          "updated_at",
+          "target_build_id",
+          "ramp_percent"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4139,11 +6068,18 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": ["entries", "diverged_pairs", "shard_errors"],
+        "fields": [
+          "entries",
+          "diverged_pairs",
+          "shard_errors"
+        ],
         "notes": "entries is an array of BuildCompatEntry objects. diverged_pairs lists (build_id, compatible_with) pairs present on some shards but absent on others, indicating a partial fanout incident. shard_errors lists shards that could not be reached; non-empty means the list may be incomplete."
       },
       "error_responses": [
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4158,17 +6094,36 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "build_id", "required": true, "description": "The worker build that will process tasks." },
-          { "name": "compatible_with", "required": true, "description": "The assigned build whose tasks the worker build may safely replay." }
+          {
+            "name": "build_id",
+            "required": true,
+            "description": "The worker build that will process tasks."
+          },
+          {
+            "name": "compatible_with",
+            "required": true,
+            "description": "The assigned build whose tasks the worker build may safely replay."
+          }
         ]
       },
       "success_response": {
         "status": 201,
-        "fields": ["id", "build_id", "compatible_with", "declared_at"]
+        "fields": [
+          "id",
+          "build_id",
+          "compatible_with",
+          "declared_at"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4179,8 +6134,18 @@
       "description": "Revoke a compatibility declaration between two build IDs.",
       "idempotency": "Idempotent: revoking a non-existent pair returns revoked=false without error.",
       "params": [
-        { "name": "build_id", "in": "path", "required": true, "description": "The worker build." },
-        { "name": "compat_with", "in": "path", "required": true, "description": "The assigned build to remove from the compatibility set." }
+        {
+          "name": "build_id",
+          "in": "path",
+          "required": true,
+          "description": "The worker build."
+        },
+        {
+          "name": "compat_with",
+          "in": "path",
+          "required": true,
+          "description": "The assigned build to remove from the compatibility set."
+        }
       ],
       "request_body": {
         "required": false,
@@ -4189,39 +6154,172 @@
       },
       "success_response": {
         "status": 200,
-        "fields": ["revoked"]
+        "fields": [
+          "revoked"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
       "method": "POST",
       "path": "/admin/build-routing/retire",
       "category": "build_routing",
-      "read_only": false,
-      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe.",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Check whether a build ID is safe to retire (no open executions, no pending tasks). Returns 409 Conflict when not safe. Reachability-only: reads build reachability and writes no state (RouteClass::ReadOnly); POST is used solely to carry a JSON request body.",
       "idempotency": "Idempotent: repeated calls reflect current reachability state and do not mutate data.",
       "params": [],
       "request_body": {
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "build_id", "required": true, "description": "The build ID to check for retirement readiness." }
+          {
+            "name": "build_id",
+            "required": true,
+            "description": "The build ID to check for retirement readiness."
+          }
         ]
       },
       "success_response": {
         "status": 200,
-        "fields": ["build_id", "safe_to_retire", "open_executions", "pending_tasks"]
+        "fields": [
+          "build_id",
+          "safe_to_retire",
+          "open_executions",
+          "pending_tasks"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
         {
           "status": 409,
           "description": "Build has open executions or pending tasks and cannot be retired yet. Body contains the same fields showing current counts."
         },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/build-routing/ramp",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Set (or update) a queue's percentage build ramp: ramp_percent% of new workflow starts on the queue receive target_build_id, the rest receive the queue's base build_id. Requires a base build policy to already exist for the queue (issue #604).",
+      "idempotency": "Idempotent by queue_name: re-posting the same queue_name updates the ramp in place.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "queue_name",
+            "required": true,
+            "description": "Task queue whose base build policy already exists."
+          },
+          {
+            "name": "target_build_id",
+            "required": true,
+            "description": "Ramp target build ID."
+          },
+          {
+            "name": "ramp_percent",
+            "required": true,
+            "description": "Integer percentage 0..=100 of new starts routed to target_build_id. 0 = no traffic to target, 100 = full cutover."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "queue_name",
+          "build_id",
+          "deployment_name",
+          "created_at",
+          "updated_at",
+          "target_build_id",
+          "ramp_percent"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "queue_name/target_build_id empty, or ramp_percent outside 0..=100."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 409,
+          "description": "No base build policy is registered for queue_name yet \u2014 call POST /admin/build-routing/policies first."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/build-routing/ramp/{queue_name}",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Clear a queue's percentage build ramp, immediately stopping new starts from reaching the target build. The queue's base build policy is left untouched (issue #604).",
+      "idempotency": "Idempotent: clearing an already-unramped policy is a no-op that still returns 200.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "Task queue whose ramp should be cleared."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "queue_name",
+          "build_id",
+          "deployment_name",
+          "created_at",
+          "updated_at",
+          "target_build_id",
+          "ramp_percent"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "No build policy is registered for queue_name."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4229,16 +6327,22 @@
       "path": "/admin/gates",
       "category": "admission_gates",
       "read_only": true,
-      "description": "List all active (non-lifted) admission gates.",
+      "description": "List all active (non-lifted) admission gates. The response also carries a `producers` block enumerating every in-process workflow-start producer and whether it is `gated`, `gated_at_admission` (deferred-fire producers gated at HTTP admission whose scanner fire is exempt-with-bypass-counter), `gated_at_relay` (gated authoritatively at relay/fire time on the target/real queue: the cross-shard completion-trigger relay blocks + drops a matching gate, and — since issue #1053 — the throttle scanner blocks + re-defers a matching gate; else both count the bypass), or `exempt_by_design` (with a rationale), so the admission-gate contract is discoverable without reading source (issue #618).",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
-      "request_body": { "required": false, "free_form": true },
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
       "success_response": {
         "status": 200,
         "free_form": true
       },
       "error_responses": [
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4253,22 +6357,61 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "scope_kind", "required": true, "description": "One of: fleet, workflow_name, queue, shard_id, owner." },
-          { "name": "scope_value", "required": false, "description": "Required for non-fleet scopes." },
-          { "name": "reason", "required": true, "description": "Human-readable incident description." },
-          { "name": "message", "required": false, "description": "Optional extended message surfaced in the Vantage UI." },
-          { "name": "expires_at", "required": false, "description": "ISO 8601 timestamp after which the gate self-clears." }
+          {
+            "name": "scope_kind",
+            "required": true,
+            "description": "One of: fleet, workflow_name, queue, shard_id, owner."
+          },
+          {
+            "name": "scope_value",
+            "required": false,
+            "description": "Required for non-fleet scopes."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable incident description."
+          },
+          {
+            "name": "message",
+            "required": false,
+            "description": "Optional extended message surfaced in the Vantage UI."
+          },
+          {
+            "name": "expires_at",
+            "required": false,
+            "description": "ISO 8601 timestamp after which the gate self-clears."
+          }
         ]
       },
       "success_response": {
         "status": 201,
-        "fields": ["id", "scope_kind", "scope_value", "reason", "created_at", "expires_at"]
+        "fields": [
+          "id",
+          "scope_kind",
+          "scope_value",
+          "reason",
+          "created_at",
+          "expires_at"
+        ]
       },
       "error_responses": [
-        { "status": 400, "description": "Invalid scope_kind/scope_value combination or empty reason." },
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 429, "description": "Active gate limit (100) reached." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 400,
+          "description": "Invalid scope_kind/scope_value combination or empty reason."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 429,
+          "description": "Active gate limit (100) reached."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4279,16 +6422,154 @@
       "description": "Lift (soft-delete) an admission gate, immediately re-opening the blocked scope.",
       "idempotency": "Idempotent: lifting a gate that does not exist or is already lifted returns lifted=false without error.",
       "params": [
-        { "name": "id", "in": "path", "required": true, "description": "UUID of the gate to lift." }
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "UUID of the gate to lift."
+        }
       ],
-      "request_body": { "required": false, "free_form": false, "fields": [] },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": {
         "status": 200,
-        "fields": ["lifted"]
+        "fields": [
+          "lifted"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/tokens",
+      "category": "api_tokens",
+      "read_only": true,
+      "description": "List all scoped API tokens as metadata only (issue #942). The plaintext secret and its hash are never returned — only id, name, scope, created_at, expires_at, last_used_at, revoked_at.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/tokens",
+      "category": "api_tokens",
+      "read_only": false,
+      "description": "Mint a scoped API token (issue #942). The plaintext secret is returned exactly once in this response; only its SHA-256 hash is stored at rest. Scope is drawn from the route classification: 'read' reaches every read-only route and is denied 403 on mutations; 'mutate' reaches everything.",
+      "idempotency": "Not idempotent: each call mints a new token row with a fresh UUID and secret.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "name",
+            "required": true,
+            "description": "Human-readable label for the caller (CI job, dashboard, on-call, SDK)."
+          },
+          {
+            "name": "scope",
+            "required": false,
+            "description": "Verb-level scope: 'read' (default) or 'mutate'."
+          },
+          {
+            "name": "expires_at",
+            "required": false,
+            "description": "RFC 3339 timestamp after which the token is rejected 401."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "id",
+          "name",
+          "scope",
+          "created_at",
+          "expires_at",
+          "last_used_at",
+          "revoked_at",
+          "secret"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Unknown scope (expected 'read' or 'mutate')."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/tokens/{id}",
+      "category": "api_tokens",
+      "read_only": false,
+      "description": "Revoke a scoped API token (issue #942). Revocation is effective on the next request (no grant cache).",
+      "idempotency": "Idempotent: revoking an unknown or already-revoked token returns revoked=false without error.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "UUID of the token to revoke."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "revoked"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4299,7 +6580,12 @@
       "description": "Get detailed worker and queue status eligibility and diagnostic breakdown for triaging stuck tasks in a specific queue.",
       "idempotency": "Read-only; always idempotent.",
       "params": [
-        { "name": "queue_name", "in": "path", "required": true, "description": "Target task queue name." }
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "Target task queue name."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -4314,11 +6600,18 @@
           "summary",
           "shards",
           "shard_errors"
-        ]
+        ],
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the queue's tasks. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database or shard unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database or shard unavailable."
+        }
       ]
     },
     {
@@ -4329,7 +6622,12 @@
       "description": "Get detailed worker eligibility and diagnostic breakdown narrowed to a single pending task.",
       "idempotency": "Read-only; always idempotent.",
       "params": [
-        { "name": "id", "in": "path", "required": true, "description": "Task UUID." }
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Task UUID."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -4345,12 +6643,660 @@
           "eligible_workers",
           "ineligible_workers",
           "summary"
+        ],
+        "notes": "Each entry in ineligible_workers carries a nested reason_codes array explaining why that online worker cannot claim the task. The full taxonomy (issue #611): wrong_queue_subscription, wrong_shard_assignment, worker_draining, worker_stopped, build_incompatible, sticky_owned_by_other_worker, concurrency_saturated (a per-key concurrency cap is actually saturated), rate_limit_exhausted (the task's rate-limit bucket has < 1.0 token; renamed from the earlier rate_limit_saturated), circuit_open (the task's next activity is gated by an OPEN circuit breaker \u2014 a downstream outage tripped it), circuit_half_open (the breaker is testing recovery with a single in-flight probe; the explainer's non-mutating snapshot reports circuit_open through the cooldown and only observes half_open once a probe dispatch is admitted), and unsatisfied_requirement:{key}={value} / unsatisfied_requirement:{key} in [{values}] for capability mismatches. For a CB activity that also declares a rate limit, rate limiting is enforced at dispatch (issue #369) so its impediment surfaces as circuit_open/circuit_half_open, never a stale rate_limit_exhausted. Multiple applicable codes are all listed, sorted."
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "Task not found across any shard."
+        },
+        {
+          "status": 503,
+          "description": "Database or shard unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/types/{workflow_name}/handlers",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Enumerate the query and update handlers registered for a workflow type (read-only). Returns a WorkflowTypeHandlers object listing each handler's name and type hints. Classified read-only (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}",
+      "category": "workflow",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Missing-workflow_id guard for the business-id route family: always returns 400 (the business-id form requires /workflows/by-id/{workflow_name}/{workflow_id}). No read, no write; classified read-only (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id is required."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id is required."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "idempotency": "Safe",
+      "description": "Missing-workflow_id guard for the business-id route family (POST variant): always returns 400. Shares the GET handler; never reads or writes state. Classified read-only despite the POST verb (issue #776).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
+      "success_response": {
+        "status": 400,
+        "free_form": true,
+        "note": "Always 400: workflow_id is required."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "workflow_id is required."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Describe the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}; resolved execution_id also in the X-Harvest-Execution-Id header."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/result",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Compact terminal result for the current run of a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "wait",
+          "in": "query",
+          "required": false,
+          "description": "Optional wait duration (e.g. 5s). Values above the server ceiling are clamped."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}/result (204 No Content with Retry-After when still running). Resolved execution_id in the X-Harvest-Execution-Id header on every response."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid wait duration."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database or listener error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/stack",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Current wait state (what it is blocked on) for the current run of a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}/stack; resolved execution_id in the X-Harvest-Execution-Id header."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/children",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List child executions of the current run for a business (workflow_name, workflow_id). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "status",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Filter by child status. May be repeated."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by child workflow name."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum number of results."
+        },
+        {
+          "name": "cursor",
+          "in": "query",
+          "required": false,
+          "description": "Pagination cursor."
+        },
+        {
+          "name": "depth",
+          "in": "query",
+          "required": false,
+          "description": "Maximum recursion depth."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "note": "Same body as GET /workflows/{id}/children ({items, next_cursor}); resolved execution_id in the X-Harvest-Execution-Id header."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Send a named signal to the current run of a business (workflow_name, workflow_id). Body is the signal payload (free-form JSON). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Same exactly-once semantics as POST /workflows/{id}/signal/{signal_name} (Idempotency-Key header or idempotency_key query param).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "signal_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered signal handler name."
+        },
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": false,
+          "description": "Exactly-once delivery key; wins over the query param."
+        },
+        {
+          "name": "idempotency_key",
+          "in": "query",
+          "required": false,
+          "description": "Exactly-once delivery key (lower precedence than the header)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true,
+        "description": "Optional signal payload passed verbatim to the handler.",
+        "fields": []
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "execution_id",
+          "ok",
+          "signal_delivered"
         ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 404, "description": "Task not found across any shard." },
-        { "status": 503, "description": "Database or shard unavailable." }
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Invoke a registered no-arg query handler on the current run of a business (workflow_name, workflow_id). Returns {\"execution_id\": ..., \"result\": <value>}. Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "query_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered query handler name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "result"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id), or query handler not registered."
+        },
+        {
+          "status": 408,
+          "description": "Query timed out."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
+        },
+        {
+          "status": 503,
+          "description": "Query handler panicked."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+      "category": "workflow",
+      "read_only": true,
+      "post_for_body_only": true,
+      "description": "Invoke a registered query handler with typed JSON args on the current run of a business (workflow_name, workflow_id). Returns {\"execution_id\": ..., \"result\": <value>}. POST is used solely to allow a structured body; never writes workflow events. Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Read-only at the workflow level (no events written).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        },
+        {
+          "name": "query_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered query handler name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "args",
+            "required": false,
+            "description": "Arguments passed to the query handler (any JSON value)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "result"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Args failed to deserialize into the handler's request type."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id), or query handler not registered."
+        },
+        {
+          "status": 408,
+          "description": "Query timed out."
+        },
+        {
+          "status": 409,
+          "description": "Workflow is not in a running state."
+        },
+        {
+          "status": 503,
+          "description": "Query handler panicked."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Cancel the current run of a business (workflow_name, workflow_id). Admin-guarded (parity with POST /workflows/{id}/cancel). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Idempotent: cancelling an already-cancelled or terminal execution is a no-op.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable cancellation reason recorded in audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "newly_cancelled",
+          "failed_task_count"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 409,
+          "description": "Execution is already in a terminal state."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/pause",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Pause the current run of a business (workflow_name, workflow_id). Admin-guarded (parity with POST /workflows/{id}/pause). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Idempotent: pausing an already-paused execution is a no-op (newly_paused=false).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable pause reason (max 500 chars)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "actor",
+          "newly_paused",
+          "paused_at"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Pause reason exceeds the length cap."
+        },
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 409,
+          "description": "Execution is in a terminal state and cannot be paused."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/by-id/{workflow_name}/{workflow_id}/resume",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Resume the current (paused) run of a business (workflow_name, workflow_id). Admin-guarded (parity with POST /workflows/{id}/resume). Resolves (workflow_name, workflow_id) to the current run: the single active (non-terminal) run if one exists, else the most recent terminal run, else 404 (never 500). Shard-aware. The resolved execution_id is returned on every response in the X-Harvest-Execution-Id header (and in the JSON body where present); acting by business id always reaches the live run even after a continue-as-new/reset fork.",
+      "idempotency": "Idempotent: resuming a non-paused execution is a 200 no-op (newly_resumed=false).",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow type name (uniqueness scope is (workflow_name, workflow_id))."
+        },
+        {
+          "name": "workflow_id",
+          "in": "path",
+          "required": true,
+          "description": "Business workflow id assigned by the embedder at start."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "actor",
+          "pause_duration_secs",
+          "newly_resumed"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "No run for (workflow_name, workflow_id)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
       ]
     }
   ]

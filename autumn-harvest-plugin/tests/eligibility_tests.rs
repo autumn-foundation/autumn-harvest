@@ -61,12 +61,18 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "test_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
+        batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -75,6 +81,7 @@ fn workflow_info() -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -124,6 +131,7 @@ async fn register_active_worker_with_build(
         build_id,
         Some("test-deploy"),
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .expect("worker registration should succeed");
@@ -594,6 +602,41 @@ async fn seed_task_with_rate_limit_and_date(
     id
 }
 
+/// Seed a claimable PENDING task with a caller-chosen `task_type` (a real
+/// circuit-breaker task is `task_type='activity'`, not `'workflow'`), naming an
+/// activity and optionally carrying a rate-limit key.
+async fn seed_typed_task(
+    pool: &DbPool,
+    queue_name: &str,
+    task_type: &str,
+    activity_name: Option<&str>,
+    rate_limit_key: Option<&str>,
+    scheduled_at_clause: &str,
+) -> uuid::Uuid {
+    let mut conn = pool.get().await.expect("task seeding connection");
+    let id = uuid::Uuid::new_v4();
+
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_task_queue (
+            id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
+            rate_limit_key, activity_name
+         ) VALUES (
+            $1, $2, $3, '{{}}'::jsonb, 'PENDING', 0, 1, {scheduled_at_clause},
+            $4, $5
+         )"
+    ))
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .bind::<diesel::sql_types::Text, _>(task_type)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(rate_limit_key)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(activity_name)
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert typed test task");
+
+    id
+}
+
 fn build_two_shard_pool(shard0_pool: DbPool, shard1_pool: DbPool) -> HarvestDbPool {
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), shard0_pool);
@@ -676,18 +719,27 @@ async fn test_eligibility_optimizations_and_resilience() {
     // pending_count should be exactly 1 (only the rate-limited one is claimable; scheduled in future and expired are excluded)
     assert_eq!(body["pending_count"], 1);
 
-    // worker-rate-limited should be marked ineligible with reason "rate_limit_saturated"
+    // worker-rate-limited should be marked ineligible with reason "rate_limit_exhausted" (AC7a).
+    // The worker is otherwise perfectly eligible (right queue, shard, build, capacity),
+    // and the single claimable task's only impediment is the saturated rate-limit bucket
+    // (no concurrency key/cap, no circuit breaker), so the reason set is EXACTLY
+    // ["rate_limit_exhausted"] — asserting exact equality guards the success metric that a
+    // rate limit is never mislabeled as concurrency saturation.
     let ineligible_list = body["ineligible_workers"].as_array().unwrap();
     let w_rl = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-rate-limited")
         .unwrap();
-    assert!(
-        w_rl["reason_codes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str().unwrap() == "rate_limit_saturated")
+    let w_rl_reasons: Vec<&str> = w_rl["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        w_rl_reasons,
+        vec!["rate_limit_exhausted"],
+        "expected exactly rate_limit_exhausted, got {w_rl_reasons:?}"
     );
 
     // 3. Test capacity limit: register a worker that has max capacity reached
@@ -1025,6 +1077,7 @@ async fn test_worker_capabilities_routing_and_triage() {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: Some("gpu = true"),
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1057,6 +1110,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1076,6 +1130,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             "v1",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -1152,6 +1207,283 @@ fn runtime_for_activities(
     )
 }
 
+fn runtime_for_registry(
+    queues: &[&str],
+    registry: Arc<HandlerRegistry>,
+    router: ShardRouter,
+) -> HarvestApiRuntime {
+    HarvestApiRuntime::new(
+        registry,
+        Arc::new(DagCatalog::new()),
+        Arc::new(Vec::new()),
+        None,
+        queues.iter().map(|queue| (*queue).to_string()).collect(),
+        autumn_harvest::scheduler::SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        router,
+    )
+}
+
+fn cb_activity(name: &'static str, queue: &'static str) -> autumn_harvest::info::ActivityInfo {
+    autumn_harvest::info::ActivityInfo {
+        name,
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some(queue),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
+            3,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )),
+        requires: None,
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    }
+}
+
+// AC7(b): a task whose next activity is gated by an OPEN circuit breaker reports
+// `circuit_open` — never an empty impediment set — and the CB activity's
+// saturated rate-limit bucket is suppressed at the claim-time explainer (issue
+// #369), so the reason is `circuit_open` and not `rate_limit_exhausted`.
+//
+// The suppression is proven end-to-end: a SECOND, non-CB task shares the same
+// rate-limit key and genuinely saturates it, so `saturated_rate_limits` really
+// does contain the key. The non-CB task's own eligibility reports
+// `rate_limit_exhausted` (proving the bucket is exhausted), while the CB task's
+// own eligibility reports `circuit_open` and never `rate_limit_exhausted`
+// (proving the #369 suppression, not a vacuously-empty saturated set). If the
+// helper's `!has_cb` guard were dropped, the CB task's per-task evaluation would
+// wrongly surface `rate_limit_exhausted` here.
+#[tokio::test]
+async fn test_open_circuit_reports_circuit_open() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    // Saturated bucket for the shared rate-limit key.
+    seed_rate_limit_bucket(&pool, "cb-rl-key", 0.0, 1.0, 0.0).await;
+
+    // Build the registry ourselves so we can force the shared, Arc-shared
+    // breaker OPEN — the same in-process state the explainer reads.
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info()],
+        vec![cb_activity("charge_card", "test-queue-cb")],
+    ));
+    registry
+        .circuit_breakers()
+        .force_open("charge_card", std::time::Instant::now());
+
+    // The CB task: a real activity task naming the CB activity, carrying the
+    // shared saturated rate-limit key (Fix 5: task_type='activity', not
+    // 'workflow', so a future refactor gating the CB branch on task type cannot
+    // silently pass).
+    let cb_task_id = seed_typed_task(
+        &pool,
+        "test-queue-cb",
+        "activity",
+        Some("charge_card"),
+        Some("cb-rl-key"),
+        "NOW() - INTERVAL '5 seconds'",
+    )
+    .await;
+
+    // A SECOND, NON-CB task sharing the same rate-limit key. Because non-CB
+    // tasks are the only source that populates `rate_limit_keys`, this is what
+    // makes `saturated_rate_limits` genuinely contain "cb-rl-key" (Fix 6).
+    let noncb_task_id = seed_typed_task(
+        &pool,
+        "test-queue-cb",
+        "workflow",
+        None,
+        Some("cb-rl-key"),
+        "NOW() - INTERVAL '5 seconds'",
+    )
+    .await;
+
+    // An otherwise-perfectly-eligible worker (right queue, shard, build).
+    register_active_worker_with_build(&pool, "worker-cb", &["test-queue-cb"], &[0], "v1", 10, 0)
+        .await;
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for_registry(&["test-queue-cb"], registry, ShardRouter::single()),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    // Queue eligibility endpoint: worker-cb is ineligible and surfaces
+    // `circuit_open` (never an empty/unknown set), absent from the eligible
+    // list, diagnosis no_eligible_workers. Note: at the queue level the
+    // per-worker reason set is a UNION across every claimable task, so the
+    // sibling non-CB task legitimately adds `rate_limit_exhausted` here — the
+    // CB-activity suppression is asserted at the per-task endpoint below, where
+    // the CB task is evaluated in isolation.
+    let (status, body) =
+        get_json_with_auth(&app, "/admin/queues/test-queue-cb/eligibility", true).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ineligible = body["ineligible_workers"].as_array().unwrap();
+    let w_cb = ineligible
+        .iter()
+        .find(|w| w["worker_id"] == "worker-cb")
+        .expect("worker-cb should be ineligible");
+    let reasons: Vec<&str> = w_cb["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.contains(&"circuit_open"),
+        "expected circuit_open, got {reasons:?}"
+    );
+    // Never left with an empty/unknown impediment set for the open-circuit cause.
+    assert!(!reasons.contains(&"unknown"), "got {reasons:?}");
+    // The worker must be absent from the eligible list.
+    let eligible = body["eligible_workers"].as_array().unwrap();
+    assert!(!eligible.iter().any(|w| w["worker_id"] == "worker-cb"));
+    assert_eq!(body["summary"]["diagnosis"], "no_eligible_workers");
+
+    // Per-task endpoint for the CB task: evaluated in isolation, worker-cb
+    // reports `circuit_open` and NOT `rate_limit_exhausted` — the #369
+    // suppression (Fix 6).
+    let (status_cb, body_cb) =
+        get_json_with_auth(&app, format!("/admin/tasks/{cb_task_id}/eligibility"), true).await;
+    assert_eq!(status_cb, StatusCode::OK);
+    let ineligible_cb = body_cb["ineligible_workers"].as_array().unwrap();
+    let w_cb_task = ineligible_cb
+        .iter()
+        .find(|w| w["worker_id"] == "worker-cb")
+        .expect("worker-cb should be ineligible for the CB task");
+    let cb_reasons: Vec<&str> = w_cb_task["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        cb_reasons.contains(&"circuit_open"),
+        "expected circuit_open for the CB task, got {cb_reasons:?}"
+    );
+    assert!(
+        !cb_reasons.contains(&"rate_limit_exhausted"),
+        "rate-limit reason must be suppressed for a CB activity, got {cb_reasons:?}"
+    );
+
+    // Per-task endpoint for the NON-CB task sharing the same key: it correctly
+    // reports `rate_limit_exhausted`, proving the shared bucket is genuinely
+    // saturated (so the CB suppression above is not vacuous).
+    let (status_nc, body_nc) = get_json_with_auth(
+        &app,
+        format!("/admin/tasks/{noncb_task_id}/eligibility"),
+        true,
+    )
+    .await;
+    assert_eq!(status_nc, StatusCode::OK);
+    let ineligible_nc = body_nc["ineligible_workers"].as_array().unwrap();
+    let w_nc_task = ineligible_nc
+        .iter()
+        .find(|w| w["worker_id"] == "worker-cb")
+        .expect("worker-cb should be ineligible for the non-CB task");
+    assert!(
+        w_nc_task["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "rate_limit_exhausted"),
+        "expected rate_limit_exhausted for the non-CB task, got {:?}",
+        w_nc_task["reason_codes"]
+    );
+}
+
+// AC7(c): a genuinely concurrency-capped task reports `concurrency_saturated`
+// and nothing else.
+#[tokio::test]
+async fn test_concurrency_capped_reports_concurrency_saturated_only() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    // A RUNNING task occupying the single slot for key "tenant-x".
+    {
+        let mut conn = pool.get().await.expect("running task connection");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue (
+                id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
+                concurrency_key, concurrency_cap, worker_id
+             ) VALUES (
+                gen_random_uuid(), 'test-queue-conc', 'workflow', '{}'::jsonb, 'RUNNING', 0, 1, NOW(),
+                'tenant-x', 1, 'worker-holding'
+             )",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert running task to saturate concurrency");
+    }
+
+    // The pending task for the same key/cap — saturated, no other impediment.
+    seed_task_detailed(
+        &pool,
+        "test-queue-conc",
+        None,
+        None,
+        None,
+        Some("tenant-x"),
+        Some(1),
+    )
+    .await;
+
+    // Otherwise-eligible worker.
+    register_active_worker_with_build(
+        &pool,
+        "worker-conc",
+        &["test-queue-conc"],
+        &[0],
+        "v1",
+        10,
+        0,
+    )
+    .await;
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-conc"], ShardRouter::single()),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let (status, body) =
+        get_json_with_auth(&app, "/admin/queues/test-queue-conc/eligibility", true).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ineligible = body["ineligible_workers"].as_array().unwrap();
+    let w_conc = ineligible
+        .iter()
+        .find(|w| w["worker_id"] == "worker-conc")
+        .expect("worker-conc should be ineligible");
+    let reasons: Vec<&str> = w_conc["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["concurrency_saturated"],
+        "expected concurrency_saturated and nothing else, got {reasons:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_worker_queue_filtering_for_capable_of() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
@@ -1174,6 +1506,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: Some("gpu = true"),
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1207,6 +1540,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1226,6 +1560,7 @@ async fn test_worker_queue_filtering_for_capable_of() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1266,6 +1601,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: Some("gpu = true"),
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1299,6 +1635,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1318,6 +1655,7 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
             "v1",
             None,
             &matching_labels,
+            0,
         )
         .await
         .unwrap();
@@ -1359,6 +1697,7 @@ async fn test_worker_heartbeat_updates_labels() {
             "v1",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -1371,7 +1710,7 @@ async fn test_worker_heartbeat_updates_labels() {
 
     {
         let mut conn = pool.get().await.unwrap();
-        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json)
+        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json, 0)
             .await
             .unwrap();
         assert_eq!(affected, 1);

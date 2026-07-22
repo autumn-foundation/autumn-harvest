@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn-harvest"
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
@@ -19,7 +19,6 @@ db = [
     "dep:diesel",
     "dep:diesel-async",
     "dep:diesel_migrations",
-    "dep:scoped-futures",
     "dep:tokio-postgres",
 ]
 testing = []
@@ -27,14 +26,26 @@ metrics-rs = ["dep:metrics"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
+# Sandboxed WebAssembly activities (issue #965). Pulls wasmtime + wat only when
+# explicitly enabled; requires the `db` feature (activity events are persisted).
+#
+# EFFECTIVE MSRV: this feature requires Rust >= 1.94 (wasmtime 46's own minimum).
+# The crate's core/default MSRV is 1.88 and is UNAFFECTED: this optional R&D-spike
+# feature is out of the default build and the MSRV CI check (`cargo check
+# --workspace`, default features, never compiles wasmtime). See
+# docs/rnd/wasm-activities-spike.md.
+wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.4.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.5.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+url = "2"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -49,70 +60,32 @@ deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
-scoped-futures = { version = "0.1", optional = true }
-tokio-postgres = { version = "0.7", optional = true }
+# 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
+# downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
+tokio-postgres = { version = "0.7.18", optional = true }
 metrics = { version = "0.24", optional = true }
 schemars = { version = "0.8", optional = true }
+# wasmtime 46's own minimum Rust is 1.94, so the `wasm-activities` feature that
+# enables these has an effective MSRV of 1.94 (the crate's core MSRV stays 1.88).
+wasmtime = { version = "46", optional = true }
+wat = { version = "1", optional = true }
 
 [[test]]
-name = "macros_query_handlers"
-required-features = ["testing"]
+name = "integration"
+path = "tests/integration/mod.rs"
 
+# Property-based (proptest) test suite. Mirrors the `integration` target's
+# single-entry-point convention: `tests/property/mod.rs` includes a module tree.
+# The pure-function suites run under `cargo test -p autumn-harvest
+# --no-default-features` (no DB); db-gated suites (build_routing, dlq) are
+# `#[cfg(feature = "db")]` submodules that only compile in a `db` build.
 [[test]]
-name = "macros_compile_fail"
-required-features = ["testing"]
-
-[[test]]
-name = "external_completion_tests"
-required-features = ["testing"]
+name = "property"
+path = "tests/property/mod.rs"
 
 [[bench]]
 name = "metrics_noop"
 harness = false
-
-[[test]]
-name = "idempotency_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "replayer_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "workflow_test_env_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "dag_unified_tests"
-required-features = ["testing", "unified-dag-execution"]
-
-[[test]]
-name = "replayer_integration_tests"
-required-features = ["testing", "db"]
-
-[[test]]
-name = "scheduler_ha_tests"
-required-features = ["db"]
-
-[[test]]
-name = "scheduler_carryover_tests"
-required-features = ["db", "testing"]
-
-[[test]]
-name = "build_routing_tests"
-required-features = ["db"]
-
-[[test]]
-name = "workflow_handle_tests"
-required-features = ["db"]
-
-[[test]]
-name = "signal_with_start_tests"
-required-features = ["db"]
-
-[[test]]
-name = "typed_stubs_tests"
-required-features = ["db"]
 
 [[example]]
 name = "signal_with_start_webhook"
@@ -122,16 +95,11 @@ required-features = ["db"]
 name = "update_with_start_cart"
 required-features = ["db"]
 
-[[test]]
-name = "cross_workflow_signal_tests"
-required-features = ["db"]
-
-[[test]]
-name = "transactional_activity_tests"
-required-features = ["db"]
-
 [[example]]
 name = "timezone_cron_schedule"
+
+[[example]]
+name = "auto_heartbeat"
 
 [[example]]
 name = "collect_approvals"
@@ -140,28 +108,89 @@ name = "collect_approvals"
 name = "fanout_batch"
 
 [[example]]
+name = "fanout_child_workflows"
+
+[[example]]
 name = "schema_workflow"
 required-features = ["schema"]
 
+[[example]]
+name = "interface_schema_workflow"
+required-features = ["schema"]
+
+[[example]]
+name = "business_metrics"
+
+[[example]]
+name = "sleep_until_renewal_reminder"
+
+[[example]]
+name = "long_lived_entity_deadline"
+
+[[example]]
+name = "cancellable_timer_sla"
+
+[[example]]
+name = "signal_aggregator"
+
+[[example]]
+name = "mutex_ledger"
+
+[[example]]
+name = "activity_interceptor"
+required-features = ["testing"]
+
+[[example]]
+name = "dag_approval_gate"
+required-features = ["unified-dag-execution"]
+
+[[example]]
+name = "dag_data_flow"
+required-features = ["unified-dag-execution"]
+
+[[example]]
+name = "child_with_timeout"
+
+[[example]]
+name = "ctx_info"
+
+[[example]]
+name = "wasm_activity"
+required-features = ["wasm-activities"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-proptest = "1.11.0"
-loom = "0.7.2"
+proptest = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
 schemars = { version = "0.8" }
+# Assemble `.wat` text into `.wasm` bytes in the `wasm-activities` integration
+# tests. Already a (feature-gated) dependency of the crate; a plain dev-dep here
+# so the integration test binaries can build guest modules regardless of feature
+# resolution.
+wat = "1"
 
-[[test]]
-name = "replay_verifier_tests"
-required-features = ["testing"]
+# testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
+# global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out
+# (`#![cfg(not(loom))]`), so hyper-util fails to compile. The loom model target
+# (`tests/loom_models.rs`) never uses testcontainers, so gate it to non-loom
+# builds; the Docker-backed integration tests that DO use it always run under a
+# normal build where `cfg(not(loom))` is true, so this is transparent to them.
+[target.'cfg(not(loom))'.dev-dependencies]
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 
-[[test]]
-name = "payload_cap_tests"
-required-features = ["testing"]
+# loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
+# `cfg(loom)` target dependency rather than `[dev-dependencies]` because the
+# `crate::loom_sync` shim references `loom::sync::*` from the *library* sources
+# (the `SessionSlotRegistry` type alias is production code, not test code), and
+# `[dev-dependencies]` are not available to the normal library build that the
+# `tests/loom_models.rs` integration target links against. Inert (not fetched
+# or compiled) on every normal build. See `docs/testing/loom.md`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
 
 [[bench]]
 name = "replay_bench"

@@ -26,120 +26,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 type HarvestApiApp = axum::Router;
 
@@ -151,7 +40,7 @@ const SIG2: &str = "db timeout after <NUM>ms connecting";
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -208,9 +97,12 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        diesel_async::SimpleAsyncConnection::batch_execute(&mut conn, INIT_SQL)
-            .await
-            .expect("failed to apply harvest migrations to shard database");
+        diesel_async::SimpleAsyncConnection::batch_execute(
+            &mut conn,
+            autumn_harvest::full_migrations_sql(),
+        )
+        .await
+        .expect("failed to apply harvest migrations to shard database");
     }
 
     ((shard0_url, shard1_url), container)
@@ -280,6 +172,8 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         .await
         .expect("failed to connect for execution insert");
     let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name,
         workflow_id: &format!("{workflow_name}-{}", uuid::Uuid::new_v4().simple()),
@@ -290,6 +184,8 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         queue_name: "default",
         execution_timeout: None,
         deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
@@ -304,6 +200,14 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -553,7 +457,7 @@ async fn aggregate_invalid_group_by_returns_400() {
     let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=tenant_id").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"]
+        body["detail"]
             .as_str()
             .unwrap_or("")
             .contains("unknown group_by dimension"),
@@ -569,7 +473,7 @@ async fn aggregate_missing_group_by_returns_400() {
     let (status, body) = get_json(&app, "/dead-letters/aggregate?limit_groups=10").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"]
+        body["detail"]
             .as_str()
             .unwrap_or("")
             .contains("at least one group_by"),
@@ -589,7 +493,7 @@ async fn aggregate_limit_groups_out_of_range_returns_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"]
+        body["detail"]
             .as_str()
             .unwrap_or("")
             .contains("limit_groups"),
@@ -617,4 +521,128 @@ async fn aggregate_merges_counts_across_shards() {
     assert_eq!(counts.get("billing"), Some(&36));
     assert_eq!(counts.get("reporting"), Some(&14));
     assert_eq!(sum_group_counts(groups), 100);
+}
+
+// ---------------------------------------------------------------------------
+// Cause-dimension aggregation (issue #613)
+// ---------------------------------------------------------------------------
+
+fn poison_pill_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::PoisonPill {
+        crash_strikes: 3,
+        last_worker_id: Some("worker-7".to_string()),
+    }
+    .to_string()
+}
+
+fn task_timeout_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::WorkflowTaskTimeout {
+        task_timeout_strikes: 3,
+        timeout_secs: 30,
+    }
+    .to_string()
+}
+
+fn callback_exhausted_error() -> String {
+    autumn_harvest::dlq::DeadLetterReason::CallbackDeliveryExhausted {
+        delivery_id: uuid::Uuid::new_v4(),
+        attempts: 10,
+        last_status: Some(503),
+        target: "https://hooks.example.com/x".to_string(),
+    }
+    .to_string()
+}
+
+/// Seed a 10-row cause fixture with three distinct engine-authored quarantine
+/// reasons plus a plain retry-exhaustion cohort:
+///   `poison_pill` = 4, `workflow_task_timeout` = 2,
+///   `callback_delivery_exhausted` = 1, `retry_exhaustion` (plain) = 3.
+async fn seed_cause_fixture(database_url: &str, shard: i32) {
+    let exec = insert_execution(database_url, shard, "cause_wf").await;
+    insert_dlq_rows(database_url, exec, "a", &poison_pill_error(), 4).await;
+    insert_dlq_rows(database_url, exec, "a", &task_timeout_error(), 2).await;
+    insert_dlq_rows(database_url, exec, "a", &callback_exhausted_error(), 1).await;
+    insert_dlq_rows(database_url, exec, "a", "connection refused", 3).await;
+}
+
+#[tokio::test]
+async fn aggregate_group_by_dlq_reason_orders_by_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+    seed_cause_fixture(&database_url, 0).await;
+
+    let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=dlq_reason").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let groups = body["groups"].as_array().expect("groups array");
+    let counts = counts_by(groups, "dlq_reason");
+    assert_eq!(counts.get("poison_pill"), Some(&4), "counts: {counts:?}");
+    assert_eq!(
+        counts.get("workflow_task_timeout"),
+        Some(&2),
+        "counts: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("callback_delivery_exhausted"),
+        Some(&1),
+        "counts: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("retry_exhaustion"),
+        Some(&3),
+        "counts: {counts:?}"
+    );
+    assert_eq!(sum_group_counts(groups), 10, "reconcile to filtered_total");
+    assert_eq!(body["filtered_total"], 10);
+    // Descending-count ordering: the largest group comes first.
+    assert_eq!(groups[0]["key"]["dlq_reason"], "poison_pill");
+}
+
+#[tokio::test]
+async fn aggregate_group_by_error_class() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_dlq_app(build_test_pool(&database_url));
+    seed_cause_fixture(&database_url, 0).await;
+
+    let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=error_class").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let groups = body["groups"].as_array().expect("groups array");
+    let counts = counts_by(groups, "error_class");
+    assert_eq!(counts.get("PoisonPill"), Some(&4), "counts: {counts:?}");
+    assert_eq!(
+        counts.get("WorkflowTaskTimeout"),
+        Some(&2),
+        "counts: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("CallbackDeliveryExhausted"),
+        Some(&1),
+        "counts: {counts:?}"
+    );
+    // Plain "connection refused" -> normalized leading token "connection".
+    assert_eq!(counts.get("connection"), Some(&3), "counts: {counts:?}");
+    assert_eq!(sum_group_counts(groups), 10);
+}
+
+#[tokio::test]
+async fn aggregate_group_by_dlq_reason_merges_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let app = build_sharded_dlq_app(&shard0_url, &shard1_url);
+
+    seed_cause_fixture(&shard0_url, 0).await;
+    seed_cause_fixture(&shard1_url, 1).await;
+
+    let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=dlq_reason").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], 20, "total sums across shards");
+    assert_eq!(body["filtered_total"], 20);
+
+    let groups = body["groups"].as_array().expect("groups array");
+    let counts = counts_by(groups, "dlq_reason");
+    assert_eq!(counts.get("poison_pill"), Some(&8));
+    assert_eq!(counts.get("workflow_task_timeout"), Some(&4));
+    assert_eq!(counts.get("callback_delivery_exhausted"), Some(&2));
+    assert_eq!(counts.get("retry_exhaustion"), Some(&6));
+    assert_eq!(sum_group_counts(groups), 20);
 }

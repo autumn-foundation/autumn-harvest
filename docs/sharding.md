@@ -80,6 +80,251 @@ The `pending` field shows how many tasks are currently deferred because the key 
 
 The `harvest.concurrency.in_flight` metric (tagged by concurrency key) is emitted by the concurrency sampler at regular intervals. **Note**: the raw key value is tagged on the metric — ensure your key cardinality is bounded (e.g., use `tenant_id`, not `execution_id`) to avoid metric cardinality explosion. See ADR-0001 §7.
 
+### Historical per-tenant usage report (issue #596)
+
+`GET /admin/concurrency` above is strictly **point-in-time**: it answers "how many tasks are in flight for this key right now?" It cannot answer the question every multi-tenant embedder eventually asks finance: "how much did tenant `acme` actually consume last month?" ADR-0001's cardinality rule deliberately keeps `MetricsRecorder` low-cardinality, so that answer cannot come from Prometheus either.
+
+`GET /admin/usage` is the **historical companion** to `/admin/concurrency` — and the supported alternative to querying `harvest_workflow_executions` / `harvest_events` directly, which is an internal schema this project does not guarantee stability for. It aggregates already-durable data over a caller-supplied time window, computed read-only, with no new `WorkflowEvent` variant and no migration.
+
+```
+GET /admin/usage?from=2026-06-01T00:00:00Z&to=2026-07-01T00:00:00Z&group_by=search_attr:tenant_id
+```
+
+`from` and `to` are required (RFC 3339 timestamp or a relative duration like `24h`, measured back from now). `group_by` defaults to `workflow_name`; pass `search_attr:<key>` to bucket by a tenant key already carried in `search_attrs` (e.g. `search_attr:tenant_id`).
+
+Response:
+```json
+{
+  "status": "complete",
+  "from": "2026-06-01T00:00:00Z",
+  "to": "2026-07-01T00:00:00Z",
+  "group_by": "search_attr:tenant_id",
+  "groups": [
+    {
+      "group": "acme",
+      "workflow_starts": 4210,
+      "completed": 4102,
+      "failed": 58,
+      "cancelled": 12,
+      "timed_out": 3,
+      "activity_executions": 51820,
+      "activity_executions_failed": 340,
+      "activity_compute_seconds": 918422.7
+    }
+  ],
+  "unavailable_shards": []
+}
+```
+
+Executions that lack the requested `search_attrs` key are grouped under the literal group `"(unattributed)"` rather than silently dropped.
+
+**Metric semantics** (each unit is counted exactly once, in the window it actually occurred — the chargeback-consistent choice):
+
+- `workflow_starts`: executions whose `started_at` falls in `[from, to]`.
+- `completed` / `failed` / `cancelled` / `timed_out`: derived from the durable terminal events (`WorkflowCompleted`/`WorkflowFailed`/`WorkflowCancelled`/`WorkflowExecutionTimedOut`) whose timestamp falls in `[from, to]`, not the mutable execution row — so a DLQ redrive that clears a `FAILED` row's state never erases a historical failure. `cancelled` additionally excludes a `WorkflowCancelled` event whose execution ended up sealed `TERMINATED` by a genuine `terminate` (which reuses the same event type as a real cancel) — but *not* one sealed `TERMINATED` by a later reset/DAG-retry, which always appends its own `WorkflowResetTerminated` marker, so a reforked-for-retry run doesn't lose its historical cancellation either. `TERMINATED` and `CONTINUED_AS_NEW` are not broken out separately.
+- `activity_executions`: count of dispatch attempts (`ActivityStarted` events) in the window — retries reuse the same activity id but each attempt appends a fresh event, so a 3-attempt activity contributes 3.
+- `activity_executions_failed`: count of terminal `ActivityFailed`/`ActivityTimedOut` events in the window that have a matching `ActivityStarted` (non-final retry attempts emit no event, so this counts exhausted-retry-or-timeout only). The start-match requirement excludes external activities, whose `ActivityTimedOut` can be appended with no `ActivityStarted` at all.
+- `activity_compute_seconds`: for each activity whose terminal event falls in the window, the wall-clock span from that activity's most recent (final-attempt) start to its terminal event, summed. Retry backoff wall time is excluded by construction.
+- Local activities and externally-completed activities are excluded from the activity counters — they never emit `ActivityStarted`, so they're not worker compute.
+
+**Window ceiling**: a `from`/`to` window wider than a configurable ceiling (default 90 days, `HarvestApiState::set_usage_window_ceiling`) is rejected with `400`, naming the ceiling, so an operator cannot accidentally trigger a full-table scan across every shard.
+
+**Shard-aware, no rollup**: like `/admin/concurrency`, `/admin/usage` fans out across every shard and merges. Unlike `GET /workflows/count`, it does **not** roll a long tail into an `other` bucket — a chargeback report that silently drops low-volume tenants would be actively wrong. Choose a bounded-cardinality `group_by` key (a tenant id, not an execution id).
+
+CLI:
+```
+harvest usage --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z --group-by search_attr:tenant_id
+```
+Renders a table by default; pass `--json` for piping.
+
 ### Adding a shard to a deployment that uses per-key concurrency
 
 Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).
+
+---
+
+## Debounce coordination is shard-local (issue #499)
+
+Debounce pending-start records (`harvest_debounce`) are routed to the same shard as the debounce key (via `ShardRouter`), matching the per-key concurrency scope above. All burst admissions for the same `(workflow_name, debounce_key)` pair must land on the same shard for the `UNIQUE (workflow_name, debounce_key)` upsert collapse to work. Cross-shard global debounce coordination is **out of scope**: embedders requiring a global cap should ensure all executions for a given debounce key route to a single shard (see the concurrency routing guidance above).
+
+---
+
+## Per-key activity rate limits are shard-local (issue #699)
+
+Per-key **activity** rate-limit buckets (`dyn-rate:{key_expr}:{resolved}` in `harvest_rate_limit_buckets`, declared via `#[activity(rate_limit(key = "input.tenant_id", rps = …))]`) are enforced **within a shard**, exactly like the per-key concurrency limits and the workflow-start throttle above. An activity dispatched from a workflow runs on that workflow's own shard, so the token bucket for a given `(key_expr, resolved_value)` is consulted on that shard only. Buckets are never coordinated across shards.
+
+**Consequence**: the effective per-tenant RPS across a multi-shard cluster is `per-shard-rate × number-of-shards-the-tenant's-workflows-land-on`. If a tenant's workflows spread across N shards via rendezvous hashing, that tenant's activities can run at up to N × the declared `rps`. Cross-shard global rate coordination is **out of scope** (it would require a coordination service or bounded-inaccuracy gossip, both of which conflict with the Postgres-native design). Embedders needing a true global per-tenant activity cap should route all of a tenant's executions to a single shard (see the concurrency routing guidance above), so every one of that tenant's activities consults the same bucket.
+
+---
+
+## Durable mutex is shard-local (issue #691)
+
+The durable named mutex `ctx.mutex(key).acquire()` (the `harvest_mutex_locks` / `harvest_mutex_waiters` tables) is enforced **within a shard**, exactly the same scope as the per-key concurrency limits above. The lock table, the FIFO waiter queue, and the `pg_advisory_xact_lock` that serializes each acquire/release/reclaim all live on the workflow's own shard, so "at most one holder per key" holds only among executions that resolve to that shard.
+
+**Consequence**: two workflows that must serialize on a shared resource must land on the **same** shard for the mutex to actually serialize them. Route all contending executions for a given lock key to a single shard (see the concurrency routing guidance above) — e.g. derive the mutex key from the same field you shard on. Cross-shard global mutual exclusion is **out of scope** for the same Postgres-native reasons as cross-shard concurrency and rate limits.
+
+---
+
+## Cross-shard keyset pagination for `GET /workflows`
+
+When `page_size` (or `cursor` / `order`) is present on a `GET /workflows` request, the engine performs a **k-way merge** across all shards so the caller sees a single globally-ordered result set without knowing which shard each execution lives on.
+
+### Per-shard query
+
+Each shard receives the same keyset predicate and fetches **`page_size + 1`** rows:
+
+```sql
+SELECT *
+FROM   harvest_workflow_executions
+WHERE  <state/workflow_name/time-range filters>
+  AND  (created_at, id) < ($cursor_created_at, $cursor_id)  -- DESC direction
+       -- or (created_at, id) > ($cursor_created_at, $cursor_id)  -- ASC direction
+ORDER  BY created_at DESC, id DESC                           -- or ASC
+LIMIT  $page_size + 1;
+```
+
+The `idx_harvest_we_created_id` index on `(created_at DESC, id DESC)` makes this an O(log n) index scan regardless of how deep into history the operator has paged.
+
+### K-way merge
+
+Results from all N shards are merged in memory by sorting on the same `(created_at DESC, id)` key. The merged list is then evaluated against the overflow probe:
+
+- If `merged_len > page_size`: a next page exists. Truncate to `page_size`, encode the last kept row as `next_cursor`.
+- If `merged_len <= page_size`: this is the last page. `next_cursor = null`.
+
+### Row budget under N shards
+
+Each shard contributes at most `page_size + 1` rows to the merge, so the total rows read across all shards is at most `N * (page_size + 1)`. With `page_size = 50` and `N = 4` shards that is at most 204 rows read to return 50. The full history is reachable across pages — no execution is ever skipped.
+
+### Cursor correctness across shards
+
+The cursor encodes a concrete `(created_at, id)` pair from the **global** top-`page_size` list, not a per-shard position. When that pair falls on shard 2, shards 0, 1, and 3 use the same `(created_at, id)` anchor to exclude rows they already returned — this is safe because `(created_at, id)` is globally unique across all shards (UUID `id` guarantees this). Inserting new rows mid-pagination on any shard does not cause duplicates or gaps: the keyset anchor is immutable once the cursor is issued.
+
+### Filter interaction
+
+`started_after` / `started_before` apply as `WHERE started_at` predicates on every shard before the keyset filter and ORDER BY, so both filters and pagination compose cleanly in a single per-shard query.
+
+### Index
+
+The additive migration `20260618000000_harvest_workflow_list_keyset_index` creates:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_harvest_we_created_id
+    ON harvest_workflow_executions (created_at DESC, id DESC);
+```
+
+This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and runs automatically with `diesel migration run`.
+
+## Cross-shard typed search-attribute predicates (`search_attr_filter`, issue #506)
+
+The `search_attr_filter=key:op:value` predicates (comparison/set filtering over
+`search_attrs`) are pushed down to **each shard's `WHERE` clause** and the
+matching rows are k-way merged exactly as the keyset pagination path above — the
+predicate is part of the shared per-shard query, so it composes with `state`,
+time-range, `cursor`, `page_size`, and `order` with no extra round-trips and no
+row duplicated or skipped under concurrent inserts.
+
+### Per-shard SQL and index strategy
+
+Every predicate stays on an index path rather than a full per-row scan by
+reusing the existing `idx_harvest_we_search` GIN index
+(`USING GIN (search_attrs)`, default `jsonb_ops`), which supports both `@>`
+(containment) and `?` (key existence):
+
+| `op` | Per-shard predicate | Index leg |
+|------|--------------------|-----------|
+| `eq` | `search_attrs @> '{"key": <typed>}'` | GIN `@>` |
+| `ne` | `search_attrs ? 'key' AND NOT (search_attrs @> '{"key": <typed>}')` | GIN `?` narrows |
+| `gt`/`gte`/`lt`/`lte` | `search_attrs ? 'key' AND jsonb_typeof(search_attrs -> 'key') = 'number' AND (search_attrs ->> 'key')::numeric <op> $val` | GIN `?` narrows, numeric recheck |
+| `in` | `search_attrs ? 'key' AND search_attrs -> 'key' = ANY($vals::jsonb[])` | GIN `?` narrows |
+| `exists` | `search_attrs ? 'key'` | GIN `?` |
+
+The key is always a **bound** parameter (never string-interpolated), so dynamic
+keys are injection-safe; the comparison operator literal comes from a fixed
+internal enum. Because the existing GIN index already covers `@>` and `?`,
+**no new index and no migration are required** — there is no column change to
+`harvest_workflow_executions`, no `harvest_events` change, and no new
+`WorkflowEvent` variant. This index must be present on every shard (it ships in
+the initial `20260409000000_harvest_initial` migration).
+
+### Typed coercion is shard-stable
+
+The value→type coercion (number / boolean / string) is a pure function of the
+predicate text, so every shard derives the identical typed comparison and the
+merged result is deterministic. Numeric comparison matches only number-typed
+stored values; a value stored as a string on one shard is excluded uniformly on
+all shards, never a partial false match.
+
+---
+
+## Adding a Shard — Operational Runbook (issue #522)
+
+Follow this procedure to add a new shard to a live deployment. Each step is safe to stop and retry.
+
+### Step 1 — Provision and migrate
+
+Provision a new Postgres database and run migrations against it:
+
+```bash
+DATABASE_URL=postgres://user:pass@new-shard-host/harvest diesel migration run
+```
+
+### Step 2 — Add to readable_shards
+
+Add the new shard to `readable_shards` (but **not** `writable_shards`) and deploy. The router can now resolve IDs that encode the new shard; nothing writes there yet.
+
+### Step 3 — Wait for readiness gate
+
+Run the shard health check against the new shard:
+
+```bash
+harvest shard health --candidate-shard <shard_id>
+# or
+GET /admin/shards/health?candidate_shard=<shard_id>
+```
+
+Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reason_codes` explaining what is blocking readiness. Three codes are relevant here:
+
+| `reason_code` | Meaning | Resolution |
+|---|---|---|
+| `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** lists this shard in its `shard_assignments`. | Add the shard to each worker's `shard_assignments` config and redeploy. |
+| `worker_queue_uncovered` | No healthy worker covers a required queue on this shard. | Same as above — check queue bindings. |
+| `schema_migration_missing` | The shard is missing required migrations. | Re-run `diesel migration run` against the shard. |
+
+The `no_live_worker` gate is the primary pre-flip readiness gate for issue #522: until at least one `Healthy + Active` worker lists the new shard in its `shard_assignments`, the shard will not report `ready`. This prevents silently stranding work on the new shard.
+
+### Step 4 — Flip writable and verify
+
+Add the new shard to `writable_shards` and deploy. The fleet **automatically drains the newly-writable shard** — no operator intervention is needed. Workers that list the shard in `shard_assignments` will claim and dispatch tasks from it within one `poll_interval`.
+
+```toml
+# Example worker config
+[harvest.worker]
+shard_assignments = [0, 1]   # worker now covers both shards
+```
+
+Once flipped:
+- New workflows begin landing on the shard via rendezvous hash.
+- In-flight workflows on existing shards continue draining through their own worker tasks.
+- Workers assigned to both shards poll each shard's pool independently on every tick, preserving per-shard ACID locality.
+
+### Observing stranded work
+
+The `harvest.shard.stranded_pending` gauge (emitted by the stranded-work sampler on each worker) shows per-shard claimable task counts for shards that have **no live covering worker**:
+
+```promql
+harvest_shard_stranded_pending{shard="1"} > 0
+```
+
+A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × poll_interval`, check `shard_assignments` on the running worker fleet.
+
+### Pre-flip checklist
+
+Before adding a shard to `writable_shards`:
+
+- [ ] `GET /admin/shards/health?candidate_shard=<id>` returns `readiness: "ready"` for the new shard.
+- [ ] No `no_live_worker` reason code present (at least one live worker covers the shard).
+- [ ] `harvest.shard.stranded_pending{shard="<id>"}` is `0` (no backlog from prior test writes).
+- [ ] Schema migrations are applied (`schema_migration_missing` absent).
+
+A `readiness: "degraded"` result with `no_live_worker` in `reason_codes` is the engine's way of saying: "flip cancelled — no worker will claim work on this shard."

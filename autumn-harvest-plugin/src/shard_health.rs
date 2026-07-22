@@ -107,7 +107,37 @@ pub struct ShardSchedulerCoverage {
 pub struct QueueDepthSummary {
     pub total_pending: i64,
     pub by_queue: BTreeMap<String, i64>,
+    /// Distinct constraint requirements among claimable pending tasks, grouped
+    /// by `(queue_name, required_capabilities, required_build_id)` (issue #522
+    /// review). Used by the coverage gate to detect a queued task that no
+    /// covering worker can actually claim — because of its labels OR its build.
+    /// Empty when no pending task carries a capability or build-id constraint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraint_demands: Vec<ConstraintDemand>,
     pub error: Option<String>,
+}
+
+/// A distinct constraint set among claimable pending tasks on a queue
+/// (issue #522 review).
+///
+/// `claim_task` only lets a worker whose labels satisfy `required_capabilities`
+/// AND whose build is eligible for `required_build_id` AND — when the row is
+/// held by an unexpired sticky lease — *is* `sticky_owner` claim the task, so a
+/// covering worker that polls the queue but fails any constraint does not
+/// actually drain it. At least one of the three fields is non-empty (rows with
+/// no constraint are covered by the basic per-queue check).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstraintDemand {
+    pub queue_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_capabilities: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_build_id: Option<String>,
+    /// `Some(worker_id)` when an unexpired sticky lease binds the row to a
+    /// specific worker; only that worker can claim it until the lease expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticky_owner: Option<String>,
+    pub count: i64,
 }
 
 /// Dead-letter count summary for a shard.
@@ -141,8 +171,10 @@ const REASON_SCHEDULER_STALE: &str = "scheduler_stale";
 const REASON_SCHEMA_MIGRATION_MISSING: &str = "schema_migration_missing";
 const REASON_SCHEMA_UNREADABLE: &str = "schema_unreadable";
 const REASON_SHARD_POOL_MISSING: &str = "shard_pool_missing";
-const REASON_SHARD_UNREACHABLE: &str = "shard_unreachable";
+pub(crate) const REASON_SHARD_UNREACHABLE: &str = "shard_unreachable";
 const REASON_STORAGE_POOL_MISSING: &str = "storage_pool_missing";
+const REASON_NO_LIVE_WORKER: &str = "no_live_worker";
+const REASON_QUEUE_DEPTH_UNREADABLE: &str = "queue_depth_unreadable";
 const REASON_WORKER_COVERAGE_UNREADABLE: &str = "worker_coverage_unreadable";
 const REASON_WORKER_HEALTH_STALE: &str = "worker_health_stale";
 const REASON_WORKER_QUEUE_UNCOVERED: &str = "worker_queue_uncovered";
@@ -273,6 +305,150 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
     }
 }
 
+/// Gate readiness when a writable shard has claimable work but no live covering
+/// worker (issue #522). A stale (unresponsive) worker does not count.
+/// Whether an unreadable claimable-queue-depth query should degrade this shard's
+/// readiness (issue #522).
+///
+/// Only writable shards — and candidate shards being evaluated for promotion to
+/// writable — must prove there is no claimable stranded work before reporting
+/// Ready, so only they fail closed when the depth query fails. A read-only shard
+/// takes no new starts and is outside the no-live-worker gate's scope, so an
+/// unreadable depth there is recorded in `error_summary` without blocking.
+fn queue_depth_unreadable_degrades(roles: &[ShardRole], candidate: bool) -> bool {
+    roles.contains(&ShardRole::Writable) || candidate
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_no_live_worker_gate(
+    shard_id: i32,
+    roles: &[ShardRole],
+    candidate: bool,
+    queue_depth: &QueueDepthSummary,
+    workers: &Result<Vec<WorkerRow>, String>,
+    compat: &autumn_harvest::build_routing::BuildCompatibilitySet,
+    reason_codes: &mut Vec<String>,
+    blocking_reasons: &mut Vec<String>,
+) {
+    // Writable shards take new starts, and a candidate shard being evaluated for
+    // promotion to writable must prove the same "no stranded claimable work"
+    // invariant *before* the flip (issue #522 review) — so a candidate that
+    // already has claimable rows (prior test writes, migration validation) with
+    // no covering worker must not report ready. Read-only, non-candidate shards
+    // are outside this gate's scope.
+    if (!roles.contains(&ShardRole::Writable) && !candidate) || queue_depth.total_pending == 0 {
+        return;
+    }
+
+    // The queues that actually have claimable pending tasks.
+    let pending_queues: std::collections::HashSet<&str> = queue_depth
+        .by_queue
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(q, _)| q.as_str())
+        .collect();
+
+    // If worker coverage is unreadable, the worker-readiness path already emits
+    // REASON_WORKER_COVERAGE_UNREADABLE. Bail out here so an unreadable query is
+    // not mistaken for "no worker covers this shard" (a false no_live_worker).
+    let Ok(ws) = workers.as_ref() else {
+        return;
+    };
+
+    // Coverage is per pending queue, not shard-wide (fix #8 + per-queue,
+    // issue #522): a worker assigned to this shard that polls `default` does
+    // not drain pending `email` tasks, so checking that *any* worker covers
+    // *any* pending queue would hide stranded work on an uncovered queue. Flag
+    // when any queue with claimable work lacks a healthy, active, assigned
+    // worker that polls it.
+    let queue_covered = |queue: &str| {
+        ws.iter().any(|w| {
+            worker_assigned_to_shard(w, shard_id)
+                && w.health == WorkerHealth::Healthy
+                && w.worker.status == WorkerStatus::Active.as_str()
+                && w.worker
+                    .queues
+                    .as_array()
+                    .is_some_and(|qs| qs.iter().any(|v| v.as_str() == Some(queue)))
+        })
+    };
+    let mut uncovered: Vec<&str> = pending_queues
+        .iter()
+        .copied()
+        .filter(|q| !queue_covered(q))
+        .collect();
+    if !uncovered.is_empty() {
+        uncovered.sort_unstable();
+        push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
+        blocking_reasons.push(format!(
+            "{} claimable task(s) queued but no live worker assigned to this shard \
+             polls queue(s) [{}]",
+            queue_depth.total_pending,
+            uncovered.join(", ")
+        ));
+    }
+
+    // Constraint-aware coverage (issue #522 review): a worker that polls the
+    // queue may still be unable to claim a pending task because of its
+    // `required_capabilities` (Exact/In label match), its `required_build_id`
+    // (exact / declared-compatible / legacy rule), or an unexpired sticky lease
+    // binding it to a specific owner (only that worker can claim it until the
+    // lease expires). claim_task enforces all three, so e.g. a GPU-only or
+    // v2-only task, or a row leased to a now-stale worker, is stranded even
+    // though `default` looks covered by the per-queue check above. All
+    // constraints are checked against the *same* worker so a task needing
+    // several is not falsely covered by different workers each satisfying only
+    // one. Skip queues already flagged with no covering worker at all to avoid a
+    // duplicate reason for the same demand.
+    let already_uncovered: std::collections::HashSet<&str> = uncovered.iter().copied().collect();
+    let mut uncovered_constraints: Vec<String> = Vec::new();
+    for demand in &queue_depth.constraint_demands {
+        if already_uncovered.contains(demand.queue_name.as_str()) {
+            continue;
+        }
+        // Parse the capability requirements once. `None` ⇒ no label constraint.
+        // An unparseable value is treated as "no label constraint" so the gate
+        // never fabricates a coverage failure from a value it cannot read.
+        let reqs: Option<Vec<autumn_harvest::eligibility::Requirement>> = demand
+            .required_capabilities
+            .as_ref()
+            .and_then(|caps| serde_json::from_value(caps.clone()).ok());
+        let satisfied = ws.iter().any(|w| {
+            worker_assigned_to_shard(w, shard_id)
+                && w.health == WorkerHealth::Healthy
+                && w.worker.status == WorkerStatus::Active.as_str()
+                && w.worker.queues.as_array().is_some_and(|qs| {
+                    qs.iter()
+                        .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
+                })
+                && demand
+                    .sticky_owner
+                    .as_deref()
+                    .is_none_or(|owner| owner == w.worker.worker_id)
+                && compat.is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
+                && reqs.as_ref().is_none_or(|reqs| {
+                    let labels: std::collections::HashMap<String, String> =
+                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    autumn_harvest::eligibility::matches_requirements(reqs, &labels)
+                })
+        });
+        if !satisfied {
+            uncovered_constraints.push(demand.queue_name.clone());
+        }
+    }
+    if !uncovered_constraints.is_empty() {
+        uncovered_constraints.sort_unstable();
+        uncovered_constraints.dedup();
+        push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
+        blocking_reasons.push(format!(
+            "claimable task(s) with capability/build/sticky requirements queued on queue(s) [{}] \
+             but no live worker assigned to this shard can claim them",
+            uncovered_constraints.join(", ")
+        ));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn observe_shard(
     shard_id: i32,
     shard_pool: &DbPool,
@@ -299,7 +475,34 @@ async fn observe_shard(
     let schedules = load_schedule_probes(&mut conn).await;
     let required_queues = required_queues(runtime, schedules.as_deref().ok());
     let workers = load_workers(&mut conn, freshness_window).await;
-    let queue_depth = load_queue_depth(&mut conn).await;
+    let workers_snapshot = workers.clone();
+    // Activity names with a circuit-breaker policy skip the rate-limit gate at
+    // claim, so the queue-depth query must exempt them from its rate-limit
+    // filter to match claim_task. Empty when no runtime or no breakers.
+    let circuit_breaker_activities: Vec<String> = runtime
+        .map(|r| {
+            r.registry()
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec()
+        })
+        .unwrap_or_default();
+    // Registered activity requirements, to back-fill eligibility for activity
+    // rows that left required_capabilities NULL. Empty when no runtime.
+    let activity_requirements = runtime
+        .map(|r| r.registry().activity_requirements_json())
+        .unwrap_or_default();
+    let queue_depth = load_queue_depth(
+        &mut conn,
+        &circuit_breaker_activities,
+        &activity_requirements,
+    )
+    .await;
+    // Build compatibility set for the no_live_worker gate's build-routing check.
+    // On load failure fall back to an empty set (exact-match / legacy rules).
+    let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
+        .await
+        .unwrap_or_default();
     let dlq = load_dlq(&mut conn).await;
 
     let mut blocking_reasons = Vec::new();
@@ -333,6 +536,18 @@ async fn observe_shard(
         error_summary.get_or_insert(error);
     }
 
+    // Gate: writable shard with claimable work but no live covering worker (issue #522).
+    check_no_live_worker_gate(
+        shard_id,
+        &roles,
+        candidate,
+        &queue_depth,
+        &workers_snapshot,
+        &compat,
+        &mut reason_codes,
+        &mut blocking_reasons,
+    );
+
     let scheduler_status = scheduler_coverage(
         runtime,
         schedules.as_deref().ok(),
@@ -356,6 +571,19 @@ async fn observe_shard(
 
     if let Some(error) = &queue_depth.error {
         error_summary.get_or_insert_with(|| error.clone());
+        // An unreadable queue-depth query forces `total_pending` to 0, which
+        // makes `check_no_live_worker_gate` bail and would otherwise let a
+        // writable/candidate shard report Ready (issue #522). In that failure
+        // mode the gate cannot prove there is no claimable stranded work, so
+        // fail closed: degrade readiness rather than attaching the error to an
+        // otherwise-ready row.
+        if queue_depth_unreadable_degrades(&roles, candidate) {
+            push_reason_code(&mut reason_codes, REASON_QUEUE_DEPTH_UNREADABLE);
+            blocking_reasons.push(format!(
+                "claimable queue depth could not be read, so stranded work on this \
+                 shard cannot be ruled out: {error}"
+            ));
+        }
     }
     if let Some(error) = &dlq.error {
         error_summary.get_or_insert_with(|| error.clone());
@@ -423,6 +651,7 @@ fn unavailable_row(
         queue_depth: QueueDepthSummary {
             total_pending: 0,
             by_queue: BTreeMap::new(),
+            constraint_demands: Vec::new(),
             error: Some(error_summary.clone()),
         },
         dlq: DlqSummary {
@@ -729,46 +958,72 @@ fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
         })
 }
 
-#[derive(diesel::QueryableByName)]
-struct QueueDepthRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    queue_name: String,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    depth: i64,
-}
-
-async fn load_queue_depth(conn: &mut AsyncPgConnection) -> QueueDepthSummary {
-    let rows = diesel::sql_query(
-        "SELECT queue_name::TEXT AS queue_name, COUNT(*)::BIGINT AS depth \
-         FROM harvest_task_queue \
-         WHERE state = 'PENDING' \
-           AND scheduled_at <= NOW() \
-         GROUP BY queue_name \
-         ORDER BY queue_name",
+async fn load_queue_depth(
+    conn: &mut AsyncPgConnection,
+    circuit_breaker_activities: &[String],
+    activity_requirements: &std::collections::HashMap<String, serde_json::Value>,
+) -> QueueDepthSummary {
+    // Derive both the per-queue depth and the constraint demands from the single
+    // shared core query, so the basic per-queue coverage check and the
+    // capability/build constraint check see exactly the same claimable rows the
+    // stranded-work sampler sees (issue #522). The query mirrors every claim_task
+    // gate: PAUSED workflow tasks, expired `schedule_to_close_at`, concurrency-cap
+    // saturation, and rate-limit exhaustion (with the circuit-breaker exemption).
+    // A row no worker could claim right now never degrades readiness.
+    let mut demands = match autumn_harvest::queue::claimable_pending_demand_by_queue(
+        conn,
+        circuit_breaker_activities,
     )
-    .load::<QueueDepthRow>(conn)
-    .await;
+    .await
+    {
+        Ok(demands) => demands,
+        Err(error) => {
+            return QueueDepthSummary {
+                total_pending: 0,
+                by_queue: BTreeMap::new(),
+                constraint_demands: Vec::new(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
 
-    rows.map_or_else(
-        |error| QueueDepthSummary {
-            total_pending: 0,
-            by_queue: BTreeMap::new(),
-            error: Some(error.to_string()),
-        },
-        |rows| {
-            let mut total_pending = 0;
-            let mut by_queue = BTreeMap::new();
-            for row in rows {
-                total_pending += row.depth;
-                by_queue.insert(row.queue_name, row.depth);
-            }
-            QueueDepthSummary {
-                total_pending,
-                by_queue,
-                error: None,
-            }
-        },
-    )
+    // Back-fill effective requirements for activity rows that didn't snapshot
+    // required_capabilities (legacy/manual enqueues), mirroring claim_task's
+    // ineligible-activities gate so the constraint check below catches them.
+    autumn_harvest::queue::apply_activity_requirements(&mut demands, activity_requirements);
+
+    let mut total_pending = 0;
+    let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
+    for demand in &demands {
+        total_pending += demand.count;
+        *by_queue.entry(demand.queue_name.clone()).or_default() += demand.count;
+    }
+
+    // Keep only the rows that carry a capability, build-id, OR sticky-lease
+    // constraint; the fully-unconstrained rows are already covered by the basic
+    // per-queue check.
+    let constraint_demands = demands
+        .into_iter()
+        .filter(|d| {
+            d.required_capabilities.is_some()
+                || d.required_build_id.is_some()
+                || d.sticky_owner.is_some()
+        })
+        .map(|d| ConstraintDemand {
+            queue_name: d.queue_name,
+            required_capabilities: d.required_capabilities,
+            required_build_id: d.required_build_id,
+            sticky_owner: d.sticky_owner,
+            count: d.count,
+        })
+        .collect();
+
+    QueueDepthSummary {
+        total_pending,
+        by_queue,
+        constraint_demands,
+        error: None,
+    }
 }
 
 async fn load_dlq(conn: &mut AsyncPgConnection) -> DlqSummary {
@@ -830,7 +1085,19 @@ fn required_queues(
             queues.insert("default".to_string());
         }
         for activity in runtime.registry().activities.values() {
-            if !activity.is_local {
+            // See the matching comment in `preflight::required_queues`: the
+            // two reserved worker-session internal activities dispatch on
+            // the caller-supplied session queue, never `default_queue`.
+            // Synthetic liveness canary (issue #796): the built-in canary
+            // activity has `default_queue: None` but is dispatched on the
+            // probe's target queue (from the workflow input), never
+            // `default_queue` — counting it would inject a phantom `"default"`
+            // required queue and flip a healthy deployment to a missing-worker
+            // readiness failure. See `preflight::required_queues`.
+            if !activity.is_local
+                && !autumn_harvest::is_reserved_session_activity_name(activity.name)
+                && !autumn_harvest::canary::is_reserved_canary_name(activity.name)
+            {
                 queues.insert(activity.default_queue.unwrap_or("default").to_string());
             }
         }
@@ -926,10 +1193,26 @@ fn schedule_count_for_shard(
 ) -> usize {
     let mut count = 0;
     if let Some(runtime) = runtime {
+        // Count a workflow schedule only on the shard that actually owns its
+        // rows, mirroring scheduler::workflow_schedule_shard /
+        // register_workflow_schedules_for_shard: workflow-only schedules route to
+        // the router's default shard, DAG-derived schedules to pick_for_dag.
+        // Without this filter every shard counts every schedule, so an offline
+        // local scheduler monitor on a non-owning shard would degrade readiness
+        // with `scheduler_not_running` for rows that live on another shard
+        // (issue #522 review).
+        let target = ShardId::new(shard_id);
         count += runtime
             .workflow_schedules()
             .iter()
-            .filter(|schedule| !schedule.paused && !matches!(schedule.schedule, Schedule::Manual))
+            .filter(|schedule| {
+                !schedule.paused
+                    && !matches!(schedule.schedule, Schedule::Manual)
+                    && schedule.dag_name.as_deref().map_or_else(
+                        || runtime.router().default_shard(),
+                        |dag| runtime.router().pick_for_dag(dag),
+                    ) == target
+            })
             .count();
         count += runtime
             .dags()
@@ -938,7 +1221,7 @@ fn schedule_count_for_shard(
                 dag.schedule
                     .as_ref()
                     .is_some_and(|schedule| !matches!(schedule, Schedule::Manual))
-                    && runtime.router().pick_for_dag(&dag.name) == ShardId::new(shard_id)
+                    && runtime.router().pick_for_dag(&dag.name) == target
             })
             .count();
     }
@@ -1000,5 +1283,676 @@ mod tests {
         let queues = required_queues(None, Some(&schedules));
 
         assert!(!queues.contains("default"));
+    }
+
+    // -------------------------------------------------------------------------
+    // no_live_worker gate unit tests (issue #522)
+    // -------------------------------------------------------------------------
+
+    fn make_worker_row(shard_id: i32, status: &str, health: WorkerHealth) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: format!("test-worker-{shard_id}"),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(["default"]),
+                shard_assignments: serde_json::json!([shard_id]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: status.to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health,
+            active_task_ids: Vec::new(),
+        }
+    }
+
+    fn pending_queue_depth(total: i64) -> QueueDepthSummary {
+        // Populate by_queue so the queue-intersection check in
+        // check_no_live_worker_gate can match workers that serve "default".
+        let mut by_queue = std::collections::BTreeMap::new();
+        if total > 0 {
+            by_queue.insert("default".to_string(), total);
+        }
+        QueueDepthSummary {
+            total_pending: total,
+            by_queue,
+            constraint_demands: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// An empty build-compatibility set: only exact-build and legacy-worker
+    /// (empty `build_id`) rules apply, matching a deployment with no declared
+    /// cross-build compatibility.
+    fn empty_compat() -> autumn_harvest::build_routing::BuildCompatibilitySet {
+        autumn_harvest::build_routing::BuildCompatibilitySet::default()
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_writable_pending_and_no_covering_worker() {
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should emit no_live_worker when no worker covers the shard"
+        );
+        assert!(!blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_for_candidate_shard_with_uncovered_pending() {
+        // A read-only shard offered as a promotion candidate must prove the
+        // no-stranded-work invariant before the flip (issue #522 review): pending
+        // rows with no covering worker block readiness even though it is not yet
+        // Writable.
+        let roles = vec![ShardRole::Readable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            true, // candidate
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "candidate shard with uncovered pending work should fire no_live_worker"
+        );
+        assert!(!blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_skips_readonly_non_candidate_shard() {
+        // A plain read-only shard that is not a candidate takes no new starts and
+        // is outside this gate's scope — pending rows there do not block.
+        let roles = vec![ShardRole::Readable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false, // not a candidate
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "read-only non-candidate shard should not fire no_live_worker"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn queue_depth_unreadable_degrades_writable_and_candidate_shards() {
+        // Writable shard: must prove no stranded work → fail closed.
+        assert!(queue_depth_unreadable_degrades(
+            &[ShardRole::Writable],
+            false
+        ));
+        // Read-only candidate being evaluated for promotion → fail closed.
+        assert!(queue_depth_unreadable_degrades(
+            &[ShardRole::Readable],
+            true
+        ));
+        // Writable candidate → fail closed.
+        assert!(queue_depth_unreadable_degrades(
+            &[ShardRole::Writable],
+            true
+        ));
+        // Plain read-only, non-candidate shard takes no new starts → not blocking.
+        assert!(!queue_depth_unreadable_degrades(
+            &[ShardRole::Readable],
+            false
+        ));
+        // No roles, non-candidate → not blocking.
+        assert!(!queue_depth_unreadable_degrades(&[], false));
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_healthy_active_worker_covers_shard() {
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(5);
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a healthy active worker covers the shard"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_shard_is_not_writable() {
+        let roles = vec![ShardRole::Readable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire for non-writable shards"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_queue_is_empty() {
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(0);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when there is no pending work"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_stale_worker_covers_shard() {
+        // A stale (unresponsive) worker should not count as "live" coverage.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(3);
+        let stale_worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Stale);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![stale_worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "stale worker should not count as live coverage"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_worker_covers_different_shard() {
+        // A healthy active worker assigned to shard 1 should not cover shard 0.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(3);
+        let worker_on_other_shard =
+            make_worker_row(1, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker_on_other_shard]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0, // checking shard 0
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "worker on different shard should not count as coverage"
+        );
+    }
+
+    fn two_queue_depth(default_pending: i64, email_pending: i64) -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        if default_pending > 0 {
+            by_queue.insert("default".to_string(), default_pending);
+        }
+        if email_pending > 0 {
+            by_queue.insert("email".to_string(), email_pending);
+        }
+        QueueDepthSummary {
+            total_pending: default_pending + email_pending,
+            by_queue,
+            constraint_demands: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_one_pending_queue_is_uncovered() {
+        // Pending work on `default` and `email`; the only worker polls
+        // `default`, so the `email` tasks are stranded even though some
+        // pending work is covered.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = two_queue_depth(3, 2);
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        // make_worker_row already polls only ["default"].
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when a pending queue has no covering worker"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("email") && !r.contains("default")),
+            "blocking reason should name the uncovered queue only: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_every_pending_queue_is_covered() {
+        // Pending work on `default` and `email`; two workers cover them
+        // between them, so no work is stranded.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = two_queue_depth(3, 2);
+        let default_worker =
+            make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let mut email_worker =
+            make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        email_worker.worker.queues = serde_json::json!(["email"]);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![default_worker, email_worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when every pending queue has a covering worker"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    /// Build a `QueueDepthSummary` with one capability-bearing pending task on
+    /// `default` requiring label `gpu = "true"`.
+    fn gpu_queue_depth() -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        by_queue.insert("default".to_string(), 1);
+        QueueDepthSummary {
+            total_pending: 1,
+            by_queue,
+            constraint_demands: vec![ConstraintDemand {
+                queue_name: "default".to_string(),
+                required_capabilities: Some(
+                    serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+                ),
+                required_build_id: None,
+                sticky_owner: None,
+                count: 1,
+            }],
+            error: None,
+        }
+    }
+
+    /// Build a `QueueDepthSummary` with one build-routed pending task on
+    /// `default` requiring build id `v2`.
+    fn build_routed_queue_depth() -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        by_queue.insert("default".to_string(), 1);
+        QueueDepthSummary {
+            total_pending: 1,
+            by_queue,
+            constraint_demands: vec![ConstraintDemand {
+                queue_name: "default".to_string(),
+                required_capabilities: None,
+                required_build_id: Some("v2".to_string()),
+                sticky_owner: None,
+                count: 1,
+            }],
+            error: None,
+        }
+    }
+
+    /// Build a `QueueDepthSummary` with one pending task on `default` held by an
+    /// unexpired sticky lease owned by `worker_id`.
+    fn sticky_queue_depth(owner: &str) -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        by_queue.insert("default".to_string(), 1);
+        QueueDepthSummary {
+            total_pending: 1,
+            by_queue,
+            constraint_demands: vec![ConstraintDemand {
+                queue_name: "default".to_string(),
+                required_capabilities: None,
+                required_build_id: None,
+                sticky_owner: Some(owner.to_string()),
+                count: 1,
+            }],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_capability_requirement_unsatisfied() {
+        // A GPU-only activity is queued on `default`; the only worker polls
+        // `default` but has no `gpu` label, so claim_task would never let it
+        // claim the task — the work is stranded even though `default` looks
+        // covered by the basic per-queue check.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = gpu_queue_depth();
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        // make_worker_row polls ["default"] with empty labels.
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when no worker satisfies the pending task's capabilities"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("capability") && r.contains("default")),
+            "blocking reason should name the capability-uncovered queue: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_capability_requirement_satisfied() {
+        // The same GPU-only activity, but the covering worker carries the
+        // `gpu = "true"` label, so it can claim the task — no stranded work.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = gpu_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.labels = serde_json::json!({"gpu": "true"});
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a covering worker satisfies the capabilities"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_build_requirement_unsatisfied() {
+        // A v2-only task is queued on `default`; the only worker polls `default`
+        // but runs build `v1` with no compatibility declared, so claim_task
+        // would never let it claim the task — stranded even though `default`
+        // looks covered by the basic per-queue check.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = "v1".to_string();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when no worker's build is eligible for the pending task"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("build") && r.contains("default")),
+            "blocking reason should name the build-uncovered queue: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_build_requirement_satisfied() {
+        // The same v2-only task, but the covering worker runs build `v2`, so it
+        // can claim it — no stranded work.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = "v2".to_string();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a covering worker's build is eligible"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_build_compat_declared() {
+        // The v2-only task with only a v1 worker, but a compatibility
+        // declaration (v1 may process v2) makes the worker eligible — mirroring
+        // claim_task's harvest_build_compat lookup.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = "v1".to_string();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut compat = autumn_harvest::build_routing::BuildCompatibilitySet::default();
+        compat.add_declaration("v1", "v2");
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &compat,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a compat declaration makes the worker build-eligible"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_sticky_lease_owner_is_not_covering() {
+        // The pending row is held by an unexpired sticky lease owned by a worker
+        // that is not present (stale/gone). The only live worker on `default`
+        // (test-worker-0) is NOT the owner, so claim_task would not let it claim
+        // the row until the lease expires — the work is stranded.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = sticky_queue_depth("test-worker-stale");
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when the sticky-lease owner is not a live covering worker"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("sticky") && r.contains("default")),
+            "blocking reason should name the sticky-uncovered queue: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_sticky_lease_owner_is_covering() {
+        // The same sticky-leased row, but the lease owner (test-worker-0) is the
+        // live covering worker, so it can claim the row — no stranded work.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = sticky_queue_depth("test-worker-0");
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when the sticky-lease owner is the live covering worker"
+        );
+        assert!(blocking_reasons.is_empty());
     }
 }

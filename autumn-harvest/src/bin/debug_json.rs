@@ -13,6 +13,7 @@ fn main() {
         target: autumn_harvest::types::ExecutionId::new(),
         signal_name: "test".to_string(),
         payload: serde_json::json!({"a": 1}),
+        idempotency_key: None,
     };
     let json_req = serde_json::to_string_pretty(&event_req).unwrap();
     println!("ExternalSignalRequested JSON:");

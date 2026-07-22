@@ -1,0 +1,7 @@
+error: cannot combine the flat `rate_limit_rps`/`rate_limit_burst`/`rate_limit_key` attributes with the nested `rate_limit(...)` form; use one
+ --> tests/compile_fail/rate_limit_flat_and_nested.rs:7:1
+  |
+7 | #[activity(rate_limit_rps = 10, rate_limit(key = "input.tenant_id", rps = 50))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `activity` (in Nightly builds, run with -Z macro-backtrace for more info)

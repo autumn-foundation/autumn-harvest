@@ -36,11 +36,15 @@ Stop at any chapter — each one ends in a runnable state.
 9. [Worker routing and capabilities](09-worker-routing.md) — Queue name partitioning, Build-ID compatibility, and capability labels.
 10. [Operating the service](10-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
 11. [Testing your workflow code](11-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
+12. [Inbound webhooks](12-webhooks.md) — `#[webhook]`, `[security.webhooks]` verification, idempotent dispatch.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 
 ## Where to go next
 
+- **Upgrading.** [`upgrading/0.5.0.md`](../upgrading/0.5.0.md) is the
+  0.4.0 → 0.5.0 upgrade guide — dependency bumps, additive migrations, and the
+  small set of source-breaking / behavior changes to verify against your code.
 - **Reference example.** [`examples/billing-autumn-web/`](../../examples/billing-autumn-web/)
   is a full subscription-checkout integration: outbox → workflow start, saga
   compensation, child workflow, version gate, signal handoff, and a scheduled
@@ -48,6 +52,11 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Standalone runner.** [`examples/standalone-runner/`](../../examples/standalone-runner/)
   shows the engine without `HarvestPlugin` — useful when embedding in a
   non-Autumn service.
+- **Embedded SQLite backend.** [`sqlite-backend.md`](../sqlite-backend.md) is a
+  task-oriented guide to `autumn-harvest-sqlite`, a single-writer, no-server
+  persistence backend for edge / local-first / single-server deployments (its
+  runnable examples live in
+  [`autumn-harvest-sqlite/examples/`](../../autumn-harvest-sqlite/examples/)).
 - **Runbooks.**
   [`audit-trail.md`](../runbooks/audit-trail.md),
   [`external-activity-handoffs.md`](../runbooks/external-activity-handoffs.md),
@@ -60,3 +69,6 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Architecture.**
   [`autumn-workflow-architecture.md`](../autumn-workflow-architecture.md) and the
   [ADRs](../adr/) document the design decisions behind the engine.
+- **Comparison.** [`comparison.md`](../comparison.md) positions harvest against
+  Temporal, DBOS, Inngest, Hatchet, and Restate — every harvest claim linked to
+  shipped evidence, with an honest section on where harvest is behind.

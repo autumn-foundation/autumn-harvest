@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn-harvest"
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
@@ -14,11 +14,20 @@ categories = ["asynchronous", "database"]
 [features]
 unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
 webhooks = ["autumn-harvest/db"]
+# MCP tool exposure for #[workflow(mcp)] workflows (issue #597). Enables
+# autumn-web's MCP layer so HarvestPlugin::mcp_tools() can project workflows
+# as start/status/signal/update/watch tools via AppBuilder::mount_mcp.
+mcp = ["autumn-web/mcp"]
+# Built-in Prometheus scrape endpoint (issue #355). Registers Harvest's nine
+# ADR-0001 catalogue metrics as an autumn-web MetricsSource feeding the
+# app's shared /actuator/prometheus endpoint. No new dependency: rendering
+# is done entirely through autumn-web's existing MetricsSource contract.
+metrics = []
 
 
 [dependencies]
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db"] }
-autumn-web = "0.5"
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-web = "0.6"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -33,13 +42,18 @@ diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }
 futures = { workspace = true }
-scoped-futures = "0.1"
 tower = "0.5"
+# Radix-tree route matcher (same crate axum 0.8 uses internally) — the read-only
+# operator role (issue #776) matches a request's nest-stripped path against
+# CLASSIFIED_ROUTES to recover its RouteClass, with correct static-beats-param
+# precedence. MatchedPath is unusable in a nested-router layer (axum #1441).
+matchit = "0.8"
 maud = { version = "0.27", features = ["axum"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-web = { version = "0.6", features = ["test-support", "mcp"] }
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
@@ -47,3 +61,15 @@ tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "mcp_tools_quickstart"
+required-features = ["mcp"]
+
+[[example]]
+name = "webhook_receiver_quickstart"
+required-features = ["webhooks"]
+
+[[example]]
+name = "metrics_scrape_quickstart"
+required-features = ["metrics"]

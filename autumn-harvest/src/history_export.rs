@@ -1,6 +1,7 @@
 //! Export workflow event histories to replay fixtures and Mermaid diagrams.
 
 use crate::event::WorkflowEvent;
+use crate::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use crate::types::ExecutionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,38 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
+
+/// Serde adapter for `Option<chrono::Duration>` as `Option<i64>` milliseconds
+/// (issue #772). `chrono::Duration` (`TimeDelta`) has no serde impl, so the
+/// deadline-aware replay metadata (`execution_timeout`) that both
+/// [`HistoryExportDocument`] and `testing::HistorySnapshot` carry is serialised
+/// as an integer millisecond count — lossless for the `INTERVAL`-backed
+/// `execution_timeout` column and matching the millisecond granularity of the
+/// deadline probe. Both structs use this module so the exported JSON round-trips
+/// into a `HistorySnapshot` verbatim.
+pub(crate) mod opt_duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    // serde `with` dictates the `&Option<T>` signature — `Option<&T>` is not
+    // usable here.
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(
+        value: &Option<chrono::Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .as_ref()
+            .map(chrono::Duration::num_milliseconds)
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<chrono::Duration>, D::Error> {
+        let millis: Option<i64> = Option::deserialize(deserializer)?;
+        Ok(millis.map(chrono::Duration::milliseconds))
+    }
+}
 
 /// Schema identifier for history export documents.
 pub const HISTORY_EXPORT_SCHEMA: &str = "autumn-harvest.history-export";
@@ -96,6 +129,22 @@ pub struct HistoryExportDocument {
     pub version: u32,
     /// Registered workflow handler name.
     pub workflow_name: String,
+    /// The business-level workflow identifier (issue #698), sourced from the
+    /// `harvest_workflow_executions.workflow_id` column. Like `parent_execution_id`
+    /// / `execution_timeout`, it lives in no `WorkflowEvent`, so it must ride the
+    /// top-level export document for an exported history (retention archive /
+    /// offline `replay_from_json`) to replay `ctx.info().workflow_id` without
+    /// false-reporting non-determinism when a workflow branches on it or embeds it
+    /// in an activity input. Serialised at the same top-level name as
+    /// [`testing::HistorySnapshot::workflow_id`], so an exported history round-trips
+    /// into that snapshot verbatim. `None` for a run without an explicit id or a
+    /// legacy export produced before this field. Non-payload operational metadata
+    /// — never redacted. The workflow **type** name rides
+    /// [`workflow_name`](Self::workflow_name).
+    ///
+    /// [`testing::HistorySnapshot::workflow_id`]: crate::testing::HistorySnapshot::workflow_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     /// Workflow execution whose history was exported.
     pub execution_id: ExecutionId,
     /// Shard that owns the execution.
@@ -120,6 +169,41 @@ pub struct HistoryExportDocument {
     /// restore the same ambient headers the workflow saw during live execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_headers: Option<HashMap<String, String>>,
+    /// The execution's `execution_timeout` budget (issue #772), serialised as
+    /// integer milliseconds at the top level so it round-trips into a
+    /// `testing::HistorySnapshot` and the JSON / `harvest-replay` replay path
+    /// threads the deadline-aware continue-as-new budget. `None` for a workflow
+    /// with no execution timeout, or a legacy export produced before this field.
+    /// **Non-payload operational metadata** — never redacted.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration_millis"
+    )]
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
+    /// (issue #772). Serialised at the top level so the JSON replay path can
+    /// compute the deadline against the value the timeout scanner enforces
+    /// rather than the nominal `start + execution_timeout`. `None` when no
+    /// absolute deadline was recorded, or a legacy export. Non-payload
+    /// operational metadata — never redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
+    /// The spawning parent's execution id (issue #698), sourced from the
+    /// `harvest_workflow_executions.parent_id` column. `parent_id` lives in no
+    /// `WorkflowEvent`, so — exactly like `execution_timeout`/`deadline_at` — it
+    /// must ride the top-level export document for a parent-aware child exported
+    /// here (retention archive / offline `replay_from_json`) to replay without
+    /// false-reporting non-determinism when its control flow branches on
+    /// `ctx.info().parent_execution_id`. Serialised at the same top-level name
+    /// as [`testing::HistorySnapshot::parent_execution_id`], so an exported
+    /// history round-trips into that snapshot verbatim. `None` for a top-level
+    /// run or a legacy export produced before this field. Non-payload
+    /// operational metadata — never redacted.
+    ///
+    /// [`testing::HistorySnapshot::parent_execution_id`]: crate::testing::HistorySnapshot::parent_execution_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution_id: Option<ExecutionId>,
 }
 
 /// Input needed to export one workflow execution history.
@@ -127,6 +211,12 @@ pub struct HistoryExportDocument {
 pub struct HistoryExportRequest {
     /// Registered workflow handler name.
     pub workflow_name: String,
+    /// The business-level workflow identifier (issue #698), embedded in the export
+    /// so the JSON / `harvest-replay` replay path threads it into the replayed
+    /// `WorkflowContext`. `None` for a run without an explicit id. Mirrors
+    /// `execution_timeout`/`parent_execution_id`: the value lives in no
+    /// `WorkflowEvent`, so it must be carried explicitly on the request.
+    pub workflow_id: Option<String>,
     /// Workflow execution whose history should be exported.
     pub execution_id: ExecutionId,
     /// Shard that owns the execution.
@@ -146,6 +236,21 @@ pub struct HistoryExportRequest {
     /// the headers are embedded in the export document so replaying the export
     /// restores the same ambient headers the original execution saw.
     pub context_headers: Option<HashMap<String, String>>,
+    /// The execution's `execution_timeout` budget (issue #772), embedded in the
+    /// export so the JSON / `harvest-replay` replay path threads the
+    /// deadline-aware continue-as-new budget. `None` for a workflow with no
+    /// execution timeout.
+    pub execution_timeout: Option<chrono::Duration>,
+    /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
+    /// (issue #772). `None` when no absolute deadline was recorded.
+    pub deadline_at: Option<DateTime<Utc>>,
+    /// The spawning parent's execution id (issue #698), sourced from the
+    /// execution row's `parent_id` column and embedded in the export so the
+    /// JSON / `harvest-replay` replay path threads the child's spawner into the
+    /// replayed `WorkflowContext`. `None` for a top-level run. Mirrors
+    /// `execution_timeout`/`deadline_at`: the value lives in no `WorkflowEvent`,
+    /// so it must be carried explicitly on the request.
+    pub parent_execution_id: Option<ExecutionId>,
 }
 
 /// History export failure modes.
@@ -174,14 +279,59 @@ pub enum HistoryExportError {
 pub fn export_history(
     request: HistoryExportRequest,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
+    let mut outcome = LossyDecodeOutcome::default();
+    export_history_decoded(request, None, &mut outcome)
+}
+
+/// [`export_history`] with an optional read-path payload decoder (issue #608).
+///
+/// Under [`HistoryPayloadPolicy::Full`] with `Some(decoder)`, every exported
+/// event is tolerantly decoded ([`PayloadCodecs::decode_value_lossy`])
+/// **before** the document is assembled and measured, so `max_bytes`
+/// enforcement and `size_limit.actual_bytes` reflect the decoded bytes the
+/// caller actually receives — never a stale pre-decode measurement (PR #936
+/// review): a decoded export that fits is not rejected because its encoded
+/// envelopes were over the limit, and a decoded export that exceeds the limit
+/// is rejected instead of shipping oversized while reporting a smaller size.
+///
+/// The decoder is ignored under [`HistoryPayloadPolicy::Redacted`] — redacted
+/// exports replace payload fields wholesale (envelope included) and must
+/// never materialize plaintext. `None` is byte-identical to
+/// [`export_history`].
+///
+/// `outcome` accumulates decode/marker counts (never content) across calls —
+/// including calls that return [`HistoryExportError`], since decoding has
+/// already happened by then — so callers can audit every decode, even one
+/// whose export was subsequently rejected for size.
+///
+/// # Errors
+///
+/// Same as [`export_history`].
+pub fn export_history_decoded(
+    request: HistoryExportRequest,
+    decoder: Option<&PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
+) -> Result<HistoryExportDocument, HistoryExportError> {
     let max_bytes = request
         .max_bytes
         .unwrap_or(DEFAULT_HISTORY_EXPORT_MAX_BYTES);
-    let events = export_events(&request.events, request.payload_policy)?;
+    let mut events = export_events(&request.events, request.payload_policy)?;
+    if request.payload_policy == HistoryPayloadPolicy::Full
+        && let Some(codecs) = decoder
+    {
+        for event in &mut events {
+            *outcome = outcome.merged(codecs.decode_value_lossy(event));
+        }
+    }
     let mut document = HistoryExportDocument {
         schema: HISTORY_EXPORT_SCHEMA.to_string(),
         version: HISTORY_EXPORT_VERSION,
         workflow_name: request.workflow_name,
+        // Issue #698: business `workflow_id` — non-payload operational metadata,
+        // carried verbatim under BOTH policies (never redacted) so an exported
+        // history round-trips its `workflow_id` into the JSON replay path, exactly
+        // like the deadline/parent metadata below.
+        workflow_id: request.workflow_id,
         execution_id: request.execution_id,
         shard_id: request.shard_id,
         exported_at: request.exported_at,
@@ -205,6 +355,17 @@ pub fn export_history(
         } else {
             request.context_headers
         },
+        // Deadline-aware replay metadata (issue #772) — non-payload operational
+        // fields, carried verbatim under BOTH policies (never redacted) so the
+        // exported history round-trips the deadline budget into the JSON /
+        // `harvest-replay` replay path.
+        execution_timeout: request.execution_timeout,
+        deadline_at: request.deadline_at,
+        // Spawning-parent id (issue #698) — non-payload operational metadata,
+        // carried verbatim under BOTH policies (never redacted) so a parent-aware
+        // child's exported history round-trips its `parent_execution_id` into the
+        // JSON replay path, exactly like the deadline metadata above.
+        parent_execution_id: request.parent_execution_id,
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;
@@ -365,7 +526,9 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowResetTerminated { .. }
                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                 | WorkflowEvent::WorkflowExecutionPaused { .. }
-                | WorkflowEvent::WorkflowExecutionResumed { .. } => {
+                | WorkflowEvent::WorkflowExecutionResumed { .. }
+                | WorkflowEvent::WorkflowRedriven { .. }
+                | WorkflowEvent::WorkflowRetryScheduled { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -376,7 +539,9 @@ impl MermaidExporter {
                 | WorkflowEvent::ActivityHeartbeat { .. } => {
                     self.handle_activity_event(event)?;
                 }
-                WorkflowEvent::TimerStarted { .. } | WorkflowEvent::TimerFired { .. } => {
+                WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerFired { .. }
+                | WorkflowEvent::TimerCancelled { .. } => {
                     self.handle_timer_event(event)?;
                 }
                 WorkflowEvent::ChildWorkflowStarted { .. }
@@ -388,7 +553,8 @@ impl MermaidExporter {
                 }
                 WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::MarkerRecorded { .. }
-                | WorkflowEvent::SideEffectRecorded { .. } => {
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::MutexGranted { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -418,6 +584,11 @@ impl MermaidExporter {
                 | WorkflowEvent::ExternalCancelFailed { .. } => {
                     self.handle_external_cancel_event(event)?;
                 }
+                WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ExternalAwaitResolved { .. }
+                | WorkflowEvent::ExternalAwaitFailed { .. } => {
+                    self.handle_external_await_event(event)?;
+                }
             }
         }
         Ok(())
@@ -431,7 +602,7 @@ impl MermaidExporter {
             WorkflowEvent::WorkflowCompleted { .. } => {
                 writeln!(self.out, "    Note over WF: Workflow Completed")?;
             }
-            WorkflowEvent::WorkflowFailed { error } => {
+            WorkflowEvent::WorkflowFailed { error, .. } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(self.out, "    Note over WF: Workflow Failed: {safe_error}")?;
             }
@@ -486,6 +657,30 @@ impl MermaidExporter {
             }
             WorkflowEvent::WorkflowExecutionResumed { actor, .. } => {
                 writeln!(self.out, "    Note over WF: Resumed by {actor}")?;
+            }
+            WorkflowEvent::WorkflowRedriven {
+                dead_letter_id,
+                reason,
+                ..
+            } => {
+                let detail = reason
+                    .as_deref()
+                    .map(|r| format!(": {}", r.replace('\n', " ").replace('"', "'")))
+                    .unwrap_or_default();
+                writeln!(
+                    self.out,
+                    "    Note over WF: Redriven (dlq: {dead_letter_id}){detail}"
+                )?;
+            }
+            WorkflowEvent::WorkflowRetryScheduled {
+                attempt,
+                retry_exec_id,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Retry Scheduled (attempt: {attempt}, next: {retry_exec_id})"
+                )?;
             }
             _ => unreachable!(),
         }
@@ -580,6 +775,16 @@ impl MermaidExporter {
                 let participant = "Timer";
                 writeln!(self.out, "    {participant}-->>-WF: Timer {timer_id} Fired")?;
             }
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                let participant = "Timer";
+                if self.participants.insert(participant.to_string()) {
+                    writeln!(self.out, "    participant {participant} as Timer")?;
+                }
+                writeln!(
+                    self.out,
+                    "    WF-->>-{participant}: Timer {timer_id} Cancelled"
+                )?;
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -613,7 +818,9 @@ impl MermaidExporter {
                     "    Note right of WF: Child Workflow Completed (ID: {child_id})"
                 )?;
             }
-            WorkflowEvent::ChildWorkflowFailed { child_id, error } => {
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id, error, ..
+            } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(
                     self.out,
@@ -670,6 +877,9 @@ impl MermaidExporter {
             WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
                 let label = name.as_deref().unwrap_or(kind.as_str());
                 writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
+            }
+            WorkflowEvent::MutexGranted { key, .. } => {
+                writeln!(self.out, "    Note over WF: Mutex Acquired: {key}")?;
             }
             _ => unreachable!(),
         }
@@ -855,6 +1065,38 @@ impl MermaidExporter {
         }
         Ok(())
     }
+
+    fn handle_external_await_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalAwaitRequested { await_id, target } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Await Requested → {target} (id: {await_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalAwaitResolved { await_id, .. } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Await Resolved (id: {await_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Await Failed ({reason_code}) (id: {await_id})"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -879,6 +1121,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -926,6 +1169,7 @@ mod tests {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 WorkflowEvent::WorkflowCompleted {
                     output: serde_json::json!({ "ok": true }),
@@ -935,6 +1179,10 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("full export should fit under the limit");
 
@@ -954,6 +1202,136 @@ mod tests {
         assert_eq!(document.event_count, 2);
         assert!(document.status.terminal);
         assert!(!document.size_limit.truncated);
+    }
+
+    /// Issue #772 (Codex P2): a full history export must carry the deadline-aware
+    /// replay metadata (`execution_timeout`/`deadline_at`) at the TOP LEVEL, in
+    /// the same wire shape a `testing::HistorySnapshot` expects, so an exported
+    /// history round-trips into a snapshot and the JSON / `harvest-replay`
+    /// replay path threads the deadline budget.
+    #[test]
+    fn full_export_carries_deadline_metadata_round_tripping_into_a_snapshot() {
+        use crate::types::ExecutionId;
+
+        let exec_id = ExecutionId::new();
+        let timeout = chrono::Duration::seconds(1800);
+        let deadline = Utc::now() + chrono::Duration::seconds(3600);
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "wf".to_string(),
+            execution_id: exec_id,
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!(null),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+            execution_timeout: Some(timeout),
+            deadline_at: Some(deadline),
+            parent_execution_id: None,
+            workflow_id: None,
+        })
+        .expect("full export should fit under the limit");
+
+        assert_eq!(document.execution_timeout, Some(timeout));
+        assert_eq!(document.deadline_at, Some(deadline));
+
+        let json = serde_json::to_string(&document).expect("export should serialize");
+        // The duration serialises as integer milliseconds at the top level.
+        assert!(
+            json.contains("\"execution_timeout\":1800000"),
+            "execution_timeout must serialise as top-level integer millis: {json}"
+        );
+
+        // The exported JSON must deserialise into a HistorySnapshot carrying the
+        // deadline metadata verbatim — this is the exact round-trip the JSON /
+        // `harvest-replay` replay path relies on.
+        let snapshot: crate::testing::HistorySnapshot =
+            serde_json::from_str(&json).expect("export JSON parses as a HistorySnapshot");
+        assert_eq!(snapshot.execution_timeout, Some(timeout));
+        assert_eq!(snapshot.deadline_at, Some(deadline));
+        assert_eq!(snapshot.workflow_name, "wf");
+        assert_eq!(snapshot.execution_id, exec_id);
+    }
+
+    /// Issue #698 (Codex P2): a full history export must carry the spawning
+    /// `parent_execution_id` at the TOP LEVEL — sourced from the row's
+    /// `parent_id` column, present in no `WorkflowEvent` — in the same wire
+    /// shape a `testing::HistorySnapshot` expects, so a parent-aware child
+    /// exported through the DB `export_history` -> `replay_from_json` path
+    /// (retention archive / offline replay) round-trips its parent instead of
+    /// deserialising `None` and false-reporting non-determinism.
+    #[test]
+    fn full_export_carries_parent_execution_id_round_tripping_into_a_snapshot() {
+        use crate::types::ExecutionId;
+
+        let exec_id = ExecutionId::new();
+        let parent = ExecutionId::new();
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "child_wf".to_string(),
+            execution_id: exec_id,
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            events: vec![WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!(null),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: Some(parent),
+            workflow_id: None,
+        })
+        .expect("full export should fit under the limit");
+
+        assert_eq!(document.parent_execution_id, Some(parent));
+
+        let json = serde_json::to_string(&document).expect("export should serialize");
+        assert!(
+            json.contains("\"parent_execution_id\":"),
+            "parent_execution_id must serialise at the top level: {json}"
+        );
+
+        // The exported JSON must deserialise into a HistorySnapshot carrying the
+        // parent verbatim — the exact round-trip the JSON / `harvest-replay`
+        // replay path relies on.
+        let snapshot: crate::testing::HistorySnapshot =
+            serde_json::from_str(&json).expect("export JSON parses as a HistorySnapshot");
+        assert_eq!(snapshot.parent_execution_id, Some(parent));
+        assert_eq!(snapshot.workflow_name, "child_wf");
+        assert_eq!(snapshot.execution_id, exec_id);
+    }
+
+    /// Issue #698 back-compat: an OLD export document JSON that predates the
+    /// top-level `parent_execution_id` field deserialises into a
+    /// `HistorySnapshot` with `parent_execution_id == None` (serde default),
+    /// so legacy archives replay unchanged.
+    #[test]
+    fn legacy_export_without_parent_field_deserialises_to_none() {
+        use crate::types::ExecutionId;
+
+        let exec_id = ExecutionId::new();
+        // Minimal document JSON with NO parent_execution_id / execution_timeout /
+        // deadline_at keys — the shape a pre-#698 / pre-#772 export produced.
+        let json = format!(
+            r#"{{"schema":"autumn-harvest.history-export","version":1,"workflow_name":"legacy_wf","execution_id":"{exec_id}","shard_id":0,"exported_at":"2026-01-01T00:00:00Z","event_count":0,"status":{{"terminal":true,"state":"COMPLETED"}},"payload_policy":"full","size_limit":{{"max_bytes":65536,"actual_bytes":10,"truncated":false,"truncation_behavior":"fail"}},"events":[]}}"#
+        );
+        let snapshot: crate::testing::HistorySnapshot =
+            serde_json::from_str(&json).expect("legacy export JSON parses as a HistorySnapshot");
+        assert_eq!(snapshot.parent_execution_id, None);
+        assert_eq!(snapshot.execution_id, exec_id);
     }
 
     #[test]
@@ -976,6 +1354,7 @@ mod tests {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
@@ -995,14 +1374,18 @@ mod tests {
                     queue: "payments".to_string(),
                     schedule_to_close_secs: 300,
                 },
-                WorkflowEvent::WorkflowFailed {
-                    error: "downstream returned bearer lower-secret".to_string(),
-                },
+                WorkflowEvent::workflow_failed(
+                    "downstream returned bearer lower-secret".to_string(),
+                ),
             ],
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1045,6 +1428,7 @@ mod tests {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 // A custom side_effect that captured a secret in its closure. Pre
                 // #384 this lived under MarkerRecorded.details and was redacted;
@@ -1059,6 +1443,10 @@ mod tests {
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1088,11 +1476,16 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             }],
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(128),
             context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
         })
         .expect_err("oversized full export must fail unless limit is raised");
 
@@ -1133,6 +1526,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_activity_event(&event);
     }
@@ -1146,6 +1540,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_timer_event(&event);
     }
@@ -1159,6 +1554,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_child_workflow_event(&event);
     }
@@ -1172,6 +1568,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_misc_event(&event);
     }
@@ -1185,6 +1582,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_local_activity_event(&event);
     }
@@ -1198,6 +1596,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_external_activity_event(&event);
     }
@@ -1211,7 +1610,237 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_update_event(&event);
+    }
+
+    // ── Codec-envelope-bearing histories (issue #608, PR #936 review) ─────────
+    //
+    // The export handlers load history *raw* (`store::load_history_undecoded`)
+    // so a non-identity codec envelope reaches `export_history` verbatim as an
+    // opaque `Value` inside the event's payload field. These tests pin the two
+    // downstream policy legs: Full passes the envelope through byte-identical
+    // (the read-path decoder — when active — decodes it afterwards), and
+    // Redacted replaces the payload field wholesale, envelope included,
+    // without ever needing a codec.
+
+    fn codec_envelope_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "aes-256-gcm",
+            "data": "bm90LXJlYWwtY2lwaGVydGV4dA==",
+        })
+    }
+
+    #[test]
+    fn full_history_export_preserves_codec_envelopes_verbatim() {
+        use crate::types::ExecutionId;
+
+        let envelope = codec_envelope_fixture();
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "encrypted_flow".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "COMPLETED".to_string(),
+            events: vec![WorkflowEvent::WorkflowCompleted {
+                output: envelope.clone(),
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+        })
+        .expect("an envelope-bearing history must export under Full");
+
+        assert_eq!(
+            document.events[0]["data"]["output"], envelope,
+            "Full export must carry the stored envelope byte-identical — \
+             decoding (or erroring) is the read-path decoder's job, not the export's"
+        );
+    }
+
+    #[test]
+    fn redacted_history_export_replaces_codec_envelopes_without_decoding() {
+        use crate::types::ExecutionId;
+
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "encrypted_flow".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "COMPLETED".to_string(),
+            events: vec![WorkflowEvent::WorkflowCompleted {
+                output: codec_envelope_fixture(),
+            }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Redacted,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+        })
+        .expect("an envelope-bearing history must export under Redacted");
+
+        let json = serde_json::to_string(&document).expect("serialize");
+        assert!(
+            !json.contains("_harvest_codec_envelope") && !json.contains("bm90LXJlYWwt"),
+            "Redacted export must replace the payload field wholesale, envelope included: {json}"
+        );
+        assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
+    }
+
+    // --- issue #608, PR #936 review: `export_history_decoded` runs the
+    // read-path decoder *before* the document is measured, so `max_bytes`
+    // enforcement and `size_limit.actual_bytes` always describe the decoded
+    // bytes the caller actually receives.
+
+    /// Test codec whose decode ignores the stored ciphertext and returns a
+    /// fixed plaintext, so tests can independently size the encoded envelope
+    /// (via the base64 `data` length) and the decoded result.
+    struct FixedPlaintextCodec {
+        plaintext: String,
+    }
+
+    impl crate::payload_codec::PayloadCodec for FixedPlaintextCodec {
+        fn codec_id(&self) -> &'static str {
+            "fixed-plaintext"
+        }
+
+        fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, crate::payload_codec::CodecError> {
+            Ok(raw.to_vec())
+        }
+
+        fn decode(&self, _encoded: &[u8]) -> Result<Vec<u8>, crate::payload_codec::CodecError> {
+            Ok(self.plaintext.clone().into_bytes())
+        }
+    }
+
+    fn fixed_plaintext_registry(plaintext_json: &str) -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.register(std::sync::Arc::new(FixedPlaintextCodec {
+            plaintext: plaintext_json.to_string(),
+        }));
+        codecs
+    }
+
+    fn fixed_plaintext_envelope(encoded_len: usize) -> Value {
+        use base64::Engine as _;
+        serde_json::json!({
+            "_harvest_codec_envelope": 1,
+            "codec_id": "fixed-plaintext",
+            "data": base64::engine::general_purpose::STANDARD.encode(vec![b'x'; encoded_len]),
+        })
+    }
+
+    fn envelope_export_request(envelope: Value, max_bytes: usize) -> HistoryExportRequest {
+        use crate::types::ExecutionId;
+        HistoryExportRequest {
+            workflow_name: "encrypted_flow".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "COMPLETED".to_string(),
+            events: vec![WorkflowEvent::WorkflowCompleted { output: envelope }],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Full,
+            max_bytes: Some(max_bytes),
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+        }
+    }
+
+    #[test]
+    fn decoded_export_exceeding_max_bytes_is_rejected_with_decoded_size() {
+        // Tiny envelope (fits comfortably), huge decoded plaintext (does not).
+        let plaintext = format!("\"{}\"", "a".repeat(8192));
+        let codecs = fixed_plaintext_registry(&plaintext);
+        let request = envelope_export_request(fixed_plaintext_envelope(8), 2048);
+
+        // Sanity: without a decoder the encoded document fits.
+        let mut ignored = LossyDecodeOutcome::default();
+        export_history_decoded(request.clone(), None, &mut ignored)
+            .expect("encoded document must fit under max_bytes");
+        assert!(!ignored.touched(), "no decoder => no decode outcome");
+
+        let mut outcome = LossyDecodeOutcome::default();
+        let error = export_history_decoded(request, Some(&codecs), &mut outcome)
+            .expect_err("decoded document must exceed max_bytes");
+        match error {
+            HistoryExportError::SizeLimitExceeded {
+                actual_bytes,
+                max_bytes,
+            } => {
+                assert_eq!(max_bytes, 2048);
+                assert!(
+                    actual_bytes > 8192,
+                    "actual_bytes must describe the decoded document, \
+                     not the small encoded one: {actual_bytes}"
+                );
+            }
+            other @ HistoryExportError::Serialization(_) => {
+                panic!("expected SizeLimitExceeded, got {other}")
+            }
+        }
+        // The decode happened before the rejection — the outcome survives the
+        // error so callers can still audit it.
+        assert_eq!(outcome.decoded, 1);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[test]
+    fn oversized_envelope_with_small_decoded_form_exports_within_max_bytes() {
+        // Big envelope (over the limit encoded), tiny decoded plaintext.
+        let codecs = fixed_plaintext_registry("\"tiny\"");
+        let request = envelope_export_request(fixed_plaintext_envelope(6000), 4096);
+
+        // Sanity: without a decoder the encoded document is over the limit —
+        // the pre-fix behavior rejected this export outright.
+        let mut ignored = LossyDecodeOutcome::default();
+        export_history_decoded(request.clone(), None, &mut ignored)
+            .expect_err("encoded document must exceed max_bytes");
+
+        let mut outcome = LossyDecodeOutcome::default();
+        let document = export_history_decoded(request, Some(&codecs), &mut outcome)
+            .expect("decoded document fits and must export");
+        assert_eq!(document.events[0]["data"]["output"], "tiny");
+        assert_eq!(outcome.decoded, 1);
+        assert!(
+            document.size_limit.actual_bytes <= 4096,
+            "size accounting must reflect the decoded document: {}",
+            document.size_limit.actual_bytes
+        );
+        // One source of truth: the reported size is the serialized size of
+        // the exact document the caller receives.
+        let serialized = serde_json::to_vec(&document).expect("serialize").len();
+        assert_eq!(document.size_limit.actual_bytes, serialized);
+    }
+
+    #[test]
+    fn redacted_export_ignores_the_decoder_entirely() {
+        let codecs = fixed_plaintext_registry("\"tiny\"");
+        let mut request = envelope_export_request(fixed_plaintext_envelope(64), 64 * 1024);
+        request.payload_policy = HistoryPayloadPolicy::Redacted;
+
+        let mut outcome = LossyDecodeOutcome::default();
+        let document = export_history_decoded(request, Some(&codecs), &mut outcome)
+            .expect("redacted export must succeed");
+        assert!(
+            !outcome.touched(),
+            "Redacted policy must never run the decoder"
+        );
+        let json = serde_json::to_string(&document).expect("serialize");
+        assert!(
+            !json.contains("tiny") && !json.contains("_harvest_codec_envelope"),
+            "Redacted export must contain neither plaintext nor the envelope: {json}"
+        );
+        assert_eq!(document.events[0]["data"]["output"]["redacted"], true);
     }
 }

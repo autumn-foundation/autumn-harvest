@@ -209,12 +209,18 @@ fn two_shard_router() -> ShardRouter {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
+        batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -223,6 +229,7 @@ fn workflow_info() -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -244,6 +251,7 @@ fn activity_info(queue: Option<&'static str>) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -316,6 +324,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[String
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .expect("worker registration should succeed");

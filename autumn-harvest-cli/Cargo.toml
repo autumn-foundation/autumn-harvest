@@ -6,13 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn-harvest"
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
 readme = "../README.md"
 keywords = ["workflow", "durable", "cli", "orchestration", "autumn"]
 categories = ["command-line-utilities", "asynchronous"]
 
 [dependencies]
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.29.0"
 percent-encoding = "2"
@@ -32,6 +32,10 @@ path = "src/bin/harvest_replay.rs"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
 
 [lints]
 workspace = true

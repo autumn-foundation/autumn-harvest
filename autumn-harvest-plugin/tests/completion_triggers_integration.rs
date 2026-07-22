@@ -22,7 +22,9 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::{
+    StartWorkflowParams, start_or_load_workflow_execution, terminate_workflow_execution,
+};
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
@@ -46,132 +48,15 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501010000_harvest_batch_jobs/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260501020000_harvest_batch_processed_ids/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 type HarvestApiApp = axum::Router;
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -210,7 +95,9 @@ async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres
 
     for url in [&shard0_url, &shard1_url] {
         let mut conn = AsyncPgConnection::establish(url).await.unwrap();
-        conn.batch_execute(INIT_SQL).await.unwrap();
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
+            .await
+            .unwrap();
     }
 
     ((shard0_url, shard1_url), container)
@@ -245,49 +132,142 @@ fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "source_wf",
                 module: "tests",
                 handler: test_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_wf",
                 module: "tests",
                 handler: test_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_with_schema_wf",
                 module: "tests",
                 handler: test_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: Some(target_schema_fn),
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            // Workflows exercised by the terminate-trigger test (issue #504):
+            // a source whose force-terminate fires `Terminated` triggers, plus the
+            // two distinct targets the test registers triggers against.
+            WorkflowInfo {
+                mcp: false,
+                name: "term_source_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            WorkflowInfo {
+                mcp: false,
+                name: "on_terminate_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            WorkflowInfo {
+                mcp: false,
+                name: "on_cancel_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -455,8 +435,12 @@ async fn test_trigger_evaluations_same_shard() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -472,7 +456,17 @@ async fn test_trigger_evaluations_same_shard() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -514,6 +508,145 @@ async fn test_trigger_evaluations_same_shard() {
     assert_eq!(target_exec.state, "RUNNING");
 }
 
+/// issue #504: a force-terminate fires `Terminated` completion triggers, NOT
+/// `Cancelled` ones — terminate is distinct from a cooperative cancellation
+/// downstream.
+#[tokio::test]
+async fn test_terminate_fires_terminated_trigger_not_cancelled() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    // A trigger that should fire on terminate, and one that should NOT.
+    let terminated_trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": terminated_trigger_id,
+            "source_workflow_name": "term_source_wf",
+            "terminal_states": ["Terminated"],
+            "target_workflow_name": "on_terminate_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+    let cancelled_trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": cancelled_trigger_id,
+            "source_workflow_name": "term_source_wf",
+            "terminal_states": ["Cancelled"],
+            "target_workflow_name": "on_cancel_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Start a RUNNING source workflow.
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "term_source_wf",
+            workflow_id: "term-source-1",
+            exec_id: source_exec_id,
+            input: json!({"hello": "world"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Force-terminate it. Same-shard trigger targets are started inline within
+    // the terminate transaction, so we can assert synchronously.
+    terminate_workflow_execution(
+        &mut conn,
+        source_exec_id,
+        "operator kill",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .unwrap();
+
+    let source: WorkflowExecution = harvest_workflow_executions::table
+        .find(source_exec_id.as_uuid())
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(source.state, "TERMINATED");
+
+    // The `["Terminated"]` trigger fired: its target run exists.
+    let terminated_target_id = format!(
+        "completion-trigger-{}-{}",
+        terminated_trigger_id, source_exec_id
+    );
+    let terminated_target: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&terminated_target_id))
+        .first(&mut conn)
+        .await
+        .expect("Terminated trigger must fire on a force-terminate");
+    assert_eq!(terminated_target.workflow_name, "on_terminate_wf");
+    assert_eq!(terminated_target.state, "RUNNING");
+
+    // The `["Cancelled"]` trigger did NOT fire: no target run exists.
+    let cancelled_target_id = format!(
+        "completion-trigger-{}-{}",
+        cancelled_trigger_id, source_exec_id
+    );
+    let cancelled_target = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&cancelled_target_id))
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .optional()
+        .unwrap();
+    assert!(
+        cancelled_target.is_none(),
+        "a Cancelled trigger must NOT fire on a force-terminate"
+    );
+}
+
 #[tokio::test]
 async fn test_trigger_input_mapping_static_and_projection() {
     let _lock = TEST_MUTEX
@@ -553,8 +686,12 @@ async fn test_trigger_input_mapping_static_and_projection() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -570,7 +707,17 @@ async fn test_trigger_input_mapping_static_and_projection() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -629,8 +776,12 @@ async fn test_trigger_input_mapping_static_and_projection() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -646,7 +797,17 @@ async fn test_trigger_input_mapping_static_and_projection() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -688,6 +849,299 @@ async fn test_trigger_input_mapping_static_and_projection() {
     assert_eq!(target_exec_proj.input, json!(999));
 }
 
+/// Issue #748 success metric: a failure-routed target receives the source's
+/// terminal-outcome envelope (incl. the failure cause) WITHOUT any
+/// `GET /workflows/{id}` on the source. The `Outcome { projection: None }`
+/// mapping assembles the envelope purely from the recorded execution row.
+///
+/// AC5 (inline/outbox parity) holds here by construction: this is a same-shard
+/// fire, and the identical `target_input` value that lands in the target
+/// execution row is the same one that would populate a cross-shard outbox row
+/// / `DeferredTriggerStart` — the envelope is assembled once at the single
+/// inline mapping site and flows to both paths verbatim.
+#[tokio::test]
+async fn test_outcome_mapping_delivers_failure_cause_to_target() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Failed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Outcome", "data": {"projection": null}}
+        }),
+    )
+    .await;
+
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-outcome",
+            exec_id: source_exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Drive the source to FAILED with a recorded error and a NULL output
+    // (the exact blind-start scenario the feature fixes).
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("FAILED"),
+            harvest_workflow_executions::output.eq(None::<Value>),
+            harvest_workflow_executions::error.eq(Some("payment declined: insufficient funds")),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Failed, None)
+        .await
+        .unwrap();
+
+    let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    // The target's input IS the terminal-outcome envelope — the failure cause
+    // is present, output is null, and the terminal state is carried.
+    assert_eq!(target_exec.input["terminal_state"], json!("FAILED"));
+    assert_eq!(
+        target_exec.input["error"],
+        json!("payment declined: insufficient funds")
+    );
+    assert_eq!(target_exec.input["output"], Value::Null);
+    assert_eq!(
+        target_exec.input["source_workflow_name"],
+        json!("source_wf")
+    );
+    assert_eq!(
+        target_exec.input["source_workflow_id"],
+        json!("source-outcome")
+    );
+    assert_eq!(
+        target_exec.input["source_exec_id"],
+        json!(source_exec_id.to_string())
+    );
+}
+
+/// AC6: an `Outcome` mapping survives the HTTP create → list round trip
+/// intact (adjacently-tagged, `projection` preserved).
+#[tokio::test]
+async fn test_create_trigger_with_outcome_mapping_round_trips() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let trigger_id = uuid::Uuid::new_v4();
+    let (status, created) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Failed", "TimedOut"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Outcome", "data": {"projection": "error"}}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        created["input_mapping"],
+        json!({"type": "Outcome", "data": {"projection": "error"}})
+    );
+
+    let (status, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        list[0]["input_mapping"],
+        json!({"type": "Outcome", "data": {"projection": "error"}})
+    );
+}
+
+/// Issue #748 COMPLETED→output positive branch: a target routed off a
+/// successful source receives the terminal-outcome envelope carrying the
+/// source's recorded output (the `execution.output.as_ref()` arm, gated on
+/// `state == Completed`). This is the complement to
+/// `test_outcome_mapping_delivers_failure_cause_to_target`, which exercises
+/// only the FAILED → `None` output branch.
+#[tokio::test]
+async fn test_outcome_mapping_delivers_output_on_completed_source() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Outcome", "data": {"projection": null}}
+        }),
+    )
+    .await;
+
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-outcome-ok",
+            exec_id: source_exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Drive the source to COMPLETED with a known non-null recorded output and
+    // no error (the positive-branch scenario the envelope carries forward).
+    let source_output = json!({"invoice_total": 4200});
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(source_output.clone())),
+            harvest_workflow_executions::error.eq(None::<String>),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Completed, None)
+        .await
+        .unwrap();
+
+    let target_wf_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_wf_id))
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    // The target's input IS the terminal-outcome envelope: the source output
+    // is carried verbatim, error is null, and the terminal state is COMPLETED.
+    assert_eq!(target_exec.input["output"], source_output);
+    assert_eq!(target_exec.input["error"], Value::Null);
+    assert_eq!(target_exec.input["terminal_state"], json!("COMPLETED"));
+    assert_eq!(
+        target_exec.input["source_workflow_name"],
+        json!("source_wf")
+    );
+    assert_eq!(
+        target_exec.input["source_workflow_id"],
+        json!("source-outcome-ok")
+    );
+    assert_eq!(
+        target_exec.input["source_exec_id"],
+        json!(source_exec_id.to_string())
+    );
+}
+
 #[tokio::test]
 async fn test_trigger_state_matching_and_deduplication() {
     let _lock = TEST_MUTEX
@@ -727,8 +1181,12 @@ async fn test_trigger_state_matching_and_deduplication() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -744,7 +1202,17 @@ async fn test_trigger_state_matching_and_deduplication() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -902,8 +1370,12 @@ async fn test_trigger_cross_shard() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -919,7 +1391,17 @@ async fn test_trigger_cross_shard() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1005,8 +1487,12 @@ async fn test_completion_trigger_via_worker_run() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1022,7 +1508,17 @@ async fn test_completion_trigger_via_worker_run() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1122,8 +1618,12 @@ async fn test_trigger_with_custom_queue() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1139,7 +1639,17 @@ async fn test_trigger_with_custom_queue() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1192,6 +1702,7 @@ async fn test_static_trigger_sync_and_cleanup() {
         target_workflow_name: "target_wf".to_string(),
         input_mapping: autumn_harvest::completion_trigger::InputMapping::Passthrough,
         queue_name: None,
+        condition: None,
     };
 
     // 1. Sync one trigger
@@ -1307,8 +1818,12 @@ async fn test_trigger_outbox_retry_and_sweep() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1324,7 +1839,17 @@ async fn test_trigger_outbox_retry_and_sweep() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1365,6 +1890,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
 
     let sweep_res = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &Some(bad_sharded_pool),
         &[ShardId::new(1)], // sweep targets Shard 1
     )
@@ -1385,6 +1911,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
     // 2. Now run outbox sweep with the correct/working sharded pool
     let sweep_res_success = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &Some(sharded_pool),
         &[ShardId::new(1)],
     )
@@ -1494,12 +2021,15 @@ async fn test_trigger_cross_shard_queue_preservation() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 10,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     autumn_harvest::register_workflow_schedules(&mut conn0, &[ws])
         .await
@@ -1520,8 +2050,12 @@ async fn test_trigger_cross_shard_queue_preservation() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1537,7 +2071,17 @@ async fn test_trigger_cross_shard_queue_preservation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1666,6 +2210,7 @@ async fn test_trigger_compensating_rollback_restores_existing() {
                 input_mapping: json!({"type": "Passthrough"}),
                 queue_name: None,
                 is_static: false,
+                condition: None,
             })
             .execute(&mut conn)
             .await
@@ -1795,6 +2340,7 @@ async fn test_exact_pool_routing_cross_shard() {
             input_mapping: json!({"type": "Passthrough"}),
             queue_name: None,
             is_static: false,
+            condition: None,
         })
         .execute(&mut conn0)
         .await
@@ -1838,14 +2384,15 @@ async fn test_exact_pool_routing_cross_shard() {
 
     let sweep_count = enforce_completion_triggers_outbox(
         &mut conn0,
+        &autumn_harvest::telemetry::NoOpMetrics,
         &incomplete_sharded_pool,
         &[ShardId::new(0), ShardId::new(1)],
     )
     .await
     .unwrap();
 
-    // Verify it processed the row (returned count 1, or 1 task was loaded)
-    assert_eq!(sweep_count, 1);
+    // Verify it processed the row (returned count 0 since task was skipped/not processed)
+    assert_eq!(sweep_count, 0);
 
     // Verify outbox row STILL exists in Shard 0 (it was skipped because Shard 1 pool was unavailable!)
     let outbox_rows_after = outbox_dsl::harvest_completion_trigger_outbox
@@ -1868,6 +2415,52 @@ async fn test_runner_startup_fails_on_sync_failure() {
     let bad_pool = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
 
     let built = autumn_harvest::HarvestBuilder::new()
+        .workflows(vec![
+            autumn_harvest::info::WorkflowInfo {
+                mcp: false,
+                name: "source",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            autumn_harvest::info::WorkflowInfo {
+                mcp: false,
+                name: "target",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+        ])
         .completion_triggers(vec![
             autumn_harvest::completion_trigger::CompletionTrigger {
                 id: uuid::Uuid::new_v4(),
@@ -1876,6 +2469,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 target_workflow_name: "target".to_string(),
                 input_mapping: autumn_harvest::completion_trigger::InputMapping::Passthrough,
                 queue_name: None,
+                condition: None,
             },
         ])
         .build();
@@ -1892,6 +2486,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(bad_pool),
     )
@@ -1945,8 +2540,12 @@ async fn test_trigger_evaluations_schema_validation() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -1962,7 +2561,17 @@ async fn test_trigger_evaluations_schema_validation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -2016,8 +2625,12 @@ async fn test_trigger_evaluations_schema_validation() {
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -2033,7 +2646,17 @@ async fn test_trigger_evaluations_schema_validation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .unwrap();
@@ -2068,4 +2691,654 @@ async fn test_trigger_evaluations_schema_validation() {
         .optional()
         .unwrap();
     assert!(target_exec_invalid.is_none());
+}
+
+/// AC #6 (issue #517): a per-trigger fire counter/metric
+/// (`harvest.completion_trigger.fires{trigger, outcome}`) is emitted so
+/// operators can confirm wiring. This drives the completion path twice and
+/// asserts the recorder observes `started` on the first evaluation and
+/// `deduped` on the (idempotent) second evaluation, both tagged with the
+/// trigger id.
+#[tokio::test]
+async fn test_trigger_emits_fire_metric_outcomes() {
+    // Minimal capturing MetricsRecorder — records only the completion-trigger
+    // fire outcomes (all other trait methods keep their no-op defaults).
+    #[derive(Default)]
+    struct CapturingMetrics {
+        fires: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl autumn_harvest::telemetry::MetricsRecorder for CapturingMetrics {
+        fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
+            self.fires
+                .lock()
+                .unwrap()
+                .push((trigger_id.to_string(), outcome.to_string()));
+        }
+    }
+
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Start + complete a source workflow.
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-metric",
+            exec_id: source_exec_id,
+            input: json!({"hello": "metric"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(json!({"result": "done"}))),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let metrics = CapturingMetrics::default();
+
+    // First evaluation: the target is started → outcome "started".
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .unwrap();
+
+    // Second evaluation of the same (source_exec_id, trigger_id): the dedupe
+    // ledger short-circuits → outcome "deduped". No second target is started.
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .unwrap();
+
+    let fires = metrics.fires.lock().unwrap().clone();
+    assert_eq!(
+        fires,
+        vec![
+            (trigger_id.to_string(), "started".to_string()),
+            (trigger_id.to_string(), "deduped".to_string()),
+        ],
+        "expected one `started` then one `deduped` fire metric for the trigger, got {fires:?}"
+    );
+
+    // Belt-and-suspenders: exactly one target execution exists despite two evals.
+    let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_count: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(target_count, 1);
+}
+
+// ─── issue #810: output-guarded (conditional) completion triggers ────────────
+
+/// Capturing recorder for both the fires counter and the new skip counter.
+#[derive(Default)]
+struct GuardCapturingMetrics {
+    fires: std::sync::Mutex<Vec<(String, String)>>,
+    skips: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for GuardCapturingMetrics {
+    fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
+        self.fires
+            .lock()
+            .unwrap()
+            .push((trigger_id.to_string(), outcome.to_string()));
+    }
+
+    fn record_completion_trigger_skipped(&self, trigger_id: &str, reason: &str) {
+        self.skips
+            .lock()
+            .unwrap()
+            .push((trigger_id.to_string(), reason.to_string()));
+    }
+}
+
+async fn start_and_complete_source(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    output: Value,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(output)),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .unwrap();
+    exec_id
+}
+
+async fn load_fire_row(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+    trigger_id: uuid::Uuid,
+) -> Option<autumn_harvest::models::CompletionTriggerFireDb> {
+    use autumn_harvest::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
+    fires_dsl::harvest_completion_trigger_fires
+        .filter(fires_dsl::source_exec_id.eq(source_exec_id.as_uuid()))
+        .filter(fires_dsl::trigger_id.eq(trigger_id))
+        .select(autumn_harvest::models::CompletionTriggerFireDb::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .unwrap()
+}
+
+async fn target_exec_count(
+    conn: &mut AsyncPgConnection,
+    trigger_id: uuid::Uuid,
+    source_exec_id: ExecutionId,
+) -> i64 {
+    let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .count()
+        .get_result(conn)
+        .await
+        .unwrap()
+}
+
+/// AC1/AC3/AC4/AC5 (issue #810): a guarded trigger fires when the condition
+/// is met, skips (recorded + metered, exactly-once) when unmet or the path is
+/// missing, and a co-registered unconditional trigger keeps byte-identical
+/// legacy behavior throughout.
+#[tokio::test]
+async fn test_condition_gate_fire_skip_and_exactly_once() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    // Guarded trigger: fire only for amount > 1000.
+    let guarded_id = uuid::Uuid::new_v4();
+    let (status, created) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": guarded_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"},
+            "condition": {
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 1000}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // The registration response echoes the stored condition.
+    assert_eq!(created["condition"]["type"], "GreaterThan");
+
+    // Unconditional (legacy) control trigger on the same source.
+    let legacy_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": legacy_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Guarded trigger referencing a path the output never carries: must skip
+    // cleanly (defined result, never a panic or an error).
+    let missing_path_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": missing_path_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"},
+            "condition": {"type": "Eq", "data": {"path": "nonexistent.field", "value": 1}}
+        }),
+    )
+    .await;
+
+    // ── Source A: condition met (amount 1500 > 1000). ──────────────────────
+    let metrics_a = GuardCapturingMetrics::default();
+    let source_a =
+        start_and_complete_source(&mut conn, "guard-src-a", json!({"amount": 1500})).await;
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_a,
+        TerminalState::Completed,
+        Some(&metrics_a),
+    )
+    .await
+    .unwrap();
+
+    // Guarded + legacy triggers both started their targets; missing-path skipped.
+    assert_eq!(target_exec_count(&mut conn, guarded_id, source_a).await, 1);
+    assert_eq!(target_exec_count(&mut conn, legacy_id, source_a).await, 1);
+    assert_eq!(
+        target_exec_count(&mut conn, missing_path_id, source_a).await,
+        0
+    );
+    // Fired rows record NULL outcome; the missing-path skip records its reason.
+    let fired_row = load_fire_row(&mut conn, source_a, guarded_id)
+        .await
+        .unwrap();
+    assert_eq!(fired_row.outcome, None);
+    let missing_row = load_fire_row(&mut conn, source_a, missing_path_id)
+        .await
+        .unwrap();
+    assert_eq!(missing_row.outcome.as_deref(), Some("condition_unmet"));
+    let skips = metrics_a.skips.lock().unwrap().clone();
+    assert_eq!(
+        skips,
+        vec![(missing_path_id.to_string(), "condition_unmet".to_string())]
+    );
+
+    // ── Source B: condition unmet (amount 500). ─────────────────────────────
+    let metrics_b = GuardCapturingMetrics::default();
+    let source_b =
+        start_and_complete_source(&mut conn, "guard-src-b", json!({"amount": 500})).await;
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_b),
+    )
+    .await
+    .unwrap();
+
+    // Guarded trigger skipped — zero target-side visibility rows — while the
+    // legacy trigger still fired (full backward compatibility).
+    assert_eq!(target_exec_count(&mut conn, guarded_id, source_b).await, 0);
+    assert_eq!(target_exec_count(&mut conn, legacy_id, source_b).await, 1);
+    let skip_row = load_fire_row(&mut conn, source_b, guarded_id)
+        .await
+        .unwrap();
+    assert_eq!(skip_row.outcome.as_deref(), Some("condition_unmet"));
+    let skips_b = metrics_b.skips.lock().unwrap().clone();
+    assert!(
+        skips_b.contains(&(guarded_id.to_string(), "condition_unmet".to_string())),
+        "expected a condition_unmet skip for the guarded trigger, got {skips_b:?}"
+    );
+
+    // ── Redelivery of B's terminal: resolved-skip stays skipped (AC5). ─────
+    let metrics_redeliver = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_redeliver),
+    )
+    .await
+    .unwrap();
+    // Still no target, no second skip metric — the dedupe signal fires instead.
+    assert_eq!(target_exec_count(&mut conn, guarded_id, source_b).await, 0);
+    assert!(metrics_redeliver.skips.lock().unwrap().is_empty());
+    let fires_redeliver = metrics_redeliver.fires.lock().unwrap().clone();
+    assert!(
+        fires_redeliver.contains(&(guarded_id.to_string(), "deduped".to_string())),
+        "expected the redelivered skip to dedupe, got {fires_redeliver:?}"
+    );
+
+    // ── Skip-then-loosen: a `condition_unmet` resolution is FINAL (AC5). ───
+    // Loosening the condition to one B's output would now satisfy and
+    // redelivering the terminal must never late-fire — the resolved-skip row
+    // dedupes exactly like a fire.
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(guarded_id))
+            .set(triggers_dsl::condition.eq(Some(json!({
+                "type": "GreaterThan",
+                "data": {"path": "amount", "value": 100}
+            }))))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let metrics_loosened = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_b,
+        TerminalState::Completed,
+        Some(&metrics_loosened),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        target_exec_count(&mut conn, guarded_id, source_b).await,
+        0,
+        "a skipped terminal must never late-fire after a condition edit"
+    );
+    assert!(metrics_loosened.skips.lock().unwrap().is_empty());
+    let fires_loosened = metrics_loosened.fires.lock().unwrap().clone();
+    assert!(
+        fires_loosened.contains(&(guarded_id.to_string(), "deduped".to_string())),
+        "expected the loosened-condition redelivery to dedupe, got {fires_loosened:?}"
+    );
+}
+
+/// issue #810 fail-closed contract: an unparseable stored condition never
+/// fires the target — the skip increments the counter with the distinct
+/// `condition_invalid` reason and the terminal commit never errors. No fires
+/// row is written (mirroring the `validation_failed` precedent), so the pair
+/// is left *unresolved* rather than durably suppressed: a later re-entry into
+/// evaluation re-evaluates it and can still fire once the condition is
+/// repaired — a mixed-version deploy window can never durably resolve the
+/// pair. Note the honest recovery contract (PR #972 review): production has
+/// no scanner that re-visits unresolved pairs, so such a re-entry is NOT
+/// guaranteed — this test invokes evaluation again by hand to pin that a
+/// re-entry, when one happens, is never wedged by the earlier skip.
+#[tokio::test]
+async fn test_invalid_stored_condition_fails_closed() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Corrupt the stored condition directly (bypasses both registration
+    // validators, simulating a row written by a different/newer build).
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(trigger_id))
+            .set(triggers_dsl::condition.eq(Some(json!({"type": "Regex", "data": {}}))))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    let metrics = GuardCapturingMetrics::default();
+    let source = start_and_complete_source(&mut conn, "guard-src-invalid", json!({"x": 1})).await;
+    evaluate_triggers_for_execution(&mut conn, source, TerminalState::Completed, Some(&metrics))
+        .await
+        .unwrap();
+
+    // No target start, no fires row (the pair stays unresolved, not durably
+    // suppressed), but the skip counter fired with the distinct reason.
+    assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 0);
+    assert!(
+        load_fire_row(&mut conn, source, trigger_id).await.is_none(),
+        "an invalid-condition skip must not write a permanent fires row"
+    );
+    let skips = metrics.skips.lock().unwrap().clone();
+    assert_eq!(
+        skips,
+        vec![(trigger_id.to_string(), "condition_invalid".to_string())]
+    );
+
+    // Manual re-entry after the operator repairs the condition (or the fleet
+    // is upgraded to a build that understands it): the pair is still
+    // re-evaluable and fires normally — never wedged by the earlier skip.
+    // (Production offers no guaranteed re-entry for an already-terminal
+    // execution; this pins the *can still fire* half of the contract.)
+    {
+        use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+        diesel::update(triggers_dsl::harvest_completion_triggers.find(trigger_id))
+            .set(triggers_dsl::condition.eq(Some(
+                json!({"type": "Eq", "data": {"path": "x", "value": 1}}),
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let metrics_fixed = GuardCapturingMetrics::default();
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source,
+        TerminalState::Completed,
+        Some(&metrics_fixed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(target_exec_count(&mut conn, trigger_id, source).await, 1);
+    let fired_row = load_fire_row(&mut conn, source, trigger_id).await.unwrap();
+    assert_eq!(fired_row.outcome, None);
+    assert!(metrics_fixed.skips.lock().unwrap().is_empty());
+}
+
+/// issue #810 registration surface: invalid condition JSON is rejected with a
+/// 400 JSON error — unknown operator, over-cap, and malformed-path all via the
+/// handler's explicit `decode_trigger_condition` (the field rides the request
+/// as raw JSON precisely so axum's typed Json extractor can't surface an
+/// unknown operator as a 422 plain-text rejection) — never silently dropped;
+/// a valid condition round-trips through GET.
+#[tokio::test]
+async fn test_condition_registration_rejects_invalid_with_400() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Unknown operator → 400 (handler-level decode; a typed Json-extractor
+    // field would instead return axum's 422 with a plain-text body).
+    let (status, _) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": {"type": "Regex", "data": {"path": "a", "value": ".*"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Over the nesting-depth cap → 400 (explicit validate()).
+    let mut over_deep = json!({"type": "Exists", "data": {"path": "a"}});
+    for _ in 0..autumn_harvest::MAX_CONDITION_DEPTH {
+        over_deep = json!({"type": "All", "data": [over_deep]});
+    }
+    let (status, body) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": over_deep
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    // Malformed dotted path → 400.
+    let (status, _) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": {"type": "Exists", "data": {"path": "a..b"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nothing was registered by the rejected attempts; a valid guarded
+    // registration lands and the list endpoint echoes the condition.
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list, json!([]));
+    let (status, created) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+            "condition": {"type": "In", "data": {"path": "region", "values": ["EU", "UK"]}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["condition"]["type"], "In");
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["condition"]["data"]["path"], "region");
+
+    // Full-replacement upsert semantics: re-POSTing the same trigger id
+    // WITHOUT a `condition` clears the stored guard (the trigger reverts to
+    // unconditional) — pinned so the documented footgun stays documented-true.
+    let trigger_id = created["id"].as_str().unwrap().to_string();
+    let (status, replaced) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "target_workflow_name": "target_wf",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(replaced["condition"], serde_json::Value::Null);
+    let (_, list) = get_json(&app, "/admin/completion-triggers").await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["condition"], serde_json::Value::Null);
 }

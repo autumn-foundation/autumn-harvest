@@ -14,9 +14,9 @@ description: >
 
 # autumn-harvest — Durable Workflow Engine for Rust
 
-**Repository**: https://github.com/madmax983/autumn-harvest
-**Version**: 0.4.0 | **Edition**: 2024 | **MSRV**: 1.88.0
-**Author**: madmax983
+**Repository**: https://github.com/autumn-foundation/autumn-harvest
+**Version**: 0.5.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Author**: autumn-foundation
 
 autumn-harvest is a Postgres-backed durable workflow engine — Temporal-style semantics
 with a single-Postgres operational footprint. Designed as a companion to autumn-web,

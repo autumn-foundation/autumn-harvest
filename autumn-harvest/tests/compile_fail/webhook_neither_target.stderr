@@ -1,0 +1,5 @@
+error: #[webhook] requires exactly one of `starts = "workflow_name"` or `signals = "workflow_name"`
+ --> tests/compile_fail/webhook_neither_target.rs:5:1
+  |
+5 | fn map_order(_ctx: &WebhookCtx, evt: serde_json::Value) -> Result<WorkflowId, String> {
+  | ^^

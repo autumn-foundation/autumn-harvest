@@ -21,12 +21,19 @@ use syn::{Expr, ItemFn, LitStr, parse::Parser as _};
 struct UpdateAttrs {
     workflow: Option<String>,
     validator: Option<Expr>,
+    /// Opt-in MCP tool exposure for this update (issue #597). Parsed from
+    /// `#[update(workflow = "…", mcp)]` or `mcp = true`.
+    mcp: bool,
+    /// Optional human-readable description for interface discovery (issue #610).
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
     let mut result = UpdateAttrs {
         workflow: None,
         validator: None,
+        mcp: false,
+        description: None,
     };
 
     syn::meta::parser(|meta| {
@@ -38,9 +45,16 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
             let value: Expr = meta.value()?.parse()?;
             result.validator = Some(value);
             Ok(())
+        } else if meta.path.is_ident("mcp") {
+            result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
+            Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `workflow = \"name\"` or `validator = path::to::fn`",
+                "unsupported attribute: expected `workflow = \"name\"`, `validator = path::to::fn`, `mcp`, or `description = \"…\"`",
             ))
         }
     })
@@ -99,6 +113,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_update_handler_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
+
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
@@ -128,6 +148,9 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
         },
     );
+
+    let mcp = attrs.mcp;
+    let mcp_expr = quote! { #mcp };
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -251,6 +274,43 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         let workflow_id = workflow_id.into();
                         let update_args = #serialize_payload;
+                        // Issue #499: a debounced workflow cannot be started through the
+                        // typed client (it can't route to the debounce-key shard or admit
+                        // through the gate); debounce admission is HTTP-only. Reject early.
+                        if let ::std::option::Option::Some(debounce_policy) = Self::info().debounce {
+                            if ::autumn_harvest::debounce::resolve_debounce_key(
+                                debounce_policy.key_expr,
+                                &start_input,
+                            )
+                            .is_some()
+                            {
+                                return ::std::result::Result::Err(
+                                    ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                        "workflow '{0}' has a debounce policy; debounced starts \
+                                         must use the HTTP start route POST /workflows/{0}/start \
+                                         (the typed client cannot express a deferred debounced start)",
+                                        #workflow_simple_name,
+                                    )),
+                                );
+                            }
+                        }
+                        if let ::std::option::Option::Some(batch_policy) = Self::info().batch.as_ref() {
+                            if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                                &batch_policy.key_expr,
+                                &start_input,
+                            )
+                            .is_some()
+                            {
+                                return ::std::result::Result::Err(
+                                    ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                        "workflow '{0}' has an event batching policy; batched starts \
+                                         must use the HTTP start route POST /workflows/{0}/start \
+                                         (the typed client cannot express a deferred batched start)",
+                                        #workflow_simple_name,
+                                    )),
+                                );
+                            }
+                        }
                         let update_id = opts.idempotency_key.as_ref().map_or_else(
                             ::autumn_harvest::types::UpdateId::new,
                             |key| {
@@ -303,6 +363,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ),
                             trace_context: opts.trace_context,
                             max_execution_timeout_ceiling,
+                            // Chain-scoped lifetime cap (issue #617): the typed-stub
+                            // update-with-start does NOT thread the chain cap; it is
+                            // resolved on the HTTP update-with-start route and the
+                            // typed stub's own `start`/`start_with_options` path.
+                            chain_execution_timeout: ::std::option::Option::None,
+                            max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                             concurrency_key,
                             concurrency_limit,
                             update_id,
@@ -317,6 +383,11 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
                                 ::autumn_harvest::chrono::Duration::from_std(d).ok()
                             ),
+                            workflow_retry_policy: Self::info().retry_policy
+                                .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                            max_workflow_attempts_ceiling: client.max_workflow_attempts(),
+                            // Typed stubs already reject debounced workflows up front.
+                            reject_fresh_if_debounced: false,
                         };
                         let _ = client;
                         ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
@@ -378,6 +449,43 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         {
                             let workflow_id = workflow_id.into();
                             let update_args = #serialize_payload;
+                            // Issue #499: a debounced workflow cannot be started through the
+                            // typed client (it can't route to the debounce-key shard or admit
+                            // through the gate); debounce admission is HTTP-only. Reject early.
+                            if let ::std::option::Option::Some(debounce_policy) = Self::info().debounce {
+                                if ::autumn_harvest::debounce::resolve_debounce_key(
+                                    debounce_policy.key_expr,
+                                    &start_input,
+                                )
+                                .is_some()
+                                {
+                                    return ::std::result::Result::Err(
+                                        ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                            "workflow '{0}' has a debounce policy; debounced starts \
+                                             must use the HTTP start route POST /workflows/{0}/start \
+                                             (the typed client cannot express a deferred debounced start)",
+                                            #workflow_simple_name,
+                                        )),
+                                    );
+                                }
+                            }
+                            if let ::std::option::Option::Some(batch_policy) = Self::info().batch.as_ref() {
+                                if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                                    &batch_policy.key_expr,
+                                    &start_input,
+                                )
+                                .is_some()
+                                {
+                                    return ::std::result::Result::Err(
+                                        ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                            "workflow '{0}' has an event batching policy; batched starts \
+                                             must use the HTTP start route POST /workflows/{0}/start \
+                                             (the typed client cannot express a deferred batched start)",
+                                            #workflow_simple_name,
+                                        )),
+                                    );
+                                }
+                            }
                             let update_id = opts.idempotency_key.as_ref().map_or_else(
                                 ::autumn_harvest::types::UpdateId::new,
                                 |key| {
@@ -430,6 +538,12 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ),
                                 trace_context: opts.trace_context,
                                 max_execution_timeout_ceiling,
+                                // Chain-scoped lifetime cap (issue #617): the typed-stub
+                                // update-with-start does NOT thread the chain cap; it is
+                                // resolved on the HTTP update-with-start route and the
+                                // typed stub's own `start`/`start_with_options` path.
+                                chain_execution_timeout: ::std::option::Option::None,
+                                max_workflow_chain_timeout_ceiling: ::std::option::Option::None,
                                 concurrency_key,
                                 concurrency_limit,
                                 update_id,
@@ -444,6 +558,11 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
                                     ::autumn_harvest::chrono::Duration::from_std(d).ok()
                                 ),
+                                workflow_retry_policy: Self::info().retry_policy
+                                    .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                                max_workflow_attempts_ceiling: client.max_workflow_attempts(),
+                                // Typed stubs already reject debounced workflows up front.
+                                reject_fresh_if_debounced: false,
                             };
                             let _ = client;
                             ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
@@ -481,7 +600,19 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 has_validator: #has_validator,
                 handler: __dispatch,
                 validator: #validator_expr,
+                mcp: #mcp_expr,
+                description: #description_expr,
+                arg_schema: ::std::option::Option::None,
+                response_schema: ::std::option::Option::None,
             }
+        }
+
+        /// Returns the [`::autumn_harvest::UpdateHandlerInfo`] for this update.
+        ///
+        /// Chain schema builders at registration, e.g.
+        /// `.updates(vec![#public_info_name().with_schemas::<Arg, Resp>()])`.
+        pub fn #public_info_name() -> ::autumn_harvest::UpdateHandlerInfo {
+            #companion_name()
         }
 
         #impl_block

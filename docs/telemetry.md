@@ -5,7 +5,87 @@ instruments that cover every production-observable aspect of the engine. The
 default implementation (`NoOpMetrics`) is zero-cost; no samples are emitted
 until you register a recorder.
 
-## Quick start with `metrics-exporter-prometheus`
+## Recommended: the built-in scrape endpoint (issue #355)
+
+If you're embedding Harvest via `autumn-harvest-plugin`'s `HarvestPlugin` in
+an autumn-web app, this is the fastest path to a working Prometheus scrape —
+one builder call, no exporter to install, no route to wire, and no new
+dependency (rendering is done entirely through autumn-web's existing
+`MetricsSource` contract):
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.4", features = ["metrics"] }
+```
+
+```rust
+let app = autumn_web::app().plugin(
+    HarvestPlugin::new()
+        .workflows(workflows![onboarding])
+        .activities(activities![send_email])
+        .api("/api/harvest")
+        .with_metrics_scrape(),
+);
+```
+
+`with_metrics_scrape()` registers a `HarvestMetricsRecorder` as both the
+engine's `MetricsRecorder` (via `HarvestBuilder::telemetry`) and an
+autumn-web `MetricsSource` (via `AppBuilder::metrics_source`). The metrics it
+covers then appear on the app's **one, already-shared** `/actuator/prometheus`
+endpoint, alongside the app's own `autumn_http_*` families and any other
+plugin's metrics — there is deliberately no separate, Harvest-owned scrape
+route. This is the "one endpoint for autumn-web apps and their plugins"
+model: every plugin registers its metrics into the same scrape, instead of
+each mounting its own.
+
+```bash
+curl http://localhost:8080/actuator/prometheus
+```
+
+Auth posture is governed entirely by the app's own `[actuator]` config
+(`actuator.prometheus`, profile-aware sensitive-endpoint gating) — the same
+policy that already protects the app's other actuator endpoints, rather than
+a second, Harvest-specific toggle.
+
+**Coverage:** this endpoint aggregates the nine ADR-0001 §7 catalogue
+metrics named in issue #355 (`harvest.workflow.started`,
+`harvest.workflow.duration`, `harvest.activity.duration`,
+`harvest.timer.started`, `harvest.queue.depth`, `harvest.dlq.entries`,
+`harvest.schedule.runs`, `harvest.schedule.skipped`,
+`harvest.retention.deleted`), plus `harvest.queue.oldest_pending_age`,
+`harvest.worker.slots_in_use`/`slots_available`/`slot_target`, and
+`harvest.shard.stranded_pending` — the engine's own background samplers
+already compute these under the same `is_enabled()` gate the nine required
+metrics live behind, so they're implemented too rather than sampled and
+discarded. **It does not back the full starter alert pack**
+(`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
+endpoint never emits (e.g. `harvest_workflow_terminal_total`,
+`harvest_activity_attempts_total`/`retries_total`,
+`harvest_schedule_fire_attempts_total`, `harvest_no_active_workers`). If you
+want the full starter alert pack to work, use the `metrics-rs` adapter
+escape hatch below, which bridges every `MetricsRecorder` method.
+
+**Trade-off:** `autumn_web::actuator::MetricsSource`'s `MetricKind` only
+supports `Counter`/`Gauge` (no histogram variant), so `harvest.workflow.duration`
+and `harvest.activity.duration` are rendered as `_count`/`_sum` counter pairs
+rather than a bucketed histogram. That's enough for an average-latency query
+(`rate(harvest_workflow_duration_sum[5m]) / rate(harvest_workflow_duration_count[5m])`)
+but not for `histogram_quantile(...)`. If you need full bucketed histograms
+(e.g. for the starter alert pack's `harvest_queue_schedule_to_start_high` p99
+alert), OTLP export, or a custom recorder, use the `metrics-rs` adapter
+escape hatch below instead — a fresh `HarvestBuilder::telemetry(...)` call
+(or a second `HarvestPlugin` that never calls `.with_metrics_scrape()`)
+overrides nothing else in your app.
+
+See `autumn-harvest-plugin/examples/metrics_scrape_quickstart.rs` for a
+complete runnable example: `cargo run`, `curl .../actuator/prometheus`, see
+all nine metrics after a single workflow run.
+
+## Escape hatch: `metrics-exporter-prometheus` for full histograms, OTLP, or a custom recorder
+
+Reach for this path if you need bucketed histogram `_bucket` series, OTLP
+push, or you already have a global `metrics`-crate recorder installed for
+app-level metrics.
 
 Enable the in-tree `metrics-rs` adapter in your application's `Cargo.toml`:
 
@@ -20,10 +100,58 @@ Then install an exporter and wire the recorder before starting any workers:
 ```rust
 use autumn_harvest::metrics_rs_adapter::MetricsRsRecorder;
 use autumn_harvest::telemetry::TelemetryConfig;
+use metrics_exporter_prometheus::Matcher;
 use std::sync::Arc;
 
 // 1. Install the Prometheus exporter (do this once at process start).
+//
+//    `metrics-exporter-prometheus` renders every histogram as a Prometheus
+//    *summary* (client-side quantiles) UNLESS you configure explicit bucket
+//    boundaries. The starter alert pack pages on
+//    `histogram_quantile(0.99, rate(harvest_queue_schedule_to_start_bucket[5m]))`,
+//    which only exists when buckets are set — and server-side `_bucket` series
+//    are the only form you can aggregate across replicas.
+//
+//    Scope the seconds-oriented boundaries to the *latency* histograms with
+//    `set_buckets_for_metric` rather than the global `set_buckets`. A global
+//    bucket set is applied to every histogram, including non-duration ones such
+//    as `harvest.workflow.history_size` (durable event counts, soft threshold
+//    10k) and the payload-size histogram (bytes) — seconds buckets would dump
+//    every sample above 600 into `+Inf` and break count/byte dashboards.
+//
+//    NOTE: `Matcher::Full` is matched against the *sanitized* metric name —
+//    `metrics-exporter-prometheus` calls `sanitize_metric_name` before looking up
+//    the per-metric distribution — so the matcher must use the Prometheus form
+//    with underscores (`harvest_queue_schedule_to_start`), NOT the dotted name
+//    registered via the `metrics` macros. A dotted matcher silently fails to match
+//    and the metric falls back to a summary (no `_bucket` series).
+const LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
 metrics_exporter_prometheus::PrometheusBuilder::new()
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_queue_schedule_to_start".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_workflow_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_activity_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    // history-size is a *count* histogram (durable events), not seconds — give
+    // it its own boundaries so it stays usable for count dashboards/alerts.
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_workflow_history_size".into()),
+        &[10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0],
+    )
+    .expect("valid bucket boundaries")
     .install()
     .expect("failed to install Prometheus exporter");
 
@@ -71,6 +199,105 @@ impl MetricsRecorder for MyRecorder {
 
 ---
 
+## Custom workflow/activity metrics (issue #532)
+
+Workflow and activity authors can emit business KPIs ("orders processed",
+"dollars charged") into the same `MetricsRecorder` pipeline the engine uses —
+without standing up a parallel metrics stack or risking double-counting on
+replay.
+
+### API
+
+```rust
+// Inside a #[workflow] function — emission is suppressed during replay:
+#[workflow]
+async fn checkout(ctx: &WorkflowContext, order: Order) -> Result<String, String> {
+    let result = ctx.execute_activity(&charge_card_info(), order.clone()).await?;
+    // Suppressed on every replay cycle; emitted at the live execution frontier.
+    ctx.metrics().counter("orders_processed", 1, &[("tier", &order.tier)]);
+    ctx.metrics().histogram("order_amount_usd", order.amount_usd, &[("tier", &order.tier)]);
+    Ok(result)
+}
+
+// Inside a #[activity] function — always emitted (activities run once per attempt):
+#[activity(start_to_close = "30s")]
+async fn charge_card(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    // Each retry of this activity is a separate execution — each emits once.
+    ctx.metrics().counter("charge_attempts", 1, &[("payment_method", &order.payment_method)]);
+    // … charge logic …
+    Ok("txn-123".to_string())
+}
+```
+
+### Replay safety
+
+Workflow metrics are **suppressed during deterministic replay**
+(`WorkflowContext::is_replaying() == true`). A workflow that has been suspended
+and resumed 50 times will not emit `ctx.metrics()` calls during those 50
+re-invocation cycles the replay engine uses to reconstruct state — only at the
+live execution frontier are metrics emitted. No new `WorkflowEvent` variants are
+produced; the history remains byte-identical whether or not the workflow author
+emits custom metrics.
+
+> **At-least-once in crash-recovery scenarios:** if the worker crashes after a
+> `ctx.metrics()` call but before the *next* event (activity schedule, timer,
+> completion) commits to the database, the task is retried from the same frontier.
+> The replay engine re-runs to that point, finds no new committed history past it,
+> and emits the metric again. This is the same at-least-once behaviour Temporal's
+> own `workflow.GetMetricsHandler()` exhibits. In practice, workflow-task durations
+> are measured in milliseconds, so duplicate emissions are rare transients; design
+> counter dashboards to be idempotent (sum/rate) rather than expecting exact
+> counts.
+
+Activity functions always run exactly once per attempt. Retries are separate
+executions and each emits independently — this is intentional and matches the
+"each attempt counts" semantics activities already have.
+
+### Namespacing
+
+All names are automatically prefixed with `harvest.user.`:
+
+| `ctx.metrics().counter("orders_processed", …)` | emits `harvest.user.orders_processed` |
+|---|---|
+| `ctx.metrics().gauge("queue_depth", …)` | emits `harvest.user.queue_depth` |
+| `ctx.metrics().histogram("latency_ms", …)` | emits `harvest.user.latency_ms` |
+
+Do **not** pass a name that starts with `harvest.` — it is reserved for engine
+metrics and will be rejected with a `tracing::warn!` (the call is dropped, not
+a hard error, so the workflow continues running).
+
+### Label cardinality rule (ADR-0001 §7)
+
+The following label keys are **forbidden** because they carry per-execution
+cardinality that would blow up any metrics backend:
+
+`execution.id`, `activity.id`, `workflow.id`, `harvest.execution.id`,
+`harvest.workflow.id`, `harvest.activity.id`, `idempotency_key`, `run_id`
+
+Using any of these keys logs a `tracing::warn!` and silently drops the metric
+call. Use low-cardinality labels only (e.g. `tier`, `region`, `payment_method`).
+Additional limits: up to 16 labels per call; label keys and metric names up to
+200 characters.
+
+### Zero-overhead when telemetry is off
+
+If no `MetricsRecorder` is configured (the default no-op path), the
+`is_enabled() → false` short-circuit exits before validation, so there is zero
+overhead in the common "telemetry off" case.
+
+### `metrics-rs` bridge
+
+When the `metrics-rs` feature is enabled, the three user-metric methods are
+bridged through `MetricsRsRecorder` using the low-level `metrics::with_recorder`
+API with dynamic names and `Vec<Label>`:
+
+```rust
+// Emits to whatever metrics exporter is installed globally (e.g. Prometheus).
+ctx.metrics().counter("orders_processed", 1, &[("tier", "gold")]);
+```
+
+---
+
 ## Metric catalogue (ADR-0001 §7)
 
 See [`docs/adr/0001-otel-trace-contract.md`](adr/0001-otel-trace-contract.md)
@@ -81,13 +308,50 @@ metric is emitted in the source code.
 |--------|-----------|-----------|
 | `harvest.workflow.started` | Counter | `worker.rs` — `process_workflow_task`, on first live invocation |
 | `harvest.workflow.duration` | Histogram | `worker.rs` — `process_workflow_task`, on executor cycle completion |
-| `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion |
+| `harvest.workflow.timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's per-run `deadline_at` (issue #243) elapses. Labels: `workflow`, `queue` |
+| `harvest.workflow.chain_timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's chain-scoped `chain_deadline_at` (issue #617) elapses. The chain cap is anchored at the first run's start and carried verbatim across every continue-as-new, so this counter — distinct from `harvest.workflow.timeout` — fires when a whole continue-as-new chain (not a single run) outlives its lifetime cap. Labels: `workflow`, `queue`. Both a chain and a run timeout still emit `harvest.workflow.terminal{outcome="timed_out"}`; the chain-vs-run distinction lives only in these two counters |
+| `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
+| `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
+| `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
+| `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); use for retry-storm detection (issue #528) |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
-| `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default) |
+| `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
+| `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — `dispatch_task`, recorded after the concurrency permit is acquired so it captures worker-local backpressure; skew-discounted (issue #501) |
+| `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
+| `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
+| `harvest.worker.slots_in_use` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, periodic (5 s default). Pure in-memory read of the workflow/activity dispatch `Semaphore`s against their configured maxima — no DB access (issue #531) |
+| `harvest.worker.slots_available` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, alongside `slots_in_use`. Invariant: `slots_in_use + slots_available == configured_max` per `slot_type` within one sampler interval (issue #531) |
+| `harvest.workflow.active` | Gauge | `worker.rs` — `spawn_workflow_active_sampler`, periodic (`poll_interval`, 5 s default). Shard-local `COUNT(*) … GROUP BY (workflow_name, state) WHERE state IN ('RUNNING','PAUSED')`, aggregated **across all shards** of the worker's `ShardedDbPool` (summed per `(workflow, state)`) so the population is fleet-wide, not default-shard-only. A read failure skips the whole tick so an outage never false-clears the gauge; drained `(workflow, state)` pairs are zero-filled (issue #770) |
+| `harvest.worker.slot_target` | Gauge | `slot_tuner.rs` — `spawn_slot_tuner_loop`, periodic (`poll_interval`). The adaptive slot tuner's current band-clamped resize target for one slot type; only emitted when `WorkerConfig::with_slot_tuner` is configured (issue #548) |
+| `harvest.worker.tuner_decisions` | Counter | `slot_tuner.rs` — `spawn_slot_tuner_loop`, once per control-loop tick, with the decision that actually took effect after band clamping (issue #548) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
-| `harvest.retention.deleted` | Counter | `retention.rs` — `run_shard_tick`, per tick per shard |
+| `harvest.schedule.overdue` | Gauge | `scheduler.rs` — `sample_overdue_schedules`, emitted per schedule by the worker's overdue sampler (`spawn_schedule_overdue_sampler`, on the `poll_interval` cadence, per shard). `1` when an *active* schedule is past its own cadence grace (`now − next_run_at > cadence step + jitter + tick`), `0` otherwise. Runs on the worker, not the scheduler tick, so a wedged tick cannot suppress its own health signal (issue #696). Paused / auto-paused / manual / exhausted / at-capacity schedules read `0`; deleted schedules go stale (standard gauge property). |
+| `harvest.retention.deleted` | Counter | `retention.rs` — `RetentionRuntime` tick, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type so per-type retention overrides are confirmable (issue #737). `sum(harvest.retention.deleted)` equals the aggregate **workflow-history** deletion count for the tick, excluding orphaned `harvest_completion_deliveries` reclaims (issue #921), which have no workflow to attribute. |
+| `harvest.retention.summary_deleted` | Counter | `retention.rs` — summaries deleted by the tiered-retention summary GC pass, once per workflow type with a real (non-dry-run) deletion; labeled by workflow type. A distinct member of the retention metric family from `harvest.retention.deleted` (history rows), so the two tiers are observable independently (issue #752). |
+| `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
+| `harvest.workflow.start_throttled` | Counter | `api.rs` (HTTP/batch) + `scheduler.rs` (scheduled/buffered fires) — once per workflow start deferred by a start throttle because the per-key token bucket was empty (issue #607) |
+| `harvest.webhook.received` | Counter | `webhook_receiver.rs` — every request that reaches an inbound webhook receiver route, regardless of outcome (issue #344) |
+| `harvest.webhook.rejected` | Counter | `webhook_receiver.rs` — every inbound webhook request rejected: signature/timestamp/replay verification failure, payload parse failure, mapping-function rejection, or missing idempotency key. Never fires for `accepted`/`idempotent_replay` (issue #344) |
+| `harvest.saga.compensated` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_start`), exactly once per real compensation sequence: a non-empty `compensate_all` / step-failure unwind actually running forward (issue #801) |
+| `harvest.saga.compensation_failed` | Counter | `saga.rs` — `run_compensations` (via `WorkflowContext::observe_saga_unwind_failed`), exactly once per unwind ending with ≥1 compensation error — the `SagaCompensationFailed` dangling-state case, counted even when the author catches the error (issue #801) |
+| `harvest.activity.panic` | Counter | `worker.rs` — activity/local-activity dispatch boundary, once per panicking attempt: a `#[activity]` body panic caught via `catch_unwind` and converted to a retryable typed `HandlerPanic` failure, distinct from ordinary `Err` failures and from process-crash quarantine (issue #782) |
+| `harvest.workflow.panic` | Counter | `worker.rs` — `process_workflow_task`, on every panic entry (each bounded re-dispatch and the final terminal failure): a `#[workflow]` body panic caught in the executor and contained under the panic-retry budget (issue #782) |
+| `harvest.canary.roundtrip` | Histogram | `worker.rs` — `process_workflow_task` Completed arm, when the workflow is a built-in synthetic liveness canary (`canary::is_canary_workflow`): wall-clock seconds from start-requested to terminal completion of the throwaway probe workflow. Distinct from the #512 replay canary (issue #796) |
+| `harvest.canary.success` | Counter | `worker.rs` — `process_workflow_task` Completed arm, once per canary probe reaching terminal completion (canary runs emit this **instead of** `harvest.workflow.terminal`, so probes never pollute business SLO counters — AC8) (issue #796) |
+| `harvest.canary.failure` | Counter | `worker.rs` — `process_workflow_task` Failed arm, and `timeout.rs` — `enforce_workflow_execution_timeouts` (a probe that does not complete within its per-probe timeout is a failure, AC6): once per canary probe that did not reach terminal completion (issue #796) |
+| `harvest.completion_trigger.skipped` | Counter | `completion_trigger.rs` — `evaluate_triggers_for_execution`, on output-guard skips (`condition_unmet` = guard evaluated false, once per fresh skip — a redelivered, already-resolved skip records `deduped` on `harvest.completion_trigger.fires` instead; `condition_invalid` = stored condition unparseable/over-cap, fail-closed with no fires row — the fire is lost for that terminal unless evaluation re-enters, so alert on this reason and re-trigger by hand; see docs/completion-triggers.md "Fail-closed on invalid stored conditions"). Best-effort on the operator cancel/terminate and parent-close-cascade paths (no recorder threaded there); the fires-row `outcome` column is the authoritative skip record (issue #810) |
+| `harvest.signal.received` | Counter | `worker.rs` — `process_workflow_task`, once per durably-delivered `SignalReceived` (the live-only `ingest_due_timers_and_signals` choke point, beside the `harvest.signal.deliver` span). Never on replay (issue #684). Labeled `workflow`+`queue` only — the signal name is a span-only attribute, never a metric label (issue #684, Codex P2: free-form send route, no declared registry to bound it) |
+| `harvest.signal.unhandled` | Counter | `worker.rs` — `process_workflow_task`, emitted **post-commit in the `Persisted` arm** (same discipline as `harvest.update.completed/failed`), so it counts **durable terminal outcomes only**. The terminal outcome's `unhandled_signals` map is computed by `drive_workflow` after the #546 push-handler flush and collected before persist; the worker **sums** the per-name map into one increment per unconsumed occurrence against the single `(workflow, queue)` series — the signal name is NOT a metric label (issue #684, Codex P2). Emission is downstream of a successful commit — and therefore of the #603 ND-block gate (`Failed{nd:Some}` early-returns) and `check_paused_and_park` (a claimed-then-paused race returns via `ParkedPaused`, a persist failure via `Err` — neither reaches the emit), so a discarded cycle's retry/resume cannot double-count. Once per delivered signal left unconsumed at a **graceful Completed/Failed** terminal outcome reached through the workflow drive; lost signal-or-deadline races (#476) excluded. **Known limitation: forced-failure / scanner terminal paths are NOT counted** (they have no driven matcher) — `TIMED_OUT`, `CANCELLED`, `TERMINATED`, parent-close cascade, and history-cap failure. For a timed-out stuck run watch `harvest.workflow.timeout` + the stack API instead (issue #684) |
+| `harvest.update.admitted` | Counter | `store.rs` — `admit_update_event`, post-commit, once per durably admitted update (HTTP `admit_update`, Vantage UI, `update_with_start` — the latter emits at its own outer-commit boundary — and the in-process typed client, which now threads a `MetricsRecorder` through `WorkflowHandleClient::execute_update_in_process` so this path is also counted). Labeled `workflow`+`queue` only — the update name is NOT a metric label (issue #684, Codex P2: admission is at the free-form update route boundary before the name is resolved against a declarative-or-imperative handler, so it cannot be bounded by construction) |
+| `harvest.update.rejected` | Counter | `api.rs` (plugin) — the `admit_update` and `update_with_start` handlers, once per update rejected by its registered validator before admission (a durable pre-admission 422). Validator rejections only; non-RUNNING/paused state conflicts are caller errors, not counted (issue #684) |
+| `harvest.update.completed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateCompleted` (name resolved from the `UpdateAdmitted` events in history) (issue #684) |
+| `harvest.update.failed` | Counter | `worker.rs` — `process_workflow_task` `Persisted` arm, post-commit, exactly once per `UpdateFailed` (issue #684) |
+| `harvest.update.duration` | Histogram | `worker.rs` — `emit_update_result_metrics`, alongside `harvest.update.completed`/`failed` on the **same** post-commit path (the terminal/suspend `Persisted` arm and the two inline external-signal branches). Wall-clock seconds from the recorded `UpdateAdmitted.timestamp` to the terminal recording (`Utc::now()` at emit, clamped so a clock-skew negative delta records `0`). Rejected updates are excluded (no handler runs); an update whose admit is not in the loaded history skips the sample (the counter still fires). Shares the completed/failed counters' delivery semantics — exactly-once on the happy path; a crash after the persist commit but before the post-commit emit drops the sample (never a double-count) (issue #781) |
+| `harvest.mutex.wait_duration` | Histogram | `worker.rs` — `persist_mutex_acquire_park`, on grant: wall-clock seconds a workflow waited to acquire a durable mutex, from request (enqueued as a FIFO waiter) to grant (issue #691) |
+| `harvest.mutex.held_duration` | Histogram | `worker.rs` — `process_mutex_releases_from_commands`, on release: wall-clock seconds a durable mutex was held, from grant (`MutexGranted.acquired_at`) to release (drop / explicit / terminal sweep / lease reclaim) (issue #691) |
+| `harvest.mutex.contention_depth` | Gauge | `worker.rs` — `persist_mutex_acquire_park`, at the moment a grant is made: the FIFO waiter-queue length for the key (number of workflows waiting on that mutex key) (issue #691) |
 
 ### Label sets
 
@@ -96,16 +360,88 @@ metric is emitted in the source code.
 | `harvest.workflow.started` | `workflow`, `queue` |
 | `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`) |
 | `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`) |
+| `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
+| `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`) |
+| `harvest.activity.retries` | `activity`, `queue` |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
+| `harvest.queue.schedule_to_start` | `queue` |
+| `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.dlq.entries` | `shard` |
+| `harvest.worker.slots_in_use` | `slot_type` (`workflow\|activity`) |
+| `harvest.worker.slots_available` | `slot_type` (`workflow\|activity`) |
+| `harvest.worker.slot_target` | `slot_type` (`workflow\|activity`) |
+| `harvest.workflow.active` | `workflow`, `state` (`running\|paused`) |
+| `harvest.worker.tuner_decisions` | `slot_type` (`workflow\|activity`), `decision` (`grow\|shrink\|hold`) |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
-| `harvest.retention.deleted` | `shard` |
+| `harvest.schedule.overdue` | `kind` (`workflow\|dag`), `name` |
+| `harvest.retention.deleted` | `workflow` |
+| `harvest.retention.summary_deleted` | `workflow` |
+| `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
+| `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
+| `harvest.webhook.received` | `path` (registered `#[webhook(path = ...)]` bindings only, closed set), `outcome` (`accepted\|idempotent_replay\|verify_failed\|parse_failed\|missing_idempotency\|internal_error`) |
+| `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
+| `harvest.saga.compensated` | `workflow`, `queue` |
+| `harvest.saga.compensation_failed` | `workflow`, `queue` |
+| `harvest.signal.received` | `workflow`, `queue` — **no `name`**: signal names come from the free-form send route and have no declared registry to bound them (issue #684, Codex P2) |
+| `harvest.signal.unhandled` | `workflow`, `queue` — **no `name`** (same reason; the worker sums the per-name unconsumed map into the single `(workflow, queue)` series) |
+| `harvest.update.admitted` | `workflow`, `queue` — **no `name`**: admission happens at the free-form update route `POST /workflows/{id}/update/{name}` before the name is resolved against a handler, and handlers register both declaratively AND imperatively (unknown until execution), so it cannot be bounded by construction; per-name visibility lives on `update.completed`/`failed`/`rejected` (issue #684, Codex P2) |
+| `harvest.update.rejected` | `workflow`, `name` (update name, bounded — validator rejection fires only for a registered handler) |
+| `harvest.update.completed` | `workflow`, `name` (update name — inherently bounded: a completed update always ran a real handler), `queue` |
+| `harvest.update.failed` | `workflow`, `name` (update name, bounded — an unregistered name's handler-not-found failure → `__unregistered__`; real handlers, declarative or imperative, keep their name), `queue` |
+| `harvest.update.duration` | `workflow`, `name` (update name — bounded exactly as `update.completed`/`failed`; unregistered → `__unregistered__`), `queue`, `outcome` (`completed\|failed` — bounded; rejected excluded) |
+| `harvest.mutex.wait_duration` | `workflow` — the lock key is high-cardinality (often tenant/entity input) and is deliberately **not** a metric label (ADR-0001 §7) |
+| `harvest.mutex.held_duration` | `workflow` — the lock key is deliberately **not** a label (ADR-0001 §7) |
+| `harvest.mutex.contention_depth` | `workflow` — the lock key is deliberately **not** a label (ADR-0001 §7) |
+| `harvest.completion_trigger.skipped` | `trigger` (trigger UUID — same precedent as `harvest.completion_trigger.fires`), `reason` (`condition_unmet\|condition_invalid`) |
+| `harvest.activity.panic` | `activity`, `queue` |
+| `harvest.workflow.panic` | `workflow`, `queue` |
+| `harvest.canary.roundtrip` | `queue`, `shard` (probed task queue + writable shard; **no `execution.id`** — issue #796) |
+| `harvest.canary.success` | `queue`, `shard` |
+| `harvest.canary.failure` | `queue`, `shard` |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by
 construction — no `record_*` method accepts an `ExecutionId`.
+
+### Saga compensation metrics (issue #801)
+
+`harvest.saga.compensated` counts **compensation sequences that started
+running forward** (unwind start — the earliest outage signal), and
+`harvest.saga.compensation_failed` counts **unwinds that finished with at
+least one error** (the dangling-state page). The exactly-once contract is
+keyed to durable `MarkerRecorded` dedup markers (`saga_compensated:{seq}` /
+`saga_compensation_failed:{seq}`): the counter fires only when the marker is
+first recorded on the live frontier, so the documented "compensations re-run
+on every replay" contract never double-counts, and pre-#801 marker-less
+histories are never counted retroactively. The failure counter is emitted
+in-Saga rather than at the worker terminal boundary, so it is separable from
+`harvest.workflow.terminal{outcome=failed}` and fires even when the workflow
+author catches `SagaCompensationFailed` and the run completes.
+
+**Per-unwind coherence (post-review hardening):** the unwind's disposition
+is resolved once at unwind start and the failure counter follows it, so
+`failed ≤ compensated` holds per unwind. A counted unwind's failure is never
+suppressed by a trailing un-awaited signal (the failure marker is recorded
+past the drained signal), the cancel-and-compensate pattern is counted (a
+trailing `WorkflowCancelled` is transparent to the marker matcher), and an
+unwind entered at a drained-signal frontier — canonically a
+signal-with-start run whose unwind starts before the staged signal is
+awaited — is conservatively uncounted **as a whole** (the `ctx.patched()`
+signal-with-start caveat, inherited).
+
+**Crash-window caveat (at-least-once, both counters, durable and in-memory
+unwinds alike):** each sample is emitted in-process within the
+single-decision-cycle gap before its dedup marker's batch commits — the
+start marker persists with the unwind's first dispatch batch, the failure
+marker with the post-unwind batch — so a worker crash (or a #383 pause-race
+decision discard) inside that gap re-emits after resume. A crash
+*mid-unwind* — between compensations, after the first batch committed — is
+exactly-once. A *pure in-memory* unwind (zero durable footprint) is the
+maximal case: a crash-resume anywhere within its single cycle can re-count —
+the metric mirror of the "compensations re-run wholesale" idempotency
+contract in `docs/saga.md`.
 
 ---
 
@@ -118,9 +454,50 @@ rate(harvest_activity_duration_count{status="failed"}[5m])
 # Current queue backlog
 harvest_queue_depth{queue="default"}
 
+# p99 schedule-to-start latency per queue (canonical worker-capacity SLI, issue #501)
+histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket[5m])))
+
+# Age of the oldest unclaimed eligible task per queue (fast-detection gauge, issue #501)
+harvest_queue_oldest_pending_age{queue="default"}
+
 # DLQ depth per shard
 harvest_dlq_entries{shard="0"}
 
+# Worker dispatch-slot utilization per slot type (issue #531):
+# "are my workers saturated?" — pairs with queue.depth to tell a worker
+# bottleneck apart from a queue/DB bottleneck.
+harvest_worker_slots_in_use / (harvest_worker_slots_in_use + harvest_worker_slots_available)
+
+# Adaptive slot tuner's current target vs. the operator-configured band
+# (issue #548) — confirms live behaviour matches [min_slots, max_slots].
+harvest_worker_slot_target{slot_type="activity"}
+
+# Tuner grow/shrink/hold rate per slot type — a steady stream of grow/shrink
+# under flat load usually means the band or step size needs retuning.
+rate(harvest_worker_tuner_decisions_total{decision!="hold"}[5m])
+
 # Effective schedule run rate (runs - skips)
 rate(harvest_schedule_runs_total[1h]) - rate(harvest_schedule_skipped_total[1h])
+
+# p99 durable-mutex acquire wait per workflow (issue #691) — how long
+# contenders queue before entering the critical section.
+histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_mutex_wait_duration_bucket[5m])))
+
+# p99 durable-mutex held duration per workflow — long holds serialize peers
+# and are the first thing to look at when acquire waits climb.
+histogram_quantile(0.99, sum by (le, workflow) (rate(harvest_mutex_held_duration_bucket[5m])))
+
+# Live durable-mutex contention depth (FIFO waiter-queue length at last grant).
+harvest_mutex_contention_depth{workflow="apply_ledger_op"}
 ```
+
+## Full importable dashboard pack
+
+The queries above are seed examples. A complete, versioned, importable
+Grafana dashboard covering **the full metric catalogue** (every `METRIC_*`
+constant in `telemetry.rs`, plus the literal-named concurrency gauges) ships
+at `docs/dashboards/starter-pack-v0.1.0.json`, with import instructions,
+prerequisites, and the alert-rule ↔ panel mapping table in
+`docs/dashboards/README.md`. Coverage is CI-enforced by
+`autumn-harvest/tests/integration/dashboard_pack_docs.rs`: a new `METRIC_*`
+constant with no dashboard panel turns the test red.

@@ -92,119 +92,15 @@ fn fanout_retry_dag(dag: &mut DagBuilder) {
     let _e = dag.activity(step_e).upstream(&b).upstream(&c).upstream(&d);
 }
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260503000000_harvest_workflow_reset/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 
 type HarvestApiApp = axum::Router;
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -255,6 +151,7 @@ fn build_worker() -> Arc<Worker> {
                 worker_id: "dag-retry-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
+                shard_notification_database_urls: Vec::new(),
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
                 poll_interval: Duration::from_millis(25),
@@ -270,9 +167,15 @@ fn build_worker() -> Arc<Worker> {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
                 sharded_pool: None,
+                slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry(),
         )
@@ -355,8 +258,12 @@ async fn seed_run(
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -373,7 +280,17 @@ async fn seed_run(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .expect("seed workflow");
@@ -411,9 +328,7 @@ fn linear_failed_events() -> (Vec<WorkflowEvent>, ActivityExecId, ActivityExecId
         completed(ib),
         sched("step_c", ic),
         failed(ic),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed".to_string()),
     ];
     (events, ia, ib)
 }
@@ -581,9 +496,7 @@ async fn retry_fanout_dag_re_executes_failed_node_level() {
         completed(ib),
         completed(id),
         failed(ic),
-        WorkflowEvent::WorkflowFailed {
-            error: "one or more DAG tasks failed".to_string(),
-        },
+        WorkflowEvent::workflow_failed("one or more DAG tasks failed".to_string()),
     ];
     let exec_id = seed_run(&mut conn, "fanout_retry_dag", "fan-1", events, "FAILED").await;
 

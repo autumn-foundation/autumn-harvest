@@ -43,6 +43,7 @@ fn build_fixture_json(activity_count: usize) -> String {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     });
     for i in 0..activity_count {
         let activity_id = ActivityExecId::new();
@@ -62,6 +63,10 @@ fn build_fixture_json(activity_count: usize) -> String {
         execution_id: exec_id,
         events,
         context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }

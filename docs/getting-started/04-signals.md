@@ -169,6 +169,36 @@ and attempts delivery; the terminal outcome (`ExternalSignalDelivered` or
 `ExternalSignalFailed`) is also recorded. On replay the recorded outcome is returned
 immediately without re-issuing any side effect.
 
+#### Exactly-once delivery with an idempotency key (issue #521)
+
+Cross-shard delivery is *at-least-once*: the outbox may re-attempt a delivery
+after a crash, which can land two `SignalReceived` events on the target. When the
+target's handler is not naturally idempotent, supply a delivery key with
+`ctx.signal_external_workflow_with_idempotency`:
+
+```rust
+ctx.signal_external_workflow_with_idempotency(
+    target,
+    "onboarding_outcome",
+    json!({ "cancelled": true }),
+    format!("cancel:{}", target),   // any String or Some(String)
+).await?;
+```
+
+The key is persisted in the `ExternalSignalRequested` event and deduplicated
+against the target's partial unique index, so re-delivery (crash recovery or
+outbox retry) lands **exactly one** `SignalReceived` event. The recorded key is
+reused verbatim on replay, so a later code change to the key expression cannot
+diverge an in-flight delivery. Omitting the key (the plain
+`signal_external_workflow` method) keeps the legacy at-least-once behavior. Dedupe
+scope is shard-local, keyed on `(target_execution_id, idempotency_key)` — the same
+scope as [signal-with-start](../management-api.md).
+
+From a typed client, the `#[signal]` macro generates both a plain
+`signal_[name]` stub method and an idempotent `signal_[name]_idempotent` sibling
+that takes a trailing `idempotency_key: impl Into<Option<String>>` and returns
+`Ok(true)` when freshly queued / `Ok(false)` when the key deduplicated.
+
 ### Reason codes
 
 | `reason_code` | Meaning |
@@ -188,6 +218,61 @@ cross-shard transaction. The workflow observes `Ok(())` once the outbox write is
 durable — the signal is guaranteed to reach the target eventually or the outbox
 will surface a permanent failure reason.
 
+## Idempotent standalone signals over HTTP (issue #521)
+
+The management route `POST /api/harvest/workflows/{id}/signal/{signal_name}`
+delivers a signal to an already-running execution. Webhook providers retry
+deliveries, so the same logical event can arrive several times. To collapse
+duplicate deliveries into a single `SignalReceived` event, supply an
+out-of-band exactly-once key — the request body stays the raw signal payload:
+
+- `Idempotency-Key:` HTTP header, **or**
+- `?idempotency_key=` query parameter.
+
+The header wins when both are present. A present `Idempotency-Key` header that
+is empty or not valid UTF-8 is rejected with `400 Bad Request` rather than
+silently degraded to at-least-once, so a client that intended exactly-once is
+never fooled. The response reports whether the signal was freshly queued:
+
+```bash
+# First delivery — queued.
+curl -X POST '/api/harvest/workflows/<exec-id>/signal/approval' \
+  -H 'Idempotency-Key: evt_abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": true}'
+# 202 { "ok": true, "signal_delivered": true }
+
+# Retry with the same key — deduplicated, no second handler run.
+curl -X POST '/api/harvest/workflows/<exec-id>/signal/approval' \
+  -H 'Idempotency-Key: evt_abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": true}'
+# 202 { "ok": true, "signal_delivered": false }
+```
+
+Dedupe scope is shard-local, keyed on `(execution_id, idempotency_key)`
+(matching signal-with-start, #244). Omitting the key reproduces the legacy
+at-least-once behavior exactly — every call delivers a distinct signal event.
+
+The CLI reaches parity with the same flag (issue #753) — it maps onto the
+`?idempotency_key=` query parameter of the same route (an empty key is
+rejected at the CLI, since the server treats an empty param as omitted):
+
+```bash
+harvest workflow signal <exec-id> approval \
+  --payload-json '{"approved": true}' \
+  --idempotency-key evt_abc123
+```
+
+Terminal executions: an unkeyed signal — or a keyed signal whose key never
+landed — keeps the existing terminal/404 error semantics (the fresh keyed
+insert rolls back with the error). One deliberate carve-out: a keyed retry
+whose key already landed while the run was still active dedupes to a no-op
+success (`202 { "signal_delivered": false }`) even after the run has since
+gone terminal — the retry acknowledges a delivery that already happened.
+See also the [idempotency chapter](06-idempotency.md#idempotent-signal-delivery)
+and the [signal-delivery section of the management-API reference](../management-api.md#signal-delivery-post-workflowsidsignalsignal_name).
+
 ### The saga-choreography example
 
 `examples/saga-choreography/` shows the complete "tenant cancel notifies all
@@ -196,6 +281,115 @@ in-flight per-tenant onboarding workflows" pattern. Run its replay tests with:
 ```bash
 cargo test -p saga-choreography
 ```
+
+## Discovering the interaction contract (issue #610)
+
+A workflow can *publish* the JSON shape of every way to interact with it — its
+signals, queries, and updates — so operators and non-Rust callers discover the
+contract without reading source, and malformed payloads are rejected at the HTTP
+boundary before they are ever enqueued. This extends the #373 workflow
+input/output schema story to the interaction surface.
+
+> **Terminology — argument, not input.** `with_arg_schema_fn` / `validate_arg`
+> (and `with_response_schema_fn`) describe a *handler's* argument and response —
+> the payload of one signal/query/update *call*. That is distinct from a
+> *workflow's* input/output (#373's `with_input_schema_fn` / `validate_input`),
+> which describes the value passed to `start`. A workflow has one input schema
+> and many per-handler argument schemas.
+
+Attach a description and a JSON Schema to each handler at registration. With the
+`schema` feature the schema is auto-derived from a `schemars::JsonSchema` type
+(or supply it by hand with `with_arg_schema_fn`/`with_description`):
+
+```rust
+#[signal(workflow = "order_workflow", description = "Cancel the in-flight order")]
+fn cancel_order(_ctx: &WorkflowContext, _req: CancelRequest) {}
+
+#[query(workflow = "order_workflow", description = "Read the order's progress")]
+fn order_status(_ctx: &WorkflowContext, req: StatusRequest) -> Result<StatusResponse, String> { /* … */ }
+
+#[update(workflow = "order_workflow", description = "Change the run's priority")]
+async fn set_priority(_ctx: &WorkflowContext, _req: SetPriority) -> Result<PriorityAck, String> { /* … */ }
+
+let plugin = HarvestPlugin::new()
+    .workflows(workflows![order_workflow])
+    .signals(vec![cancel_order_info().with_schemas::<CancelRequest>()])
+    .queries(vec![order_status_info().with_schemas::<StatusRequest, StatusResponse>()])
+    .updates(vec![set_priority_info().with_schemas::<SetPriority, PriorityAck>()]);
+```
+
+### Discovery endpoint
+
+```
+GET /api/harvest/workflows/registered/{name}/interface
+```
+
+Returns the workflow type's published interaction surface. Each array is sorted
+by handler name (so the response is deterministic across calls); handlers with
+no published schema simply omit the schema/description fields, and signals never
+carry a `response_schema`:
+
+```json
+{
+  "signals": [
+    {
+      "name": "cancel_order",
+      "description": "Cancel the in-flight order",
+      "arg_schema": { "type": "object", "properties": { "reason": { "type": "string" } }, "required": ["reason"] }
+    }
+  ],
+  "queries": [
+    {
+      "name": "order_status",
+      "description": "Read the order's progress",
+      "arg_schema": { "type": "object", "properties": { "verbose": { "type": "boolean" } } },
+      "response_schema": { "type": "object", "properties": { "state": { "type": "string" }, "processed": { "type": "integer" } } }
+    }
+  ],
+  "updates": [
+    {
+      "name": "set_priority",
+      "description": "Change the run's priority",
+      "arg_schema": { "type": "object", "properties": { "priority": { "type": "integer" } }, "required": ["priority"] },
+      "response_schema": { "type": "object", "properties": { "applied": { "type": "boolean" } } }
+    }
+  ]
+}
+```
+
+A `404` is returned when the workflow type is not registered.
+
+### Boundary validation
+
+When a signal or update handler has a published `arg_schema`, the payload is
+validated **before** it is durably enqueued at every interaction entry point —
+the signal-send route, `POST /workflows/{name}/signal-with-start`, the update
+route, and `POST /workflows/{name}/update-with-start`. A malformed payload is
+rejected with a field-level `400`:
+
+```bash
+# `cancel` requires a string `reason` — send an empty object:
+curl -X POST '/api/harvest/workflows/<exec-id>/signal/cancel_order' \
+  -H 'Content-Type: application/json' -d '{}'
+# 400
+# {
+#   "error": "signal payload validation failed",
+#   "violations": [ { "message": "missing required field 'reason'", "field_path": "/reason" } ]
+# }
+```
+
+`field_path` is a JSON Pointer (RFC 6901), matching the #373 workflow-input
+validation response shape. A handler with **no** published `arg_schema` is never
+validated — its route behaves exactly as before.
+
+> **Rendering note.** A violation's `message` and `field_path` can reflect keys
+> from the caller-supplied payload object, so a UI that renders them must
+> HTML-escape both before display (they are untrusted input, not fixed strings).
+
+See
+`examples/interface_schema_workflow.rs` (run with `--features schema`) for a
+complete worked example, and the [queries](../management-api.md) and updates
+chapters for the request/response envelopes.
 
 ---
 

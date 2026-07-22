@@ -100,13 +100,63 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_worker_saturation"
     },
     {
-      "id": "harvest_queue_backlog_growth",
+      "id": "harvest_queue_schedule_to_start_high",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue.",
-      "default_threshold": "Page when queue depth stays above 100 pending tasks and continues growing for 10 minutes. Tune absolute depth per queue throughput.",
+      "signal_source": "ADR-0001/#501 histogram harvest.queue.schedule_to_start recorded per claim on the existing claim path (worker.rs). Label: queue (bounded).",
+      "default_threshold": "Page when p99 schedule-to-start latency for any queue exceeds 30 seconds over a 5-minute window. Tune the threshold to match your per-queue SLA.",
       "severity": "page",
       "owner_persona": "workflow on-call",
-      "description": "Pending task count is growing faster than workers can claim and complete work.",
+      "description": "Tasks are waiting too long between becoming eligible and being claimed by a worker \u2014 the canonical signal that worker capacity is insufficient for current load.",
+      "first_action": "harvest worker health --output json",
+      "dependencies": [
+        {
+          "ref": "#501",
+          "status": "shipped",
+          "surface": "METRIC_QUEUE_SCHEDULE_TO_START / harvest.queue.schedule_to_start"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric labels: queue; execution.id / activity.id are span-only"
+        },
+        {
+          "ref": "#100",
+          "status": "shipped",
+          "surface": "worker health API for first triage"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "harvest.queue.schedule_to_start is exposed as harvest_queue_schedule_to_start_{bucket,count,sum} ONLY when the Prometheus exporter is configured with histogram bucket boundaries (PrometheusBuilder::set_buckets, see docs/telemetry.md). Without buckets, metrics-exporter-prometheus emits a summary (no _bucket series) and this histogram_quantile rule will not evaluate. Use histogram_quantile(0.99, ...) for the p99. Replace the queue label value with your actual queue name.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket{queue=\"default\"}[5m]))) > 30"
+          },
+          {
+            "kind": "promql",
+            "expr": "harvest_queue_oldest_pending_age{queue=\"default\"} > 30",
+            "note": "Companion oldest-pending-age gauge fires within one sampler interval (\u226415 s) when a task is stuck; useful as a fast-detection complement to the p99 histogram."
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest worker health --output json",
+        "harvest worker list --queue <queue> --output json",
+        "harvest concurrency status --output json",
+        "GET /api/harvest/workers/health",
+        "GET /api/harvest/admin/concurrency"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_queue_schedule_to_start_high"
+    },
+    {
+      "id": "harvest_queue_backlog_growth",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue. Secondary signal \u2014 superseded as primary page by harvest_queue_schedule_to_start_high (#501).",
+      "default_threshold": "Ticket when queue depth stays above 100 pending tasks and continues growing for 10 minutes. Tune absolute depth per queue throughput. Prefer the schedule-to-start p99 alert as the primary page.",
+      "severity": "ticket",
+      "owner_persona": "workflow on-call",
+      "description": "Pending task count is growing faster than workers can claim and complete work. Use this as a secondary/corroborating signal; the schedule-to-start p99 alert is the primary capacity page.",
       "first_action": "harvest worker health --output json",
       "dependencies": [
         {
@@ -127,7 +177,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Prometheus exporters commonly expose harvest.queue.depth as harvest_queue_depth. Label only by bounded queue names.",
+        "notes": "Prometheus exporters commonly expose harvest.queue.depth as harvest_queue_depth. Label only by bounded queue names. This depth+derivative heuristic is throughput-specific; use harvest_queue_schedule_to_start_high for the latency-based primary page.",
         "expressions": [
           {
             "kind": "promql",
@@ -143,6 +193,51 @@
         "GET /api/harvest/admin/concurrency"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth"
+    },
+    {
+      "id": "harvest_worker_slot_saturation",
+      "status": "enforceable",
+      "signal_source": "Issue #531 gauges harvest.worker.slots_in_use / harvest.worker.slots_available, sampled in-process per worker against the workflow/activity dispatch semaphores. Labelled by bounded slot_type (workflow|activity).",
+      "default_threshold": "Ticket when a worker's slot utilization (slots_in_use / (slots_in_use + slots_available)) stays above 90% for 5 minutes for either slot_type. The 90% / 5m threshold is a STARTER DEFAULT, not a universal SLO \u2014 sustained high utilization is healthy for some throughput-oriented fleets; tune per queue/latency target. Pair with harvest.queue.depth to tell a worker bottleneck (slots saturated AND backlog growing) apart from a queue/DB bottleneck (backlog growing while slots are free).",
+      "severity": "ticket",
+      "owner_persona": "workflow on-call",
+      "description": "A worker's workflow or activity dispatch slots are nearly all in use \u2014 the worker, not the queue or DB, is the bottleneck. When this fires alongside a growing harvest.queue.depth, raising max_concurrent_* or adding workers will relieve the backlog. When slots are free but the backlog grows, the bottleneck is downstream (DB/throttled dependency) and adding workers will not help.",
+      "first_action": "harvest worker health --output json",
+      "dependencies": [
+        {
+          "ref": "#531",
+          "status": "shipped",
+          "surface": "METRIC_WORKER_SLOTS_IN_USE / METRIC_WORKER_SLOTS_AVAILABLE / harvest.worker.slots_*"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric labels: slot_type"
+        },
+        {
+          "ref": "#100",
+          "status": "shipped",
+          "surface": "worker health API for first triage"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Prometheus exporters commonly expose these gauges as harvest_worker_slots_in_use / harvest_worker_slots_available. Label only by bounded slot_type. The 90% / 5m threshold is a starter default, not a universal SLO. Evaluate per slot_type; a single-worker process exposes one series per slot_type distinguished by the scrape target's own instance/job labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "min_over_time((harvest_worker_slots_in_use / (harvest_worker_slots_in_use + harvest_worker_slots_available))[5m:]) > 0.9"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest worker health --output json",
+        "harvest worker list --output json",
+        "harvest concurrency status --output json",
+        "GET /api/harvest/workers/health",
+        "GET /api/harvest/admin/concurrency"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_worker_slot_saturation"
     },
     {
       "id": "harvest_activity_failure_surge",
@@ -232,13 +327,18 @@
     {
       "id": "harvest_schedule_missed_runs",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 schedule counters harvest.schedule.runs and harvest.schedule.skipped plus schedule management API.",
-      "default_threshold": "Page when a required schedule records any skipped run or has zero successful runs across two expected firing windows.",
+      "signal_source": "#696 server-side overdue gauge harvest.schedule.overdue (primary) plus ADR-0001/#138 schedule counters harvest.schedule.runs / harvest.schedule.skipped and the schedule management API. Per-schedule overdue/overdue_by_secs read fields name the wedged schedule and how late.",
+      "default_threshold": "Page when any active schedule reports overdue > 0 (it is past its own cadence grace), or records any skipped run. The overdue gauge is derived per schedule from its own next_run_at + cadence, so no per-schedule interval needs hand-encoding.",
       "severity": "page",
       "owner_persona": "workflow owner",
       "description": "A workflow or DAG schedule is not dispatching at its expected cadence.",
       "first_action": "harvest schedule list --output json",
       "dependencies": [
+        {
+          "ref": "#696",
+          "status": "shipped",
+          "surface": "METRIC_SCHEDULE_OVERDUE gauge + overdue/overdue_by_secs on GET /admin/schedules"
+        },
         {
           "ref": "#138",
           "status": "shipped",
@@ -252,8 +352,12 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Use bounded schedule kind and registered schedule name labels only.",
+        "notes": "Primary: the precise per-schedule overdue gauge (harvest_schedule_overdue, a gauge, no _total suffix) names the wedged schedule. Secondary: skipped counter for policy skips. Tertiary: absence-of-runs, kept only for total process death where nothing emits the overdue gauge (pair with an `up`/scrape-health signal). Use bounded schedule kind and registered schedule name labels only. RECOMMENDED hold: configure the primary overdue rule with `for: 2m` (well above the ~30s sampler cadence and one scheduler tick) so single-scrape transients — a just-resumed long-paused schedule whose next_run_at self-heals within one tick, or short-cadence clock skew — do not page while a genuine wedge (persists many minutes) still fires. A deleted overdue schedule leaves its gauge series stuck at 1 until the emitting worker restarts (standard gauge property); cross-check the read (the schedule is gone) and treat a `for:`-held firing for a non-existent schedule as resolved.",
         "expressions": [
+          {
+            "kind": "promql",
+            "expr": "max by (kind, name) (harvest_schedule_overdue) > 0"
+          },
           {
             "kind": "promql",
             "expr": "sum by (kind, name, reason) (increase(harvest_schedule_skipped_total[15m])) > 0"
@@ -290,7 +394,7 @@
         {
           "ref": "ADR-0001",
           "status": "accepted",
-          "surface": "bounded metric labels: shard"
+          "surface": "bounded metric labels: workflow"
         }
       ],
       "prometheus": {
@@ -299,7 +403,7 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "increase(harvest_retention_deleted_total{shard=\"0\"}[6h]) == 0"
+            "expr": "sum(increase(harvest_retention_deleted_total[6h])) == 0"
           }
         ]
       },
@@ -436,35 +540,315 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate"
     },
     {
+      "id": "harvest_activity_success_ratio",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.attempts counter with outcome label (issue #528).",
+      "default_threshold": "Page when the activity success ratio drops below 90% over 5 minutes for any activity type. Tune per SLO.",
+      "severity": "page",
+      "owner_persona": "workflow owner",
+      "description": "The fraction of activity attempts that succeeded has fallen below the threshold for a given activity type. Unlike the legacy harvest_activity_failure_surge alert (which counts failed histogram samples), this alert is computed within a single metric family \u2014 harvest.activity.attempts{outcome} \u2014 so the ratio is accurate and directly actionable. outcome is bounded to two values (completed/failed), keeping cardinality low. execution.id is never a label.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed for error.type breakdown and harvest.activity.retries for retry-storm indicators",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.attempts{activity,queue,outcome=completed|failed} counter emitted once per attempt for both outcomes"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "outcome label is low-cardinality (2 values: completed/failed). activity must be bounded to registered activity types. Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "(sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\"}[5m])) or on(activity, queue) (0 * sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])))) / sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])) < 0.90"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_success_ratio"
+    },
+    {
+      "id": "harvest_activity_retry_storm",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.retries counter (issue #528).",
+      "default_threshold": "Ticket when the retry rate for any activity type exceeds 5 retries/second sustained over 5 minutes. Tune with harvest_activity_retry_storm_critical for a page at the 20/s threshold.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A high retry rate for an activity type is the earliest warning of a degrading downstream dependency before work tips into the DLQ. harvest.activity.retries fires exactly once per retry actually scheduled (after the schedule_to_close deadline check), so the counter is the authoritative retry-storm signal independent of eventual success or failure. The existing harvest_activity_failure_surge alert fires only when failures are terminal \u2014 this alert catches storms that eventually succeed but are burning retries at scale.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed{error.type} for the failure class causing retries; inspect circuit breaker state at GET /api/harvest/admin/circuits",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.retries{activity,queue} counter incremented once per retry enqueued"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Labels are low-cardinality (activity type, queue). Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (activity, queue) (rate(harvest_activity_retries_total[5m])) > 5"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits",
+        "harvest workflow stack <execution_id>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm"
+    },
+    {
+      "id": "harvest_activity_retry_storm_critical",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.retries counter (issue #528).",
+      "default_threshold": "Page when the retry rate for any activity type exceeds 20 retries/second sustained over 5 minutes \u2014 at this scale the task queue saturates and other work is blocked.",
+      "severity": "page",
+      "owner_persona": "workflow owner",
+      "description": "The page-tier companion to harvest_activity_retry_storm. At 20 retries/s the worker pool is under severe pressure and latency for all work on that queue will degrade. Escalate immediately if the retry rate does not drop within 5 minutes of first response.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed{error.type} for the failure class causing retries; force-open the circuit breaker if the downstream is known-bad: POST /api/harvest/admin/circuits/{activity_name}/force-open",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.retries{activity,queue} counter incremented once per retry enqueued"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Labels are low-cardinality (activity type, queue). Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (activity, queue) (rate(harvest_activity_retries_total[5m])) > 20"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits",
+        "POST /api/harvest/admin/circuits/{activity_name}/force-open"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm"
+    },
+    {
       "id": "harvest_workflow_non_determinism",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 counter harvest.workflow.non_determinism plus management API failure_cause query.",
-      "default_threshold": "Page immediately on any non-zero rate of non-deterministic replay failures. This indicates a replay-breaking deploy has been shipped to production.",
+      "signal_source": "ADR-0001/#138 counters harvest.workflow.non_determinism (detection, #480) and harvest.workflow.nondeterministic_block (non-terminal block entries, #603), plus the management API nd_blocked filter.",
+      "default_threshold": "Page immediately on any non-zero rate of replay-divergence detections. This indicates a replay-breaking deploy has been shipped to production.",
       "severity": "page",
       "owner_persona": "release on-call",
-      "description": "Workflow executions are failing during replay due to non-deterministic divergence (different history generated than previously recorded). This usually happens when a new code version changes workflow logic without proper version gating or routing protection.",
-      "first_action": "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism",
+      "description": "In-flight workflow executions are diverging on replay (different commands generated than previously recorded), usually because a new code version changed workflow logic without version gating or build routing. Since issue #603 the engine BLOCKS the affected executions non-terminally (state stays RUNNING, task re-pended with capped backoff) instead of terminally failing them: rolling back or fixing the offending build resumes the whole cohort with no per-execution operator action.",
+      "first_action": "GET /api/harvest/workflows?nd_blocked=true",
       "dependencies": [
         {
           "ref": "#480",
           "status": "shipped",
           "surface": "METRIC_WORKFLOW_NON_DETERMINISM / harvest.workflow.non_determinism"
+        },
+        {
+          "ref": "#603",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_ND_BLOCKED / harvest.workflow.nondeterministic_block + GET /workflows?nd_blocked=true"
+        },
+        {
+          "ref": "#614",
+          "status": "shipped",
+          "surface": "POST /workflows/{id}/replay-diagnosis (per-execution on-demand divergence verdict; recommended next step after listing nd_blocked runs)"
         }
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Non-determinism signals a logic mismatch. Labels include workflow and build_id. Keep build_id low-cardinality.",
+        "notes": "Non-determinism signals a logic mismatch. harvest_workflow_non_determinism_total carries workflow and build_id labels (keep build_id low-cardinality); harvest_workflow_nondeterministic_block_total carries workflow and queue.",
         "expressions": [
           {
             "kind": "promql",
             "expr": "sum by (workflow, build_id) (increase(harvest_workflow_non_determinism_total[5m])) > 0"
+          },
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow, queue) (increase(harvest_workflow_nondeterministic_block_total[5m])) > 0"
           }
         ]
       },
       "management_checks": [
-        "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism"
+        "GET /api/harvest/workflows?nd_blocked=true",
+        "POST /api/harvest/workflows/{id}/replay-diagnosis (issue #614 — confirm the precise per-execution divergence {kind, event_index, expected, actual}, and re-run after a candidate fix to confirm a 'clean' verdict)",
+        "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism (pre-#603 terminally-failed rows only)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism"
+    },
+    {
+      "id": "harvest_saga_compensation_spike",
+      "status": "enforceable",
+      "signal_source": "harvest.saga.compensated counter (issue #801), incremented exactly once per real compensation sequence at unwind start.",
+      "default_threshold": "Ticket when the compensation rate for any workflow type is elevated for 5 minutes against its own baseline: rate(harvest_saga_compensated_total[5m]) > 4 * rate(harvest_saga_compensated_total[1h] offset 1h), min 1/min. A workflow with no samples in the offset window (new or long-dormant) gets a zero baseline, so the 1/min absolute floor alone fires its first rollback wave. Page on sustained (> 15 min) elevation. Tune per workflow volume.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "Sagas are rolling back at an elevated rate. A compensation spike is the canonical leading indicator that a downstream dependency is failing: forward steps succeed until one dependency starts erroring, and every affected saga then unwinds. The counter fires exactly once per real unwind (deduped across replays by a durable marker), so the rate reflects genuine rollback volume, not replay noise.",
+      "first_action": "Identify the spiking workflow label, then find the failing step: harvest workflow list --state FAILED --workflow-name <name> | head -20 and check harvest.activity.failed{workflow.type=<name>} for the error.type breakdown of the downstream that is failing.",
+      "dependencies": [
+        {
+          "ref": "#801",
+          "status": "shipped",
+          "surface": "harvest.saga.compensated{workflow, queue} counter emitted exactly once per compensation sequence"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "workflow and queue labels are bounded (registered workflow types / configured queues). execution.id is never a label. Compensation volume is workload-relative — a baseline-relative expression avoids paging on a workflow type that legitimately compensates often. The `or <current> * 0` arm defaults the baseline to a zero-valued series with matching labels when the offset window has no samples, so a new or long-dormant workflow's FIRST rollback wave still trips the absolute 1/min floor instead of vanishing from the vector match.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_saga_compensated_total[5m])) > 4 * (sum by (workflow) (rate(harvest_saga_compensated_total[1h] offset 1h)) or sum by (workflow) (rate(harvest_saga_compensated_total[5m])) * 0) and sum by (workflow) (rate(harvest_saga_compensated_total[5m])) > (1/60)"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED",
+        "GET /api/harvest/dead-letters"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_saga_compensation_spike"
+    },
+    {
+      "id": "harvest_saga_compensation_failed",
+      "status": "enforceable",
+      "signal_source": "harvest.saga.compensation_failed counter (issue #801), incremented exactly once per unwind that finishes with at least one compensation error (HarvestError::SagaCompensationFailed).",
+      "default_threshold": "Page on ANY occurrence: increase(harvest_saga_compensation_failed_total[5m]) > 0.",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "A saga rollback itself failed, leaving the system in a partially-committed, dangling state (e.g. a charge that could not be refunded, a reservation that could not be released) that needs manual reconciliation. This signal is distinct from harvest.workflow.terminal{outcome=failed} and fires even when the workflow author catches the error and the run completes — every dangling state raises exactly one alertable increment.",
+      "first_action": "Find the affected executions: harvest workflow list --state FAILED --workflow-name <name>. If nothing is FAILED, the author caught the error and the run COMPLETED — also list recent completions (harvest workflow list --state COMPLETED --workflow-name <name> --limit 20) and search each run's history for the saga_compensation_failed: marker or the SagaCompensationFailed error string. Then inspect the run's history for the failing compensation activity (GET /api/harvest/workflows/{id}/history) and reconcile the dangling resource manually (refund, release, restore).",
+      "dependencies": [
+        {
+          "ref": "#801",
+          "status": "shipped",
+          "surface": "harvest.saga.compensation_failed{workflow, queue} counter emitted exactly once per failed unwind, including author-caught failures"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Zero false negatives is the design goal: the counter is emitted in-Saga at the failure observation point, deduped across replays by a durable marker, and (post-review hardening) a counted unwind's failure is never suppressed by a trailing un-awaited signal. The only uncounted failures are the documented conservative edge (an unwind entered at an unresolvable history position is uncounted as a whole — see docs/saga.md accepted edges). workflow and queue labels are bounded; execution.id is never a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow, queue) (increase(harvest_saga_compensation_failed_total[5m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED",
+        "GET /api/harvest/workflows?state=COMPLETED&workflow_name=<name> (author-caught failures complete normally)",
+        "GET /api/harvest/workflows/{execution_id}/history"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_saga_compensation_failed"
+    },
+    {
+      "id": "harvest_update_rejected_rate",
+      "status": "enforceable",
+      "signal_source": "harvest.update.rejected counter (issue #684), incremented once per workflow update rejected by its registered validator before admission (a durable pre-admission 422).",
+      "default_threshold": "Ticket when the per-workflow validator-rejection rate is sustained above baseline for 10 minutes: sum by (workflow) (rate(harvest_update_rejected_total[5m])) rising materially above its normal level. Starter default — tune per workflow; a healthy client should see near-zero validator rejections.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A workflow's update handler is receiving payloads its validator rejects at a sustained rate. This usually means a client is sending malformed or stale update requests (a schema/version drift after a deploy, a buggy caller, or a retry storm of an already-invalid payload). Rejections are cheap and safe — the update never becomes durable history — but a spike means legitimate callers may be failing to drive the workflow.",
+      "first_action": "Identify the offending update and caller: the metric's workflow + name labels name the workflow type and update. Inspect the caller's payload against the workflow's registered update validator, and check for a recent client or workflow deploy that changed the expected shape.",
+      "dependencies": [
+        {
+          "ref": "#684",
+          "status": "shipped",
+          "surface": "harvest.update.rejected{workflow, name} counter emitted at the admit_update and update_with_start validator-rejection sites"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Scope is validator rejections only (a pre-admission 422); non-RUNNING/paused admission-state conflicts are surfaced as caller errors, not counted here. workflow and name labels are bounded; execution.id is never a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_update_rejected_total[5m]))"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows/types/{workflow_name}/handlers",
+        "GET /api/harvest/workflows?workflow_name=<name>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_update_rejected_rate"
+    },
+    {
+      "id": "harvest_signal_unhandled_rate",
+      "status": "enforceable",
+      "signal_source": "harvest.signal.unhandled counter (issue #684), incremented once per delivered signal a workflow left unconsumed when it reached a Completed or Failed terminal outcome.",
+      "default_threshold": "Ticket when the per-workflow unhandled-signal rate is sustained above baseline for 10 minutes: sum by (workflow) (rate(harvest_signal_unhandled_total[5m])) rising materially above normal. Starter default — a small steady rate can be legitimate (late/duplicate signals a workflow deliberately ignores); alert on a change from the workflow's own baseline, not an absolute floor.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A workflow type is completing (or failing) while delivered signals it received were never consumed by a wait_for_signal/receive_signal call or a push handler. This often indicates a race between a signal-sending caller and the workflow's own control flow, a removed/renamed signal handler after a deploy, or a signal arriving after the workflow already decided to finish. Coverage is scoped to graceful (Completed/Failed) terminal outcomes reached via the worker drive; cancel/terminate/execution-timeout are out of scope by design.",
+      "first_action": "Identify the workflow type and signal from the metric's workflow + name labels. Confirm whether the workflow is expected to consume that signal on every run, and check for a recent workflow deploy that removed or renamed the corresponding wait_for_signal/receive_signal/register_signal_handler call, or a caller that started sending a signal the workflow no longer handles.",
+      "dependencies": [
+        {
+          "ref": "#684",
+          "status": "shipped",
+          "surface": "harvest.signal.unhandled{workflow, name} counter emitted from the executor terminal arms for Completed/Failed outcomes"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Signals excused by a lost signal-or-deadline race (issue #476) are never counted. Scope is Completed/Failed terminal outcomes only (the paths with a driven matcher); cancel/terminate/execution-timeout/parent-close are structurally out of scope. workflow and name labels are bounded; execution.id is never a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_signal_unhandled_total[5m]))"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?workflow_name=<name>&state=COMPLETED",
+        "GET /api/harvest/workflows/{execution_id}/history"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_signal_unhandled_rate"
+    },
+    {
+      "id": "harvest_workflow_population_leak",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#770 gauge harvest.workflow.active sampled per shard (labels workflow, state) plus the harvest.workflow.terminal counter.",
+      "default_threshold": "Ticket when the active population of a workflow type rises by more than 50 over an hour while its terminal completion rate stays effectively flat (< 0.01/s). Tune per workflow expected concurrency.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "The in-progress population of a workflow type keeps growing while few or no executions reach a terminal state — a leak or backlog (starts outpacing completions), not a healthy burst that later drains.",
+      "first_action": "harvest workflow list --state RUNNING --limit 25",
+      "dependencies": [
+        {
+          "ref": "#770",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_ACTIVE / harvest.workflow.active"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric labels: workflow, state"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Population growth (max-min over the window) paired with a near-zero terminal rate distinguishes a leak from a burst that drains. Keep workflow/state labels bounded.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "(sum by (workflow) (max_over_time(harvest_workflow_active[1h])) - sum by (workflow) (min_over_time(harvest_workflow_active[1h]))) > 50 and sum by (workflow) (rate(harvest_workflow_terminal_total[1h])) < 0.01"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest workflow list --state RUNNING --limit 25",
+        "GET /api/harvest/workflows?state=RUNNING"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_population_leak"
     }
   ]
 }

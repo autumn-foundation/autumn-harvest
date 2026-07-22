@@ -1,0 +1,5 @@
+# cargo-fuzz build + campaign artifacts — never committed.
+target/
+corpus/
+artifacts/
+coverage/

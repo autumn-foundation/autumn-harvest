@@ -26,6 +26,7 @@ which alerts are enforceable today and which need another exported signal:
 | #160 | Deployment preflight report. |
 | #161 | Shard health/readiness report. |
 | #171 | Build-id routing. The `no_compatible_worker` alert is marked pending until a native bounded management signal is exported. |
+| #501 | Schedule-to-start latency histogram and oldest-pending-age gauge — the primary queue-saturation page signals. |
 
 Pending rules are intentionally not presented as enforceable. That keeps the
 pack honest; nothing good happens when an alert pretends an API exists.
@@ -44,6 +45,8 @@ Harvest metric names that are expected after Prometheus normalization:
 | `harvest.activity.duration` | `harvest_activity_duration_count`, `harvest_activity_duration_sum`, `harvest_activity_duration_bucket` |
 | `harvest.timer.started` | `harvest_timer_started_total` |
 | `harvest.queue.depth` | `harvest_queue_depth` |
+| `harvest.queue.schedule_to_start` | `harvest_queue_schedule_to_start_count`, `harvest_queue_schedule_to_start_sum`, `harvest_queue_schedule_to_start_bucket` |
+| `harvest.queue.oldest_pending_age` | `harvest_queue_oldest_pending_age` |
 | `harvest.dlq.entries` | `harvest_dlq_entries` |
 | `harvest.schedule.runs` | `harvest_schedule_runs_total` |
 | `harvest.schedule.skipped` | `harvest_schedule_skipped_total` |
@@ -89,9 +92,12 @@ Recommended check cadence:
 
 1. Wire metrics if you use Prometheus/Grafana. See `docs/telemetry.md`.
 2. Import the native metric expressions from `starter-pack-v0.1.0.json`.
-3. Add API checks for readiness rules that are not native metrics.
-4. Link each alert to `docs/runbooks/harvest-alerts.md`.
-5. Run the drills in `docs/runbooks/synthetic-incident-drills.md` before
+3. Import the companion Grafana dashboard pack
+   (`../dashboards/starter-pack-v0.1.0.json`) — every rule in this pack maps
+   to a named panel; the mapping table is in `../dashboards/README.md`.
+4. Add API checks for readiness rules that are not native metrics.
+5. Link each alert to `docs/runbooks/harvest-alerts.md`.
+6. Run the drills in `docs/runbooks/synthetic-incident-drills.md` before
    calling the deployment production-ready.
 
 No rule in this pack requires a new `WorkflowEvent` variant, event-history

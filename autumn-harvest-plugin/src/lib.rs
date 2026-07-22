@@ -1,21 +1,51 @@
 //! Autumn plugin crate for autumn-harvest.
 
 pub mod api;
+/// Scoped API tokens + rotation for the management API (issue #942).
+pub mod api_token;
+/// Default `reqwest`-based completion-callback deliverer (issue #605).
+///
+/// Implements [`autumn_harvest::completion_callback::CompletionCallbackDeliverer`],
+/// auto-wired by [`crate::plugin::HarvestPlugin`].
+pub mod callback_deliverer;
+pub mod canary;
 pub mod config;
+pub mod dag_graph;
 pub mod dag_retry;
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;
 pub mod prelude;
+pub mod replay_diagnosis;
 pub mod runner;
+pub mod schedule_runs;
+pub mod shard_fanout;
 pub mod shard_health;
 pub mod state;
+pub mod status_summary;
 pub mod ui;
+pub mod usage;
 pub mod version_gate_retirement;
 pub mod version_usage;
+pub mod workflow_count;
+pub mod workflow_reachability;
 
 #[cfg(feature = "webhooks")]
 pub mod webhook;
+
+/// Inbound HTTP webhook receiver route generation and dispatch (issue #344).
+#[cfg(feature = "webhooks")]
+pub mod webhook_receiver;
+
+#[cfg(feature = "mcp")]
+pub mod mcp_tools;
+
+/// Built-in Prometheus scrape endpoint (issue #355).
+///
+/// Registers the nine ADR-0001 §7 catalogue metrics as an autumn-web
+/// `MetricsSource` feeding the app's shared `/actuator/prometheus` endpoint.
+#[cfg(feature = "metrics")]
+pub mod metrics_scrape;
 
 pub use api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
@@ -23,7 +53,7 @@ pub use api::{
 };
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
-    HarvestReadinessConfig, HarvestRuntimeConfig,
+    HarvestReadinessConfig, HarvestRuntimeConfig, HarvestStartupConfig, OrphanStartupAction,
 };
 pub use outbox::{
     WorkflowStartRequest, drain_workflow_start_outbox_once, enqueue_workflow_start_outbox,

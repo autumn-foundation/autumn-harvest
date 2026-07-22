@@ -108,6 +108,42 @@ pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 /// Per ADR-0001 §7, `execution.id` / `activity.id` are span-only.
 pub const METRIC_ACTIVITY_FAILED: &str = "harvest.activity.failed";
 
+/// Counter: incremented once per activity attempt for **both** successful and
+/// failed outcomes, providing a single metric family for success-rate SLOs.
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded)
+/// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): `"completed"` or `"failed"`
+///   (mirrors [`ActivityStatus::as_str`])
+///
+/// Use this counter to compute activity success rate in a single metric family:
+/// `rate(harvest_activity_attempts_total{outcome="completed"}[5m]) /
+///  rate(harvest_activity_attempts_total[5m])`.
+///
+/// Complements the existing [`METRIC_ACTIVITY_FAILED`] (richer labels:
+/// `workflow.type`/`error.type`/`non_retryable`) and [`METRIC_ACTIVITY_DURATION`]
+/// (histogram). Together the three form the complete activity-outcome trio.
+///
+/// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and must
+/// never appear as labels here.
+pub const METRIC_ACTIVITY_ATTEMPTS: &str = "harvest.activity.attempts";
+
+/// Counter: incremented once each time a retry is **actually scheduled** for
+/// an activity, enabling direct "retry storm" alerting before work dead-letters.
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded)
+///
+/// A retry is counted only when the attempt is retryable *and* the
+/// `schedule_to_close` deadline (if set) is not already exceeded — i.e., exactly
+/// when a new task row is enqueued for the next attempt.
+///
+/// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and must
+/// never appear as labels here.
+pub const METRIC_ACTIVITY_RETRIES: &str = "harvest.activity.retries";
+
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
@@ -117,8 +153,95 @@ pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
 /// Gauge: current number of pending (unclaimed) tasks in a queue.
 pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
 
+/// Histogram: wall-clock seconds a task waited between becoming eligible
+/// (`scheduled_at`) and being claimed by a worker (`started_at`).
+///
+/// Recorded at claim time on the existing `claim_task` path. Labels:
+///   - `"queue"` — the task queue name (bounded cardinality).
+///
+/// Use this as the canonical "do I need more workers?" SLI: page when the
+/// p99 exceeds your per-queue SLA (e.g. `histogram_quantile(0.99, …) > 30`).
+/// Per ADR-0001 §7, `execution.id` / `activity.id` are span-only and MUST NOT
+/// appear as metric labels here.
+pub const METRIC_QUEUE_SCHEDULE_TO_START: &str = "harvest.queue.schedule_to_start";
+
+/// Gauge: age in seconds of the oldest currently-unclaimed eligible task in a
+/// queue, sampled on the same cadence as `harvest.queue.depth`.
+///
+/// "Eligible" means `state = 'PENDING' AND scheduled_at <= NOW()` — the same
+/// slice that `claim_task` competes over. Labels:
+///   - `"queue"` — the task queue name (bounded cardinality).
+///
+/// Reports `0` when no eligible tasks are queued, preventing stale gauge values
+/// from lingering after a queue drains.
+pub const METRIC_QUEUE_OLDEST_PENDING_AGE: &str = "harvest.queue.oldest_pending_age";
+
+/// Counter: incremented once each time a task is dispatched from a queue.
+///
+/// This lets operators confirm that the live per-queue dispatch split matches
+/// the configured `queue_weights` (issue #515). The counter is recorded in
+/// `dispatch_task` for both weighted and default paths, so it is always
+/// observable regardless of whether weights are configured.
+///
+/// Labels:
+///   - `"queue"` — the task queue name (bounded cardinality, ADR-0001 §7).
+///
+/// `execution.id` / `activity.id` are span-only and MUST NOT appear as labels.
+pub const METRIC_QUEUE_DISPATCHED: &str = "harvest.queue.dispatched";
+
+/// Gauge: current number of claimable pending tasks on a shard that has no
+/// covering live worker (issue #522).
+///
+/// Emitted per shard by the stranded-work sampler. Labelled `{shard}`.
+/// A healthy steady state is `0` on every shard.
+pub const METRIC_SHARD_STRANDED_PENDING: &str = "harvest.shard.stranded_pending";
+
+/// Gauge: number of a worker's dispatch slots currently in use for one slot
+/// type (issue #531).
+///
+/// Sampled in-process by the worker's slot sampler against the two dispatch
+/// `Semaphore`s (`max_concurrent_workflows` / `max_concurrent_activities`).
+/// Labelled `{slot_type}` where `slot_type` is `workflow` or `activity`.
+/// Invariant: `slots_in_use + slots_available == configured_max` for that slot
+/// type within one sampler interval. Per ADR-0001 §7, `execution.id` MUST NOT
+/// appear as a label.
+pub const METRIC_WORKER_SLOTS_IN_USE: &str = "harvest.worker.slots_in_use";
+
+/// Gauge: number of a worker's dispatch slots currently free for one slot type
+/// (issue #531). Companion to [`METRIC_WORKER_SLOTS_IN_USE`]; same labels and
+/// invariant.
+pub const METRIC_WORKER_SLOTS_AVAILABLE: &str = "harvest.worker.slots_available";
+
+/// Gauge: the adaptive slot tuner's current resize target for one slot type
+/// (issue #548).
+///
+/// Emitted in-process by the worker's slot-tuner control loop on the same
+/// cadence as the other monitoring tasks. Labelled `{slot_type}` only, same
+/// bounded values as [`METRIC_WORKER_SLOTS_IN_USE`]. Composes with the #531
+/// occupancy gauges on the same dashboard: `slot_target` is the band-clamped
+/// value the controller is steering toward; `slots_in_use` /
+/// `slots_available` (issue #531) sum to it. Only emitted when a
+/// `SlotTuner` is configured. Per ADR-0001 §7, `execution.id` MUST NOT appear
+/// as a label.
+pub const METRIC_WORKER_SLOT_TARGET: &str = "harvest.worker.slot_target";
+
+/// Counter: incremented once per adaptive slot-tuner control-loop tick with
+/// the decision that took effect (issue #548).
+///
+/// Labelled `{slot_type, decision}` where `decision` is one of `grow` /
+/// `shrink` / `hold` ([`TunerDecision::as_str`]). A decision that was clamped
+/// away by the `[min_slots, max_slots]` band (e.g. a `Grow` request at
+/// `max_slots`) is recorded as `hold`, reflecting what actually happened to
+/// the live target rather than what the controller requested.
+pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
+
+/// Counter: incremented once per dead-letter entry processed by an operator
+/// redrive (issue #510). Labelled `{queue, outcome}` where `outcome` is one of
+/// `redriven` / `skipped` / `failed`.
+pub const METRIC_DLQ_REDRIVEN: &str = "harvest.dlq.redriven";
 
 /// Counter: incremented each time a scheduled run is dispatched.
 pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
@@ -128,8 +251,18 @@ pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
 /// Counter: incremented when a completion trigger fires (issue #517).
 ///
-/// Attributes: `trigger`, `outcome` (started | skipped | deduped).
+/// Attributes: `trigger`, `outcome` (`started` | `skipped` | `deduped` |
+/// `validation_failed` | `payload_too_large`).
 pub const METRIC_COMPLETION_TRIGGER_FIRED: &str = "harvest.completion_trigger.fires";
+
+/// Counter: a completion trigger's output guard skipped a fire (issue #810).
+///
+/// Deliberately a **separate** counter from
+/// [`METRIC_COMPLETION_TRIGGER_FIRED`], whose `outcome="skipped"` already
+/// means "workflow-id reuse dedupe at start" — do not overload.
+///
+/// Attributes: `trigger`, `reason` (`condition_unmet` | `condition_invalid`).
+pub const METRIC_COMPLETION_TRIGGER_SKIPPED: &str = "harvest.completion_trigger.skipped";
 
 /// Counter: incremented each time `POST /admin/schedules/{id}/trigger` fires a
 /// one-off run (issue #343).
@@ -143,6 +276,14 @@ pub const METRIC_SCHEDULE_DECISION_WRITE_FAILED: &str = "harvest.schedule.decisi
 
 /// Counter: number of rows deleted by the retention janitor in one tick.
 pub const METRIC_RETENTION_DELETED: &str = "harvest.retention.deleted";
+
+/// Counter: number of execution summaries garbage-collected by the summary
+/// retention GC pass (issue #752).
+///
+/// A distinct member of the retention metric family from
+/// `harvest.retention.deleted` (history rows), so operators can separate the
+/// two tiers. Labeled by the low-cardinality `workflow` registry key.
+pub const METRIC_SUMMARY_DELETED: &str = "harvest.retention.summary_deleted";
 
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
@@ -198,6 +339,30 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented when a workflow execution is terminated because its
+/// chain-scoped lifetime cap (`chain_deadline_at`) elapsed (issue #617).
+///
+/// Distinct from [`METRIC_WORKFLOW_TIMEOUT`]: the chain cap is anchored at the
+/// first run's start and carried verbatim across every continue-as-new, so this
+/// counter fires when a whole CAN chain (not a single run) has run too long.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_CHAIN_TIMEOUT: &str = "harvest.workflow.chain_timeout";
+
+/// Counter: incremented each time a workflow-task dispatch is abandoned because
+/// it did not complete or suspend within `WorkerConfig::workflow_task_timeout`
+/// (issue #494).
+///
+/// Each increment signals one reclamation of a worker concurrency slot from a
+/// hung or blocking workflow body. After `poison_pill_threshold` consecutive
+/// increments for the same execution the task is quarantined to the DLQ with
+/// [`DeadLetterReason::WorkflowTaskTimeout`](crate::dlq::DeadLetterReason).
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_TASK_TIMEOUT: &str = "harvest.workflow.task_timeout";
+
 /// Counter: incremented exactly once per run when a workflow execution exceeds its
 /// declared soft SLA budget (`sla_deadline_at`) while still RUNNING/SUSPENDED.
 ///
@@ -208,10 +373,29 @@ pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_SLA_BREACHED: &str = "harvest.workflow.sla_breached";
 
+/// Counter: incremented each time a failed workflow execution is automatically
+/// rescheduled for a retry run (issue #523).
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_RETRIES: &str = "harvest.workflow.retries";
+
 /// Counter: incremented when a replay non-determinism (divergence) failure occurs.
 ///
 /// Labeled by `workflow` (workflow name) and `build_id`.
 pub const METRIC_WORKFLOW_NON_DETERMINISM: &str = "harvest.workflow.non_determinism";
+
+/// Counter: incremented each time an execution enters (or re-enters) the
+/// non-terminal replay-non-determinism blocked state (issue #603).
+///
+/// A single incident emits once per blocked dispatch attempt, so the rate
+/// reflects how hard the divergent cohort is re-hitting the divergence; the
+/// execution row's `nd_block_count` column disambiguates re-blocks from fresh
+/// incidents.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_ND_BLOCKED: &str = "harvest.workflow.nondeterministic_block";
 
 /// Counter: incremented each time a workflow execution is paused by an operator
 /// or the bounded-pause auto-resume scanner (issue #383).
@@ -226,6 +410,12 @@ pub const METRIC_WORKFLOW_PAUSED: &str = "harvest.workflow.paused";
 /// Labeled by `workflow` (workflow name) and `queue` (task queue name).
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_PAUSE_DURATION: &str = "harvest.workflow.pause_duration";
+
+/// Counter: incremented when a workflow execution reaches a terminal state
+/// with unfinished update/signal handlers (issue #536).
+///
+/// Labeled by `workflow` (workflow name) and `kind` (handler kind, e.g. "update").
+pub const METRIC_WORKFLOW_UNFINISHED_HANDLERS: &str = "harvest.workflow.unfinished_handlers";
 
 /// Counter: incremented each time a poison-pill task is quarantined to the
 /// dead-letter queue after crashing `poison_pill_threshold` workers in a row
@@ -247,13 +437,152 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
+/// Counter: incremented each time an activity handler **panics** (unwinds)
+/// instead of returning a clean `Err`, and the engine contains the panic as a
+/// retryable typed `HandlerPanic` failure (issue #782).
+///
+/// Fires once per panicking attempt (a retried activity that panics again on
+/// its next attempt increments again), so this is a per-attempt panic-rate
+/// signal. Labeled by `activity` (registered activity name) and `queue` (task
+/// queue name). `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_ACTIVITY_PANIC: &str = "harvest.activity.panic";
+
+/// Counter: a contained workflow handler panic (issue #782).
+///
+/// Incremented each time a workflow handler **panics** (unwinds) instead of
+/// returning a clean `Err`, and the engine contains the panic as a non-terminal
+/// re-dispatch (or, once `workflow_panic_max_attempts` is reached, a terminal
+/// typed `HandlerPanic` failure).
+///
+/// Fires on **every** panic entry — each non-terminal panic-retry *and* the
+/// final terminal panic — so a workflow that panics `N` times before exhausting
+/// its panic budget emits `N` samples. Labeled by `workflow` (workflow name)
+/// and `queue` (task queue name). `execution.id` stays span-only per
+/// ADR-0001 §7.
+pub const METRIC_WORKFLOW_PANIC: &str = "harvest.workflow.panic";
+
+/// Counter: incremented each time a start request is admitted to a debounce
+/// pending record — i.e. the burst is absorbed without starting a run (issue #499).
+///
+/// Labeled by `workflow` (workflow type name) and `debounce_key` (resolved key).
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+pub const METRIC_WORKFLOW_DEBOUNCED: &str = "harvest.workflow.debounced";
+
+/// Counter: incremented each time the debounce scanner fires a pending record
+/// and starts exactly one workflow execution (issue #499).
+///
+/// Labeled by `workflow` (workflow type name) and `queue` (task queue name).
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
+
+/// Counter: incremented each time a workflow start is deferred by a start
+/// throttle because no token was available (issue #607).
+///
+/// Labeled by `workflow` (workflow type name) only. The resolved throttle key is
+/// high-cardinality (tenant/user input), so per ADR-0001 §7 it is deliberately
+/// **not** a metric label — per-key backlog is exposed via the
+/// `GET /admin/start-throttle` admin read instead. `execution.id` is span-only
+/// and must never appear here.
+pub const METRIC_WORKFLOW_START_THROTTLED: &str = "harvest.workflow.start_throttled";
+
+/// Counter: incremented exactly once per real saga compensation sequence
+/// (issue #801).
+///
+/// A "sequence" is a non-empty `Saga::compensate_all` / step-failure unwind
+/// actually running forward. Counted at unwind start on the live frontier,
+/// deduped across replays by the durable `saga_compensated:{seq}` marker, so
+/// the value reflects real sequences rather than the replay/re-registration
+/// count.
+///
+/// A compensation-rate spike is the canonical leading indicator that a
+/// downstream dependency is failing and sagas are rolling back en masse.
+///
+/// At-least-once within the single-decision-cycle gap between in-process
+/// emission and the marker's batch commit (crash / pause-race discard) —
+/// see the accepted edges in `docs/saga.md`.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_SAGA_COMPENSATED: &str = "harvest.saga.compensated";
+
+/// Counter: incremented exactly once per saga unwind that finishes with at
+/// least one compensation error (issue #801).
+///
+/// This is the `HarvestError::SagaCompensationFailed` dangling-state case
+/// needing manual reconciliation.
+///
+/// Distinct from the generic `harvest.workflow.terminal{outcome=failed}`
+/// counter, and emitted in-Saga rather than at the worker terminal boundary,
+/// so it fires even when the workflow author catches the error and the run
+/// goes on to COMPLETE.
+///
+/// Coupled to the unwind's start disposition (`failed ≤ compensated`, per
+/// unwind), and at-least-once within the same emit→persist gap as the
+/// compensated counter — see the accepted edges in `docs/saga.md`.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_SAGA_COMPENSATION_FAILED: &str = "harvest.saga.compensation_failed";
+
+/// Histogram: wall-clock seconds a workflow waited to acquire a durable mutex,
+/// from request (enqueued as a waiter) to grant (issue #691).
+///
+/// Labeled by `workflow` (workflow type name) only. The lock key is
+/// high-cardinality (often tenant/entity input), so per ADR-0001 §7 it is
+/// deliberately **not** a metric label. `execution.id` stays span-only.
+pub const METRIC_MUTEX_WAIT: &str = "harvest.mutex.wait_duration";
+
+/// Histogram: wall-clock seconds a durable mutex was held, from grant to
+/// release (issue #691).
+///
+/// Labeled by `workflow` (workflow type name) only — the lock key is
+/// deliberately **not** a label (ADR-0001 §7). `execution.id` stays span-only.
+pub const METRIC_MUTEX_HELD: &str = "harvest.mutex.held_duration";
+
+/// Gauge: the number of workflows waiting on a durable mutex key at the moment
+/// a grant is made (contention depth), i.e. the FIFO waiter-queue length for
+/// the key (issue #691).
+///
+/// Labeled by `workflow` (workflow type name) only — the lock key is
+/// deliberately **not** a label (ADR-0001 §7). `execution.id` stays span-only.
+pub const METRIC_MUTEX_CONTENTION: &str = "harvest.mutex.contention_depth";
+
+/// Histogram: wall-clock seconds a synthetic liveness-canary probe took from
+/// start-requested to terminal completion (issue #796).
+///
+/// This is the built-in end-to-end pipeline probe, **distinct from the #512
+/// replay canary** (which validates code changes). Recorded only when a canary
+/// run reaches terminal completion; a timed-out probe increments
+/// [`METRIC_CANARY_FAILURE`] instead.
+///
+/// Labeled by `queue` (the probed task queue) and `shard` (the writable shard
+/// the probe ran on). Per ADR-0001 §7, `execution.id` is never a label.
+pub const METRIC_CANARY_ROUNDTRIP: &str = "harvest.canary.roundtrip";
+
+/// Counter: incremented once each time a synthetic liveness-canary probe
+/// reaches terminal completion (issue #796).
+///
+/// Labeled by `queue` and `shard`. `execution.id` stays span-only per the
+/// cardinality rule (ADR-0001 §7).
+pub const METRIC_CANARY_SUCCESS: &str = "harvest.canary.success";
+
+/// Counter: incremented once each time a synthetic liveness-canary probe fails
+/// (issue #796).
+///
+/// A failure is a probe that did not reach terminal completion within its
+/// per-probe timeout, or that terminated in a non-completed state.
+///
+/// Labeled by `queue` and `shard`. `execution.id` stays span-only per the
+/// cardinality rule (ADR-0001 §7).
+pub const METRIC_CANARY_FAILURE: &str = "harvest.canary.failure";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
 /// it was accepted or rejected. Labeled with:
 /// - `payload.kind`: the [`PayloadKind`] variant (e.g. `"ActivityInput"`)
 /// - `workflow.type`: the workflow type name
-/// - `activity.name`: the activity name (empty string when not applicable)
+/// - `activity.name`: the activity name (label omitted when not applicable)
 ///
 /// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
 ///
@@ -269,6 +598,23 @@ pub const METRIC_PAYLOAD_BYTES: &str = "harvest.payload.bytes";
 /// Per ADR-0001 §7, `execution.id` is span-only.
 pub const METRIC_PAYLOAD_REJECTED: &str = "harvest.payload.rejected";
 
+/// Counter + bytes measure: a payload-bearing field was offloaded to an external
+/// [`PayloadStore`](crate::payload_store::PayloadStore) via claim-check (issue #524).
+///
+/// Incremented once per offloaded field; the increment value is the **byte
+/// length** of the offloaded payload, so operators get both an offload rate
+/// (count of events) and total bytes offloaded.
+///
+/// Labels: `payload.field` (the event field name, e.g. `"output"`), `store.id`.
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+pub const METRIC_PAYLOAD_OFFLOADED: &str = "harvest.payload.offloaded";
+
+/// Histogram: wall-clock seconds to fetch an offloaded payload back from the
+/// external store on read/replay (issue #524).
+///
+/// Labels: `store.id`. Per ADR-0001 §7, `execution.id` is span-only.
+pub const METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION: &str = "harvest.payload.offload_fetch_duration";
+
 /// Counter: incremented each time a new workflow start is blocked by an
 /// active admission gate (issue #377).
 ///
@@ -283,6 +629,19 @@ pub const METRIC_ADMISSION_BLOCKED: &str = "harvest.admission.blocked";
 
 /// Gauge: current number of active admission gates.
 pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active";
+
+/// Counter: incremented each time a start producer that is **exempt-by-design**
+/// from the admission gate relays a workflow start (issue #618).
+///
+/// Label:
+///   - `"producer"` (= [`METRIC_LABEL_PRODUCER`]) — the exempt producer's
+///     bounded label (e.g. `"outbox"`), from
+///     [`crate::admission_gate::StartProducer::as_str`].
+///
+/// This makes every intentional gate bypass observable so an operator can see
+/// in real time whether anything is slipping the gate. Per ADR-0001 §7,
+/// `execution.id` is never a metric label.
+pub const METRIC_ADMISSION_BYPASSED: &str = "harvest.admission.bypassed";
 
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
@@ -317,6 +676,343 @@ pub const METRIC_SCHEDULE_FIRE_ATTEMPTS: &str = "harvest.schedule.fire_attempts"
 /// window. Each auto-pause event means operator action is required to resume.
 pub const METRIC_SCHEDULE_AUTO_PAUSED: &str = "harvest.schedule.auto_paused";
 
+/// Gauge: per-schedule overdue flag (issue #696).
+///
+/// `1` when an *active* schedule is overdue to fire relative to its own cadence
+/// (`now − next_run_at > grace`, where `grace = cadence step + jitter +
+/// scheduler tick interval`), `0` otherwise.
+///
+/// Labels:
+///   - `"kind"` — `"workflow"` or `"dag"` (bounded).
+///   - `"name"` — the registered workflow or DAG name (low-cardinality). Per
+///     ADR-0001 §7 the schedule/execution id is NEVER a label.
+///
+/// Emitted per schedule by a periodic background sampler
+/// (`scheduler::sample_overdue_schedules`, run per shard on the worker
+/// monitoring cadence, independent of the scheduler tick so a wedged tick does
+/// not suppress its own health signal). Intentionally-not-firing schedules
+/// (`is_paused`, `auto_paused_at`, `Schedule::Manual`, `end_at`/`max_runs`
+/// exhausted) and at-capacity schedules report `0`. The sampler re-emits every
+/// pass, including `0` for recovered/healthy schedules, so the gauge stays
+/// fresh; a *deleted* schedule's series goes stale (no registry to reset it,
+/// the standard gauge property). Two schedules that share a `name` aggregate on
+/// the gauge (overdue if either is overdue).
+///
+/// Alert on `max by (kind, name) (harvest_schedule_overdue) > 0` — a precise
+/// per-schedule threshold that names the wedged schedule, replacing the fragile
+/// absence-of-`harvest.schedule.runs` inference.
+pub const METRIC_SCHEDULE_OVERDUE: &str = "harvest.schedule.overdue";
+
+/// Gauge: count of *in-flight* (RUNNING/SUSPENDED) executions whose durable
+/// event history has grown past the configured soft
+/// `continue_as_new_threshold` (issue #493).
+///
+/// Labeled by `workflow` (workflow type name). `execution.id` MUST NOT appear
+/// here (ADR-0001 §7 cardinality rule).
+///
+/// Sampled on the same cadence as `harvest.queue.depth` (the
+/// `spawn_queue_depth_sampler` interval). A non-zero value means at least one
+/// in-flight workflow is accumulating history faster than its author drains it
+/// via `continue_as_new`. Alert on sustained non-zero values so the operator
+/// can nudge the author or enable `max_workflow_history_events`.
+pub const METRIC_WORKFLOW_HISTORY_OVERSIZED: &str = "harvest.workflow.history_oversized";
+
+/// Gauge: count of currently-*active* workflow executions, grouped by workflow
+/// type and lifecycle state (issue #770).
+///
+/// Labels:
+/// - `workflow` (= [`METRIC_LABEL_WORKFLOW`]): the workflow type name
+///   (bounded — one per registered `#[workflow]`).
+/// - `state` (= [`METRIC_LABEL_STATE`]): the active lifecycle state, one of
+///   exactly two bounded values — `"running"` or `"paused"` (issue #383).
+///
+/// `execution.id` MUST NOT appear here (ADR-0001 §7 cardinality rule); total
+/// series cardinality is bounded by `workflow_types × 2`.
+///
+/// Sourced from a shard-local `COUNT(*) … GROUP BY (workflow_name, state)
+/// WHERE state IN ('RUNNING','PAUSED')` and summed across every shard of the
+/// worker's `ShardedDbPool`. Sampled on the same cadence as
+/// `harvest.queue.depth`. A non-zero value is the live in-progress population;
+/// a steady rise while `harvest.workflow.terminal` stays flat signals a leak
+/// or backlog. `nd_blocked` runs stay `RUNNING` (issue #603) and so count
+/// under `state="running"`; there is no separate state for them.
+pub const METRIC_WORKFLOW_ACTIVE: &str = "harvest.workflow.active";
+
+/// Counter: incremented on every request that reaches an inbound webhook
+/// receiver route, regardless of outcome (issue #344).
+///
+/// Labels: `path` (the registered `#[webhook(path = ...)]` binding — a
+/// closed set fixed at `HarvestPlugin::build` time, so cardinality is bounded
+/// by construction per ADR-0001 §7) and `outcome` (= [`METRIC_LABEL_OUTCOME`],
+/// one of [`WebhookOutcome`]'s bounded values). `execution.id` is never a
+/// label here — it stays span-only.
+pub const METRIC_WEBHOOK_RECEIVED: &str = "harvest.webhook.received";
+
+/// Counter: incremented every time an inbound webhook request is rejected (issue #344).
+///
+/// Rejection reasons: signature/timestamp/replay verification failure,
+/// payload parse failure, a mapping function rejection, or a missing
+/// idempotency key.
+///
+/// Labels: `path` and `outcome`, same bounded contract as
+/// [`METRIC_WEBHOOK_RECEIVED`]. `outcome` is never `"accepted"` on this
+/// counter.
+pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
+
+/// Counter: incremented once per worker-session acquisition attempt (issue
+/// #606), i.e. once per `ctx.create_session(...)` call.
+///
+/// Labels: `queue` (the session's target task queue) and `outcome` (=
+/// [`METRIC_LABEL_OUTCOME`], one of [`SessionAcquisitionOutcome`]'s bounded
+/// values: `acquired`/`timed_out`/`broken`). Per ADR-0001 §7, `execution.id`
+/// is never a label -- a session's identity stays span-/log-only here.
+pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
+
+/// Counter: a `SignalReceived` event was durably delivered into a workflow's
+/// history and promoted to a live workflow-task wake (issue #684).
+///
+/// Emitted once per delivered signal at the single durable-delivery choke
+/// point (`ingest_due_timers_and_signals`, live worker path only — never on
+/// replay). Labeled by `workflow` (workflow name) and `queue` (task queue),
+/// both bounded.
+///
+/// **The signal `name` is deliberately NOT a label (issue #684, Codex P2).**
+/// Signals are delivered via the free-form route
+/// `POST /workflows/{id}/signal/{signal_name}` — the `signal_name` path segment
+/// is caller-controlled and, unlike activity names or `#[update]` handler names,
+/// has no declared registry to bound it. A caller using per-entity / dynamic
+/// signal names would create unbounded metric series, violating the ADR-0001 §7
+/// cardinality contract. Per-signal-name diagnostics are out of scope for this
+/// slice (use the per-workflow stack / open-awaitables API). `execution.id` is
+/// span-only per ADR-0001 §7 and must never appear here.
+pub const METRIC_SIGNAL_RECEIVED: &str = "harvest.signal.received";
+
+/// Counter: a delivered `SignalReceived` was never consumed at a terminal
+/// outcome (issue #684).
+///
+/// "Never consumed" = no `wait_for_signal`/`receive_signal` and no push handler
+/// claimed it by the time the run reached a **Completed or Failed** terminal
+/// outcome via the worker drive.
+///
+/// The consumed-set is computed in the executor's terminal arms (the only place
+/// the driven matcher exists) and **carried out on the terminal
+/// [`WorkflowOutcome`](crate::executor::WorkflowOutcome)**; the **worker** emits
+/// this counter from that map **post-commit, in its `Persisted` arm** — the same
+/// discipline as [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] — so the
+/// counter represents **durable terminal outcomes only**. That arm is reached
+/// only after the persist transaction commits, downstream of the issue #603
+/// ND-block gate (`Failed{nd:Some}` early-returns before persist) and
+/// `check_paused_and_park` (a claimed-then-paused race returns via
+/// `ParkedPaused`, and a persist failure via the `Err` arm — neither reaches the
+/// emit). A retry/resume of such a discarded cycle therefore cannot double-count.
+/// Signals excused by a lost signal-or-deadline race (issue #476) are never
+/// counted. Labeled by `workflow`, `name`, and `queue`.
+///
+/// **Coverage scope — KNOWN LIMITATION (deliberate):** this is emitted only
+/// from graceful `Completed`/`Failed` terminals reached through the workflow
+/// drive. **Forced-failure / scanner terminal paths — `TIMED_OUT`, `CANCELLED`,
+/// `TERMINATED`, parent-close cascade, and history-cap failure
+/// (`fail_workflow_for_history_cap`) — with an undrained signal are NOT
+/// counted**, because they have no driven matcher to reconstruct the
+/// consumed-set, and a partial/inaccurate count on a watched SLO metric is
+/// worse than none.
+/// This notably **excludes the "stuck workflow that ignored a signal and then
+/// timed out"** case: for that, watch [`METRIC_WORKFLOW_TIMEOUT`] plus the
+/// per-workflow stack API instead.
+///
+/// Labeled by `workflow` and `queue` only, both bounded. **The signal `name`
+/// is deliberately NOT a label (issue #684, Codex P2)** — for the same
+/// free-form-send-route / no-declared-registry reason as
+/// [`METRIC_SIGNAL_RECEIVED`], and most acutely here: an unhandled signal's
+/// name is by definition a mismatched / unlistened-for one. The worker sums
+/// the terminal outcome's per-name unconsumed map and emits one increment per
+/// unconsumed occurrence against the single `(workflow, queue)` series.
+/// `execution.id` is span-only per ADR-0001 §7.
+pub const METRIC_SIGNAL_UNHANDLED: &str = "harvest.signal.unhandled";
+
+/// Counter: a workflow update was durably admitted (`UpdateAdmitted` appended)
+/// (issue #684).
+///
+/// Emitted post-commit at the single admission choke point
+/// (`store::admit_update_event`) for the HTTP, Vantage-UI, and update-with-start
+/// paths. Labeled by `workflow` (workflow name) and `queue`. `execution.id` is
+/// span-only per ADR-0001 §7.
+///
+/// **`name` is deliberately NOT a label — bounded by construction (issue #684,
+/// Codex P2):** the raw route `POST /workflows/{id}/update/{name}` admits ANY
+/// name (the validator lookup is best-effort — an unregistered name falls
+/// through and is durably admitted), so a `name` label would let a hostile/buggy
+/// caller create unbounded `admitted` series. Unlike the terminal
+/// [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] counters — which bound an
+/// unregistered name to the [`UNREGISTERED_UPDATE_NAME`] sentinel using the
+/// workflow's handler-not-found *result* — the admission site cannot bound the
+/// name: it has no way to know whether a name resolves to a handler, because
+/// imperatively-registered handlers (`ctx.register_update_handler`, the common
+/// pattern) are not known until the workflow executes, and bounding against only
+/// the declarative `registry.update_handlers` would mislabel every legitimate
+/// imperatively-registered update. Dropping the label is therefore the only way
+/// to bound this counter's cardinality by construction. Per-name update
+/// visibility lives on the post-resolution counters `harvest.update.completed`/
+/// `failed`/`rejected` instead.
+pub const METRIC_UPDATE_ADMITTED: &str = "harvest.update.admitted";
+
+/// Counter: a workflow update was rejected by its registered validator before
+/// admission (a pre-admission `422`) (issue #684).
+///
+/// Emitted at the two durable validator-rejection sites (the `admit_update`
+/// and `update_with_start` HTTP handlers). Scope is deliberately limited to
+/// **validator** rejections — non-`RUNNING`/paused admission-state conflicts
+/// are surfaced as caller errors, not counted here. Labeled by `workflow` and
+/// `name` (update name). `execution.id` is span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_REJECTED: &str = "harvest.update.rejected";
+
+/// Counter: an admitted workflow update ran its handler to success
+/// (`UpdateCompleted` appended) (issue #684).
+///
+/// Emitted post-commit in the worker's `Persisted` arm, exactly once per
+/// completed update (the `RecordUpdateResult` command is produced once on live
+/// execution). Labeled by `workflow`, `name` (update name), and `queue`. A
+/// completed update always ran a real handler, so its `name` is inherently
+/// bounded to the app's registered handler set (issue #684, Codex P2).
+/// `execution.id` is span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_COMPLETED: &str = "harvest.update.completed";
+
+/// Counter: an admitted workflow update's handler returned an error
+/// (`UpdateFailed` appended) (issue #684).
+///
+/// Emitted post-commit in the worker's `Persisted` arm, exactly once per
+/// failed update. Labeled by `workflow`, `name` (update name), and `queue`. The
+/// `name` label is bounded (issue #684, Codex P2): a genuinely-unregistered
+/// name — admitted via the free-form raw route with no matching handler —
+/// fails the workflow's handler lookup with the exact `"update handler '<name>'
+/// not found"` error, which the worker buckets to the [`UNREGISTERED_UPDATE_NAME`]
+/// sentinel; every real handler (declarative `#[update]` **or** imperative
+/// `ctx.register_update_handler`) keeps its name. `execution.id` is span-only
+/// per ADR-0001 §7.
+pub const METRIC_UPDATE_FAILED: &str = "harvest.update.failed";
+
+/// Histogram: wall-clock seconds from an update's durable admission
+/// (`UpdateAdmitted`) to its terminal result recording
+/// (`UpdateCompleted`/`UpdateFailed`) (issue #781).
+///
+/// The admit→terminal latency companion to the `harvest.update.*` lifecycle
+/// counters (issue #684). Emitted on the **same** post-commit best-effort path
+/// as [`METRIC_UPDATE_COMPLETED`]/[`METRIC_UPDATE_FAILED`] (the shared
+/// `collect_update_result_metrics`/`emit_update_result_metrics` worker helpers),
+/// so it inherits their exactly-once-on-the-happy-path delivery semantics: a
+/// crash after the persist commit but before the post-commit emit drops the
+/// sample (at-most-once for that window, never a double-count). Labeled by
+/// `workflow`, `name` (update name — bounded to the resolved handler set, an
+/// unregistered name → [`UNREGISTERED_UPDATE_NAME`]), `queue`, and `outcome`
+/// (`"completed"`/`"failed"` — rejected updates never enter the histogram, as no
+/// handler runs). The admit timestamp comes from the `UpdateAdmitted` event
+/// already in the loaded history; the terminal time is `Utc::now()` at emit,
+/// clamped so a clock-skew negative delta records `0`, never a garbage value.
+/// `execution.id`/`update_id` are span-only per ADR-0001 §7.
+pub const METRIC_UPDATE_DURATION: &str = "harvest.update.duration";
+
+/// Sentinel `name` label for a `harvest.update.failed` counter when the admitted
+/// update name resolved to no handler (issue #684, Codex P2).
+///
+/// The raw route `POST /workflows/{id}/update/{name}` admits arbitrary,
+/// caller-controlled names; an unregistered one fails the workflow's handler
+/// lookup with the exact `"update handler '<name>' not found"` error, and the
+/// worker buckets exactly that case to this sentinel — keeping the `name` label
+/// bounded to the app's real handler set plus this one extra series, without
+/// mislabeling any legitimately-registered (declarative or imperative) handler.
+pub const UNREGISTERED_UPDATE_NAME: &str = "__unregistered__";
+
+/// Bounded outcome classification for a worker-session acquisition attempt
+/// (issue #606).
+///
+/// Every value maps 1:1 to a distinct `create_session` result, so the set is
+/// closed by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAcquisitionOutcome {
+    /// A worker with a free session slot claimed the acquire task before the
+    /// caller's `acquisition_timeout` elapsed.
+    Acquired,
+    /// No worker had a free slot within `acquisition_timeout`; surfaced to
+    /// the caller as `HarvestError::SessionAcquireTimeout`.
+    TimedOut,
+    /// The session was reclaimed as broken (host died/drained or its lease
+    /// expired) before or during acquisition; surfaced as
+    /// `HarvestError::SessionBroken`.
+    Broken,
+}
+
+impl SessionAcquisitionOutcome {
+    /// Stable lower-case outcome string used as the `outcome` metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acquired => "acquired",
+            Self::TimedOut => "timed_out",
+            Self::Broken => "broken",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionAcquisitionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Metric label: the registered `#[webhook(path = ...)]` binding path
+/// (issue #344). Bounded cardinality: only registered webhook bindings ever
+/// appear, fixed at `HarvestPlugin::build` time.
+pub const METRIC_LABEL_PATH: &str = "path";
+
+/// Bounded outcome classification for an inbound webhook request (issue #344).
+///
+/// Every value maps 1:1 to an HTTP status class the receiver route returns,
+/// so the set is closed by construction — no user input ever becomes an
+/// outcome string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookOutcome {
+    /// A fresh workflow execution (or signal) was dispatched (`202`).
+    Accepted,
+    /// A redelivery of an already-dispatched event was recognized and
+    /// short-circuited without a duplicate dispatch (`200`, or a `409` from
+    /// autumn-web's own replay-protection layer).
+    IdempotentReplay,
+    /// autumn-web's `SignedWebhook` extractor rejected the request
+    /// (signature mismatch, stale timestamp, missing/malformed header).
+    VerifyFailed,
+    /// The verified body was not valid JSON, or the mapping function
+    /// deserialize/reject step failed.
+    ParseFailed,
+    /// A `SignalsWithStart` target resolved no delivery ID to use as the
+    /// signal's idempotency key.
+    MissingIdempotency,
+    /// Any other internal failure (e.g. the harvest runtime is not yet
+    /// started, or the dispatch call itself failed).
+    InternalError,
+}
+
+impl WebhookOutcome {
+    /// Stable lower-case outcome string used as the `outcome` metric label
+    /// and the JSON `error_code` field.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::IdempotentReplay => "idempotent_replay",
+            Self::VerifyFailed => "verify_failed",
+            Self::ParseFailed => "parse_failed",
+            Self::MissingIdempotency => "missing_idempotency",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+impl std::fmt::Display for WebhookOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -338,6 +1034,9 @@ pub const METRIC_LABEL_ACTIVITY_NAME: &str = "activity.name";
 pub const METRIC_LABEL_QUEUE: &str = "queue";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
+/// Metric label: active workflow lifecycle state (issue #770) — one of the
+/// bounded values `"running"` / `"paused"`.
+pub const METRIC_LABEL_STATE: &str = "state";
 /// Metric label: low-cardinality error class on failed activity records.
 pub const METRIC_LABEL_ERROR_TYPE: &str = "error.type";
 /// Metric label: whether a failure was flagged non-retryable.
@@ -362,8 +1061,144 @@ pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).
 pub const METRIC_LABEL_SCOPE: &str = "scope";
+/// Metric label: the in-process start producer (issue #618).
+pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
+/// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
+pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
+/// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
+/// issue #548).
+pub const METRIC_LABEL_DECISION: &str = "decision";
+
+// ---------------------------------------------------------------------------
+// Custom (user) metric constants and validation (issue #532)
+// ---------------------------------------------------------------------------
+
+/// Required prefix for all user-emitted custom metric names.
+///
+/// A call like `ctx.metrics().counter("orders_processed", 1, &[])` emits a
+/// metric named `"harvest.user.orders_processed"`. The prefix is applied
+/// automatically by [`UserMetrics`]; callers supply only the suffix.
+///
+/// Names already starting with `"harvest."` are rejected to prevent collision
+/// with engine-internal metrics (see [`validate_user_metric`]).
+pub const USER_METRIC_PREFIX: &str = "harvest.user.";
+
+/// Maximum byte length of the user-supplied metric name suffix.
+pub const MAX_USER_METRIC_NAME_LEN: usize = 200;
+
+/// Maximum number of key-value labels allowed per custom metric call.
+///
+/// Matches the practical label-count limit recommended by ADR-0001 §7.
+pub const MAX_USER_METRIC_LABELS: usize = 16;
+
+/// High-cardinality label keys that are rejected by [`validate_user_metric`].
+///
+/// Per ADR-0001 §7, execution/activity identifiers must never appear on
+/// metrics because they would create an unbounded label cardinality.
+/// Both dotted and underscore-separated forms are listed to block both
+/// the OpenTelemetry convention (`execution.id`) and the Prometheus convention
+/// (`execution_id`) from being used as label keys.
+pub const FORBIDDEN_USER_LABEL_KEYS: &[&str] = &[
+    // Dotted forms (OpenTelemetry naming convention)
+    "execution.id",
+    "activity.id",
+    "workflow.id",
+    ATTR_EXECUTION_ID, // = "harvest.execution.id"
+    ATTR_WORKFLOW_ID,  // = "harvest.workflow.id"
+    "harvest.activity.id",
+    // Prometheus underscore forms
+    "execution_id",
+    "activity_id",
+    "workflow_id",
+    // Non-namespaced high-cardinality keys
+    "idempotency_key",
+    "run_id",
+];
+
+/// Validation error returned by [`validate_user_metric`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserMetricError {
+    /// The name is empty.
+    EmptyName,
+    /// The name starts with `"harvest."`, which is reserved for engine metrics.
+    ReservedPrefix,
+    /// The name exceeds [`MAX_USER_METRIC_NAME_LEN`] bytes.
+    NameTooLong,
+    /// More than [`MAX_USER_METRIC_LABELS`] labels were supplied.
+    TooManyLabels,
+    /// A label key is empty.
+    EmptyLabelKey,
+    /// A label key is in the high-cardinality denylist ([`FORBIDDEN_USER_LABEL_KEYS`]).
+    ForbiddenLabelKey(String),
+}
+
+impl std::fmt::Display for UserMetricError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => write!(f, "custom metric name must not be empty"),
+            Self::ReservedPrefix => write!(
+                f,
+                "custom metric name must not start with \"harvest.\"; \
+                 that prefix is reserved for engine metrics"
+            ),
+            Self::NameTooLong => write!(
+                f,
+                "custom metric name exceeds {MAX_USER_METRIC_NAME_LEN} bytes"
+            ),
+            Self::TooManyLabels => write!(
+                f,
+                "custom metric has more than {MAX_USER_METRIC_LABELS} labels"
+            ),
+            Self::EmptyLabelKey => write!(f, "custom metric label key must not be empty"),
+            Self::ForbiddenLabelKey(key) => write!(
+                f,
+                "label key \"{key}\" is forbidden on custom metrics (ADR-0001 §7 \
+                 cardinality rule); use a low-cardinality label instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserMetricError {}
+
+/// Validate a user-supplied custom metric name and label set.
+///
+/// Called automatically by [`UserMetrics`]; you only need to call this
+/// directly when building a custom [`MetricsRecorder`] that pre-validates
+/// names at registration time.
+///
+/// # Errors
+///
+/// Returns `Err(UserMetricError::*)` for any of the following:
+/// - empty or over-long name suffix
+/// - name starting with `"harvest."` (reserved engine prefix)
+/// - more than [`MAX_USER_METRIC_LABELS`] labels
+/// - empty or forbidden label key
+pub fn validate_user_metric(name: &str, labels: &[(&str, &str)]) -> Result<(), UserMetricError> {
+    if name.is_empty() {
+        return Err(UserMetricError::EmptyName);
+    }
+    if name.starts_with("harvest.") {
+        return Err(UserMetricError::ReservedPrefix);
+    }
+    if name.len() > MAX_USER_METRIC_NAME_LEN {
+        return Err(UserMetricError::NameTooLong);
+    }
+    if labels.len() > MAX_USER_METRIC_LABELS {
+        return Err(UserMetricError::TooManyLabels);
+    }
+    for (key, _) in labels {
+        if key.is_empty() {
+            return Err(UserMetricError::EmptyLabelKey);
+        }
+        if FORBIDDEN_USER_LABEL_KEYS.contains(key) {
+            return Err(UserMetricError::ForbiddenLabelKey((*key).to_string()));
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -598,6 +1433,53 @@ impl ActivityStatus {
     }
 }
 
+/// A worker dispatch-slot pool, used as the bounded `slot_type` label on the
+/// worker slot-occupancy gauges (issue #531).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotType {
+    /// The `max_concurrent_workflows` semaphore pool.
+    Workflow,
+    /// The `max_concurrent_activities` semaphore pool.
+    Activity,
+}
+
+impl SlotType {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+        }
+    }
+}
+
+/// The decision an adaptive slot tuner made on one control-loop tick (issue
+/// #548), used as the bounded `decision` label on
+/// [`METRIC_WORKER_TUNER_DECISIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunerDecision {
+    /// The live target was increased.
+    Grow,
+    /// The live target was decreased.
+    Shrink,
+    /// The live target was left unchanged (including a grow/shrink request
+    /// fully absorbed by the `[min_slots, max_slots]` band clamp).
+    Hold,
+}
+
+impl TunerDecision {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grow => "grow",
+            Self::Shrink => "shrink",
+            Self::Hold => "hold",
+        }
+    }
+}
+
 /// Sink for the harvest engine's standard metrics.
 ///
 /// Implementations fan these calls into an OpenTelemetry meter (or whatever
@@ -606,9 +1488,21 @@ impl ActivityStatus {
 pub trait MetricsRecorder: Send + Sync {
     /// A completion trigger was fired/evaluated (issue #517).
     ///
-    /// `outcome` is one of: `"started"`, `"skipped"`, `"deduped"`.
+    /// `outcome` is one of: `"started"`, `"skipped"`, `"deduped"`,
+    /// `"validation_failed"`, `"payload_too_large"`.
     fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
         let _ = (trigger_id, outcome);
+    }
+
+    /// A completion trigger's output guard skipped a fire (issue #810).
+    ///
+    /// `reason` is one of: `"condition_unmet"` (guard evaluated `false`) or
+    /// `"condition_invalid"` (stored condition unparseable/over-cap —
+    /// fail-closed skip). Emitted only when the resolved-skip fires row is
+    /// freshly inserted; a redelivery of an already-resolved skip records
+    /// `"deduped"` on [`Self::record_completion_trigger_fired`] instead.
+    fn record_completion_trigger_skipped(&self, trigger_id: &str, reason: &str) {
+        let _ = (trigger_id, reason);
     }
 
     /// A new workflow start was blocked by an active admission gate (issue #377).
@@ -625,9 +1519,25 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = count;
     }
 
+    /// A start producer that is exempt-by-design from the admission gate relayed
+    /// a workflow start (issue #618).
+    ///
+    /// `producer` is the bounded label from
+    /// [`crate::admission_gate::StartProducer::as_str`] (e.g. `"outbox"`).
+    /// Making every intentional bypass observable is how an operator confirms
+    /// nothing is silently slipping an active gate.
+    fn record_admission_bypassed(&self, producer: &str) {
+        let _ = producer;
+    }
+
     /// A workflow task entered the executor on a worker.
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A workflow execution reached a terminal state with unfinished update/signal handlers (issue #536).
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, kind: &str, count: u64) {
+        let _ = (workflow_name, kind, count);
     }
 
     /// A workflow task finished an executor cycle.
@@ -677,6 +1587,67 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow replay non-determinism (divergence) failure was detected.
     fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
         let _ = (workflow_name, build_id);
+    }
+
+    /// An execution entered (or re-entered) the non-terminal
+    /// replay-non-determinism blocked state (issue #603).
+    ///
+    /// Emitted once per blocked dispatch attempt — never on the terminal
+    /// failure path, which a blocked execution deliberately does not take.
+    /// Maps to [`METRIC_WORKFLOW_ND_BLOCKED`].
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// An activity handler panicked (unwound) and the engine contained the
+    /// panic as a retryable typed `HandlerPanic` failure (issue #782).
+    ///
+    /// Emitted once per panicking attempt. Maps to [`METRIC_ACTIVITY_PANIC`].
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_activity_panic(&self, activity_name: &str, queue: &str) {
+        let _ = (activity_name, queue);
+    }
+
+    /// A workflow handler panicked (unwound) and the engine contained the panic
+    /// as a non-terminal re-dispatch or (once the panic budget is exhausted) a
+    /// terminal typed `HandlerPanic` failure (issue #782).
+    ///
+    /// Emitted on every panic entry — each retry and the final terminal failure.
+    /// Maps to [`METRIC_WORKFLOW_PANIC`]. Per ADR-0001 §7, `execution.id` must
+    /// never be a label here.
+    fn record_workflow_panic(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// Gauge snapshot: `count` in-flight executions for `workflow_name` whose
+    /// durable event count exceeds the configured soft continue-as-new
+    /// threshold (issue #493).
+    ///
+    /// Callers emit one call per distinct workflow name per sampler tick so
+    /// the gauge resets cleanly when oversized executions drain. A `count` of
+    /// `0` should be emitted for known workflow names once the oversized count
+    /// drops to zero so the gauge falls back to zero rather than going stale.
+    ///
+    /// Maps to [`METRIC_WORKFLOW_HISTORY_OVERSIZED`].
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_workflow_history_oversized(&self, workflow_name: &str, count: u64) {
+        let _ = (workflow_name, count);
+    }
+
+    /// The current count of active workflow executions of type `workflow` in
+    /// lifecycle `state` (issue #770).
+    ///
+    /// `state` is always one of the two bounded values `"running"` /
+    /// `"paused"`. Callers emit one call per distinct `(workflow, state)` pair
+    /// per sampler tick and a `count` of `0` for pairs that were present last
+    /// tick but have since drained, so the gauge resets cleanly rather than
+    /// going stale.
+    ///
+    /// Maps to [`METRIC_WORKFLOW_ACTIVE`]. Per ADR-0001 §7, `execution.id` must
+    /// never be a label here.
+    fn record_workflow_active(&self, workflow: &str, state: &str, count: u64) {
+        let _ = (workflow, state, count);
     }
 
     /// An activity invocation finished.
@@ -733,6 +1704,37 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (activity_name, workflow_type, error_type, non_retryable);
     }
 
+    /// An activity attempt completed (success or failure).
+    ///
+    /// Increments [`METRIC_ACTIVITY_ATTEMPTS`] with label `outcome` set to
+    /// `ActivityStatus::as_str()` (`"completed"` or `"failed"`). Fires **once per
+    /// attempt for both outcomes**, keeping the counter in lockstep with the
+    /// `harvest.activity.duration` histogram count.
+    ///
+    /// This is the primary signal for activity success-rate SLOs: compute
+    /// `rate(harvest_activity_attempts_total{outcome="completed"}[5m]) /
+    ///  rate(harvest_activity_attempts_total[5m])` within a single metric family.
+    ///
+    /// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and
+    /// must never appear as metric attributes; the method signature enforces this
+    /// by construction.
+    fn record_activity_attempt(&self, activity_name: &str, queue: &str, outcome: ActivityStatus) {
+        let _ = (activity_name, queue, outcome);
+    }
+
+    /// A retry was scheduled for an activity (one per retry actually enqueued).
+    ///
+    /// Increments [`METRIC_ACTIVITY_RETRIES`] with labels `activity` and `queue`.
+    /// Fires only when a retry is durably enqueued (i.e. after the
+    /// `schedule_to_close` deadline check passes), so the count is the authoritative
+    /// "retries scheduled" signal for retry-storm detection.
+    ///
+    /// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and
+    /// must never appear as metric attributes.
+    fn record_activity_retried(&self, activity_name: &str, queue: &str) {
+        let _ = (activity_name, queue);
+    }
+
     /// A durable timer was persisted.
     fn record_timer_started(&self, duration_secs: f64) {
         let _ = duration_secs;
@@ -741,6 +1743,31 @@ pub trait MetricsRecorder: Send + Sync {
     /// A periodic snapshot of queued pending task count.
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         let _ = (queue_name, depth);
+    }
+
+    /// A task was dispatched from the named queue (issue #515).
+    ///
+    /// Recorded once per `dispatch_task` call. Lets operators confirm the live
+    /// per-queue dispatch split matches `WorkerConfig::queue_weights`.
+    /// Maps to the counter [`METRIC_QUEUE_DISPATCHED`].
+    fn record_task_dispatched(&self, queue_name: &str) {
+        let _ = queue_name;
+    }
+
+    /// Wall-clock seconds a task waited between becoming eligible
+    /// (`scheduled_at`) and being claimed by a worker (`started_at`).
+    ///
+    /// Recorded at claim time. Only `queue_name` is used as a label;
+    /// `execution.id` / `activity.id` are span-only per ADR-0001 §7.
+    fn record_schedule_to_start(&self, queue_name: &str, wait_secs: f64) {
+        let _ = (queue_name, wait_secs);
+    }
+
+    /// Age in seconds of the oldest currently-unclaimed eligible task in a
+    /// queue. Sampled alongside `record_queue_depth`. Reports `0` when the
+    /// queue is drained so stale gauge values do not linger.
+    fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
+        let _ = (queue_name, age_secs);
     }
 
     /// Results of one retention-janitor tick on a shard.
@@ -752,6 +1779,33 @@ pub trait MetricsRecorder: Send + Sync {
         duration_secs: f64,
     ) {
         let _ = (shard, candidate_count, deleted_count, duration_secs);
+    }
+
+    /// Number of history rows the retention janitor deleted for a specific
+    /// workflow type in one tick (issue #737).
+    ///
+    /// Maps to the counter [`METRIC_RETENTION_DELETED`], labeled with the
+    /// low-cardinality `workflow` registry key so operators can confirm
+    /// per-type deletion. Emitted for real deletes only (never dry-run).
+    /// `sum(harvest.retention.deleted)` over the label equals the aggregate
+    /// **workflow-history** deletion count for the tick, *excluding* orphaned
+    /// `harvest_completion_deliveries` reclaims (issue #921) — those rows have
+    /// no owning execution and therefore no workflow name to attribute — so it
+    /// may read below the tick's total `deleted_count`.
+    fn record_retention_deleted(&self, workflow: &str, count: u64) {
+        let _ = (workflow, count);
+    }
+
+    /// Number of execution summaries the summary-retention GC pass deleted for
+    /// a specific workflow type in one tick (issue #752).
+    ///
+    /// Maps to the counter [`METRIC_SUMMARY_DELETED`], labeled with the
+    /// low-cardinality `workflow` registry key. A distinct member of the
+    /// retention metric family from [`Self::record_retention_deleted`] (which
+    /// counts history-row deletions), so operators can observe the two tiers
+    /// independently. Emitted for real deletes only (never dry-run).
+    fn record_summary_deleted(&self, workflow: &str, count: u64) {
+        let _ = (workflow, count);
     }
 
     /// Current number of RUNNING tasks for a concurrency group key.
@@ -786,11 +1840,18 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (key, refill_rate);
     }
 
-    /// Record that a task claim was throttled/skipped due to rate limiting.
+    /// Record that a task claim/dispatch was throttled/skipped due to rate
+    /// limiting.
     ///
-    /// Maps to the counter `harvest.rate_limit.throttled{key}`.
-    fn record_rate_limit_throttled(&self, key: &str) {
-        let _ = key;
+    /// Maps to the counter `harvest.rate_limit.throttled{activity}`.
+    ///
+    /// **Cardinality (ADR-0001 §7):** the `activity` argument MUST be a bounded
+    /// value (the registered activity name). It is used as a metric label, so a
+    /// caller must never pass the raw rate-limit bucket key — a dynamic per-key
+    /// key (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant
+    /// input and would explode label cardinality.
+    fn record_rate_limit_throttled(&self, activity: &str) {
+        let _ = activity;
     }
 
     /// Current number of entries in the dead-letter queue on one shard.
@@ -802,6 +1863,57 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_dlq_entries{shard}`.
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         let _ = (shard, depth);
+    }
+
+    /// Periodic snapshot of a worker's dispatch-slot occupancy for one slot
+    /// type (issue #531).
+    ///
+    /// Emitted in-process by the worker's slot sampler against the two dispatch
+    /// `Semaphore`s. `in_use` and `available` are read from a single
+    /// `available_permits()` observation, so the invariant
+    /// `in_use + available == configured_max` holds for that slot type.
+    ///
+    /// Maps to the gauges
+    /// `harvest_worker_slots_in_use{slot_type}` /
+    /// `harvest_worker_slots_available{slot_type}`.
+    fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
+        let _ = (slot_type, in_use, available);
+    }
+
+    /// The adaptive slot tuner's current resize target for one slot type
+    /// (issue #548).
+    ///
+    /// Emitted in-process by the worker's slot-tuner control loop on the same
+    /// cadence as [`record_worker_slots`](Self::record_worker_slots). Only
+    /// emitted when a `SlotTuner` is configured.
+    ///
+    /// Maps to the gauge `harvest_worker_slot_target{slot_type}`.
+    fn record_worker_slot_target(&self, slot_type: SlotType, target: u64) {
+        let _ = (slot_type, target);
+    }
+
+    /// A tuner-decision counter tick for one slot type (issue #548).
+    ///
+    /// Emitted once per control-loop tick with the decision that actually
+    /// took effect after band clamping.
+    ///
+    /// Maps to the counter `harvest_worker_tuner_decisions{slot_type, decision}`.
+    fn record_tuner_decision(&self, slot_type: SlotType, decision: TunerDecision) {
+        let _ = (slot_type, decision);
+    }
+
+    /// Current number of claimable pending tasks on a shard that has no
+    /// covering live worker (issue #522).
+    ///
+    /// Emitted per shard by the stranded-work sampler. When a shard is
+    /// covered by at least one live worker the value is emitted as `0`.
+    /// A non-zero value means work is stranded: workflows rendezvous-hashed
+    /// onto this shard will never reach `RUNNING` until a covering worker is
+    /// started.
+    ///
+    /// Maps to the gauge `METRIC_SHARD_STRANDED_PENDING{shard}`.
+    fn record_shard_stranded_pending(&self, shard: u16, count: u64) {
+        let _ = (shard, count);
     }
 
     /// A scheduled run was dispatched (either a DAG run or a workflow start).
@@ -883,6 +1995,19 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = schedule_name;
     }
 
+    /// Per-schedule overdue-to-fire flag (issue #696).
+    ///
+    /// `kind` is `"workflow"` or `"dag"`; `name` is the schedule's workflow or
+    /// DAG name (low-cardinality). `overdue` is `true` when the schedule is
+    /// active and past its own cadence grace, `false` otherwise. A gauge, so
+    /// this must be re-emitted every sampler pass — including `false` for
+    /// healthy schedules — to keep the value fresh.
+    ///
+    /// Maps to the gauge [`METRIC_SCHEDULE_OVERDUE`] set to `1.0`/`0.0`.
+    fn record_schedule_overdue(&self, kind: &str, name: &str, overdue: bool) {
+        let _ = (kind, name, overdue);
+    }
+
     /// A query handler invocation completed (issue #234).
     ///
     /// `query_name` is the handler name registered via `register_query` /
@@ -927,6 +2052,29 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A workflow execution was terminated because its chain-scoped lifetime cap
+    /// (`chain_deadline_at`) elapsed (issue #617). Distinct from
+    /// [`Self::record_workflow_timeout`]: the chain cap spans a whole
+    /// continue-as-new chain, not a single run.
+    ///
+    /// Maps to the counter `harvest.workflow.chain_timeout{workflow, queue}`.
+    /// Additive, non-breaking default no-op.
+    fn record_workflow_chain_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow-task dispatch was abandoned because it did not complete or
+    /// suspend within `WorkerConfig::workflow_task_timeout` (issue #494).
+    ///
+    /// Each call represents one reclaimed worker concurrency slot. After
+    /// `poison_pill_threshold` consecutive calls for the same execution the
+    /// task is escalated to the DLQ.
+    ///
+    /// Maps to the counter `harvest.workflow.task_timeout{workflow, queue}`.
+    fn record_workflow_task_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
     /// A workflow execution has exceeded its declared soft SLA budget while
     /// still RUNNING/SUSPENDED (issue #487).
     ///
@@ -939,12 +2087,28 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A failed workflow execution was automatically rescheduled for a retry run (issue #523).
+    ///
+    /// Maps to the counter `harvest.workflow.retries{workflow, queue}`.
+    fn record_workflow_retry(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
     /// A poison-pill task was quarantined to the dead-letter queue after
     /// crashing the configured number of workers in a row (issue #367).
     ///
     /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         let _ = (queue, reason);
+    }
+
+    /// An operator redrive processed one dead-letter entry (issue #510).
+    ///
+    /// Maps to the counter `harvest.dlq.redriven{queue, outcome}` where
+    /// `outcome` is `redriven` / `skipped` / `failed`. Per the ADR-0001
+    /// cardinality rule, `execution.id` is never a metric label.
+    fn record_dlq_redriven(&self, queue: &str, outcome: &str) {
+        let _ = (queue, outcome);
     }
 
     /// A workflow execution was paused by an operator or the auto-resume
@@ -1005,6 +2169,23 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (kind, workflow_type);
     }
 
+    /// A payload-bearing field was offloaded to an external store (issue #524).
+    ///
+    /// Maps to the [`METRIC_PAYLOAD_OFFLOADED`] counter, incremented by
+    /// `byte_len`. `field` is the event field name (`"input"`, `"output"`, …);
+    /// `store_id` identifies the configured store.
+    fn record_payload_offloaded(&self, field: &str, store_id: &str, byte_len: u64) {
+        let _ = (field, store_id, byte_len);
+    }
+
+    /// An offloaded payload was fetched back from the external store on
+    /// read/replay (issue #524).
+    ///
+    /// Maps to the [`METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION`] histogram.
+    fn record_payload_offload_fetch(&self, store_id: &str, duration_secs: f64) {
+        let _ = (store_id, duration_secs);
+    }
+
     /// A cross-workflow external signal was sent.
     ///
     /// Maps to the counter `harvest.workflow.external_signal.sent` with attributes:
@@ -1018,13 +2199,438 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
     }
+
+    /// A start request was absorbed by a debounce pending record (issue #499).
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_DEBOUNCED`] with label `workflow`.
+    /// The debounce key is deliberately **not** a label: it is resolved from
+    /// user/tenant input and would create unbounded metric cardinality
+    /// (ADR-0001 §7). The raw key remains available in logs and the
+    /// `GET /admin/debounce` endpoint.
+    fn record_workflow_debounced(&self, workflow_name: &str) {
+        let _ = workflow_name;
+    }
+
+    /// The debounce scanner fired a pending record and started one execution (issue #499).
+    ///
+    /// Maps to the counter [`METRIC_DEBOUNCE_FIRED`] with labels
+    /// `workflow` and `queue`.
+    fn record_debounce_fired(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow start was deferred by a start throttle (issue #607).
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_START_THROTTLED`] with label
+    /// `workflow`. The resolved throttle key is deliberately **not** a label
+    /// (unbounded cardinality, ADR-0001 §7); per-key backlog is exposed via the
+    /// `GET /admin/start-throttle` admin read.
+    fn record_start_throttled(&self, workflow_name: &str) {
+        let _ = workflow_name;
+    }
+
+    /// A request reached an inbound webhook receiver route (issue #344).
+    ///
+    /// Maps to the counter [`METRIC_WEBHOOK_RECEIVED`] with labels `path`
+    /// and `outcome`.
+    fn record_webhook_received(&self, path: &str, outcome: WebhookOutcome) {
+        let _ = (path, outcome);
+    }
+
+    /// A worker session's acquisition attempt resolved to a terminal outcome
+    /// (issue #606): a worker claimed it, the caller's `acquisition_timeout`
+    /// elapsed first, or it was reclaimed as broken before/during
+    /// acquisition.
+    ///
+    /// Maps to the counter [`METRIC_SESSION_ACQUISITION`] with labels
+    /// `queue` and `outcome`.
+    fn record_session_acquisition(&self, queue: &str, outcome: SessionAcquisitionOutcome) {
+        let _ = (queue, outcome);
+    }
+
+    /// An inbound webhook request was rejected (issue #344).
+    ///
+    /// Maps to the counter [`METRIC_WEBHOOK_REJECTED`] with labels `path`
+    /// and `outcome`. `outcome` is never [`WebhookOutcome::Accepted`] here.
+    fn record_webhook_rejected(&self, path: &str, outcome: WebhookOutcome) {
+        let _ = (path, outcome);
+    }
+
+    /// A saga compensation sequence started running forward (issue #801).
+    ///
+    /// Emitted **exactly once per real unwind** — on the live frontier where
+    /// the durable `saga_compensated:{seq}` dedup marker is first recorded;
+    /// replays of a recorded unwind never re-emit.
+    ///
+    /// Maps to the counter `harvest.saga.compensated{workflow, queue}`.
+    fn record_saga_compensated(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A saga unwind finished with at least one compensation error — the
+    /// `SagaCompensationFailed` dangling-state case (issue #801).
+    ///
+    /// Emitted exactly once per failed unwind, independent of whether the
+    /// author propagates or catches the error, and separable from
+    /// `harvest.workflow.terminal{outcome=failed}`.
+    ///
+    /// Maps to the counter `harvest.saga.compensation_failed{workflow, queue}`.
+    fn record_saga_compensation_failed(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    // ── Durable mutex (issue #691) ────────────────────────────────────────
+
+    /// A workflow acquired a durable mutex; record how long it waited from
+    /// request to grant (issue #691).
+    ///
+    /// Maps to the histogram [`METRIC_MUTEX_WAIT`] with label `workflow`. The
+    /// lock key is deliberately **not** a label (unbounded cardinality,
+    /// ADR-0001 §7).
+    fn record_mutex_wait(&self, workflow: &str, seconds: f64) {
+        let _ = (workflow, seconds);
+    }
+
+    /// A durable mutex was released; record how long it was held from grant to
+    /// release (issue #691).
+    ///
+    /// Maps to the histogram [`METRIC_MUTEX_HELD`] with label `workflow`. The
+    /// lock key is deliberately **not** a label (ADR-0001 §7).
+    fn record_mutex_held(&self, workflow: &str, seconds: f64) {
+        let _ = (workflow, seconds);
+    }
+
+    /// The FIFO waiter-queue depth for a durable mutex key at the moment of a
+    /// grant (contention depth, issue #691).
+    ///
+    /// Maps to the gauge [`METRIC_MUTEX_CONTENTION`] with label `workflow`. The
+    /// lock key is deliberately **not** a label (ADR-0001 §7).
+    fn record_mutex_contention(&self, workflow: &str, depth: u64) {
+        let _ = (workflow, depth);
+    }
+
+    // ── Synthetic liveness canary (issue #796) ────────────────────────────
+    //
+    // The built-in end-to-end pipeline probe. Distinct from the #512 replay
+    // canary. Labels are limited to `queue` and `shard` (a `u16` here,
+    // stringified in the metrics-rs bridge). Per ADR-0001 §7, `execution.id`
+    // is never accepted, so the cardinality rule holds by construction.
+
+    /// A synthetic liveness-canary probe reached terminal completion on
+    /// `(queue, shard)` (issue #796).
+    ///
+    /// Maps to the counter [`METRIC_CANARY_SUCCESS`] labeled `queue`, `shard`.
+    fn record_canary_success(&self, queue: &str, shard: u16) {
+        let _ = (queue, shard);
+    }
+
+    /// A synthetic liveness-canary probe failed on `(queue, shard)` — it did
+    /// not complete within the per-probe timeout, or terminated in a
+    /// non-completed state (issue #796).
+    ///
+    /// Maps to the counter [`METRIC_CANARY_FAILURE`] labeled `queue`, `shard`.
+    fn record_canary_failure(&self, queue: &str, shard: u16) {
+        let _ = (queue, shard);
+    }
+
+    /// Observed round-trip latency (seconds) of a completed synthetic
+    /// liveness-canary probe on `(queue, shard)` (issue #796).
+    ///
+    /// Maps to the histogram [`METRIC_CANARY_ROUNDTRIP`] labeled `queue`,
+    /// `shard`.
+    fn record_canary_roundtrip(&self, queue: &str, shard: u16, duration_secs: f64) {
+        let _ = (queue, shard, duration_secs);
+    }
+
+    // ── Signal & update lifecycle counters (issue #684) ───────────────────
+
+    /// A `SignalReceived` event was durably delivered into a workflow's
+    /// history (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_SIGNAL_RECEIVED`] with labels `workflow`
+    /// and `queue`. The signal name is deliberately NOT a label (issue #684,
+    /// Codex P2): it comes from the free-form send route and has no declared
+    /// registry to bound it.
+    fn record_signal_received(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A delivered signal was never consumed by the workflow before it reached
+    /// a Completed/Failed terminal outcome (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_SIGNAL_UNHANDLED`] with labels `workflow`
+    /// and `queue`. The signal name is deliberately NOT a label (issue #684,
+    /// Codex P2): it comes from the free-form send route and has no declared
+    /// registry to bound it. The worker emits one call per unconsumed
+    /// occurrence, so the counter still reflects the terminal outcome's total
+    /// unconsumed-signal volume against the single `(workflow, queue)` series.
+    fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow update was durably admitted (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_ADMITTED`] with labels `workflow`
+    /// and `queue`. The update `name` is deliberately NOT a label (issue #684,
+    /// Codex P2): admission happens at the free-form route boundary
+    /// (`POST /workflows/{id}/update/{name}`) where the name has not yet been
+    /// resolved against a registered handler — and update handlers register
+    /// both declaratively (`registry.update_handlers`) and imperatively
+    /// (`ctx.register_update_handler`, not known until the workflow executes),
+    /// so the admission site cannot bound the name against any registry without
+    /// mislabeling legitimate imperatively-registered updates. Dropping the
+    /// label is therefore the only way to bound this counter's cardinality by
+    /// construction. Per-name update visibility lives on the post-resolution
+    /// counters `harvest.update.completed`/`failed`/`rejected` instead.
+    fn record_update_admitted(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow update was rejected by its validator before admission
+    /// (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_REJECTED`] with labels `workflow`
+    /// and `name` (update name).
+    fn record_update_rejected(&self, workflow_name: &str, update_name: &str) {
+        let _ = (workflow_name, update_name);
+    }
+
+    /// An admitted workflow update completed successfully (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_COMPLETED`] with labels `workflow`,
+    /// `name` (update name), and `queue`.
+    fn record_update_completed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        let _ = (workflow_name, update_name, queue);
+    }
+
+    /// An admitted workflow update's handler failed (issue #684).
+    ///
+    /// Maps to the counter [`METRIC_UPDATE_FAILED`] with labels `workflow`,
+    /// `name` (update name), and `queue`.
+    fn record_update_failed(&self, workflow_name: &str, update_name: &str, queue: &str) {
+        let _ = (workflow_name, update_name, queue);
+    }
+
+    /// An admitted workflow update reached a terminal result; `duration_secs` is
+    /// the wall-clock time from durable admission to that result (issue #781).
+    ///
+    /// Maps to the histogram [`METRIC_UPDATE_DURATION`] with labels `workflow`,
+    /// `name` (update name), `queue`, and `outcome` (`"completed"`/`"failed"`).
+    /// Emitted on the same post-commit path as
+    /// [`record_update_completed`](Self::record_update_completed)/[`record_update_failed`](Self::record_update_failed),
+    /// so it shares their delivery semantics (see [`METRIC_UPDATE_DURATION`]).
+    fn record_update_duration(
+        &self,
+        workflow_name: &str,
+        update_name: &str,
+        queue: &str,
+        outcome: &str,
+        duration_secs: f64,
+    ) {
+        let _ = (workflow_name, update_name, queue, outcome, duration_secs);
+    }
+
+    /// Whether this recorder actually forwards samples anywhere.
+    ///
+    /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
+    /// `false` so callers can skip *expensive sample-production work* (e.g. the
+    /// per-poll-interval `oldest_pending_ages` / `queue_depths` sampler SQL) when
+    /// no recorder is configured — the per-event `record_*` calls are already
+    /// zero-cost, but the queries that feed gauges are not. Treat this as a hint
+    /// for guarding observation work, never for changing engine behavior.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    // ── Custom / user-emitted metrics (issue #532) ────────────────────────
+
+    /// Record a custom counter emitted by workflow or activity author code.
+    ///
+    /// `name` is the **fully-qualified** metric name (already prefixed with
+    /// `"harvest.user."` by [`UserMetrics`]); `labels` are validated
+    /// low-cardinality key-value pairs.  The default implementation is a no-op.
+    ///
+    /// Per ADR-0001 §7, `execution.id` and other high-cardinality identifiers
+    /// must never appear in `labels`.  [`UserMetrics`] enforces this before
+    /// reaching this method.
+    fn record_user_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
+        let _ = (name, value, labels);
+    }
+
+    /// Record a custom gauge emitted by workflow or activity author code.
+    ///
+    /// Same namespacing and cardinality contract as [`record_user_counter`].
+    ///
+    /// [`record_user_counter`]: MetricsRecorder::record_user_counter
+    fn record_user_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        let _ = (name, value, labels);
+    }
+
+    /// Record a custom histogram sample emitted by workflow or activity author code.
+    ///
+    /// Same namespacing and cardinality contract as [`record_user_counter`].
+    ///
+    /// [`record_user_counter`]: MetricsRecorder::record_user_counter
+    fn record_user_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        let _ = (name, value, labels);
+    }
+}
+
+/// Emit the once-per-terminal-outcome business counter `harvest.workflow.terminal`
+/// (issue #519), **skipping synthetic-liveness-canary probe runs** (issue #796,
+/// AC8).
+///
+/// This is the single choke point through which every non-canary terminal
+/// transition routes its business SLO counter, so a canary probe (identified by
+/// [`crate::canary::is_canary_workflow`]) can never leak into
+/// `harvest.workflow.terminal` no matter which terminal path it reaches (worker
+/// completion/failure, execution timeout, poison-pill quarantine, batch/operator
+/// cancel/terminate, history-cap, race-loser cancel, …). The canary-skip
+/// decision lives in exactly one place — here.
+///
+/// A canary probe emits ONLY `harvest.canary.*`; it never contributes to
+/// `harvest.workflow.terminal` or any other `harvest.workflow.*` business
+/// counter. The two primary terminal sites (worker completion and
+/// execution-timeout) additionally emit the probe's own `harvest.canary.*`
+/// signal in their canary branch and route their non-canary terminal through
+/// this helper. A canary still contributes to `harvest.activity.*`/
+/// `harvest.queue.*`, which it legitimately exercises.
+///
+/// Generic over `M: MetricsRecorder + ?Sized` so it accepts `&dyn
+/// MetricsRecorder`, `&(dyn MetricsRecorder + Send + Sync)`, and `&*Arc<dyn
+/// MetricsRecorder>` uniformly.
+pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    queue: &str,
+    outcome: WorkflowStatus,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_workflow_terminal(workflow_name, queue, outcome);
 }
 
 /// Default metrics recorder that discards every sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoOpMetrics;
 
-impl MetricsRecorder for NoOpMetrics {}
+impl MetricsRecorder for NoOpMetrics {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UserMetrics handle (issue #532)
+// ---------------------------------------------------------------------------
+
+/// Replay-safe custom-metrics handle exposed by `ctx.metrics()`.
+///
+/// Obtained from [`WorkflowContext::metrics`](crate::context::WorkflowContext::metrics)
+/// or [`ActivityContext::metrics`](crate::context::ActivityContext::metrics).
+/// All method calls are **zero-cost no-ops** when the configured
+/// [`MetricsRecorder`] is [`NoOpMetrics`] or when the workflow is replaying.
+///
+/// ## Namespacing
+///
+/// The `name` argument is the **suffix** only.  A full metric name is
+/// assembled as `"harvest.user.{name}"` so custom metrics are clearly
+/// separated from engine metrics in your backend.
+///
+/// ```text
+/// ctx.metrics().counter("orders_processed", 1, &[("tier", "gold")])
+/// // → emits "harvest.user.orders_processed" with label tier=gold
+/// ```
+///
+/// ## Replay safety (workflow metrics only)
+///
+/// When called from a `#[workflow]` body, metric emission is **suppressed
+/// during deterministic replay** (`ctx.is_replaying() == true`).  A counter
+/// incremented once in workflow logic therefore increments the backend exactly
+/// once regardless of how many replay cycles the executor runs.
+///
+/// ## Activity retries
+///
+/// When called from a `#[activity]` body, metrics are **not** suppressed —
+/// every actual invocation emits.  Each retry is a separate execution, so a
+/// counter inside an activity body increments once per attempt.  Document
+/// retry semantics in your metrics if downstream consumers care.
+///
+/// ## Label cardinality
+///
+/// Per ADR-0001 §7, label keys must be low-cardinality.  The following keys
+/// are **always rejected** (logged as warnings, metric is dropped):
+/// `execution.id`, `activity.id`, `workflow.id`, `harvest.execution.id`,
+/// `harvest.activity.id`, `idempotency_key`, `run_id`.  At most
+/// [`MAX_USER_METRIC_LABELS`] labels are accepted per call.
+pub struct UserMetrics<'a> {
+    recorder: &'a dyn MetricsRecorder,
+    suppressed: bool,
+}
+
+impl<'a> UserMetrics<'a> {
+    /// Create a new handle.
+    ///
+    /// `suppressed` should be `true` when `WorkflowContext::is_replaying()` is
+    /// true; always `false` for `ActivityContext`.
+    #[must_use]
+    pub(crate) fn new(recorder: &'a dyn MetricsRecorder, suppressed: bool) -> Self {
+        Self {
+            recorder,
+            suppressed,
+        }
+    }
+
+    /// Emit a custom counter increment.
+    ///
+    /// Suppressed during workflow replay and when telemetry is disabled.
+    /// Logs a `tracing::warn!` and drops the call on label-validation failure.
+    pub fn counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
+        if self.suppressed || !self.recorder.is_enabled() {
+            return;
+        }
+        if let Err(e) = validate_user_metric(name, labels) {
+            tracing::warn!(metric_name = name, error = %e, "custom metric rejected");
+            return;
+        }
+        let full_name = format!("{USER_METRIC_PREFIX}{name}");
+        self.recorder.record_user_counter(&full_name, value, labels);
+    }
+
+    /// Emit a custom gauge observation.
+    ///
+    /// Suppressed during workflow replay and when telemetry is disabled.
+    /// Logs a `tracing::warn!` and drops the call on label-validation failure.
+    pub fn gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        if self.suppressed || !self.recorder.is_enabled() {
+            return;
+        }
+        if let Err(e) = validate_user_metric(name, labels) {
+            tracing::warn!(metric_name = name, error = %e, "custom metric rejected");
+            return;
+        }
+        let full_name = format!("{USER_METRIC_PREFIX}{name}");
+        self.recorder.record_user_gauge(&full_name, value, labels);
+    }
+
+    /// Emit a custom histogram sample.
+    ///
+    /// Suppressed during workflow replay and when telemetry is disabled.
+    /// Logs a `tracing::warn!` and drops the call on label-validation failure.
+    pub fn histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        if self.suppressed || !self.recorder.is_enabled() {
+            return;
+        }
+        if let Err(e) = validate_user_metric(name, labels) {
+            tracing::warn!(metric_name = name, error = %e, "custom metric rejected");
+            return;
+        }
+        let full_name = format!("{USER_METRIC_PREFIX}{name}");
+        self.recorder
+            .record_user_histogram(&full_name, value, labels);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Telemetry bundle
@@ -1183,12 +2789,88 @@ mod tests {
             "harvest.schedule.decision_write_failed"
         );
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
+        assert_eq!(METRIC_SUMMARY_DELETED, "harvest.retention.summary_deleted");
+        // issue #618: exempt-by-design start producers increment this counter.
+        assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
+        assert_eq!(METRIC_LABEL_PRODUCER, "producer");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
+        assert_eq!(
+            METRIC_WORKFLOW_CHAIN_TIMEOUT,
+            "harvest.workflow.chain_timeout"
+        );
         assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
         assert_eq!(
             METRIC_WORKFLOW_NON_DETERMINISM,
             "harvest.workflow.non_determinism"
         );
+        assert_eq!(
+            METRIC_WORKFLOW_ND_BLOCKED,
+            "harvest.workflow.nondeterministic_block"
+        );
+        assert_eq!(
+            METRIC_WORKFLOW_TASK_TIMEOUT,
+            "harvest.workflow.task_timeout"
+        );
+        assert_eq!(
+            METRIC_QUEUE_SCHEDULE_TO_START,
+            "harvest.queue.schedule_to_start"
+        );
+        assert_eq!(
+            METRIC_QUEUE_OLDEST_PENDING_AGE,
+            "harvest.queue.oldest_pending_age"
+        );
+        assert_eq!(
+            METRIC_COMPLETION_TRIGGER_FIRED,
+            "harvest.completion_trigger.fires"
+        );
+        assert_eq!(
+            METRIC_COMPLETION_TRIGGER_SKIPPED,
+            "harvest.completion_trigger.skipped"
+        );
+        assert_eq!(METRIC_ACTIVITY_PANIC, "harvest.activity.panic");
+        assert_eq!(METRIC_WORKFLOW_PANIC, "harvest.workflow.panic");
+        // Synthetic liveness canary (issue #796) — distinct from #512 replay canary.
+        assert_eq!(METRIC_CANARY_ROUNDTRIP, "harvest.canary.roundtrip");
+        assert_eq!(METRIC_CANARY_SUCCESS, "harvest.canary.success");
+        assert_eq!(METRIC_CANARY_FAILURE, "harvest.canary.failure");
+    }
+
+    #[test]
+    fn record_canary_metrics_have_noop_defaults() {
+        // Synthetic liveness-canary metrics (issue #796) must exist as no-op
+        // default trait methods so existing MetricsRecorder implementations
+        // compile without changes. Labels are `queue` and `shard` only.
+        let rec = NoOpMetrics;
+        rec.record_canary_success("default", 0);
+        rec.record_canary_failure("email", 2);
+        rec.record_canary_roundtrip("default", 0, 0.42);
+    }
+
+    #[test]
+    fn record_handler_panic_has_noop_defaults() {
+        // Contained-handler-panic counters (issue #782). Both must exist with a
+        // no-op default body so existing MetricsRecorder implementations compile
+        // without changes.
+        let rec = NoOpMetrics;
+        rec.record_activity_panic("send_email", "default");
+        rec.record_workflow_panic("onboarding", "default");
+    }
+
+    #[test]
+    fn metric_update_duration_constant_has_correct_name() {
+        // Issue #781: the admit→terminal latency histogram name is
+        // family-consistent with the #1032 `harvest.update.*` counters.
+        assert_eq!(METRIC_UPDATE_DURATION, "harvest.update.duration");
+    }
+
+    #[test]
+    fn record_update_duration_has_noop_default() {
+        // Issue #781: the admit→terminal latency histogram must exist as a
+        // no-op-default trait method so existing MetricsRecorder implementations
+        // compile without changes. Outcome ∈ {completed, failed}.
+        let rec = NoOpMetrics;
+        rec.record_update_duration("onboarding", "set_priority", "default", "completed", 0.42);
+        rec.record_update_duration("onboarding", "cancel", "default", "failed", 1.5);
     }
 
     #[test]
@@ -1294,6 +2976,59 @@ mod tests {
     }
 
     #[test]
+    fn emit_workflow_terminal_skips_canary_and_records_business_workflows() {
+        // Issue #796 AC8: the single choke point routes a business workflow's
+        // terminal to `record_workflow_terminal` but skips a synthetic-liveness
+        // canary probe entirely, so a canary can never leak into
+        // `harvest.workflow.terminal` no matter which terminal path it reaches.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct TerminalCounter(AtomicUsize);
+        impl MetricsRecorder for TerminalCounter {
+            fn record_workflow_terminal(&self, _wf: &str, _q: &str, _outcome: WorkflowStatus) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(TerminalCounter::default());
+
+        // A canary probe (any per-queue name) records NOTHING.
+        for canary in [
+            crate::canary::CANARY_WORKFLOW_NAME_PREFIX,
+            "__harvest_canary_probe__default",
+            "__harvest_canary_probe__email",
+        ] {
+            emit_workflow_terminal(counter.as_ref(), canary, "default", WorkflowStatus::Failed);
+        }
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "a canary probe must never increment harvest.workflow.terminal"
+        );
+
+        // An ordinary business workflow records once per call.
+        emit_workflow_terminal(
+            counter.as_ref(),
+            "onboarding",
+            "default",
+            WorkflowStatus::Completed,
+        );
+        emit_workflow_terminal(counter.as_ref(), "checkout", "q", WorkflowStatus::Cancelled);
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            2,
+            "business workflows must still increment harvest.workflow.terminal"
+        );
+
+        // Also works through a `&*Arc<dyn MetricsRecorder>` erased reference.
+        let erased: Arc<dyn MetricsRecorder> = counter.clone();
+        emit_workflow_terminal(&*erased, "billing", "default", WorkflowStatus::TimedOut);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn execution_id_is_not_a_parameter_of_record_workflow_terminal() {
         // ADR-0001 §7 cardinality rule: execution.id is span-only.
         // This test verifies by construction that record_workflow_terminal
@@ -1302,6 +3037,125 @@ mod tests {
         rec.record_workflow_terminal("billing", "default", WorkflowStatus::Completed);
         // If execution.id were a parameter the call above would require an
         // extra UUID argument and this test would fail to compile.
+    }
+
+    // ── Activity attempt + retry counter tests (issue #528) ─────────────
+
+    #[test]
+    fn metric_activity_attempts_constant_has_correct_name() {
+        assert_eq!(METRIC_ACTIVITY_ATTEMPTS, "harvest.activity.attempts");
+    }
+
+    #[test]
+    fn metric_activity_retries_constant_has_correct_name() {
+        assert_eq!(METRIC_ACTIVITY_RETRIES, "harvest.activity.retries");
+    }
+
+    #[test]
+    fn record_activity_attempt_has_noop_default() {
+        // MetricsRecorder::record_activity_attempt must exist with a no-op
+        // default body so existing implementations compile without changes.
+        let rec = NoOpMetrics;
+        rec.record_activity_attempt("send_email", "default", ActivityStatus::Completed);
+        rec.record_activity_attempt("send_email", "default", ActivityStatus::Failed);
+    }
+
+    #[test]
+    fn record_activity_retried_has_noop_default() {
+        let rec = NoOpMetrics;
+        rec.record_activity_retried("send_email", "default");
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_activity_attempt() {
+        // ADR-0001 §7 cardinality rule: execution.id / activity.id are span-only.
+        // Verifies by construction: the method only accepts activity_name, queue, outcome.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_activity_attempt("charge_card", "billing", ActivityStatus::Completed);
+    }
+
+    #[test]
+    fn activity_status_outcome_values_are_bounded() {
+        // outcome label is low-cardinality: exactly "completed" and "failed".
+        assert_eq!(ActivityStatus::Completed.as_str(), "completed");
+        assert_eq!(ActivityStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn record_activity_attempt_fires_for_both_outcomes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct AttemptCounter {
+            completed: AtomicUsize,
+            failed: AtomicUsize,
+        }
+
+        impl MetricsRecorder for AttemptCounter {
+            fn record_activity_attempt(
+                &self,
+                _activity: &str,
+                _queue: &str,
+                outcome: ActivityStatus,
+            ) {
+                match outcome {
+                    ActivityStatus::Completed => {
+                        self.completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ActivityStatus::Failed => {
+                        self.failed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
+        let counter = AttemptCounter::default();
+        counter.record_activity_attempt("act", "q", ActivityStatus::Completed);
+        counter.record_activity_attempt("act", "q", ActivityStatus::Completed);
+        counter.record_activity_attempt("act", "q", ActivityStatus::Failed);
+        assert_eq!(counter.completed.load(Ordering::SeqCst), 2);
+        assert_eq!(counter.failed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn record_activity_retried_fires_per_retry_scheduled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct RetryCounter(AtomicUsize);
+
+        impl MetricsRecorder for RetryCounter {
+            fn record_activity_retried(&self, _activity: &str, _queue: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = RetryCounter::default();
+        counter.record_activity_retried("send_email", "default");
+        counter.record_activity_retried("send_email", "default");
+        counter.record_activity_retried("send_email", "default");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            3,
+            "retry counter should fire once per retry scheduled"
+        );
+    }
+
+    // ── Workflow-task timeout metric tests (issue #494) ───────────────────
+
+    #[test]
+    fn record_workflow_task_timeout_has_noop_default() {
+        // MetricsRecorder::record_workflow_task_timeout must exist with a
+        // no-op default so existing implementations compile without changes.
+        let rec = NoOpMetrics;
+        rec.record_workflow_task_timeout("onboarding", "default");
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_workflow_task_timeout() {
+        // ADR-0001 §7 cardinality rule: execution.id is span-only.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_workflow_task_timeout("billing", "default");
     }
 
     #[test]
@@ -1441,6 +3295,109 @@ mod tests {
     }
 
     #[test]
+    fn shard_stranded_pending_gauge_has_default_noop_impl() {
+        // record_shard_stranded_pending must exist on MetricsRecorder with (shard: u16, count: u64).
+        // METRIC_SHARD_STRANDED_PENDING is the constant; this verifies shape + no-op (issue #522).
+        let rec = NoOpMetrics;
+        rec.record_shard_stranded_pending(0, 0);
+        rec.record_shard_stranded_pending(1, 42);
+        // verify the constant is exported
+        assert_eq!(
+            METRIC_SHARD_STRANDED_PENDING,
+            "harvest.shard.stranded_pending"
+        );
+    }
+
+    #[test]
+    fn worker_slots_gauge_has_default_noop_impl() {
+        // record_worker_slots must exist on MetricsRecorder with
+        // (slot_type: SlotType, in_use: u64, available: u64). The constants are
+        // the registered names; this verifies shape + no-op (issue #531).
+        let rec = NoOpMetrics;
+        rec.record_worker_slots(SlotType::Workflow, 0, 0);
+        rec.record_worker_slots(SlotType::Activity, 3, 5);
+        assert_eq!(METRIC_WORKER_SLOTS_IN_USE, "harvest.worker.slots_in_use");
+        assert_eq!(
+            METRIC_WORKER_SLOTS_AVAILABLE,
+            "harvest.worker.slots_available"
+        );
+        assert_eq!(METRIC_LABEL_SLOT_TYPE, "slot_type");
+    }
+
+    #[test]
+    fn slot_type_stringify_is_bounded() {
+        assert_eq!(SlotType::Workflow.as_str(), "workflow");
+        assert_eq!(SlotType::Activity.as_str(), "activity");
+    }
+
+    #[test]
+    fn slot_target_gauge_and_tuner_decision_counter_have_default_noop_impls() {
+        // record_worker_slot_target / record_tuner_decision must exist on
+        // MetricsRecorder with a no-op default (issue #548).
+        let rec = NoOpMetrics;
+        rec.record_worker_slot_target(SlotType::Workflow, 20);
+        rec.record_worker_slot_target(SlotType::Activity, 40);
+        rec.record_tuner_decision(SlotType::Workflow, TunerDecision::Grow);
+        rec.record_tuner_decision(SlotType::Activity, TunerDecision::Shrink);
+        assert_eq!(METRIC_WORKER_SLOT_TARGET, "harvest.worker.slot_target");
+        assert_eq!(
+            METRIC_WORKER_TUNER_DECISIONS,
+            "harvest.worker.tuner_decisions"
+        );
+        assert_eq!(METRIC_LABEL_DECISION, "decision");
+    }
+
+    #[test]
+    fn tuner_decision_stringify_is_bounded() {
+        assert_eq!(TunerDecision::Grow.as_str(), "grow");
+        assert_eq!(TunerDecision::Shrink.as_str(), "shrink");
+        assert_eq!(TunerDecision::Hold.as_str(), "hold");
+    }
+
+    #[test]
+    fn worker_slot_invariant_holds_at_recorder_call_site() {
+        // AC: `available + in_use == configured_max` for each slot type within
+        // one sampler interval. A tracking recorder seeded with the configured
+        // maxima asserts the invariant for every observed sample (issue #531).
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct InvariantRecorder {
+            configured: HashMap<&'static str, u64>,
+            samples: Mutex<Vec<(&'static str, u64, u64)>>,
+        }
+
+        impl MetricsRecorder for InvariantRecorder {
+            fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
+                let max = *self
+                    .configured
+                    .get(slot_type.as_str())
+                    .expect("known slot type");
+                assert_eq!(
+                    in_use + available,
+                    max,
+                    "in_use + available must equal configured max for {}",
+                    slot_type.as_str()
+                );
+                self.samples
+                    .lock()
+                    .unwrap()
+                    .push((slot_type.as_str(), in_use, available));
+            }
+        }
+
+        let rec = InvariantRecorder {
+            configured: HashMap::from([("workflow", 8), ("activity", 16)]),
+            samples: Mutex::new(Vec::new()),
+        };
+        // Simulate one sampler interval: 3 of 8 workflow slots busy, 10 of 16
+        // activity slots busy.
+        rec.record_worker_slots(SlotType::Workflow, 3, 5);
+        rec.record_worker_slots(SlotType::Activity, 10, 6);
+        assert_eq!(rec.samples.lock().unwrap().len(), 2);
+    }
+
+    #[test]
     fn all_metric_record_methods_compile_without_execution_id() {
         // ADR-0001 §7: execution.id is span-only and FORBIDDEN as a metric label.
         // This test verifies by construction that no record_* method on
@@ -1460,7 +3417,13 @@ mod tests {
         rec.record_schedule_run("workflow", "daily_digest");
         rec.record_schedule_skipped("workflow", "daily_digest", "paused");
         rec.record_retention_tick(0, 100, 50, 0.02);
+        rec.record_retention_deleted("onboarding", 50);
+        rec.record_summary_deleted("onboarding", 50);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
+        rec.record_workflow_nondeterministic_block("onboarding", "default");
+        rec.record_schedule_to_start("default", 1.5);
+        rec.record_queue_oldest_pending_age("default", 30.0);
+        rec.record_worker_slots(SlotType::Workflow, 3, 5);
         // If any method silently accepted execution.id we'd see it here.
     }
 
@@ -1472,6 +3435,59 @@ mod tests {
         assert_eq!(WorkflowStatus::ContinuedAsNew.as_str(), "continued_as_new");
         assert_eq!(ActivityStatus::Completed.as_str(), "completed");
         assert_eq!(ActivityStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn webhook_outcome_stringifies_to_bounded_values() {
+        assert_eq!(WebhookOutcome::Accepted.as_str(), "accepted");
+        assert_eq!(
+            WebhookOutcome::IdempotentReplay.as_str(),
+            "idempotent_replay"
+        );
+        assert_eq!(WebhookOutcome::VerifyFailed.as_str(), "verify_failed");
+        assert_eq!(WebhookOutcome::ParseFailed.as_str(), "parse_failed");
+        assert_eq!(
+            WebhookOutcome::MissingIdempotency.as_str(),
+            "missing_idempotency"
+        );
+        assert_eq!(WebhookOutcome::InternalError.as_str(), "internal_error");
+        assert_eq!(WebhookOutcome::Accepted.to_string(), "accepted");
+    }
+
+    #[test]
+    fn noop_metrics_implements_webhook_methods_without_panicking() {
+        let rec = NoOpMetrics;
+        rec.record_webhook_received("/hooks/orders", WebhookOutcome::Accepted);
+        rec.record_webhook_rejected("/hooks/orders", WebhookOutcome::VerifyFailed);
+    }
+
+    #[test]
+    fn session_acquisition_outcome_stringifies_to_bounded_values() {
+        assert_eq!(SessionAcquisitionOutcome::Acquired.as_str(), "acquired");
+        assert_eq!(SessionAcquisitionOutcome::TimedOut.as_str(), "timed_out");
+        assert_eq!(SessionAcquisitionOutcome::Broken.as_str(), "broken");
+        assert_eq!(SessionAcquisitionOutcome::Acquired.to_string(), "acquired");
+    }
+
+    #[test]
+    fn metric_session_acquisition_name_is_stable() {
+        assert_eq!(METRIC_SESSION_ACQUISITION, "harvest.session.acquisition");
+    }
+
+    #[test]
+    fn noop_metrics_implements_session_acquisition_without_panicking() {
+        let rec = NoOpMetrics;
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Acquired);
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::TimedOut);
+        rec.record_session_acquisition("gpu-workers", SessionAcquisitionOutcome::Broken);
+    }
+
+    #[test]
+    fn noop_metrics_implements_admission_bypassed_without_panicking() {
+        // issue #618: the new bypass counter has a no-op default (additive).
+        let rec = NoOpMetrics;
+        rec.record_admission_bypassed("outbox");
+        rec.record_admission_bypassed("api");
     }
 
     #[test]
@@ -1499,6 +3515,17 @@ mod tests {
         );
         telemetry.metrics.record_timer_started(5.0);
         telemetry.metrics.record_queue_depth("default", 0);
+    }
+
+    #[test]
+    fn queue_latency_metrics_have_noop_defaults() {
+        let rec = NoOpMetrics;
+        // Both new queue latency methods must compile with only queue_name and
+        // the value (no execution.id) and must not panic on the no-op recorder.
+        rec.record_schedule_to_start("default", 0.0);
+        rec.record_schedule_to_start("priority", 1.234);
+        rec.record_queue_oldest_pending_age("default", 0.0);
+        rec.record_queue_oldest_pending_age("priority", 42.5);
     }
 
     #[test]
@@ -1565,5 +3592,256 @@ mod tests {
             count.activities.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    // ── Custom metrics tests (issue #532) ────────────────────────────────
+
+    #[test]
+    fn user_metric_prefix_constant_is_correct() {
+        assert_eq!(USER_METRIC_PREFIX, "harvest.user.");
+    }
+
+    #[test]
+    fn validate_user_metric_accepts_valid_name_and_labels() {
+        assert!(
+            validate_user_metric("orders_processed", &[("tier", "gold")]).is_ok(),
+            "valid name + label should pass"
+        );
+        assert!(
+            validate_user_metric("orders_processed", &[]).is_ok(),
+            "empty label list should pass"
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_empty_name() {
+        assert_eq!(
+            validate_user_metric("", &[]),
+            Err(UserMetricError::EmptyName)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_harvest_prefix() {
+        // Names starting with "harvest." would collide with engine metrics.
+        assert_eq!(
+            validate_user_metric("harvest.workflow.started", &[]),
+            Err(UserMetricError::ReservedPrefix)
+        );
+        assert_eq!(
+            validate_user_metric("harvest.user.something", &[]),
+            Err(UserMetricError::ReservedPrefix),
+            "even the user prefix itself must be rejected in the suffix argument"
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_name_too_long() {
+        let long_name = "a".repeat(MAX_USER_METRIC_NAME_LEN + 1);
+        assert_eq!(
+            validate_user_metric(&long_name, &[]),
+            Err(UserMetricError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_too_many_labels() {
+        let labels: Vec<(&str, &str)> = (0..=MAX_USER_METRIC_LABELS)
+            .map(|_| ("tier", "gold"))
+            .collect();
+        assert_eq!(
+            validate_user_metric("orders", &labels),
+            Err(UserMetricError::TooManyLabels)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_empty_label_key() {
+        assert_eq!(
+            validate_user_metric("orders", &[("", "value")]),
+            Err(UserMetricError::EmptyLabelKey)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_forbidden_label_keys() {
+        // ADR-0001 §7 cardinality rule: these keys are never allowed on metrics.
+        for forbidden in FORBIDDEN_USER_LABEL_KEYS {
+            let result = validate_user_metric("orders", &[(forbidden, "some-uuid")]);
+            assert!(
+                matches!(result, Err(UserMetricError::ForbiddenLabelKey(_))),
+                "label key \"{forbidden}\" should be forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn user_metrics_noop_recorder_is_suppressed_silently() {
+        // With NoOpMetrics the is_enabled() gate returns false so no validation
+        // is run and nothing panics, even for a theoretically invalid name.
+        let rec = NoOpMetrics;
+        let m = UserMetrics::new(&rec, false);
+        m.counter("orders", 1, &[]);
+        m.gauge("queue_depth", 3.0, &[]);
+        m.histogram("latency_ms", 42.0, &[]);
+    }
+
+    #[test]
+    fn user_metrics_suppressed_flag_short_circuits_even_with_real_recorder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingRec(AtomicUsize);
+        impl MetricsRecorder for CountingRec {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn record_user_counter(&self, _name: &str, _val: u64, _labels: &[(&str, &str)]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let rec = CountingRec::default();
+        let m = UserMetrics::new(&rec, true); // suppressed = true (replay mode)
+        m.counter("orders", 1, &[]);
+        m.counter("orders", 1, &[]);
+        assert_eq!(
+            rec.0.load(Ordering::SeqCst),
+            0,
+            "suppressed handle must emit zero samples"
+        );
+    }
+
+    #[test]
+    fn user_metrics_live_handle_emits_to_recorder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingRec(AtomicUsize);
+        impl MetricsRecorder for CountingRec {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn record_user_counter(&self, name: &str, val: u64, _labels: &[(&str, &str)]) {
+                // Verify prefix is applied
+                assert!(
+                    name.starts_with(USER_METRIC_PREFIX),
+                    "emitted name must start with USER_METRIC_PREFIX"
+                );
+                self.0
+                    .fetch_add(usize::try_from(val).unwrap_or(usize::MAX), Ordering::SeqCst);
+            }
+        }
+
+        let rec = CountingRec::default();
+        let m = UserMetrics::new(&rec, false); // not suppressed
+        m.counter("orders_processed", 3, &[("tier", "gold")]);
+        assert_eq!(rec.0.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn user_metrics_drops_call_with_forbidden_label_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingRec(AtomicUsize);
+        impl MetricsRecorder for CountingRec {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn record_user_counter(&self, _name: &str, _val: u64, _labels: &[(&str, &str)]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let rec = CountingRec::default();
+        let m = UserMetrics::new(&rec, false);
+        // execution.id is forbidden — call should be dropped (warn + return)
+        m.counter("orders", 1, &[("execution.id", "some-uuid")]);
+        assert_eq!(
+            rec.0.load(Ordering::SeqCst),
+            0,
+            "metric with forbidden label must be dropped"
+        );
+    }
+
+    #[test]
+    fn record_user_counter_has_noop_default() {
+        // Verify the three new default methods compile and are no-ops on NoOpMetrics.
+        let rec = NoOpMetrics;
+        rec.record_user_counter("harvest.user.orders", 1, &[("tier", "gold")]);
+        rec.record_user_gauge("harvest.user.balance", 42.0, &[]);
+        rec.record_user_histogram("harvest.user.latency_ms", 10.5, &[]);
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_user_counter() {
+        // ADR-0001 §7 — execution.id must not appear in the method signature.
+        // This test verifies it by construction: the call below compiles only
+        // because the signature is (name, value, labels) with no exec-id param.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_user_counter("harvest.user.orders", 1, &[("tier", "gold")]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Saga compensation observability (issue #801)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn saga_metric_constants_are_stable() {
+        // The saga compensation counters are specified by ADR-0001 §7 naming
+        // convention (instrument.noun); alert-pack PromQL depends on the
+        // rendered Prometheus names, so the constants must never drift.
+        assert_eq!(METRIC_SAGA_COMPENSATED, "harvest.saga.compensated");
+        assert_eq!(
+            METRIC_SAGA_COMPENSATION_FAILED,
+            "harvest.saga.compensation_failed"
+        );
+    }
+
+    #[test]
+    fn workflow_active_metric_and_label_constant_names() {
+        // Issue #770 — the gauge name and the `state` label constant.
+        assert_eq!(METRIC_WORKFLOW_ACTIVE, "harvest.workflow.active");
+        assert_eq!(METRIC_LABEL_STATE, "state");
+    }
+
+    #[test]
+    fn record_workflow_active_has_noop_default() {
+        // MetricsRecorder::record_workflow_active must exist with a no-op
+        // default body (`state` as `&str`) so existing MetricsRecorder impls
+        // compile unchanged. Must not panic.
+        let rec = NoOpMetrics;
+        rec.record_workflow_active("checkout", "running", 3);
+        rec.record_workflow_active("checkout", "paused", 0);
+    }
+
+    #[test]
+    fn record_saga_compensated_has_noop_default() {
+        // MetricsRecorder::record_saga_compensated must exist with a no-op
+        // default body so existing MetricsRecorder implementations compile
+        // without changes (AC4).
+        let rec = NoOpMetrics;
+        rec.record_saga_compensated("book_trip", "default");
+    }
+
+    #[test]
+    fn record_saga_compensation_failed_has_noop_default() {
+        // Same additive no-op-default contract for the dangling-state counter.
+        let rec = NoOpMetrics;
+        rec.record_saga_compensation_failed("book_trip", "default");
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_saga_counters() {
+        // Compile-level pin ONLY: this test proves the two methods exist and
+        // accept exactly (workflow_name, queue) — the cardinality guarantee
+        // itself is the trait signature (an ExecutionId parameter would not
+        // compile). It asserts nothing at runtime and is not evidence of
+        // production label content; that is pinned by the context-level
+        // label tests and the metrics_rs_adapter bridge test.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_saga_compensated("billing", "default");
+        rec.record_saga_compensation_failed("billing", "default");
     }
 }

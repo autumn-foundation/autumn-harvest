@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::batch_start::BatchStartConfig;
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
-use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+use crate::info::{
+    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
@@ -49,6 +51,14 @@ pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Default bounded-pause ceiling before auto-resume (24 hours, issue #383).
 pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_secs(24 * 3600);
+/// Default max-wait cap for debounced workflow starts (1 hour, issue #499).
+pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
+/// Default large-payload offload threshold (issue #524): 256 KiB.
+///
+/// Payload-bearing fields larger than this are offloaded to the configured
+/// [`PayloadStore`](crate::payload_store::PayloadStore). Only takes effect when
+/// a store is registered.
+pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -60,12 +70,22 @@ pub struct HarvestBuilder {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers collected via `updates![…]`.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata collected via `signals![…]` (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Ordered activity execution interceptor chain (issue #680). Index 0 is the
+    /// OUTERMOST wrapper; the activity handler is innermost. Empty (default) =
+    /// no interceptors.
+    activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
     payload_codecs: PayloadCodecs,
+    /// Embedder-supplied external blob store for large-payload offloading (issue #524).
+    payload_store: Option<Arc<dyn crate::payload_store::PayloadStore>>,
+    /// Byte threshold above which payload-bearing fields are offloaded (issue #524).
+    payload_offload_threshold: u64,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243).
     ///
@@ -73,6 +93,19 @@ pub struct HarvestBuilder {
     /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap (issue #617).
+    ///
+    /// Unlike `max_workflow_execution_timeout` (which only caps a *specified*
+    /// per-run timeout), this ceiling ALSO acts as a fleet-wide DEFAULT: a
+    /// workflow that declares no chain cap still inherits this value as its chain
+    /// deadline, so an operator can cap every chain even when a workflow
+    /// under-specifies. `None` means no chain cap is applied fleet-wide.
+    max_workflow_chain_timeout: Option<Duration>,
+    /// Optional hard ceiling on the number of durable events a RUNNING workflow
+    /// execution may accumulate (issue #493). When a workflow's event count
+    /// reaches or exceeds this value the execution is terminated with
+    /// `WorkflowFailed` and a machine-readable reason. `None` = no ceiling.
+    max_workflow_history_events: Option<u64>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
     /// Default: 2 MiB.
     max_activity_input_bytes: u64,
@@ -98,6 +131,36 @@ pub struct HarvestBuilder {
     batch_start_config: BatchStartConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+    /// Server-side ceiling on `workflow_attempt` (issue #523).
+    /// When set, `retry_policy.max_attempts` is clamped to `min(max_attempts, ceiling)`.
+    max_workflow_attempts: Option<u32>,
+    /// Ceiling on the `[from, to]` window accepted by `GET /admin/usage`
+    /// (issue #596). `None` uses `crate::usage::default_usage_window_ceiling()`.
+    usage_window_ceiling: Option<Duration>,
+    /// Cap on distinct groups `GET /admin/usage` will return before failing
+    /// loudly with `413` (issue #596). `None` uses
+    /// `crate::usage::default_usage_max_groups()`.
+    usage_max_groups: Option<usize>,
+    /// Builder-wide completion-callback configuration (issue #605): default
+    /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
+    /// optional custom deliverer.
+    completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    /// Retention window for request-scoped start idempotency keys (issue #808).
+    /// A repeated `idempotency_key` within this window deduplicates onto the same
+    /// execution; after it elapses the key is reusable. `None` uses
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
+    start_idempotency_window: Option<Duration>,
+    /// Sandbox policy per registered WASM activity (issue #965), keyed by name.
+    #[cfg(feature = "wasm-activities")]
+    wasm_bindings: std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared WASM engine + compiled-module cache, created lazily on the first
+    /// `wasm_activity(...)` call (issue #965). `None` = no WASM activities.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl Default for HarvestBuilder {
@@ -110,14 +173,20 @@ impl Default for HarvestBuilder {
             auto_registered_dag_workflows: Vec::new(),
             query_handlers: Vec::new(),
             update_handlers: Vec::new(),
+            signal_handlers: Vec::new(),
             worker_config: WorkerConfig::default(),
             state: std::collections::HashMap::new(),
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
             history_archiver: None,
+            activity_interceptors: Vec::new(),
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
+            payload_store: None,
+            payload_offload_threshold: DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
+            max_workflow_chain_timeout: None,
+            max_workflow_history_events: None,
             max_activity_input_bytes: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
@@ -127,6 +196,18 @@ impl Default for HarvestBuilder {
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
             completion_triggers: Vec::new(),
+            max_workflow_attempts: None,
+            usage_window_ceiling: None,
+            usage_max_groups: None,
+            completion_callback_config:
+                crate::completion_callback::CompletionCallbackBuilderConfig::default(),
+            start_idempotency_window: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: None,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: Vec::new(),
         }
     }
 }
@@ -144,6 +225,7 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
@@ -153,6 +235,14 @@ impl std::fmt::Debug for HarvestBuilder {
             .field(
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
+            )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
+            )
+            .field(
+                "max_workflow_history_events",
+                &self.max_workflow_history_events,
             )
             .field("max_activity_input_bytes", &self.max_activity_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
@@ -164,6 +254,13 @@ impl std::fmt::Debug for HarvestBuilder {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("usage_window_ceiling", &self.usage_window_ceiling)
+            .field("usage_max_groups", &self.usage_max_groups)
+            .field(
+                "completion_callback_default_target_count",
+                &self.completion_callback_config.default_targets.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -178,15 +275,26 @@ pub struct BuiltHarvest {
     query_handlers: Vec<QueryHandlerInfo>,
     /// Declarative update handlers indexed by workflow name for fast lookup.
     update_handlers: Vec<UpdateHandlerInfo>,
+    /// Declarative signal handler metadata (issue #610).
+    signal_handlers: Vec<SignalHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Ordered activity execution interceptor chain (issue #680). Index 0 = outermost.
+    activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
     payload_codecs: PayloadCodecs,
+    /// Configured large-payload offloader (issue #524). `None` = no store registered.
+    payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
     pub max_workflow_execution_timeout: Option<Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
+    /// default (issue #617). `None` = no chain cap applied fleet-wide.
+    pub max_workflow_chain_timeout: Option<Duration>,
+    /// Hard ceiling on durable event count per execution (issue #493). `None` = no ceiling.
+    pub max_workflow_history_events: Option<u64>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
     /// Default: 2 MiB.
     pub max_activity_input_bytes: u64,
@@ -211,6 +319,34 @@ pub struct BuiltHarvest {
     pub batch_start_config: BatchStartConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+    /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
+    pub max_workflow_attempts: Option<u32>,
+    /// Ceiling on the `[from, to]` window accepted by `GET /admin/usage`
+    /// (issue #596). Defaults to 90 days.
+    pub usage_window_ceiling: Duration,
+    /// Cap on distinct groups `GET /admin/usage` will return before failing
+    /// loudly with `413` (issue #596). Defaults to 10,000.
+    pub usage_max_groups: usize,
+    /// Resolved builder-wide completion-callback configuration (issue #605).
+    /// `deliverer` is still `None` here when the embedder didn't supply a
+    /// custom one — the plugin substitutes its default `reqwest`-based
+    /// implementation at runtime startup.
+    completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
+    /// Retention window for request-scoped start idempotency keys (issue #808).
+    /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
+    /// (24h) when unset on the builder.
+    pub start_idempotency_window: Duration,
+    /// Sandbox policy per registered WASM activity (issue #965), keyed by name.
+    #[cfg(feature = "wasm-activities")]
+    wasm_bindings: std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    /// Shared WASM engine + compiled-module cache (issue #965). `None` = no WASM
+    /// activities registered.
+    #[cfg(feature = "wasm-activities")]
+    wasm_store: Option<Arc<crate::wasm_activities::WasmModuleStore>>,
+    /// `(activity_name, module_bytes)` pairs published to each worker's shard DB
+    /// at startup (issue #965).
+    #[cfg(feature = "wasm-activities")]
+    wasm_module_registrations: Vec<(String, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -222,6 +358,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("workflow_schedule_count", &self.workflow_schedules.len())
             .field("query_handler_count", &self.query_handlers.len())
             .field("update_handler_count", &self.update_handlers.len())
+            .field("signal_handler_count", &self.signal_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
@@ -231,6 +368,14 @@ impl std::fmt::Debug for BuiltHarvest {
             .field(
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
+            )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
+            )
+            .field(
+                "max_workflow_history_events",
+                &self.max_workflow_history_events,
             )
             .field("max_activity_input_bytes", &self.max_activity_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
@@ -243,6 +388,13 @@ impl std::fmt::Debug for BuiltHarvest {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("usage_window_ceiling", &self.usage_window_ceiling)
+            .field("usage_max_groups", &self.usage_max_groups)
+            .field(
+                "completion_callback_default_target_count",
+                &self.completion_callback_config.default_targets.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -361,6 +513,31 @@ pub enum HarvestBuilderError {
         reason: String,
     },
 
+    /// A plain (non-DAG, non-canary) [`WorkflowSchedule`] opted into
+    /// `all_writable_shards`, which is only supported for DAG schedules and the
+    /// built-in synthetic liveness canary (issue #796).
+    ///
+    /// Registration honours the flag for any schedule, but the fire path only
+    /// encodes the shard id into the minted `ExecutionId` for DAGs and canaries
+    /// (it derives that from the workflow name / DAG-ness of the persisted
+    /// `harvest_schedules` row, which carries no `all_writable_shards` column).
+    /// A plain workflow opting in would register on every writable shard yet
+    /// mint every execution on the default shard — duplicate runs plus
+    /// cross-shard write inconsistency. Making it general-purpose would require
+    /// persisting the flag as a `harvest_schedules` column (a migration), which
+    /// #796 (AC10) deliberately avoids, so this combination is rejected here.
+    #[error(
+        "workflow_schedule for '{workflow_name}' sets all_writable_shards, which is \
+         only supported for DAG schedules and the built-in liveness canary; a plain \
+         workflow cannot use it because the fire path would mint executions on the \
+         default shard (making it general-purpose requires a harvest_schedules \
+         migration, avoided per issue #796 AC10)"
+    )]
+    AllWritableShardsUnsupported {
+        /// The plain workflow name that improperly opted into `all_writable_shards`.
+        workflow_name: String,
+    },
+
     /// A normal workflow registration reused the name of a DAG that is
     /// auto-registered as a workflow for unified DAG execution.
     #[error(
@@ -385,6 +562,23 @@ pub enum HarvestBuilderError {
         activity: String,
     },
 
+    /// A classic (non-unified) DAG contains a signal/timer gate node (issue
+    /// #746). Gate nodes lower onto the unified workflow-handler execution path
+    /// (`ctx.wait_for_signal`); the classic DAG executor has no way to suspend
+    /// on a signal, so the gate would silently never fire. Enable the
+    /// `unified-dag-execution` feature (on by default) so the `#[dag]` macro
+    /// emits the workflow handler that can run gates.
+    #[error(
+        "DAG '{dag}' has a signal gate on signal '{signal}' but is not unified \
+         (workflow_handler is None); signal gates require the unified-dag-execution path"
+    )]
+    DagSignalGateRequiresUnifiedExecution {
+        /// DAG containing the signal gate.
+        dag: String,
+        /// The signal the gate waits on.
+        signal: String,
+    },
+
     /// A workflow declares `ConcurrencyPolicy { limit: 0 }`, which makes the
     /// saturation check `(SELECT COUNT(*) ...) < 0` always false, permanently
     /// deferring every start for that workflow.
@@ -395,6 +589,32 @@ pub enum HarvestBuilderError {
     ZeroWorkflowConcurrencyLimit {
         /// The workflow name.
         workflow: String,
+    },
+
+    /// A workflow's `ThrottlePolicy` (issue #607) has a `burst` or
+    /// `refill_per_sec` that could never actually pace admissions.
+    ///
+    /// `ThrottlePolicy::from_rate_str` — the path the `#[workflow(throttle(...))]`
+    /// macro always uses — already rejects these values at parse time, but
+    /// `ThrottlePolicy`'s fields are `pub` so an application can also
+    /// construct one directly (a struct literal, or
+    /// `WorkflowInfo::with_throttle`) and bypass that validation entirely
+    /// (code review, issue #607). A `burst` below `1.0` (or non-finite) can
+    /// never successfully debit a token — the token debit path only admits a
+    /// start when the refilled bucket reaches `>= 1.0`, and refill is capped
+    /// at `burst` — so every start under that key would defer forever. A
+    /// non-finite or non-positive `refill_per_sec` either disables the
+    /// throttle (an infinite refill effectively fills the bucket instantly,
+    /// admitting everything) or freezes it once the initial burst is spent
+    /// (a zero/negative/NaN refill never restores a drained bucket).
+    /// Caught here, at build time, so every construction path is validated
+    /// exactly once regardless of how the policy was built.
+    #[error("workflow '{workflow}' has an invalid ThrottlePolicy: {reason}")]
+    InvalidWorkflowThrottlePolicy {
+        /// The workflow name.
+        workflow: String,
+        /// Which field was invalid and why.
+        reason: String,
     },
 
     /// A [`WorkerConfig`] field has an invalid value.
@@ -438,6 +658,78 @@ pub enum HarvestBuilderError {
         key: String,
     },
 
+    /// An activity declares a dynamic per-key rate limit (issue #699,
+    /// `rate_limit(key = "…")`) but no `rps`. Parallel to
+    /// [`Self::RateLimitKeyWithoutCap`] with dynamic-form wording so the fix
+    /// names the right attribute.
+    #[error(
+        "activity '{activity}' declares rate_limit(key = \"{key}\") but no rps; \
+         add rps, e.g. rate_limit(key = \"{key}\", rps = 50)"
+    )]
+    RateLimitKeyExprWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The dynamic key expression.
+        key: String,
+    },
+
+    /// A static `rate_limit_key` begins with the reserved `dyn-rate:` prefix
+    /// (issue #699). That prefix namespaces per-key/dynamic rate-limit buckets;
+    /// a static key beginning with it could collide with a generated dynamic
+    /// bucket, so it is rejected to keep the static and dynamic bucket
+    /// namespaces provably disjoint.
+    #[error(
+        "activity '{activity}' sets rate_limit_key = \"{key}\", which begins with the reserved \
+         `dyn-rate:` prefix (reserved for per-key/dynamic rate-limit buckets); \
+         choose a different rate_limit_key"
+    )]
+    RateLimitKeyReservedPrefix {
+        /// The activity name.
+        activity: String,
+        /// The offending static key.
+        key: String,
+    },
+
+    /// A local activity declares a dynamic per-key rate limit
+    /// (issue #699, `rate_limit(key = "…")`). Local activities run inline on
+    /// the workflow worker via `run_local_activity_inline`, bypassing the
+    /// task-dispatch / enqueue path where per-key rate limiting is enforced, so
+    /// the limit would be silently unenforced. The `#[activity]` macro rejects
+    /// this at parse time; a hand-built `ActivityInfo` (a directly-constructed
+    /// `HandlerRegistry`) bypasses the macro, so it is rejected here too.
+    #[error(
+        "activity '{activity}' is local (is_local = true) but declares a dynamic \
+         rate_limit(key = \"{key}\"); local activities run inline on the workflow worker \
+         and bypass the task-dispatch path where per-key rate limiting is enforced, so the \
+         limit would be silently unenforced -- remove `local = true` or the rate_limit(key = ...)"
+    )]
+    RateLimitKeyExprOnLocalActivity {
+        /// The activity name.
+        activity: String,
+        /// The dynamic key expression.
+        key: String,
+    },
+
+    /// An activity declares a `rate_limit_rps` or `rate_limit_burst` that is not
+    /// finite and strictly greater than zero (issue #699 review, Codex P2). The
+    /// `#[activity]` macro rejects `<= 0` at parse time, but a hand-built
+    /// `ActivityInfo` (a directly-constructed `HandlerRegistry`) bypasses the
+    /// macro; a non-positive / non-finite rate yields a `burst = tokens = 0`
+    /// bucket whose gate can never reach one token, permanently wedging every
+    /// scheduled activity on that bucket. Match the macro's universal positivity
+    /// check here (and go stricter — also reject `NaN`/`±inf`, which
+    /// `n <= 0.0` alone lets through).
+    #[error(
+        "activity '{activity}' sets {field} to a non-positive or non-finite value; \
+         {field} must be finite and greater than zero"
+    )]
+    RateLimitRateNotPositive {
+        /// The activity name.
+        activity: String,
+        /// The offending field name (`rate_limit_rps` or `rate_limit_burst`).
+        field: &'static str,
+    },
+
     /// A completion trigger references an unknown workflow name as a source or target.
     #[non_exhaustive]
     #[error(
@@ -452,6 +744,82 @@ pub enum HarvestBuilderError {
         /// All workflow names currently registered on the builder.
         registered: Vec<String>,
     },
+
+    /// A per-workflow-type retention override (issue #737) names a workflow
+    /// type that is not registered on this builder — either an explicit
+    /// `#[workflow]` or an auto-registered DAG workflow. Caught at build time
+    /// so a typo'd override name is a clear error rather than a silently
+    /// ignored override. Mirrors [`Self::UnknownCompletionTriggerWorkflow`].
+    #[non_exhaustive]
+    #[error(
+        "retention override names unknown workflow type '{workflow_name}'; \
+         register it with .workflows(...) or remove the override. \
+         registered workflows: {registered:?}"
+    )]
+    UnknownRetentionOverrideWorkflow {
+        /// The unrecognised workflow name in the retention override.
+        workflow_name: String,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
+
+    /// A completion trigger carries an output guard that fails
+    /// [`crate::completion_trigger::TriggerCondition::validate`] — over the
+    /// boundedness caps or with a malformed dotted path (issue #810). Never
+    /// silently dropped: registration fails fast.
+    #[non_exhaustive]
+    #[error("completion_trigger '{trigger_id}' has an invalid condition: {message}")]
+    InvalidCompletionTriggerCondition {
+        /// The offending trigger's id.
+        trigger_id: uuid::Uuid,
+        /// The first validation violation found.
+        message: String,
+    },
+
+    /// `max_workflow_history_events` is set but is not strictly greater than
+    /// the configured soft `continue_as_new_threshold`.
+    ///
+    /// The hard ceiling must always be higher than the advisory threshold so a
+    /// workflow that crosses the soft line gets a chance to rotate via
+    /// `continue_as_new` before the ceiling terminates it.
+    #[error(
+        "max_workflow_history_events ({ceiling}) must be strictly greater than \
+         history_continue_as_new_threshold ({threshold}); \
+         raise the ceiling or lower the soft threshold"
+    )]
+    HistoryCeilingBelowSoftThreshold {
+        /// The configured hard ceiling.
+        ceiling: u64,
+        /// The configured soft continue-as-new threshold.
+        threshold: u64,
+    },
+
+    /// A builder-wide default completion-callback target (issue #605) failed
+    /// SSRF validation against the configured
+    /// [`crate::completion_callback::SsrfPolicy`] host allowlist.
+    #[error("completion-callback default target '{url}' rejected: {rejection}")]
+    CallbackTargetRejected {
+        /// The rejected target URL.
+        url: String,
+        /// The machine-readable SSRF rejection reason.
+        rejection: crate::completion_callback::SsrfRejection,
+    },
+
+    /// A native `#[activity]` registration shares its name with a WASM activity
+    /// binding (issue #965 review). The native registration would win in the
+    /// handler registry while the WASM binding lingered, so the worker's WASM
+    /// dispatch seam would run the sandboxed guest under the native activity's
+    /// metadata — a silent wrong-implementation. Rejected at build time; pick a
+    /// distinct name for one of them.
+    #[cfg(feature = "wasm-activities")]
+    #[error(
+        "activity '{activity}' is registered both as a native activity and as a WASM \
+         activity binding; rename one so the name is unambiguous"
+    )]
+    WasmActivityNameCollision {
+        /// The name registered as both native and WASM.
+        activity: String,
+    },
 }
 
 impl BuiltHarvest {
@@ -464,6 +832,30 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
+    }
+
+    /// The `(activity_name, module_bytes)` WASM module registrations to publish
+    /// at worker startup (issue #965). Empty when no WASM activity is registered.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_module_registrations(&self) -> &[(String, Vec<u8>)] {
+        &self.wasm_module_registrations
+    }
+
+    /// The configured large-payload offloader, if a [`PayloadStore`] is
+    /// registered (issue #524).
+    ///
+    /// [`PayloadStore`]: crate::payload_store::PayloadStore
+    #[must_use]
+    pub const fn payload_offloader(&self) -> Option<&Arc<crate::payload_store::PayloadOffloader>> {
+        self.payload_offloader.as_ref()
+    }
+
+    /// The configured activity execution interceptor chain (issue #680), in
+    /// registration order (index 0 = outermost).
+    #[must_use]
+    pub fn activity_interceptors(&self) -> &[Arc<dyn crate::interceptor::ActivityInterceptor>] {
+        &self.activity_interceptors
     }
 
     /// History-size guardrails applied to workflow contexts and workers.
@@ -523,10 +915,29 @@ impl BuiltHarvest {
         self.max_workflow_execution_timeout
     }
 
+    /// Server-side ceiling on the chain-scoped lifetime cap, doubling as a
+    /// fleet-wide chain default (issue #617). `None` = no chain cap fleet-wide.
+    #[must_use]
+    pub const fn max_workflow_chain_timeout_ceiling(&self) -> Option<Duration> {
+        self.max_workflow_chain_timeout
+    }
+
     /// Registered DAG metadata.
     #[must_use]
     pub fn dags(&self) -> &[DagInfo] {
         &self.dags
+    }
+
+    /// Registered workflow metadata.
+    ///
+    /// Used by the boot-time orphaned-workflow-type reachability gate
+    /// (issue #700 AC4) to resolve the registered-name set from the owned
+    /// `BuiltHarvest` **before** `HarvestRunner::start` spawns the worker poll
+    /// loop — so the gate can refuse boot before any worker can claim and
+    /// terminally fail an orphaned-type execution.
+    #[must_use]
+    pub fn workflow_infos(&self) -> &[WorkflowInfo] {
+        &self.workflows
     }
 
     /// Declarative query handlers collected via `.queries(queries![…])`.
@@ -539,6 +950,22 @@ impl BuiltHarvest {
     #[must_use]
     pub fn update_handlers(&self) -> &[UpdateHandlerInfo] {
         &self.update_handlers
+    }
+
+    /// Declarative signal handler metadata collected via `.signals(signals![…])`
+    /// (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
+    }
+
+    /// Returns all signal handler infos for the named workflow (issue #610).
+    #[must_use]
+    pub fn signal_handlers_for(&self, workflow_name: &str) -> Vec<&SignalHandlerInfo> {
+        self.signal_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
     }
 
     /// Returns all query handler infos for the named workflow.
@@ -577,6 +1004,14 @@ impl BuiltHarvest {
         self.history_archiver.as_ref()
     }
 
+    /// Resolved builder-wide completion-callback configuration (issue #605).
+    #[must_use]
+    pub const fn completion_callback_config(
+        &self,
+    ) -> &crate::completion_callback::CompletionCallbackBuilderConfig {
+        &self.completion_callback_config
+    }
+
     /// Override the audit log retention window after the build step.
     ///
     /// Use this to apply a runtime-configured value (e.g. from `HarvestApiState`)
@@ -596,22 +1031,65 @@ impl BuiltHarvest {
         Vec<WorkflowSchedule>,
         WorkerConfig,
     ) {
+        // issue #921 review: `autumn-harvest-plugin`'s runner is the only
+        // installer of `GLOBAL_CALLBACK_CONFIG` this crate ships. A direct
+        // (non-plugin) core embedder using this method never routes through
+        // it, so completion-callback config would otherwise be silently
+        // inert. See `install_global_callback_config_for_direct_worker`.
+        crate::completion_callback::install_global_callback_config_for_direct_worker(
+            &self.completion_callback_config,
+        );
+        // issue #808 review (Codex P2): the start-idempotency expiry sweep
+        // (`enforce_timeouts_once` -> `sweep_expired_start_idempotency`) reads
+        // its retention window from a process-global static, mirroring the
+        // callback-config pattern above. `Plugin::build` installs it, but a
+        // standalone `HarvestRunner` worker process funnels through this method
+        // (via `into_worker_parts_with_extra_state`) without ever calling
+        // `Plugin::build` — so in a split web/worker deployment the worker's
+        // sweep would otherwise use the DEFAULT 24h window while the web app's
+        // reserve honors a custom `start_idempotency_window`, deleting a claim
+        // the reserve still considers live and letting a same-key retry create
+        // a second execution. Install the configured window here too so every
+        // worker (plugin-embedded or standalone) sweeps on the same window.
+        crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
+        #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
+        let mut registry = crate::worker::HandlerRegistry::with_state_and_telemetry(
+            self.workflows,
+            self.activities,
+            Arc::new(self.state),
+            self.telemetry,
+        )
+        .with_handler_infos(
+            self.query_handlers,
+            self.update_handlers,
+            self.signal_handlers,
+        )
+        .with_history_policy(self.history_policy)
+        .with_payload_caps(
+            self.max_activity_input_bytes,
+            self.max_workflow_input_bytes,
+            self.max_activity_result_bytes,
+            self.max_signal_payload_bytes,
+        )
+        .with_current_details_cap(self.max_current_details_bytes)
+        .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
+        .with_payload_offloader(self.payload_offloader.clone())
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
+        #[cfg(feature = "wasm-activities")]
+        if let Some(store) = self.wasm_store {
+            registry = registry.with_wasm_activities(
+                store,
+                self.wasm_bindings,
+                self.wasm_module_registrations,
+            );
+        }
         (
-            crate::worker::HandlerRegistry::with_state_and_telemetry(
-                self.workflows,
-                self.activities,
-                Arc::new(self.state),
-                self.telemetry,
-            )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy)
-            .with_payload_caps(
-                self.max_activity_input_bytes,
-                self.max_workflow_input_bytes,
-                self.max_activity_result_bytes,
-                self.max_signal_payload_bytes,
-            )
-            .with_current_details_cap(self.max_current_details_bytes),
+            registry,
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -631,23 +1109,53 @@ impl BuiltHarvest {
         Vec<WorkflowSchedule>,
         WorkerConfig,
     ) {
+        // See the identical calls in `into_worker_parts` above. This is the
+        // method the standalone `HarvestRunner` worker actually funnels through
+        // (runner.rs), so installing the configured start-idempotency sweep
+        // window here is what closes the split web/worker dedup gap.
+        crate::completion_callback::install_global_callback_config_for_direct_worker(
+            &self.completion_callback_config,
+        );
+        crate::start_idempotency::set_purge_window_secs(self.start_idempotency_window);
         self.state.extend(extra_state);
+        #[cfg_attr(not(feature = "wasm-activities"), allow(unused_mut))]
+        let mut registry = crate::worker::HandlerRegistry::with_state_and_telemetry(
+            self.workflows,
+            self.activities,
+            Arc::new(self.state),
+            self.telemetry,
+        )
+        .with_handler_infos(
+            self.query_handlers,
+            self.update_handlers,
+            self.signal_handlers,
+        )
+        .with_history_policy(self.history_policy)
+        .with_payload_caps(
+            self.max_activity_input_bytes,
+            self.max_workflow_input_bytes,
+            self.max_activity_result_bytes,
+            self.max_signal_payload_bytes,
+        )
+        .with_current_details_cap(self.max_current_details_bytes)
+        .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+        .with_max_workflow_chain_timeout(self.max_workflow_chain_timeout)
+        .with_payload_offloader(self.payload_offloader.clone())
+        .with_activity_interceptors(self.activity_interceptors.clone())
+        .with_activity_defaults(
+            self.worker_config.default_activity_retry_policy.clone(),
+            self.worker_config.default_activity_start_to_close,
+        );
+        #[cfg(feature = "wasm-activities")]
+        if let Some(store) = self.wasm_store {
+            registry = registry.with_wasm_activities(
+                store,
+                self.wasm_bindings,
+                self.wasm_module_registrations,
+            );
+        }
         (
-            crate::worker::HandlerRegistry::with_state_and_telemetry(
-                self.workflows,
-                self.activities,
-                Arc::new(self.state),
-                self.telemetry,
-            )
-            .with_handler_infos(self.query_handlers, self.update_handlers)
-            .with_history_policy(self.history_policy)
-            .with_payload_caps(
-                self.max_activity_input_bytes,
-                self.max_workflow_input_bytes,
-                self.max_activity_result_bytes,
-                self.max_signal_payload_bytes,
-            )
-            .with_current_details_cap(self.max_current_details_bytes),
+            registry,
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -693,6 +1201,107 @@ impl HarvestBuilder {
     pub fn workflows(mut self, workflows: Vec<WorkflowInfo>) -> Self {
         self.workflows.extend(workflows);
         self
+    }
+
+    /// Registered workflow metadata, in registration order.
+    ///
+    /// Used by the plugin's MCP tool generator (issue #597) to select
+    /// `mcp`-flagged workflows before the runtime starts. Includes the
+    /// auto-registered shadow `WorkflowInfo` for each unified DAG (see
+    /// [`Self::dag_infos`]).
+    #[must_use]
+    pub fn workflow_infos(&self) -> &[WorkflowInfo] {
+        &self.workflows
+    }
+
+    /// Registered activity metadata, in registration order.
+    ///
+    /// Pre-build accessor used by the plugin's built-in synthetic liveness
+    /// canary (issue #796) to confirm the reserved canary activity is
+    /// registered exactly once before the runtime starts.
+    #[must_use]
+    pub fn activity_infos(&self) -> &[ActivityInfo] {
+        &self.activities
+    }
+
+    /// Registered workflow schedules, in registration order.
+    ///
+    /// Pre-build accessor used by the plugin's built-in synthetic liveness
+    /// canary (issue #796) to assert the per-writable-shard probe schedule was
+    /// registered.
+    #[must_use]
+    pub fn workflow_schedules(&self) -> &[WorkflowSchedule] {
+        &self.workflow_schedules
+    }
+
+    /// Read access to the worker configuration.
+    ///
+    /// Pre-build counterpart of [`Self::worker_config_mut`], used by the
+    /// synthetic liveness canary (issue #796) to confirm a probe queue is in
+    /// the worker's drained-queue set.
+    #[must_use]
+    pub const fn worker_config(&self) -> &WorkerConfig {
+        &self.worker_config
+    }
+
+    /// Read access to the retention configuration.
+    ///
+    /// Pre-build counterpart of the consuming [`Self::retention`] setter, used
+    /// by the synthetic liveness canary (issue #796) to add per-workflow
+    /// self-cleaning retention overrides while preserving any existing config.
+    #[must_use]
+    pub const fn retention_config(&self) -> &RetentionConfig {
+        &self.retention
+    }
+
+    /// Registered DAG metadata, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::dags`]. Used by the plugin's
+    /// MCP tool generator to distinguish a unified DAG's auto-registered
+    /// `WorkflowInfo` (see [`Self::workflow_infos`]) from an ordinary
+    /// workflow, so the DAG's `start` tool can route through the DAG trigger
+    /// contract rather than generic workflow start.
+    #[must_use]
+    pub fn dag_infos(&self) -> &[DagInfo] {
+        &self.dags
+    }
+
+    /// Registered declarative update handlers, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::update_handlers`] (issue #597).
+    #[must_use]
+    pub fn update_handlers(&self) -> &[UpdateHandlerInfo] {
+        &self.update_handlers
+    }
+
+    /// The configured payload-codec registry.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::payload_codecs`] (issue #608):
+    /// lets the plugin mirror the registry onto its API state at `build()`
+    /// time — alongside the `decode_payloads_on_read` opt-in flag — instead
+    /// of waiting for the runtime startup hook, so there is no boot window
+    /// where a decode-eligible request sees a default identity-only registry.
+    /// `try_build` clones this registry verbatim, so the pre-build and
+    /// post-build views are identical.
+    #[must_use]
+    pub const fn payload_codecs(&self) -> &PayloadCodecs {
+        &self.payload_codecs
+    }
+
+    /// Registered declarative query handlers, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::query_handlers`] (issue #597).
+    #[must_use]
+    pub fn query_handlers(&self) -> &[QueryHandlerInfo] {
+        &self.query_handlers
+    }
+
+    /// Registered declarative signal handler metadata, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::signal_handlers`] (issue #610).
+    #[must_use]
+    pub fn signal_handlers(&self) -> &[SignalHandlerInfo] {
+        &self.signal_handlers
     }
 
     /// Register activity definitions (output of `activities![]` macro).
@@ -758,6 +1367,22 @@ impl HarvestBuilder {
     #[must_use]
     pub fn updates(mut self, handlers: Vec<UpdateHandlerInfo>) -> Self {
         self.update_handlers.extend(handlers);
+        self
+    }
+
+    /// Register declarative signal handler metadata (output of `signals![…]`
+    /// macro) for self-service interface discovery (issue #610).
+    ///
+    /// Each [`SignalHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute and carries an optional payload schema and
+    /// description. This metadata is published by the management API; it does not
+    /// register a runtime handler (push handlers register inside the workflow body
+    /// via [`WorkflowContext::register_signal_handler`](crate::context::WorkflowContext)).
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn signals(mut self, handlers: Vec<SignalHandlerInfo>) -> Self {
+        self.signal_handlers.extend(handlers);
         self
     }
 
@@ -834,6 +1459,31 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register an external [`PayloadStore`](crate::payload_store::PayloadStore)
+    /// for large-payload offloading via claim-check (issue #524).
+    ///
+    /// Once registered, any payload-bearing field larger than
+    /// [`payload_offload_threshold`](HarvestBuilder::payload_offload_threshold)
+    /// is written to the store and replaced inline with a small reference
+    /// envelope, so big blobs flow between steps without bloating
+    /// `harvest_events` or tripping the #252 size cap. With no store registered,
+    /// behaviour is unchanged.
+    #[must_use]
+    pub fn payload_store(mut self, store: impl crate::payload_store::PayloadStore) -> Self {
+        self.payload_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Set the byte threshold above which payload-bearing fields are offloaded
+    /// to the registered [`PayloadStore`](crate::payload_store::PayloadStore)
+    /// (issue #524). Fields at or below the threshold stay inline. Default:
+    /// [`DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`] (256 KiB). No effect without a store.
+    #[must_use]
+    pub const fn payload_offload_threshold(mut self, bytes: u64) -> Self {
+        self.payload_offload_threshold = bytes;
+        self
+    }
+
     #[must_use]
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
@@ -842,7 +1492,7 @@ impl HarvestBuilder {
 
     /// Configure retention janitor behavior for completed workflow history.
     #[must_use]
-    pub const fn retention(mut self, retention: RetentionConfig) -> Self {
+    pub fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
         self
     }
@@ -851,6 +1501,169 @@ impl HarvestBuilder {
     #[must_use]
     pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
         self.history_archiver = Some(Arc::new(archiver));
+        self
+    }
+
+    /// Register an activity execution interceptor (issue #680).
+    ///
+    /// Interceptors wrap **every** activity execution on the worker — regular
+    /// and local. Call this repeatedly to build an ordered chain: the
+    /// **first-registered interceptor is the OUTERMOST wrapper** (runs first on
+    /// the way in, last on the way out) and the activity handler is innermost.
+    ///
+    /// An interceptor may transform the input, transform the result or error,
+    /// or short-circuit (returning without calling `next.run`, so the handler
+    /// never runs). An interceptor error and panic are contained on the same
+    /// retry / circuit-breaker / dead-letter path as a handler error/panic. See
+    /// [`crate::interceptor`] for the full contract.
+    #[must_use]
+    pub fn activity_interceptor(
+        mut self,
+        interceptor: impl crate::interceptor::ActivityInterceptor,
+    ) -> Self {
+        self.activity_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Register a sandboxed WebAssembly activity (issue #965).
+    ///
+    /// The activity is registered as a normal (non-local) `ActivityInfo` whose
+    /// module bytes are published to each worker's shard database at startup and
+    /// whose guest is run through the worker's WASM dispatch seam instead of a
+    /// native handler. Capabilities are deny-all by default; grant them (and
+    /// override the resource limits, queue, retry policy, or start-to-close) via
+    /// the [`WasmActivityRegistration`](crate::wasm_store::WasmActivityRegistration)
+    /// fluent setters.
+    ///
+    /// The shared WASM engine + compiled-module cache is created lazily on the
+    /// first call and reused across every registered WASM activity.
+    #[cfg(feature = "wasm-activities")]
+    #[must_use]
+    pub fn wasm_activity(
+        mut self,
+        registration: crate::wasm_store::WasmActivityRegistration,
+    ) -> Self {
+        // Leak the name/queue to `'static` for the placeholder `ActivityInfo`
+        // (mirrors the MCP-tool route-generation precedent). A builder is a
+        // one-time process-startup object, so a bounded leak per registered
+        // activity is acceptable.
+        let name: &'static str = Box::leak(registration.name.clone().into_boxed_str());
+        let queue: Option<&'static str> = registration
+            .queue
+            .as_ref()
+            .map(|q| &*Box::leak(q.clone().into_boxed_str()));
+        self.activities.push(crate::info::ActivityInfo::wasm(
+            name,
+            queue,
+            Some(registration.retry.clone()),
+            registration.start_to_close,
+        ));
+        self.wasm_bindings
+            .insert(registration.name.clone(), registration.binding());
+        if self.wasm_store.is_none() {
+            self.wasm_store = Some(Arc::new(crate::wasm_activities::WasmModuleStore::new()));
+        }
+        // Keep the registration byte-blobs last-wins consistent with the binding
+        // (`wasm_bindings.insert`) and the `ActivityInfo` registry, both of which
+        // use the LATER definition on a duplicate name (issue #965 review). A
+        // blind append would leave the STALE first blob's bytes in the vector;
+        // `seed_registered_wasm_modules` activates the first same-name row when
+        // none is active, so on a clean shard it would seed+activate those stale
+        // bytes under the newer binding/retry/queue metadata — a mismatch.
+        // Replace-on-insert so exactly one entry per name survives, matching the
+        // last registration.
+        if let Some(existing) = self
+            .wasm_module_registrations
+            .iter_mut()
+            .find(|(existing_name, _)| *existing_name == registration.name)
+        {
+            existing.1 = registration.wasm_bytes;
+        } else {
+            self.wasm_module_registrations
+                .push((registration.name, registration.wasm_bytes));
+        }
+        self
+    }
+
+    /// Register a builder-wide default completion-callback target (issue
+    /// #605): a URL that receives a signed POST of the terminal result for
+    /// every workflow whose effective target set includes it (per-execution
+    /// targets set via a start option are unioned with these defaults).
+    ///
+    /// The target is validated against the configured SSRF host allowlist
+    /// at [`try_build`](Self::try_build) time — call
+    /// [`completion_callback_allowlist`](Self::completion_callback_allowlist)
+    /// first if the target's host isn't already allowlisted, or `try_build`
+    /// returns [`HarvestBuilderError::CallbackTargetRejected`].
+    #[must_use]
+    pub fn completion_callback_default(
+        mut self,
+        url: impl Into<String>,
+        filter: crate::completion_callback::EventFilter,
+    ) -> Self {
+        self.completion_callback_config
+            .default_targets
+            .push(crate::completion_callback::CallbackTarget::new(url, filter));
+        self
+    }
+
+    /// Configure the SSRF host allowlist for completion-callback targets
+    /// (issue #605). Every registered target (builder default or
+    /// per-execution) must match an entry here (exact host or `*.suffix`)
+    /// or it is rejected at registration time.
+    #[must_use]
+    pub fn completion_callback_allowlist(
+        mut self,
+        allowlist: crate::completion_callback::HostAllowlist,
+    ) -> Self {
+        self.completion_callback_config.allowlist = allowlist;
+        self
+    }
+
+    /// Permit `http://` completion-callback targets (default: `https://` only).
+    #[must_use]
+    pub const fn completion_callback_allow_http(mut self, allow: bool) -> Self {
+        self.completion_callback_config.allow_http = allow;
+        self
+    }
+
+    /// Permit IP-literal completion-callback target hosts, subject to the
+    /// private/loopback/link-local rejection rules (default: rejected).
+    #[must_use]
+    pub const fn completion_callback_allow_ip_literals(mut self, allow: bool) -> Self {
+        self.completion_callback_config.allow_ip_literals = allow;
+        self
+    }
+
+    /// Set the HMAC secret used to sign every completion-callback delivery's
+    /// `X-Harvest-Signature` header (issue #605), so receivers can verify
+    /// authenticity and reject replays. If never called, deliveries are
+    /// still signed but with an empty key — operators enabling completion
+    /// callbacks should always set a real secret.
+    #[must_use]
+    pub fn completion_callback_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.completion_callback_config.secret =
+            Some(crate::completion_callback::CallbackSecret::new(secret));
+        self
+    }
+
+    /// Override the default delivery retry policy (issue #605). Defaults to
+    /// [`crate::completion_callback::default_delivery_retry_policy`] (~1 hour window).
+    #[must_use]
+    pub fn completion_callback_retry_policy(mut self, policy: crate::policy::RetryPolicy) -> Self {
+        self.completion_callback_config.retry_policy = policy;
+        self
+    }
+
+    /// Override the outbound HTTP transport for completion-callback delivery
+    /// (issue #605). When not called, the plugin substitutes its default
+    /// `reqwest`-based implementation at startup — core ships no HTTP client.
+    #[must_use]
+    pub fn completion_callback_deliverer(
+        mut self,
+        deliverer: impl crate::completion_callback::CompletionCallbackDeliverer,
+    ) -> Self {
+        self.completion_callback_config.deliverer = Some(Arc::new(deliverer));
         self
     }
 
@@ -864,10 +1677,43 @@ impl HarvestBuilder {
         self
     }
 
+    /// Override the deadline fraction used by
+    /// [`crate::context::WorkflowContext::should_continue_as_new`] for
+    /// deadline-aware continue-as-new (issue #772). Clamped into `[0.0, 1.0]`.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`](crate::context::DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION)
+    /// (`0.8`).
+    #[must_use]
+    pub const fn history_continue_as_new_deadline_fraction(mut self, fraction: f64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_continue_as_new_deadline_fraction(fraction);
+        self
+    }
+
     /// Configure an opt-in hard cap for workflow history event counts.
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
         self.history_policy = self.history_policy.with_event_hard_cap(cap);
+        self
+    }
+
+    /// Set a server-side hard ceiling on the number of durable events a RUNNING
+    /// workflow execution may accumulate (issue #493).
+    ///
+    /// When set, the background timeout scanner terminates any execution whose
+    /// recorded event count reaches or exceeds `ceiling` with `WorkflowFailed`
+    /// and a machine-readable error reason of the form
+    /// `"history_ceiling_exceeded: event count {n} >= ceiling {c}"`.
+    ///
+    /// `None` (the default) means no ceiling is enforced.
+    ///
+    /// The ceiling MUST be strictly greater than `history_continue_as_new_threshold`
+    /// (default 10,000). A misconfiguration is caught by [`Self::try_build`].
+    #[must_use]
+    pub const fn max_workflow_history_events(mut self, ceiling: Option<u64>) -> Self {
+        self.max_workflow_history_events = ceiling;
         self
     }
 
@@ -895,6 +1741,73 @@ impl HarvestBuilder {
     #[must_use]
     pub const fn max_workflow_execution_timeout(mut self, ceiling: Duration) -> Self {
         self.max_workflow_execution_timeout = Some(ceiling);
+        self
+    }
+
+    /// Set a server-side ceiling on the chain-scoped lifetime cap (issue #617).
+    ///
+    /// This ceiling caps any workflow-declared `chain_execution_timeout` AND acts
+    /// as a fleet-wide default: a workflow that declares no chain cap still
+    /// inherits this value as its chain deadline. `None` (the default) means no
+    /// chain cap is applied fleet-wide.
+    #[must_use]
+    pub const fn max_workflow_chain_timeout(mut self, ceiling: Duration) -> Self {
+        self.max_workflow_chain_timeout = Some(ceiling);
+        self
+    }
+
+    /// Set a server-side ceiling on workflow retry attempts (issue #523).
+    ///
+    /// When set, `retry_policy.max_attempts` is clamped to `min(max_attempts, ceiling)`.
+    /// `None` (the default) means no ceiling is enforced.
+    #[must_use]
+    pub const fn max_workflow_attempts(mut self, ceiling: u32) -> Self {
+        self.max_workflow_attempts = Some(ceiling);
+        self
+    }
+
+    /// Set the retention window for request-scoped start idempotency keys
+    /// (issue #808).
+    ///
+    /// A repeated `idempotency_key` on `POST /workflows/{name}/start` within this
+    /// window deduplicates onto the same execution (returning it as a no-op);
+    /// once the window elapses, the same key is reusable. Defaults to
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] (24h).
+    #[must_use]
+    pub const fn start_idempotency_window(mut self, window: Duration) -> Self {
+        self.start_idempotency_window = Some(window);
+        self
+    }
+
+    /// The configured start-idempotency retention window, or `None` if unset
+    /// (the default 24h applies at build time).
+    ///
+    /// Read-only pre-build accessor (issue #695).
+    #[must_use]
+    pub const fn start_idempotency_window_config(&self) -> Option<Duration> {
+        self.start_idempotency_window
+    }
+
+    /// Override the ceiling on the `[from, to]` window accepted by
+    /// `GET /admin/usage` (issue #596).
+    ///
+    /// Defaults to 90 days (`crate::usage::default_usage_window_ceiling()`).
+    #[must_use]
+    pub const fn usage_window_ceiling(mut self, ceiling: Duration) -> Self {
+        self.usage_window_ceiling = Some(ceiling);
+        self
+    }
+
+    /// Override the cap on distinct groups `GET /admin/usage` will return
+    /// before failing loudly with `413` (issue #596).
+    ///
+    /// Defaults to 10,000 (`crate::usage::default_usage_max_groups()`). A
+    /// chargeback report must never silently drop a low-volume tenant's
+    /// data, so exceeding this cap is a hard error naming the ceiling
+    /// rather than a silent top-N rollup.
+    #[must_use]
+    pub const fn usage_max_groups(mut self, cap: usize) -> Self {
+        self.usage_max_groups = Some(cap);
         self
     }
 
@@ -1031,10 +1944,16 @@ impl HarvestBuilder {
     /// when activities sharing a `concurrency_key` declare different
     /// `max_concurrent` values, or when a [`WorkflowSchedule`] references a
     /// workflow name not registered on this builder.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(self) -> Result<BuiltHarvest, HarvestBuilderError> {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+        validate_retention_overrides(
+            &self.retention,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
 
         if self.worker_config.worker_heartbeat_interval.is_zero() {
             return Err(HarvestBuilderError::InvalidWorkerConfig(
@@ -1044,6 +1963,7 @@ impl HarvestBuilder {
 
         validate_concurrency_keys(&self.activities)?;
         validate_workflow_concurrency_limits(&self.workflows)?;
+        validate_workflow_throttle_policies(&self.workflows)?;
         validate_dag_workflow_name_collisions(
             &self.workflows,
             &self.auto_registered_dag_workflows,
@@ -1063,8 +1983,24 @@ impl HarvestBuilder {
             self.worker_config.max_local_activity_start_to_close,
         )?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
+        validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
-        validate_rate_limit_keys(&self.activities)?;
+        validate_activity_rate_limits(&self.activities)?;
+        #[cfg(feature = "wasm-activities")]
+        validate_wasm_activity_name_collisions(&self.wasm_bindings, &self.activities)?;
+        if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
+            return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
+        }
+
+        if let Some(ceiling) = self.max_workflow_history_events {
+            let threshold = self.history_policy.continue_as_new_threshold();
+            if ceiling <= threshold {
+                return Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling,
+                    threshold,
+                });
+            }
+        }
 
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
@@ -1077,6 +2013,21 @@ impl HarvestBuilder {
             .unwrap_or(worker_config.unknown_target_grace_window);
         worker_config.unknown_target_grace_window = unknown_target_grace_window;
 
+        let usage_window_ceiling = self
+            .usage_window_ceiling
+            .unwrap_or_else(crate::usage::default_usage_window_ceiling);
+        let usage_max_groups = self
+            .usage_max_groups
+            .unwrap_or_else(crate::usage::default_usage_max_groups);
+
+        let telemetry_arc = Arc::new(self.telemetry.unwrap_or_default());
+        let payload_offloader = self.payload_store.clone().map(|store| {
+            Arc::new(crate::payload_store::PayloadOffloader::new(
+                store,
+                self.payload_offload_threshold,
+                telemetry_arc.metrics.clone(),
+            ))
+        });
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
@@ -1084,14 +2035,19 @@ impl HarvestBuilder {
             workflow_schedules: self.workflow_schedules,
             query_handlers: self.query_handlers,
             update_handlers: self.update_handlers,
+            signal_handlers: self.signal_handlers,
             worker_config,
             state: self.state,
-            telemetry: Arc::new(self.telemetry.unwrap_or_default()),
+            telemetry: telemetry_arc,
             retention: self.retention,
             history_archiver: self.history_archiver,
+            activity_interceptors: self.activity_interceptors,
             payload_codecs: self.payload_codecs.clone(),
+            payload_offloader,
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
+            max_workflow_chain_timeout: self.max_workflow_chain_timeout,
+            max_workflow_history_events: self.max_workflow_history_events,
             max_activity_input_bytes: self.max_activity_input_bytes,
             max_activity_result_bytes: self.max_activity_result_bytes,
             max_signal_payload_bytes: self.max_signal_payload_bytes,
@@ -1101,6 +2057,19 @@ impl HarvestBuilder {
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
             completion_triggers: self.completion_triggers,
+            max_workflow_attempts: self.max_workflow_attempts,
+            usage_window_ceiling,
+            usage_max_groups,
+            completion_callback_config: self.completion_callback_config,
+            start_idempotency_window: self
+                .start_idempotency_window
+                .unwrap_or(crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW),
+            #[cfg(feature = "wasm-activities")]
+            wasm_bindings: self.wasm_bindings,
+            #[cfg(feature = "wasm-activities")]
+            wasm_store: self.wasm_store,
+            #[cfg(feature = "wasm-activities")]
+            wasm_module_registrations: self.wasm_module_registrations,
         })
     }
 }
@@ -1125,6 +2094,14 @@ fn validate_dags_do_not_use_local_activities(
             continue;
         };
         for task in definition.tasks() {
+            // A signal/timer gate (issue #746) stores its *signal* name in
+            // `activity_name` but never dispatches an activity, so its name must
+            // not be validated against registered local activities — otherwise a
+            // gate and a local activity sharing a name (e.g. both `approval`)
+            // would false-reject the build.
+            if task.signal.is_some() {
+                continue;
+            }
             if local_activities.contains(task.activity_name.as_str()) {
                 return Err(HarvestBuilderError::LocalActivityInDag {
                     dag: dag.name.to_string(),
@@ -1134,6 +2111,33 @@ fn validate_dags_do_not_use_local_activities(
         }
     }
 
+    Ok(())
+}
+
+/// Reject a signal/timer gate node on a **classic** (non-unified) DAG
+/// (`workflow_handler.is_none()`) — issue #746.
+///
+/// Gate nodes lower onto the unified workflow-handler path
+/// (`ctx.wait_for_signal`); the classic DAG executor cannot suspend on a
+/// signal, so the gate would silently never fire. A gate on a unified DAG
+/// (`workflow_handler.is_some()`, the default `#[dag]` output) is allowed.
+fn validate_classic_dags_have_no_signal_gates(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        if dag.workflow_handler.is_some() {
+            continue;
+        }
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if let Some(gate) = &task.signal {
+                return Err(HarvestBuilderError::DagSignalGateRequiresUnifiedExecution {
+                    dag: dag.name.to_string(),
+                    signal: gate.signal_name.clone(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1201,6 +2205,46 @@ fn validate_completion_triggers(
                 registered,
             });
         }
+        // Output-guard boundedness validation (issue #810): reject an
+        // over-cap or malformed-path condition at build time so it can never
+        // reach the terminal-commit path.
+        if let Some(ref condition) = trigger.condition
+            && let Err(message) = condition.validate()
+        {
+            return Err(HarvestBuilderError::InvalidCompletionTriggerCondition {
+                trigger_id: trigger.id,
+                message,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every per-workflow-type retention override (issue #737)
+/// names a registered workflow type — either an explicitly registered
+/// `#[workflow]` or an auto-registered DAG workflow. Catches typos at build
+/// time rather than silently ignoring the override. Mirrors
+/// [`validate_completion_triggers`].
+fn validate_retention_overrides(
+    retention: &crate::retention::RetentionConfig,
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    if retention.workflow_overrides().is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows
+        .iter()
+        .map(|w| w.name.to_string())
+        .chain(auto_registered_dag_workflows.iter().cloned())
+        .collect();
+    for name in retention.workflow_overrides().keys() {
+        if !registered.contains(name) {
+            return Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow {
+                workflow_name: name.clone(),
+                registered,
+            });
+        }
     }
     Ok(())
 }
@@ -1229,6 +2273,20 @@ fn validate_workflow_schedules(
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
                 reason: "workflow schedule targets an auto-registered DAG workflow; use the DAG schedule registration instead".to_string(),
+            });
+        }
+        // `all_writable_shards` is only honoured on the fire path for DAG
+        // schedules and the built-in liveness canary (issue #796). A plain
+        // workflow opting in would register on every writable shard yet mint
+        // executions on the default shard (see the field docs). Reject fast so
+        // the footgun surfaces as a clear build error instead of silent
+        // duplicate/cross-shard-inconsistent runs at fire time.
+        if schedule.all_writable_shards
+            && schedule.dag_name.is_none()
+            && !crate::canary::is_canary_workflow(&schedule.workflow_name)
+        {
+            return Err(HarvestBuilderError::AllWritableShardsUnsupported {
+                workflow_name: schedule.workflow_name.clone(),
             });
         }
         // Reject zero-length intervals (would cause infinite loops in due_run_plan
@@ -1350,15 +2408,169 @@ struct RateLimitKeyEntry {
     contributors: Vec<(String, f64, Option<f64>)>,
 }
 
+/// Reject an activity whose `rate_limit_rps` or `rate_limit_burst` is not
+/// finite and strictly greater than zero (issue #699 review, Codex P2).
+///
+/// Applies to static AND dynamic rate limits — the `#[activity]` macro enforces
+/// positivity universally at parse time (`n <= 0.0` -> compile error), but a
+/// hand-built `ActivityInfo` (a directly-constructed `HandlerRegistry`)
+/// bypasses the macro; a non-positive / non-finite rps yields a
+/// `burst = tokens = 0` bucket whose gate can never reach one token,
+/// permanently wedging every scheduled activity on that bucket. This goes
+/// stricter than the macro by also rejecting `NaN`/`±inf`, which `n <= 0.0`
+/// alone lets through.
+fn check_rate_limit_positive(
+    activity: &crate::info::ActivityInfo,
+) -> Result<(), HarvestBuilderError> {
+    if let Some(rps) = activity.rate_limit_rps
+        && (!rps.is_finite() || rps <= 0.0)
+    {
+        return Err(HarvestBuilderError::RateLimitRateNotPositive {
+            activity: activity.name.to_string(),
+            field: "rate_limit_rps",
+        });
+    }
+    if let Some(burst) = activity.rate_limit_burst
+        && (!burst.is_finite() || burst <= 0.0)
+    {
+        return Err(HarvestBuilderError::RateLimitRateNotPositive {
+            activity: activity.name.to_string(),
+            field: "rate_limit_burst",
+        });
+    }
+    Ok(())
+}
+
 /// Verify that rate limiting attributes on activities are consistent and valid.
-fn validate_rate_limit_keys(
-    activities: &[crate::info::ActivityInfo],
+/// Validate every activity's rate-limit configuration (issue #699).
+///
+/// This is the single, comprehensive rate-limit gate. It is called from
+/// [`HarvestBuilder::try_build`] (the builder path) **and** from
+/// [`crate::worker::Worker::new`] (the direct-`HandlerRegistry` / worker-startup
+/// path), so a worker constructed without going through the builder still
+/// fails loud, once, before its poll loop and first enqueue — rather than
+/// slipping an invalid config past the piecemeal schedule-time guards in
+/// `persist_scheduled_activities` (issue #699 review, Codex round-5 P2).
+///
+/// Checks, per activity:
+/// - a dynamic `rate_limit(key = …)` on a **local** activity — local activities
+///   run inline and bypass the dispatch path entirely, so the limit would be
+///   silently unenforced ([`HarvestBuilderError::RateLimitKeyExprOnLocalActivity`]);
+/// - a dynamic `rate_limit(key = …)` without an `rps`
+///   ([`HarvestBuilderError::RateLimitKeyExprWithoutCap`]);
+/// - two activities sharing a normalized dynamic key-expression that declare
+///   different `rps`/`burst` — the shared bucket's config would become
+///   insertion-order dependent under `ON CONFLICT DO NOTHING`
+///   ([`HarvestBuilderError::RateLimitKeyMismatch`]);
+/// - a static `rate_limit_key` squatting the reserved `dyn-rate:` prefix
+///   ([`HarvestBuilderError::RateLimitKeyReservedPrefix`]);
+/// - a static `rate_limit_key`/`rate_limit_burst` without `rps`;
+/// - two activities sharing a static key with different `rps`/`burst`.
+///
+/// Accepts an iterator of `&ActivityInfo` rather than a slice so both the
+/// builder's `Vec<ActivityInfo>` and the worker registry's
+/// `HashMap<String, ActivityInfo>::values()` can be validated without an owned
+/// copy (`ActivityInfo` is not `Clone`). Mismatch detection is order-independent
+/// (any two disagreeing configs reject regardless of which is seen first), so
+/// the registry's non-deterministic iteration order does not affect whether a
+/// conflicting set is rejected — only cosmetic ordering within the error's
+/// contributor list.
+pub(crate) fn validate_activity_rate_limits<'a>(
+    activities: impl IntoIterator<Item = &'a crate::info::ActivityInfo>,
 ) -> Result<(), HarvestBuilderError> {
     use std::collections::HashMap;
 
     let mut seen: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
+    // Dynamic per-key rate-limit expressions (issue #699) live in an independent
+    // map keyed on the dot-path EXPRESSION so static (bare-name / string) keys and
+    // dynamic (`dyn-rate:{expr}:{tenant}`) buckets — which the enqueue path
+    // namespaces so they can never collide — are validated separately.
+    let mut seen_dynamic: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
 
     for activity in activities {
+        // Positivity (issue #699 review, Codex P2): reject a non-finite /
+        // non-positive rps or burst — static OR dynamic — before either branch
+        // (see `check_rate_limit_positive`).
+        check_rate_limit_positive(activity)?;
+
+        // Dynamic per-key rate limit (issue #699): validated in its own map and
+        // never touches the static path below (its static `rate_limit_key` is
+        // suppressed by the macro).
+        if let Some(key_expr) = activity.rate_limit_key_expr {
+            // A dynamic per-key rate limit on a LOCAL activity is silently
+            // unenforced: local activities run inline via
+            // `run_local_activity_inline`, bypassing the task-dispatch/enqueue
+            // path where per-key rate limiting lives. The `#[activity]` macro
+            // rejects this at parse time, but a hand-built `ActivityInfo`
+            // (direct `HandlerRegistry`) bypasses the macro. Fail loud
+            // (issue #699 review, Codex round-5 P2). (Scope: this rejects the
+            // DYNAMIC form only; the pre-existing static-rate-on-local #332
+            // asymmetry is a documented follow-up, not expanded here.)
+            if activity.is_local {
+                return Err(HarvestBuilderError::RateLimitKeyExprOnLocalActivity {
+                    activity: activity.name.to_string(),
+                    key: key_expr.to_string(),
+                });
+            }
+            // A dynamic key expression needs a rate to bucket against.
+            let Some(rps) = activity.rate_limit_rps else {
+                return Err(HarvestBuilderError::RateLimitKeyExprWithoutCap {
+                    activity: activity.name.to_string(),
+                    key: key_expr.to_string(),
+                });
+            };
+            // Normalize the `input.` prefix (issue #699 review, #6) so
+            // `key = "input.tenant_id"` and `key = "tenant_id"` — which resolve
+            // the same field and share one bucket — are validated together.
+            let normalized_expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
+            let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
+            let entry = seen_dynamic
+                .entry(normalized_expr)
+                .or_insert_with(|| RateLimitKeyEntry {
+                    first_rps: rps,
+                    first_burst: effective_burst,
+                    contributors: Vec::new(),
+                });
+            entry
+                .contributors
+                .push((activity.name.to_string(), rps, activity.rate_limit_burst));
+            if (entry.first_rps - rps).abs() > 1e-9
+                || (entry.first_burst - effective_burst).abs() > 1e-9
+            {
+                let mapped = entry
+                    .contributors
+                    .iter()
+                    .map(|(name, r, b)| (name.clone(), FloatEq(*r), b.map(FloatEq)))
+                    .collect();
+                return Err(HarvestBuilderError::RateLimitKeyMismatch {
+                    key: key_expr.to_string(),
+                    activities: mapped,
+                });
+            }
+            continue;
+        }
+
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699). Both static and
+        // dynamic keys register `ON CONFLICT DO NOTHING` against the shared
+        // `harvest_rate_limit_buckets` table, so a static key colliding with a
+        // generated `dyn-rate:{expr}:{tenant}` string would race
+        // first-writer-wins on the bucket's rate/burst. Reject it up front.
+        // (The `start-throttle:` prefix from #607 is a separate pre-existing
+        // namespace; this validation reserves `dyn-rate:` — the one this PR
+        // generates — and leaves `start-throttle:` as a follow-up.)
+        // The literal mirrors `crate::queue::DYNAMIC_RATE_PREFIX` (the `queue`
+        // module is `db`-gated, but this validation runs in every build) and the
+        // macro's own compile-time reject in `autumn-harvest-macros`.
+        if let Some(key) = activity.rate_limit_key
+            && key.starts_with("dyn-rate:")
+        {
+            return Err(HarvestBuilderError::RateLimitKeyReservedPrefix {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
         // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
         if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
             return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
@@ -1410,6 +2622,35 @@ fn validate_rate_limit_keys(
     Ok(())
 }
 
+/// Reject a name registered as BOTH a WASM activity binding and a native
+/// `#[activity]` (issue #965 review).
+///
+/// `wasm_activity(...)` pushes a placeholder `ActivityInfo` ([`is_wasm_stub`]) and
+/// records a `WasmBinding`; a later native `.activities(...)` with the same name
+/// wins in the handler registry (a `HashMap`, last-registration-wins) while the
+/// WASM binding lingers, so the worker's WASM dispatch seam would still resolve
+/// the binding and run the sandboxed guest under the native metadata — a silent
+/// wrong-implementation. Fail closed instead.
+///
+/// [`is_wasm_stub`]: crate::info::ActivityInfo::is_wasm_stub
+#[cfg(feature = "wasm-activities")]
+fn validate_wasm_activity_name_collisions(
+    wasm_bindings: &std::collections::HashMap<String, crate::wasm_store::WasmBinding>,
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    for activity in activities {
+        // A native (non-placeholder) activity whose name is also a WASM binding
+        // is the ambiguous case. The WASM-activity placeholder itself IS a WASM
+        // binding by construction, so exclude it via `is_wasm_stub`.
+        if !activity.is_wasm_stub() && wasm_bindings.contains_key(activity.name) {
+            return Err(HarvestBuilderError::WasmActivityNameCollision {
+                activity: activity.name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reject local activities whose `default_start_to_close` exceeds the worker
 /// cap. Failing early gives operators a clear error instead of a runtime surprise.
 fn validate_local_activity_timeouts(
@@ -1441,6 +2682,52 @@ fn validate_workflow_concurrency_limits(
         if wf.concurrency.is_some_and(|p| p.limit == 0) {
             return Err(HarvestBuilderError::ZeroWorkflowConcurrencyLimit {
                 workflow: wf.name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject workflows whose `ThrottlePolicy` (issue #607) has a `burst` or
+/// `refill_per_sec` that could never actually pace admissions.
+///
+/// `ThrottlePolicy::from_rate_str` (the only path `#[workflow(throttle(...))]`
+/// uses) already enforces these same rules at parse time, but the struct's
+/// fields are `pub`, so a direct construction (a struct literal, or
+/// `WorkflowInfo::with_throttle`) bypasses that check entirely (code review).
+/// Validated once here, at build time, regardless of how the policy was
+/// built — mirrors `validate_workflow_concurrency_limits`'s precedent for
+/// catching a similarly "silently permanently broken" policy shape.
+fn validate_workflow_throttle_policies(
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    for wf in workflows {
+        let Some(policy) = wf.throttle else {
+            continue;
+        };
+        if !policy.burst.is_finite() {
+            return Err(HarvestBuilderError::InvalidWorkflowThrottlePolicy {
+                workflow: wf.name.to_string(),
+                reason: format!("burst must be a finite number, got {}", policy.burst),
+            });
+        }
+        if policy.burst < 1.0 {
+            return Err(HarvestBuilderError::InvalidWorkflowThrottlePolicy {
+                workflow: wf.name.to_string(),
+                reason: format!(
+                    "burst must be >= 1.0 (a bucket capacity below one token \
+                     can never successfully debit), got {}",
+                    policy.burst
+                ),
+            });
+        }
+        if !policy.refill_per_sec.is_finite() || policy.refill_per_sec <= 0.0 {
+            return Err(HarvestBuilderError::InvalidWorkflowThrottlePolicy {
+                workflow: wf.name.to_string(),
+                reason: format!(
+                    "refill_per_sec must be a finite number > 0, got {}",
+                    policy.refill_per_sec
+                ),
             });
         }
     }
@@ -1483,8 +2770,32 @@ pub struct StickyRoutingConfig {
 pub struct WorkerConfig {
     /// Queues this worker polls. Defaults to `["default"]`.
     pub queues: Vec<String>,
+    /// Optional per-queue dispatch weights for multi-queue worker fairness (issue #515).
+    ///
+    /// When non-empty, the worker uses weighted-random queue ordering on each
+    /// poll iteration so that dispatch share tracks the configured weights under
+    /// saturation. A queue absent from this map defaults to weight **1**
+    /// (equal share with other un-weighted queues).
+    ///
+    /// A weight of **0** places the queue last (fallthrough-only): it is only
+    /// drained when every positive-weight queue has no available work.
+    ///
+    /// **Default: empty** — the existing single `ANY($2)` claim query runs
+    /// unchanged, preserving today's byte-for-byte behaviour for all workers
+    /// that do not configure weights.
+    pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
+    /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
+    /// (issue #522).
+    ///
+    /// When a worker is assigned to multiple shards, each shard can optionally
+    /// have its own notification URL so the worker can use LISTEN/NOTIFY for
+    /// that shard's task queue instead of falling back to polling. Shards
+    /// absent from this map fall back to poll-only behaviour for that shard.
+    ///
+    /// **Default: empty** — all assigned shards use polling.
+    pub shard_notification_database_urls: Vec<(crate::types::ShardId, String)>,
     /// Maximum concurrent workflow executions on this worker.
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
@@ -1516,6 +2827,23 @@ pub struct WorkerConfig {
     /// Any local activity registered with `start_to_close > cap` is rejected
     /// at builder `try_build()` time.
     pub max_local_activity_start_to_close: Duration,
+    /// Builder-level default activity retry policy (issue #620).
+    ///
+    /// Applied at schedule time as the lowest-priority fallback in the
+    /// precedence chain: call-site override → activity `#[activity(retry = …)]`
+    /// default → this builder default → implicit fallback. `None` (the default)
+    /// is opt-in — an unset floor leaves today's behaviour byte-for-byte
+    /// unchanged. Set via [`WorkerConfig::with_default_activity_retry_policy`].
+    pub default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
+    /// call-site override → activity default → this builder default → no
+    /// timeout. `None` (the default) is opt-in. For *local* activities the
+    /// resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
+    /// [`WorkerConfig::with_default_activity_start_to_close`].
+    pub default_activity_start_to_close: Option<Duration>,
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
@@ -1563,6 +2891,42 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
+    /// Maximum wall-clock time a single workflow-task dispatch may run before
+    /// the worker reclaims the concurrency slot (issue #494).
+    ///
+    /// When a `#[workflow]` body does not reach a suspension point or complete
+    /// within this budget, the dispatch is abandoned: its semaphore permit is
+    /// released so other tasks can proceed and the task row is reset to
+    /// `PENDING` for a subsequent attempt. Deterministic replay means a
+    /// transient slow dispatch recovers safely on retry.
+    ///
+    /// After `poison_pill_threshold` consecutive timeouts for the same
+    /// execution the task is escalated to the dead-letter queue rather than
+    /// re-queued, so a permanently stuck workflow body never loops forever.
+    ///
+    /// Defaults to **10 seconds**. Set to [`Duration::ZERO`] to disable
+    /// (workflow tasks run without a wall-clock budget — the behaviour before
+    /// this field was added). Protection is **on by default**.
+    pub workflow_task_timeout: Duration,
+    /// Maximum number of times a workflow whose handler **panics** (unwinds) is
+    /// re-dispatched with backoff before the run is failed terminally with a
+    /// typed `HandlerPanic` error (issue #782).
+    ///
+    /// A caught workflow-body panic is treated as a recoverable, non-terminal
+    /// condition for the first `workflow_panic_max_attempts` strikes so a bad
+    /// deploy can be hotfixed-and-redeployed before in-flight runs fail. Once
+    /// the budget is exhausted (a permanent panic bug) the run fails terminally,
+    /// bounding the re-dispatch churn.
+    ///
+    /// The strike counter is **in-process and per-worker-instance**, so it
+    /// resets on worker restart/redeploy. This is intentional: a redeploy of
+    /// fixed code gets a fresh budget (exactly the "buy time to hotfix" goal),
+    /// while a single long-lived worker still terminates a permanently-panicking
+    /// run after this many consecutive strikes.
+    ///
+    /// Defaults to **3**. Set to `0` to fail terminally on the **first** panic
+    /// (no panic-retry).
+    pub workflow_panic_max_attempts: u32,
     /// Maximum wall-clock time a workflow execution may stay paused before the
     /// bounded-pause auto-resume scanner force-resumes it with
     /// `actor = "auto-resume(timeout)"` (issue #383).
@@ -1572,16 +2936,73 @@ pub struct WorkerConfig {
     pub max_workflow_pause_duration: Duration,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: std::collections::HashMap<String, String>,
+    /// Hard ceiling on the number of history events a workflow may accumulate
+    /// before the server terminates it (issue #493).
+    ///
+    /// When `Some(n)`, any `RUNNING` execution whose recorded event count
+    /// reaches `n` is failed with a machine-readable `WorkflowFailed` event
+    /// (`"history_ceiling_exceeded: event count {n} >= ceiling {n}"`).
+    /// This is a server-side safety net for workflows that do not cooperate
+    /// with `ctx.should_continue_as_new()`.
+    ///
+    /// Defaults to `None` (disabled).
+    pub max_workflow_history_events: Option<u64>,
+    /// Default maximum wait before a debounced workflow start is forced to fire,
+    /// even if the burst has not settled (issue #499).
+    ///
+    /// Applied when a `DebouncePolicy.max_wait` is `None`. Prevents a
+    /// continuously-retriggered workflow from being deferred indefinitely.
+    ///
+    /// Defaults to **1 hour**. Override via `with_default_debounce_max_wait`.
+    pub default_debounce_max_wait: Duration,
+    /// Lease TTL for a held durable mutex (`ctx.mutex`, issue #691).
+    ///
+    /// The lease scanner reclaims a lock whose lease has elapsed; the holder's
+    /// own decision cycles renew it forward. Must exceed the worst-case
+    /// wall-clock time a workflow spends inside a single held critical section
+    /// (the interval between decision cycles that renew the lease) — see the
+    /// `mutex` module's lease contract.
+    ///
+    /// Defaults to **60 seconds**. Override via `with_mutex_lease_ttl`.
+    pub mutex_lease_ttl: Duration,
+    /// Opt-in adaptive dispatch-slot tuner (issue #548).
+    ///
+    /// When `Some`, both dispatch semaphores (`max_concurrent_workflows` /
+    /// `max_concurrent_activities`) are auto-resized within
+    /// `[SlotTunerConfig::min_slots, SlotTunerConfig::max_slots]`, driven by
+    /// in-process slot utilization, worker DB-pool pressure, and recent
+    /// claim-to-dispatch permit-wait latency. The controller never resizes
+    /// below `min_slots` (liveness floor) or above `max_slots` (hard safety
+    /// cap); a shrink decision only withholds *new* permits and never cancels
+    /// or reclaims an already-dispatched task, so graceful shutdown and
+    /// draining are unaffected.
+    ///
+    /// **Defaults to `None`: byte-for-byte identical fixed-concurrency
+    /// behaviour** — the worker uses `max_concurrent_workflows` /
+    /// `max_concurrent_activities` exactly as it does today. Set via
+    /// `with_slot_tuner`.
+    pub slot_tuner: Option<crate::slot_tuner::SlotTunerConfig>,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
+    /// Advertised worker-session capacity (issue #606): the maximum number
+    /// of `ctx.create_session(...)` sessions this worker will host
+    /// concurrently. Opening a session consumes one slot; ending it
+    /// (`Session::complete()`) or the broken-session scanner reclaiming a
+    /// dead/expired session releases it.
+    ///
+    /// **Defaults to `0`: sessions disabled, zero behavior change** for
+    /// existing deployments. Set via `with_max_concurrent_sessions`.
+    pub max_concurrent_sessions: i32,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             queues: vec!["default".to_string()],
+            queue_weights: std::collections::HashMap::new(),
             notification_database_url: None,
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
             shutdown_timeout: Duration::from_secs(30),
@@ -1590,6 +3011,8 @@ impl Default for WorkerConfig {
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -1598,10 +3021,17 @@ impl Default for WorkerConfig {
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            workflow_task_timeout: Duration::from_secs(10),
+            workflow_panic_max_attempts: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             labels: std::collections::HashMap::new(),
+            max_workflow_history_events: None,
+            default_debounce_max_wait: DEFAULT_DEBOUNCE_MAX_WAIT,
+            mutex_lease_ttl: crate::mutex::DEFAULT_MUTEX_LEASE_TTL,
+            slot_tuner: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
+            max_concurrent_sessions: 0,
         }
     }
 }
@@ -1624,10 +3054,52 @@ impl WorkerConfig {
         self
     }
 
+    /// Set per-queue dispatch weights for multi-queue worker fairness (issue #515).
+    ///
+    /// Each pair `(queue_name, weight)` assigns a relative dispatch probability
+    /// to that queue. Under sustained saturation the empirical dispatch share
+    /// per queue converges to `weight / sum(all_weights)`.
+    ///
+    /// Queues bound via [`with_queues`](Self::with_queues) but absent from this
+    /// map default to weight **1**. A weight of **0** places the queue last
+    /// (fallthrough-only). Calling this method with an empty iterator is a
+    /// no-op and preserves the default unchanged behaviour.
+    ///
+    /// This method **merges** into any previously configured weights (consistent
+    /// with [`with_labels`](Self::with_labels)). Repeated calls accumulate
+    /// entries; a later entry for the same queue name overwrites the earlier one.
+    #[must_use]
+    pub fn with_queue_weights<S: Into<String>>(
+        mut self,
+        weights: impl IntoIterator<Item = (S, u32)>,
+    ) -> Self {
+        self.queue_weights
+            .extend(weights.into_iter().map(|(k, v)| (k.into(), v)));
+        self
+    }
+
     /// Enable LISTEN/NOTIFY wakeups using a dedicated Postgres connection.
     #[must_use]
     pub fn with_notification_database_url(mut self, database_url: impl Into<String>) -> Self {
         self.notification_database_url = Some(database_url.into());
+        self
+    }
+
+    /// Set per-shard LISTEN/NOTIFY notification URLs for multi-shard workers
+    /// (issue #522).
+    ///
+    /// Each entry maps a shard ID to a Postgres URL. Shards not listed fall
+    /// back to polling. The entries are additive — calling this method
+    /// replaces the full list.
+    #[must_use]
+    pub fn with_shard_notification_database_urls(
+        mut self,
+        urls: impl IntoIterator<Item = (crate::types::ShardId, impl Into<String>)>,
+    ) -> Self {
+        self.shard_notification_database_urls = urls
+            .into_iter()
+            .map(|(shard, url)| (shard, url.into()))
+            .collect();
         self
     }
 
@@ -1747,6 +3219,66 @@ impl WorkerConfig {
         self
     }
 
+    /// Override the per-workflow-task dispatch timeout (default 10 s, issue #494).
+    ///
+    /// A workflow-task dispatch that does not complete or suspend within this
+    /// budget has its concurrency permit reclaimed immediately, allowing other
+    /// tasks to proceed. The hung future is cancelled and the task row is reset
+    /// to `PENDING` so any worker can re-claim it on the next poll.
+    ///
+    /// After `poison_pill_threshold` consecutive timeouts for the same
+    /// execution the task is escalated to the DLQ rather than re-queued
+    /// indefinitely (see [`with_poison_pill_threshold`]).
+    ///
+    /// Set to [`Duration::ZERO`] to disable (no wall-clock budget on workflow
+    /// tasks — the behaviour before this setting was added).
+    ///
+    /// [`with_poison_pill_threshold`]: Self::with_poison_pill_threshold
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// // Tighten to 5 s for a latency-sensitive deployment.
+    /// let config = WorkerConfig::default().with_workflow_task_timeout(Duration::from_secs(5));
+    /// assert_eq!(config.workflow_task_timeout, Duration::from_secs(5));
+    ///
+    /// // Disable the guard entirely.
+    /// let config = WorkerConfig::default().with_workflow_task_timeout(Duration::ZERO);
+    /// assert!(config.workflow_task_timeout.is_zero());
+    /// ```
+    #[must_use]
+    pub const fn with_workflow_task_timeout(mut self, timeout: Duration) -> Self {
+        self.workflow_task_timeout = timeout;
+        self
+    }
+
+    /// Override the maximum number of panic re-dispatches before a
+    /// panicking-workflow run fails terminally (issue #782).
+    ///
+    /// See [`workflow_panic_max_attempts`](Self::workflow_panic_max_attempts).
+    /// Defaults to **3**; `0` fails terminally on the first panic.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_workflow_panic_max_attempts(5);
+    /// assert_eq!(config.workflow_panic_max_attempts, 5);
+    ///
+    /// // Fail terminally on the first panic.
+    /// let config = WorkerConfig::default().with_workflow_panic_max_attempts(0);
+    /// assert_eq!(config.workflow_panic_max_attempts, 0);
+    /// ```
+    #[must_use]
+    pub const fn with_workflow_panic_max_attempts(mut self, attempts: u32) -> Self {
+        self.workflow_panic_max_attempts = attempts;
+        self
+    }
+
     /// Override the maximum start delay for a workflow (issue #322).
     ///
     /// Default: 365 days.
@@ -1823,11 +3355,101 @@ impl WorkerConfig {
         self
     }
 
+    /// Set the hard ceiling on workflow history events (issue #493).
+    ///
+    /// Pass `None` to disable (the default). When set, any `RUNNING` execution
+    /// that accumulates `n` or more events is terminated with
+    /// `history_ceiling_exceeded`. Must be strictly greater than
+    /// `continue_as_new_threshold` (checked at worker startup, not here).
+    #[must_use]
+    pub const fn with_max_workflow_history_events(mut self, ceiling: Option<u64>) -> Self {
+        self.max_workflow_history_events = ceiling;
+        self
+    }
+
+    /// Override the default max-wait cap applied to debounced workflow starts
+    /// when `DebouncePolicy.max_wait` is `None` (issue #499).
+    ///
+    /// Prevents a continuously-retriggered workflow from being deferred
+    /// indefinitely. Defaults to **1 hour**.
+    #[must_use]
+    pub const fn with_default_debounce_max_wait(mut self, max_wait: Duration) -> Self {
+        self.default_debounce_max_wait = max_wait;
+        self
+    }
+
+    /// Override the lease TTL for held durable mutexes (`ctx.mutex`, issue #691).
+    ///
+    /// Must exceed the worst-case wall-clock time a workflow spends inside a
+    /// single held critical section (the interval between decision cycles that
+    /// renew the lease); too short a TTL lets the scanner reclaim a lock while
+    /// its holder is still mid-critical-section. Defaults to **60 seconds**.
+    #[must_use]
+    pub const fn with_mutex_lease_ttl(mut self, ttl: Duration) -> Self {
+        self.mutex_lease_ttl = ttl;
+        self
+    }
+
+    /// Install an adaptive dispatch-slot tuner (issue #548).
+    ///
+    /// Both dispatch semaphores are auto-resized within
+    /// `[cfg.min_slots, cfg.max_slots]`. When this method is never called
+    /// (`slot_tuner` stays `None`), the worker's fixed-concurrency semaphore
+    /// behaviour is byte-for-byte identical to today.
+    ///
+    /// See [`crate::slot_tuner`] for the default controller's signals
+    /// (slot utilization, worker DB-pool pressure, claim-to-dispatch permit
+    /// wait) and `docs/operations/adaptive-slot-tuner.md` for the operator
+    /// guide.
+    #[must_use]
+    pub fn with_slot_tuner(mut self, cfg: crate::slot_tuner::SlotTunerConfig) -> Self {
+        self.slot_tuner = Some(cfg);
+        self
+    }
+
     #[cfg(feature = "db")]
     /// Set the sharded database pool for exact shard routing.
     #[must_use]
     pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
         self.sharded_pool = Some(pool);
+        self
+    }
+
+    /// Advertise worker-session capacity (issue #606).
+    ///
+    /// Enables `ctx.create_session(...)` to acquire this worker: up to `n`
+    /// sessions may be `ACTIVE` on it at once. Defaults to `0` (sessions
+    /// disabled) — the single builder call adopting this feature costs the
+    /// author, per the issue's success metric.
+    #[must_use]
+    pub const fn with_max_concurrent_sessions(mut self, n: i32) -> Self {
+        self.max_concurrent_sessions = n;
+        self
+    }
+
+    /// Set the builder-level default activity retry policy (issue #620).
+    ///
+    /// Resolved at schedule time as the lowest-priority fallback: a call-site
+    /// override or an activity's own `#[activity(retry = …)]` default both win
+    /// over this floor. Unset (the default) leaves today's behaviour
+    /// byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_default_activity_retry_policy(
+        mut self,
+        policy: crate::policy::RetryPolicy,
+    ) -> Self {
+        self.default_activity_retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the builder-level default activity `start_to_close` timeout (issue #620).
+    ///
+    /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
+    /// For *local* activities the resolved value is still clamped by
+    /// [`WorkerConfig::max_local_activity_start_to_close`].
+    #[must_use]
+    pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
+        self.default_activity_start_to_close = Some(timeout);
         self
     }
 }
@@ -1841,12 +3463,18 @@ mod tests {
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            mcp: false,
             name: "test",
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1855,6 +3483,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }
     }
 
@@ -1876,6 +3505,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }
     }
 
@@ -1898,6 +3528,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }
     }
 
@@ -1905,6 +3536,18 @@ mod tests {
     fn harvest_builder_collects_workflows() {
         let builder = HarvestBuilder::new().workflows(vec![fake_workflow_info()]);
         assert_eq!(builder.workflow_count(), 1);
+    }
+
+    #[test]
+    fn workflow_infos_accessor_exposes_registered_infos_with_mcp_flag() {
+        // Issue #597: the plugin's MCP tool generator reads registered
+        // workflows (incl. the mcp flag) from the builder before startup.
+        let builder = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info(), fake_workflow_info().with_mcp()]);
+        let infos = builder.workflow_infos();
+        assert_eq!(infos.len(), 2);
+        assert!(!infos[0].mcp);
+        assert!(infos[1].mcp);
     }
 
     #[test]
@@ -1937,6 +3580,44 @@ mod tests {
     fn worker_config_builder_adds_queues() {
         let config = WorkerConfig::default().with_queues(["email-workers", "etl"]);
         assert!(config.queues.contains(&"email-workers".to_string()));
+    }
+
+    #[test]
+    fn with_slot_tuner_sets_config_and_default_is_none() {
+        assert!(WorkerConfig::default().slot_tuner.is_none());
+
+        let config =
+            WorkerConfig::default().with_slot_tuner(crate::slot_tuner::SlotTunerConfig::new(5, 50));
+        let tuner = config.slot_tuner.expect("slot_tuner must be set");
+        assert_eq!(tuner.min_slots, 5);
+        assert_eq!(tuner.max_slots, 50);
+    }
+
+    #[test]
+    fn worker_config_shard_notification_urls_default_empty() {
+        let config = WorkerConfig::default();
+        assert!(
+            config.shard_notification_database_urls.is_empty(),
+            "shard_notification_database_urls must default to empty"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_shard_notification_database_urls_sets_entries() {
+        use crate::types::ShardId;
+        let config = WorkerConfig::default().with_shard_notification_database_urls([
+            (ShardId::new(0), "postgres://host0/harvest"),
+            (ShardId::new(1), "postgres://host1/harvest"),
+        ]);
+        assert_eq!(config.shard_notification_database_urls.len(), 2);
+        assert_eq!(
+            config.shard_notification_database_urls[0].0,
+            ShardId::new(0)
+        );
+        assert_eq!(
+            config.shard_notification_database_urls[1].0,
+            ShardId::new(1)
+        );
     }
 
     #[test]
@@ -2042,9 +3723,36 @@ mod tests {
         assert_eq!(policy.event_hard_cap(), Some(256));
     }
 
+    #[test]
+    fn harvest_builder_accepts_deadline_fraction_override() {
+        // Issue #772: the deadline-aware continue-as-new fraction is
+        // configurable and clamped into [0.0, 1.0].
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_deadline_fraction(0.6)
+            .build();
+        let policy = built.history_policy();
+        assert!((policy.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
+
+        let clamped = HarvestBuilder::new()
+            .history_continue_as_new_deadline_fraction(2.0)
+            .build();
+        assert!(
+            (clamped.history_policy().continue_as_new_deadline_fraction() - 1.0).abs()
+                < f64::EPSILON
+        );
+    }
+
     #[cfg(feature = "db")]
     #[test]
     fn harvest_builder_passes_history_policy_to_worker_registry() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .history_continue_as_new_threshold(9)
             .history_event_hard_cap(11)
@@ -2054,6 +3762,99 @@ mod tests {
 
         assert_eq!(registry.history_policy().continue_as_new_threshold(), 9);
         assert_eq!(registry.history_policy().event_hard_cap(), Some(11));
+    }
+
+    // Issue #620: the two `into_worker_parts*` hunks copy the builder-level
+    // activity defaults out of `WorkerConfig` and into the `HandlerRegistry`.
+    // Every other #620 test injects them via `HandlerRegistry::
+    // with_activity_defaults` directly, bypassing those hunks — so this test
+    // drives the REAL public entry point (`WorkerConfig::with_default_*` ->
+    // `.worker(..)` -> `.build()` -> `.into_worker_parts()`) and asserts the
+    // registry carries the configured floor. Without the wiring hunks the
+    // registry would report `None` and this test would fail.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        7,
+                        Duration::from_millis(25),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(42)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(7),
+            "the builder-level default retry policy must be wired into the registry"
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(42)),
+            "the builder-level default start_to_close must be wired into the registry"
+        );
+    }
+
+    // Issue #620: the `into_worker_parts_with_extra_state` hunk is a distinct
+    // code path (used by the plugin's extra-state runner); assert it wires the
+    // same floor. An empty extra-state map is the minimal input.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_extra_state_wires_activity_defaults_into_worker_registry() {
+        use crate::policy::RetryPolicy;
+
+        // `into_worker_parts_with_extra_state` unconditionally writes the
+        // process-global start-idempotency sweep window; serialize against the
+        // sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(
+                WorkerConfig::default()
+                    .with_default_activity_retry_policy(RetryPolicy::fixed(
+                        6,
+                        Duration::from_millis(15),
+                    ))
+                    .with_default_activity_start_to_close(Duration::from_secs(17)),
+            )
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+
+        assert_eq!(
+            registry
+                .default_activity_retry_policy()
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(6),
+        );
+        assert_eq!(
+            registry.default_activity_start_to_close(),
+            Some(Duration::from_secs(17)),
+        );
     }
 
     #[test]
@@ -2089,6 +3890,14 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn built_harvest_into_worker_parts_preserves_shared_state() {
+        // `into_worker_parts` unconditionally writes the process-global
+        // start-idempotency sweep window; serialize against the sibling
+        // `into_worker_parts_installs_configured_start_idempotency_purge_window`
+        // test, which reads that global back (issue #808 / #620).
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let built = HarvestBuilder::new()
             .workflows(vec![fake_workflow_info()])
             .activities(vec![ActivityInfo {
@@ -2108,6 +3917,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2119,6 +3929,52 @@ mod tests {
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
+    }
+
+    /// The core worker build path (`into_worker_parts`) — which the standalone
+    /// `HarvestRunner` worker funnels through via
+    /// `into_worker_parts_with_extra_state` — must install the configured
+    /// start-idempotency retention window into the process-global sweep static
+    /// (issue #808, Codex P2). Without this, a split web/worker deployment
+    /// running the sweep in a standalone runner would use the DEFAULT 24h window
+    /// while the web app's reserve honors a custom window, deleting a claim the
+    /// reserve still considers live and letting a same-key retry double-start.
+    #[cfg(feature = "db")]
+    #[test]
+    fn into_worker_parts_installs_configured_start_idempotency_purge_window() {
+        // Serialize against the sibling `purge_window_precision_and_clamping`
+        // test, which mutates the same process-global static.
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Start from a known baseline distinct from the custom value below.
+        crate::start_idempotency::set_purge_window_secs(
+            crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+        );
+
+        // A custom window distinct from the 24h default and the sibling test's
+        // values (7200s / 1.5s) so a stale/default read fails loudly.
+        let custom = Duration::from_secs(3 * 24 * 3600);
+        let built = HarvestBuilder::new()
+            .start_idempotency_window(custom)
+            .build();
+        assert_eq!(built.start_idempotency_window, custom);
+
+        let (_registry, _dags, _ws, _wc) = built.into_worker_parts();
+
+        assert!(
+            (crate::start_idempotency::purge_window_secs() - custom.as_secs_f64()).abs() < 1e-9,
+            "into_worker_parts must install the configured start-idempotency \
+             sweep window (expected {}s, got {}s)",
+            custom.as_secs_f64(),
+            crate::start_idempotency::purge_window_secs(),
+        );
+
+        // Restore the default so ordering-independent test runs don't leak state.
+        crate::start_idempotency::set_purge_window_secs(
+            crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
+        );
     }
 
     #[test]
@@ -2155,6 +4011,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2179,6 +4036,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2292,15 +4150,21 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "report_wf",
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
                     limit: 0,
                 }),
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -2309,6 +4173,7 @@ mod tests {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .try_build();
         let err = result.unwrap_err();
@@ -2323,20 +4188,136 @@ mod tests {
         assert!(err.to_string().contains("report_wf"));
     }
 
+    /// Minimal `WorkflowInfo` carrying `throttle` and nothing else non-default,
+    /// for the `validate_workflow_throttle_policies` tests below.
+    fn throttled_wf_info(throttle: crate::throttle::ThrottlePolicy) -> WorkflowInfo {
+        WorkflowInfo {
+            mcp: false,
+            name: "report_wf",
+            module: "test",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: Some(throttle),
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn builder_rejects_directly_constructed_throttle_policy_with_burst_below_one() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 1.0,
+                burst: 0.5,
+                key_expr: None,
+                schedule_to_start: None,
+            })])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowThrottlePolicy { ref workflow, .. }
+                    if workflow == "report_wf"
+            ),
+            "expected InvalidWorkflowThrottlePolicy, got: {err}"
+        );
+        assert!(err.to_string().contains("burst"));
+    }
+
+    #[test]
+    fn builder_rejects_directly_constructed_throttle_policy_with_infinite_burst() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 1.0,
+                burst: f64::INFINITY,
+                key_expr: None,
+                schedule_to_start: None,
+            })])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowThrottlePolicy { ref workflow, .. }
+                    if workflow == "report_wf"
+            ),
+            "expected InvalidWorkflowThrottlePolicy, got: {err}"
+        );
+        assert!(err.to_string().contains("finite"));
+    }
+
+    #[test]
+    fn builder_rejects_directly_constructed_throttle_policy_with_nonpositive_refill() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 0.0,
+                burst: 5.0,
+                key_expr: None,
+                schedule_to_start: None,
+            })])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowThrottlePolicy { ref workflow, .. }
+                    if workflow == "report_wf"
+            ),
+            "expected InvalidWorkflowThrottlePolicy, got: {err}"
+        );
+        assert!(err.to_string().contains("refill_per_sec"));
+    }
+
+    #[test]
+    fn builder_accepts_a_valid_directly_constructed_throttle_policy() {
+        use crate::throttle::ThrottlePolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![throttled_wf_info(ThrottlePolicy {
+                refill_per_sec: 1.667,
+                burst: 20.0,
+                key_expr: Some("input.tenant_id"),
+                schedule_to_start: None,
+            })])
+            .try_build();
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
     #[test]
     fn builder_accepts_workflow_with_nonzero_concurrency_limit() {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "report_wf",
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
                     limit: 5,
                 }),
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -2345,9 +4326,49 @@ mod tests {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .try_build();
         assert!(result.is_ok());
+    }
+
+    // ── Builder-level activity default floor (issue #620) ─────────────────
+    //
+    // RED PHASE: the `default_activity_retry_policy` / `default_activity_start_to_close`
+    // fields and their `with_*` builder methods do not exist yet — this test
+    // fails to COMPILE against the missing `WorkerConfig` symbols until the
+    // green phase adds them. Both default to `None` so an unset config is
+    // byte-for-byte identical to today (opt-in, AC1/AC6).
+
+    #[test]
+    fn worker_config_activity_defaults_default_to_none() {
+        use crate::policy::RetryPolicy;
+
+        let config = WorkerConfig::default();
+        assert!(
+            config.default_activity_retry_policy.is_none(),
+            "default activity retry policy must be unset by default (opt-in)"
+        );
+        assert!(
+            config.default_activity_start_to_close.is_none(),
+            "default activity start_to_close must be unset by default (opt-in)"
+        );
+
+        // The two builder methods set the floors and are chainable.
+        let configured = WorkerConfig::default()
+            .with_default_activity_retry_policy(RetryPolicy::fixed(4, Duration::from_millis(50)))
+            .with_default_activity_start_to_close(Duration::from_secs(300));
+        assert_eq!(
+            configured
+                .default_activity_retry_policy
+                .as_ref()
+                .map(|p| p.max_attempts),
+            Some(4),
+        );
+        assert_eq!(
+            configured.default_activity_start_to_close,
+            Some(Duration::from_secs(300)),
+        );
     }
 
     // ── Local activity cap tests ──────────────────────────────────────────
@@ -2359,6 +4380,28 @@ mod tests {
             config.max_local_activity_start_to_close,
             Duration::from_secs(60)
         );
+    }
+
+    // ── Workflow-task timeout tests (issue #494) ──────────────────────────
+
+    #[test]
+    fn worker_config_workflow_task_timeout_defaults_to_10s() {
+        assert_eq!(
+            WorkerConfig::default().workflow_task_timeout,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn worker_config_with_workflow_task_timeout_overrides() {
+        let config = WorkerConfig::default().with_workflow_task_timeout(Duration::from_secs(30));
+        assert_eq!(config.workflow_task_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn worker_config_workflow_task_timeout_zero_disables() {
+        let config = WorkerConfig::default().with_workflow_task_timeout(Duration::ZERO);
+        assert_eq!(config.workflow_task_timeout, Duration::ZERO);
     }
 
     #[test]
@@ -2376,6 +4419,36 @@ mod tests {
     fn worker_config_poison_pill_threshold_zero_disables() {
         let config = WorkerConfig::default().with_poison_pill_threshold(0);
         assert_eq!(config.poison_pill_threshold, 0);
+    }
+
+    // ── Workflow panic-retry budget tests (issue #782) ────────────────────
+
+    #[test]
+    fn worker_config_workflow_panic_max_attempts_defaults_to_3() {
+        assert_eq!(WorkerConfig::default().workflow_panic_max_attempts, 3);
+    }
+
+    #[test]
+    fn worker_config_with_workflow_panic_max_attempts_overrides() {
+        let config = WorkerConfig::default().with_workflow_panic_max_attempts(5);
+        assert_eq!(config.workflow_panic_max_attempts, 5);
+    }
+
+    #[test]
+    fn worker_config_workflow_panic_max_attempts_zero_is_terminal_on_first_panic() {
+        let config = WorkerConfig::default().with_workflow_panic_max_attempts(0);
+        assert_eq!(config.workflow_panic_max_attempts, 0);
+    }
+
+    // `WorkerRuntimeConfig` lives in the `db`-gated `worker` module, so this
+    // threading assertion is only compiled under the `db` feature.
+    #[cfg(feature = "db")]
+    #[test]
+    fn worker_runtime_config_threads_workflow_panic_max_attempts() {
+        use crate::worker::WorkerRuntimeConfig;
+        let cfg = WorkerConfig::default().with_workflow_panic_max_attempts(7);
+        let runtime: WorkerRuntimeConfig = cfg.into();
+        assert_eq!(runtime.workflow_panic_max_attempts, 7);
     }
 
     #[test]
@@ -2476,6 +4549,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                rate_limit_key_expr: None,
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2520,6 +4594,42 @@ mod tests {
         );
     }
 
+    // ── usage_window_ceiling tests (issue #596) ────────────────────────────────
+
+    #[test]
+    fn builder_usage_window_ceiling_defaults_to_ninety_days() {
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.usage_window_ceiling,
+            crate::usage::default_usage_window_ceiling()
+        );
+    }
+
+    #[test]
+    fn builder_usage_window_ceiling_is_carried_through_build() {
+        let ceiling = Duration::from_secs(3600);
+        let built = HarvestBuilder::new().usage_window_ceiling(ceiling).build();
+        assert_eq!(
+            built.usage_window_ceiling, ceiling,
+            "ceiling must survive build()"
+        );
+    }
+
+    #[test]
+    fn builder_usage_max_groups_defaults_to_ten_thousand() {
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.usage_max_groups,
+            crate::usage::default_usage_max_groups()
+        );
+    }
+
+    #[test]
+    fn builder_usage_max_groups_is_carried_through_build() {
+        let built = HarvestBuilder::new().usage_max_groups(42).build();
+        assert_eq!(built.usage_max_groups, 42, "cap must survive build()");
+    }
+
     // ── CronInTimezone builder validation ────────────────────────────────────
 
     #[test]
@@ -2561,6 +4671,96 @@ mod tests {
         );
     }
 
+    fn named_workflow_info(name: &'static str) -> WorkflowInfo {
+        WorkflowInfo {
+            name,
+            ..fake_workflow_info()
+        }
+    }
+
+    #[test]
+    fn builder_rejects_all_writable_shards_on_plain_workflow_schedule() {
+        // A plain (non-DAG, non-canary) workflow opting into all_writable_shards
+        // must be rejected at build time — the fire path would mint executions
+        // on the default shard (issue #796).
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("nightly")])
+            .workflow_schedule(
+                WorkflowSchedule::new("nightly", Schedule::Interval(Duration::from_secs(60)))
+                    .with_all_writable_shards(),
+            )
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                HarvestBuilderError::AllWritableShardsUnsupported { workflow_name }
+                    if workflow_name == "nightly"
+            ),
+            "expected AllWritableShardsUnsupported, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_all_writable_shards_on_canary_schedule() {
+        // The built-in liveness canary (name starts with the reserved prefix)
+        // is allowed to opt in.
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("__harvest_canary_probe__default")])
+            .workflow_schedule(
+                WorkflowSchedule::new(
+                    "__harvest_canary_probe__default",
+                    Schedule::Interval(Duration::from_secs(30)),
+                )
+                .with_all_writable_shards(),
+            )
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "canary schedule with all_writable_shards must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_all_writable_shards_on_dag_schedule() {
+        // A DAG schedule (dag_name Some) encodes its shard on the fire path, so
+        // the flag is supported.
+        let mut sched =
+            WorkflowSchedule::new("daily_etl", Schedule::Interval(Duration::from_secs(60)))
+                .with_all_writable_shards();
+        sched.dag_name = Some("daily_etl".to_string());
+
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("daily_etl")])
+            .workflow_schedule(sched)
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "DAG schedule with all_writable_shards must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_plain_workflow_schedule_without_the_flag() {
+        // Default behaviour is unchanged: a plain schedule without the flag
+        // builds fine.
+        let result = HarvestBuilder::new()
+            .workflows(vec![named_workflow_info("nightly")])
+            .workflow_schedule(WorkflowSchedule::new(
+                "nightly",
+                Schedule::Interval(Duration::from_secs(60)),
+            ))
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "plain schedule without the flag must be accepted: {result:?}"
+        );
+    }
+
     #[test]
     fn builder_rejects_unknown_timezone_in_dag_schedule() {
         fn build(_dag: &mut DagBuilder) {}
@@ -2582,6 +4782,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
@@ -2614,6 +4815,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
@@ -2638,6 +4840,7 @@ mod tests {
             rate_limit_rps: Some(10.0),
             rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -2659,6 +4862,7 @@ mod tests {
             rate_limit_rps: Some(20.0), // mismatched rps!
             rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -2695,6 +4899,7 @@ mod tests {
             rate_limit_rps: None, // Missing RPS!
             rate_limit_burst: None,
             rate_limit_key: Some("stripe"),
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
@@ -2711,6 +4916,203 @@ mod tests {
                     if activity == "act1" && key == "stripe"
             ),
             "expected RateLimitKeyWithoutCap error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_static_rate_limit_key_with_reserved_dyn_rate_prefix() {
+        // A static `rate_limit_key` must not squat the `dyn-rate:` namespace
+        // reserved for per-key/dynamic buckets (issue #699 review, Codex P2) —
+        // it could collide first-writer-wins with a generated dynamic bucket.
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(50.0),
+            rate_limit_burst: None,
+            rate_limit_key: Some("dyn-rate:9:tenant_id:acme"),
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyReservedPrefix { ref activity, ref key })
+                    if activity == "act1" && key == "dyn-rate:9:tenant_id:acme"
+            ),
+            "expected RateLimitKeyReservedPrefix, got: {result:?}"
+        );
+    }
+
+    // ── Dynamic per-key rate limits (issue #699) ──────────────────────────────
+
+    /// Build a bare `ActivityInfo` for the dynamic-per-key rate-limit tests.
+    fn rate_activity(
+        name: &'static str,
+        rps: Option<f64>,
+        burst: Option<f64>,
+        key: Option<&'static str>,
+        key_expr: Option<&'static str>,
+    ) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: rps,
+            rate_limit_burst: burst,
+            rate_limit_key: key,
+            rate_limit_key_expr: key_expr,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_dynamic_rate_limit_key_without_rps() {
+        let act = rate_activity("charge", None, None, None, Some("input.tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyExprWithoutCap { ref activity, ref key })
+                    if activity == "charge" && key == "input.tenant_id"
+            ),
+            "expected RateLimitKeyExprWithoutCap for dynamic key, got: {result:?}"
+        );
+        // The dynamic-form message names `rate_limit(...)` and `rps`, not the
+        // static `rate_limit_key` wording (issue #699 review, #11).
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("rate_limit(key"),
+            "message should name rate_limit(key = ...): {msg}"
+        );
+        assert!(msg.contains("rps"), "message should mention rps: {msg}");
+        assert!(
+            !msg.contains("rate_limit_key ="),
+            "dynamic message must not use the static rate_limit_key wording: {msg}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_same_dynamic_key_expr_with_different_rps() {
+        let a = rate_activity("charge", Some(10.0), None, None, Some("input.tenant_id"));
+        let b = rate_activity("refund", Some(20.0), None, None, Some("input.tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![a, b]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { ref key, .. })
+                    if key == "input.tenant_id"
+            ),
+            "expected RateLimitKeyMismatch for dynamic key_expr, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_normalizes_input_prefix_so_both_spellings_share_validation() {
+        // `key = "input.tenant_id"` and `key = "tenant_id"` resolve the same
+        // field and share one bucket, so a mismatched rps across the two spellings
+        // must be caught by the mismatch guard (issue #699 review, #6).
+        let a = rate_activity("charge", Some(10.0), None, None, Some("input.tenant_id"));
+        let b = rate_activity("refund", Some(20.0), None, None, Some("tenant_id"));
+        let result = HarvestBuilder::new().activities(vec![a, b]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { .. })
+            ),
+            "the two `input.` spellings must be validated together, got: {result:?}"
+        );
+
+        // Same field, same rps across both spellings → OK, and they produce the
+        // SAME normalized bucket key.
+        let c = rate_activity("a", Some(10.0), None, None, Some("input.tenant_id"));
+        let d = rate_activity("b", Some(10.0), None, None, Some("tenant_id"));
+        assert!(
+            HarvestBuilder::new()
+                .activities(vec![c, d])
+                .try_build()
+                .is_ok(),
+            "matching rps across both spellings must build"
+        );
+        // The bucket-key equality is proven directly against the (db-gated) queue
+        // helper. The builder-validation half above runs on every feature set.
+        #[cfg(feature = "db")]
+        assert_eq!(
+            crate::queue::dynamic_rate_bucket_key("input.tenant_id", Some("acme")),
+            crate::queue::dynamic_rate_bucket_key("tenant_id", Some("acme")),
+            "both spellings must share one bucket key"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_matching_dynamic_key_expr_and_distinct_exprs() {
+        // Same expr + same rps → OK; distinct exprs → OK; a static key alongside
+        // is independent and does not collide.
+        let a = rate_activity(
+            "charge",
+            Some(10.0),
+            Some(20.0),
+            None,
+            Some("input.tenant_id"),
+        );
+        let b = rate_activity(
+            "refund",
+            Some(10.0),
+            Some(20.0),
+            None,
+            Some("input.tenant_id"),
+        );
+        let c = rate_activity("notify", Some(5.0), None, None, Some("input.org"));
+        let d = rate_activity("email", Some(3.0), None, Some("input.tenant_id"), None);
+        let result = HarvestBuilder::new()
+            .activities(vec![a, b, c, d])
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "expected matching/distinct dynamic rate limits to build, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn builder_static_and_dynamic_key_maps_are_independent() {
+        // A static key "tenant" and a dynamic key_expr "tenant" (same string) must
+        // NOT be conflated — they live in separate validation maps and namespaced
+        // buckets, so mismatched rps across the two is not an error.
+        let stat = rate_activity("s", Some(10.0), None, Some("tenant"), None);
+        let dyn_ = rate_activity("d", Some(99.0), None, None, Some("tenant"));
+        let result = HarvestBuilder::new()
+            .activities(vec![stat, dyn_])
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "static and dynamic keys sharing a string must be independent, got: {:?}",
+            result.err()
         );
     }
 
@@ -2793,5 +5195,354 @@ mod tests {
             ),
             "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn validate_retention_overrides_registration() {
+        use crate::retention::RetentionConfig;
+        use std::time::Duration;
+
+        let workflows = vec![fake_workflow_info()]; // registered name: "test"
+        let dags = vec!["my_dag".to_string()];
+
+        // Unknown override name -> Err
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("typo_wf", Duration::from_secs(60));
+        let result = validate_retention_overrides(&cfg, &workflows, &dags);
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow { ref workflow_name, ref registered })
+                    if workflow_name == "typo_wf" && registered.contains(&"test".to_string())
+            ),
+            "Expected UnknownRetentionOverrideWorkflow naming the unknown type and listing registered, got: {result:?}"
+        );
+
+        // Known registered workflow name -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("test", Duration::from_secs(60));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+
+        // Known auto-registered DAG workflow name -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("my_dag", Duration::from_secs(60));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+
+        // Empty overrides -> Ok
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        assert!(validate_retention_overrides(&cfg, &workflows, &dags).is_ok());
+    }
+
+    #[test]
+    fn harvest_builder_rejects_unknown_retention_override() {
+        use crate::retention::RetentionConfig;
+        use std::time::Duration;
+
+        let cfg = RetentionConfig::with_max_age(Duration::from_secs(3600))
+            .with_workflow_override("nope", Duration::from_secs(60));
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .retention(cfg)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownRetentionOverrideWorkflow { ref workflow_name, .. })
+                    if workflow_name == "nope"
+            ),
+            "Expected UnknownRetentionOverrideWorkflow naming the unknown type, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_invalid_trigger_condition() {
+        use crate::completion_trigger::{CompletionTrigger, TriggerCondition};
+
+        // A structurally valid condition passes try_build.
+        let ok_trigger =
+            CompletionTrigger::new("test", "test").with_condition(TriggerCondition::Eq {
+                path: "region".into(),
+                value: serde_json::json!("EU"),
+            });
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_trigger(ok_trigger)
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "Expected builder success with a valid condition, got: {result:?}"
+        );
+
+        // A condition over the boundedness caps fails try_build (issue #810).
+        let mut over_deep = TriggerCondition::Exists { path: "a".into() };
+        for _ in 0..crate::completion_trigger::MAX_CONDITION_DEPTH {
+            over_deep = TriggerCondition::All(vec![over_deep]);
+        }
+        let trigger_id = uuid::Uuid::new_v4();
+        let bad_trigger = CompletionTrigger::new("test", "test")
+            .with_id(trigger_id)
+            .with_condition(over_deep);
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_trigger(bad_trigger)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::InvalidCompletionTriggerCondition {
+                    trigger_id: id,
+                    ..
+                }) if id == trigger_id
+            ),
+            "Expected InvalidCompletionTriggerCondition, got: {result:?}"
+        );
+
+        // A malformed dotted path fails try_build too.
+        let bad_path =
+            CompletionTrigger::new("test", "test").with_condition(TriggerCondition::Exists {
+                path: "a..b".into(),
+            });
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_trigger(bad_path)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::InvalidCompletionTriggerCondition { .. })
+            ),
+            "Expected InvalidCompletionTriggerCondition for malformed path, got: {result:?}"
+        );
+    }
+
+    // --- AC3 / AC5 / AC6: max_workflow_history_events builder tests (issue #493) ---
+
+    #[test]
+    fn builder_max_workflow_history_events_defaults_to_none() {
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.max_workflow_history_events, None,
+            "ceiling must default to None (no ceiling enforced)"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_is_carried_through_build() {
+        // Default soft threshold is 10_000; ceiling must be strictly greater.
+        let built = HarvestBuilder::new()
+            .max_workflow_history_events(Some(50_000))
+            .build();
+        assert_eq!(built.max_workflow_history_events, Some(50_000));
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_none_clears_ceiling() {
+        let built = HarvestBuilder::new()
+            .max_workflow_history_events(Some(50_000))
+            .max_workflow_history_events(None)
+            .build();
+        assert_eq!(built.max_workflow_history_events, None);
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_must_be_strictly_greater_than_soft_threshold() {
+        // Default soft threshold is 10_000; a ceiling of 9_999 must fail.
+        let result = HarvestBuilder::new()
+            .max_workflow_history_events(Some(9_999))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling: 9_999,
+                    threshold: 10_000,
+                })
+            ),
+            "expected HistoryCeilingBelowSoftThreshold but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_exactly_equal_to_threshold_fails() {
+        // Ceiling == soft threshold must also fail (strictly-greater required).
+        let result = HarvestBuilder::new()
+            .max_workflow_history_events(Some(10_000))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling: 10_000,
+                    threshold: 10_000,
+                })
+            ),
+            "expected HistoryCeilingBelowSoftThreshold for equal values but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_error_message_is_informative() {
+        let err = HarvestBuilder::new()
+            .max_workflow_history_events(Some(5_000))
+            .try_build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("5000"),
+            "error message should contain ceiling: {msg}"
+        );
+        assert!(
+            msg.contains("10000"),
+            "error message should contain threshold: {msg}"
+        );
+    }
+
+    #[test]
+    fn builder_ceiling_above_custom_soft_threshold_passes() {
+        // With a custom soft threshold of 500, a ceiling of 501 must succeed.
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(500)
+            .max_workflow_history_events(Some(501))
+            .build();
+        assert_eq!(built.max_workflow_history_events, Some(501));
+    }
+
+    #[test]
+    fn builder_ceiling_equal_to_custom_soft_threshold_fails() {
+        let result = HarvestBuilder::new()
+            .history_continue_as_new_threshold(500)
+            .max_workflow_history_events(Some(500))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling: 500,
+                    threshold: 500,
+                })
+            ),
+            "expected failure when ceiling == custom threshold, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_completion_callback_default_target_is_stored() {
+        use crate::completion_callback::{EventFilter, HostAllowlist};
+        let built = HarvestBuilder::new()
+            .completion_callback_allowlist(HostAllowlist::new().with_pattern("api.example.com"))
+            .completion_callback_default("https://api.example.com/hook", EventFilter::AnyTerminal)
+            .build();
+        assert_eq!(built.completion_callback_config().default_targets.len(), 1);
+        assert_eq!(
+            built.completion_callback_config().default_targets[0].url,
+            "https://api.example.com/hook"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_a_non_allowlisted_completion_callback_default_target() {
+        use crate::completion_callback::EventFilter;
+        // No allowlist configured -> every domain host is rejected.
+        let result = HarvestBuilder::new()
+            .completion_callback_default("https://evil.com/hook", EventFilter::AnyTerminal)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::CallbackTargetRejected { ref url, .. })
+                    if url == "https://evil.com/hook"
+            ),
+            "expected CallbackTargetRejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_with_no_completion_callback_config_has_empty_defaults() {
+        // Identical-behavior guarantee: an embedder who never touches the
+        // completion-callback API gets an empty default-target list.
+        let built = HarvestBuilder::new().build();
+        assert!(
+            built
+                .completion_callback_config()
+                .default_targets
+                .is_empty()
+        );
+        assert!(built.completion_callback_config().deliverer.is_none());
+    }
+
+    #[test]
+    fn builder_completion_callback_secret_and_retry_policy_are_stored() {
+        use crate::policy::RetryPolicy;
+        use std::time::Duration;
+        let built = HarvestBuilder::new()
+            .completion_callback_secret(b"shh".to_vec())
+            .completion_callback_retry_policy(RetryPolicy::fixed(5, Duration::from_secs(2)))
+            .build();
+        assert!(built.completion_callback_config().secret.is_some());
+        assert_eq!(
+            built.completion_callback_config().retry_policy.max_attempts,
+            5
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn native_activity_shadowing_a_wasm_binding_is_rejected() {
+        use crate::wasm_store::WasmActivityRegistration;
+
+        // A native activity registered with the same name as a WASM activity is
+        // ambiguous: the native handler wins in the registry while the WASM
+        // binding lingers. try_build must reject it rather than silently run the
+        // guest under native metadata.
+        let result = HarvestBuilder::new()
+            .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+            .activities(vec![make_activity("checksum", None, None)])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::WasmActivityNameCollision { ref activity })
+                    if activity == "checksum"
+            ),
+            "expected WasmActivityNameCollision, got {result:?}"
+        );
+
+        // A WASM activity with no native shadow builds fine.
+        assert!(
+            HarvestBuilder::new()
+                .wasm_activity(WasmActivityRegistration::new("checksum", vec![1, 2, 3]))
+                .try_build()
+                .is_ok(),
+            "a lone WASM activity must build"
+        );
+    }
+
+    #[cfg(feature = "wasm-activities")]
+    #[test]
+    fn duplicate_wasm_activity_registration_is_last_wins() {
+        use crate::policy::RetryPolicy;
+        use crate::wasm_store::WasmActivityRegistration;
+        use std::time::Duration;
+
+        let builder = HarvestBuilder::new()
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", vec![1, 1, 1])
+                    .with_queue("first")
+                    .with_retry(RetryPolicy::fixed(2, Duration::from_millis(10))),
+            )
+            .wasm_activity(
+                WasmActivityRegistration::new("checksum", vec![2, 2, 2])
+                    .with_queue("second")
+                    .with_retry(RetryPolicy::fixed(7, Duration::from_millis(20))),
+            );
+
+        // Exactly one registration entry for the name, carrying the LATER bytes.
+        let regs: Vec<&(String, Vec<u8>)> = builder
+            .wasm_module_registrations
+            .iter()
+            .filter(|(n, _)| n == "checksum")
+            .collect();
+        assert_eq!(regs.len(), 1, "duplicate name must not keep both blobs");
+        assert_eq!(regs[0].1, vec![2, 2, 2], "must retain the later bytes");
     }
 }

@@ -23,6 +23,15 @@
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
 //! | HVG008 | NonDeterministicPredicate| HardBlocker | Non-deterministic predicate closures|
 //! | HVG009 | UnsafeLogging | Warning      | Bare tracing calls amplified by replay |
+//! | HVG010 | SelectMacro   | HardBlocker  | `select!` macros + `futures::future::select*` combinators over ctx awaitables |
+//! | HVG011 | NonDeterministicIteration | HardBlocker* | `HashMap`/`HashSet` iteration order (issue #785) |
+//!
+//! \* HVG011's catalog severity is the class's worst case (a loop body that
+//! schedules commands). Detection surfaces (the `#[workflow]` macro lint and
+//! `det_check`'s DET010) downgrade a command-free loop to a Warning.
+//! Note the ID remap: issue #785's text proposed HVG010, but HVG010 was
+//! already permanently assigned to SelectMacro (issue #600) — IDs are never
+//! reused, so the iteration-order rule ships as HVG011.
 
 /// Severity of a guardrail rule violation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +64,15 @@ pub enum RuleCategory {
     /// Bare `tracing::{info,warn,error}!` calls inside a `#[workflow]` body that
     /// fire on every replay cycle, amplifying log volume.
     UnsafeLogging,
+    /// `tokio::select!` / `futures::select!` / `futures::select_biased!` — or the
+    /// `futures::future::{select, select_all, select_ok, try_select}`
+    /// combinator functions (issue #799) — used to race concurrent operations
+    /// inside a `#[workflow]` body (issue #600).
+    SelectMacro,
+    /// Iteration over a `HashMap`/`HashSet` inside a `#[workflow]` body — hash
+    /// iteration order is randomized per process and diverges on replay
+    /// (issue #785).
+    NonDeterministicIteration,
 }
 
 /// A single entry in the guardrail rule catalog.
@@ -206,6 +224,57 @@ static CATALOG: &[RuleEntry] = &[
             ctx.log_warn(message), ctx.log_error(message). These are suppressed automatically \
             during replay (is_replaying() == true) and auto-tag every event with workflow_id, \
             execution_id, workflow_type, and replay = false for log correlation.",
+    },
+    RuleEntry {
+        id: "HVG010",
+        severity: Severity::HardBlocker,
+        category: RuleCategory::SelectMacro,
+        explanation: "Using tokio::select!, futures::select!, or futures::select_biased! -- or \
+            the futures::future::{select, select_all, select_ok, try_select} combinators -- to \
+            race concurrent ctx-managed operations (activities, timers, signals, child workflows) \
+            inside a workflow body is a double footgun: (1) the winning branch depends on \
+            non-deterministic poll/arrival order, so a replay can pick a different branch than \
+            the original run and diverge; (2) the dropped loser branches do not durably cancel \
+            the underlying work -- a scheduled activity keeps running on a worker and a durable \
+            timer row stays live, leaking state that is never cleaned up.",
+        alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive \
+            (issue #600). It records the winning branch durably via a MarkerRecorded event so \
+            replay always resolves the same winner, and durably cancels every losing branch \
+            (activity task rows, child-workflow executions, or a losing durable timer) so no \
+            leaked in-flight work remains. For a single signal bounded by a deadline, \
+            ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive \
+            ctx.race()'s timer-plus-signal shape wraps. To fan out many activities in parallel \
+            and collect their results in a deterministic order, use ctx.execute_activity_fan_out* \
+            instead of racing them; to block until a workflow-local predicate holds (optionally \
+            bounded by a deadline), use ctx.await_condition_timeout().",
+    },
+    // HVG011 (issue #785). ID remap: the issue text proposed HVG010, but
+    // HVG010 was already permanently assigned to SelectMacro (issue #600) and
+    // rule IDs are never reused, so this rule ships as HVG011.
+    //
+    // Severity note: the catalog severity is the class's worst case (a loop
+    // body that schedules commands is a HardBlocker). Detection surfaces (the
+    // #[workflow] macro lint and det_check's DET010) downgrade a command-free
+    // loop to a Warning.
+    RuleEntry {
+        id: "HVG011",
+        severity: Severity::HardBlocker,
+        category: RuleCategory::NonDeterministicIteration,
+        explanation: "Iterating a std::collections::HashMap or HashSet directly inside a \
+            workflow body observes the hash-iteration order, which is randomized per process \
+            (RandomState seeds differ across workers and restarts), so a replay can visit the \
+            entries in a different order than the original run. When the loop body schedules \
+            commands (ctx.execute_activity*, ctx.spawn_child_workflow*, \
+            ctx.execute_local_activity*, ctx.timer, ctx.side_effect), the command sequence is \
+            recorded in history in iteration order -- a reordered replay produces a different \
+            command sequence and diverges (non-determinism error / nd-block). Even a \
+            command-free loop can leak the non-deterministic order into workflow-local state \
+            and flip a later branch.",
+        alternative: "Use a BTreeMap/BTreeSet (deterministic iteration order) for any \
+            collection a workflow iterates, or collect the keys into a Vec and sort() it \
+            before iterating: let mut keys: Vec<_> = map.keys().cloned().collect(); \
+            keys.sort(); for k in keys { ... }. Collections that are only ever point-looked-up \
+            (never iterated) are fine to keep as HashMap/HashSet.",
     },
 ];
 

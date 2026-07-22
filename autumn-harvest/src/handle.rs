@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -18,7 +19,8 @@ use serde_json::Value;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
+    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
 };
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
@@ -162,10 +164,22 @@ struct WorkflowHandleClientInner {
     query_handlers: Vec<crate::info::QueryHandlerInfo>,
     max_workflow_input_bytes: u64,
     max_workflow_execution_timeout: Option<Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
+    /// default (issue #617). `None` = no chain cap applied fleet-wide.
+    max_workflow_chain_timeout: Option<Duration>,
     max_workflow_start_delay: Duration,
     max_signal_payload_bytes: u64,
     query_timeout: Duration,
     history_policy: crate::context::WorkflowHistoryPolicy,
+    /// Default max-wait cap for debounced starts when the policy omits `max_wait`.
+    default_debounce_max_wait: Duration,
+    /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
+    max_workflow_attempts: Option<u32>,
+    /// Engine metrics recorder (issue #684). Wired by the runtime so the
+    /// in-process update path (`execute_update_in_process`) can emit
+    /// `harvest.update.admitted` at admission, matching the HTTP/UI paths.
+    /// Defaults to a no-op recorder when the client is built without one.
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -186,10 +200,17 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
             )
+            .field(
+                "max_workflow_chain_timeout",
+                &self.max_workflow_chain_timeout,
+            )
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("query_timeout", &self.query_timeout)
             .field("history_policy", &self.history_policy)
+            .field("default_debounce_max_wait", &self.default_debounce_max_wait)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("metrics", &"<MetricsRecorder>")
             .finish()
     }
 }
@@ -244,11 +265,28 @@ impl WorkflowHandleClient {
                 query_handlers: Vec::new(),
                 max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
                 max_workflow_execution_timeout: None,
+                max_workflow_chain_timeout: None,
                 max_workflow_start_delay: crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY,
                 max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
                 query_timeout: Duration::from_secs(5),
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
+                default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
+                max_workflow_attempts: None,
+                metrics: Arc::new(crate::telemetry::NoOpMetrics),
             }),
+        }
+    }
+
+    /// Wire the engine metrics recorder into the client (issue #684).
+    ///
+    /// The in-process update path emits `harvest.update.admitted` at admission,
+    /// matching the HTTP and Vantage-UI paths. Defaults to a no-op recorder.
+    #[must_use]
+    pub fn with_metrics(self, metrics: Arc<dyn crate::telemetry::MetricsRecorder>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.metrics = metrics;
+        Self {
+            inner: Arc::new(inner),
         }
     }
 
@@ -307,6 +345,16 @@ impl WorkflowHandleClient {
         }
     }
 
+    /// Add the global chain-scoped lifetime cap ceiling to the client (issue #617).
+    #[must_use]
+    pub fn with_max_workflow_chain_timeout(self, ceiling: Option<Duration>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_chain_timeout = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Add the global max workflow start delay to the client.
     #[must_use]
     pub fn with_max_workflow_start_delay(self, ceiling: Duration) -> Self {
@@ -349,10 +397,53 @@ impl WorkflowHandleClient {
             inner: Arc::new(inner),
         }
     }
+    /// Set the default max-wait cap for debounced starts.
+    ///
+    /// Applied when a `DebouncePolicy.max_wait` is `None`. Mirrors
+    /// [`WorkerConfig::with_default_debounce_max_wait`](crate::builder::WorkerConfig::with_default_debounce_max_wait).
+    /// Defaults to 1 hour.
+    #[must_use]
+    pub fn with_default_debounce_max_wait(self, max_wait: Duration) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.default_debounce_max_wait = max_wait;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Get the default debounce max-wait cap.
+    #[must_use]
+    pub fn default_debounce_max_wait(&self) -> Duration {
+        self.inner.default_debounce_max_wait
+    }
+
+    /// Get the server-side ceiling on workflow retry attempts (issue #523).
+    #[must_use]
+    pub fn max_workflow_attempts(&self) -> Option<u32> {
+        self.inner.max_workflow_attempts
+    }
+
+    /// Set the server-side ceiling on workflow retry attempts (issue #523).
+    #[must_use]
+    pub fn with_max_workflow_attempts(self, ceiling: Option<u32>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_attempts = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
         self.inner.max_workflow_execution_timeout
+    }
+
+    /// Get the chain-scoped lifetime cap ceiling (issue #617). Doubles as the
+    /// fleet-wide chain default.
+    #[must_use]
+    pub fn max_workflow_chain_timeout(&self) -> Option<Duration> {
+        self.inner.max_workflow_chain_timeout
     }
 
     /// Get the maximum allowed workflow start delay.
@@ -409,7 +500,7 @@ impl WorkflowHandleClient {
         conn: &mut AsyncPgConnection,
         request: StartWorkflowParams<'_>,
     ) -> HarvestResult<StartedWorkflowHandle> {
-        let started = start_or_load_workflow_execution(conn, request).await?;
+        let started = start_or_load_workflow_execution(conn, request, None).await?;
         let handle = self.handle(started.exec_id);
         Ok(StartedWorkflowHandle { started, handle })
     }
@@ -474,6 +565,68 @@ impl WorkflowHandle {
         Ok(())
     }
 
+    /// Gracefully cancel this workflow execution (cooperative path).
+    ///
+    /// Mirrors `POST /workflows/{id}/cancel`: appends a `WorkflowCancelled`
+    /// event and seals the run as `CANCELLED`. The workflow body is expected
+    /// to observe the cancellation via `is_cancelled`/`check_cancellation`.
+    /// Idempotent against an already-cancelled run; returns
+    /// [`HarvestError::Config`] for a run already terminal for another reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist,
+    /// [`HarvestError::Config`] when the execution is already terminal, and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn cancel(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        cancel_workflow_execution(
+            &mut conn,
+            self.exec_id,
+            reason,
+            &crate::telemetry::NoOpMetrics,
+        )
+        .await
+    }
+
+    /// Forcefully terminate this workflow execution (operator escape hatch).
+    ///
+    /// Mirrors `POST /workflows/{id}/terminate`: seals a live run in the
+    /// `TERMINATED` state unilaterally without requiring the workflow body to
+    /// cooperate, fails outstanding task rows, and runs the parent-close
+    /// cascade. A result-awaiting caller observes [`HarvestError::Terminated`]
+    /// (distinct from a cooperative cancel and from a failure). Idempotent
+    /// no-op against any already-terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn terminate(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        terminate_workflow_execution(
+            &mut conn,
+            self.exec_id,
+            reason,
+            &crate::telemetry::NoOpMetrics,
+        )
+        .await
+    }
+
     /// Return the current compact result snapshot without waiting.
     ///
     /// # Errors
@@ -503,7 +656,9 @@ impl WorkflowHandle {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             HarvestError::Config("workflow result wait duration overflowed".to_string())
         })?;
-        let snapshot = self.result_snapshot().await?;
+        // Follow the workflow-level retry chain (issue #523) so a still-retrying
+        // run is not reported terminal at its first FAILED attempt.
+        let snapshot = WorkflowResult::from_execution(&self.load_effective_execution().await?);
         if snapshot.is_terminal() {
             return Ok(Some(snapshot));
         }
@@ -514,7 +669,7 @@ impl WorkflowHandle {
         let mut listener = self.connect_listener().await?;
 
         loop {
-            let snapshot = self.result_snapshot().await?;
+            let snapshot = WorkflowResult::from_execution(&self.load_effective_execution().await?);
             if snapshot.is_terminal() {
                 return Ok(Some(snapshot));
             }
@@ -527,7 +682,8 @@ impl WorkflowHandle {
             match listener.wait_for_notification_timeout(remaining).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let snapshot = self.result_snapshot().await?;
+                    let snapshot =
+                        WorkflowResult::from_execution(&self.load_effective_execution().await?);
                     return if snapshot.is_terminal() {
                         Ok(Some(snapshot))
                     } else {
@@ -550,17 +706,21 @@ impl WorkflowHandle {
     /// Returns terminal workflow errors, database errors, listener setup errors,
     /// or not-found errors.
     pub async fn result_raw(&self) -> HarvestResult<Value> {
-        let execution = self.load_execution().await?;
+        let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
-            return result;
+            return self
+                .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                .await;
         }
 
         let mut listener = self.connect_listener().await?;
 
         loop {
-            let execution = self.load_execution().await?;
+            let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
-                return result;
+                return self
+                    .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                    .await;
             }
 
             match listener.wait_for_notification().await? {
@@ -585,9 +745,11 @@ impl WorkflowHandle {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             HarvestError::Config("workflow result timeout duration overflowed".to_string())
         })?;
-        let execution = self.load_execution().await?;
+        let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
-            return result;
+            return self
+                .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                .await;
         }
         if Instant::now() >= deadline {
             return Err(wait_timeout_error(&execution));
@@ -596,9 +758,11 @@ impl WorkflowHandle {
         let mut listener = self.connect_listener().await?;
 
         loop {
-            let execution = self.load_execution().await?;
+            let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
-                return result;
+                return self
+                    .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                    .await;
             }
 
             let now = Instant::now();
@@ -609,9 +773,11 @@ impl WorkflowHandle {
             match listener.wait_for_notification_timeout(remaining).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let execution = self.load_execution().await?;
+                    let execution = self.load_effective_execution().await?;
                     if let Some(result) = terminal_raw_result(&execution) {
-                        return result;
+                        return self
+                            .enrich_terminal_result(ExecutionId::from_uuid(execution.id), result)
+                            .await;
                     }
                     return Err(wait_timeout_error(&execution));
                 }
@@ -619,6 +785,122 @@ impl WorkflowHandle {
                     listener = self.connect_listener().await?;
                 }
             }
+        }
+    }
+
+    /// Load the typed fields of the terminal `WorkflowFailed` event for
+    /// `exec_id` (issue #767).
+    ///
+    /// Returns `Some(DecodedWorkflowFailure)` when a `WorkflowFailed` event
+    /// exists in history (carrying its `error_type`/`details`/`non_retryable`, all
+    /// `None` for a legacy untyped failure), or `None` when the execution has no
+    /// `WorkflowFailed` event. Callers should invoke this only on the `FAILED`
+    /// branch, since it performs an extra history load.
+    ///
+    /// `exec_id` is an explicit parameter (rather than `self.exec_id`) because
+    /// `result_raw` follows the workflow-level retry chain (issue #523) and must
+    /// recover the typed failure from the *effective* (final-attempt) execution,
+    /// not the original handle id. `result_snapshot` (which reports the original
+    /// row, not the chain) passes `self.exec_id()` so its typed fields stay
+    /// consistent with the execution row it actually reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns database or history-load errors.
+    pub(crate) async fn terminal_typed_failure(
+        &self,
+        exec_id: ExecutionId,
+    ) -> HarvestResult<Option<crate::failure::DecodedWorkflowFailure>> {
+        let shard = self.client.inner.router.shard_for_execution(exec_id);
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let history = crate::store::load_history_with_codecs(
+            &mut conn,
+            exec_id,
+            &self.client.inner.payload_codecs,
+        )
+        .await?;
+        drop(conn);
+
+        Ok(history.events.iter().rev().find_map(|event| match event {
+            crate::event::WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => Some(crate::failure::DecodedWorkflowFailure {
+                message: error.clone(),
+                error_type: error_type.clone(),
+                details: details.clone(),
+                non_retryable: *non_retryable,
+            }),
+            _ => None,
+        }))
+    }
+
+    /// Enrich a terminal `result_raw` outcome with the typed failure fields.
+    ///
+    /// For a `FAILED` execution (`Err(HarvestError::WorkflowFailed { .. })`) this
+    /// performs one extra history load to recover the typed
+    /// `error_type`/`details`/`non_retryable` (issue #767). The `reason` stays the
+    /// human message from `execution.error`. Every other outcome is passed through
+    /// untouched (no extra DB round-trip).
+    ///
+    /// `exec_id` is the id of the execution the failure was reported from — for
+    /// `result_raw` this is the *effective* execution after following the
+    /// workflow-level retry chain (issue #523), so a retried run whose final
+    /// attempt failed with a different typed cause surfaces that final attempt's
+    /// typed fields, not the original attempt's.
+    async fn enrich_terminal_result(
+        &self,
+        exec_id: ExecutionId,
+        result: HarvestResult<Value>,
+    ) -> HarvestResult<Value> {
+        let Err(HarvestError::WorkflowFailed {
+            name,
+            reason,
+            error_type,
+            details,
+            non_retryable,
+        }) = result
+        else {
+            return result;
+        };
+        // Only reload history when the message-only branch produced an untyped
+        // failure (the common terminal path); if typed fields are already present
+        // there is nothing to recover.
+        if error_type.is_some() || details.is_some() || non_retryable.is_some() {
+            return Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type,
+                details,
+                non_retryable,
+            });
+        }
+        match self.terminal_typed_failure(exec_id).await {
+            Ok(Some(decoded)) => Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type: decoded.error_type,
+                details: decoded.details,
+                non_retryable: decoded.non_retryable,
+            }),
+            // No WorkflowFailed event or a history-load error: fall back to the
+            // untyped result rather than masking the terminal failure.
+            _ => Err(HarvestError::WorkflowFailed {
+                name,
+                reason,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            }),
         }
     }
 
@@ -645,6 +927,10 @@ impl WorkflowHandle {
     }
 
     async fn load_execution(&self) -> HarvestResult<WorkflowExecution> {
+        self.load_execution_by_id(self.exec_id).await
+    }
+
+    async fn load_execution_by_id(&self, exec_id: ExecutionId) -> HarvestResult<WorkflowExecution> {
         let shard = self.shard();
         let mut conn = self
             .client
@@ -656,13 +942,64 @@ impl WorkflowHandle {
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
         harvest_workflow_executions::table
-            .find(self.exec_id.as_uuid())
+            .find(exec_id.as_uuid())
             .select(WorkflowExecution::as_select())
             .first(&mut conn)
             .await
             .optional()
             .map_err(database_error)?
-            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", self.exec_id)))
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
+    /// If `execution` is `FAILED` and a workflow-level retry was scheduled for
+    /// it (issue #523), return the retry successor's [`ExecutionId`]. The retry
+    /// runs on the same shard with a fresh `exec_id`/`workflow_id` and links back
+    /// via `retry_of_exec_id`, so a result wait that stopped at the original
+    /// `FAILED` row would surface the first transient failure even though the
+    /// chain may still complete. Returns `None` for non-failed states or when no
+    /// retry exists (the failure is the chain's final outcome).
+    async fn retry_successor_id(
+        &self,
+        failed: &WorkflowExecution,
+    ) -> HarvestResult<Option<ExecutionId>> {
+        if failed.state != "FAILED" {
+            return Ok(None);
+        }
+        let shard = self.shard();
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let next: Option<uuid::Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(failed.id)))
+            .select(harvest_workflow_executions::id)
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        Ok(next.map(ExecutionId::from_uuid))
+    }
+
+    /// Load the *effective* execution to inspect for a result wait: starting at
+    /// this handle's `exec_id`, follow the workflow-level retry chain (issue
+    /// #523) while each execution is `FAILED` with a scheduled retry, returning
+    /// the deepest (most recent) execution. For workflows without a retry policy
+    /// this is exactly `load_execution()` — the original row — so behavior is
+    /// unchanged for the non-retry case.
+    async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
+        let mut execution = self.load_execution().await?;
+        // Bounded by the chain length (max_attempts); a self-referential cycle
+        // is impossible because each retry has a strictly fresh exec_id.
+        loop {
+            match self.retry_successor_id(&execution).await? {
+                Some(next) => execution = self.load_execution_by_id(next).await?,
+                None => return Ok(execution),
+            }
+        }
     }
 
     /// Execute a registered query handler in-process by replaying event history.
@@ -670,6 +1007,10 @@ impl WorkflowHandle {
     /// # Errors
     ///
     /// Returns query execution or hydration errors.
+    // Already at the clippy line limit before #772 round 6 added the two-line
+    // deadline-budget threading below; an allow is cheaper than refactoring an
+    // unrelated large function for a 2-line fix.
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_query_in_process(
         &self,
         workflow_info: &crate::info::WorkflowInfo,
@@ -710,7 +1051,23 @@ impl WorkflowHandle {
             history.events,
             self.client.inner.shared_state.clone(),
             self.client.inner.history_policy,
-        );
+        )
+        // #772 round 6: thread the deadline budget (see `hydrate_ctx_for_query`).
+        .with_execution_timeout(execution.execution_timeout)
+        .with_deadline(execution.deadline_at)
+        // #698: thread the spawning-parent id (mirrors the deadline budget) so a
+        // query handler running against a loaded execution reads the correct
+        // `ctx.info().parent_execution_id` for a child workflow.
+        .with_parent_execution_id(
+            execution
+                .parent_id
+                .map(crate::types::ExecutionId::from_uuid),
+        )
+        // #698: thread the workflow type name / business `workflow_id` from the
+        // loaded execution row so `ctx.info().workflow_type` / `workflow_id` are the
+        // real values (not "") for a query handler running against this run.
+        .with_workflow_name(execution.workflow_name.clone())
+        .with_workflow_id(execution.workflow_id.clone());
         for q_info in &self.client.inner.query_handlers {
             if q_info.workflow == workflow_info.name {
                 ctx.register_declarative_query_handler(q_info);
@@ -728,7 +1085,17 @@ impl WorkflowHandle {
         let waker = futures::task::waker_ref(&waker_arc);
         let mut poll_cx = std::task::Context::from_waker(&waker);
 
-        let handler_fut = (workflow_info.handler)(&ctx, execution.input.clone());
+        // Issue #782 (PR #1012 review): contain a panic during future
+        // *construction* (a hand-written handler doing synchronous work before
+        // returning its boxed future), mirroring the poll-time containment below.
+        // Query replays emit no commands and append no events — map the caught
+        // construction panic to a clean `QueryHandlerPanicked` (503).
+        let handler_fut = match crate::error::catch_construct(|| {
+            (workflow_info.handler)(&ctx, execution.input.clone())
+        }) {
+            Ok(fut) => fut,
+            Err(message) => return Err(HarvestError::QueryHandlerPanicked(message)),
+        };
         tokio::pin!(handler_fut);
 
         let mut replay_result = None;
@@ -742,7 +1109,24 @@ impl WorkflowHandle {
                 });
             }
             flag.store(false, std::sync::atomic::Ordering::Release);
-            match handler_fut.as_mut().poll(&mut poll_cx) {
+            // Issue #782: contain a workflow-handler panic during the in-process
+            // read-only replay drive, mirroring `executor::drive_query_replay`
+            // exactly. Without this, a panicking query handler on a code-changed
+            // in-flight run unwinds through the in-process
+            // `TypedWorkflowHandle`/`WorkflowHandle` caller. Query replays emit no
+            // commands and append no events, so there is nothing to roll back —
+            // map the caught panic to a clean `QueryHandlerPanicked` (503).
+            let poll = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler_fut.as_mut().poll(&mut poll_cx)
+            })) {
+                Ok(poll) => poll,
+                Err(panic_payload) => {
+                    return Err(HarvestError::QueryHandlerPanicked(
+                        crate::error::panic_message(panic_payload),
+                    ));
+                }
+            };
+            match poll {
                 std::task::Poll::Ready(res) => {
                     replay_result = Some(res);
                     break;
@@ -760,10 +1144,10 @@ impl WorkflowHandle {
         }
 
         if let Some(Err(reason)) = replay_result {
-            return Err(HarvestError::WorkflowFailed {
-                name: self.exec_id.to_string(),
+            return Err(HarvestError::workflow_failed_untyped(
+                self.exec_id.to_string(),
                 reason,
-            });
+            ));
         }
 
         ctx.execute_query_with_args(query_name, args)
@@ -784,8 +1168,20 @@ impl WorkflowHandle {
     ) -> HarvestResult<Value> {
         self.validate_workflow_type(conn, workflow_name).await?;
         let update_id = crate::types::UpdateId::new();
-        crate::store::admit_update_event(conn, self.exec_id, update_id, name.to_string(), input)
-            .await?;
+        // Issue #684: emit harvest.update.admitted post-commit for the in-process
+        // typed-client path too. The update's completion is driven by the worker
+        // (woken below), which emits update.completed/failed, so admitting
+        // without recording admitted would leave this path asymmetric. The
+        // recorder defaults to a no-op when the client was built without one.
+        crate::store::admit_update_event(
+            conn,
+            self.exec_id,
+            update_id,
+            name.to_string(),
+            input,
+            Some(self.client.inner.metrics.as_ref()),
+        )
+        .await?;
         crate::queue::wake_workflow_task(conn, self.exec_id).await?;
         let start = Instant::now();
         let poll_interval = Duration::from_millis(100);
@@ -800,12 +1196,9 @@ impl WorkflowHandle {
                 .await?;
                 match crate::replay::HistoryMatcher::new(h.events).match_update(update_id) {
                     crate::replay::HistoryMatch::Matched { output } => Some(Ok(output)),
-                    crate::replay::HistoryMatch::Failed { error, .. } => {
-                        Some(Err(HarvestError::WorkflowFailed {
-                            name: self.exec_id.to_string(),
-                            reason: error,
-                        }))
-                    }
+                    crate::replay::HistoryMatch::Failed { error, .. } => Some(Err(
+                        HarvestError::workflow_failed_untyped(self.exec_id.to_string(), error),
+                    )),
                     _ => None,
                 }
             };
@@ -831,13 +1224,16 @@ fn terminal_raw_result(execution: &WorkflowExecution) -> Option<HarvestResult<Va
         "COMPLETED" | "CONTINUED_AS_NEW" => {
             Some(Ok(execution.output.clone().unwrap_or(Value::Null)))
         }
-        "FAILED" => Some(Err(HarvestError::WorkflowFailed {
-            name: execution.workflow_name.clone(),
-            reason: execution
+        // Message-only here (no history access); `enrich_terminal_result`
+        // augments this with the typed fields from the terminal `WorkflowFailed`
+        // event on the `FAILED` branch (issue #767).
+        "FAILED" => Some(Err(HarvestError::workflow_failed_untyped(
+            execution.workflow_name.clone(),
+            execution
                 .error
                 .clone()
                 .unwrap_or_else(|| "workflow failed".to_string()),
-        })),
+        ))),
         "CANCELLED" => Some(Err(HarvestError::Cancelled(
             execution
                 .error

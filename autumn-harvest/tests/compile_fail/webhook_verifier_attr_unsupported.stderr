@@ -1,0 +1,5 @@
+error: unsupported attribute `verifier`: signature verification, timestamp tolerance, and replay protection are configured on the embedding app under `[security.webhooks]` (autumn-web 0.5 signed-webhook endpoints), not on #[webhook]. See docs/getting-started/12-webhooks.md.
+ --> tests/compile_fail/webhook_verifier_attr_unsupported.rs:6:58
+  |
+6 | #[webhook(path = "/hooks/orders", starts = "order_flow", verifier = my_verifier)]
+  |                                                          ^^^^^^^^

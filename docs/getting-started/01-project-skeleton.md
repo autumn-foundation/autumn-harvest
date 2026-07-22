@@ -4,6 +4,14 @@
 
 ---
 
+> **Shortcut:** `harvest new <name>` scaffolds this entire skeleton — a
+> `Cargo.toml`, a runnable `#[workflow]`/`#[activity]` pair with `HarvestPlugin`
+> wiring, a `compose.yaml` Postgres, an `autumn.toml`, and a README whose
+> three-command path reaches one durable execution. It is pure local file
+> generation (no database, no network) and names everything after `<name>`. The
+> rest of this chapter builds the skeleton by hand so you can see each moving
+> part; reach for `harvest new` once you know what it emits.
+
 Create a new Cargo project that depends on the engine, the Autumn plugin, and
 the web framework:
 

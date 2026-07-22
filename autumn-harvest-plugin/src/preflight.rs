@@ -78,6 +78,7 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
     checks.push(check_dlq_read_access(api_state).await);
     checks.push(check_retention_visibility(api_state));
     checks.push(check_admin_auth_boundary(api_state));
+    checks.push(check_history_ceiling_config(api_state));
 
     let overall_status = checks
         .iter()
@@ -620,6 +621,34 @@ async fn observe_shard_availability(shard_id: i32, shard_pool: &DbPool) -> Shard
     }
 }
 
+/// Collect preflight failures for DAG task references to unregistered
+/// activities.
+fn dag_unregistered_activity_failures<'a>(
+    dags: impl IntoIterator<Item = (&'a str, &'a [autumn_harvest::DagTask])>,
+    is_registered_activity: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (dag_name, tasks) in dags {
+        for task in tasks {
+            // A signal/timer gate (issue #746) stores its *signal* name in
+            // `activity_name` but dispatches no activity, so its identifier must
+            // not be validated against the activity catalog — otherwise a valid
+            // signal-gate DAG false-fails preflight before rollout. Mirror of the
+            // builder's `validate_dags_do_not_use_local_activities` gate skip.
+            if task.signal.is_some() {
+                continue;
+            }
+            if !is_registered_activity(&task.activity_name) {
+                failures.push(format!(
+                    "dag '{dag_name}' references unregistered activity '{}'",
+                    task.activity_name
+                ));
+            }
+        }
+    }
+    failures
+}
+
 fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResult {
     let Ok(runtime) = api_state.runtime() else {
         return check(
@@ -634,21 +663,13 @@ fn check_catalog_consistency(api_state: &HarvestApiState) -> PreflightCheckResul
         );
     };
 
-    let mut failures = Vec::new();
-    for dag in runtime.dags().values() {
-        for task in dag.definition.tasks() {
-            if !runtime
-                .registry()
-                .activities
-                .contains_key(&task.activity_name)
-            {
-                failures.push(format!(
-                    "dag '{}' references unregistered activity '{}'",
-                    dag.name, task.activity_name
-                ));
-            }
-        }
-    }
+    let mut failures = dag_unregistered_activity_failures(
+        runtime
+            .dags()
+            .values()
+            .map(|dag| (dag.name.as_str(), dag.definition.tasks())),
+        |name| runtime.registry().activities.contains_key(name),
+    );
     for activity in runtime.registry().activities.values() {
         if activity.default_queue == Some("") {
             failures.push(format!(
@@ -1019,7 +1040,23 @@ fn required_queues(runtime: &crate::api::HarvestApiRuntime) -> BTreeSet<String> 
         queues.insert("default".to_string());
     }
     for activity in runtime.registry().activities.values() {
-        if !activity.is_local {
+        // Worker sessions (issue #606): the two reserved internal
+        // activities (`__harvest_session_acquire`/`__harvest_session_release`)
+        // are always registered so the enqueue-time handler lookup never
+        // hard-fails on them, but they're dispatched on the *caller-supplied*
+        // session queue at the point `create_session`/`Session::complete` is
+        // called, never on `default_queue`. Counting them here would
+        // spuriously report a deployment with no session-based workflow at
+        // all as requiring a worker on `"default"`.
+        // Synthetic liveness canary (issue #796): the built-in canary activity
+        // has `default_queue: None` but is always dispatched on the probe's
+        // *target* queue (carried in the workflow input), never on
+        // `default_queue`. Counting it here would inject a phantom `"default"`
+        // required queue, flipping a healthy non-default-queue deployment RED.
+        if !activity.is_local
+            && !autumn_harvest::is_reserved_session_activity_name(activity.name)
+            && !autumn_harvest::canary::is_reserved_canary_name(activity.name)
+        {
             queues.insert(activity.default_queue.unwrap_or("default").to_string());
         }
     }
@@ -1209,6 +1246,65 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     )
 }
 
+fn check_history_ceiling_config(api_state: &HarvestApiState) -> PreflightCheckResult {
+    let ceiling = api_state.max_workflow_history_events();
+    let soft_threshold = api_state
+        .runtime()
+        .ok()
+        .map(|rt| rt.registry().history_policy().continue_as_new_threshold());
+
+    match (ceiling, soft_threshold) {
+        (Some(ceiling), Some(threshold)) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "hard history event ceiling is configured and validated above the soft threshold",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": true,
+                "max_workflow_history_events": ceiling,
+                "continue_as_new_threshold": threshold,
+                "headroom": ceiling.saturating_sub(threshold),
+            }),
+        ),
+        (Some(ceiling), None) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "hard history event ceiling is configured",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": true,
+                "max_workflow_history_events": ceiling,
+                "continue_as_new_threshold": null,
+            }),
+        ),
+        (None, Some(threshold)) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "history ceiling is disabled; soft continue-as-new threshold is the only guard",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": false,
+                "continue_as_new_threshold": threshold,
+                "note": "set max_workflow_history_events on HarvestBuilder to enable the hard ceiling",
+            }),
+        ),
+        (None, None) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "history ceiling is disabled and no runtime is available to inspect the soft threshold",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": false,
+                "continue_as_new_threshold": null,
+            }),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1325,5 +1421,78 @@ mod tests {
         assert!(sql.contains("has_sequence_privilege"));
         assert!(sql.contains("harvest_events_id_seq"));
         assert!(sql.contains("USAGE"));
+    }
+
+    fn activity_task(name: &str) -> autumn_harvest::DagTask {
+        autumn_harvest::DagTask {
+            activity_name: name.to_string(),
+            upstreams: Vec::new(),
+            trigger_rule: autumn_harvest::TriggerRule::AllSuccess,
+            retry_policy: None,
+            start_to_close: None,
+            queue: None,
+            map_upstream: None,
+            map_failure_policy: autumn_harvest::MapFailurePolicy::FailFast,
+            condition: None,
+            signal: None,
+            input_from: None,
+        }
+    }
+
+    fn signal_gate_task(signal_name: &str) -> autumn_harvest::DagTask {
+        autumn_harvest::DagTask {
+            signal: Some(autumn_harvest::DagSignalGate {
+                signal_name: signal_name.to_string(),
+                timeout: None,
+                on_timeout: autumn_harvest::GateTimeoutAction::FailRun,
+            }),
+            ..activity_task(signal_name)
+        }
+    }
+
+    #[test]
+    fn catalog_check_skips_signal_gate_nodes() {
+        // A signal/timer gate (issue #746) stores its *signal* name in
+        // `activity_name` but dispatches no activity, so preflight must not
+        // report the gate identifier as an unregistered activity.
+        let registered: HashSet<&str> = ["extract", "load"].into_iter().collect();
+        let tasks = vec![
+            activity_task("extract"),
+            signal_gate_task("approval"), // signal name is NOT a registered activity
+            activity_task("load"),
+        ];
+
+        let failures = dag_unregistered_activity_failures(
+            std::iter::once(("etl_with_gate", tasks.as_slice())),
+            |name| registered.contains(name),
+        );
+
+        assert!(
+            failures.is_empty(),
+            "signal gate node must not be flagged as an unregistered activity: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_check_still_flags_genuinely_unregistered_activities() {
+        let registered: HashSet<&str> = std::iter::once("extract").collect();
+        let tasks = vec![
+            activity_task("extract"),
+            signal_gate_task("approval"),
+            activity_task("missing_activity"),
+        ];
+
+        let failures = dag_unregistered_activity_failures(
+            std::iter::once(("etl_with_gate", tasks.as_slice())),
+            |name| registered.contains(name),
+        );
+
+        assert_eq!(
+            failures,
+            vec![
+                "dag 'etl_with_gate' references unregistered activity 'missing_activity'"
+                    .to_string()
+            ]
+        );
     }
 }

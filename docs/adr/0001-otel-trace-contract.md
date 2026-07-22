@@ -2,7 +2,7 @@
 
 **Status**: Accepted  
 **Date**: 2026-05-01  
-**Issue**: [#93](https://github.com/madmax983/autumn-harvest/issues/93)
+**Issue**: [#93](https://github.com/autumn-foundation/autumn-harvest/issues/93)
 
 ---
 
@@ -226,6 +226,12 @@ configured):
 
 ### 7. Metric catalogue
 
+> **Note:** the table below is a historical snapshot. The authoritative
+> catalogue is the set of `METRIC_*` constants in `telemetry.rs`, machine-
+> enforced (100% dashboard coverage) by
+> `autumn-harvest/tests/integration/dashboard_pack_docs.rs` and visualized by
+> `docs/dashboards/starter-pack-v0.1.0.json`.
+
 The following metrics are defined by the constants in `telemetry.rs`. The
 `MetricsRecorder` trait method that drives each metric is listed alongside it.
 
@@ -234,19 +240,51 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_WORKFLOW_STARTED`  | `harvest.workflow.started`    | Counter      | `workflow.name` (bounded), `queue` (bounded)  | `execution.id`        |
 | `METRIC_WORKFLOW_DURATION` | `harvest.workflow.duration`   | Histogram    | `workflow.name`, `queue`, `status`            | `execution.id`        |
 | `METRIC_WORKFLOW_TERMINAL` | `harvest.workflow.terminal`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue`, `outcome` (6 values: completed/failed/cancelled/timed_out/terminated/continued_as_new) | `execution.id` |
-| `METRIC_ACTIVITY_DURATION` | `harvest.activity.duration`   | Histogram    | `activity.name` (bounded), `queue`, `status` | `execution.id`        |
+| `METRIC_WORKFLOW_TIMEOUT`  | `harvest.workflow.timeout`    | Counter      | `workflow` (bounded), `queue` (bounded)       | `execution.id`        |
+| `METRIC_WORKFLOW_CHAIN_TIMEOUT` | `harvest.workflow.chain_timeout` | Counter | `workflow` (bounded), `queue` (bounded) — fires when a continue-as-new chain outlives its `chain_execution_timeout` cap (issue #617); distinct from `harvest.workflow.timeout` | `execution.id` |
+| `METRIC_ACTIVITY_DURATION` | `harvest.activity.duration`   | Histogram    | `activity.name` (bounded), `queue`, `status` (`completed\|failed`) | `execution.id`, `activity.id` |
+| `METRIC_ACTIVITY_FAILED`   | `harvest.activity.failed`     | Counter      | `activity` (bounded), `workflow.type`, `error.type` (low-cardinality), `non_retryable` | `execution.id`, `activity.id` |
+| `METRIC_ACTIVITY_ATTEMPTS` | `harvest.activity.attempts`   | Counter      | `activity` (bounded), `queue` (bounded), `outcome` (`completed\|failed`) | `execution.id`, `activity.id` |
+| `METRIC_ACTIVITY_RETRIES`  | `harvest.activity.retries`    | Counter      | `activity` (bounded), `queue` (bounded)       | `execution.id`, `activity.id` |
 | `METRIC_TIMER_STARTED`     | `harvest.timer.started`       | Counter      | _(none)_                                      |                       |
 | `METRIC_QUEUE_DEPTH`       | `harvest.queue.depth`         | Gauge        | `queue` (bounded)                             | `execution.id`        |
+| `METRIC_WORKFLOW_ACTIVE`   | `harvest.workflow.active`     | Gauge        | `workflow` (bounded), `state` (2 values: running/paused) | `execution.id` |
 | `METRIC_DLQ_ENTRIES`       | `harvest.dlq.entries`         | Gauge        | `shard` (≤ 256)                               |                       |
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |
-| `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `shard` (≤ 256)                               |                       |
+| `METRIC_SCHEDULE_OVERDUE`  | `harvest.schedule.overdue`    | Gauge        | `kind` (2 values), `name` (bounded)           | `execution.id`        |
+| `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`)        |                       |
 | `METRIC_WORKFLOW_PAUSED`   | `harvest.workflow.paused`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`      |
 | `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
+| `METRIC_SAGA_COMPENSATED`  | `harvest.saga.compensated`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
+| `METRIC_SAGA_COMPENSATION_FAILED` | `harvest.saga.compensation_failed` | Counter | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
+| `METRIC_ACTIVITY_PANIC`    | `harvest.activity.panic`      | Counter      | `activity` (= `METRIC_LABEL_ACTIVITY`, bounded), `queue` (bounded) | `execution.id`, `activity.id` |
+| `METRIC_WORKFLOW_PANIC`    | `harvest.workflow.panic`      | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`        |
+| `METRIC_SIGNAL_RECEIVED`   | `harvest.signal.received`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` — **no `name` label**: signal names come from the free-form send route `POST /workflows/{id}/signal/{signal_name}` and have no declared registry to bound them (issue #684, Codex P2) | `execution.id`, signal `name` |
+| `METRIC_SIGNAL_UNHANDLED`  | `harvest.signal.unhandled`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` — **no `name` label** (same free-form-send-route reason as `harvest.signal.received`; the worker sums the terminal outcome's per-name unconsumed map into the single `(workflow, queue)` series). **graceful terminals only** (`Completed`/`Failed` reached through the workflow drive); forced-failure / scanner terminal paths (`TIMED_OUT`/`CANCELLED`/`TERMINATED`/parent-close cascade/history-cap failure) have no driven matcher and are NOT counted | `execution.id`, signal `name` |
+| `METRIC_UPDATE_ADMITTED`   | `harvest.update.admitted`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` — **no `name` label**: admission happens at the free-form update route `POST /workflows/{id}/update/{name}` before the name is resolved against a handler, and handlers register both declaratively AND imperatively (`ctx.register_update_handler`, unknown until execution), so the name cannot be bounded by construction; per-name visibility lives on `update.completed`/`failed`/`rejected` (issue #684, Codex P2) | `execution.id`, update `name` |
+| `METRIC_UPDATE_REJECTED`   | `harvest.update.rejected`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded) | `execution.id` |
+| `METRIC_UPDATE_COMPLETED`  | `harvest.update.completed`    | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded), `queue` | `execution.id` |
+| `METRIC_UPDATE_FAILED`     | `harvest.update.failed`       | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded), `queue` | `execution.id` |
+| `METRIC_UPDATE_DURATION`   | `harvest.update.duration`     | Histogram    | `workflow` (= `METRIC_LABEL_WORKFLOW`), `name` (update name, bounded — `__unregistered__` for an unresolved name), `queue`, `outcome` (`completed`/`failed`, bounded — rejected excluded) | `execution.id`, `update_id` |
 
 **Cardinality rule**: `execution.id` (a UUID) is **explicitly forbidden** as a
 metric label. It is unbounded and would explode the metric time-series in any
 production APM. Use `ATTR_EXECUTION_ID` only on *spans*, never on *metrics*.
+
+**Rate-limit throttle counter — label change (issue #699, BREAKING for
+operators).** `harvest.rate_limit.throttled` is now labelled by the **bounded
+activity name** (`activity`), not the raw bucket `key`. Per-key rate limits
+(#699) resolve a bucket key from workflow input at enqueue time
+(`dyn-rate:{expr}:{tenant}`), which embeds unbounded tenant input; using it as a
+metric label would create one time-series per tenant forever. The counter is
+therefore labelled by the registered activity name, which is bounded. **Any
+dashboard or alert keyed on the old `key` label of `harvest_rate_limit_throttled`
+must move to `activity`.** For the same reason, the per-key token/refill
+**gauges** (`harvest.rate_limit.tokens_available` / `harvest.rate_limit.refill_rate`)
+exclude the unbounded `dyn-rate:` and `start-throttle:` bucket families from their
+per-key sampler; per-tenant bucket state is observable via
+`GET /admin/rate-limits`, not metrics.
 
 ---
 

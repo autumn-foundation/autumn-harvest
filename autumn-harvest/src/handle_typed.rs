@@ -14,7 +14,11 @@ use crate::handle::{WorkflowHandle, WorkflowResultState};
 use crate::types::ExecutionId;
 
 /// Compact type-safe workflow result payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived: `error_details` is a
+/// [`serde_json::Value`], which is only `PartialEq` (issue #767).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
 pub struct TypedWorkflowResult<T> {
     /// Current compact state.
     pub state: WorkflowResultState,
@@ -24,17 +28,45 @@ pub struct TypedWorkflowResult<T> {
     pub error: Option<String>,
     /// Timestamp when the execution entered a terminal state.
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Stable error-type class from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    ///
+    /// `Some` only for a failure state produced by a typed workflow failure;
+    /// `None` for success states and legacy/untyped failures.
+    pub error_type: Option<String>,
+    /// Structured details from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    pub error_details: Option<serde_json::Value>,
+    /// Non-retryable flag from a typed
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
+    pub non_retryable: Option<bool>,
 }
 
 /// Type-safe awaitable handle for one workflow execution.
-#[derive(Debug, Clone)]
 pub struct TypedWorkflowHandle<T> {
     inner: WorkflowHandle,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
-unsafe impl<T> Send for TypedWorkflowHandle<T> {}
-unsafe impl<T> Sync for TypedWorkflowHandle<T> {}
+// Manual `Debug` impl so `TypedWorkflowHandle<T>` is formattable regardless of
+// whether `T` implements `Debug`. `T` is a phantom type parameter (the handle
+// holds no `T`), so the derived impl's implicit `T: Debug` bound is spurious.
+impl<T> std::fmt::Debug for TypedWorkflowHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedWorkflowHandle")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<T> Clone for TypedWorkflowHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
 
 impl<T> TypedWorkflowHandle<T> {
     /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
@@ -57,6 +89,38 @@ impl<T> TypedWorkflowHandle<T> {
     #[must_use]
     pub const fn inner(&self) -> &WorkflowHandle {
         &self.inner
+    }
+
+    /// Gracefully cancel this workflow execution (cooperative path).
+    ///
+    /// Delegates to [`WorkflowHandle::cancel`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist,
+    /// [`HarvestError::Config`] when the execution is already terminal, and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn cancel(
+        &self,
+        reason: &str,
+    ) -> HarvestResult<crate::execution::CancelledWorkflowExecution> {
+        self.inner.cancel(reason).await
+    }
+
+    /// Forcefully terminate this workflow execution (operator escape hatch).
+    ///
+    /// Delegates to [`WorkflowHandle::terminate`]; seals the run as
+    /// `TERMINATED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn terminate(
+        &self,
+        reason: &str,
+    ) -> HarvestResult<crate::execution::CancelledWorkflowExecution> {
+        self.inner.terminate(reason).await
     }
 
     /// Wait until the workflow reaches a terminal state and deserialize its success
@@ -108,11 +172,40 @@ impl<T> TypedWorkflowHandle<T> {
             Some(val) => Some(serde_json::from_value(val).map_err(HarvestError::Serialization)?),
             None => None,
         };
+        // Only a `Failed` state emits a `WorkflowFailed` event carrying typed
+        // fields (issue #767); the extra history load is skipped for every other
+        // state (`Cancelled`/`TimedOut`/`Terminated` never carry a typed
+        // `WorkflowFailure`). A transient history-load failure is *swallowed*
+        // (falls back to untyped `None` fields), mirroring
+        // `HandleInner::enrich_terminal_result` — it must not turn an otherwise
+        // correct snapshot (state + human `error` message intact) into an `Err`.
+        //
+        // `result_snapshot` reports the original handle's execution row (it does
+        // NOT follow the #523 retry chain — unlike `result_raw`), so the typed
+        // failure is loaded from `self.inner`'s own `exec_id` to stay consistent
+        // with the snapshot's `state`/`error`.
+        let (error_type, error_details, non_retryable) =
+            if snap.state == WorkflowResultState::Failed {
+                if let Ok(Some(decoded)) = self
+                    .inner
+                    .terminal_typed_failure(self.inner.exec_id())
+                    .await
+                {
+                    (decoded.error_type, decoded.details, decoded.non_retryable)
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
         Ok(TypedWorkflowResult {
             state: snap.state,
             output,
             error: snap.error,
             completed_at: snap.completed_at,
+            error_type,
+            error_details,
+            non_retryable,
         })
     }
 }
@@ -149,6 +242,8 @@ pub struct TypedStartOptions {
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
     /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
     pub sla: Option<Duration>,
+    /// Optional batch policy for this start request. Overrides `WorkflowInfo::batch`.
+    pub batch: Option<crate::event_batch::BatchPolicy>,
 }
 
 /// Optional configurations when invoking an update and starting a workflow atomically.

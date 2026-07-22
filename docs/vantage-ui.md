@@ -86,6 +86,8 @@ Event fields are extracted from the inner `data` object of the adjacently-tagged
 | `/workflows/{exec_id}` | Workflow detail |
 | `/workers` | Worker fleet |
 | `/schedules` | Cron/interval schedules |
+| `/dags` | DAG list |
+| `/dags/{dag_name}` | DAG detail |
 | `/dlq` | Dead letter queue |
 
 ## Live Event Streaming (feature toggle)

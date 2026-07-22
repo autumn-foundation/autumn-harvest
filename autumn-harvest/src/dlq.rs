@@ -14,7 +14,6 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use scoped_futures::ScopedFutureExt;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -28,19 +27,43 @@ pub const MAX_BULK_LIMIT: u32 = 1000;
 
 /// Filter for bulk DLQ operations.
 ///
-/// At least one of `activity_name`, `workflow_name`, `failed_after`, or
-/// `failed_before` must be set. A filter with only `limit` or `dry_run` is
-/// considered empty and rejected with 400 at the API layer.
+/// At least one substantive criterion (any of `activity_name`, `workflow_name`,
+/// `queue_name`, `min_attempts`, `failed_after`, `failed_before`, or a cause
+/// dimension) must be set. A filter with only `limit` or `dry_run` is considered
+/// empty and rejected with 400 at the API layer.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BulkDlqFilter {
     /// Exact match on `activity_name`.
     pub activity_name: Option<String>,
     /// Exact match on the workflow name of the parent execution.
     pub workflow_name: Option<String>,
+    /// Exact match on `queue_name` (issue #613). SQL-expressible (real column),
+    /// so it carries no compute-on-read cost. Lets an operator reproduce a
+    /// `queue_name`-scoped aggregate facet exactly (AC5).
+    #[serde(default)]
+    pub queue_name: Option<String>,
+    /// Inclusive lower bound on `attempts` (issue #613). SQL-expressible (real
+    /// column), so it carries no compute-on-read cost. Mirrors the aggregate
+    /// endpoint's `min_attempts` filter so a facet read there re-selects the
+    /// same rows here (AC5).
+    #[serde(default)]
+    pub min_attempts: Option<i32>,
     /// Inclusive lower bound on `failed_at`.
     pub failed_after: Option<chrono::DateTime<chrono::Utc>>,
     /// Exclusive upper bound on `failed_at`.
     pub failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Exact match on the derived [`error_class`] of the entry's error text
+    /// (issue #613). Applied as a compute-on-read post-filter.
+    #[serde(default)]
+    pub error_class: Option<String>,
+    /// Exact match on the derived [`dlq_reason`] class (issue #613). Applied
+    /// as a compute-on-read post-filter.
+    #[serde(default)]
+    pub dlq_reason: Option<String>,
+    /// Exact match on the derived [`failure_signature`] (issue #613). Applied
+    /// as a compute-on-read post-filter.
+    #[serde(default)]
+    pub failure_signature: Option<String>,
     /// Cap on rows acted on per call. Defaults to 100, hard-capped at 1000.
     pub limit: Option<u32>,
     /// When `true`, return matching rows and count without writing.
@@ -56,8 +79,39 @@ impl BulkDlqFilter {
     pub const fn is_empty(&self) -> bool {
         self.activity_name.is_none()
             && self.workflow_name.is_none()
+            && self.queue_name.is_none()
+            && self.min_attempts.is_none()
             && self.failed_after.is_none()
             && self.failed_before.is_none()
+            && self.error_class.is_none()
+            && self.dlq_reason.is_none()
+            && self.failure_signature.is_none()
+    }
+
+    /// Returns `true` if any compute-on-read *cause* dimension is set
+    /// (issue #613). When set, the SQL predicate cannot express the filter, so
+    /// callers must load rows and post-filter via [`Self::cause_matches`].
+    #[must_use]
+    pub const fn has_cause_filter(&self) -> bool {
+        self.error_class.is_some() || self.dlq_reason.is_some() || self.failure_signature.is_some()
+    }
+
+    /// Returns `true` if `error` satisfies every set cause dimension
+    /// (issue #613). Unset dimensions never exclude, so a filter with no cause
+    /// dimension matches every row.
+    #[must_use]
+    pub fn cause_matches(&self, error: &str) -> bool {
+        self.error_class
+            .as_ref()
+            .is_none_or(|v| error_class(error) == *v)
+            && self
+                .dlq_reason
+                .as_ref()
+                .is_none_or(|v| dlq_reason(error) == *v)
+            && self
+                .failure_signature
+                .as_ref()
+                .is_none_or(|v| failure_signature(error) == *v)
     }
 
     /// Effective row limit: uses the provided value clamped to [1, 1000],
@@ -99,6 +153,111 @@ pub struct BulkDlqResult {
     pub failures: Vec<BulkDlqFailure>,
 }
 
+// ---------------------------------------------------------------------------
+// Redrive (issue #510)
+// ---------------------------------------------------------------------------
+
+/// Filter for the operator redrive endpoint (`POST /dlq/redrive`, issue #510).
+///
+/// Selects dead-letter rows to re-enqueue with a fresh retry budget. At least
+/// one substantive criterion must be set — a filter with only `max`/`dry_run`
+/// is rejected with 400 at the API layer. The time bounds map onto the
+/// `failed_at` column (`dead_lettered_after` → `>=`, `dead_lettered_before`
+/// → `<`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RedriveFilter {
+    /// Exact match on `queue_name`.
+    pub queue: Option<String>,
+    /// Exact match on the workflow name of the owning execution.
+    pub workflow_name: Option<String>,
+    /// Inclusive lower bound on `failed_at`.
+    pub dead_lettered_after: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `failed_at`.
+    pub dead_lettered_before: Option<DateTime<Utc>>,
+    /// Case-insensitive substring match on the `error` column.
+    pub error_contains: Option<String>,
+    /// Explicit set of dead-letter row IDs to target.
+    pub dead_letter_ids: Option<Vec<Uuid>>,
+    /// Cap on rows redriven per call. Defaults to 100, hard-capped at 1000.
+    pub max: Option<u32>,
+    /// When `true`, return matching rows and count without writing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl RedriveFilter {
+    /// Returns `true` if no substantive filter criterion is specified.
+    ///
+    /// `max` and `dry_run` alone do not count as criteria.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_none()
+            && self.workflow_name.is_none()
+            && self.dead_lettered_after.is_none()
+            && self.dead_lettered_before.is_none()
+            && self.error_contains.is_none()
+            && self.dead_letter_ids.as_ref().is_none_or(Vec::is_empty)
+    }
+
+    /// Effective row cap: the provided `max` clamped to `[1, MAX_BULK_LIMIT]`,
+    /// defaulting to `DEFAULT_BULK_LIMIT`. Zero is treated as 1 so callers never
+    /// get a silent no-op from `LIMIT 0`.
+    #[must_use]
+    pub fn effective_max(&self) -> i64 {
+        i64::from(
+            self.max
+                .unwrap_or(DEFAULT_BULK_LIMIT)
+                .clamp(1, MAX_BULK_LIMIT),
+        )
+    }
+}
+
+/// Structured result of a redrive operation (issue #510).
+///
+/// `matched` vs `redriven` makes silent truncation impossible: when the filter
+/// matches more rows than `max`, the operator sees there is more to do.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RedriveResult {
+    /// Total rows matching the filter across the shard, before the `max` clip.
+    pub matched: usize,
+    /// Rows re-enqueued with a fresh retry budget.
+    pub redriven: usize,
+    /// Rows that matched but were a no-op (already redriven / execution already
+    /// progressed). Reported, never a duplicate enqueue.
+    pub skipped: usize,
+    /// Rows rejected with a clear error (e.g. owning execution is COMPLETED).
+    pub failed: usize,
+    /// IDs of rows actually redriven (in dry-run, the bounded sample that would
+    /// be redriven).
+    pub ids: Vec<String>,
+    /// Whether this was a dry-run (no writes performed).
+    pub dry_run: bool,
+    /// Per-row rejections that did not roll back other rows.
+    pub failures: Vec<BulkDlqFailure>,
+}
+
+/// Outcome of redriving a single dead-letter entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedriveOutcome {
+    /// The entry was re-enqueued; carries the new task-queue row id.
+    Redriven(Uuid),
+    /// The entry was a no-op (missing row, or owning execution already running).
+    Skipped,
+}
+
+/// Escape `%` and `_` so an operator-supplied substring is matched literally by
+/// a SQL `ILIKE` pattern.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Typed dead-letter reason for engine-authored DLQ entries.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -118,6 +277,32 @@ pub enum DeadLetterReason {
         crash_strikes: i32,
         last_worker_id: Option<String>,
     },
+    /// A workflow-task dispatch did not complete or suspend within the
+    /// `workflow_task_timeout` budget `task_timeout_strikes` times in a row
+    /// (issue #494). The worker reclaimed the concurrency slot on each
+    /// occasion; after hitting the threshold the task was quarantined rather
+    /// than re-queued indefinitely.
+    ///
+    /// `timeout_secs` is the configured budget (whole seconds) at quarantine
+    /// time. `task_timeout_strikes` is the in-process consecutive-timeout
+    /// count that triggered escalation.
+    WorkflowTaskTimeout {
+        task_timeout_strikes: i32,
+        timeout_secs: u64,
+    },
+    /// A completion-callback delivery (issue #605) exhausted its configured
+    /// retry budget without ever receiving a 2xx response. Distinct from
+    /// clean task-retry exhaustion: there is no `harvest_task_queue` row or
+    /// workflow execution to reactivate on redrive — an operator-triggered
+    /// redrive resets the *same* `harvest_completion_deliveries` row
+    /// (`completion_callback::redrive_delivery`) to `PENDING` so the
+    /// scanner re-attempts it with the same `delivery_id`.
+    CallbackDeliveryExhausted {
+        delivery_id: Uuid,
+        attempts: i32,
+        last_status: Option<u16>,
+        target: String,
+    },
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -125,6 +310,74 @@ impl std::fmt::Display for DeadLetterReason {
         match serde_json::to_string(self) {
             Ok(json) => f.write_str(&json),
             Err(_) => f.write_str("DeadLetterReasonSerializationFailed"),
+        }
+    }
+}
+
+impl DeadLetterReason {
+    /// Stable, low-cardinality `snake_case` class name for this quarantine
+    /// reason (issue #613). This is the value the `dlq_reason` aggregation
+    /// dimension and bulk-filter dimension key on.
+    #[must_use]
+    pub const fn reason_class(&self) -> &'static str {
+        match self {
+            Self::HistoryCapExceeded { .. } => "history_cap_exceeded",
+            Self::PoisonPill { .. } => "poison_pill",
+            Self::WorkflowTaskTimeout { .. } => "workflow_task_timeout",
+            Self::CallbackDeliveryExhausted { .. } => "callback_delivery_exhausted",
+        }
+    }
+
+    /// `PascalCase` serde `"type"` tag for this reason, used as the derived
+    /// `error_class` for an engine-authored quarantine entry (issue #613).
+    #[must_use]
+    pub const fn type_tag(&self) -> &'static str {
+        match self {
+            Self::HistoryCapExceeded { .. } => "HistoryCapExceeded",
+            Self::PoisonPill { .. } => "PoisonPill",
+            Self::WorkflowTaskTimeout { .. } => "WorkflowTaskTimeout",
+            Self::CallbackDeliveryExhausted { .. } => "CallbackDeliveryExhausted",
+        }
+    }
+}
+
+/// Delegate a `task_type = "CALLBACK"` dead-letter's replay to the
+/// completion-delivery redrive primitive (issue #605), so the generic DLQ
+/// replay surface (single-row API, bulk replay, UI) actually redrives the
+/// delivery instead of failing on `dead_letter_task_type`'s "invalid
+/// `task_type`" error (issue #921 review, Codex P2). Called from inside the
+/// caller's already-open transaction; `completion_callback::redrive_delivery`
+/// opens its own nested transaction (a savepoint) on the same connection,
+/// which is safe.
+///
+/// Returns the delivery's own id (`original_task_id`, stable across
+/// redrives) in place of a newly-created task-queue row id — there is no
+/// task-queue row for a completion delivery, so this is the closest
+/// equivalent "id of the unit of work that now represents this retry."
+async fn redrive_callback_dead_letter(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    workflow_exec_id: Option<Uuid>,
+    original_task_id: Uuid,
+) -> HarvestResult<Uuid> {
+    let exec_id = workflow_exec_id
+        .map(crate::types::ExecutionId::from_uuid)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "dead-letter {dead_letter_id} is a CALLBACK entry with no workflow_exec_id"
+            ))
+        })?;
+
+    match crate::completion_callback::redrive_delivery(conn, exec_id, original_task_id).await? {
+        crate::completion_callback::DeliveryRedriveOutcome::Redriven => Ok(original_task_id),
+        crate::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
+            HarvestError::NotFound(format!("dead-letter {dead_letter_id}")),
+        ),
+        crate::completion_callback::DeliveryRedriveOutcome::NotFailed { current_state } => {
+            Err(HarvestError::Config(format!(
+                "cannot replay dead-letter {dead_letter_id}: completion delivery \
+                 {original_task_id} is {current_state}, not FAILED"
+            )))
         }
     }
 }
@@ -280,93 +533,105 @@ pub async fn replay_dead_letter(
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    conn.transaction::<Uuid, HarvestError, _>(|conn| {
-        async move {
-            let entry = dsl::harvest_dead_letters
-                .find(dead_letter_id)
-                .select(DeadLetter::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
+    Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+        let entry = dsl::harvest_dead_letters
+            .find(dead_letter_id)
+            .select(DeadLetter::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?
+            .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
 
-            let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
+        // A completion-callback dead letter (issue #605) is not a
+        // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
+        // completion-delivery attempt, and "replay by re-enqueue" below
+        // has no meaning for it. Delegate to the delivery's own redrive
+        // primitive instead of erroring with "invalid task_type" (issue
+        // #921 review, Codex P2): the generic DLQ "replay" surface (API,
+        // bulk replay, UI) must actually redrive the delivery, not fail.
+        if entry.task_type.eq_ignore_ascii_case("callback") {
+            return redrive_callback_dead_letter(
+                conn,
+                dead_letter_id,
+                entry.workflow_exec_id,
+                entry.original_task_id,
+            )
+            .await;
+        }
 
-            let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
-            params.workflow_exec_id = entry.workflow_exec_id;
-            params.activity_name = entry.activity_name;
-            params.max_attempts = entry.attempts.max(1);
+        let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
-            // Restore required_build_id and concurrency policy from the owning
-            // execution so the replayed task is subject to the same constraints.
-            if let Some(exec_id) = params.workflow_exec_id {
-                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let row: Option<(Option<String>, String, String)> =
-                    exec_dsl::harvest_workflow_executions
-                        .find(exec_id)
-                        .select((
-                            exec_dsl::assigned_build_id,
-                            exec_dsl::workflow_name,
-                            exec_dsl::state,
-                        ))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                if let Some((build_id, workflow_name, state)) = row {
-                    // Refuse to revive a task into a workflow that has already
-                    // reached a terminal state. Re-running the activity/workflow
-                    // task would execute user code and append events against a
-                    // dead execution, corrupting its history (issue #367). This
-                    // is what makes a poison-pill activity DLQ entry — whose
-                    // owning workflow is failed at quarantine time —
-                    // non-replayable.
-                    if state != "RUNNING" {
-                        return Err(HarvestError::WorkflowNotRunning(
-                            exec_id.to_string().parse().map_err(|_| {
-                                HarvestError::Database(format!(
-                                    "execution id {exec_id} is not a valid ExecutionId"
-                                ))
-                            })?,
-                        ));
-                    }
-                    params.required_build_id = build_id;
-                    // Concurrency policy lives on WorkflowInfo and governs
-                    // workflow-task slots only.  Activity tasks are not subject
-                    // to the workflow-level cap (the claim query enforces caps
-                    // per task_type, so mixing them would throttle activities
-                    // against the wrong budget).
-                    if task_type == TaskType::Workflow
-                        && let Some(reg) = registry
-                        && let Some(info) = reg.workflows.get(&workflow_name)
-                        && let Some(policy) = &info.concurrency
-                    {
-                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
-                            policy.key_expr,
-                            &params.input,
-                        );
-                        params.max_concurrent = Some(policy.limit);
-                    }
+        let mut params = EnqueueParams::new(entry.queue_name, task_type, entry.input);
+        params.workflow_exec_id = entry.workflow_exec_id;
+        params.activity_name = entry.activity_name;
+        params.max_attempts = entry.attempts.max(1);
+
+        // Restore required_build_id and concurrency policy from the owning
+        // execution so the replayed task is subject to the same constraints.
+        if let Some(exec_id) = params.workflow_exec_id {
+            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+            let row: Option<(Option<String>, String, String)> =
+                exec_dsl::harvest_workflow_executions
+                    .find(exec_id)
+                    .select((
+                        exec_dsl::assigned_build_id,
+                        exec_dsl::workflow_name,
+                        exec_dsl::state,
+                    ))
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+            if let Some((build_id, workflow_name, state)) = row {
+                // Refuse to revive a task into a workflow that has already
+                // reached a terminal state. Re-running the activity/workflow
+                // task would execute user code and append events against a
+                // dead execution, corrupting its history (issue #367). This
+                // is what makes a poison-pill activity DLQ entry — whose
+                // owning workflow is failed at quarantine time —
+                // non-replayable.
+                if state != "RUNNING" {
+                    return Err(HarvestError::WorkflowNotRunning(
+                        exec_id.to_string().parse().map_err(|_| {
+                            HarvestError::Database(format!(
+                                "execution id {exec_id} is not a valid ExecutionId"
+                            ))
+                        })?,
+                    ));
+                }
+                params.required_build_id = build_id;
+                // Concurrency policy lives on WorkflowInfo and governs
+                // workflow-task slots only.  Activity tasks are not subject
+                // to the workflow-level cap (the claim query enforces caps
+                // per task_type, so mixing them would throttle activities
+                // against the wrong budget).
+                if task_type == TaskType::Workflow
+                    && let Some(reg) = registry
+                    && let Some(info) = reg.workflows.get(&workflow_name)
+                    && let Some(policy) = &info.concurrency
+                {
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+                    params.max_concurrent = Some(policy.limit);
                 }
             }
-
-            let task_id = crate::queue::enqueue(conn, &params).await?;
-            let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            if deleted == 0 {
-                return Err(HarvestError::NotFound(format!(
-                    "dead-letter {dead_letter_id}"
-                )));
-            }
-
-            Ok(task_id)
         }
-        .scope_boxed()
-    })
+
+        let task_id = crate::queue::enqueue(conn, &params).await?;
+        let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        if deleted == 0 {
+            return Err(HarvestError::NotFound(format!(
+                "dead-letter {dead_letter_id}"
+            )));
+        }
+
+        Ok(task_id)
+    }))
     .await
 }
 
@@ -380,6 +645,16 @@ pub async fn replay_dead_letter(
 /// API fan-out layer to count matches on shards where the global limit is
 /// already exhausted, so that `matched` in the aggregated response always
 /// reflects the true pre-limit total across all shards.
+///
+/// This is part of the external-embedder surface (issue #613): the live HTTP
+/// path uses the `_api_bulk` variants in the plugin's `api.rs`, which apply the
+/// same predicate set. Keep the two in sync when adding a filter dimension.
+///
+/// A cause filter is compute-on-read — it loads all SQL-prefiltered rows and
+/// classifies each in Rust (symmetric with the aggregate endpoint's accepted
+/// cost). `BulkDlqFilter::effective_limit` caps rows *acted on*, not rows
+/// *scanned*; narrow with the SQL-expressible filters (queue/activity/workflow/
+/// time window/`min_attempts`) on large DLQs.
 ///
 /// # Errors
 ///
@@ -404,11 +679,29 @@ pub async fn count_bulk_filter_matches(
                 .sql(")"),
         );
     }
+    if let Some(ref queue) = filter.queue_name {
+        query = query.filter(dsl::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = filter.min_attempts {
+        query = query.filter(dsl::attempts.ge(min));
+    }
     if let Some(after) = filter.failed_after {
         query = query.filter(dsl::failed_at.ge(after));
     }
     if let Some(before) = filter.failed_before {
         query = query.filter(dsl::failed_at.lt(before));
+    }
+
+    // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
+    // `error` strings and count the ones that pass the cause post-filter.
+    if filter.has_cause_filter() {
+        let errors: Vec<String> = query
+            .select(dsl::error)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        let matched = errors.iter().filter(|e| filter.cause_matches(e)).count();
+        return Ok(i64::try_from(matched).unwrap_or(i64::MAX));
     }
 
     query
@@ -428,10 +721,17 @@ async fn query_dead_letters_for_bulk(
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Text};
 
+    // Cause dimensions (issue #613) are compute-on-read, so the SQL row limit
+    // cannot be applied before the post-filter (it would clip pre-filter rows).
+    // Drop the SQL limit, order oldest-first, then post-filter and `take` the
+    // effective limit — so the cause filter precedes the limit.
+    let cause = filter.has_cause_filter();
     let mut query = dsl::harvest_dead_letters
         .into_boxed()
-        .order(dsl::failed_at.asc())
-        .limit(filter.effective_limit());
+        .order(dsl::failed_at.asc());
+    if !cause {
+        query = query.limit(filter.effective_limit());
+    }
 
     if let Some(ref name) = filter.activity_name {
         query = query.filter(dsl::activity_name.eq(name.clone()));
@@ -443,6 +743,12 @@ async fn query_dead_letters_for_bulk(
                 .sql(")"),
         );
     }
+    if let Some(ref queue) = filter.queue_name {
+        query = query.filter(dsl::queue_name.eq(queue.clone()));
+    }
+    if let Some(min) = filter.min_attempts {
+        query = query.filter(dsl::attempts.ge(min));
+    }
     if let Some(after) = filter.failed_after {
         query = query.filter(dsl::failed_at.ge(after));
     }
@@ -450,11 +756,22 @@ async fn query_dead_letters_for_bulk(
         query = query.filter(dsl::failed_at.lt(before));
     }
 
-    query
+    let rows = query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+
+    if cause {
+        let limit = usize::try_from(filter.effective_limit()).unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .filter(|r| filter.cause_matches(&r.error))
+            .take(limit)
+            .collect())
+    } else {
+        Ok(rows)
+    }
 }
 
 /// Bulk replay dead-letter entries matching `filter`.
@@ -589,6 +906,308 @@ pub async fn bulk_discard_dead_letters(
 }
 
 // ---------------------------------------------------------------------------
+// Redrive operations (issue #510)
+// ---------------------------------------------------------------------------
+
+/// Apply the redrive filter dimensions to a boxed `harvest_dead_letters` query.
+///
+/// Shared by [`count_redrive_filter_matches`] and
+/// [`query_dead_letters_for_redrive`] so the count and the acted-on set always
+/// see identical predicates.
+fn apply_redrive_filter<'a>(
+    mut query: crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg>,
+    filter: &RedriveFilter,
+) -> crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg> {
+    use crate::schema::harvest_dead_letters::dsl;
+    use diesel::PgTextExpressionMethods;
+
+    if let Some(ref queue) = filter.queue {
+        query = query.filter(dsl::queue_name.eq(queue.clone()));
+    }
+    if let Some(ref wf_name) = filter.workflow_name {
+        use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        use diesel::NullableExpressionMethods;
+        query = query.filter(
+            dsl::workflow_exec_id.eq_any(
+                exec_dsl::harvest_workflow_executions
+                    .filter(exec_dsl::workflow_name.eq(wf_name.clone()))
+                    .select(exec_dsl::id.nullable()),
+            ),
+        );
+    }
+    if let Some(after) = filter.dead_lettered_after {
+        query = query.filter(dsl::failed_at.ge(after));
+    }
+    if let Some(before) = filter.dead_lettered_before {
+        query = query.filter(dsl::failed_at.lt(before));
+    }
+    if let Some(ref needle) = filter.error_contains {
+        query = query.filter(dsl::error.ilike(format!("%{}%", escape_like(needle))));
+    }
+    if let Some(ref ids) = filter.dead_letter_ids {
+        query = query.filter(dsl::id.eq_any(ids.clone()));
+    }
+    query
+}
+
+/// Count dead-letter rows matching `filter` without applying a row cap.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn count_redrive_filter_matches(
+    conn: &mut AsyncPgConnection,
+    filter: &RedriveFilter,
+) -> HarvestResult<i64> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    apply_redrive_filter(dsl::harvest_dead_letters.into_boxed(), filter)
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Query dead-letter rows matching `filter`, oldest-first, up to
+/// `filter.effective_max()` rows.
+async fn query_dead_letters_for_redrive(
+    conn: &mut AsyncPgConnection,
+    filter: &RedriveFilter,
+) -> HarvestResult<Vec<DeadLetter>> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    let query = dsl::harvest_dead_letters
+        .into_boxed()
+        .order(dsl::failed_at.asc())
+        .limit(filter.effective_max());
+
+    apply_redrive_filter(query, filter)
+        .select(DeadLetter::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Redrive a single dead-letter entry (issue #510).
+///
+/// Re-enqueues the dead-lettered task onto its original queue with a fresh
+/// retry budget. Unlike [`replay_dead_letter`], a redrive **reactivates** an
+/// owning execution that was sealed `FAILED` at quarantine time (`FAILED →
+/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
+/// resumes from existing history append-only). The whole operation is one
+/// transaction.
+///
+/// Outcomes:
+/// - Missing DLQ row → `Ok(Skipped)` (idempotent: a second redrive of the same
+///   id is a no-op, since the row is deleted on the first redrive).
+/// - Owning execution `RUNNING` → `Ok(Skipped)` and the row is deleted (the
+///   live execution already owns the work; re-enqueuing would double-dispatch).
+/// - Owning execution `FAILED` → reactivate + re-enqueue → `Ok(Redriven(task))`.
+/// - Owning execution any other terminal state (`COMPLETED`/`CANCELLED`/…) →
+///   `Err` with a clear message; the row is left in place for the operator.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the owning execution is in a
+/// non-`FAILED` terminal state, or [`HarvestError::Database`] on query failure.
+pub async fn redrive_dead_letter(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
+    reason: Option<&str>,
+) -> HarvestResult<RedriveOutcome> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    Box::pin(
+        conn.transaction::<RedriveOutcome, HarvestError, _>(async |conn| {
+            let Some(entry) = dsl::harvest_dead_letters
+                .find(dead_letter_id)
+                .select(DeadLetter::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+            else {
+                // Already redriven (or discarded): idempotent no-op.
+                return Ok(RedriveOutcome::Skipped);
+            };
+
+            // Delegate a completion-callback dead letter (issue #605) to its
+            // own redrive primitive instead of erroring with "invalid
+            // task_type" (issue #921 review, Codex P2) -- see
+            // `redrive_callback_dead_letter`'s doc comment.
+            if entry.task_type.eq_ignore_ascii_case("callback") {
+                return match redrive_callback_dead_letter(
+                    conn,
+                    dead_letter_id,
+                    entry.workflow_exec_id,
+                    entry.original_task_id,
+                )
+                .await
+                {
+                    Ok(delivery_id) => Ok(RedriveOutcome::Redriven(delivery_id)),
+                    Err(HarvestError::NotFound(_)) => Ok(RedriveOutcome::Skipped),
+                    Err(e) => Err(e),
+                };
+            }
+
+            let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
+
+            let mut params =
+                EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
+            params.workflow_exec_id = entry.workflow_exec_id;
+            params.activity_name = entry.activity_name.clone();
+            params.max_attempts = entry.attempts.max(1);
+
+            if let Some(exec_uuid) = entry.workflow_exec_id {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let row: Option<(Option<String>, String, String)> =
+                    exec_dsl::harvest_workflow_executions
+                        .find(exec_uuid)
+                        .select((
+                            exec_dsl::assigned_build_id,
+                            exec_dsl::workflow_name,
+                            exec_dsl::state,
+                        ))
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+
+                let (build_id, workflow_name, state) = row.ok_or_else(|| {
+                    HarvestError::NotFound(format!("workflow execution {exec_uuid}"))
+                })?;
+
+                match state.as_str() {
+                    // Live execution already owns the work — converge state by
+                    // deleting the stale DLQ row and report a skip rather than
+                    // double-dispatching a second task.
+                    "RUNNING" | "PAUSED" => {
+                        diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        return Ok(RedriveOutcome::Skipped);
+                    }
+                    // The load-bearing differentiator (AC #7): reopen a run
+                    // sealed FAILED at quarantine time so it can resume.
+                    "FAILED" => {
+                        let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
+                        crate::execution::reactivate_failed_execution(
+                            conn,
+                            exec_id,
+                            dead_letter_id,
+                            reason,
+                        )
+                        .await?;
+                    }
+                    // Non-FAILED terminal states are not resurrectable.
+                    other => {
+                        return Err(HarvestError::Config(format!(
+                            "cannot redrive dead-letter {dead_letter_id}: owning execution \
+                         {exec_uuid} is {other} (terminal, not resurrectable)"
+                        )));
+                    }
+                }
+
+                params.required_build_id = build_id;
+                if task_type == TaskType::Workflow
+                    && let Some(reg) = registry
+                    && let Some(info) = reg.workflows.get(&workflow_name)
+                    && let Some(policy) = &info.concurrency
+                {
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+                    params.max_concurrent = Some(policy.limit);
+                }
+            }
+
+            let task_id = crate::queue::enqueue(conn, &params).await?;
+            diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            Ok(RedriveOutcome::Redriven(task_id))
+        }),
+    )
+    .await
+}
+
+/// Redrive all dead-letter entries matching `filter` (issue #510).
+///
+/// Each row is redriven independently through [`redrive_dead_letter`] so a
+/// per-row rejection never rolls back already-redriven rows. When
+/// `filter.dry_run` is `true`, no writes are performed and `ids` carries the
+/// bounded sample that would be redriven. One `harvest.dlq.redriven{queue,
+/// outcome}` counter increment is emitted per non-dry-run row.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the initial filter query fails.
+/// Per-row rejections are captured in [`RedriveResult::failures`].
+pub async fn redrive_dead_letters(
+    conn: &mut AsyncPgConnection,
+    filter: &RedriveFilter,
+    registry: Option<&HandlerRegistry>,
+    reason: Option<&str>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) -> HarvestResult<RedriveResult> {
+    let matched = usize::try_from(count_redrive_filter_matches(conn, filter).await?).unwrap_or(0);
+    let rows = query_dead_letters_for_redrive(conn, filter).await?;
+
+    if filter.dry_run {
+        return Ok(RedriveResult {
+            matched,
+            redriven: 0,
+            skipped: 0,
+            failed: 0,
+            ids: rows.iter().map(|r| r.id.to_string()).collect(),
+            dry_run: true,
+            failures: Vec::new(),
+        });
+    }
+
+    let mut redriven = 0usize;
+    let mut skipped = 0usize;
+    let mut ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+
+    for row in &rows {
+        match redrive_dead_letter(conn, row.id, registry, reason).await {
+            Ok(RedriveOutcome::Redriven(_task_id)) => {
+                redriven += 1;
+                ids.push(row.id.to_string());
+                metrics.record_dlq_redriven(&row.queue_name, "redriven");
+            }
+            Ok(RedriveOutcome::Skipped) => {
+                skipped += 1;
+                metrics.record_dlq_redriven(&row.queue_name, "skipped");
+            }
+            Err(e) => {
+                failures.push(BulkDlqFailure {
+                    id: row.id.to_string(),
+                    reason: e.to_string(),
+                });
+                metrics.record_dlq_redriven(&row.queue_name, "failed");
+            }
+        }
+    }
+
+    Ok(RedriveResult {
+        matched,
+        redriven,
+        skipped,
+        failed: failures.len(),
+        ids,
+        dry_run: false,
+        failures,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Root-cause aggregation (issue #385)
 // ---------------------------------------------------------------------------
 //
@@ -636,6 +1255,61 @@ pub fn failure_signature(error: &str) -> String {
     let first_line = error.lines().next().unwrap_or("").trim();
     let normalized = normalize_dynamic_runs(first_line);
     truncate_chars(normalized.trim(), SIGNATURE_MAX_LEN)
+}
+
+/// Maximum length of a derived `error_class`, in characters.
+pub const ERROR_CLASS_MAX_LEN: usize = 80;
+
+/// Classify a DLQ `error` string into a low-cardinality *reason* class
+/// (issue #613).
+///
+/// Engine-authored quarantine entries serialize a tagged [`DeadLetterReason`]
+/// as their `error` (see `dead_letter`'s callers); those map to the reason's
+/// stable `snake_case` [`DeadLetterReason::reason_class`]. Every other error —
+/// a plain `Err(String)` or a typed activity-failure envelope — is retry
+/// exhaustion (there is no production path that dead-letters a plain
+/// retry-exhausted activity, but tests and embedders can), so it maps to
+/// `"retry_exhaustion"`. Pure and deterministic: identical across queries and
+/// shards for the same input.
+#[must_use]
+pub fn dlq_reason(error: &str) -> String {
+    serde_json::from_str::<DeadLetterReason>(error).map_or_else(
+        |_| "retry_exhaustion".to_string(),
+        |reason| reason.reason_class().to_string(),
+    )
+}
+
+/// Classify a DLQ `error` string into a low-cardinality *error class*
+/// (issue #613).
+///
+/// Resolution order:
+/// 1. A typed activity-failure envelope → its stable `error_type` (e.g.
+///    `"CircuitOpen"`, `"HandlerPanic"`).
+/// 2. A tagged [`DeadLetterReason`] → its `PascalCase` [`DeadLetterReason::type_tag`].
+/// 3. Otherwise → the normalized leading token of the first line (dynamic
+///    runs collapsed to placeholders).
+///
+/// The result is truncated to [`ERROR_CLASS_MAX_LEN`] characters. Pure and
+/// deterministic: identical across queries and shards for the same input.
+///
+/// An empty `error` yields an empty-string class, which the bulk-filter
+/// validator rejects with `400` (a degenerate input: production `error` is NOT
+/// NULL and carries a tagged reason or a non-empty message).
+#[must_use]
+pub fn error_class(error: &str) -> String {
+    // Every branch returns a trimmed value so a padded `error_type` facet key
+    // round-trips through the (trimming) bulk-filter validator (issue #613): a
+    // facet key read from this classifier and fed back as a `BulkDlqFilter`
+    // cause dimension must re-select the same rows.
+    if let Some(failure) = crate::failure::parse_typed_payload(error) {
+        return truncate_chars(failure.error_type.trim(), ERROR_CLASS_MAX_LEN);
+    }
+    if let Ok(reason) = serde_json::from_str::<DeadLetterReason>(error) {
+        return reason.type_tag().to_string();
+    }
+    let first_line = error.lines().next().unwrap_or("").trim();
+    let token = first_line.split_whitespace().next().unwrap_or("");
+    truncate_chars(&normalize_token(token), ERROR_CLASS_MAX_LEN)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -744,6 +1418,10 @@ pub enum DlqGroupDimension {
     TimeBucket,
     /// Derived [`failure_signature`] of the error text.
     FailureSignature,
+    /// Derived [`dlq_reason`] class of the error text (issue #613).
+    DlqReason,
+    /// Derived [`error_class`] of the error text (issue #613).
+    ErrorClass,
 }
 
 impl DlqGroupDimension {
@@ -757,6 +1435,8 @@ impl DlqGroupDimension {
             Self::TaskType => "task_type",
             Self::TimeBucket => "time_bucket",
             Self::FailureSignature => "failure_signature",
+            Self::DlqReason => "dlq_reason",
+            Self::ErrorClass => "error_class",
         }
     }
 
@@ -770,6 +1450,8 @@ impl DlqGroupDimension {
             "task_type" => Self::TaskType,
             "time_bucket" => Self::TimeBucket,
             "failure_signature" => Self::FailureSignature,
+            "dlq_reason" => Self::DlqReason,
+            "error_class" => Self::ErrorClass,
             _ => return None,
         })
     }
@@ -867,7 +1549,7 @@ impl DlqAggregateParams {
                         format!(
                             "unknown group_by dimension '{value}'; expected one of: \
                              workflow_name, activity_name, queue_name, task_type, \
-                             time_bucket, failure_signature"
+                             time_bucket, failure_signature, dlq_reason, error_class"
                         )
                     })?;
                     if !params.group_by.contains(&dim) {
@@ -955,7 +1637,11 @@ fn set_filter(slot: &mut Option<String>, value: &str) {
     }
 }
 
-fn parse_instant(field: &str, value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+pub fn parse_instant(
+    field: &str,
+    value: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
     let trimmed = value.trim();
     if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
         return Ok(parsed.with_timezone(&Utc));
@@ -1058,6 +1744,48 @@ fn render_group_key(params: &DlqAggregateParams, key: &[Option<String>]) -> serd
     serde_json::Value::Object(obj)
 }
 
+/// Bounded-cardinality "top-N + other" rollup shared by every grouped
+/// aggregation read model in this codebase (DLQ aggregation here, and the
+/// workflow-count fleet snapshot in `autumn-harvest-plugin`).
+///
+/// `groups` is sorted descending by `count_of` (ties broken by `key`,
+/// ascending) and truncated to `limit`. When the dropped tail's summed count
+/// is positive, it is folded into one rollup entry appended via `make_other`
+/// and the returned `bool` is `true`; a truncation that only drops zero-count
+/// entries reports `false` and appends no rollup row (this never happens for
+/// real `COUNT(*)` rows, which are always `>= 1`, but keeps the helper exact
+/// for any future caller with synthetic zero-count groups). Per-group counts
+/// always reconcile to the pre-rollup total either way.
+#[must_use]
+pub fn rollup_top_n<K: Ord, A, T>(
+    mut groups: Vec<(K, A)>,
+    limit: usize,
+    count_of: impl Fn(&A) -> i64,
+    to_entry: impl Fn(K, A) -> T,
+    make_other: impl FnOnce(i64) -> T,
+) -> (Vec<T>, bool) {
+    groups.sort_by(|a, b| {
+        count_of(&b.1)
+            .cmp(&count_of(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    if groups.len() <= limit {
+        return (
+            groups.into_iter().map(|(k, a)| to_entry(k, a)).collect(),
+            false,
+        );
+    }
+
+    let other_count: i64 = groups[limit..].iter().map(|(_, a)| count_of(a)).sum();
+    let mut out: Vec<T> = groups.drain(..limit).map(|(k, a)| to_entry(k, a)).collect();
+    let truncated = other_count > 0;
+    if truncated {
+        out.push(make_other(other_count));
+    }
+    (out, truncated)
+}
+
 /// Merge per-shard partial aggregates into a single response.
 ///
 /// Counts sum across shards; `first_seen`/`last_seen` take the global min/max;
@@ -1099,50 +1827,36 @@ pub fn merge_dlq_aggregates(
         }
     }
 
-    let mut groups: Vec<DlqRawGroup> = merged.into_values().collect();
-    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
-
+    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged
+        .into_values()
+        .map(|group| (group.key.clone(), group))
+        .collect();
     let limit = params.limit_groups as usize;
-    let mut out = Vec::new();
-    let mut truncated = false;
 
-    if groups.len() > limit {
-        let other_count: i64 = groups[limit..].iter().map(|g| g.count).sum();
-        for group in &groups[..limit] {
-            out.push(DlqGroup {
-                key: render_group_key(params, &group.key),
-                count: group.count,
-                first_seen: group.first_seen,
-                last_seen: group.last_seen,
-                sample_dead_letter_ids: group.sample_ids.clone(),
-            });
-        }
-        if other_count > 0 {
-            out.push(DlqGroup {
-                key: serde_json::json!({ "_other": true }),
-                count: other_count,
-                first_seen: None,
-                last_seen: None,
-                sample_dead_letter_ids: Vec::new(),
-            });
-            truncated = true;
-        }
-    } else {
-        for group in &groups {
-            out.push(DlqGroup {
-                key: render_group_key(params, &group.key),
-                count: group.count,
-                first_seen: group.first_seen,
-                last_seen: group.last_seen,
-                sample_dead_letter_ids: group.sample_ids.clone(),
-            });
-        }
-    }
+    let (groups, truncated) = rollup_top_n(
+        groups,
+        limit,
+        |group| group.count,
+        |key, group| DlqGroup {
+            key: render_group_key(params, &key),
+            count: group.count,
+            first_seen: group.first_seen,
+            last_seen: group.last_seen,
+            sample_dead_letter_ids: group.sample_ids,
+        },
+        |other_count| DlqGroup {
+            key: serde_json::json!({ "_other": true }),
+            count: other_count,
+            first_seen: None,
+            last_seen: None,
+            sample_dead_letter_ids: Vec::new(),
+        },
+    );
 
     DlqAggregateResponse {
         total,
         filtered_total,
-        groups: out,
+        groups,
         truncated,
     }
 }
@@ -1253,6 +1967,8 @@ pub async fn aggregate_dead_letters(
                 DlqGroupDimension::TaskType => Some(task_type.clone()),
                 DlqGroupDimension::TimeBucket => Some(params.time_bucket.format(failed_at)),
                 DlqGroupDimension::FailureSignature => Some(failure_signature(&error)),
+                DlqGroupDimension::DlqReason => Some(dlq_reason(&error)),
+                DlqGroupDimension::ErrorClass => Some(error_class(&error)),
             })
             .collect();
 
@@ -1303,6 +2019,112 @@ async fn load_workflow_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Redrive filter unit tests (issue #510) ───────────────────────────────
+
+    #[test]
+    fn redrive_filter_is_empty_only_when_no_substantive_criterion() {
+        assert!(RedriveFilter::default().is_empty());
+        // max / dry_run alone do not count.
+        assert!(
+            RedriveFilter {
+                max: Some(10),
+                dry_run: true,
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        // Each substantive field alone is non-empty.
+        assert!(
+            !RedriveFilter {
+                queue: Some("q".into()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                workflow_name: Some("wf".into()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                error_contains: Some("timeout".into()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                dead_lettered_after: Some(Utc::now()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                dead_letter_ids: Some(vec![Uuid::new_v4()]),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        // An empty id vector is not a substantive criterion.
+        assert!(
+            RedriveFilter {
+                dead_letter_ids: Some(vec![]),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn redrive_filter_effective_max_clamps() {
+        assert_eq!(RedriveFilter::default().effective_max(), 100);
+        assert_eq!(
+            RedriveFilter {
+                max: Some(0),
+                ..Default::default()
+            }
+            .effective_max(),
+            1,
+            "zero must clamp to 1, never a silent LIMIT 0"
+        );
+        assert_eq!(
+            RedriveFilter {
+                max: Some(50_000),
+                ..Default::default()
+            }
+            .effective_max(),
+            i64::from(MAX_BULK_LIMIT)
+        );
+        assert_eq!(
+            RedriveFilter {
+                max: Some(250),
+                ..Default::default()
+            }
+            .effective_max(),
+            250
+        );
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        assert_eq!(escape_like("path\\x"), "path\\\\x");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[test]
+    fn redrive_outcome_is_copy_eq() {
+        let id = Uuid::new_v4();
+        assert_eq!(RedriveOutcome::Redriven(id), RedriveOutcome::Redriven(id));
+        assert_ne!(RedriveOutcome::Redriven(id), RedriveOutcome::Skipped);
+    }
 
     #[test]
     fn dead_letter_entry_builds() {
@@ -1393,6 +2215,66 @@ mod tests {
     }
 
     #[test]
+    fn dead_letter_reason_workflow_task_timeout_is_typed_json() {
+        let reason = DeadLetterReason::WorkflowTaskTimeout {
+            task_timeout_strikes: 3,
+            timeout_secs: 10,
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("WorkflowTaskTimeout"));
+        assert!(json.contains("task_timeout_strikes"));
+        assert!(json.contains("timeout_secs"));
+    }
+
+    #[test]
+    fn dead_letter_reason_callback_delivery_exhausted_is_typed_json() {
+        let delivery_id = Uuid::new_v4();
+        let reason = DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id,
+            attempts: 5,
+            last_status: Some(503),
+            target: "https://api.example.com/hook".into(),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("CallbackDeliveryExhausted"));
+        assert!(json.contains("api.example.com"));
+        assert!(json.contains("503"));
+    }
+
+    #[test]
+    fn callback_delivery_exhausted_is_distinct_from_poison_pill_and_timeout() {
+        // A delivery DLQ entry must never be mistaken for clean task-retry
+        // exhaustion (issue #605 AC: "typed reason distinct from clean
+        // task-retry exhaustion").
+        let callback = DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id: Uuid::new_v4(),
+            attempts: 5,
+            last_status: None,
+            target: "https://api.example.com/hook".into(),
+        };
+        let poison_pill = DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: None,
+        };
+        assert_ne!(callback.to_string(), poison_pill.to_string());
+        assert!(!matches!(callback, DeadLetterReason::PoisonPill { .. }));
+        assert!(!matches!(
+            callback,
+            DeadLetterReason::WorkflowTaskTimeout { .. }
+        ));
+    }
+
+    #[test]
     fn bulk_filter_is_empty_when_no_criteria_set() {
         let filter = BulkDlqFilter::default();
         assert!(filter.is_empty());
@@ -1420,6 +2302,24 @@ mod tests {
     fn bulk_filter_is_not_empty_when_failed_after_set() {
         let filter = BulkDlqFilter {
             failed_after: Some(chrono::Utc::now()),
+            ..BulkDlqFilter::default()
+        };
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn bulk_dlq_filter_is_empty_false_for_queue_only() {
+        let filter = BulkDlqFilter {
+            queue_name: Some("low-pri".into()),
+            ..BulkDlqFilter::default()
+        };
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn bulk_dlq_filter_is_empty_false_for_min_attempts_only() {
+        let filter = BulkDlqFilter {
+            min_attempts: Some(3),
             ..BulkDlqFilter::default()
         };
         assert!(!filter.is_empty());
@@ -1478,8 +2378,13 @@ mod tests {
         let filter = BulkDlqFilter {
             activity_name: Some("charge_card".into()),
             workflow_name: Some("billing".into()),
+            queue_name: Some("low-pri".into()),
+            min_attempts: Some(3),
             failed_after: None,
             failed_before: None,
+            error_class: None,
+            dlq_reason: None,
+            failure_signature: None,
             limit: Some(200),
             dry_run: true,
         };
@@ -1487,6 +2392,8 @@ mod tests {
         let back: BulkDlqFilter = serde_json::from_str(&json).unwrap();
         assert_eq!(back.activity_name.as_deref(), Some("charge_card"));
         assert_eq!(back.workflow_name.as_deref(), Some("billing"));
+        assert_eq!(back.queue_name.as_deref(), Some("low-pri"));
+        assert_eq!(back.min_attempts, Some(3));
         assert_eq!(back.limit, Some(200));
         assert!(back.dry_run);
     }
@@ -1555,6 +2462,263 @@ mod tests {
         // Same root cause with different dynamic ids collapses identically.
         let c = failure_signature("stripe charge ch_3Abc declined for user 9999");
         assert_eq!(a, c);
+    }
+
+    // ----- Cause classifiers: dlq_reason / error_class (issue #613) -----
+
+    fn poison_pill_json() -> String {
+        DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: Some("worker-7".to_string()),
+        }
+        .to_string()
+    }
+
+    fn history_cap_json() -> String {
+        DeadLetterReason::HistoryCapExceeded {
+            count: 10_001,
+            cap: 10_000,
+            workflow_type: "big_wf".to_string(),
+        }
+        .to_string()
+    }
+
+    fn task_timeout_json() -> String {
+        DeadLetterReason::WorkflowTaskTimeout {
+            task_timeout_strikes: 3,
+            timeout_secs: 30,
+        }
+        .to_string()
+    }
+
+    fn callback_exhausted_json() -> String {
+        DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id: Uuid::new_v4(),
+            attempts: 10,
+            last_status: Some(503),
+            target: "https://hooks.example.com/x".to_string(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn dlq_reason_maps_every_typed_variant_to_snake_case() {
+        assert_eq!(dlq_reason(&poison_pill_json()), "poison_pill");
+        assert_eq!(dlq_reason(&history_cap_json()), "history_cap_exceeded");
+        assert_eq!(dlq_reason(&task_timeout_json()), "workflow_task_timeout");
+        assert_eq!(
+            dlq_reason(&callback_exhausted_json()),
+            "callback_delivery_exhausted"
+        );
+    }
+
+    #[test]
+    fn dlq_reason_plain_string_is_retry_exhaustion() {
+        assert_eq!(dlq_reason("connection refused"), "retry_exhaustion");
+        assert_eq!(dlq_reason(""), "retry_exhaustion");
+    }
+
+    #[test]
+    fn dlq_reason_typed_activity_envelope_is_retry_exhaustion() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let envelope = ActivityFailure::retryable("RateLimitExceeded", "429").into_error_payload();
+        // An activity-failure envelope is NOT a DeadLetterReason, so it is not
+        // an engine-authored quarantine — it is retry exhaustion.
+        assert_eq!(dlq_reason(&envelope), "retry_exhaustion");
+    }
+
+    #[test]
+    fn error_class_typed_envelope_uses_error_type() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let circuit = ActivityFailure::non_retryable("CircuitOpen", "open").into_error_payload();
+        assert_eq!(error_class(&circuit), "CircuitOpen");
+        let panic = ActivityFailure::retryable("HandlerPanic", "boom").into_error_payload();
+        assert_eq!(error_class(&panic), "HandlerPanic");
+    }
+
+    #[test]
+    fn error_class_dead_letter_reason_uses_pascal_case_tag() {
+        assert_eq!(error_class(&poison_pill_json()), "PoisonPill");
+        assert_eq!(error_class(&history_cap_json()), "HistoryCapExceeded");
+        assert_eq!(error_class(&task_timeout_json()), "WorkflowTaskTimeout");
+        assert_eq!(
+            error_class(&callback_exhausted_json()),
+            "CallbackDeliveryExhausted"
+        );
+    }
+
+    #[test]
+    fn error_class_plain_string_uses_normalized_leading_token() {
+        assert_eq!(error_class("connection refused"), "connection");
+        assert_eq!(error_class("timeout while dialing host"), "timeout");
+        // Leading token normalization collapses dynamic runs.
+        assert_eq!(error_class("user_1234 not found"), "user_<NUM>");
+        assert_eq!(error_class(""), "");
+    }
+
+    #[test]
+    fn error_class_is_bounded_and_deterministic() {
+        let long = "x".repeat(500);
+        let class = error_class(&long);
+        assert!(class.chars().count() <= ERROR_CLASS_MAX_LEN);
+        assert_eq!(error_class(&long), class);
+    }
+
+    #[test]
+    fn error_class_trims_padded_error_type_for_round_trip() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        // A typed envelope whose error_type carries surrounding whitespace must
+        // classify to the trimmed class so the facet key round-trips through the
+        // (trimming) bulk-filter validator (issue #613, P3-1).
+        let padded = ActivityFailure::non_retryable("  CircuitOpen  ", "open").into_error_payload();
+        assert_eq!(error_class(&padded), "CircuitOpen");
+    }
+
+    #[test]
+    fn cause_classifiers_are_deterministic() {
+        let e = poison_pill_json();
+        assert_eq!(dlq_reason(&e), dlq_reason(&e));
+        assert_eq!(error_class(&e), error_class(&e));
+        assert_eq!(failure_signature(&e), failure_signature(&e));
+    }
+
+    #[test]
+    fn bulk_filter_is_not_empty_when_only_a_cause_is_set() {
+        let f = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            ..Default::default()
+        };
+        assert!(!f.is_empty());
+        assert!(f.has_cause_filter());
+
+        let ec = BulkDlqFilter {
+            error_class: Some("CircuitOpen".to_string()),
+            ..Default::default()
+        };
+        assert!(!ec.is_empty());
+
+        let fs = BulkDlqFilter {
+            failure_signature: Some("boom".to_string()),
+            ..Default::default()
+        };
+        assert!(!fs.is_empty());
+    }
+
+    #[test]
+    fn bulk_filter_empty_and_has_cause_helpers() {
+        let empty = BulkDlqFilter::default();
+        assert!(empty.is_empty());
+        assert!(!empty.has_cause_filter());
+
+        let structural = BulkDlqFilter {
+            activity_name: Some("send_email".to_string()),
+            ..Default::default()
+        };
+        assert!(!structural.is_empty());
+        assert!(!structural.has_cause_filter());
+    }
+
+    #[test]
+    fn cause_matches_uses_exact_equality() {
+        let f = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            ..Default::default()
+        };
+        assert!(f.cause_matches(&poison_pill_json()));
+        assert!(!f.cause_matches(&task_timeout_json()));
+        assert!(!f.cause_matches("connection refused"));
+
+        // No cause filter matches everything.
+        let none = BulkDlqFilter::default();
+        assert!(none.cause_matches("anything"));
+
+        // error_class is exact, not case-folded.
+        let ec = BulkDlqFilter {
+            error_class: Some("poisonpill".to_string()),
+            ..Default::default()
+        };
+        assert!(!ec.cause_matches(&poison_pill_json()));
+    }
+
+    #[test]
+    fn cause_matches_ands_multiple_cause_dimensions() {
+        let both = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            error_class: Some("PoisonPill".to_string()),
+            ..Default::default()
+        };
+        assert!(both.cause_matches(&poison_pill_json()));
+
+        let mismatch = BulkDlqFilter {
+            dlq_reason: Some("poison_pill".to_string()),
+            error_class: Some("WorkflowTaskTimeout".to_string()),
+            ..Default::default()
+        };
+        assert!(!mismatch.cause_matches(&poison_pill_json()));
+    }
+
+    #[test]
+    fn group_dimension_wire_round_trips_cause_dims() {
+        assert_eq!(DlqGroupDimension::DlqReason.as_wire(), "dlq_reason");
+        assert_eq!(DlqGroupDimension::ErrorClass.as_wire(), "error_class");
+        assert_eq!(
+            DlqGroupDimension::from_wire("dlq_reason"),
+            Some(DlqGroupDimension::DlqReason)
+        );
+        assert_eq!(
+            DlqGroupDimension::from_wire("error_class"),
+            Some(DlqGroupDimension::ErrorClass)
+        );
+        assert_eq!(DlqGroupDimension::from_wire("nope"), None);
+    }
+
+    #[test]
+    fn params_parse_cause_group_by_and_still_reject_unknown() {
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "dlq_reason"), ("group_by", "error_class")]),
+            Utc::now(),
+        )
+        .expect("valid");
+        assert_eq!(
+            p.group_by,
+            vec![DlqGroupDimension::DlqReason, DlqGroupDimension::ErrorClass]
+        );
+
+        let err =
+            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "bogus_dim")]), Utc::now())
+                .expect_err("unknown dim must still error");
+        assert!(
+            err.contains("dlq_reason"),
+            "message should list new dims: {err}"
+        );
+        assert!(
+            err.contains("error_class"),
+            "message should list new dims: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_groups_by_dlq_reason() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::DlqReason],
+            ..Default::default()
+        };
+        let partials = vec![
+            DlqAggregatePartial {
+                total: 5,
+                filtered_total: 4,
+                groups: vec![raw_group(&[Some("poison_pill")], 4, &["a"])],
+            },
+            DlqAggregatePartial {
+                total: 3,
+                filtered_total: 2,
+                groups: vec![raw_group(&[Some("poison_pill")], 2, &["b"])],
+            },
+        ];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert_eq!(resp.groups.len(), 1);
+        assert_eq!(resp.groups[0].count, 6);
+        assert_eq!(resp.groups[0].key["dlq_reason"], "poison_pill");
     }
 
     // ----- Parameter parsing & validation (issue #385) -----

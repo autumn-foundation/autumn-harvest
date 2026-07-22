@@ -327,6 +327,282 @@ nodes as runnable for the purpose of structure validation — it does not
 evaluate condition closures. Use `WorkflowTestEnv` or a real run to verify
 routing behaviour.
 
+## Passing data between nodes (node input binding)
+
+By default, every DAG node's activity is fed the DAG's *trigger input*
+(wrapped in a `{ "conf": …, "dag_task": "<name>" }` envelope) — **not** the
+output of the upstream node it depends on. So a classic
+`extract → transform → load` pipeline, where each stage consumes the prior
+stage's output, previously forced you to either flatten the whole pipeline
+into one mega-activity or hand-thread outputs through shared state. Neither
+is the graph you wanted to draw.
+
+**Node input binding** (issue #702) closes that gap: bind a node's activity
+input directly to one or more upstream node outputs, with one builder call
+per data edge and zero hand-written output-threading.
+
+```rust
+#[activity(start_to_close = "30s")]
+async fn extract_rows(_ctx: &ActivityContext) -> HarvestResult<Value> {
+    Ok(serde_json::json!([{ "id": 1 }, { "id": 2 }]))
+}
+
+#[activity(start_to_close = "30s")]
+async fn transform_rows(_ctx: &ActivityContext, rows: Value) -> HarvestResult<Value> {
+    // `rows` IS the extract output, verbatim — no envelope to unpack.
+    Ok(serde_json::json!({ "record_count": rows.as_array().map_or(0, Vec::len) }))
+}
+
+#[activity(start_to_close = "30s")]
+async fn load_summary(_ctx: &ActivityContext, summary: Value) -> HarvestResult<Value> {
+    // `summary` IS the transform output, verbatim.
+    Ok(Value::Null)
+}
+
+#[dag]
+pub fn etl_pipeline(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_rows);
+    let transform = dag.activity(transform_rows).input_from(&extract);
+    let _load = dag.activity(load_summary).input_from(&transform);
+}
+```
+
+### The three binding methods
+
+| Method | The bound node's activity receives … |
+|---|---|
+| `.input_from(&up)` | `up`'s recorded output, **verbatim** — no `conf`/`dag_task` wrapper. |
+| `.input_from_all(&[&a, &b])` | a JSON object merging both outputs, keyed by each upstream's **activity name**. |
+| `.input_from_aliased(&[("k", &a)])` | a JSON object merging the outputs, keyed by the **given alias**. |
+
+`.input_from_all` keys by activity name, so two upstreams sharing an activity
+name is a `DagBuildError::DuplicateInputBindingKey` at build time — use
+`.input_from_aliased` to disambiguate. A repeated alias is likewise a
+`DuplicateInputBindingKey`, and declaring both an `.input_from(…)` binding
+and a mapped upstream (`.map_activity(…).over(…)`) on the same node is a
+`DagBuildError::ConflictingInputBinding`. All three are caught when the DAG
+is compiled, never at run time.
+
+```rust
+// Fan-in: merge two upstream outputs into one keyed object.
+let users = dag.activity(fetch_users);
+let orders = dag.activity(fetch_orders);
+let _report = dag
+    .activity(join_report)
+    .input_from_aliased(&[("users", &users), ("orders", &orders)]);
+// join_report receives { "users": <fetch_users out>, "orders": <fetch_orders out> }
+```
+
+### Binding implies the dependency edge
+
+A binding **is** a data edge, so it adds the upstream dependency
+automatically — you do not also need `.upstream(&up)` (an extra one is
+harmless). The bound node therefore runs *after* its bound upstream(s), and
+only after their outputs are recorded.
+
+### Skipped or failed upstreams yield null
+
+If a bound upstream was skipped (by a trigger rule or a `.condition`) or
+failed, its contribution to the binding is a deterministic `Value::Null` —
+never a missing key. By default a node whose upstream was skipped is itself
+skipped; to make a bound node run *anyway* and branch on the null, give it a
+permissive trigger rule:
+
+```rust
+let maybe = dag.activity(maybe_step).upstream(&root).condition(|_| false); // skipped
+let _final = dag
+    .activity(finalize)
+    .input_from(&maybe)               // maybe was skipped → input is null
+    .trigger_rule(TriggerRule::AllDone);
+```
+
+### Determinism rule
+
+A bound node's input is a **pure function of already-recorded upstream
+outputs**. Those outputs are frozen in `harvest_events` before the bound
+node is dispatched, so replay reconstructs byte-identical inputs on every
+worker and every pass. Do not derive a node's input from process state, the
+system clock, or random values — bind to an upstream output instead (and if
+you need a captured wall-clock or random value, produce it with
+[`ctx.side_effect`](07-reliability-knobs.md) in an upstream activity and read
+it back through that activity's output). **No new `WorkflowEvent` variant
+and no migration:** binding is computed in the workflow body from recorded
+`ActivityCompleted` outputs, and an unbound DAG is byte-identical to today.
+
+### Composition
+
+Input binding composes with the rest of the DAG surface. It slots in
+alongside a `.condition(…)` branch (evaluate the branch predicate over
+upstream outputs, then bind the chosen node's input), and a bound node's
+own output can feed a downstream [mapped fan-out](#dynamic-task-mapping-fan-out)
+(`.map_activity(…).over(&bound_node)`) exactly as any other node's output
+does. A worked end-to-end example — a three-stage ETL plus a fan-in merge —
+lives in `autumn-harvest/examples/dag_data_flow.rs`.
+
+A few interactions worth knowing:
+
+* **A binding is also a `.condition(…)` edge.** Because a binding adds its
+  upstream to the node's dependency list, that upstream *also* shows up in the
+  node's `.condition(|ups| …)` slice — and `ups` is ordered by the sequence in
+  which the builder calls run, not by which method added the edge. So a
+  condition that indexes `ups[0]` must account for every `.input_from*` call:
+  interleave `.input_from(…)` and `.upstream(…)` deliberately, since their call
+  order determines the `ups[…]` indices your predicate sees (`.upstream(&a)`
+  before `.input_from(&b)` → `ups[0]` is `a`; the reverse → `ups[0]` is `b`).
+* **You can bind to a fan-out node's output.** `.input_from(&mapped_node)` — the
+  reverse of "a bound node's output feeds a fan-out" above — is legal; the bound
+  node receives the whole *collected array* the mapped node produced, as a single
+  JSON array value.
+* **An activity used in both bound and unbound positions gets different inputs.**
+  The same `#[activity]` reused in a bound node (raw upstream output) and an
+  unbound node (the trigger-input + `{ "conf": …, "dag_task": … }` wrapper)
+  receives structurally different inputs in each position — write the activity's
+  input deserialization to handle both shapes if you reuse it that way.
+* **`input_from*` on a signal-gate node is a build error.** A binding on a gate
+  is rejected at build time (`InputBindingOnGate`), mirroring the
+  `input_from` + `map_activity` conflict. A gate dispatches no activity, so the
+  binding *value* is ignored — but unlike the inert activity-only setters
+  (`.queue()`, `.retry()`, `.start_to_close()`), a binding also auto-adds a
+  dependency edge, which would silently make the gate wait for that upstream
+  before its signal wait. Because that edge is a *structural* effect (not an
+  inert dead field), the binding is rejected rather than swallowed. Use
+  `.upstream(&gate_dependency)` to add a gate dependency deliberately.
+
+## Signal / approval gates
+
+A **gate node** pauses a DAG run until a named signal arrives, then makes the
+signal payload its output so downstream nodes can consume it. It's the
+declarative way to insert a human approval — or any external-event wait —
+*between* graph nodes without rewriting the whole pipeline as a `#[workflow]`.
+
+Gate nodes are **unified-DAG only** (they lower onto the unified
+workflow-execution path). A classic DAG containing a gate is rejected at build
+time with a `DagSignalGateRequiresUnifiedExecution` error naming the DAG and
+signal. Enable the `unified-dag-execution` feature (on by default).
+
+### Declaring a gate
+
+```rust
+use std::time::Duration;
+use autumn_harvest::dag::GateTimeoutAction;
+
+#[dag(default_queue = "approvals")]
+fn order_approval_pipeline(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_order);
+    // Pause until the "approval" signal arrives; fail the run if it doesn't
+    // arrive within 24h.
+    let gate = dag
+        .signal_gate_with_timeout(
+            "approval",
+            Duration::from_secs(24 * 60 * 60),
+            GateTimeoutAction::FailRun,
+        )
+        .upstream(&extract);
+    let _load = dag.activity(load_order).upstream(&gate);
+}
+```
+
+`signal_gate(name)` is the no-timeout form (wait indefinitely).
+`signal_gate_with_timeout(name, timeout, on_timeout)` arms a durable deadline.
+A gate returns a `DagTaskRef`, so it composes exactly like any other node:
+`.upstream(&gate)`, `.map_activity(f).over(&gate)` (fan out over an array
+payload), `.condition(...)`.
+
+### Delivering the signal (unblocking a gate)
+
+Deliver the gate's signal with the ordinary standalone signal route — the gate
+consumes it just like a `wait_for_signal`:
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/harvest/workflows/{exec_id}/signal/approval \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": true, "reviewer": "alice"}'
+```
+
+The JSON body becomes the gate's output. A downstream node reads it via a
+`.condition(...)` predicate or a `.map_activity(...).over(&gate)` fan-out.
+
+### Timeout: fail vs continue
+
+| `on_timeout`                  | when the deadline fires first | gate output   |
+|-------------------------------|-------------------------------|---------------|
+| `GateTimeoutAction::FailRun`  | the DAG run **fails**         | —             |
+| `GateTimeoutAction::Continue` | the run **continues**         | `Value::Null` |
+
+### "Continue to a named branch" is declarative
+
+There is no bespoke branch-target mechanism. Under `Continue`, the gate's
+null-vs-payload output *is* the branch selector — attach a `.condition(...)` to
+each downstream node:
+
+```rust
+#[dag(default_queue = "approvals")]
+fn order_approval_with_fallback(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_order);
+    let gate = dag
+        .signal_gate_with_timeout(
+            "approval",
+            Duration::from_secs(24 * 60 * 60),
+            GateTimeoutAction::Continue,
+        )
+        .upstream(&extract);
+    // Approved: gate output is the (non-null) signal payload.
+    let _fulfil = dag
+        .activity(load_order)
+        .upstream(&gate)
+        .condition(|ups| !ups[0].is_null());
+    // Timed out: gate output is the null sentinel.
+    let _escalate = dag
+        .activity(escalate_to_manager)
+        .upstream(&gate)
+        .condition(|ups| ups[0].is_null());
+}
+```
+
+The condition-skipped branch records a `dag_skip:{N}` marker exactly like any
+other data-dependent skip, and the run still succeeds.
+
+### Durability and replay
+
+Gates reuse the existing signal/timer machinery — no new `WorkflowEvent`
+variant, no migration. A gated run is durable across restarts and replays
+deterministically: whichever of the signal or the deadline is recorded first
+in history wins on every replay. See `examples/dag_approval_gate.rs` for a
+complete, tested walkthrough (signal branch, timeout-fail, and
+timeout-escalate, each with a `WorkflowReplayer` self-check).
+
+### Edge traps
+
+- **A JSON `null` payload looks like a timeout.** Under a `Continue` gate the
+  timed-out output is `Value::Null`, so a downstream `.condition(|ups|
+  ups[0].is_null())` cannot distinguish a timeout from an *approval whose signal
+  body was literally `null`*. If your signal payload can legitimately be `null`,
+  branch on a field instead (e.g. `.condition(|ups| ups[0].get("approved") ==
+  Some(&serde_json::json!(true)))`), not on `.is_null()`.
+- **A `Continue` gate cannot feed `.map` directly.** The null timeout output is
+  not a JSON array, so `.map_activity(f).over(&gate)` fails at runtime with
+  `mapped upstream output is not a JSON array`. Guard the map behind a
+  `.condition(|ups| ups[0].is_array())` (or only map over gates whose signal
+  payload is always an array — an unbounded `signal_gate` or a `FailRun` gate,
+  which never emit the null sentinel).
+- **Independent gates in one level are serialized, not concurrent.** Level
+  isolation splits every gate into its own singleton execution level, so two
+  gates that Kahn-levelling would place together run *sequentially* (the first
+  gate resolves, then the second is reached) — they are **not** two overlapping
+  wait windows. Gate nodes do not model concurrent signal waits.
+- **Only `.upstream()` / `.condition()` / `.trigger_rule()` affect a gate.** A
+  gate dispatches no activity, so the activity-only chained setters
+  `.retry(...)`, `.start_to_close(...)`, `.queue(...)`, and
+  `.map_failure_policy(...)` are accepted by the fluent builder but **silently
+  ignored** on a gate node.
+
+### MCP exposure
+
+A `#[dag(mcp)]` DAG that contains a gate keeps its `signal_{dag}` MCP tool, so
+an agent can unblock the gate by handle; an activity-only DAG suppresses that
+tool.
+
 ## Registering DAGs with the plugin
 
 ```rust
@@ -457,7 +733,7 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
 | Use a **workflow schedule** when… | Use a **DAG** when… |
 |---|---|
 | The work is one ordered sequence with a clear linear shape. | The work is a graph: fan-out, fan-in, parallel branches. |
-| You need signals, durable timers, child workflows, or version gates inside the run. | The run is purely activity orchestration with no human-wait or signal handoff. |
+| You need arbitrary signal handlers, durable timers, child workflows, or version gates inside the run. | The run is activity orchestration — including a **single signal/approval gate** between nodes, which a [signal gate](#signal--approval-gates) handles declaratively without dropping to a workflow. |
 | Failure handling is per-step compensation (saga). | Failure handling is per-task trigger rules (AllDone, OneFailed). |
 | You want to query state mid-run. | The graph is fixed and you want the dashboard's graph view. |
 

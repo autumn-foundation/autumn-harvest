@@ -7,6 +7,7 @@
 //! The API layer queries this table (per-shard) to surface fleet status to
 //! operators via the management HTTP routes.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +56,10 @@ pub struct WorkerRegistration {
     pub deployment_name: Option<String>,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: std::collections::HashMap<String, String>,
+    /// Advertised worker-session capacity (issue #606). `0` (the default)
+    /// means sessions are disabled on this worker -- zero behavior change
+    /// for existing deployments.
+    pub max_concurrent_sessions: i32,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
 use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
@@ -298,6 +303,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     build_id: &str,
     deployment_name: Option<&str>,
     labels: &std::collections::HashMap<String, String, S>,
+    max_concurrent_sessions: i32,
 ) -> HarvestResult<()> {
     use diesel::pg::upsert::excluded;
 
@@ -316,6 +322,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
         build_id,
         deployment_name,
         labels: labels_json,
+        max_concurrent_sessions,
     };
 
     diesel::insert_into(harvest_workers::table)
@@ -335,6 +342,15 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
             harvest_workers::deployment_name.eq(excluded(harvest_workers::deployment_name)),
             harvest_workers::labels.eq(excluded(harvest_workers::labels)),
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
+            // Clear any stale drain deadline so a re-registering worker does not
+            // inherit the deadline left behind by a prior Draining/Stopped cycle.
+            harvest_workers::drain_deadline_at.eq(Option::<DateTime<Utc>>::None),
+            harvest_workers::max_concurrent_sessions
+                .eq(excluded(harvest_workers::max_concurrent_sessions)),
+            // A re-registering worker starts with zero in-use sessions -- any
+            // sessions it previously hosted are reconciled by the
+            // broken-session scanner against its new (post-restart) identity.
+            harvest_workers::in_use_sessions.eq(0_i32),
         ))
         .execute(conn)
         .await
@@ -357,12 +373,14 @@ pub async fn heartbeat_worker(
     worker_id: &str,
     in_flight_count: i32,
     labels: &serde_json::Value,
+    in_use_sessions: i32,
 ) -> HarvestResult<usize> {
     let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(Utc::now()),
             harvest_workers::in_flight_count.eq(in_flight_count),
             harvest_workers::labels.eq(labels),
+            harvest_workers::in_use_sessions.eq(in_use_sessions),
         ))
         .execute(conn)
         .await
@@ -385,6 +403,42 @@ pub async fn transition_status(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Transition a worker row from `Active` to `Draining`, leaving rows that are
+/// already `Draining` or `Stopped` untouched.
+///
+/// Used by the heartbeat task to repair shard rows that were still `Active`
+/// because the drain fan-out could not reach the shard (network partition or
+/// transient unavailability).  The `Active`-only guard ensures this never
+/// reverts a row that was already advanced by a concurrent path.
+///
+/// `drain_deadline` is written to `drain_deadline_at` in the same statement
+/// so that the deduplication layer (`dedup_workers_by_freshest`) sees the
+/// correct drain window even when this newly-repaired row becomes the freshest
+/// snapshot (issue #522 review).
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+async fn transition_active_to_draining(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    drain_deadline: Option<DateTime<Utc>>,
+) -> HarvestResult<()> {
+    diesel::update(
+        harvest_workers::table
+            .find(worker_id)
+            .filter(harvest_workers::status.eq(WorkerStatus::Active.as_str())),
+    )
+    .set((
+        harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
+        harvest_workers::drain_deadline_at.eq(drain_deadline),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -852,6 +906,31 @@ pub async fn read_worker_drain_deadline(
     Ok(row.flatten())
 }
 
+/// Read the `drain_deadline_at` for a worker that is currently `Draining`.
+///
+/// Returns `None` when the worker row does not exist, has no deadline set, or
+/// is in any other state (e.g. `Active` with a stale deadline left from a
+/// previous drain cycle that was interrupted before `register_worker` cleared
+/// it).
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn read_draining_worker_deadline(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
+        .find(worker_id)
+        .filter(harvest_workers::status.eq(WorkerStatus::Draining.as_str()))
+        .select(harvest_workers::drain_deadline_at)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.flatten())
+}
+
 /// Request a graceful drain for the worker identified by `worker_id`.
 ///
 /// The function classifies the current worker state and, if appropriate,
@@ -1016,13 +1095,129 @@ pub async fn drain_preview(
 /// the worker automatically. It stops when `cancel` is triggered.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
+// The shared applied-set uses the worker's own fixed hasher; no need to generalize.
+#[allow(clippy::implicit_hasher)]
+/// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
+/// re-registration / drain transitions, and refresh the drain deadline.
+async fn do_heartbeat_tick(
+    conn: &mut AsyncPgConnection,
+    registration: &WorkerRegistration,
+    in_flight: i32,
+    labels_json: &serde_json::Value,
+    worker_shutdown: &CancellationToken,
+    drain_deadline_max: &Mutex<Option<DateTime<Utc>>>,
+    remote_drain_deadline: &Mutex<Option<std::time::Instant>>,
+    in_use_sessions: i32,
+) {
+    match heartbeat_worker(
+        conn,
+        &registration.worker_id,
+        in_flight,
+        labels_json,
+        in_use_sessions,
+    )
+    .await
+    {
+        Ok(0) => {
+            if worker_shutdown.is_cancelled() {
+                // Worker is already draining — do not create a new Active row on
+                // a shard that missed the fan-out.  An absent row correctly
+                // reflects no live coverage; re-registering as Active would give
+                // shard health checks a false positive.
+                tracing::debug!(
+                    worker_id = %registration.worker_id,
+                    "worker draining; skipping re-registration for recovered shard"
+                );
+            } else {
+                tracing::info!(worker_id = %registration.worker_id, "worker row missing; re-registering");
+                if let Err(error) = register_worker(
+                    conn,
+                    &registration.worker_id,
+                    &registration.queues,
+                    &registration.shard_assignments,
+                    registration.max_concurrency,
+                    &registration.host,
+                    registration.version.as_deref(),
+                    &registration.build_id,
+                    registration.deployment_name.as_deref(),
+                    &registration.labels,
+                    registration.max_concurrent_sessions,
+                )
+                .await
+                {
+                    tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker re-registration failed");
+                }
+            }
+        }
+        Ok(_) => {
+            if worker_shutdown.is_cancelled() {
+                // Already draining — transition this shard's row to Draining if
+                // the fan-out missed it (e.g. shard recovered after the drain was
+                // issued).  Guarded to Active rows only so it never reverts a row
+                // that already reached Draining or Stopped.
+                // Also write the current monotonic drain deadline so the
+                // dedup-by-freshest layer doesn't mask the effective drain
+                // window when this row's heartbeat is the most recent one
+                // (issue #522 review).
+                let current_deadline = drain_deadline_max.lock().ok().and_then(|g| *g);
+                if let Err(error) =
+                    transition_active_to_draining(conn, &registration.worker_id, current_deadline)
+                        .await
+                {
+                    tracing::warn!(
+                        worker_id = %registration.worker_id,
+                        error = %error,
+                        "failed to transition recovered shard row to Draining"
+                    );
+                }
+                // Refresh the stored deadline so an operator-extended window is
+                // picked up by drain_in_flight without restarting the worker.
+                sync_drain_deadline(
+                    conn,
+                    &registration.worker_id,
+                    drain_deadline_max,
+                    remote_drain_deadline,
+                )
+                .await;
+            } else {
+                // Heartbeat succeeded; check whether a remote drain has changed
+                // this worker's status to Draining.  Cancel the worker's
+                // poll-loop token (not the heartbeat token) so the poll loop
+                // stops accepting new work while heartbeats continue until
+                // fully stopped (P1).
+                match read_worker_status(conn, &registration.worker_id).await {
+                    Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
+                        tracing::info!(
+                            worker_id = %registration.worker_id,
+                            "remote drain detected; triggering graceful shutdown"
+                        );
+                        sync_drain_deadline(
+                            conn,
+                            &registration.worker_id,
+                            drain_deadline_max,
+                            remote_drain_deadline,
+                        )
+                        .await;
+                        worker_shutdown.cancel();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker heartbeat write failed");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,
     wf_semaphore: Arc<Semaphore>,
-    wf_max: usize,
+    wf_max: Arc<AtomicUsize>,
     act_semaphore: Arc<Semaphore>,
-    act_max: usize,
+    act_max: Arc<AtomicUsize>,
     interval: Duration,
     cancel: CancellationToken,
     worker_shutdown: CancellationToken,
@@ -1030,6 +1225,17 @@ pub fn spawn_worker_heartbeat(
     // operator-supplied drain_deadline_at, refreshed on every heartbeat tick
     // so that extended deadlines are picked up by drain_in_flight.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    // Maximum `drain_deadline_at` value applied to `remote_drain_deadline` so far,
+    // shared across this worker's per-shard heartbeat tasks. Using the maximum
+    // (rather than a full set) prevents a shard whose row was never updated from
+    // the prior deadline from reverting the cell: stale shorter values are rejected
+    // while genuine extensions (newer, later values) always advance the cell.
+    drain_deadline_max: Arc<Mutex<Option<DateTime<Utc>>>>,
+    // In-process worker-session registry (issue #606): sampled fresh each
+    // tick (mirroring `in_flight` above) so `harvest_workers.in_use_sessions`
+    // — previously always written as a literal `0` — reflects this worker's
+    // actual live session count.
+    session_slots_in_use: crate::sessions::SessionSlotRegistry,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
@@ -1038,94 +1244,33 @@ pub fn spawn_worker_heartbeat(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-
-            let in_flight = compute_in_flight(&wf_semaphore, wf_max, &act_semaphore, act_max);
-
+            // Loaded fresh each tick (issue #548 review): a tuned worker's
+            // dispatch target can change between heartbeats, so a value
+            // captured once at spawn time would drift from reality.
+            //
+            // UFCS is required here: `diesel_async::RunQueryDsl::load` is in
+            // scope in this module and its blanket by-value-receiver impl
+            // wins method resolution over `AtomicUsize::load(&self, ..)`.
+            let in_flight = compute_in_flight(
+                &wf_semaphore,
+                AtomicUsize::load(&wf_max, Ordering::Relaxed),
+                &act_semaphore,
+                AtomicUsize::load(&act_max, Ordering::Relaxed),
+            );
+            let in_use_sessions = crate::sessions::session_slot_count(&session_slots_in_use);
             match pool.get().await {
                 Ok(mut conn) => {
-                    match heartbeat_worker(
+                    let () = do_heartbeat_tick(
                         &mut conn,
-                        &registration.worker_id,
+                        &registration,
                         in_flight,
                         &labels_json,
+                        &worker_shutdown,
+                        &drain_deadline_max,
+                        &remote_drain_deadline,
+                        in_use_sessions,
                     )
-                    .await
-                    {
-                        Ok(0) => {
-                            tracing::info!(
-                                worker_id = %registration.worker_id,
-                                "worker row missing; re-registering"
-                            );
-                            if let Err(error) = register_worker(
-                                &mut conn,
-                                &registration.worker_id,
-                                &registration.queues,
-                                &registration.shard_assignments,
-                                registration.max_concurrency,
-                                &registration.host,
-                                registration.version.as_deref(),
-                                &registration.build_id,
-                                registration.deployment_name.as_deref(),
-                                &registration.labels,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    worker_id = %registration.worker_id,
-                                    error = %error,
-                                    "worker re-registration failed"
-                                );
-                            }
-                        }
-                        Ok(_) => {
-                            if worker_shutdown.is_cancelled() {
-                                // Already draining — refresh the stored deadline on
-                                // every heartbeat so an operator-extended window (via
-                                // a second POST .../drain with a later deadline_at)
-                                // is picked up by drain_in_flight without restarting
-                                // the worker.
-                                sync_drain_deadline(
-                                    &mut conn,
-                                    &registration.worker_id,
-                                    &remote_drain_deadline,
-                                )
-                                .await;
-                            } else {
-                                // Heartbeat succeeded; check whether a remote drain
-                                // request has changed this worker's status to Draining.
-                                // Cancel the worker's poll-loop shutdown token (not the
-                                // heartbeat token) so the poll loop stops accepting new
-                                // work within the next heartbeat interval while heartbeats
-                                // continue until the worker is fully stopped (P1).
-                                match read_worker_status(&mut conn, &registration.worker_id).await {
-                                    Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
-                                        tracing::info!(
-                                            worker_id = %registration.worker_id,
-                                            "remote drain detected; triggering graceful shutdown"
-                                        );
-                                        // Store the operator-supplied deadline as an
-                                        // absolute Instant so drain_in_flight can
-                                        // honour it (P2-B).
-                                        sync_drain_deadline(
-                                            &mut conn,
-                                            &registration.worker_id,
-                                            &remote_drain_deadline,
-                                        )
-                                        .await;
-                                        worker_shutdown.cancel();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %registration.worker_id,
-                                error = %error,
-                                "worker heartbeat write failed"
-                            );
-                        }
-                    }
+                    .await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1144,18 +1289,57 @@ pub fn spawn_worker_heartbeat(
 /// Called both on first drain detection and on every subsequent heartbeat
 /// tick while the worker is draining, so that an operator-extended deadline
 /// is reflected without a restart.
+/// Decide whether an observed `drain_deadline_at` should be applied to the
+/// shared effective-deadline cell, recording it as applied when so (issue #522
+/// review).
+///
+/// Returns `true` when `deadline` is strictly greater than the maximum deadline
+/// applied so far (or when no deadline has been applied yet), advancing `max` in
+/// the process.  Returns `false` for equal or earlier values, which are either
+/// idempotent re-observations of the current deadline or stale values from a
+/// shard row that was not updated when the operator last changed the deadline.
+///
+/// Using the strict-max rule prevents a lagging shard from reverting the shared
+/// drain-deadline cell: if shard A was unreachable when the operator extended
+/// T1 → T2 and only A's row still holds T1, A's heartbeat will correctly reject
+/// T1 (T1 < T2 = current max).  Operator-driven shortening is not reflected in
+/// the in-process cell, but the local `shutdown_timeout` fallback still bounds
+/// the drain, and an operator who needs a hard stop can send SIGTERM.
+fn classify_drain_deadline(max: &mut Option<DateTime<Utc>>, deadline: DateTime<Utc>) -> bool {
+    if max.is_none_or(|m| deadline > m) {
+        *max = Some(deadline);
+        true
+    } else {
+        false
+    }
+}
+
 async fn sync_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
+    // Maximum `drain_deadline_at` value applied to `cell` so far, shared across
+    // this worker's per-shard heartbeat tasks.  A new deadline is applied only
+    // when it is strictly greater than the current max (issue #522 review).
+    max_applied: &Mutex<Option<DateTime<Utc>>>,
     cell: &Mutex<Option<std::time::Instant>>,
 ) {
     if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
+        let Ok(mut max_guard) = max_applied.lock() else {
+            return;
+        };
+        if !classify_drain_deadline(&mut max_guard, deadline) {
+            return;
+        }
         let remaining = deadline
             .signed_duration_since(Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
+        let candidate = std::time::Instant::now() + remaining;
+        // Update the cell while still holding `max_guard`, so two shards observing
+        // distinct new deadlines concurrently can't reorder their writes (lock
+        // order max_applied→cell is the only place both are held).
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some(std::time::Instant::now() + remaining);
+            *guard = Some(candidate);
         }
     }
 }
@@ -1210,6 +1394,52 @@ mod tests {
         assert_eq!(WorkerStatus::from_str("zombie"), None);
         assert_eq!(WorkerStatus::from_str(""), None);
         assert_eq!(WorkerStatus::from_str("active"), None); // case-sensitive
+    }
+
+    // -- classify_drain_deadline (cross-shard merge, issue #522 review) --
+
+    #[test]
+    fn classify_drain_deadline_applies_initial_and_skips_same_value() {
+        let mut max: Option<DateTime<Utc>> = None;
+        let d1 = Utc::now();
+        // Initial drain: first shard to observe it applies.
+        assert!(classify_drain_deadline(&mut max, d1));
+        assert_eq!(max, Some(d1));
+        // Another shard observing the same value: idempotent, no re-apply.
+        assert!(!classify_drain_deadline(&mut max, d1));
+    }
+
+    #[test]
+    fn classify_drain_deadline_skips_stale_recovery_reread() {
+        // Shard A applies D1 (initial), then D2 (operator extension).
+        // Shard B was offline during D2 so its row still holds D1.
+        // When B recovers it must NOT revert the cell back to D1.
+        let mut max: Option<DateTime<Utc>> = None;
+        let d1 = Utc::now();
+        let d2 = d1 + chrono::Duration::minutes(5);
+        assert!(classify_drain_deadline(&mut max, d1)); // shard A applies D1
+        assert!(classify_drain_deadline(&mut max, d2)); // shard A applies D2
+        // Shard B recovers; stale D1 < D2 (current max) → rejected.
+        assert!(!classify_drain_deadline(&mut max, d1));
+        assert_eq!(max, Some(d2));
+    }
+
+    #[test]
+    fn classify_drain_deadline_applies_extension_on_first_observation() {
+        // Shard A applied D1. Shard A then goes unreachable and the operator
+        // re-drains with D2 > D1 that reaches only shard B. Shard B's first
+        // observation of D2 must advance the cell even though it is already set.
+        let mut max: Option<DateTime<Utc>> = None;
+        let d1 = Utc::now();
+        let d2 = d1 + chrono::Duration::minutes(5); // extension
+        let d_short = d1 - chrono::Duration::minutes(2); // would be a shorten
+        assert!(classify_drain_deadline(&mut max, d1)); // shard A applies D1
+        assert!(classify_drain_deadline(&mut max, d2)); // shard B first-sees D2 > D1
+        assert_eq!(max, Some(d2));
+        // Operator-driven shortening (d_short < d2) is NOT reflected via the
+        // in-process cell; the local shutdown_timeout fallback bounds the drain.
+        assert!(!classify_drain_deadline(&mut max, d_short));
+        assert_eq!(max, Some(d2)); // cell unchanged
     }
 
     #[test]
@@ -1366,6 +1596,7 @@ mod tests {
             build_id: String::new(),
             deployment_name: None,
             labels: std::collections::HashMap::new(),
+            max_concurrent_sessions: 0,
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
@@ -1392,6 +1623,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -1461,6 +1694,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -1487,6 +1722,36 @@ mod tests {
             .expect("active_task_ids should be array");
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].as_str().unwrap(), tid.to_string());
+    }
+
+    // -- Worker session capacity surfaces via WorkerRow's #[serde(flatten)]
+    //    HarvestWorker (issue #606) -- no handler change needed for
+    //    GET /workers / GET /workers/{id} to expose these fields.
+
+    #[test]
+    fn worker_row_flattens_session_capacity_fields() {
+        let mut row = make_test_worker_row(vec![]);
+        row.worker.max_concurrent_sessions = 5;
+        row.worker.in_use_sessions = 2;
+
+        let json = serde_json::to_value(&row).unwrap();
+        // Flattened directly onto the top-level object, not nested under "worker".
+        assert_eq!(json["max_concurrent_sessions"], serde_json::json!(5));
+        assert_eq!(json["in_use_sessions"], serde_json::json!(2));
+        assert!(
+            json.get("worker").is_none(),
+            "HarvestWorker fields must be flattened, not nested"
+        );
+    }
+
+    #[test]
+    fn worker_row_default_session_capacity_is_zero() {
+        // The default-off contract (AC2): a worker that never calls
+        // with_max_concurrent_sessions surfaces 0/0.
+        let row = make_test_worker_row(vec![]);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["max_concurrent_sessions"], serde_json::json!(0));
+        assert_eq!(json["in_use_sessions"], serde_json::json!(0));
     }
 
     // -- DrainOutcome --
@@ -1645,6 +1910,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],

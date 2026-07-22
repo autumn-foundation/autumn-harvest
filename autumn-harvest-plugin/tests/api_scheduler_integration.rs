@@ -53,127 +53,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::sync::Barrier;
 use tower::ServiceExt;
 
-const INIT_SQL: &str = concat!(
-    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508000000_harvest_external_task_updated_at/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260504000000_harvest_workflow_parent_children/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260508010000_harvest_workers_drain_deadline/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    ),
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!(
-        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
-    ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    ),
-    "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
-    ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
-);
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
 type HarvestApiApp = axum::Router;
 
 #[derive(diesel::QueryableByName)]
@@ -190,7 +72,7 @@ struct ExistsByName {
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(init_sql())
         .with_tag("16")
         .start()
         .await
@@ -247,7 +129,7 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
             .await
             .expect("failed to connect to shard database");
-        conn.batch_execute(INIT_SQL)
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
             .await
             .expect("failed to apply harvest migrations to shard database");
     }
@@ -258,7 +140,13 @@ async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(4)
+        // Sized at 8 for comfortable headroom under the concurrent-request money
+        // test. Since the Codex F4 fix, a single-shard backfill reuses the per-slot
+        // exec conn for budget accounting and holds exactly one connection at a time
+        // (proven pool-size-1 safe by
+        // `backfill_single_shard_pool_size_one_does_not_deadlock`), so 8 is generous
+        // rather than a floor.
+        .max_size(8)
         .build()
         .expect("failed to build test pool")
 }
@@ -390,12 +278,18 @@ async fn patch_json(
 fn approval_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "approval_workflow",
             module: "tests",
             handler: approval_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -405,6 +299,7 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))
@@ -414,12 +309,18 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -429,14 +330,21 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "timer_then_signal_workflow",
                 module: "tests",
                 handler: timer_then_signal_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -446,6 +354,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -470,6 +379,7 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
         handler: record_activity,
@@ -494,6 +404,7 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
         handler: wait_on_barrier_activity,
@@ -553,8 +464,12 @@ async fn insert_workflow_on_url(
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -571,7 +486,17 @@ async fn insert_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .expect("workflow insert should succeed");
@@ -635,8 +560,12 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             memo: None,
             search_attrs: None,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
@@ -653,7 +582,17 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
         },
+        None,
     )
     .await
     .expect("child workflow insert should succeed");
@@ -726,6 +665,7 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }
 }
 
@@ -791,6 +731,8 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
     let seeded_run_id = uuid::Uuid::new_v4();
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: seeded_run_id,
             workflow_name: dag_name,
             workflow_id: &seeded_run_id.to_string(),
@@ -801,6 +743,8 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             queue_name: "default",
             execution_timeout: None,
             deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
@@ -816,6 +760,14 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         })
         .execute(&mut conn)
         .await
@@ -1121,6 +1073,8 @@ async fn seed_scheduled_activity_task_from_url(
         .expect("failed to connect for scheduled activity seed");
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&autumn_harvest::models::NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
             id: exec_id.as_uuid(),
             workflow_name,
             workflow_id,
@@ -1131,6 +1085,8 @@ async fn seed_scheduled_activity_task_from_url(
             queue_name: "default",
             execution_timeout: None,
             deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
@@ -1146,6 +1102,14 @@ async fn seed_scheduled_activity_task_from_url(
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
         })
         .execute(&mut conn)
         .await
@@ -1159,6 +1123,7 @@ async fn seed_scheduled_activity_task_from_url(
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -1898,6 +1863,7 @@ fn manual_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }
 }
 
@@ -1917,6 +1883,7 @@ fn interval_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }
 }
 
@@ -1936,17 +1903,24 @@ fn classic_interval_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }
 }
 
 fn workflow_info_named(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "tests",
         handler: approval_workflow,
         execution_timeout: None,
+        chain_execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
+        batch: None,
+        throttle: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -1955,6 +1929,7 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -1974,6 +1949,7 @@ fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }
 }
 
@@ -1993,6 +1969,7 @@ fn manual_interval_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }
 }
 
@@ -2743,6 +2720,147 @@ async fn harvest_api_stack_endpoint_surfaces_rate_limit_throttling() {
         pending[0]["task_status"],
         "waiting on rate_limit_key=test_rate_limit_bucket"
     );
+    // An activity that has never heartbeated reports a null checkpoint (#503).
+    assert!(
+        pending[0]["heartbeat_details"].is_null(),
+        "heartbeat_details must be null when no checkpoint flushed"
+    );
+    assert_eq!(pending[0]["heartbeat_details_truncated"], false);
+    assert!(pending[0]["heartbeat_details_bytes"].is_null());
+}
+
+#[tokio::test]
+async fn harvest_api_stack_endpoint_surfaces_heartbeat_checkpoint() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "stack-hb",
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for test setup");
+
+    let checkpoint = serde_json::json!({"processed": 4500, "total": 10000});
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue ( \
+            id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, attempt, max_attempts, scheduled_at, started_at, last_heartbeat_at, heartbeat_details \
+         ) VALUES ( \
+            gen_random_uuid(), 'default', 'activity', $1, 'pipeline', '{}'::jsonb, 'RUNNING', 0, 0, 5, NOW(), NOW(), NOW(), $2 \
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(checkpoint.clone())
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert heartbeating task");
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let pending = payload["pending_activities"]
+        .as_array()
+        .expect("pending_activities must be an array");
+    assert_eq!(pending.len(), 1);
+    // The latest checkpoint payload is surfaced verbatim (#503).
+    assert_eq!(pending[0]["heartbeat_details"], checkpoint);
+    assert_eq!(pending[0]["heartbeat_details_truncated"], false);
+    assert!(
+        pending[0]["heartbeat_details_bytes"].as_u64().unwrap() > 0,
+        "byte size must be reported alongside the payload"
+    );
+    assert!(
+        pending[0]["last_heartbeat_at"].is_string(),
+        "last_heartbeat_at remains present"
+    );
+    // A small, in-budget checkpoint is not budget-omitted (#503 review).
+    assert_eq!(pending[0]["heartbeat_details_omitted_for_budget"], false);
+    assert_eq!(payload["checkpoints_truncated_for_budget"], false);
+}
+
+#[tokio::test]
+async fn harvest_api_stack_endpoint_truncates_oversized_heartbeat_checkpoint() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "stack-hb-big",
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for test setup");
+
+    // Default activity-result cap is 2 MiB; a 2.1 MiB blob must trip the guard.
+    let big_blob = "x".repeat(2 * 1024 * 1024 + 100 * 1024);
+    let checkpoint = serde_json::json!({ "blob": big_blob });
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue ( \
+            id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, attempt, max_attempts, scheduled_at, started_at, last_heartbeat_at, heartbeat_details \
+         ) VALUES ( \
+            gen_random_uuid(), 'default', 'activity', $1, 'pipeline', '{}'::jsonb, 'RUNNING', 0, 0, 5, NOW(), NOW(), NOW(), $2 \
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(checkpoint)
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert oversized heartbeating task");
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let pending = payload["pending_activities"]
+        .as_array()
+        .expect("pending_activities must be an array");
+    assert_eq!(pending.len(), 1);
+    // Over-cap payload is withheld; only the truncation marker + size are returned (#503).
+    assert!(
+        pending[0]["heartbeat_details"].is_null(),
+        "over-cap payload must be withheld"
+    );
+    assert_eq!(pending[0]["heartbeat_details_truncated"], true);
+    assert!(
+        pending[0]["heartbeat_details_bytes"].as_u64().unwrap() > 2 * 1024 * 1024,
+        "reported size must exceed the 2 MiB cap"
+    );
 }
 
 #[tokio::test]
@@ -2836,6 +2954,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn external_runner_processes_workflows_started_via_management_api() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -2844,12 +2963,18 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let web_runtime = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2859,6 +2984,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -2871,6 +2997,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -2880,12 +3007,18 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let runner = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
                 execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
+                batch: None,
+                throttle: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2895,6 +3028,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -2907,6 +3041,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -2959,12 +3094,18 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "parallel_activities_workflow",
             module: "tests",
             handler: parallel_activities_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -2974,6 +3115,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("parallel_a"),
@@ -3014,12 +3156,18 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "staggered_parallel_workflow",
             module: "tests",
             handler: staggered_parallel_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3029,6 +3177,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("parallel_fast"),
@@ -3078,12 +3227,18 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "parallel_same_activity_workflow",
             module: "tests",
             handler: parallel_same_activity_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3093,6 +3248,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![recording_activity_info("shared_parallel")],
         Arc::new(state),
@@ -3129,12 +3285,18 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "barrier_parallel_workflow",
             module: "tests",
             handler: barrier_parallel_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3144,6 +3306,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("barrier_first"),
@@ -3189,12 +3352,18 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "timeout_completion_race_workflow",
             module: "tests",
             handler: timeout_completion_race_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3204,6 +3373,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![blocking_activity_info(
             "timeout_completion_race",
@@ -3357,6 +3527,8 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
             &None,
             &[],
             None,
+            None,
+            60,
         )
         .await
     });
@@ -3478,6 +3650,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
 
     let runner = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
@@ -3489,6 +3662,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
                 audit_retention_days: 90,
                 schedule_decision_retention_days: 7,
                 archival_timeout_secs: 30,
+                ..Default::default()
             })
             .build(),
         &HarvestRuntimeConfig {
@@ -3501,6 +3675,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
             outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
             batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+            startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -3813,12 +3988,18 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     let pool = build_test_pool(&database_url);
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "manual_pipeline",
             module: "tests",
             handler: manual_pipeline_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3828,6 +4009,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -4079,6 +4261,7 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("manual unified DAG should compile"),
     );
@@ -4095,12 +4278,15 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let registry = Arc::new(HandlerRegistry::new(
         vec![workflow_info_named(dag_name)],
@@ -4381,6 +4567,7 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     };
     let workflow_schedule = dag_info
         .as_workflow_schedule()
@@ -4472,6 +4659,7 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4561,6 +4749,7 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4582,12 +4771,15 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     {
@@ -4674,12 +4866,15 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     {
@@ -4729,7 +4924,678 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
     );
 }
 
+// ── Backfill max_runs atomic reservation (issue #688) ─────────────────────────
+
+/// Register a pure workflow-only (`dag_name` = NULL) hourly-cron schedule with a
+/// given `max_runs` budget and stand up an app whose runtime knows the workflow,
+/// so backfill dispatches actually create executions. Returns the app plus the
+/// freshly-loaded schedule row (`runs_started` = 0 on insert).
+async fn setup_workflow_backfill_app(
+    database_url: &str,
+    pool: DbPool,
+    name: &'static str,
+    max_runs: Option<u32>,
+) -> (HarvestApiApp, HarvestSchedule) {
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input: Value::Null,
+        catchup: false,
+        // Keep max_active_runs high so it never gates the small backfill windows
+        // below — the test isolates the max_runs budget path.
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs,
+        catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+            .await
+            .expect("failed to connect for workflow schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("workflow schedule should register");
+    }
+    let schedule = load_workflow_only_schedule_from_url_optional(database_url, name)
+        .await
+        .expect("workflow-only schedule row should exist");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    (app, schedule)
+}
+
+/// Like `setup_workflow_backfill_app`, but the registered `WorkflowInfo` carries
+/// a `throttle` policy (so `workflow_resolving_throttle` returns `Some` and the
+/// backfill loop enters the throttle block, where the oversized-input check —
+/// and its `release_backfill_budget_slot` release path — lives) and the schedule
+/// input can be sized to overflow the workflow-input cap (issue #688 release
+/// test). The throttle policy has no key (`key_expr = None`), so every slot
+/// resolves the same empty key.
+async fn setup_throttled_workflow_backfill_app(
+    database_url: &str,
+    pool: DbPool,
+    name: &'static str,
+    max_runs: Option<u32>,
+    input: Value,
+) -> (HarvestApiApp, HarvestSchedule) {
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input,
+        catchup: false,
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs,
+        catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+            .await
+            .expect("failed to connect for workflow schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("workflow schedule should register");
+    }
+    let schedule = load_workflow_only_schedule_from_url_optional(database_url, name)
+        .await
+        .expect("workflow-only schedule row should exist");
+
+    let mut info = workflow_info_named(name);
+    // A tiny per-workflow cap documents intent, but the effective cap is
+    // max(per, registry-global), so it never *lowers* the cap below the
+    // registry's 2 MiB default. The test's input is instead sized past that
+    // default, forcing the oversized-input path without mutating the
+    // process-global GLOBAL_MAX_WORKFLOW_INPUT_BYTES (which would race parallel
+    // tests in this binary).
+    info.max_input_bytes = Some(1);
+    info.throttle = Some(
+        autumn_harvest::throttle::ThrottlePolicy::from_rate_str("100/m", None, None, None)
+            .expect("valid throttle policy"),
+    );
+
+    let registry = Arc::new(HandlerRegistry::new(vec![info], vec![]));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    (app, schedule)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_one() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_race_one_slot_wf";
+    // Exactly one max_runs slot remains (max_runs = 1, runs_started = 0).
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(1)).await;
+
+    // A 3-hour hourly window → 4 candidate slots, more than the single remaining
+    // slot, so two concurrent requests both have work to dispatch.
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let uri = format!("/admin/schedules/{}/backfill", schedule.id);
+    let body = json!({ "from": from, "to": to });
+
+    // Fire both requests genuinely concurrently on a multi-thread runtime (two
+    // spawned tasks, not cooperatively-scheduled `tokio::join!` futures on one
+    // thread) so the atomic reservation is exercised under real thread-level
+    // parallelism — a stale-snapshot gate would let BOTH dispatch here.
+    let (app_a, app_b) = (app.clone(), app.clone());
+    let (uri_a, uri_b) = (uri.clone(), uri.clone());
+    let (body_a, body_b) = (body.clone(), body.clone());
+    let handle_a = tokio::spawn(async move { post_json(&app_a, uri_a, body_a).await });
+    let handle_b = tokio::spawn(async move { post_json(&app_b, uri_b, body_b).await });
+    let (status_a, json_a) = handle_a.await.expect("backfill request A must not panic");
+    let (status_b, json_b) = handle_b.await.expect("backfill request B must not panic");
+    assert_eq!(status_a, StatusCode::OK, "req A body: {json_a}");
+    assert_eq!(status_b, StatusCode::OK, "req B body: {json_b}");
+
+    let dispatched_a = json_a["dispatched"].as_u64().unwrap();
+    let dispatched_b = json_b["dispatched"].as_u64().unwrap();
+    assert_eq!(
+        dispatched_a + dispatched_b,
+        1,
+        "exactly one slot must be dispatched across two concurrent requests \
+         (A={dispatched_a}, B={dispatched_b}); atomic reservation must not over-run max_runs"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 1,
+        "runs_started must equal max_runs after the single dispatch"
+    );
+    assert!(
+        reloaded.exhausted_at.is_some(),
+        "schedule must transition to exhausted once the last slot is consumed"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        1,
+        "exactly one execution row must exist for the schedule"
+    );
+}
+
+/// F4 regression (issue #688 review, Codex): with a web DB pool of size 1
+/// (single-shard), a non-dry-run backfill must NOT self-deadlock. Before the fix
+/// the route held a dedicated schedule-shard connection across the dispatch loop
+/// while each slot also checked out a per-slot exec conn — two concurrent
+/// connections against a size-1 pool wedge forever (the route waits on a
+/// connection it already holds). The fix reuses the per-slot exec conn for budget
+/// accounting when the schedule and exec shards share a pool, so the route holds
+/// exactly one connection at a time again (restoring pre-#688 pool-size-1 safety).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
+    let (database_url, _container) = setup_test_database_url().await;
+    // Deliberately size the pool at 1: exercising the exact F4 self-deadlock
+    // condition (pool.rs only forbids size 0, so 1 is a valid production config).
+    let pool = {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url.as_str());
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("failed to build size-1 test pool")
+    };
+    let name = "backfill_pool_size_one_wf";
+    // Unlimited budget so every planned slot actually dispatches, exercising the
+    // reserve + transition budget path on the single shared connection.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-05-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let uri = format!("/admin/schedules/{}/backfill", schedule.id);
+    let body = json!({ "from": from, "to": to });
+
+    // If the route self-deadlocks on the size-1 pool this times out (a clear
+    // failure) rather than hanging the whole test binary indefinitely.
+    let (status, json) = tokio::time::timeout(Duration::from_secs(20), post_json(&app, uri, body))
+        .await
+        .expect("backfill on a size-1 pool must return, not self-deadlock");
+
+    assert_eq!(status, StatusCode::OK, "backfill body: {json}");
+    assert!(
+        json["dispatched"].as_u64().unwrap() >= 1,
+        "at least one slot should dispatch, body: {json}"
+    );
+}
+
+/// Issue #740 (AC3): a schedule backfill records the `backfill` source
+/// referencing the schedule id. Backfill is only reachable through this
+/// plugin HTTP handler (`POST /admin/schedules/{id}/backfill`), so this is the
+/// single direct assertion of the backfill provenance path. Driven with a
+/// non-throttled workflow schedule (the common backfill branch) whose runs are
+/// dispatched immediately, then inspected on the created execution rows.
 #[tokio::test]
+async fn backfill_records_backfill_source_referencing_schedule_id() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_provenance_wf";
+
+    // Isolate this workflow/schedule name on a possibly-shared DB.
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect for isolation scrub");
+        diesel::delete(
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(name)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("clear prior executions");
+        diesel::delete(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
+            .execute(&mut conn)
+            .await
+            .expect("clear prior schedule");
+    }
+
+    // Unlimited budget → every planned slot dispatches immediately.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    // A 1-hour hourly window → 2 candidate slots (10:00, 11:00), both dispatch.
+    let from = chrono::DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-06-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "backfill body: {body}");
+    assert!(
+        body["dispatched"].as_u64().unwrap() >= 1,
+        "at least one backfilled slot should dispatch, body: {body}"
+    );
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect for row read");
+    let rows: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(name))
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("load backfilled runs");
+    assert!(
+        !rows.is_empty(),
+        "a non-dry-run backfill should create execution rows"
+    );
+    for row in &rows {
+        assert_eq!(
+            row.start_source.as_deref(),
+            Some("backfill"),
+            "a backfilled run records the `backfill` source, not `api`"
+        );
+        assert_eq!(
+            row.start_source_ref.as_deref(),
+            Some(schedule.id.to_string().as_str()),
+            "a backfilled run references the schedule id"
+        );
+    }
+}
+
+/// Deterministic reserve-then-RELEASE proof (issue #688): every slot reserves a
+/// `max_runs` budget slot, enters the throttle block, hits the oversized-input
+/// guard, and releases the reservation. No slot ever dispatches, and the
+/// schedule's `runs_started` must return to exactly its pre-backfill value —
+/// proving `release_backfill_budget_slot` returns every reserved slot.
+#[tokio::test]
+async fn backfill_release_on_oversized_input_leaves_budget_intact() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_release_oversized_wf";
+    // A schedule input that serializes past the registry's default 2 MiB
+    // workflow-input cap, so the throttle block's oversized-input guard trips
+    // for every slot. (The effective cap is max(per-workflow, registry-global);
+    // rather than lower the process-global cap — which would race parallel tests
+    // — the input is sized past the default.)
+    let big = "x".repeat(2 * 1024 * 1024 + 1024);
+    let input = json!({ "blob": big });
+    // Budget of 5 with a 2-slot window: budget is never exhausted, so any
+    // net change in runs_started can only come from a leaked reservation.
+    let (app, schedule) =
+        setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
+
+    // A 1-hour hourly window → 2 candidate slots (10:00, 11:00).
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T11:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let window_size = body["total"].as_u64().unwrap();
+    assert_eq!(window_size, 2, "1-hour hourly window has 2 slots");
+    assert_eq!(
+        body["dispatched"],
+        serde_json::json!(0),
+        "no slot may dispatch — every one overflows the input cap"
+    );
+    assert_eq!(
+        body["skipped_reasons"]["oversized_input"],
+        serde_json::json!(window_size),
+        "every slot must be skipped for oversized_input"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 0,
+        "runs_started must return to its pre-backfill value — every reserved \
+         slot was released, none leaked"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "a schedule whose budget was never actually consumed must not be exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        0,
+        "no execution rows may be created when every slot is skipped"
+    );
+}
+
+#[tokio::test]
+async fn backfill_over_window_dispatches_only_remaining_budget() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_over_window_wf";
+    // Two slots of budget, a four-slot window.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(2)).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(4), "window has 4 slots");
+    assert_eq!(body["dispatched"], serde_json::json!(2));
+    assert_eq!(
+        body["skipped_reasons"]["max_runs_exhausted"],
+        serde_json::json!(2),
+        "the two out-of-budget slots must be reported as max_runs_exhausted"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(reloaded.runs_started, 2);
+    assert!(reloaded.exhausted_at.is_some());
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        2,
+    );
+}
+
+#[tokio::test]
+async fn backfill_unlimited_schedule_increments_runs_started() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_unlimited_wf";
+    // Unlimited budget (max_runs = None) — every slot dispatches, runs_started
+    // still increments for observability, exhausted_at stays NULL.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(3), "window has 3 slots");
+    assert_eq!(body["dispatched"], serde_json::json!(3));
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 3,
+        "runs_started must increase by the number dispatched even when unlimited"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "an unlimited schedule must never transition to exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        3,
+    );
+}
+
+/// A row with `max_runs = 0` in the column must be treated as UNLIMITED by the
+/// atomic reservation guard (issue #688 review, Codex F1) — matching
+/// `backfill_budget_reached`, the up-front exhaustion check, and the dry-run
+/// projection, all of which read non-positive `max_runs` as "no cap". The
+/// builder normalizes `0 → None`, so this writes `0` to the column DIRECTLY via
+/// diesel to simulate a pre-existing / hand-written row. Without the
+/// `max_runs <= 0` clause in the reservation predicate, `0 < 0` is false and the
+/// backfill would wrongly skip every slot as `max_runs_exhausted`.
+///
+/// NOTE: the release-clears-exhaustion path (F2b) is a concurrent-only scenario
+/// not deterministically reproducible in a single-request test: within one
+/// request, once a slot transitions the row to exhausted, subsequent
+/// reservations fail the `exhausted_at IS NULL` guard and set `budget_hit`, so no
+/// release-after-transition occurs intra-request. F2b is covered by the
+/// `clear_stale_max_runs_exhaustion_generates_the_guarded_clear_update` shape
+/// test plus code reasoning, matching the no-Docker precedent.
+#[tokio::test]
+async fn backfill_max_runs_zero_is_treated_as_unlimited() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "backfill_max_runs_zero_wf";
+    // Register unlimited (builder normalizes 0 → None), then force the column to
+    // literal 0 to exercise the reservation guard's non-positive handling.
+    let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect to force max_runs = 0");
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(harvest_schedules::max_runs.eq(Some(0_i32)))
+            .execute(&mut conn)
+            .await
+            .expect("forcing max_runs = 0 must succeed");
+    }
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(3), "window has 3 slots");
+    assert_eq!(
+        body["dispatched"],
+        serde_json::json!(3),
+        "max_runs = 0 must be treated as unlimited — every slot dispatches"
+    );
+
+    let reloaded = load_workflow_only_schedule_from_url_optional(&database_url, name)
+        .await
+        .expect("schedule row should still exist");
+    assert_eq!(
+        reloaded.runs_started, 3,
+        "runs_started must increase by the number dispatched (max_runs = 0 = unlimited)"
+    );
+    assert!(
+        reloaded.exhausted_at.is_none(),
+        "a max_runs = 0 (unlimited) schedule must never transition to exhausted"
+    );
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, name).await,
+        3,
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "backfill_dag_over_window";
+    // A unified DAG schedule row (dag_name set) with a two-slot budget over a
+    // four-slot window — exercises the DAG loop's atomic reservation path.
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Cron("0 * * * *".to_string())),
+            catchup: false,
+            max_active_runs: 1000,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+        }])
+        .expect("unified DAG should compile"),
+    );
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: Some(2),
+        catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for DAG schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("DAG schedule should register");
+    }
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["total"], serde_json::json!(4), "window has 4 slots");
+    assert_eq!(body["dispatched"], serde_json::json!(2));
+    assert_eq!(
+        body["skipped_reasons"]["max_runs_exhausted"],
+        serde_json::json!(2),
+    );
+
+    let reloaded = load_schedule_from_url(&database_url, dag_name).await;
+    assert_eq!(reloaded.runs_started, 2);
+    assert!(reloaded.exhausted_at.is_some());
+    assert_eq!(
+        count_workflow_executions_by_name_from_url(&database_url, dag_name).await,
+        2,
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -4741,12 +5607,18 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "interval_pipeline",
             module: "tests",
             handler: interval_pipeline_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4756,6 +5628,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "interval_step",
@@ -4774,6 +5647,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            rate_limit_key_expr: None,
             circuit_breaker: None,
             requires: None,
             handler: record_activity,
@@ -4839,6 +5713,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -4850,12 +5725,18 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "interval_pipeline",
             module: "tests",
             handler: interval_pipeline_workflow,
             execution_timeout: None,
+            chain_execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4865,6 +5746,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![recording_activity_info("interval_step")],
         Arc::new(state),
@@ -5042,12 +5924,15 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5081,12 +5966,15 @@ async fn register_workflow_schedules_preserves_existing_dag_marker_for_workflow_
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let workflow_only_update = WorkflowSchedule::new(
         "preserve_dag_marker",
@@ -5138,12 +6026,15 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: "legacy_workflow_only_dag".to_string(),
@@ -5158,12 +6049,15 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5207,12 +6101,15 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
         .expect("fixed pause timestamp should parse")
@@ -5235,6 +6132,7 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("unified DAG should compile"),
     );
@@ -5301,6 +6199,7 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5328,12 +6227,15 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5360,6 +6262,7 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // issue #617 added a chain-cap field to the WorkflowSchedule literal
 async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade() {
     let (database_url, _container) = setup_test_database_url().await;
     let dag_name = "split_legacy_dag";
@@ -5380,6 +6283,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5402,12 +6306,15 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -5422,12 +6329,15 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5464,6 +6374,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split_legacy_rows() {
     let (database_url, _container) = setup_test_database_url().await;
     let dag_name = "split_paused_legacy_dag";
@@ -5487,6 +6398,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5509,12 +6421,15 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -5529,12 +6444,15 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5596,6 +6514,7 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5612,12 +6531,15 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5712,6 +6634,7 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5728,12 +6651,15 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5815,6 +6741,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5831,12 +6758,15 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5859,12 +6789,15 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
             execution_timeout: None,
+            chain_execution_timeout: None,
             calendar: None,
             skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
             consecutive_failure_limit: None,
             end_at: None,
             max_runs: None,
             catchup_policy: None,
+            retry_policy: None,
+            all_writable_shards: false,
         };
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
             .await
@@ -5936,6 +6869,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5952,12 +6886,15 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5984,6 +6921,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }])
         .expect("classic DAG schedule should compile");
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
@@ -6052,12 +6990,15 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     {
@@ -6516,12 +7457,15 @@ async fn scheduler_tick_preserves_dag_metadata() {
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
         execution_timeout: None,
+        chain_execution_timeout: None,
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
     };
 
     let dag_info = DagInfo {
@@ -6539,6 +7483,7 @@ async fn scheduler_tick_preserves_dag_metadata() {
         owner: Some("ops-team"),
         runbook_url: Some("http://ops-runbook"),
         severity: Some("sev2"),
+        mcp: false,
     };
     let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
 
@@ -6602,6 +7547,7 @@ async fn api_trigger_preserves_dag_metadata() {
         owner: Some("dev-team"),
         runbook_url: Some("http://dev-runbook"),
         severity: Some("sev1"),
+        mcp: false,
     };
     let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
     let registry = Arc::new(HandlerRegistry::new(
@@ -6655,4 +7601,421 @@ async fn api_trigger_preserves_dag_metadata() {
     assert_eq!(execution.owner.as_deref(), Some("dev-team"));
     assert_eq!(execution.runbook_url.as_deref(), Some("http://dev-runbook"));
     assert_eq!(execution.severity.as_deref(), Some("sev1"));
+}
+
+// ── Overdue-schedule read fields (issue #696) ────────────────────────────────
+
+/// Prefer a shared migrated Postgres via `HARVEST_TEST_DATABASE_URL` (Docker-free
+/// local runs); otherwise start a fresh testcontainers Postgres 16.
+async fn overdue_read_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
+}
+
+/// Insert a workflow schedule directly with an explicit `next_run_at`.
+async fn insert_overdue_test_schedule(
+    database_url: &str,
+    wf_name: &str,
+    next_run_at: chrono::DateTime<chrono::Utc>,
+    is_paused: bool,
+) -> uuid::Uuid {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect");
+    // Isolate this schedule name on a possibly-shared DB.
+    diesel::delete(harvest_schedules::table.filter(dsl::workflow_name.eq(wf_name)))
+        .execute(&mut conn)
+        .await
+        .expect("clear prior schedule");
+    let id = uuid::Uuid::new_v4();
+    diesel::insert_into(harvest_schedules::table)
+        .values((
+            dsl::id.eq(id),
+            dsl::workflow_name.eq(wf_name),
+            dsl::schedule_expr.eq("interval:60"),
+            dsl::timezone.eq("UTC"),
+            dsl::catchup.eq(false),
+            dsl::max_active_runs.eq(10),
+            dsl::is_paused.eq(is_paused),
+            dsl::next_run_at.eq(next_run_at),
+            dsl::jitter_secs.eq(0_i64),
+            dsl::overlap_policy.eq("skip"),
+            dsl::buffered_runs.eq(serde_json::json!([])),
+            dsl::buffer_all_max.eq(100),
+            dsl::skip_policy.eq("skip"),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert schedule");
+    id
+}
+
+/// AC1: `GET /admin/schedules` and `/{id}` report `overdue` + `overdue_by_secs`
+/// per schedule, computed from the schedule's own `next_run_at` and cadence.
+#[tokio::test]
+async fn schedule_read_reports_overdue_fields() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let now = chrono::Utc::now();
+    // interval:60 => grace = 61s. 300s past its slot => overdue.
+    let wedged_id = insert_overdue_test_schedule(
+        &database_url,
+        "overdue_read_wedged",
+        now - chrono::Duration::seconds(300),
+        false,
+    )
+    .await;
+    // Just fired => healthy.
+    insert_overdue_test_schedule(
+        &database_url,
+        "overdue_read_healthy",
+        now - chrono::Duration::seconds(10),
+        false,
+    )
+    .await;
+
+    // List endpoint — a complete fan-out returns a bare array.
+    let (status, body) = get_json(&app, "/admin/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body.as_array().expect("schedules list is an array");
+    let wedged = entries
+        .iter()
+        .find(|e| e["name"] == "overdue_read_wedged")
+        .expect("wedged schedule present in list");
+    assert_eq!(
+        wedged["overdue"], true,
+        "wedged schedule must report overdue=true in the list"
+    );
+    let by = wedged["overdue_by_secs"]
+        .as_i64()
+        .expect("overdue_by_secs is an integer for an overdue schedule");
+    assert!(by > 0, "overdue_by_secs must be positive, got {by}");
+
+    let healthy = entries
+        .iter()
+        .find(|e| e["name"] == "overdue_read_healthy")
+        .expect("healthy schedule present in list");
+    assert_eq!(healthy["overdue"], false);
+    assert!(
+        healthy["overdue_by_secs"].is_null(),
+        "a non-overdue schedule reports null overdue_by_secs"
+    );
+
+    // Single-schedule endpoint.
+    let (status, single) = get_json(&app, format!("/admin/schedules/{wedged_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(single["overdue"], true);
+    assert!(single["overdue_by_secs"].as_i64().unwrap_or(0) > 0);
+}
+
+/// Insert a `RUNNING` workflow execution for `wf_name` with a unique
+/// `workflow_id`, so the schedule's shard-local capacity basis
+/// (`scheduler::schedule_running_basis` = `RUNNING`/`PAUSED` count) counts it.
+async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect for running execution seed");
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&autumn_harvest::models::NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: wf_name,
+            workflow_id: &workflow_id,
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            input: Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert running execution");
+}
+
+/// AC (issue #696, Codex round 2): the create/upsert HTTP **response** must
+/// report the same tick-exact, shard-local `at_capacity` as the list/get reads
+/// and the `harvest.schedule.overdue` gauge. A same-cadence re-register preserves
+/// the existing `next_run_at` (`apply_workflow_schedule_update` recomputes it only
+/// on a cadence change), so a wedged-in-the-past `next_run_at` survives the
+/// re-register. When the schedule is `Skip` + catchup AND at capacity, the tick
+/// legitimately holds `next_run_at` in the past (a deferred fire, not a wedge), so
+/// it must report `overdue == false`. Before the fix the response hardcoded
+/// `at_capacity = false`, so it reported `overdue == true` — disagreeing with the
+/// read == gauge == tick invariant.
+#[tokio::test]
+async fn schedule_create_response_at_capacity_is_not_overdue() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let name = "overdue_upsert_at_capacity_wf";
+
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: true,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
+        catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect for initial register");
+        // Isolate the name on a possibly-shared DB.
+        diesel::delete(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
+            .execute(&mut conn)
+            .await
+            .expect("clear prior schedule");
+        diesel::delete(
+            harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_name.eq(name)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("clear prior executions");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("register schedule");
+        // Simulate a wedge: force next_run_at 300s into the past (> 61s grace for
+        // interval:60). A same-cadence re-register preserves this value.
+        diesel::update(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(chrono::Utc::now() - chrono::Duration::seconds(300)),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("wedge next_run_at");
+    }
+    // At capacity: one RUNNING execution (>= max_active_runs = 1).
+    insert_running_execution_for(&database_url, name).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(name)],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    // Re-register via the create/upsert route with the SAME cadence, Skip+catchup.
+    // Same cadence => next_run_at preserved (still 300s in the past).
+    let (status, body) = post_json(
+        &app,
+        "/admin/schedules/workflow",
+        json!({
+            "workflow_name": name,
+            "schedule_expr": "interval:60",
+            "queue_name": "default",
+            "catchup": true,
+            "overlap_policy": "skip",
+            "max_active_runs": 1
+        }),
+    )
+    .await;
+
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "create/upsert should succeed, got {status}: {body}"
+    );
+    assert_eq!(
+        body["overdue"], false,
+        "an at-capacity Skip+catchup schedule with a preserved past next_run_at must report \
+         overdue=false in the create/upsert response (matching read == gauge == tick): {body}"
+    );
+    assert!(
+        body["overdue_by_secs"].is_null(),
+        "a non-overdue schedule reports null overdue_by_secs in the response: {body}"
+    );
+}
+
+/// Seed a daily-cron schedule whose `next_run_at` slot (3 days ago) sits inside an
+/// explicit calendar exclusion block spanning `[today-3 .. today+2]`, so a
+/// `run_next_business_day` policy rebases the effective fire to `today+3` (future).
+/// Returns `(deferred_id, control_id)`; the control has no calendar (same past
+/// slot). Dates are computed relative to the real `Utc::now()` (the read path uses
+/// the real clock), so the deferral is future regardless of which weekday CI runs.
+async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uuid, uuid::Uuid) {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect");
+    let cal = "cal_read_deferred";
+    let deferred = "overdue_read_cal_deferred";
+    let control = "overdue_read_cal_control";
+
+    // Isolate on a possibly-shared DB.
+    for wf in [deferred, control] {
+        diesel::delete(harvest_schedules::table.filter(dsl::workflow_name.eq(wf)))
+            .execute(&mut conn)
+            .await
+            .expect("clear prior schedule");
+    }
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_calendar_exclusions WHERE calendar_name = '{cal}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear prior exclusions");
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_calendars WHERE name = '{cal}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("clear prior calendar");
+
+    // Parent calendar row (FK target for both the exclusions and the schedule).
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_calendars (id, name, built_in) VALUES (gen_random_uuid(), '{cal}', false)"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("insert calendar");
+
+    let today = chrono::Utc::now().date_naive();
+    let slot_date = today - chrono::Duration::days(3);
+    // Exclude [today-3 .. today+2] (6 days) so the forward scan from the slot lands
+    // on today+3 — comfortably in the future relative to the mid-run `now`.
+    for offset in -3..=2 {
+        let d = today + chrono::Duration::days(offset);
+        diesel::sql_query(format!(
+            "INSERT INTO harvest_calendar_exclusions (id, calendar_name, excluded_date) \
+             VALUES (gen_random_uuid(), '{cal}', DATE '{d}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert exclusion");
+    }
+
+    // next_run_at = slot_date at midnight (a daily-cron slot 3 days in the past).
+    let next_run_at = slot_date.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+
+    let mut deferred_id = uuid::Uuid::nil();
+    let mut control_id = uuid::Uuid::nil();
+    for (wf, cal_name, skip_policy, out) in [
+        (
+            deferred,
+            Some(cal),
+            "run_next_business_day",
+            &mut deferred_id,
+        ),
+        (control, None, "skip", &mut control_id),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        diesel::insert_into(harvest_schedules::table)
+            .values((
+                dsl::id.eq(id),
+                dsl::workflow_name.eq(wf),
+                dsl::schedule_expr.eq("cron:0 0 * * *"),
+                dsl::timezone.eq("UTC"),
+                dsl::catchup.eq(false),
+                dsl::max_active_runs.eq(10),
+                dsl::is_paused.eq(false),
+                dsl::next_run_at.eq(next_run_at),
+                dsl::jitter_secs.eq(0_i64),
+                dsl::overlap_policy.eq("skip"),
+                dsl::buffered_runs.eq(serde_json::json!([])),
+                dsl::buffer_all_max.eq(100),
+                dsl::skip_policy.eq(skip_policy),
+                dsl::calendar_name.eq(cal_name),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("insert schedule");
+        *out = id;
+    }
+    (deferred_id, control_id)
+}
+
+/// Codex round 3: `GET /admin/schedules/{id}` must honor the tick's calendar
+/// deferral. A `run_next_business_day` schedule whose slot fell inside an
+/// exclusion block, rebased to a FUTURE business day, reports `overdue: false`;
+/// the same past slot WITHOUT a calendar reports `overdue: true` (control),
+/// proving the calendar resolution is what suppresses the false positive.
+#[tokio::test]
+async fn schedule_read_honors_calendar_deferred_fire() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let (deferred_id, control_id) = seed_calendar_deferred_read_schedules(&database_url).await;
+
+    let (status, deferred) = get_json(&app, format!("/admin/schedules/{deferred_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        deferred["overdue"], false,
+        "a calendar-deferred (future business-day) schedule must report overdue=false: {deferred}"
+    );
+    assert!(
+        deferred["overdue_by_secs"].is_null(),
+        "a non-overdue schedule reports null overdue_by_secs: {deferred}"
+    );
+
+    let (status, control) = get_json(&app, format!("/admin/schedules/{control_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        control["overdue"], true,
+        "the same past slot WITHOUT a calendar must still report overdue=true (control): {control}"
+    );
 }

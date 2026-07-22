@@ -67,6 +67,513 @@ fn management_routes_match_contract() {
     );
 }
 
+/// `GET /workflows/count` (issue #544) must have an entry in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// `audit.rs`'s own exhaustiveness tests only check `CLASSIFIED_ROUTES` and
+/// `ALL_MUTATION_ROUTES` against each other, which stays green even if a route
+/// is added to `harvest_api_router` and never classified at all — as happened
+/// here. This test walks the live router for this one route so the specific
+/// regression this diff fixed can't silently reappear.
+///
+/// A broader "every route in `harvest_api_router` must be classified" sweep
+/// was tried here and found 27 pre-existing, unrelated routes with the same
+/// gap; fixing those is out of scope for this change and risks misclassifying
+/// a route's mutation semantics without a dedicated per-route review, so this
+/// test stays scoped to the route this diff actually introduces.
+#[test]
+fn workflow_count_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let route = "GET /workflows/count";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == route),
+        "{route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
+/// Business-id ("latest run") route variants (issue #805) must each be
+/// registered in `management_api_routes()` AND classified with the correct
+/// `RouteClass` in `autumn_harvest::audit::CLASSIFIED_ROUTES` (mirroring their
+/// exec-id counterparts). `audit.rs`'s own exhaustiveness tests only cross-check
+/// `CLASSIFIED_ROUTES` and `ALL_MUTATION_ROUTES` against each other, never
+/// against the live router, so this pins the specific routes this diff adds.
+#[test]
+fn business_id_routes_are_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    // (by-id route, class, exec-id counterpart) — each by-id route mirrors its
+    // exec-id counterpart's class AND its EXCLUDED_ROUTES membership. The
+    // `excluded?` expectation is DERIVED from the exec-id counterpart's actual
+    // EXCLUDED_ROUTES membership (not hardcoded per route) so the mirror is
+    // correct-by-construction: e.g. `.../result`'s counterpart
+    // (`GET /workflows/{id}/result`) is ReadOnly but NOT excluded, so the by-id
+    // variant must not be excluded either.
+    let expected = [
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+            RouteClass::ReadOnly,
+            "GET /workflows/{id}",
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+            RouteClass::ReadOnly,
+            "GET /workflows/{id}/result",
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+            RouteClass::ReadOnly,
+            "GET /workflows/{id}/stack",
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+            RouteClass::ReadOnly,
+            "GET /workflows/{id}/children",
+        ),
+        (
+            "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            RouteClass::ReadOnly,
+            "GET /workflows/{id}/query/{query_name}",
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+            RouteClass::ReadOnly,
+            "POST /workflows/{id}/query/{query_name}",
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+            RouteClass::Mutating,
+            "POST /workflows/{id}/signal/{signal_name}",
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+            RouteClass::Mutating,
+            "POST /workflows/{id}/cancel",
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+            RouteClass::Mutating,
+            "POST /workflows/{id}/pause",
+        ),
+        (
+            "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+            RouteClass::Mutating,
+            "POST /workflows/{id}/resume",
+        ),
+    ];
+
+    for (route, class, exec_id_counterpart) in expected {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| format!("{m} {p}") == route),
+            "{route} must be registered in management_api_routes()"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == class),
+            "{route} must be classified {class:?} in CLASSIFIED_ROUTES"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES.iter().any(|(r, _)| *r == route),
+            "{route} must appear in ALL_MUTATION_ROUTES"
+        );
+        // The by-id route's EXCLUDED membership must exactly mirror its exec-id
+        // counterpart's — derived, so it can never silently diverge.
+        let counterpart_excluded = EXCLUDED_ROUTES.contains(&exec_id_counterpart);
+        assert_eq!(
+            EXCLUDED_ROUTES.contains(&route),
+            counterpart_excluded,
+            "{route} EXCLUDED_ROUTES membership ({}) must mirror its exec-id \
+             counterpart {exec_id_counterpart} ({counterpart_excluded})",
+            EXCLUDED_ROUTES.contains(&route)
+        );
+    }
+}
+
+/// `GET /admin/status` (issue #679) must be registered in the live route
+/// registry AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router, so this pin closes that gap for the new route.
+#[test]
+fn admin_status_route_is_classified() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    let route = "GET /admin/status";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+        "{route} must be classified RouteClass::ReadOnly in \
+         autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
+/// `GET /admin/usage` (issue #596) must have an entry in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: the corresponding
+/// `usage_report_route_is_classified_read_only` test in `audit.rs` only
+/// cross-checks `CLASSIFIED_ROUTES` against `ALL_MUTATION_ROUTES`/
+/// `EXCLUDED_ROUTES` internally, never against the live router, so it stays
+/// green even if `/admin/usage` were removed from `harvest_api_router`
+/// entirely. This test closes that gap.
+#[test]
+fn usage_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let route = "GET /admin/usage";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == route),
+        "{route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
+/// The completion-callback delivery list + redrive routes (issue #605) must
+/// have entries in `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`/`usage_route_is_classified`:
+/// these two routes shipped registered in `management_api_routes()` but
+/// initially absent from every classification list in `audit.rs`, exactly
+/// the gap this precedent test pattern exists to catch — `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router.
+#[test]
+fn completion_delivery_routes_are_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let list_route = "GET /workflows/{id}/completion-deliveries";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == list_route),
+        "{list_route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == list_route),
+        "{list_route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+
+    let redrive_route = "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == redrive_route),
+        "{redrive_route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == redrive_route),
+        "{redrive_route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
+/// `PATCH /admin/schedules/{id}` (issue #771) must be registered in the
+/// management route list AND classified in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: the audit-side mutual
+/// cross-check (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if
+/// a route is dropped from BOTH lists, so this test pins the route against
+/// the live router registry.
+#[test]
+fn schedule_update_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let route = "PATCH /admin/schedules/{id}";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == route),
+        "{route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
+/// The single-activity force-fail route (issue #765) must be registered in the
+/// live route registry, classified Mutating, and mapped to its audit
+/// operation.
+///
+/// Mirrors `workflow_count_route_is_classified`: `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router, so this pin closes that gap for the new route.
+#[test]
+fn fail_now_route_is_classified_and_audited() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, OP_ACTIVITY_FAIL_NOW, RouteClass,
+    };
+
+    let route = "POST /workflows/{id}/activities/{activity_exec_id}/fail-now";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && *class == RouteClass::Mutating),
+        "{route} must be classified Mutating in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && *op == Some(OP_ACTIVITY_FAIL_NOW)),
+        "{route} must be mapped to OP_ACTIVITY_FAIL_NOW in ALL_MUTATION_ROUTES"
+    );
+}
+
+/// `POST /workflows/{id}/replay-diagnosis` (issue #614) must be registered in
+/// the management route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES` (it is a POST for the replay action
+/// but appends no events / performs no writes), appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES`.
+///
+/// Mirrors `timeline_route_is_classified`: the audit-side mutual cross-check
+/// (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if a route is
+/// dropped from BOTH lists, so this pins the route against the live router.
+#[test]
+fn replay_diagnosis_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "POST /workflows/{id}/replay-diagnosis";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
+/// `GET /workflows/{id}/timeline` (issue #739) must be registered in the
+/// management route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES` — the exact
+/// read-only precedent set by `GET /workflows/{id}/stack`.
+///
+/// Mirrors `workflow_count_route_is_classified`: the audit-side mutual
+/// cross-check (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if a
+/// route is dropped from BOTH lists, so this test pins the route against the
+/// live router registry.
+#[test]
+fn timeline_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/{id}/timeline";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    // Read-only routes are declared in the manifest with a `None` audit op and
+    // listed in EXCLUDED_ROUTES (never audited as a mutation).
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
+/// The ephemeral workflow progress SSE stream (issue #791) must be registered
+/// in the management route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES` — the exact
+/// read-only precedent set by `GET /workflows/{id}/timeline`.
+///
+/// Mirrors `timeline_route_is_classified`: the audit-side mutual cross-check
+/// (`CLASSIFIED_ROUTES` vs `ALL_MUTATION_ROUTES`) stays green if a route is
+/// dropped from BOTH lists, so this pins the route against the live router
+/// registry. Note the route is deliberately NOT admin-gated (AC5).
+#[test]
+fn progress_stream_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/{id}/stream";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
+/// The tiered/summary retention list (issue #752) must be registered in the
+/// live route registry and classified `ReadOnly`, listed in
+/// `ALL_MUTATION_ROUTES` with no audit op, and in `EXCLUDED_ROUTES`.
+///
+/// Mirrors `timeline_route_is_classified`: the audit-side mutual cross-check
+/// stays green if a route is dropped from BOTH lists, so this pins the route
+/// against the live router registry.
+#[test]
+fn workflow_summaries_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/summaries";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
+/// `GET /workflows/{id}/run-chain` (issue #701) must be registered in the
+/// management route list AND classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`, appearing in the route manifest
+/// with no audit operation (`None`) and listed in `EXCLUDED_ROUTES` — the exact
+/// read-only precedent set by `GET /workflows/{id}/timeline`.
+#[test]
+fn run_chain_route_is_classified() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, EXCLUDED_ROUTES, RouteClass,
+    };
+
+    let route = "GET /workflows/{id}/run-chain";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && matches!(class, RouteClass::ReadOnly)),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && op.is_none()),
+        "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (None)"
+    );
+    assert!(
+        EXCLUDED_ROUTES.contains(&route),
+        "{route} is read-only and must be listed in EXCLUDED_ROUTES"
+    );
+}
+
+/// The DAG run graph view (issue #690) must be registered in the live route
+/// registry and classified `ReadOnly` in `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: `audit.rs`'s own exhaustiveness
+/// tests only cross-check `CLASSIFIED_ROUTES` and `ALL_MUTATION_ROUTES` against
+/// each other (which stays green if a route is dropped from BOTH), never against
+/// the live router — this pin closes that gap for the new route.
+#[test]
+fn dag_run_graph_route_is_classified() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    let route = "GET /dags/{dag_name}/runs/{run_exec_id}";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && *class == RouteClass::ReadOnly),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {
@@ -256,6 +763,61 @@ fn contract_read_only_classification_is_consistent() {
     }
 }
 
+/// The contract's `read_only` bool is a SECOND read/mutate source of truth
+/// alongside `autumn_harvest::audit::CLASSIFIED_ROUTES` (the class the #776
+/// read-only enforcement layer actually keys on). The existing
+/// `contract_read_only_classification_is_consistent` test only self-checks the
+/// JSON (a mutating-verb route must not be `read_only:true` unless
+/// `post_for_body_only`); it never compares the JSON flag to the class table,
+/// so the two could silently drift (as `POST /admin/build-routing/retire` did
+/// — `ReadOnly` in the class table but `read_only:false` in the contract).
+///
+/// This test cross-checks them directly: for every route present in BOTH
+/// sources, `contract.read_only` must equal "the class is `ReadOnly` or
+/// `PublicSafe`". (Routes present in only one source are covered by the other
+/// contract/classification exhaustiveness tests.)
+#[test]
+fn contract_read_only_flag_matches_classified_routes() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    let contract = load_contract();
+    // "METHOD path" -> is-read (ReadOnly | PublicSafe).
+    let class_is_read: HashMap<String, bool> = CLASSIFIED_ROUTES
+        .iter()
+        .map(|(template, class)| {
+            (
+                (*template).to_string(),
+                matches!(class, RouteClass::ReadOnly | RouteClass::PublicSafe),
+            )
+        })
+        .collect();
+
+    let mut mismatches = Vec::new();
+    for route in contract["routes"].as_array().unwrap() {
+        let method = route["method"].as_str().unwrap_or("");
+        let path = route["path"].as_str().unwrap_or("");
+        let key = format!("{method} {path}");
+        // Only routes classified in CLASSIFIED_ROUTES (the intersection).
+        let Some(&is_read) = class_is_read.get(&key) else {
+            continue;
+        };
+        let contract_read_only = route["read_only"].as_bool().unwrap_or(false);
+        if contract_read_only != is_read {
+            mismatches.push(format!(
+                "{key}: contract read_only={contract_read_only} but CLASSIFIED_ROUTES \
+                 class-is-read={is_read}"
+            ));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "docs/api-contract.json `read_only` must match \
+         autumn_harvest::audit::CLASSIFIED_ROUTES (ReadOnly/PublicSafe => read_only:true, \
+         Mutating => read_only:false):\n{mismatches:#?}"
+    );
+}
+
 /// Every contract route that has a structured `success_response` (i.e. a `fields`
 /// array rather than `free_form: true`) must have its top-level response field
 /// names listed in `management_api_response_fields()`, and vice-versa.
@@ -437,6 +999,125 @@ fn contract_routes_have_params_array() {
         assert!(
             route["params"].is_array(),
             "route {method} {path}: missing 'params' array (use [] when the route has no parameters)"
+        );
+    }
+}
+
+// ── Read-only operator role (issue #776) ──────────────────────────────────────
+
+/// AC4 coverage sweep: EVERY route registered in `management_api_routes()` (the
+/// authoritative mounted-route inventory) must resolve to a `RouteClass` entry
+/// in `autumn_harvest::audit::CLASSIFIED_ROUTES`. The read-only enforcement
+/// layer keys on that table; a mounted route with no class entry would be
+/// treated as a mutation (fail closed) — this test makes that classification
+/// gap a hard failure so the read-only tier's grant surface stays complete.
+///
+/// `audit.rs`'s own exhaustiveness guards only cross-check `CLASSIFIED_ROUTES`
+/// against `ALL_MUTATION_ROUTES`, never against the live router — which is
+/// exactly how routes drifted unclassified before #776.
+#[test]
+fn every_management_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+    use std::collections::HashSet;
+
+    let classified: HashSet<&str> = CLASSIFIED_ROUTES.iter().map(|(r, _)| *r).collect();
+    let mut unclassified: Vec<String> = Vec::new();
+    for (method, path) in management_api_routes() {
+        let key = format!("{method} {path}");
+        if !classified.contains(key.as_str()) {
+            unclassified.push(key);
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "management_api_routes() entries with no CLASSIFIED_ROUTES entry \
+         (read-only enforcement source of truth, issue #776 AC4):\n{unclassified:#?}"
+    );
+}
+
+/// Pin the specific mutation routes this diff classifies as `RouteClass::Mutating`
+/// (privilege-escalation guard, issue #776). A wrong `Mutating`→`ReadOnly` entry
+/// here would let a read-only principal force-open a circuit / create a calendar
+/// / retry a DAG / start-via-update. Mirrors the `business_id_routes_are_classified`
+/// per-route pinning style: the general guards only cross-check the two lists.
+#[test]
+fn readonly_role_new_mutations_are_classified_mutating() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    for route in [
+        "POST /workflows/{workflow_name}/update-with-start",
+        "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+        "POST /admin/circuits/{activity_name}/force-open",
+        "POST /admin/circuits/{activity_name}/force-close",
+        "POST /admin/completion-triggers",
+        "POST /calendars",
+        "PUT /calendars/{name}",
+        "DELETE /calendars/{name}",
+    ] {
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+            "{route} must be classified RouteClass::Mutating (issue #776) — a \
+             read-only principal must never reach it"
+        );
+    }
+}
+
+/// Pin the read routes newly classified for the read-only tier. Each must be
+/// `RouteClass::ReadOnly` so a read-only principal reaches it (AC1), and the
+/// three router-only routes (`/handlers`, the two by-id missing-id stubs) must
+/// be registered in `management_api_routes()` and the contract so the sweep
+/// above and `management_routes_match_contract` cover them.
+#[test]
+fn readonly_role_new_reads_are_classified_read_only() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    for route in [
+        "GET /batches/pending",
+        "GET /workflows/registered",
+        "GET /workflows/registered/{name}/schema",
+        "GET /workflows/types/{workflow_name}/handlers",
+        "GET /workflows/by-id/{workflow_name}",
+        "POST /workflows/by-id/{workflow_name}",
+        "GET /dead-letters/aggregate",
+        "GET /admin/circuits",
+        "GET /admin/circuits/{activity_name}",
+        "GET /admin/queues/scaling",
+        "GET /admin/metrics",
+        "GET /admin/completion-triggers",
+        "GET /admin/schedules/{id}",
+        "GET /admin/schedules/{id}/runs",
+        "GET /admin/schedules/decisions",
+        "GET /admin/schedules/{id}/decisions",
+        "GET /admin/schedules/{id}/preview",
+        "POST /admin/schedules/preview",
+        "GET /calendars",
+        "GET /calendars/{name}",
+        "GET /workers/{worker_id}/pinned",
+        "GET /admin/queues/{queue_name}/eligibility",
+        "GET /admin/tasks/{id}/eligibility",
+    ] {
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly (issue #776 AC1)"
+        );
+    }
+
+    // The three router-only routes must be registered so the AC4 sweep and the
+    // management_routes_match_contract test cover them.
+    for (method, path) in [
+        ("GET", "/workflows/types/{workflow_name}/handlers"),
+        ("GET", "/workflows/by-id/{workflow_name}"),
+        ("POST", "/workflows/by-id/{workflow_name}"),
+    ] {
+        assert!(
+            management_api_routes()
+                .iter()
+                .any(|(m, p)| *m == method && *p == path),
+            "{method} {path} must be registered in management_api_routes() (issue #776)"
         );
     }
 }

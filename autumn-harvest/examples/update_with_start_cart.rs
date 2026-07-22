@@ -142,6 +142,9 @@ async fn add_item_atomic(
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
             max_execution_timeout_ceiling: None,
+            // Chain-scoped lifetime cap (issue #617): SWS/UWS test fixture.
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
             concurrency_key: None,
             concurrency_limit: None,
             update_id,
@@ -157,6 +160,9 @@ async fn add_item_atomic(
             context_headers: None,
 
             sla: None,
+            workflow_retry_policy: None,
+            max_workflow_attempts_ceiling: None,
+            reject_fresh_if_debounced: false,
         },
     )
     .await?;

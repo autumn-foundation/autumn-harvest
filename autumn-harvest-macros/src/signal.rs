@@ -9,18 +9,28 @@ use syn::{ItemFn, LitStr, parse::Parser as _};
 
 struct SignalAttrs {
     workflow: Option<String>,
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<SignalAttrs> {
-    let mut result = SignalAttrs { workflow: None };
+    let mut result = SignalAttrs {
+        workflow: None,
+        description: None,
+    };
 
     syn::meta::parser(|meta| {
         if meta.path.is_ident("workflow") {
             let value: LitStr = meta.value()?.parse()?;
             result.workflow = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected `workflow = \"workflow_name\"`"))
+            Err(meta.error(
+                "unsupported attribute: expected `workflow = \"workflow_name\"` or `description = \"…\"`",
+            ))
         }
     })
     .parse2(attr)?;
@@ -60,6 +70,17 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
     let method_name = format_ident!("signal_{fn_name}");
+    let idem_method_name = format_ident!("signal_{fn_name}_idempotent");
+    let companion_name = format_ident!("__autumn_signal_handler_info_{fn_name}");
+    let public_info_name = format_ident!("{fn_name}_info");
+
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
+
+    // Best-effort Rust type name for the payload (params after `ctx`).
+    let arg_type_hint = build_arg_type_hint(&func.sig.inputs.iter().skip(1).collect::<Vec<_>>());
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -129,39 +150,70 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         tokens
     };
+    // Shared prologue: validate the target type, serialize the payload, and
+    // enforce the signal payload cap before any insert.
+    let cap_check = quote! {
+        handle.validate_workflow_type(conn, #workflow_simple_name).await?;
+        let payload = #serialize_payload;
+        let size = ::autumn_harvest::serde_json::to_string(&payload)
+            .map(|s| s.len() as u64)
+            .unwrap_or(0);
+        let limit = handle.client().max_signal_payload_bytes();
+        if size > limit {
+            return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
+                kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
+                observed_bytes: size,
+                cap_bytes: limit,
+                workflow_type: #workflow_simple_name.to_string(),
+                activity_name: None,
+            });
+        }
+    };
+
+    let method_defs = quote! {
+        /// Send a type-safe signal to this workflow execution.
+        pub async fn #method_name(
+            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+            handle: &::autumn_harvest::WorkflowHandle,
+            #(#params),*
+        ) -> ::autumn_harvest::HarvestResult<()> {
+            #cap_check
+            ::autumn_harvest::signal::send_signal(
+                conn,
+                handle.exec_id(),
+                #fn_name_str,
+                payload,
+            )
+            .await
+        }
+
+        /// Send a type-safe signal with an opt-in exactly-once delivery key.
+        ///
+        /// Returns `true` when freshly queued, `false` when the key deduped.
+        pub async fn #idem_method_name(
+            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+            handle: &::autumn_harvest::WorkflowHandle,
+            #(#params,)*
+            __autumn_idempotency_key: impl Into<Option<String>>,
+        ) -> ::autumn_harvest::HarvestResult<bool> {
+            #cap_check
+            let __idem_key = __autumn_idempotency_key.into();
+            ::autumn_harvest::signal::send_signal_idempotent(
+                conn,
+                handle.exec_id(),
+                #fn_name_str,
+                payload,
+                __idem_key.as_deref(),
+            )
+            .await
+        }
+    };
+
     let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
-                    /// Send a type-safe signal to this workflow execution.
-                    pub async fn #method_name(
-                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                        handle: &::autumn_harvest::WorkflowHandle,
-                        #(#params),*
-                    ) -> ::autumn_harvest::HarvestResult<()> {
-                        handle.validate_workflow_type(conn, #workflow_simple_name).await?;
-                        let payload = #serialize_payload;
-                        let size = ::autumn_harvest::serde_json::to_string(&payload)
-                            .map(|s| s.len() as u64)
-                            .unwrap_or(0);
-                        let limit = handle.client().max_signal_payload_bytes();
-                        if size > limit {
-                            return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
-                                kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
-                                observed_bytes: size,
-                                cap_bytes: limit,
-                                workflow_type: #workflow_simple_name.to_string(),
-                                activity_name: None,
-                            });
-                        }
-                        ::autumn_harvest::signal::send_signal(
-                            conn,
-                            handle.exec_id(),
-                            #fn_name_str,
-                            payload,
-                        )
-                        .await
-                    }
+                    #method_defs
                 }
             }
         }
@@ -172,35 +224,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use super::*;
                     use #leading_colon #(#nested_path_tokens::)*#stub_ident;
                     impl #stub_ident {
-                        /// Send a type-safe signal to this workflow execution.
-                        pub async fn #method_name(
-                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<()> {
-                            handle.validate_workflow_type(conn, #workflow_simple_name).await?;
-                            let payload = #serialize_payload;
-                            let size = ::autumn_harvest::serde_json::to_string(&payload)
-                                .map(|s| s.len() as u64)
-                                .unwrap_or(0);
-                            let limit = handle.client().max_signal_payload_bytes();
-                            if size > limit {
-                                return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
-                                    kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
-                                    observed_bytes: size,
-                                    cap_bytes: limit,
-                                    workflow_type: #workflow_simple_name.to_string(),
-                                    activity_name: None,
-                                });
-                            }
-                            ::autumn_harvest::signal::send_signal(
-                                conn,
-                                handle.exec_id(),
-                                #fn_name_str,
-                                payload,
-                            )
-                            .await
-                        }
+                        #method_defs
                     }
                 }
             }
@@ -210,8 +234,51 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #func
 
+        #[doc(hidden)]
+        pub fn #companion_name() -> ::autumn_harvest::SignalHandlerInfo {
+            ::autumn_harvest::SignalHandlerInfo {
+                name: #fn_name_str,
+                workflow: #workflow_simple_name,
+                module: module_path!(),
+                arg_type_hint: #arg_type_hint,
+                description: #description_expr,
+                arg_schema: ::std::option::Option::None,
+            }
+        }
+
+        /// Returns the [`::autumn_harvest::SignalHandlerInfo`] for this signal.
+        ///
+        /// Chain a payload-schema builder at registration, e.g.
+        /// `.signals(vec![#public_info_name().with_schemas::<Arg>()])`.
+        pub fn #public_info_name() -> ::autumn_harvest::SignalHandlerInfo {
+            #companion_name()
+        }
+
         #impl_block
     }
+}
+
+/// Returns a `String` describing the payload params for `arg_type_hint`.
+fn build_arg_type_hint(params: &[&syn::FnArg]) -> String {
+    if params.is_empty() {
+        return "()".to_string();
+    }
+    if params.len() == 1
+        && let syn::FnArg::Typed(pt) = params[0]
+    {
+        return crate::type_name_hint(&pt.ty);
+    }
+    let parts: Vec<_> = params
+        .iter()
+        .filter_map(|arg| {
+            if let syn::FnArg::Typed(pt) = arg {
+                Some(crate::type_name_hint(&pt.ty))
+            } else {
+                None
+            }
+        })
+        .collect();
+    format!("({})", parts.join(", "))
 }
 
 fn first_param_is_ctx(inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>) -> bool {

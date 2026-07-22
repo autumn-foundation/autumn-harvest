@@ -1,0 +1,48 @@
+[package]
+name = "autumn-harvest-sqlite"
+description = "Embedded, single-writer SQLite backend for autumn-harvest (edge / local-first)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn-harvest"
+readme = "README.md"
+keywords = ["workflow", "sqlite", "edge", "local-first", "autumn"]
+categories = ["asynchronous", "database", "embedded"]
+
+[features]
+default = []
+
+[dependencies]
+# The pure, backend-neutral determinism core: `default-features = false` drops
+# `db` (Diesel/Postgres) so only `run_workflow`, `WorkflowEvent`, the replay
+# engine, and `WorkflowContext` are pulled in.
+autumn-harvest = { version = "0.5.0", path = "../autumn-harvest", default-features = false }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `testing` gives the cross-backend replay harness (`WorkflowReplayer`).
+autumn-harvest = { path = "../autumn-harvest", default-features = false, features = ["testing"] }
+# Used directly by the orphan-reclaim test to inspect raw `harvest_tasks` state.
+rusqlite = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+# Single consolidated integration-test binary. Cargo compiles each top-level
+# `tests/*.rs` as its own binary; routing every per-area file through one
+# `[[test]]` target (with the files as `mod`s in `tests/integration/mod.rs`)
+# collapses ~17 binaries into 1, cutting CI compile time and disk. Mirrors the
+# core `autumn-harvest` crate's `integration` target.
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[lints]
+workspace = true

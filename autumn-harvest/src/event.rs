@@ -10,11 +10,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    TimerId, UpdateId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
+    ExternalSignalId, TimerId, UpdateId, WorkerId,
 };
 
 fn default_error_type() -> String {
@@ -83,6 +84,13 @@ pub enum WorkflowEvent {
         /// and `None` for manual starts. Frozen at workflow start time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
+        /// The nominal scheduled fire-time (logical slot) this run is responsible for
+        /// (issue #508). `Some` for scheduled / backfilled / caught-up runs; `None` for
+        /// direct/manual API starts, ad-hoc trigger-now, and pre-#508 histories. This is
+        /// the pre-jitter logical slot (`scheduled_for`), NOT `effective_fire_time` and
+        /// NOT the execution start wall-clock (`timestamp`). Frozen at start; replay-stable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheduled_time: Option<DateTime<Utc>>,
     },
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
@@ -90,9 +98,41 @@ pub enum WorkflowEvent {
         output: serde_json::Value,
     },
     /// The workflow panicked or returned a non-recoverable error.
+    ///
+    /// ## Backward-compatibility note (issue #767)
+    ///
+    /// `error_type`, `details`, and `non_retryable` were added after the
+    /// initial release. Old events stored without these fields deserialise
+    /// cleanly via `#[serde(default)]` to `None`. Unlike `ActivityFailed`,
+    /// `error_type` is `Option<String>` (not defaulted to `"Error"`) so a
+    /// pre-#767 untyped failure is distinguishable from a typed one. The
+    /// append-only invariant is preserved — no variants removed, no renames.
     WorkflowFailed {
-        /// String representation of the failure.
+        /// Human-readable string representation of the failure.
         error: String,
+        /// Low-cardinality error-type name from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for events stored before issue #767 or for failures returned
+        /// via the legacy `Err(String)` path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        /// Optional structured details preserved from
+        /// [`WorkflowFailure::with_details`](crate::failure::WorkflowFailure::with_details).
+        ///
+        /// `None` for untyped or pre-#767 failures. Omitted from the serialised
+        /// form when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable classification hint from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for untyped or pre-#767 failures. This is a downstream
+        /// classification hint (caller / completion-trigger), **not** a control
+        /// input to the engine's workflow-level retry (#523) loop (issue #767
+        /// scope).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        non_retryable: Option<bool>,
     },
     /// The workflow was intentionally cancelled (e.g., via API or parent workflow).
     WorkflowCancelled {
@@ -217,11 +257,38 @@ pub enum WorkflowEvent {
         output: serde_json::Value,
     },
     /// The spawned sub-workflow encountered a fatal error.
+    ///
+    /// ## Backward-compatibility note (issue #767)
+    ///
+    /// `error_type`, `details`, and `non_retryable` were added after the
+    /// initial release and deserialise to `None` for pre-#767 events. See
+    /// [`WorkflowFailed`](Self::WorkflowFailed) for the full rationale.
     ChildWorkflowFailed {
         /// The ID of the spawned execution.
         child_id: ExecutionId,
-        /// The reason the child failed.
+        /// The reason the child failed (human-readable message).
         error: String,
+        /// Low-cardinality error-type name from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for pre-#767 or untyped child failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        /// Optional structured details from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for pre-#767 or untyped child failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable classification hint from a typed
+        /// [`WorkflowFailure`](crate::failure::WorkflowFailure).
+        ///
+        /// `None` for pre-#767 or untyped child failures. This is a downstream
+        /// classification hint (caller / completion-trigger), **not** a control
+        /// input to the engine's workflow-level retry (#523) loop (issue #767
+        /// scope).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        non_retryable: Option<bool>,
     },
 
     // ── Markers ───────────────────────────────────────────────────
@@ -256,6 +323,52 @@ pub enum WorkflowEvent {
         name: String,
         /// JSON input for the activity.
         input: serde_json::Value,
+        /// Disambiguation marker distinguishing a #620+ event whose defaults were
+        /// fully resolved at first schedule from a genuine pre-#620 legacy event
+        /// (issue #620, Codex P2). BOTH `retry_policy` and `start_to_close_nanos`
+        /// below serialize as absent when they resolved to "no floor", so an
+        /// absent value alone cannot tell a resolved-to-nothing #620+ event apart
+        /// from a legacy event — the former MUST stay frozen (implicit 1-attempt /
+        /// no STC floor) on recovery, the latter MUST fall back to live
+        /// re-derivation for backward compat. This one marker covers both frozen
+        /// fields: every #620+ schedule writes it `true` at the same first-schedule
+        /// anchor; a pre-#620 event has the field absent → deserializes to `false`.
+        #[serde(default)]
+        resolved: bool,
+        /// The fully-resolved retry policy this local activity was scheduled
+        /// with (call-site → activity default → builder default; issue #620).
+        ///
+        /// Additive/optional: pre-#620 events deserialize to `None`. On a #620+
+        /// event (`resolved == true`), a recorded `None` means "explicitly
+        /// resolved to no retry floor" and MUST stay frozen (implicit 1 attempt);
+        /// a legacy event (`resolved == false`) with `None` falls back to today's
+        /// live re-derivation. Frozen here so a local activity mid-retry across a
+        /// worker crash keeps its ORIGINAL retry budget even if the builder-level
+        /// default (`WorkerConfig::with_default_activity_retry_policy`) is changed
+        /// in the crash-recovery window (AC8: an in-flight execution is unaffected
+        /// by later default changes). Recorded on the live frontier at first
+        /// schedule; read on crash-recovery replay — the established side-effect
+        /// pattern.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_policy: Option<crate::policy::RetryPolicy>,
+        /// The fully-resolved `start_to_close` this local activity was scheduled
+        /// with, in **nanoseconds** (call-site → activity default → builder
+        /// default; issue #620, Codex P2). Nanoseconds — the FULL `Duration`
+        /// precision — so no floor is ever truncated: the local per-attempt
+        /// timeout is `Duration::from_nanos(this).min(cap)`. Truncating at any
+        /// coarser unit is the same footgun one order down (a seconds field
+        /// zeroes a subsecond floor; a millis field zeroes a sub-millisecond
+        /// floor like `Duration::from_micros(500)`), so the full `Duration` is
+        /// carried end-to-end (`u64` nanos ≈ 584 years — never saturates for a
+        /// realistic timeout).
+        ///
+        /// Additive/optional, same freeze semantics as `retry_policy`: on a #620+
+        /// event (`resolved == true`) a recorded value — `Some` OR `None` — is
+        /// authoritative on recovery (`None` = "explicitly resolved to no STC
+        /// floor", frozen); a legacy event (`resolved == false`) falls back to
+        /// live re-derivation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_to_close_nanos: Option<u64>,
     },
     /// A local activity finished executing successfully.
     LocalActivityCompleted {
@@ -417,6 +530,10 @@ pub enum WorkflowEvent {
         signal_name: String,
         /// JSON payload to deliver to the receiving workflow.
         payload: serde_json::Value,
+        /// Additive optional exactly-once delivery key; dedups re-issued
+        /// requests against `uq_harvest_signals_idem`. Older events load as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     /// The signal was successfully inserted into the target workflow's signal
     /// queue (or durably queued via the outbox for cross-shard delivery).
@@ -585,9 +702,228 @@ pub enum WorkflowEvent {
         /// Machine-readable reason code (`"target_unknown"`).
         reason_code: String,
     },
+
+    // ── DLQ redrive reactivation (issue #510) ─────────────────────────────────
+    /// An operator redrove a dead-lettered task whose owning execution had been
+    /// sealed `FAILED` at quarantine time. This event reopens the execution: it
+    /// is appended **after** the superseded terminal
+    /// [`WorkflowFailed`](Self::WorkflowFailed) and the execution transitions
+    /// `FAILED` → `RUNNING` so the re-enqueued task resumes from existing
+    /// history (append-only; no prior event is rewritten).
+    ///
+    /// ## Replay determinism
+    ///
+    /// `WorkflowRedriven` is a **non-terminal** lifecycle event and is a no-op
+    /// for command dispatch during replay: the
+    /// [`crate::replay::HistoryMatcher`] marks both this event **and** the
+    /// `WorkflowFailed` it supersedes as transparent, so the reconstructed
+    /// command sequence advances past the reopened terminal instead of
+    /// diverging against it. A bare trailing `WorkflowFailed` with no following
+    /// `WorkflowRedriven` stays non-transparent (a genuinely failed run).
+    WorkflowRedriven {
+        /// Wall-clock time the redrive reactivation was applied.
+        redriven_at: DateTime<Utc>,
+        /// The `harvest_dead_letters` row that triggered this reactivation.
+        dead_letter_id: Uuid,
+        /// Optional operator-supplied reason. `None` when no reason was given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    // ── Workflow-level retry linkage (issue #523) ─────────────────────────────────
+    /// Appended to a sealed `FAILED` execution immediately after `WorkflowFailed`
+    /// when the engine auto-schedules a retry run.
+    ///
+    /// ## Replay determinism
+    ///
+    /// This event lives ONLY in the sealed failed run's history and is appended
+    /// **after** the terminal `WorkflowFailed` event. The
+    /// [`crate::replay::HistoryMatcher`] stops consuming events after a terminal
+    /// lifecycle event, so this trailing event is transparent to replay: the
+    /// failed run is already sealed; its retry is a separate execution.
+    WorkflowRetryScheduled {
+        /// The execution ID of the newly-created retry run.
+        retry_exec_id: ExecutionId,
+        /// Attempt number of the NEW run (= `failed_run.workflow_attempt` + 1).
+        attempt: u32,
+        /// Wall-clock instant when the retry becomes claimable by a worker.
+        /// `Utc::now()` for immediate retries, or `now + backoff` for delayed ones.
+        fire_at: DateTime<Utc>,
+    },
+
+    // ── Cancellable / renewable durable timers (issue #768) ───────────────────────
+    /// Records that an author-controlled durable timer was cancelled (or reset).
+    ///
+    /// Emitted by the non-suspending [`crate::context::WorkflowCommand::CancelTimer`]
+    /// bookkeeping command (via `handle.cancel()`, `ctx.cancel_timer(id)`, or the
+    /// cancel half of `handle.reset(..)`). The corresponding `harvest_timers` row is
+    /// deleted in the same transaction, so no [`Self::TimerFired`] is ever produced
+    /// for a cancelled timer.
+    ///
+    /// ## Replay determinism
+    ///
+    /// A `TimerCancelled { timer_id }` recorded **before** any `TimerFired` with the
+    /// same id resolves the timer's observed outcome to
+    /// [`crate::context::TimerOutcome::Cancelled`]. It is a command-bearing event
+    /// that may interleave with unrelated activity/timer/child scans, so every
+    /// forward scan loop in [`crate::replay::HistoryMatcher`] skips it out of order
+    /// (mirroring the `TimerFired` / external-cancel skip pattern).
+    ///
+    /// Appended at the END of the enum; pre-#768 histories that never contain this
+    /// variant deserialize unchanged.
+    TimerCancelled {
+        /// The id of the timer that was cancelled.
+        timer_id: TimerId,
+    },
+
+    // ── External workflow await (issue #757) ──────────────────────────────────
+    /// A workflow requested to durably await the terminal outcome of another
+    /// workflow execution by `ExecutionId`.
+    ///
+    /// The `await_id` correlates this request with its terminal outcome event
+    /// (`ExternalAwaitResolved` or `ExternalAwaitFailed`). On replay the
+    /// caller's context returns the recorded outcome without re-observing the
+    /// target. Unlike cancel/signal, the await is **observe-only** — it never
+    /// establishes parent/child linkage, cancels, or otherwise affects the
+    /// target's lifecycle.
+    ExternalAwaitRequested {
+        /// Correlation ID linking this event to its terminal outcome.
+        await_id: ExternalAwaitId,
+        /// The execution ID of the workflow to await.
+        target: ExecutionId,
+    },
+    /// The awaited target reached a `COMPLETED` terminal state. Carries the
+    /// target's recorded output (inflated), frozen into the awaiter's own
+    /// history so replay is deterministic.
+    ExternalAwaitResolved {
+        /// Correlation ID matching the corresponding `ExternalAwaitRequested`.
+        await_id: ExternalAwaitId,
+        /// The target workflow's terminal output value.
+        output: serde_json::Value,
+    },
+    /// The awaited target reached a non-`COMPLETED` terminal state
+    /// (`FAILED`/`TIMED_OUT`/`CANCELLED`/`TERMINATED`), or the target could not
+    /// be found after the configured grace window.
+    ///
+    /// `reason_code` is one of:
+    /// - `"target_failed"` — the target reached `FAILED`.
+    /// - `"target_timed_out"` — the target reached `TIMED_OUT`.
+    /// - `"target_cancelled"` — the target reached `CANCELLED`.
+    /// - `"target_terminated"` — the target reached `TERMINATED`.
+    /// - `"target_unknown"` — no execution matching `target` was found within
+    ///   the grace window.
+    ///
+    /// For a `FAILED` target the `message`/`error_type`/`details`/`non_retryable`
+    /// carry the target's typed [`crate::failure::WorkflowFailure`] (decoded via
+    /// [`crate::failure::decode_workflow_failure`]); for transport failures or
+    /// untyped failures they are `None`.
+    ExternalAwaitFailed {
+        /// Correlation ID matching the corresponding `ExternalAwaitRequested`.
+        await_id: ExternalAwaitId,
+        /// Machine-readable reason code (see variant docs).
+        reason_code: String,
+        /// Human-readable failure message from the target's terminal cause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Stable error-type name from a typed target failure; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        /// Structured details from a typed target failure; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+        /// Advisory non-retryable flag from a typed target failure; `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        non_retryable: Option<bool>,
+    },
+    /// A durable mutex was acquired (issue #691). Records exclusive access to
+    /// `key` with the monotonic fencing token `lock_seq`. This is the replay
+    /// anchor for `ctx.mutex(key).acquire()`.
+    ///
+    /// Release is EVENT-LESS bookkeeping (mirrors `SetCurrentDetails`) — there
+    /// is intentionally NO `MutexReleased` event, so no forward-scan skip-list
+    /// needs updating.
+    MutexGranted {
+        /// The lock key that was acquired.
+        key: String,
+        /// Monotonic fencing token minted for this grant.
+        lock_seq: i64,
+        /// Wall-clock instant the lock was granted.
+        acquired_at: DateTime<Utc>,
+    },
 }
 
 impl WorkflowEvent {
+    /// Forward-compatible constructor for [`WorkflowEvent::WorkflowStarted`] that
+    /// defaults the carryover (#488) and scheduled-time (#508) additive fields to
+    /// `None`. Gives downstream code a non-breaking construction path across future
+    /// additive field additions to this variant (issue #688).
+    #[must_use]
+    pub const fn workflow_started(
+        input: serde_json::Value,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self::WorkflowStarted {
+            input,
+            timestamp,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    /// Construct an untyped [`WorkflowEvent::WorkflowFailed`] (issue #767): the
+    /// typed fields default to `None`, preserving pre-#767 legacy semantics.
+    #[must_use]
+    pub fn workflow_failed(error: impl Into<String>) -> Self {
+        Self::WorkflowFailed {
+            error: error.into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+
+    /// Construct a typed [`WorkflowEvent::WorkflowFailed`] from a decoded
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) payload (issue #767).
+    #[must_use]
+    pub fn workflow_failed_typed(decoded: &crate::failure::DecodedWorkflowFailure) -> Self {
+        Self::WorkflowFailed {
+            error: decoded.message.clone(),
+            error_type: decoded.error_type.clone(),
+            details: decoded.details.clone(),
+            non_retryable: decoded.non_retryable,
+        }
+    }
+
+    /// Construct an untyped [`WorkflowEvent::ChildWorkflowFailed`] (issue #767):
+    /// the typed fields default to `None`, preserving pre-#767 legacy semantics.
+    #[must_use]
+    pub fn child_workflow_failed(child_id: ExecutionId, error: impl Into<String>) -> Self {
+        Self::ChildWorkflowFailed {
+            child_id,
+            error: error.into(),
+            error_type: None,
+            details: None,
+            non_retryable: None,
+        }
+    }
+
+    /// Construct a typed [`WorkflowEvent::ChildWorkflowFailed`] from a decoded
+    /// [`WorkflowFailure`](crate::failure::WorkflowFailure) payload (issue #767).
+    #[must_use]
+    pub fn child_workflow_failed_typed(
+        child_id: ExecutionId,
+        decoded: &crate::failure::DecodedWorkflowFailure,
+    ) -> Self {
+        Self::ChildWorkflowFailed {
+            child_id,
+            error: decoded.message.clone(),
+            error_type: decoded.error_type.clone(),
+            details: decoded.details.clone(),
+            non_retryable: decoded.non_retryable,
+        }
+    }
+
     /// Stable string identifier for this event variant, stored in
     /// `harvest_events.event_type`.
     #[must_use]
@@ -636,6 +972,13 @@ impl WorkflowEvent {
             Self::ExternalCancelRequested { .. } => "ExternalCancelRequested",
             Self::ExternalCancelDelivered { .. } => "ExternalCancelDelivered",
             Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
+            Self::WorkflowRedriven { .. } => "WorkflowRedriven",
+            Self::WorkflowRetryScheduled { .. } => "WorkflowRetryScheduled",
+            Self::TimerCancelled { .. } => "TimerCancelled",
+            Self::ExternalAwaitRequested { .. } => "ExternalAwaitRequested",
+            Self::ExternalAwaitResolved { .. } => "ExternalAwaitResolved",
+            Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
+            Self::MutexGranted { .. } => "MutexGranted",
         }
     }
 
@@ -656,6 +999,10 @@ impl WorkflowEvent {
                 // never consumed by the workflow function itself, so must be skipped
                 // during unconsumed-event checks to avoid false non-determinism reports.
                 | Self::ChildWorkflowCascadeApplied { .. }
+                // Appended to the failed run's history after WorkflowFailed as a
+                // durable linkage record; the failed run is sealed and the event is
+                // never consumed by its workflow function on replay.
+                | Self::WorkflowRetryScheduled { .. }
         )
     }
 }
@@ -665,6 +1012,86 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    // ── WorkflowFailed / ChildWorkflowFailed typed-failure tests (issue #767) ─
+
+    #[test]
+    fn workflow_failed_pre_767_json_deserializes_with_none() {
+        let old_json = r#"{"type":"WorkflowFailed","data":{"error":"boom"}}"#;
+        let back: WorkflowEvent = serde_json::from_str(old_json).unwrap();
+        match back {
+            WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(error, "boom");
+                assert!(error_type.is_none());
+                assert!(details.is_none());
+                assert!(non_retryable.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn child_workflow_failed_pre_767_json_deserializes_with_none() {
+        let old_json = r#"{"type":"ChildWorkflowFailed","data":{"child_id":"00000000-0000-0000-0000-000000000001","error":"boom"}}"#;
+        let back: WorkflowEvent = serde_json::from_str(old_json).unwrap();
+        match back {
+            WorkflowEvent::ChildWorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error, "boom");
+                assert!(error_type.is_none());
+                assert!(details.is_none());
+                assert!(non_retryable.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn workflow_failed_typed_round_trips() {
+        use crate::failure::IntoWorkflowErrorString;
+        let decoded = crate::failure::decode_workflow_failure(
+            &crate::failure::WorkflowFailure::new("ValidationRejected", "bad")
+                .with_details(serde_json::json!({"field": "x"}))
+                .non_retryable()
+                .into_workflow_error_payload(),
+        );
+        let event = WorkflowEvent::workflow_failed_typed(&decoded);
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowEvent::WorkflowFailed {
+                error,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(error, "bad");
+                assert_eq!(error_type, Some("ValidationRejected".to_string()));
+                assert_eq!(details, Some(serde_json::json!({"field": "x"})));
+                assert_eq!(non_retryable, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn workflow_failed_none_fields_omitted_from_json() {
+        let event = WorkflowEvent::workflow_failed("x");
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("error_type"));
+        assert!(!json.contains("details"));
+        assert!(!json.contains("non_retryable"));
+    }
 
     // ── ActivityFailed typed-failure tests (issue #227) ──────────────────────
 
@@ -748,11 +1175,70 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::WorkflowStarted { .. }));
         Ok(())
+    }
+
+    // ── issue #508: scheduled_time field ────────────────────────────────────────
+
+    /// Legacy JSON without `scheduled_time` deserializes to `None` (backward compat).
+    #[test]
+    fn workflow_started_legacy_json_scheduled_time_defaults_to_none() {
+        let legacy_json =
+            r#"{"type":"WorkflowStarted","data":{"input":{},"timestamp":"2026-01-01T00:00:00Z"}}"#;
+        let event: WorkflowEvent = serde_json::from_str(legacy_json).unwrap();
+        match event {
+            WorkflowEvent::WorkflowStarted { scheduled_time, .. } => {
+                assert!(
+                    scheduled_time.is_none(),
+                    "legacy JSON must deserialize to None"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `scheduled_time: Some(t)` round-trips correctly through serde.
+    #[test]
+    fn workflow_started_scheduled_time_round_trips() {
+        use chrono::TimeZone as _;
+        let slot = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!(null),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: Some(slot),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowEvent::WorkflowStarted { scheduled_time, .. } => {
+                assert_eq!(scheduled_time, Some(slot));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `scheduled_time: None` is omitted from JSON (no key emitted).
+    #[test]
+    fn workflow_started_scheduled_time_none_omitted_from_json() {
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!(null),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("scheduled_time"),
+            "None should be omitted from JSON, got: {json}"
+        );
     }
 
     #[test]
@@ -770,15 +1256,100 @@ mod tests {
     }
 
     #[test]
+    fn mutex_granted_round_trips() -> Result<(), serde_json::Error> {
+        // Issue #691: the durable-mutex replay anchor round-trips verbatim and
+        // carries the adjacently-tagged `"type":"MutexGranted"` discriminator.
+        let event = WorkflowEvent::MutexGranted {
+            key: "ledger:acct-42".into(),
+            lock_seq: 7,
+            acquired_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["type"], "MutexGranted");
+        assert_eq!(value["data"]["key"], "ledger:acct-42");
+        assert_eq!(value["data"]["lock_seq"], 7);
+        let back: WorkflowEvent = serde_json::from_value(value)?;
+        let WorkflowEvent::MutexGranted {
+            key,
+            lock_seq,
+            acquired_at,
+        } = back
+        else {
+            panic!("expected MutexGranted, got {}", event.type_name());
+        };
+        assert_eq!(key, "ledger:acct-42");
+        assert_eq!(lock_seq, 7);
+        assert_eq!(
+            acquired_at,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn local_activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
+        // Issue #620 (Codex P2): a #620+ event carrying the resolution marker
+        // plus frozen retry/STC must round-trip all three fields verbatim.
         let event = WorkflowEvent::LocalActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "format_data".into(),
             input: serde_json::json!({"x": 1}),
+            resolved: true,
+            retry_policy: Some(crate::policy::RetryPolicy::fixed(
+                4,
+                std::time::Duration::from_millis(10),
+            )),
+            // A sub-millisecond value (500µs = 500_000 ns): a millis field would
+            // have zeroed it — the full-nanos field round-trips it exactly.
+            start_to_close_nanos: Some(500_000),
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
-        assert!(matches!(back, WorkflowEvent::LocalActivityScheduled { .. }));
+        match back {
+            WorkflowEvent::LocalActivityScheduled {
+                resolved,
+                retry_policy,
+                start_to_close_nanos,
+                ..
+            } => {
+                assert!(resolved, "resolution marker must round-trip as true");
+                assert_eq!(
+                    retry_policy.map(|p| p.max_attempts),
+                    Some(4),
+                    "frozen retry policy must round-trip"
+                );
+                assert_eq!(
+                    start_to_close_nanos,
+                    Some(500_000),
+                    "frozen sub-millisecond STC nanos must round-trip exactly"
+                );
+            }
+            other => panic!("expected LocalActivityScheduled, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pre_620_local_activity_scheduled_deserializes_as_unresolved() -> Result<(), serde_json::Error>
+    {
+        // A pre-#620 stored event has none of the three additive fields. It must
+        // deserialize with `resolved = false` (legacy → re-derive on recovery)
+        // and both frozen fields `None`, preserving the append-only invariant.
+        let legacy = r#"{"type":"LocalActivityScheduled","data":{"activity_id":"00000000-0000-0000-0000-000000000001","name":"format_data","input":{"x":1}}}"#;
+        let back: WorkflowEvent = serde_json::from_str(legacy)?;
+        match back {
+            WorkflowEvent::LocalActivityScheduled {
+                resolved,
+                retry_policy,
+                start_to_close_nanos,
+                ..
+            } => {
+                assert!(!resolved, "a legacy event must deserialize as unresolved");
+                assert!(retry_policy.is_none());
+                assert!(start_to_close_nanos.is_none());
+            }
+            other => panic!("expected LocalActivityScheduled, got {other:?}"),
+        }
         Ok(())
     }
 
@@ -848,11 +1419,12 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
             },
-            WorkflowEvent::WorkflowFailed { error: "x".into() },
+            WorkflowEvent::workflow_failed("x"),
             WorkflowEvent::WorkflowCancelled { reason: "x".into() },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -904,10 +1476,7 @@ mod tests {
                 child_id: ExecutionId::new(),
                 output: serde_json::Value::Null,
             },
-            WorkflowEvent::ChildWorkflowFailed {
-                child_id: ExecutionId::new(),
-                error: "x".into(),
-            },
+            WorkflowEvent::child_workflow_failed(ExecutionId::new(), "x"),
             WorkflowEvent::MarkerRecorded {
                 name: "m".into(),
                 details: serde_json::Value::Null,
@@ -943,6 +1512,9 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 name: "format_data".into(),
                 input: serde_json::Value::Null,
+                resolved: false,
+                retry_policy: None,
+                start_to_close_nanos: None,
             },
             WorkflowEvent::LocalActivityCompleted {
                 activity_id: ActivityExecId::new(),
@@ -952,6 +1524,11 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 error: "transient".into(),
                 attempt: 1,
+            },
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id: ActivityExecId::new(),
+                error: "permanent".into(),
+                attempt: 3,
             },
             WorkflowEvent::UpdateAdmitted {
                 update_id: crate::types::UpdateId::new(),
@@ -983,6 +1560,7 @@ mod tests {
                 target: ExecutionId::new(),
                 signal_name: "cancel".into(),
                 payload: serde_json::Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered {
                 signal_id: crate::types::ExternalSignalId::new(),
@@ -1009,11 +1587,105 @@ mod tests {
                 resumed_at: Utc::now(),
                 actor: "oncall".into(),
             },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: ExecutionId::new(),
+                workflow_name: "child_wf".into(),
+                input: serde_json::Value::Null,
+                parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: ExecutionId::new(),
+                policy: crate::types::ParentClosePolicy::RequestCancel,
+                action: "request_cancel".into(),
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id: crate::types::ExternalCancelId::new(),
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalCancelDelivered {
+                cancel_id: crate::types::ExternalCancelId::new(),
+            },
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id: crate::types::ExternalCancelId::new(),
+                reason_code: "target_unknown".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: Utc::now(),
+                dead_letter_id: Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: Utc::now(),
+            },
+            WorkflowEvent::TimerCancelled {
+                timer_id: TimerId::new("t"),
+            },
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: crate::types::ExternalAwaitId::new(),
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: crate::types::ExternalAwaitId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: crate::types::ExternalAwaitId::new(),
+                reason_code: "target_failed".into(),
+                message: None,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            },
         ];
 
-        assert_eq!(events.len(), 37);
+        assert_eq!(events.len(), 49);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 37, "duplicate type names detected");
+        assert_eq!(names.len(), 49, "duplicate type names detected");
+    }
+
+    // ── TimerCancelled tests (issue #768) ─────────────────────────────────────
+
+    #[test]
+    fn timer_cancelled_round_trips() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::TimerCancelled {
+            timer_id: TimerId::new("idle-timeout"),
+        };
+        assert_eq!(event.type_name(), "TimerCancelled");
+        let json = serde_json::to_string(&event)?;
+        // Adjacently-tagged serde contract.
+        assert!(
+            json.contains("\"type\":\"TimerCancelled\""),
+            "type tag must be present: {json}"
+        );
+        assert!(
+            json.contains("\"timer_id\":\"idle-timeout\""),
+            "timer_id must be nested under data: {json}"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::TimerCancelled { timer_id } => {
+                assert_eq!(timer_id, TimerId::new("idle-timeout"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pre_cancellation_history_deserializes_unchanged() -> Result<(), serde_json::Error> {
+        // A history captured before issue #768 — a TimerStarted followed by a
+        // TimerFired — must still deserialize into exactly the same variants.
+        let json = r#"[
+            {"type":"TimerStarted","data":{"timer_id":"t","duration_secs":300}},
+            {"type":"TimerFired","data":{"timer_id":"t"}}
+        ]"#;
+        let events: Vec<WorkflowEvent> = serde_json::from_str(json)?;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], WorkflowEvent::TimerStarted { .. }));
+        assert!(matches!(events[1], WorkflowEvent::TimerFired { .. }));
+        Ok(())
     }
 
     // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────
@@ -1131,6 +1803,7 @@ mod tests {
             target,
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
+            idempotency_key: Some("evt_123".into()),
         };
         assert_eq!(event.type_name(), "ExternalSignalRequested");
         let json = serde_json::to_string(&event)?;
@@ -1141,12 +1814,41 @@ mod tests {
                 target: t,
                 signal_name,
                 payload,
+                idempotency_key,
             } => {
                 assert_eq!(sid, signal_id);
                 assert_eq!(t, target);
                 assert_eq!(signal_name, "tenant_cancel");
                 assert_eq!(payload["reason"], "billing_lapse");
+                assert_eq!(idempotency_key.as_deref(), Some("evt_123"));
             }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_requested_pre_521_json_deserializes_without_key()
+    -> Result<(), serde_json::Error> {
+        // An older event has no `idempotency_key` field; the additive
+        // `#[serde(default)]` must deserialize it to `None` (append-only
+        // invariant: no new variant, old JSON still loads).
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let legacy = serde_json::json!({
+            "type": "ExternalSignalRequested",
+            "data": {
+                "signal_id": signal_id,
+                "target": target,
+                "signal_name": "tenant_cancel",
+                "payload": {"reason": "billing_lapse"}
+            }
+        });
+        let back: WorkflowEvent = serde_json::from_value(legacy)?;
+        match back {
+            WorkflowEvent::ExternalSignalRequested {
+                idempotency_key, ..
+            } => assert_eq!(idempotency_key, None),
             _ => panic!("wrong variant"),
         }
         Ok(())
@@ -1217,6 +1919,7 @@ mod tests {
                 target,
                 signal_name: "x".into(),
                 payload: serde_json::Value::Null,
+                idempotency_key: None,
             }
             .is_terminal_lifecycle()
         );
@@ -1273,6 +1976,98 @@ mod tests {
             timed_out_at: Utc::now(),
         };
         assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
+    }
+
+    // ── is_terminal_lifecycle exhaustive coverage (issue #612 seal check) ─────
+
+    #[test]
+    fn every_terminal_seal_variant_is_terminal_lifecycle() {
+        let exec = ExecutionId::new();
+        let terminal: Vec<WorkflowEvent> = vec![
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::workflow_failed("boom"),
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator".into(),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: exec,
+                input: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowResetTerminated {
+                reset_to_exec_id: exec,
+                reason: "reset".into(),
+                operator_id: "op".into(),
+            },
+            WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: Utc::now(),
+                timed_out_at: Utc::now(),
+            },
+            // Trailing bookkeeping events appended after the terminal seal.
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: exec,
+                policy: crate::types::ParentClosePolicy::RequestCancel,
+                action: "request_cancel".into(),
+            },
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: exec,
+                attempt: 2,
+                fire_at: Utc::now(),
+            },
+        ];
+        for event in &terminal {
+            assert!(
+                event.is_terminal_lifecycle(),
+                "{} must be a terminal lifecycle event",
+                event.type_name()
+            );
+        }
+    }
+
+    #[test]
+    fn non_terminal_events_are_not_terminal_lifecycle() {
+        let id = ActivityExecId::new();
+        let non_terminal: Vec<WorkflowEvent> = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id,
+                name: "a".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id,
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t-1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            // Redrive reopens a previously-failed run — must NOT count as a seal.
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: Utc::now(),
+                dead_letter_id: Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        for event in &non_terminal {
+            assert!(
+                !event.is_terminal_lifecycle(),
+                "{} must NOT be a terminal lifecycle event",
+                event.type_name()
+            );
+        }
     }
 
     // ── Pause/Resume tests (issue #383) ───────────────────────────────────────
@@ -1348,5 +2143,272 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         Ok(())
+    }
+
+    // ── WorkflowRedriven (issue #510) ────────────────────────────────────────
+
+    #[test]
+    fn workflow_redriven_type_name_and_not_terminal() {
+        let event = WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id: Uuid::new_v4(),
+            reason: Some("downstream fixed".into()),
+        };
+        assert_eq!(event.type_name(), "WorkflowRedriven");
+        assert!(
+            !event.is_terminal_lifecycle(),
+            "redrive reopens the run and must not be a terminal lifecycle event"
+        );
+    }
+
+    #[test]
+    fn workflow_redriven_round_trips_adjacently_tagged() -> Result<(), serde_json::Error> {
+        let dead_letter_id = Uuid::new_v4();
+        let event = WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id,
+            reason: Some("credential rotated".into()),
+        };
+        let json = serde_json::to_string(&event)?;
+        // Adjacently-tagged: {"type":"WorkflowRedriven","data":{...}}
+        assert!(json.contains("\"type\":\"WorkflowRedriven\""));
+        assert!(json.contains("\"data\""));
+        assert!(json.contains("dead_letter_id"));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowRedriven {
+                dead_letter_id: id,
+                reason,
+                ..
+            } => {
+                assert_eq!(id, dead_letter_id);
+                assert_eq!(reason.as_deref(), Some("credential rotated"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_redriven_omits_reason_when_none() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id: Uuid::new_v4(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            !json.contains("reason"),
+            "reason must be skipped when None, got {json}"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::WorkflowRedriven { reason: None, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_started_constructor_defaults_additive_fields_to_none()
+    -> Result<(), serde_json::Error> {
+        let ts = Utc::now();
+        let event = WorkflowEvent::workflow_started(serde_json::json!({"k": 1}), ts);
+        match &event {
+            WorkflowEvent::WorkflowStarted {
+                input,
+                timestamp,
+                last_completion_result,
+                last_error,
+                scheduled_time,
+            } => {
+                assert_eq!(input, &serde_json::json!({"k": 1}));
+                assert_eq!(timestamp, &ts);
+                assert!(last_completion_result.is_none());
+                assert!(last_error.is_none());
+                assert!(scheduled_time.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // The three additive optionals skip when None.
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            !json.contains("last_completion_result"),
+            "last_completion_result must skip when None, got {json}"
+        );
+        assert!(
+            !json.contains("last_error"),
+            "last_error must skip when None, got {json}"
+        );
+        assert!(
+            !json.contains("scheduled_time"),
+            "scheduled_time must skip when None, got {json}"
+        );
+
+        // Round-trips back to an equivalent value.
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowStarted {
+                input,
+                timestamp,
+                last_completion_result,
+                last_error,
+                scheduled_time,
+            } => {
+                assert_eq!(input, serde_json::json!({"k": 1}));
+                assert_eq!(timestamp, ts);
+                assert!(last_completion_result.is_none());
+                assert!(last_error.is_none());
+                assert!(scheduled_time.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    // ── ExternalAwait event tests (issue #757) ────────────────────────────
+
+    #[test]
+    fn external_await_requested_round_trips() -> Result<(), serde_json::Error> {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let target = ExecutionId::new();
+        let event = WorkflowEvent::ExternalAwaitRequested { await_id, target };
+        assert_eq!(event.type_name(), "ExternalAwaitRequested");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id: aid,
+                target: t,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(t, target);
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_resolved_round_trips() -> Result<(), serde_json::Error> {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let event = WorkflowEvent::ExternalAwaitResolved {
+            await_id,
+            output: serde_json::json!({"total": 42}),
+        };
+        assert_eq!(event.type_name(), "ExternalAwaitResolved");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: aid,
+                output,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(output["total"], 42);
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_failed_round_trips_with_typed_fields() -> Result<(), serde_json::Error> {
+        let await_id = crate::types::ExternalAwaitId::new();
+        let event = WorkflowEvent::ExternalAwaitFailed {
+            await_id,
+            reason_code: "target_failed".into(),
+            message: Some("boom".into()),
+            error_type: Some("PaymentDeclined".into()),
+            details: Some(serde_json::json!({"code": 402})),
+            non_retryable: Some(true),
+        };
+        assert_eq!(event.type_name(), "ExternalAwaitFailed");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: aid,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => {
+                assert_eq!(aid, await_id);
+                assert_eq!(reason_code, "target_failed");
+                assert_eq!(message.as_deref(), Some("boom"));
+                assert_eq!(error_type.as_deref(), Some("PaymentDeclined"));
+                assert_eq!(details.unwrap()["code"], 402);
+                assert_eq!(non_retryable, Some(true));
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_failed_pre_757_json_deserializes_without_optional_fields()
+    -> Result<(), serde_json::Error> {
+        // A minimal ExternalAwaitFailed with only reason_code — the additive
+        // `#[serde(default)]` optional fields must deserialize to `None`.
+        let await_id = crate::types::ExternalAwaitId::new();
+        let legacy = serde_json::json!({
+            "type": "ExternalAwaitFailed",
+            "data": {
+                "await_id": await_id,
+                "reason_code": "target_unknown"
+            }
+        });
+        let back: WorkflowEvent = serde_json::from_value(legacy)?;
+        match back {
+            WorkflowEvent::ExternalAwaitFailed {
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(reason_code, "target_unknown");
+                assert_eq!(message, None);
+                assert_eq!(error_type, None);
+                assert_eq!(details, None);
+                assert_eq!(non_retryable, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_await_events_are_not_terminal_lifecycle() {
+        let await_id = crate::types::ExternalAwaitId::new();
+        assert!(
+            !WorkflowEvent::ExternalAwaitRequested {
+                await_id,
+                target: ExecutionId::new(),
+            }
+            .is_terminal_lifecycle()
+        );
+        assert!(
+            !WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::Value::Null,
+            }
+            .is_terminal_lifecycle()
+        );
+        assert!(
+            !WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code: "target_failed".into(),
+                message: None,
+                error_type: None,
+                details: None,
+                non_retryable: None,
+            }
+            .is_terminal_lifecycle()
+        );
     }
 }

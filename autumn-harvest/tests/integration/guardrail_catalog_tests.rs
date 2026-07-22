@@ -1,0 +1,473 @@
+/// Red-phase tests for issue #173: deterministic guardrail rule catalog foundation.
+///
+/// These tests define the expected shape of the catalog before any implementation
+/// exists. They should fail on first run (red), then pass once guardrail.rs is
+/// fully implemented (green).
+use autumn_harvest::guardrail::{
+    GuardrailFinding, GuardrailSuppression, GuardrailSuppressionError, RuleCategory, RuleEntry,
+    Severity, catalog,
+};
+use std::collections::HashSet;
+
+// ── Catalog coverage ─────────────────────────────────────────────────────────
+
+#[test]
+fn catalog_covers_all_required_categories() {
+    let entries = catalog();
+    let categories: HashSet<String> = entries
+        .iter()
+        .map(|e| format!("{:?}", e.category))
+        .collect();
+
+    let required = [
+        "WallClock",
+        "Randomness",
+        "ProcessEnv",
+        "SleepTimer",
+        "BackgroundTask",
+        "DirectIo",
+        "ProcessGlobal",
+    ];
+
+    for cat in required {
+        assert!(
+            categories.contains(cat),
+            "catalog is missing category: {cat}"
+        );
+    }
+}
+
+#[test]
+fn catalog_rule_ids_are_unique() {
+    let entries = catalog();
+    let mut ids = HashSet::new();
+    for entry in entries {
+        assert!(
+            ids.insert(entry.id),
+            "duplicate rule id in catalog: {}",
+            entry.id
+        );
+    }
+}
+
+#[test]
+fn catalog_rule_ids_match_hvg_prefix_pattern() {
+    for entry in catalog() {
+        assert!(
+            entry.id.starts_with("HVG"),
+            "rule id '{}' does not start with 'HVG'",
+            entry.id
+        );
+        let suffix = &entry.id["HVG".len()..];
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_digit()),
+            "rule id '{}' suffix is not all digits",
+            entry.id
+        );
+        assert!(
+            !suffix.is_empty(),
+            "rule id '{}' has no numeric suffix",
+            entry.id
+        );
+    }
+}
+
+#[test]
+fn catalog_every_entry_has_nonempty_explanation_and_alternative() {
+    for entry in catalog() {
+        assert!(
+            !entry.explanation.trim().is_empty(),
+            "rule '{}' has empty explanation",
+            entry.id
+        );
+        assert!(
+            !entry.alternative.trim().is_empty(),
+            "rule '{}' has empty alternative",
+            entry.id
+        );
+    }
+}
+
+#[test]
+fn catalog_has_at_least_one_hard_blocker_per_required_category() {
+    let entries = catalog();
+
+    // Every required category must have at least one HardBlocker
+    let hard_blocker_categories: HashSet<String> = entries
+        .iter()
+        .filter(|e| matches!(e.severity, Severity::HardBlocker))
+        .map(|e| format!("{:?}", e.category))
+        .collect();
+
+    let required = [
+        "WallClock",
+        "Randomness",
+        "ProcessEnv",
+        "SleepTimer",
+        "BackgroundTask",
+        "DirectIo",
+        "ProcessGlobal",
+    ];
+
+    for cat in required {
+        assert!(
+            hard_blocker_categories.contains(cat),
+            "category {cat} has no HardBlocker rule"
+        );
+    }
+}
+
+#[test]
+fn catalog_alternative_guidance_mentions_harvest_concepts() {
+    // At least one alternative per required category should mention a Harvest
+    // concept (activity, timer, signal, version, ctx.) so guidance is actionable.
+    let harvest_keywords = [
+        "activity",
+        "timer",
+        "signal",
+        "ctx.",
+        "version",
+        "WorkflowContext",
+        "ActivityContext",
+        "harvest",
+    ];
+
+    let entries = catalog();
+    let mut found_harvest_guidance = false;
+    for entry in entries {
+        let alt_lower = entry.alternative.to_lowercase();
+        if harvest_keywords.iter().any(|kw| alt_lower.contains(*kw)) {
+            found_harvest_guidance = true;
+        }
+    }
+
+    assert!(
+        found_harvest_guidance,
+        "no catalog entry references a Harvest concept in its alternative guidance"
+    );
+}
+
+// ── RuleEntry field types ─────────────────────────────────────────────────────
+
+#[test]
+fn rule_entry_exposes_id_severity_category_explanation_alternative() {
+    let entry: &RuleEntry = catalog().first().expect("catalog must be non-empty");
+    // Just checking field access compiles and produces expected types.
+    let _: &str = entry.id;
+    let _: &Severity = &entry.severity;
+    let _: &RuleCategory = &entry.category;
+    let _: &str = entry.explanation;
+    let _: &str = entry.alternative;
+}
+
+// ── GuardrailFinding ─────────────────────────────────────────────────────────
+
+#[test]
+fn guardrail_finding_fields_accessible() {
+    let finding = GuardrailFinding {
+        rule_id: "HVG001".to_string(),
+        severity: Severity::HardBlocker,
+        category: RuleCategory::WallClock,
+        message: "Used std::time::Instant::now() in workflow body".to_string(),
+        alternative: "Use ctx.current_time() or move time reads into an activity".to_string(),
+        workflow_name: Some("checkout_workflow".to_string()),
+        source_location: Some("src/workflows/checkout.rs:42".to_string()),
+    };
+
+    assert_eq!(finding.rule_id, "HVG001");
+    assert!(matches!(finding.severity, Severity::HardBlocker));
+    assert!(matches!(finding.category, RuleCategory::WallClock));
+    assert!(finding.workflow_name.is_some());
+    assert!(finding.source_location.is_some());
+}
+
+#[test]
+fn guardrail_finding_optional_workflow_name_and_location() {
+    let finding = GuardrailFinding {
+        rule_id: "HVG002".to_string(),
+        severity: Severity::HardBlocker,
+        category: RuleCategory::Randomness,
+        message: "rand::random() called in workflow body".to_string(),
+        alternative: "Pass randomness as workflow input or record via a side-effect activity"
+            .to_string(),
+        workflow_name: None,
+        source_location: None,
+    };
+
+    assert!(finding.workflow_name.is_none());
+    assert!(finding.source_location.is_none());
+}
+
+#[test]
+fn guardrail_finding_is_debug_and_clone() {
+    let finding = GuardrailFinding {
+        rule_id: "HVG001".to_string(),
+        severity: Severity::HardBlocker,
+        category: RuleCategory::WallClock,
+        message: "test".to_string(),
+        alternative: "use activity".to_string(),
+        workflow_name: None,
+        source_location: None,
+    };
+    let cloned = finding.clone();
+    assert_eq!(finding.rule_id, cloned.rule_id);
+    let _ = format!("{finding:?}");
+}
+
+// ── GuardrailSuppression ──────────────────────────────────────────────────────
+
+#[test]
+fn suppression_requires_nonempty_reason() {
+    let result = GuardrailSuppression::new("HVG001", "");
+    assert!(result.is_err(), "empty reason string should be rejected");
+    match result {
+        Err(GuardrailSuppressionError::EmptyReason) => {}
+        other => panic!("expected EmptyReason, got {other:?}"),
+    }
+}
+
+#[test]
+fn suppression_accepts_nonempty_reason() {
+    let suppression = GuardrailSuppression::new(
+        "HVG001",
+        "Seeded PRNG, determinism verified by replay test suite",
+    )
+    .expect("non-empty reason must succeed");
+    assert_eq!(suppression.rule_id(), "HVG001");
+    assert!(!suppression.reason().is_empty());
+}
+
+#[test]
+fn suppression_whitespace_only_reason_is_rejected() {
+    let result = GuardrailSuppression::new("HVG002", "   ");
+    assert!(result.is_err(), "whitespace-only reason should be rejected");
+}
+
+#[test]
+fn suppression_empty_rule_id_is_rejected() {
+    let result = GuardrailSuppression::new("", "valid reason");
+    assert!(result.is_err(), "empty rule ID should be rejected");
+    match result {
+        Err(GuardrailSuppressionError::EmptyRuleId) => {}
+        other => panic!("expected EmptyRuleId, got {other:?}"),
+    }
+}
+
+#[test]
+fn suppression_whitespace_rule_id_is_rejected() {
+    let result = GuardrailSuppression::new("   ", "valid reason");
+    assert!(
+        result.is_err(),
+        "whitespace-only rule ID should be rejected"
+    );
+}
+
+#[test]
+fn suppression_deserialize_rejects_empty_reason() {
+    let json = r#"{"rule_id":"HVG001","reason":""}"#;
+    let result: Result<GuardrailSuppression, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "deserialization must enforce non-empty reason invariant"
+    );
+}
+
+#[test]
+fn suppression_deserialize_rejects_whitespace_reason() {
+    let json = r#"{"rule_id":"HVG001","reason":"   "}"#;
+    let result: Result<GuardrailSuppression, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "deserialization must enforce non-whitespace reason invariant"
+    );
+}
+
+#[test]
+fn suppression_deserialize_rejects_empty_rule_id() {
+    let json = r#"{"rule_id":"","reason":"valid reason"}"#;
+    let result: Result<GuardrailSuppression, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "deserialization must enforce non-empty rule_id invariant"
+    );
+}
+
+#[test]
+fn suppression_deserialize_roundtrip_valid() {
+    let original = GuardrailSuppression::new("HVG001", "covered by replay fixture").unwrap();
+    let json = serde_json::to_string(&original).unwrap();
+    let restored: GuardrailSuppression = serde_json::from_str(&json).unwrap();
+    assert_eq!(original, restored);
+}
+
+#[test]
+fn suppression_exposes_rule_id_and_reason() {
+    let s = GuardrailSuppression::new("HVG003", "CI fixture, not a real workflow").unwrap();
+    assert_eq!(s.rule_id(), "HVG003");
+    assert_eq!(s.reason(), "CI fixture, not a real workflow");
+}
+
+#[test]
+fn suppression_is_debug_and_clone() {
+    let s = GuardrailSuppression::new("HVG004", "reason").unwrap();
+    let cloned = s.clone();
+    assert_eq!(s.rule_id(), cloned.rule_id());
+    let _ = format!("{s:?}");
+}
+
+// ── Severity and Category traits ──────────────────────────────────────────────
+
+#[test]
+fn severity_is_debug_clone_eq() {
+    let a = Severity::HardBlocker;
+    let b = Severity::Warning;
+    let _ = format!("{a:?}");
+    let _ = format!("{b:?}");
+    assert_ne!(a, b);
+    assert_eq!(a, a.clone());
+}
+
+#[test]
+fn category_is_debug_clone_eq() {
+    let cats = [
+        RuleCategory::WallClock,
+        RuleCategory::Randomness,
+        RuleCategory::ProcessEnv,
+        RuleCategory::SleepTimer,
+        RuleCategory::BackgroundTask,
+        RuleCategory::DirectIo,
+        RuleCategory::ProcessGlobal,
+    ];
+    let mut seen = HashSet::new();
+    for cat in &cats {
+        let s = format!("{cat:?}");
+        assert!(seen.insert(s.clone()), "duplicate category debug repr: {s}");
+        let cloned = cat.clone();
+        assert_eq!(cat, &cloned);
+    }
+}
+
+// ── catalog lookup helper ─────────────────────────────────────────────────────
+
+#[test]
+fn catalog_lookup_by_id_returns_correct_entry() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let entry = rule_by_id("HVG001").expect("HVG001 must exist in catalog");
+    assert_eq!(entry.id, "HVG001");
+    assert!(matches!(entry.category, RuleCategory::WallClock));
+}
+
+#[test]
+fn catalog_lookup_missing_id_returns_none() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    assert!(rule_by_id("HVGZZZZ").is_none());
+    assert!(rule_by_id("").is_none());
+}
+
+// ── HVG011: HashMap/HashSet iteration order (issue #785) ─────────────────────
+//
+// NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
+// already permanently assigned to SelectMacro (issue #600) and rule IDs are
+// never reused, so the iteration-order rule ships as HVG011.
+
+#[test]
+fn catalog_contains_hvg011_nondeterministic_iteration() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let entry = rule_by_id("HVG011")
+        .expect("HVG011 (issue #785, remapped from the issue's proposed HVG010) must exist");
+    assert!(
+        matches!(entry.category, RuleCategory::NonDeterministicIteration),
+        "HVG011 must use the NonDeterministicIteration category"
+    );
+    // Catalog severity is the class's worst case (a command-emitting loop);
+    // detection surfaces downgrade command-free loops to Warning.
+    assert!(
+        matches!(entry.severity, Severity::HardBlocker),
+        "HVG011 catalog severity must be HardBlocker"
+    );
+    let explanation = entry.explanation.to_lowercase();
+    assert!(
+        explanation.contains("iteration") && explanation.contains("hash"),
+        "HVG011 explanation must name the hash-iteration-order risk"
+    );
+    assert!(
+        entry.alternative.contains("BTreeMap") && entry.alternative.contains("sort"),
+        "HVG011 alternative must offer BTreeMap/BTreeSet or sorted-Vec remediation"
+    );
+}
+
+// ── HVG010: SelectMacro (issue #600) + combinator functions (issue #799) ─────
+//
+// NOTE on the rule ID: issue #799's text proposed "HVG011", but HVG011 was
+// already permanently assigned to NonDeterministicIteration (issue #785) and
+// rule IDs are never reused — the select rule is HVG010 (issue #600), extended
+// by issue #799 to also flag the futures combinator FUNCTIONS.
+
+#[test]
+fn catalog_hvg010_is_select_macro_hard_blocker() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let entry = rule_by_id("HVG010").expect("HVG010 (SelectMacro) must exist");
+    assert!(
+        matches!(entry.category, RuleCategory::SelectMacro),
+        "HVG010 must use the SelectMacro category"
+    );
+    assert!(
+        matches!(entry.severity, Severity::HardBlocker),
+        "HVG010 must be a HardBlocker (branch poll order is not author-controllable)"
+    );
+}
+
+#[test]
+fn catalog_hvg010_explanation_names_the_combinator_functions() {
+    // AC1 (issue #799): the rule covers the futures combinator FUNCTIONS as
+    // well as the select macros.
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let explanation = rule_by_id("HVG010").unwrap().explanation;
+    for needle in ["select!", "select_all", "select_ok", "try_select"] {
+        assert!(
+            explanation.contains(needle),
+            "HVG010 explanation must name `{needle}`, got: {explanation}"
+        );
+    }
+}
+
+#[test]
+fn catalog_hvg010_alternative_names_todays_deterministic_primitives() {
+    // AC3 (issue #799): the diagnostic must name the alternatives that exist
+    // TODAY — ctx.race() (issue #600), receive_signal_timeout /
+    // wait_for_signal_timeout, execute_activity_fan_out*, await_condition_timeout.
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let alt = rule_by_id("HVG010").unwrap().alternative;
+    for needle in [
+        "ctx.race()",
+        "receive_signal_timeout",
+        "wait_for_signal_timeout",
+        "execute_activity_fan_out",
+        "await_condition_timeout",
+    ] {
+        assert!(
+            alt.contains(needle),
+            "HVG010 alternative must name `{needle}`, got: {alt}"
+        );
+    }
+}
+
+// ── Finding construction from catalog entry ───────────────────────────────────
+
+#[test]
+fn finding_from_rule_entry() {
+    use autumn_harvest::guardrail::rule_by_id;
+
+    let entry = rule_by_id("HVG002").unwrap();
+    let finding = GuardrailFinding::from_rule(entry, "rand called here", None, None);
+    assert_eq!(finding.rule_id, "HVG002");
+    assert!(matches!(finding.category, RuleCategory::Randomness));
+    assert!(!finding.message.is_empty());
+    assert!(!finding.alternative.is_empty());
+}

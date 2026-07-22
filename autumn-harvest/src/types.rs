@@ -557,6 +557,102 @@ impl FromStr for ExternalCancelId {
     }
 }
 
+/// Unique identifier for a single `await_external_workflow` invocation (issue #757).
+///
+/// Generated when the workflow calls `ctx.await_external_workflow(...)` and
+/// embedded in the `ExternalAwaitRequested`, `ExternalAwaitResolved`, and
+/// `ExternalAwaitFailed` events so the request can be correlated with its
+/// outcome during replay. Exact clone of [`ExternalCancelId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalAwaitId(Uuid);
+
+impl ExternalAwaitId {
+    /// Creates a new, random `ExternalAwaitId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalAwaitId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalAwaitId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalAwaitId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalAwaitId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
+/// Unique identifier for a worker session (issue #606).
+///
+/// Recorded deterministically via the existing `MarkerRecorded` mechanism when
+/// a workflow calls `ctx.create_session(...)` — the *identity* is replayed
+/// like any other marker, but the *physical worker binding* it resolves to is
+/// non-replayed runtime routing state, exactly like activity placement today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId(Uuid);
+
+impl SessionId {
+    /// Creates a new, random `SessionId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as a `SessionId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for SessionId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Durable timer handle within a workflow.
 ///
 /// ## Examples
@@ -704,6 +800,170 @@ pub enum WorkflowIdReusePolicy {
     /// between them leaves the prior workflow CANCELLED with no new run started;
     /// retrying with the same policy starts a fresh run on the next attempt.
     TerminateIfRunning,
+}
+
+/// Controls what happens when a plain start collides with a currently-ACTIVE
+/// (RUNNING or PAUSED) prior execution of the same `(workflow_name, workflow_id)`.
+///
+/// This is *orthogonal* to [`WorkflowIdReusePolicy`], which governs TERMINAL
+/// priors (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`). The two axes compose in the
+/// start-path admission logic: the conflict policy has no effect on a terminal
+/// prior, and the reuse policy has no effect on an active prior (except via the
+/// [`WorkflowIdConflictPolicy::Unspecified`] default, which defers to the reuse
+/// policy's *native* active behavior).
+///
+/// Like [`WorkflowIdReusePolicy`], this is a *caller* concern chosen at request
+/// time; it is never persisted.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::WorkflowIdConflictPolicy;
+///
+/// // Unspecified is the default — it preserves each reuse policy's native
+/// // active behavior, so no existing caller changes.
+/// assert_eq!(
+///     WorkflowIdConflictPolicy::default(),
+///     WorkflowIdConflictPolicy::Unspecified
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowIdConflictPolicy {
+    /// Default. Do not override the active-prior behavior — the reuse policy's
+    /// NATIVE active behavior applies (`AllowDuplicate` → return existing;
+    /// `RejectDuplicate` → `Err(AlreadyExists)`; `AllowDuplicateFailedOnly` →
+    /// return existing; `TerminateIfRunning` → cancel + start fresh). Preserves
+    /// the exact documented behavior of all four reuse policies, so no existing
+    /// caller changes.
+    #[default]
+    Unspecified,
+
+    /// On an active prior, return [`crate::error::HarvestError::AlreadyExists`]
+    /// regardless of reuse policy.
+    Fail,
+
+    /// On an active prior, return the existing running/paused execution's handle
+    /// (`created == false`). No new `WorkflowStarted` event, no task enqueued, no
+    /// cancel — the idempotent "attach to the in-flight run" path.
+    UseExisting,
+
+    /// On an active prior, cancel it and start a fresh run (same as
+    /// `TerminateIfRunning`'s active behavior) regardless of reuse policy.
+    TerminateExisting,
+}
+
+// ---------------------------------------------------------------------------
+// StartSource
+// ---------------------------------------------------------------------------
+
+/// A bounded classifier for *how* a workflow execution was started (issue #740).
+///
+/// Recorded durably on every execution across all start paths so operators can
+/// answer "where did this run come from?" — an API call, a schedule tick, a
+/// child spawn, a completion trigger, and so on. This is distinct from the
+/// `origin` column (issue #534), which classifies scheduled dispatch sub-kinds;
+/// the two coexist.
+///
+/// The variant set is intentionally bounded (low-cardinality) so it is safe as
+/// a filter dimension and, if ever surfaced, a metric label. An unrecognized
+/// stored string deserializes to [`StartSource::Unknown`] rather than erroring,
+/// so a value written by a newer build never breaks an older reader.
+///
+/// A start-source column is *never* read during replay, so recording it has no
+/// effect on determinism.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::StartSource;
+///
+/// // Unknown is the default (a NULL / pre-upgrade column).
+/// assert_eq!(StartSource::default(), StartSource::Unknown);
+/// assert_eq!(StartSource::Api.as_str(), "api");
+/// // Unrecognized strings never error — they map to Unknown.
+/// assert_eq!(StartSource::from_str("not-a-real-source"), StartSource::Unknown);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartSource {
+    /// Started via the plain HTTP start route or an equivalent direct API call.
+    Api,
+    /// Fired by a schedule tick.
+    Schedule,
+    /// Started by a schedule backfill run.
+    Backfill,
+    /// Started atomically alongside a signal (`signal_with_start`).
+    SignalWithStart,
+    /// Started atomically alongside an update (`update_with_start`).
+    UpdateWithStart,
+    /// Started by a completion trigger reacting to another workflow's terminal.
+    CompletionTrigger,
+    /// Started by an inbound webhook delivery.
+    Webhook,
+    /// Spawned as a child workflow (awaited or detached).
+    Child,
+    /// Started via the batch-start API.
+    Batch,
+    /// A continue-as-new successor run.
+    ContinueAsNew,
+    /// A reset-fork run.
+    Reset,
+    /// Started by the cross-shard outbox dispatcher.
+    Outbox,
+    /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
+    /// stored value). This is the default.
+    #[default]
+    Unknown,
+}
+
+impl StartSource {
+    /// The stable, `snake_case` wire string for this source.
+    ///
+    /// Matches the `#[serde(rename_all = "snake_case")]` representation and is
+    /// what is written to the `start_source` column.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Schedule => "schedule",
+            Self::Backfill => "backfill",
+            Self::SignalWithStart => "signal_with_start",
+            Self::UpdateWithStart => "update_with_start",
+            Self::CompletionTrigger => "completion_trigger",
+            Self::Webhook => "webhook",
+            Self::Child => "child",
+            Self::Batch => "batch",
+            Self::ContinueAsNew => "continue_as_new",
+            Self::Reset => "reset",
+            Self::Outbox => "outbox",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored/source string into a [`StartSource`].
+    ///
+    /// Unrecognized input maps to [`StartSource::Unknown`] and never errors, so
+    /// a value written by a newer build is tolerated by an older reader.
+    #[must_use]
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "api" => Self::Api,
+            "schedule" => Self::Schedule,
+            "backfill" => Self::Backfill,
+            "signal_with_start" => Self::SignalWithStart,
+            "update_with_start" => Self::UpdateWithStart,
+            "completion_trigger" => Self::CompletionTrigger,
+            "webhook" => Self::Webhook,
+            "child" => Self::Child,
+            "batch" => Self::Batch,
+            "continue_as_new" => Self::ContinueAsNew,
+            "reset" => Self::Reset,
+            "outbox" => Self::Outbox,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,5 +1471,153 @@ mod tests {
         let json = serde_json::to_string(&n).unwrap();
         let back: DeploymentName = serde_json::from_str(&json).unwrap();
         assert_eq!(n, back);
+    }
+
+    #[test]
+    fn session_id_is_random_uuid() {
+        let a = SessionId::new();
+        let b = SessionId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_id_display_and_from_str_round_trip() {
+        let id = SessionId::new();
+        let s = id.to_string();
+        let parsed: SessionId = s.parse().unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn session_id_from_uuid_and_as_uuid_round_trip() {
+        let uuid = uuid::Uuid::new_v4();
+        let id = SessionId::from_uuid(uuid);
+        assert_eq!(id.as_uuid(), uuid);
+    }
+
+    #[test]
+    fn session_id_serde_round_trip() {
+        let id = SessionId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let back: SessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn session_id_invalid_str_fails_to_parse() {
+        assert!("not-a-valid-uuid".parse::<SessionId>().is_err());
+    }
+
+    #[test]
+    fn priority_round_trips_through_string_and_display() {
+        for priority in [
+            Priority::Low,
+            Priority::Normal,
+            Priority::High,
+            Priority::Critical,
+        ] {
+            let s = priority.to_string();
+            let parsed: Priority = s.parse().expect("valid priority string should parse");
+            assert_eq!(parsed, priority);
+        }
+    }
+
+    #[test]
+    fn priority_rejects_unknown_string() {
+        let err = "highest"
+            .parse::<Priority>()
+            .expect_err("unknown priority should fail");
+        assert!(err.contains("unknown priority"));
+    }
+
+    #[test]
+    fn priority_maps_to_and_from_i32() {
+        assert_eq!(Priority::Low.as_i32(), -1);
+        assert_eq!(Priority::Normal.as_i32(), 0);
+        assert_eq!(Priority::High.as_i32(), 1);
+        assert_eq!(Priority::Critical.as_i32(), 2);
+
+        assert_eq!(Priority::from_i32(-1), Some(Priority::Low));
+        assert_eq!(Priority::from_i32(0), Some(Priority::Normal));
+        assert_eq!(Priority::from_i32(1), Some(Priority::High));
+        assert_eq!(Priority::from_i32(2), Some(Priority::Critical));
+
+        assert_eq!(Priority::from_i32(3), None);
+        assert_eq!(Priority::from_i32(-2), None);
+    }
+
+    #[test]
+    fn priority_round_trips_serde() {
+        let cases = vec![
+            (Priority::Low, "\"low\""),
+            (Priority::Normal, "\"normal\""),
+            (Priority::High, "\"high\""),
+            (Priority::Critical, "\"critical\""),
+        ];
+
+        for (priority, expected_json) in cases {
+            let json = serde_json::to_string(&priority).unwrap();
+            assert_eq!(json, expected_json);
+
+            let deserialized: Priority = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, priority);
+        }
+    }
+
+    #[test]
+    fn start_source_as_str_from_str_round_trip() {
+        let all = [
+            StartSource::Api,
+            StartSource::Schedule,
+            StartSource::Backfill,
+            StartSource::SignalWithStart,
+            StartSource::UpdateWithStart,
+            StartSource::CompletionTrigger,
+            StartSource::Webhook,
+            StartSource::Child,
+            StartSource::Batch,
+            StartSource::ContinueAsNew,
+            StartSource::Reset,
+            StartSource::Outbox,
+            StartSource::Unknown,
+        ];
+        for src in all {
+            assert_eq!(
+                StartSource::from_str(src.as_str()),
+                src,
+                "round-trip failed for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_source_from_str_unrecognized_maps_to_unknown() {
+        assert_eq!(StartSource::from_str("garbage"), StartSource::Unknown);
+        assert_eq!(StartSource::from_str(""), StartSource::Unknown);
+        assert_eq!(StartSource::from_str("API"), StartSource::Unknown);
+        assert_eq!(StartSource::from_str("unknown"), StartSource::Unknown);
+    }
+
+    #[test]
+    fn start_source_default_is_unknown() {
+        assert_eq!(StartSource::default(), StartSource::Unknown);
+    }
+
+    #[test]
+    fn start_source_serde_matches_as_str() {
+        // serde snake_case rename must agree with as_str() for every variant.
+        let cases = [
+            StartSource::Api,
+            StartSource::SignalWithStart,
+            StartSource::CompletionTrigger,
+            StartSource::ContinueAsNew,
+            StartSource::Unknown,
+        ];
+        for src in cases {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(json, format!("\"{}\"", src.as_str()));
+            let de: StartSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, src);
+        }
     }
 }

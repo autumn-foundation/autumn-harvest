@@ -4,6 +4,16 @@
 //! production run) and generates a self-contained `#[tokio::test]` that uses
 //! `WorkflowSimulator` to exactly reproduce the execution locally, mocking out
 //! all activities to match their recorded production outcomes.
+//!
+//! Expects a **production-shaped** history: every `ActivityCompleted`/
+//! `ActivityFailed` event's `activity_id` has a matching earlier
+//! `ActivityScheduled` (true of every history read from `harvest_events`,
+//! since a real execution appends exactly one terminal event per scheduled
+//! activity). A history produced by `WorkflowSimulator`'s own retry loop
+//! (`simulator.rs`) is not safe input here: its non-terminal retry-attempt
+//! `ActivityFailed` events intentionally use a synthetic id with no matching
+//! `ActivityScheduled`, and the id-keyed lookups below silently drop any
+//! event whose id they don't recognize.
 
 use crate::event::WorkflowEvent;
 use crate::types::ActivityExecId;
@@ -87,7 +97,7 @@ impl TestHarnessGenerator {
                 WorkflowEvent::WorkflowCompleted { output } => {
                     final_result = Some(Ok(output.clone()));
                 }
-                WorkflowEvent::WorkflowFailed { error } => {
+                WorkflowEvent::WorkflowFailed { error, .. } => {
                     final_result = Some(Err(error.clone()));
                 }
                 _ => {}
@@ -174,6 +184,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: act_id,
@@ -213,6 +224,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: act_id,
@@ -228,9 +240,7 @@ mod tests {
                 non_retryable: false,
                 details: None,
             },
-            WorkflowEvent::WorkflowFailed {
-                error: "workflow failed: charge_card failed".into(),
-            },
+            WorkflowEvent::workflow_failed("workflow failed: charge_card failed"),
         ];
 
         let generator = TestHarnessGenerator::new();

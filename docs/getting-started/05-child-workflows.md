@@ -162,4 +162,22 @@ release its lock gracefully before stopping.
 
 ---
 
+## Bounding and fanning out children
+
+Two more child-workflow shapes, each with a runnable example:
+
+- **Bound a child by a deadline (issue #779).**
+  `ctx.execute_child_workflow_timeout::<O>(&child_info(), input, timeout)` races a
+  child's terminal outcome against a durable timer — `Ok(Some(output))` if the
+  child finishes in time, `Ok(None)` if the deadline fires first (the still-running
+  child is request-cancelled). It mirrors [`receive_signal_timeout`](04-signals.md)
+  one level up. See `examples/child_with_timeout.rs`.
+- **Fan out N children in parallel (issue #601).**
+  `ctx.spawn_child_workflow_fan_out(&child_info(), inputs)` (and the `_collect` /
+  `_raw` variants) schedule all N children concurrently and collect results in
+  input order — the child-workflow sibling of activity fan-out, for sub-orchestrations
+  that need their own durable history. See `examples/fanout_child_workflows.rs`.
+
+---
+
 [← Signals](04-signals.md) · [Index](README.md) · [Next: Idempotency →](06-idempotency.md)

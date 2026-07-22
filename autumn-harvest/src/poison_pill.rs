@@ -108,7 +108,6 @@ mod scanner {
     use diesel_async::AsyncConnection;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
-    use scoped_futures::ScopedFutureExt;
     use tokio_util::sync::CancellationToken;
 
     use super::{ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision};
@@ -171,57 +170,54 @@ mod scanner {
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
 
-        conn.transaction::<bool, HarvestError, _>(|conn| {
-            async move {
-                let Some(worker_id) = worker else {
-                    return Ok(false);
-                };
-                // Lock the row and re-verify it is still the same orphan.
-                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
-                    .find(task_id)
-                    .for_update()
-                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                match current {
-                    Some((state, Some(wid), strikes))
-                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                    _ => return Ok(false),
-                }
-                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                    return Ok(false);
-                }
-
-                diesel::update(dsl::harvest_task_queue.find(task_id))
-                    .set((
-                        dsl::state.eq("PENDING"),
-                        dsl::worker_id.eq(None::<String>),
-                        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-                        dsl::sticky_worker_id.eq(None::<String>),
-                        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-                        // Clear the dead attempt's heartbeat timestamp so the
-                        // fresh attempt is not immediately timed out by the
-                        // COALESCE(last_heartbeat_at, started_at) scanner.
-                        // heartbeat_details is preserved so a retry can still
-                        // read the last flushed checkpoint.
-                        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-                        // Clear the previous error: crashes don't leave a
-                        // meaningful error string, and the stale message from an
-                        // earlier clean failure would otherwise appear as
-                        // previous_failure() on the next attempt.
-                        dsl::error.eq(None::<String>),
-                        dsl::crash_strikes.eq(new_strikes),
-                        dsl::scheduled_at.eq(Utc::now()),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                Ok(true)
+        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            let Some(worker_id) = worker else {
+                return Ok(false);
+            };
+            // Lock the row and re-verify it is still the same orphan.
+            let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                .find(task_id)
+                .for_update()
+                .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            match current {
+                Some((state, Some(wid), strikes))
+                    if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
+                _ => return Ok(false),
             }
-            .scope_boxed()
-        })
+            if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                return Ok(false);
+            }
+
+            diesel::update(dsl::harvest_task_queue.find(task_id))
+                .set((
+                    dsl::state.eq("PENDING"),
+                    dsl::worker_id.eq(None::<String>),
+                    dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+                    dsl::sticky_worker_id.eq(None::<String>),
+                    dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+                    // Clear the dead attempt's heartbeat timestamp so the
+                    // fresh attempt is not immediately timed out by the
+                    // COALESCE(last_heartbeat_at, started_at) scanner.
+                    // heartbeat_details is preserved so a retry can still
+                    // read the last flushed checkpoint.
+                    dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+                    // Clear the previous error: crashes don't leave a
+                    // meaningful error string, and the stale message from an
+                    // earlier clean failure would otherwise appear as
+                    // previous_failure() on the next attempt.
+                    dsl::error.eq(None::<String>),
+                    dsl::crash_strikes.eq(new_strikes),
+                    dsl::scheduled_at.eq(Utc::now()),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Ok(true)
+        }))
         .await
     }
 
@@ -230,17 +226,33 @@ mod scanner {
     ///
     /// Only transitions executions still in `RUNNING`; a workflow that already
     /// reached a terminal state is left untouched. Returns the
-    /// `(workflow_id, workflow_name)` of the execution when (and only when) it
-    /// actually transitioned `RUNNING` → `FAILED`, so the caller can count the
-    /// failure toward schedule auto-pause once the transaction commits.
+    /// `(workflow_id, workflow_name, schedule_id, origin)` of the execution when
+    /// (and only when) it actually transitioned `RUNNING` → `FAILED`, so the
+    /// caller can count the failure toward schedule auto-pause once the
+    /// transaction commits (with the correct origin so backfill quarantines are
+    /// not mis-attributed to the cadence counter).
+    #[allow(clippy::too_many_lines)]
     async fn fail_owning_workflow(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         error: &str,
-    ) -> HarvestResult<(Option<(String, String)>, Vec<DeferredTriggerStart>)> {
+        metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
+    ) -> HarvestResult<(
+        Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
+        Vec<DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
+    )> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
-        type ExecRow = (String, Option<uuid::Uuid>, Option<String>, String, String);
+        type ExecRow = (
+            String,
+            Option<uuid::Uuid>,
+            Option<String>,
+            String,
+            String,
+            Option<uuid::Uuid>,
+            Option<String>,
+        );
         let current: Option<ExecRow> = exec_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
             .for_update()
@@ -250,14 +262,24 @@ mod scanner {
                 exec_dsl::parent_close_policy,
                 exec_dsl::workflow_id,
                 exec_dsl::workflow_name,
+                exec_dsl::schedule_id,
+                exec_dsl::origin,
             ))
             .first(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?;
-        let Some((state, parent_id, parent_close_policy, workflow_id, workflow_name)) = current
+        let Some((
+            state,
+            parent_id,
+            parent_close_policy,
+            workflow_id,
+            workflow_name,
+            schedule_id,
+            origin,
+        )) = current
         else {
-            return Ok((None, Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         };
         // PAUSED is a non-terminal active state (issue #383): an in-flight
         // activity that was admitted before the pause can still be running, so a
@@ -265,16 +287,14 @@ mod scanner {
         // owning workflow rather than leave it parked in PAUSED forever with a
         // dead task. Treat PAUSED like RUNNING here.
         if state != "RUNNING" && state != "PAUSED" {
-            return Ok((None, Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         }
 
         let history = crate::store::load_history(conn, exec_id).await?;
         crate::store::append_events(
             conn,
             exec_id,
-            &[WorkflowEvent::WorkflowFailed {
-                error: error.to_string(),
-            }],
+            &[WorkflowEvent::workflow_failed(error.to_string())],
             history.next_event_id,
         )
         .await?;
@@ -323,12 +343,12 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
         let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
             conn,
             exec_id,
             crate::completion_trigger::TerminalState::Failed,
-            None,
+            metrics,
         )
         .await?;
         deferred.extend(failed_triggers);
@@ -344,15 +364,16 @@ mod scanner {
             crate::store::append_single_event(
                 conn,
                 parent_exec_id,
-                WorkflowEvent::ChildWorkflowFailed {
-                    child_id: exec_id,
-                    error: error.to_string(),
-                },
+                WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
             )
             .await?;
             crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
         }
-        Ok((Some((workflow_id, workflow_name)), deferred))
+        Ok((
+            Some((workflow_id, workflow_name, schedule_id, origin)),
+            deferred,
+            closed_children,
+        ))
     }
 
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
@@ -415,62 +436,64 @@ mod scanner {
         let workflow_exec_id = task.workflow_exec_id;
 
         // The transaction returns whether the row was acted on, plus the owning
-        // workflow's (id, name) when it was actually failed RUNNING → FAILED so
-        // the schedule failure counter can be bumped after commit.
-        let (acted, failed_workflow, deferred_starts) = conn
-            .transaction::< (
+        // workflow's (id, name, schedule_id, origin) when it was actually failed
+        // RUNNING → FAILED so the schedule failure counter can be bumped (with
+        // the correct origin) after commit.
+        let (acted, failed_workflow, deferred_starts, closed_children) =
+            Box::pin(conn.transaction::<(
                 bool,
-                Option<(String, String)>,
+                Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
-            ), HarvestError, _>(|conn| {
-                async move {
-                    let Some(worker_id) = worker else {
-                        return Ok((false, None, Vec::new()));
-                    };
-                    let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
-                        .find(task_id)
-                        .for_update()
-                        .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(crate::error::database_error)?;
-                    match current {
-                        Some((state, Some(wid), strikes))
-                            if state == "RUNNING"
-                                && wid == worker_id
-                                && strikes == prior_strikes => {}
-                        _ => return Ok((false, None, Vec::new())),
-                    }
-                    if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                        return Ok((false, None, Vec::new()));
-                    }
-
-                    dead_letter(conn, &entry).await?;
-
-                    diesel::update(dsl::harvest_task_queue.find(task_id))
-                        .set((
-                            dsl::state.eq("FAILED"),
-                            dsl::worker_id.eq(None::<String>),
-                            dsl::crash_strikes.eq(new_strikes),
-                            dsl::error.eq(Some(error.clone())),
-                            dsl::completed_at.eq(Some(Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-
-                    let (failed_workflow, deferred) = match workflow_exec_id {
-                        Some(exec_uuid) => {
-                            fail_owning_workflow(conn, execution_id_from_uuid(exec_uuid), &error)
-                                .await?
-                        }
-                        None => (None, Vec::new()),
-                    };
-                    Ok((true, failed_workflow, deferred))
+                Vec<(ExecutionId, String)>,
+            ), HarvestError, _>(async |conn| {
+                let Some(worker_id) = worker else {
+                    return Ok((false, None, Vec::new(), Vec::new()));
+                };
+                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                    .find(task_id)
+                    .for_update()
+                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                match current {
+                    Some((state, Some(wid), strikes))
+                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
+                    _ => return Ok((false, None, Vec::new(), Vec::new())),
                 }
-                .scope_boxed()
-            })
+                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                    return Ok((false, None, Vec::new(), Vec::new()));
+                }
+
+                dead_letter(conn, &entry).await?;
+
+                diesel::update(dsl::harvest_task_queue.find(task_id))
+                    .set((
+                        dsl::state.eq("FAILED"),
+                        dsl::worker_id.eq(None::<String>),
+                        dsl::crash_strikes.eq(new_strikes),
+                        dsl::error.eq(Some(error.clone())),
+                        dsl::completed_at.eq(Some(Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
+                    Some(exec_uuid) => {
+                        fail_owning_workflow(
+                            conn,
+                            execution_id_from_uuid(exec_uuid),
+                            &error,
+                            Some(metrics),
+                        )
+                        .await?
+                    }
+                    None => (None, Vec::new(), Vec::new()),
+                };
+                Ok((true, failed_workflow, deferred, closed_children))
+            }))
             .await?;
 
         if acted {
@@ -479,20 +502,60 @@ mod scanner {
             // schedule auto-pause threshold (issue #360), mirroring the normal
             // failure and timeout paths. Runs after the transaction commits so
             // a counter error can never abort the quarantine.
-            if let Some((workflow_id, workflow_name)) = failed_workflow {
-                metrics.record_workflow_terminal(
+            if let Some((workflow_id, workflow_name, schedule_id, origin)) = failed_workflow {
+                crate::telemetry::emit_workflow_terminal(
+                    metrics,
                     &workflow_name,
                     &task.queue_name,
                     crate::telemetry::WorkflowStatus::Failed,
                 );
+
+                if let Some(exec_uuid) = task.workflow_exec_id {
+                    let exec_id = execution_id_from_uuid(exec_uuid);
+                    if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                        conn,
+                        exec_id,
+                        &workflow_name,
+                        Some(metrics),
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            exec_id = %exec_id,
+                            err = %e,
+                            "Failed to check and report unfinished handlers on poison pill workflow failure"
+                        );
+                    }
+                }
+
                 crate::scheduler::maybe_increment_schedule_failure_counter(
                     conn,
                     &workflow_id,
                     &workflow_name,
+                    schedule_id,
+                    origin.as_deref(),
                     metrics,
                 )
                 .await;
             }
+
+            for (child_id, child_name) in closed_children {
+                if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                    conn,
+                    child_id,
+                    &child_name,
+                    Some(metrics),
+                )
+                .await
+                {
+                    tracing::error!(
+                        child_id = %child_id,
+                        err = %e,
+                        "Failed to check and report unfinished handlers on cascaded child in poison pill"
+                    );
+                }
+            }
+
             for start in deferred_starts {
                 start.spawn();
             }

@@ -42,6 +42,8 @@ pub const OP_WORKFLOW_SIGNAL_WITH_START: &str = "workflow.signal_with_start";
 pub const OP_WORKFLOW_UPDATE_WITH_START: &str = "workflow.update_with_start";
 /// Audit operation: Cancelled a workflow execution.
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
+/// Audit operation: Force-terminated a single workflow execution (issue #504).
+pub const OP_WORKFLOW_TERMINATE: &str = "workflow.terminate";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
 /// Audit operation: Paused an individual workflow execution (issue #383).
@@ -56,6 +58,8 @@ pub const OP_DAG_RETRY: &str = "dag.retry";
 pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
+/// Audit operation: Edited an existing workflow schedule in place (issue #771).
+pub const OP_SCHEDULE_UPDATE: &str = "schedule.update";
 /// Audit operation: Paused an active workflow schedule.
 pub const OP_SCHEDULE_PAUSE: &str = "schedule.pause";
 /// Audit operation: Resumed a paused workflow schedule.
@@ -72,6 +76,8 @@ pub const OP_DLQ_REPLAY: &str = "dlq.replay";
 pub const OP_DLQ_REPLAY_BULK: &str = "dlq.replay.bulk";
 /// Audit operation: Bulk-discarded dead-letter queue (DLQ) tasks.
 pub const OP_DLQ_DISCARD_BULK: &str = "dlq.discard.bulk";
+/// Audit operation: Redrove (re-enqueued) dead-letter queue (DLQ) tasks (issue #510).
+pub const OP_DLQ_REDRIVE: &str = "dlq.redrive";
 /// Audit operation: Submitted a batch processing job.
 pub const OP_BATCH_SUBMIT: &str = "batch.submit";
 /// Audit operation: Atomically started a batch of workflow executions (issue #357).
@@ -106,6 +112,55 @@ pub const OP_TASK_REPRIORITIZE: &str = "task.reprioritize";
 pub const OP_GATE_CREATE: &str = "gate.create";
 /// Audit operation: Lifted (removed) an admission gate (issue #377).
 pub const OP_GATE_LIFT: &str = "gate.lift";
+/// Audit operation: Erased PII payload fields from a completed workflow
+/// execution (issue #495). Terminal-only, irreversible.
+pub const OP_WORKFLOW_ERASE_PAYLOADS: &str = "workflow.erase_payloads";
+/// Audit operation: Placed a per-execution legal hold (issue #747).
+pub const OP_LEGAL_HOLD_SET: &str = "legal_hold.set";
+/// Audit operation: Released a per-execution legal hold (issue #747).
+pub const OP_LEGAL_HOLD_RELEASE: &str = "legal_hold.release";
+/// Audit operation: Ran the replay compatibility canary.
+pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
+/// Audit operation: Force-retried a backing-off activity task (issue #516).
+pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
+/// Audit operation: Force-failed a hung in-flight activity task (issue #765).
+pub const OP_ACTIVITY_FAIL_NOW: &str = "activity.fail_now";
+/// Audit operation: Batch-reset workflow executions to a semantic point (issue #538).
+pub const OP_BATCH_RESET: &str = "batch.reset";
+/// Audit operation: Set (or updated) a queue's percentage build ramp (issue #604).
+pub const OP_BUILD_RAMP_SET: &str = "build_routing.ramp.set";
+/// Audit operation: Cleared a queue's percentage build ramp (issue #604).
+pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
+/// Audit operation: Manually redrove a dead-lettered completion-callback
+/// delivery (issue #605).
+pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
+/// Audit operation: an inbound webhook trigger dispatched a workflow start or signal (issue #344).
+///
+/// Written only for dispatch *attempts* that pass autumn-web's signature
+/// verification -- an unauthenticated sender cannot generate audit rows by
+/// sending unsigned/badly-signed requests. No
+/// `ALL_MUTATION_ROUTES`/`CLASSIFIED_ROUTES` entry exists for this operation:
+/// webhook binding paths are user-defined and registered as app-level routes
+/// outside `harvest_api_router`, so they are invisible to (and correctly
+/// excluded from) those management-router manifests. See
+/// `docs/getting-started/12-webhooks.md`.
+pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
+/// Audit operation: an operator read decoded codec-encrypted payloads on the
+/// management API / Vantage UI read path (issue #608).
+///
+/// A **read** audit like [`OP_EXECUTION_STREAM_OPEN`]: written at most once
+/// per request, and only when at least one codec envelope was actually
+/// decoded or degraded to an `_harvest_undecodable` marker (the SSE stream
+/// audits once at stream open whenever decode mode is active for that
+/// stream, since frame counts are unknowable up front). The record names the
+/// actor, route, and target execution — never the payload content. No
+/// `CLASSIFIED_ROUTES`/`ALL_MUTATION_ROUTES` change: no route mutates and no
+/// new route exists.
+pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
+/// Audit operation: minted a scoped API token (issue #942).
+pub const OP_TOKEN_CREATE: &str = "token.create";
+/// Audit operation: revoked a scoped API token (issue #942).
+pub const OP_TOKEN_REVOKE: &str = "token.revoke";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -121,9 +176,15 @@ pub const TARGET_DEAD_LETTER: &str = "dead_letter";
 pub const TARGET_BATCH: &str = "batch";
 pub const TARGET_RETENTION: &str = "retention";
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
+/// Audit target type for individual activity task operations (issue #516).
+pub const TARGET_ACTIVITY: &str = "activity";
 pub const TARGET_WORKER: &str = "worker";
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
+/// Audit target type for completion-callback delivery operations (issue #605).
+pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
+/// Audit target type for scoped API token operations (issue #942).
+pub const TARGET_TOKEN: &str = "token";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -150,6 +211,9 @@ pub const HEADER_REQUEST_ID: &str = "x-request-id";
 
 /// Call-origin hint: `"api"` (default), `"cli"`, or `"ui"`.
 pub const HEADER_SOURCE: &str = "x-harvest-source";
+
+/// Out-of-band exactly-once delivery key for the standalone signal route.
+pub const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
 
 // ── Retention ─────────────────────────────────────────────────────────────────
 
@@ -199,6 +263,29 @@ pub enum RouteClass {
     Mutating,
 }
 
+/// Pure access-control decision for the read-only operator role (issue #776).
+///
+/// Returns `true` when a read-only principal must be **denied (403)** the
+/// route it is calling. A read-only principal may reach [`RouteClass::ReadOnly`]
+/// and [`RouteClass::PublicSafe`] routes but never a [`RouteClass::Mutating`]
+/// one.
+///
+/// **Fail closed by construction.** The enforcement layer resolves an
+/// unclassified path to [`RouteClass::Mutating`] before calling this function,
+/// so a route a contributor forgot to classify is denied to read-only
+/// principals — never accidentally exposed.
+///
+/// This is deliberately a pure, `const` function keyed only on
+/// `RouteClass` (the source-of-truth verb classification) so the security
+/// decision is pinned by a truth-table unit test with no session or router
+/// harness. Principal classification (read-only vs admin vs anonymous) is a
+/// separate concern resolved by the enforcement layer and passed in as
+/// `is_readonly_principal`.
+#[must_use]
+pub const fn deny_readonly_mutation(is_readonly_principal: bool, class: RouteClass) -> bool {
+    is_readonly_principal && !matches!(class, RouteClass::ReadOnly | RouteClass::PublicSafe)
+}
+
 /// Security classification for every route registered in `harvest_api_router`.
 ///
 /// Each entry is `(route_template, RouteClass)`. The exhaustiveness guard test
@@ -215,10 +302,21 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
+    ("GET /workflows/count", RouteClass::ReadOnly),
+    // Tiered/summary retention list (issue #752): read-only, admin-guarded.
+    ("GET /workflows/summaries", RouteClass::ReadOnly),
     ("GET /workflows", RouteClass::ReadOnly),
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
+    ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
+    ("GET /workflows/{id}/run-chain", RouteClass::ReadOnly),
+    // Single-execution replay diagnosis (issue #614): POST for the replay action
+    // but read-only (appends no events, performs no writes, no audit trail).
+    (
+        "POST /workflows/{id}/replay-diagnosis",
+        RouteClass::ReadOnly,
+    ),
     (
         "GET /workflows/{id}/query/{query_name}",
         RouteClass::ReadOnly,
@@ -233,12 +331,32 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/{id}/update/{update_id}/result",
         RouteClass::ReadOnly,
     ),
+    // Workflow terminal-output projection (issue #527): read-only long-poll.
+    ("GET /workflows/{id}/result", RouteClass::ReadOnly),
+    // Paginated, filterable single-execution history (issue #529): read-only cursor walk.
+    ("GET /workflows/{id}/history", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
+    // Completion-callback delivery listing (issue #605): read-only, no audit.
+    (
+        "GET /workflows/{id}/completion-deliveries",
+        RouteClass::ReadOnly,
+    ),
     ("GET /dags", RouteClass::ReadOnly),
     ("GET /dags/{dag_name}/runs", RouteClass::ReadOnly),
+    // DAG run graph view (issue #690): read-only projection of a run's node
+    // topology + status; no audit trail.
+    (
+        "GET /dags/{dag_name}/runs/{run_exec_id}",
+        RouteClass::ReadOnly,
+    ),
     ("GET /dead-letters", RouteClass::ReadOnly),
     ("GET /admin/preflight", RouteClass::ReadOnly),
     ("GET /admin/shards/health", RouteClass::ReadOnly),
+    ("GET /admin/status", RouteClass::ReadOnly),
+    // Effective runtime-config introspection (issue #695): read-only, secret-free.
+    ("GET /admin/config", RouteClass::ReadOnly),
+    // Synthetic liveness canary freshness report (issue #796): read-only.
+    ("GET /admin/canary", RouteClass::ReadOnly),
     ("GET /admin/version-gates/usage", RouteClass::ReadOnly),
     (
         "GET /admin/version-gates/retirement-check",
@@ -246,6 +364,16 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("GET /admin/retention", RouteClass::ReadOnly),
     ("GET /admin/concurrency", RouteClass::ReadOnly),
+    // Historical per-tenant/per-workflow usage report (issue #596): read-only
+    // aggregation over already-durable data, companion to /admin/concurrency.
+    ("GET /admin/usage", RouteClass::ReadOnly),
+    ("GET /admin/debounce", RouteClass::ReadOnly),
+    ("GET /admin/start-throttle", RouteClass::ReadOnly),
+    // Workflow-type handler reachability (issue #520): read-only, no state mutation.
+    (
+        "GET /admin/workflow-types/reachability",
+        RouteClass::ReadOnly,
+    ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
@@ -253,6 +381,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/gates", RouteClass::ReadOnly),
     ("POST /admin/gates", RouteClass::Mutating),
     ("DELETE /admin/gates/{id}", RouteClass::Mutating),
+    // Scoped API tokens (issue #942).
+    ("GET /admin/tokens", RouteClass::ReadOnly),
+    ("POST /admin/tokens", RouteClass::Mutating),
+    ("DELETE /admin/tokens/{id}", RouteClass::Mutating),
     ("GET /admin/schedules", RouteClass::ReadOnly),
     ("GET /admin/rate-limits", RouteClass::ReadOnly),
     ("GET /admin/audit", RouteClass::ReadOnly),
@@ -267,6 +399,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /executions/{exec_id}/events/stream",
         RouteClass::ReadOnly,
     ),
+    // SSE ephemeral workflow progress stream (issue #791): read-only side
+    // channel over LISTEN/NOTIFY, never mutates state. NOT admin-gated (AC5).
+    ("GET /workflows/{id}/stream", RouteClass::ReadOnly),
     // ── Mutating ── modifies workflow execution or system configuration ───────
     // All of these are covered by the audit trail (harvest_audit_log) or are
     // explicitly listed in EXCLUDED_ROUTES with an audit disposition note.
@@ -279,6 +414,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
+    ("POST /workflows/{id}/terminate", RouteClass::Mutating),
     ("POST /workflows/{id}/pause", RouteClass::Mutating),
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
@@ -297,8 +433,15 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /dead-letters/replay", RouteClass::Mutating),
     ("POST /dead-letters/discard", RouteClass::Mutating),
     ("POST /dead-letters/{id}/replay", RouteClass::Mutating),
+    ("POST /dlq/redrive", RouteClass::Mutating),
+    // Completion-callback delivery redrive (issue #605).
+    (
+        "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+        RouteClass::Mutating,
+    ),
     ("POST /admin/retention/run-now", RouteClass::Mutating),
     ("POST /admin/schedules/workflow", RouteClass::Mutating),
+    ("PATCH /admin/schedules/{id}", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/resume", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/backfill", RouteClass::Mutating),
@@ -335,8 +478,161 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     // Retire is a read-only reachability check; no DB state is written.
     ("POST /admin/build-routing/retire", RouteClass::ReadOnly),
+    // Percentage build ramp (issue #604)
+    ("POST /admin/build-routing/ramp", RouteClass::Mutating),
+    (
+        "DELETE /admin/build-routing/ramp/{queue_name}",
+        RouteClass::Mutating,
+    ),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", RouteClass::Mutating),
+    // PII erasure (issue #495): admin-only, irreversible, terminal-only.
+    ("POST /workflows/{id}/erase-payloads", RouteClass::Mutating),
+    // Per-execution legal hold (issue #747): admin-only.
+    ("POST /workflows/{id}/legal-hold", RouteClass::Mutating),
+    (
+        "POST /workflows/{id}/legal-hold/release",
+        RouteClass::Mutating,
+    ),
+    // Replay canary (issue #512): admin-only.
+    ("POST /admin/workflows/replay-canary", RouteClass::Mutating),
+    // Force-retry backing-off activity (issue #516): admin-only.
+    (
+        "POST /workflows/{id}/activities/{activity_exec_id}/retry-now",
+        RouteClass::Mutating,
+    ),
+    // Force-fail hung in-flight activity (issue #765): admin-only.
+    (
+        "POST /workflows/{id}/activities/{activity_exec_id}/fail-now",
+        RouteClass::Mutating,
+    ),
+    // Batch reset by semantic point (issue #538): admin-only.
+    ("POST /workflows/batch_reset", RouteClass::Mutating),
+    // ── Business-id ("latest run") route variants (issue #805) ────────────────
+    // Each mirrors its exec-id counterpart's class exactly.
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    // POST query accepts typed args but never mutates workflow state.
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+        RouteClass::Mutating,
+    ),
+    // ── Read-only operator role (issue #776) — routes that were mounted in
+    // harvest_api_router but had drifted without a classification entry. Under
+    // #776 fail-closed enforcement an unclassified route is treated as
+    // Mutating; these are classified explicitly per verified handler behavior
+    // so the read-only tier reaches every genuine read (AC1) and never a
+    // mutation (AC2). Every "Mutating" handler below was verified to write
+    // state; every "ReadOnly" handler was verified not to.
+    //
+    // ReadOnly — discovery / reads (no state mutation):
+    ("GET /batches/pending", RouteClass::ReadOnly),
+    ("GET /workflows/registered", RouteClass::ReadOnly),
+    (
+        "GET /workflows/registered/{name}/schema",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "GET /workflows/registered/{name}/interface",
+        RouteClass::ReadOnly,
+    ),
+    // Enumerates a workflow type's query/update handlers (read). Router-only:
+    // not in management_api_routes() before #776.
+    (
+        "GET /workflows/types/{workflow_name}/handlers",
+        RouteClass::ReadOnly,
+    ),
+    // Missing-workflow_id guard: always returns 400 (no read, no write). Both
+    // verbs share one handler; classified ReadOnly so a read-only principal
+    // receives the intended 400 rather than a 403. Router-only before #776.
+    ("GET /workflows/by-id/{workflow_name}", RouteClass::ReadOnly),
+    (
+        "POST /workflows/by-id/{workflow_name}",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /dead-letters/aggregate", RouteClass::ReadOnly),
+    // Circuit-breaker snapshots (read); force-open/close are the mutations below.
+    ("GET /admin/circuits", RouteClass::ReadOnly),
+    ("GET /admin/circuits/{activity_name}", RouteClass::ReadOnly),
+    ("GET /admin/queues/scaling", RouteClass::ReadOnly),
+    ("GET /admin/metrics", RouteClass::ReadOnly),
+    ("GET /admin/completion-triggers", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}/runs", RouteClass::ReadOnly),
+    ("GET /admin/schedules/decisions", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}/decisions", RouteClass::ReadOnly),
+    ("GET /admin/schedules/{id}/preview", RouteClass::ReadOnly),
+    // Preview a candidate schedule: POST carries the candidate in the body but
+    // only validates + projects fire times; no state is written.
+    ("POST /admin/schedules/preview", RouteClass::ReadOnly),
+    ("GET /calendars", RouteClass::ReadOnly),
+    ("GET /calendars/{name}", RouteClass::ReadOnly),
+    ("GET /workers/{worker_id}/pinned", RouteClass::ReadOnly),
+    (
+        "GET /admin/queues/{queue_name}/eligibility",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /admin/tasks/{id}/eligibility", RouteClass::ReadOnly),
+    // Mutating — these write state. A read-only principal is denied (403).
+    // Update-with-start admits an update and may start a fresh run.
+    (
+        "POST /workflows/{workflow_name}/update-with-start",
+        RouteClass::Mutating,
+    ),
+    // DAG retry-from-failed-node (reset internals).
+    (
+        "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+        RouteClass::Mutating,
+    ),
+    // Operator force-open / force-close of a circuit breaker.
+    (
+        "POST /admin/circuits/{activity_name}/force-open",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /admin/circuits/{activity_name}/force-close",
+        RouteClass::Mutating,
+    ),
+    // Calendar + completion-trigger CRUD. No dedicated audit op constant yet
+    // (audit wiring is out of scope for #776); disposition is EXCLUDED_ROUTES.
+    ("POST /admin/completion-triggers", RouteClass::Mutating),
+    ("POST /calendars", RouteClass::Mutating),
+    ("PUT /calendars/{name}", RouteClass::Mutating),
+    ("DELETE /calendars/{name}", RouteClass::Mutating),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -351,12 +647,14 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_SIGNAL,
     OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_TERMINATE,
     OP_WORKFLOW_PAUSE,
     OP_WORKFLOW_RESUME,
     OP_WORKFLOW_RESET,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
+    OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
     OP_SCHEDULE_RESUME,
     OP_SCHEDULE_DELETE,
@@ -365,6 +663,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DLQ_REPLAY,
     OP_DLQ_REPLAY_BULK,
     OP_DLQ_DISCARD_BULK,
+    OP_DLQ_REDRIVE,
     OP_BATCH_SUBMIT,
     OP_BATCH_START,
     OP_RETENTION_RUN_NOW,
@@ -380,6 +679,42 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_GATE_LIFT,
     // Task queue management (issue #249)
     OP_TASK_REPRIORITIZE,
+    // PII erasure (issue #495)
+    OP_WORKFLOW_ERASE_PAYLOADS,
+    // Per-execution legal hold (issue #747)
+    OP_LEGAL_HOLD_SET,
+    OP_LEGAL_HOLD_RELEASE,
+    OP_WORKFLOW_REPLAY_CANARY,
+    // Force-retry backing-off activity (issue #516)
+    OP_ACTIVITY_RETRY_NOW,
+    // Force-fail hung in-flight activity (issue #765)
+    OP_ACTIVITY_FAIL_NOW,
+    // Batch reset by semantic point (issue #538)
+    OP_BATCH_RESET,
+    // Percentage build ramp (issue #604)
+    OP_BUILD_RAMP_SET,
+    OP_BUILD_RAMP_CLEAR,
+    // Completion-callback delivery redrive (issue #605)
+    OP_CALLBACK_REDRIVE,
+    // Inbound webhook receiver (issue #344). No ALL_MUTATION_ROUTES entry --
+    // webhook paths are user-defined, app-level routes; see the doc comment
+    // on OP_WEBHOOK_TRIGGER.
+    OP_WEBHOOK_TRIGGER,
+    // Operator read-path payload decoding (issue #608). Read audit — no
+    // ALL_MUTATION_ROUTES entry; see the doc comment on OP_PAYLOAD_DECODE_READ.
+    OP_PAYLOAD_DECODE_READ,
+    // Read-only operator role (issue #776): these four constants pre-existed
+    // but had never been wired into a route manifest entry. Their handlers
+    // already write audit rows under these ops; classifying the routes (below)
+    // requires an ALL_MUTATION_ROUTES entry, which in turn requires the op be
+    // registered here.
+    OP_WORKFLOW_UPDATE_WITH_START,
+    OP_DAG_RETRY,
+    OP_CIRCUIT_FORCE_OPEN,
+    OP_CIRCUIT_FORCE_CLOSE,
+    // Scoped API tokens (issue #942)
+    OP_TOKEN_CREATE,
+    OP_TOKEN_REVOKE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -388,10 +723,15 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
 /// coverage guard test to ensure no route is accidentally omitted from either
 /// [`ALL_MUTATION_ROUTES`] or this exclusion list.
 pub const EXCLUDED_ROUTES: &[&str] = &[
+    "GET /workflows/count",
+    "GET /workflows/summaries",
     "GET /workflows",
     "GET /workflows/{id}",
     "GET /workflows/{id}/children",
     "GET /workflows/{id}/stack",
+    "GET /workflows/{id}/timeline",
+    "GET /workflows/{id}/run-chain",
+    "POST /workflows/{id}/replay-diagnosis",
     "GET /workflows/{id}/query/{query_name}",
     "POST /workflows/{id}/query/{query_name}",
     "GET /workflows/{id}/queries",
@@ -399,17 +739,26 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // Updates are synchronous request/response, not tracked as operator
     // audit events in this slice; they appear in the workflow event history.
     "POST /workflows/{id}/update/{update_name}",
+    "GET /workflows/{id}/history",
     "GET /workflows/{id}/history/export",
+    "GET /workflows/{id}/completion-deliveries",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
+    "GET /dags/{dag_name}/runs/{run_exec_id}",
     "GET /dead-letters",
     "GET /health",
     "GET /admin/preflight",
     "GET /admin/shards/health",
+    "GET /admin/status",
+    "GET /admin/config",
+    "GET /admin/canary",
     "GET /admin/version-gates/usage",
     "GET /admin/version-gates/retirement-check",
     "GET /admin/retention",
     "GET /admin/concurrency",
+    "GET /admin/usage",
+    "GET /admin/debounce",
+    "GET /admin/start-throttle",
     "GET /admin/history/exports",
     "GET /admin/external-handoffs",
     "GET /admin/external-handoffs/{token}",
@@ -427,12 +776,63 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/audit",
     // SSE stream is read-only; stream open/close are audited manually in the handler.
     "GET /executions/{exec_id}/events/stream",
+    // Ephemeral progress stream (issue #791): read-only, no audit trail
+    // (disposable side channel; no open/close audit rows are written).
+    "GET /workflows/{id}/stream",
     // Build routing reads and the retire safety check never write audit rows.
     "GET /admin/build-routing",
     "GET /admin/build-routing/compat",
     "POST /admin/build-routing/retire",
     // Admission gate list is read-only.
     "GET /admin/gates",
+    // Scoped API token list is read-only (issue #942).
+    "GET /admin/tokens",
+    // Business-id ("latest run") read-only variants (issue #805). Each mirrors
+    // its exec-id counterpart's EXCLUDED_ROUTES membership exactly. Note the
+    // `.../result` variant is deliberately absent — its exec-id counterpart
+    // (`GET /workflows/{id}/result`) is classified ReadOnly and appears in
+    // ALL_MUTATION_ROUTES with `None` (both mean "not audited") but is NOT in
+    // EXCLUDED_ROUTES, so the by-id variant must not be either.
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+    "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+    // POST query is read-only (typed args, no state mutation).
+    "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+    // ── Read-only operator role (issue #776) ──────────────────────────────────
+    // ReadOnly routes (no audit trail — reads):
+    "GET /batches/pending",
+    "GET /workflows/registered",
+    "GET /workflows/registered/{name}/schema",
+    "GET /workflows/registered/{name}/interface",
+    "GET /workflows/types/{workflow_name}/handlers",
+    "GET /workflows/by-id/{workflow_name}",
+    "POST /workflows/by-id/{workflow_name}",
+    "GET /dead-letters/aggregate",
+    "GET /admin/circuits",
+    "GET /admin/circuits/{activity_name}",
+    "GET /admin/queues/scaling",
+    "GET /admin/metrics",
+    "GET /admin/completion-triggers",
+    "GET /admin/schedules/{id}",
+    "GET /admin/schedules/{id}/runs",
+    "GET /admin/schedules/decisions",
+    "GET /admin/schedules/{id}/decisions",
+    "GET /admin/schedules/{id}/preview",
+    "POST /admin/schedules/preview",
+    "GET /calendars",
+    "GET /calendars/{name}",
+    "GET /workers/{worker_id}/pinned",
+    "GET /admin/queues/{queue_name}/eligibility",
+    "GET /admin/tasks/{id}/eligibility",
+    // Mutating routes with no dedicated audit op constant (calendar +
+    // completion-trigger CRUD). Audit wiring for these is out of scope for
+    // #776; their audit disposition is "explicitly excluded" so the
+    // mutating_routes_are_audited_or_explicitly_excluded guard passes.
+    "POST /admin/completion-triggers",
+    "POST /calendars",
+    "PUT /calendars/{name}",
+    "DELETE /calendars/{name}",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -446,10 +846,16 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
 /// will fail if any expected mutation route is missing or declared as excluded.
 pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // Workflow management
+    ("GET /workflows/count", None),
+    ("GET /workflows/summaries", None),
     ("GET /workflows", None),
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
     ("GET /workflows/{id}/stack", None),
+    ("GET /workflows/{id}/timeline", None),
+    ("GET /workflows/{id}/run-chain", None),
+    // Issue #614: read-only, no audit operation.
+    ("POST /workflows/{id}/replay-diagnosis", None),
     (
         "POST /workflows/{workflow_name}/start",
         Some(OP_WORKFLOW_START),
@@ -459,6 +865,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_WORKFLOW_SIGNAL_WITH_START),
     ),
     ("POST /workflows/{id}/cancel", Some(OP_WORKFLOW_CANCEL)),
+    (
+        "POST /workflows/{id}/terminate",
+        Some(OP_WORKFLOW_TERMINATE),
+    ),
     ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
@@ -471,10 +881,18 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/queries", None),
     ("POST /workflows/{id}/update/{update_name}", None),
     ("GET /workflows/{id}/update/{update_id}/result", None),
+    ("GET /workflows/{id}/result", None),
+    ("GET /workflows/{id}/history", None),
     ("GET /workflows/{id}/history/export", None),
+    ("GET /workflows/{id}/completion-deliveries", None),
+    (
+        "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+        Some(OP_CALLBACK_REDRIVE),
+    ),
     // DAG management
     ("GET /dags", None),
     ("GET /dags/{dag_name}/runs", None),
+    ("GET /dags/{dag_name}/runs/{run_exec_id}", None),
     ("POST /dags/{dag_name}/trigger", Some(OP_DAG_TRIGGER)),
     ("PATCH /dags/{dag_name}", Some(OP_DAG_PATCH)),
     // Dead-letter queue
@@ -482,15 +900,24 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /dead-letters/replay", Some(OP_DLQ_REPLAY_BULK)),
     ("POST /dead-letters/discard", Some(OP_DLQ_DISCARD_BULK)),
     ("POST /dead-letters/{id}/replay", Some(OP_DLQ_REPLAY)),
+    ("POST /dlq/redrive", Some(OP_DLQ_REDRIVE)),
     // Health / observability (read-only)
     ("GET /health", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
+    ("GET /admin/status", None),
+    ("GET /admin/config", None),
+    ("GET /admin/canary", None),
     ("GET /admin/version-gates/usage", None),
     ("GET /admin/version-gates/retirement-check", None),
     ("GET /admin/retention", None),
     ("POST /admin/retention/run-now", Some(OP_RETENTION_RUN_NOW)),
     ("GET /admin/concurrency", None),
+    ("GET /admin/usage", None),
+    ("GET /admin/debounce", None),
+    ("GET /admin/start-throttle", None),
+    // Workflow-type handler reachability (issue #520): read-only.
+    ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),
     ("GET /admin/external-handoffs", None),
     ("GET /admin/external-handoffs/{token}", None),
@@ -498,6 +925,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/schedules", None),
     ("GET /admin/rate-limits", None),
     ("POST /admin/schedules/workflow", Some(OP_SCHEDULE_CREATE)),
+    ("PATCH /admin/schedules/{id}", Some(OP_SCHEDULE_UPDATE)),
     ("POST /admin/schedules/{id}/pause", Some(OP_SCHEDULE_PAUSE)),
     (
         "POST /admin/schedules/{id}/resume",
@@ -542,6 +970,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/audit", None),
     // SSE execution event stream (issue #324): read-only; open/close audited in handler.
     ("GET /executions/{exec_id}/events/stream", None),
+    // Ephemeral progress stream (issue #791): read-only, not audited.
+    ("GET /workflows/{id}/stream", None),
     // Build routing management (issue #362)
     ("GET /admin/build-routing", None),
     (
@@ -559,12 +989,140 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ),
     // retire is a read-only safety check — no state is mutated.
     ("POST /admin/build-routing/retire", None),
+    // Percentage build ramp (issue #604)
+    ("POST /admin/build-routing/ramp", Some(OP_BUILD_RAMP_SET)),
+    (
+        "DELETE /admin/build-routing/ramp/{queue_name}",
+        Some(OP_BUILD_RAMP_CLEAR),
+    ),
     // Admission gates (issue #377)
     ("GET /admin/gates", None),
     ("POST /admin/gates", Some(OP_GATE_CREATE)),
     ("DELETE /admin/gates/{id}", Some(OP_GATE_LIFT)),
+    // Scoped API tokens (issue #942)
+    ("GET /admin/tokens", None),
+    ("POST /admin/tokens", Some(OP_TOKEN_CREATE)),
+    ("DELETE /admin/tokens/{id}", Some(OP_TOKEN_REVOKE)),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", Some(OP_TASK_REPRIORITIZE)),
+    // PII erasure (issue #495)
+    (
+        "POST /workflows/{id}/erase-payloads",
+        Some(OP_WORKFLOW_ERASE_PAYLOADS),
+    ),
+    // Per-execution legal hold (issue #747)
+    ("POST /workflows/{id}/legal-hold", Some(OP_LEGAL_HOLD_SET)),
+    (
+        "POST /workflows/{id}/legal-hold/release",
+        Some(OP_LEGAL_HOLD_RELEASE),
+    ),
+    // Replay canary (issue #512)
+    (
+        "POST /admin/workflows/replay-canary",
+        Some(OP_WORKFLOW_REPLAY_CANARY),
+    ),
+    // Force-retry backing-off activity (issue #516)
+    (
+        "POST /workflows/{id}/activities/{activity_exec_id}/retry-now",
+        Some(OP_ACTIVITY_RETRY_NOW),
+    ),
+    // Force-fail hung in-flight activity (issue #765)
+    (
+        "POST /workflows/{id}/activities/{activity_exec_id}/fail-now",
+        Some(OP_ACTIVITY_FAIL_NOW),
+    ),
+    // Batch reset by semantic point (issue #538)
+    ("POST /workflows/batch_reset", Some(OP_BATCH_RESET)),
+    // ── Business-id ("latest run") route variants (issue #805) ────────────────
+    // Audit operations mirror the exec-id counterparts (the by-id handlers
+    // delegate to them; the delegated handler writes the audit row under the
+    // exec-id route string with the resolved exec_id as the target).
+    ("GET /workflows/by-id/{workflow_name}/{workflow_id}", None),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/result",
+        None,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/stack",
+        None,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/children",
+        None,
+    ),
+    (
+        "GET /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        None,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/query/{query_name}",
+        None,
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+        Some(OP_WORKFLOW_SIGNAL),
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/cancel",
+        Some(OP_WORKFLOW_CANCEL),
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/pause",
+        Some(OP_WORKFLOW_PAUSE),
+    ),
+    (
+        "POST /workflows/by-id/{workflow_name}/{workflow_id}/resume",
+        Some(OP_WORKFLOW_RESUME),
+    ),
+    // ── Read-only operator role (issue #776) — classification manifest ────────
+    // ReadOnly routes (None = not audited):
+    ("GET /batches/pending", None),
+    ("GET /workflows/registered", None),
+    ("GET /workflows/registered/{name}/schema", None),
+    ("GET /workflows/registered/{name}/interface", None),
+    ("GET /workflows/types/{workflow_name}/handlers", None),
+    ("GET /workflows/by-id/{workflow_name}", None),
+    ("POST /workflows/by-id/{workflow_name}", None),
+    ("GET /dead-letters/aggregate", None),
+    ("GET /admin/circuits", None),
+    ("GET /admin/circuits/{activity_name}", None),
+    ("GET /admin/queues/scaling", None),
+    ("GET /admin/metrics", None),
+    ("GET /admin/completion-triggers", None),
+    ("GET /admin/schedules/{id}", None),
+    ("GET /admin/schedules/{id}/runs", None),
+    ("GET /admin/schedules/decisions", None),
+    ("GET /admin/schedules/{id}/decisions", None),
+    ("GET /admin/schedules/{id}/preview", None),
+    ("POST /admin/schedules/preview", None),
+    ("GET /calendars", None),
+    ("GET /calendars/{name}", None),
+    ("GET /workers/{worker_id}/pinned", None),
+    ("GET /admin/queues/{queue_name}/eligibility", None),
+    ("GET /admin/tasks/{id}/eligibility", None),
+    // Mutating routes — the four with pre-existing op constants audit under
+    // them (their handlers already write the audit row); the calendar +
+    // completion-trigger CRUD have no op and are excluded (None).
+    (
+        "POST /workflows/{workflow_name}/update-with-start",
+        Some(OP_WORKFLOW_UPDATE_WITH_START),
+    ),
+    (
+        "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+        Some(OP_DAG_RETRY),
+    ),
+    (
+        "POST /admin/circuits/{activity_name}/force-open",
+        Some(OP_CIRCUIT_FORCE_OPEN),
+    ),
+    (
+        "POST /admin/circuits/{activity_name}/force-close",
+        Some(OP_CIRCUIT_FORCE_CLOSE),
+    ),
+    ("POST /admin/completion-triggers", None),
+    ("POST /calendars", None),
+    ("PUT /calendars/{name}", None),
+    ("DELETE /calendars/{name}", None),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────
@@ -767,6 +1325,30 @@ mod tests {
         assert_eq!(DEFAULT_AUDIT_RETENTION_DAYS, 90);
     }
 
+    #[test]
+    fn replay_canary_route_is_classified_correctly() {
+        let route = "POST /admin/workflows/replay-canary";
+        let classification = CLASSIFIED_ROUTES
+            .iter()
+            .find(|(r, _)| *r == route)
+            .map(|(_, c)| *c);
+        assert_eq!(
+            classification,
+            Some(RouteClass::Mutating),
+            "Replay canary route must be classified as Mutating"
+        );
+
+        let mutation_op = ALL_MUTATION_ROUTES
+            .iter()
+            .find(|(r, _)| *r == route)
+            .and_then(|(_, op)| *op);
+        assert_eq!(
+            mutation_op,
+            Some("workflow.replay_canary"),
+            "Replay canary route must have the workflow.replay_canary audit operation"
+        );
+    }
+
     // ── Route classification exhaustiveness guards ────────────────────────────
     //
     // These tests enforce that CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES stay
@@ -785,6 +1367,395 @@ mod tests {
                  CLASSIFIED_ROUTES — add it with the correct RouteClass"
             );
         }
+    }
+
+    #[test]
+    fn legal_hold_routes_are_classified_and_audited() {
+        // Per-execution legal hold (issue #747): both routes are admin-only
+        // mutations and must be classified + audited. This dedicated test —
+        // not just the general exhaustiveness guards, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other — is what
+        // catches a route dropped from BOTH lists.
+        for route in [
+            "POST /workflows/{id}/legal-hold",
+            "POST /workflows/{id}/legal-hold/release",
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #747)"
+            );
+        }
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "POST /workflows/{id}/legal-hold"
+                    && *op == Some(OP_LEGAL_HOLD_SET)),
+            "legal-hold set route must map to OP_LEGAL_HOLD_SET (issue #747)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "POST /workflows/{id}/legal-hold/release"
+                    && *op == Some(OP_LEGAL_HOLD_RELEASE)),
+            "legal-hold release route must map to OP_LEGAL_HOLD_RELEASE (issue #747)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_SET));
+        assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_RELEASE));
+    }
+
+    #[test]
+    fn token_routes_are_classified_and_audited() {
+        // Scoped API tokens (issue #942): create + revoke are admin-only
+        // mutations; list is a read. This dedicated pin — not just the general
+        // exhaustiveness guards, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other — is what catches a route
+        // dropped from BOTH lists (the recurring gap the codebase pins
+        // per-route).
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "POST /admin/tokens" && *c == RouteClass::Mutating),
+            "POST /admin/tokens must be classified RouteClass::Mutating (issue #942)"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/tokens" && *c == RouteClass::ReadOnly),
+            "GET /admin/tokens must be classified RouteClass::ReadOnly (issue #942)"
+        );
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "DELETE /admin/tokens/{id}" && *c == RouteClass::Mutating),
+            "DELETE /admin/tokens/{{id}} must be classified RouteClass::Mutating (issue #942)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "POST /admin/tokens" && *op == Some(OP_TOKEN_CREATE)),
+            "create-token route must map to OP_TOKEN_CREATE (issue #942)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/tokens" && op.is_none()),
+            "list-tokens route is a read — must map to None in ALL_MUTATION_ROUTES (issue #942)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "DELETE /admin/tokens/{id}" && *op == Some(OP_TOKEN_REVOKE)),
+            "revoke-token route must map to OP_TOKEN_REVOKE (issue #942)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_TOKEN_CREATE));
+        assert!(AUDITED_OPERATIONS.contains(&OP_TOKEN_REVOKE));
+        // The list read is explicitly excluded from audit.
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /admin/tokens"),
+            "GET /admin/tokens must be in EXCLUDED_ROUTES (read, no audit) (issue #942)"
+        );
+    }
+
+    #[test]
+    fn workflow_result_route_is_classified_read_only() {
+        // The workflow-result endpoint (issue #527) is a read-only projection of the
+        // execution's terminal output. It must be classified so the route-exhaustiveness
+        // guards below cover it.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /workflows/{id}/result" && *c == RouteClass::ReadOnly),
+            "GET /workflows/{{id}}/result must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #527)"
+        );
+    }
+
+    #[test]
+    fn workflow_count_route_is_classified_read_only() {
+        // The grouped workflow-count fleet snapshot (issue #544) is a
+        // read-only fan-out projection, no different from the other cross-shard
+        // read models it's modeled after. This test — not just the general
+        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
+        // and ALL_MUTATION_ROUTES against each other rather than against the
+        // live router — is what actually catches a new route shipping with no
+        // classification at all.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /workflows/count" && *c == RouteClass::ReadOnly),
+            "GET /workflows/count must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #544)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /workflows/count" && op.is_none()),
+            "GET /workflows/count must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #544)"
+        );
+    }
+
+    #[test]
+    fn dag_run_graph_route_is_classified_read_only() {
+        // The DAG run graph view (issue #690) is a read-only projection of a
+        // run's node topology + status. This pinned test — not just the general
+        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
+        // and ALL_MUTATION_ROUTES against each other rather than against the
+        // live router — is what actually catches the route being dropped from
+        // BOTH lists at once.
+        let route = "GET /dags/{dag_name}/runs/{run_exec_id}";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #690)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #690)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn replay_diagnosis_route_is_classified_read_only() {
+        // The single-execution replay-diagnosis endpoint (issue #614) loads one
+        // execution's recorded history and replays it against the currently
+        // registered handler, returning a structured verdict. It is read-only
+        // (appends no events, performs no writes) and writes no audit rows. This
+        // pinned test — not just the general exhaustiveness guards below, which
+        // only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other rather than against the live router — is what actually catches
+        // the route being dropped from BOTH lists at once.
+        let route = "POST /workflows/{id}/replay-diagnosis";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #614)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #614)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #614)"
+        );
+    }
+
+    #[test]
+    fn progress_stream_route_is_classified_read_only() {
+        // The ephemeral workflow progress SSE stream (issue #791) is a
+        // read-only, best-effort side channel; it never mutates state and
+        // writes no audit rows. This pinned test — not just the general
+        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
+        // and ALL_MUTATION_ROUTES against each other rather than against the
+        // live router — is what actually catches the route being dropped from
+        // BOTH lists at once.
+        let route = "GET /workflows/{id}/stream";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #791)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #791)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #791)"
+        );
+    }
+
+    #[test]
+    fn admin_status_route_is_classified_read_only() {
+        // The rolled-up health summary (issue #679) is a read-only fan-out
+        // projection. This pin — not just the general exhaustiveness guards,
+        // which only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
+        // against each other — is what catches the route shipping unclassified.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/status" && *c == RouteClass::ReadOnly),
+            "GET /admin/status must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #679)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/status" && op.is_none()),
+            "GET /admin/status must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #679)"
+        );
+    }
+
+    #[test]
+    fn admin_canary_route_is_classified_read_only() {
+        // The synthetic liveness canary freshness report (issue #796) is a
+        // read-only cross-shard projection. This pin — not just the general
+        // exhaustiveness guards, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other — is what catches the route
+        // shipping unclassified.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/canary" && *c == RouteClass::ReadOnly),
+            "GET /admin/canary must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #796)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/canary" && op.is_none()),
+            "GET /admin/canary must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #796)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /admin/canary"),
+            "GET /admin/canary must appear in EXCLUDED_ROUTES (read-only, no \
+             audit trail; issue #796)"
+        );
+    }
+
+    #[test]
+    fn schedule_update_route_is_classified_mutating() {
+        // The in-place schedule update (issue #771) is a mutating, audited
+        // operator route. This pinned test — not just the general
+        // exhaustiveness guards below, which only cross-check
+        // CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each other rather
+        // than against the live router — is what actually catches the route
+        // being dropped from BOTH lists at once.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "PATCH /admin/schedules/{id}" && *c == RouteClass::Mutating),
+            "PATCH /admin/schedules/{{id}} must be classified RouteClass::Mutating in \
+             CLASSIFIED_ROUTES (issue #771)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "PATCH /admin/schedules/{id}"
+                    && *op == Some(OP_SCHEDULE_UPDATE)),
+            "PATCH /admin/schedules/{{id}} must appear in ALL_MUTATION_ROUTES mapped to \
+             OP_SCHEDULE_UPDATE (issue #771)"
+        );
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_SCHEDULE_UPDATE),
+            "schedule.update must be a registered audited operation (issue #771)"
+        );
+    }
+
+    #[test]
+    fn usage_report_route_is_classified_read_only() {
+        // The historical per-tenant usage report (issue #596) is a read-only
+        // fan-out aggregation, no different from workflow_count / debounce /
+        // concurrency. This test — not just the general exhaustiveness guards
+        // below, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other rather than against the live
+        // router — is what actually catches a new route shipping with no
+        // classification at all.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/usage" && *c == RouteClass::ReadOnly),
+            "GET /admin/usage must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #596)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/usage" && op.is_none()),
+            "GET /admin/usage must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #596)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /admin/usage"),
+            "GET /admin/usage must appear in EXCLUDED_ROUTES (read-only, no audit trail \
+             entry expected, issue #596)"
+        );
+    }
+
+    #[test]
+    fn completion_delivery_routes_are_classified() {
+        // Issue #605 code review: the completion-callback delivery list and
+        // redrive routes shipped registered in the router (management_api_routes
+        // in autumn-harvest-plugin/src/api.rs) but absent from
+        // CLASSIFIED_ROUTES/AUDITED_OPERATIONS/ALL_MUTATION_ROUTES entirely —
+        // exactly the gap issues #544/#601 each independently hit and had to
+        // retroactively patch, since the general exhaustiveness guards below
+        // only cross-check these lists against each other, never against the
+        // live router. This test is what actually catches that class of gap
+        // for these two specific routes.
+        assert!(
+            CLASSIFIED_ROUTES.iter().any(|(r, c)| {
+                *r == "GET /workflows/{id}/completion-deliveries" && *c == RouteClass::ReadOnly
+            }),
+            "GET /workflows/{{id}}/completion-deliveries must be classified \
+             RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #605)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES.iter().any(|(r, op)| {
+                *r == "GET /workflows/{id}/completion-deliveries" && op.is_none()
+            }),
+            "GET /workflows/{{id}}/completion-deliveries must appear in \
+             ALL_MUTATION_ROUTES with no audit operation (issue #605)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /workflows/{id}/completion-deliveries"),
+            "GET /workflows/{{id}}/completion-deliveries must appear in EXCLUDED_ROUTES \
+             (read-only, no audit trail entry expected, issue #605)"
+        );
+
+        let redrive_route = "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == redrive_route && *c == RouteClass::Mutating),
+            "{redrive_route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES \
+             (issue #605)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == redrive_route && *op == Some(OP_CALLBACK_REDRIVE)),
+            "{redrive_route} must appear in ALL_MUTATION_ROUTES with audit operation \
+             OP_CALLBACK_REDRIVE (issue #605)"
+        );
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_CALLBACK_REDRIVE),
+            "OP_CALLBACK_REDRIVE must appear in AUDITED_OPERATIONS (issue #605)"
+        );
+    }
+
+    #[test]
+    fn payload_decode_read_op_is_registered_in_audited_operations() {
+        // Issue #608: operator read-path decoding of codec-encrypted payloads
+        // writes one best-effort audit row per request that decoded/marked
+        // ≥1 envelope (SSE: one row at stream open when decode mode is
+        // active). It is a *read* audit like OP_EXECUTION_STREAM_OPEN — no
+        // CLASSIFIED_ROUTES/ALL_MUTATION_ROUTES change (no route mutates and
+        // no new route exists), but the operation name itself must be in the
+        // registry so audit consumers can enumerate it.
+        assert_eq!(OP_PAYLOAD_DECODE_READ, "payload.decode_read");
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_PAYLOAD_DECODE_READ),
+            "OP_PAYLOAD_DECODE_READ must appear in AUDITED_OPERATIONS (issue #608)"
+        );
     }
 
     #[test]
@@ -855,6 +1826,126 @@ mod tests {
                      explicitly declare its audit disposition"
                 );
             }
+        }
+    }
+
+    // ── Read-only operator role (issue #776) ──────────────────────────────────
+
+    #[test]
+    fn deny_readonly_mutation_truth_table() {
+        // A read-only principal is denied every Mutating route, allowed every
+        // ReadOnly/PublicSafe route. A non-read-only principal is never denied
+        // by this decision (the enforcement layer leaves them to the existing
+        // admin gates).
+        assert!(
+            deny_readonly_mutation(true, RouteClass::Mutating),
+            "read-only principal must be denied a Mutating route (403)"
+        );
+        assert!(
+            !deny_readonly_mutation(true, RouteClass::ReadOnly),
+            "read-only principal must reach a ReadOnly route"
+        );
+        assert!(
+            !deny_readonly_mutation(true, RouteClass::PublicSafe),
+            "read-only principal must reach a PublicSafe route"
+        );
+        // A non-read-only (admin/anon) principal is never denied by THIS fn —
+        // their access is decided by the existing admin gates, not this layer.
+        assert!(!deny_readonly_mutation(false, RouteClass::Mutating));
+        assert!(!deny_readonly_mutation(false, RouteClass::ReadOnly));
+        assert!(!deny_readonly_mutation(false, RouteClass::PublicSafe));
+    }
+
+    #[test]
+    fn newly_classified_mutations_are_mutating_and_covered() {
+        // Privilege-escalation guard (issue #776): every route added to the
+        // classification table as a mutation in this slice MUST be
+        // RouteClass::Mutating — a wrong Mutating→ReadOnly entry would let a
+        // read-only principal force-open a circuit / create a calendar / retry
+        // a DAG / start-via-update. Dedicated pin (like the legal-hold pin):
+        // the general exhaustiveness guards only cross-check the two lists
+        // against each other, so this catches a class regression on these
+        // specific routes.
+        let audited: std::collections::HashSet<&str> = ALL_MUTATION_ROUTES
+            .iter()
+            .filter_map(|(r, op)| op.map(|_| *r))
+            .collect();
+        let excluded: std::collections::HashSet<&str> = EXCLUDED_ROUTES.iter().copied().collect();
+        for route in [
+            "POST /workflows/{workflow_name}/update-with-start",
+            "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+            "POST /admin/circuits/{activity_name}/force-open",
+            "POST /admin/circuits/{activity_name}/force-close",
+            "POST /admin/completion-triggers",
+            "POST /calendars",
+            "PUT /calendars/{name}",
+            "DELETE /calendars/{name}",
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+                "{route} must be classified RouteClass::Mutating (issue #776) — \
+                 a read-only principal must never reach it"
+            );
+            assert!(
+                audited.contains(route) || excluded.contains(route),
+                "{route} must declare its audit disposition (Some(op) or EXCLUDED_ROUTES)"
+            );
+        }
+        // The four circuit/dag/update ops reuse pre-existing constants that had
+        // never been wired into a route manifest entry; confirm the wiring.
+        for op in [
+            OP_WORKFLOW_UPDATE_WITH_START,
+            OP_DAG_RETRY,
+            OP_CIRCUIT_FORCE_OPEN,
+            OP_CIRCUIT_FORCE_CLOSE,
+        ] {
+            assert!(
+                AUDITED_OPERATIONS.contains(&op),
+                "operation '{op}' must be in AUDITED_OPERATIONS (issue #776 wiring)"
+            );
+        }
+    }
+
+    #[test]
+    fn newly_classified_reads_are_read_only() {
+        // The read grant surface for the read-only tier: each must be
+        // RouteClass::ReadOnly so a read-only principal reaches it (AC1). A
+        // wrong ReadOnly→Mutating here would only over-restrict (403 a read),
+        // not escalate, but it breaks the "100% of ReadOnly reachable" bar.
+        for route in [
+            "GET /batches/pending",
+            "GET /workflows/registered",
+            "GET /workflows/registered/{name}/schema",
+            "GET /workflows/registered/{name}/interface",
+            "GET /workflows/types/{workflow_name}/handlers",
+            "GET /workflows/by-id/{workflow_name}",
+            "POST /workflows/by-id/{workflow_name}",
+            "GET /dead-letters/aggregate",
+            "GET /admin/circuits",
+            "GET /admin/circuits/{activity_name}",
+            "GET /admin/queues/scaling",
+            "GET /admin/metrics",
+            "GET /admin/completion-triggers",
+            "GET /admin/schedules/{id}",
+            "GET /admin/schedules/{id}/runs",
+            "GET /admin/schedules/decisions",
+            "GET /admin/schedules/{id}/decisions",
+            "GET /admin/schedules/{id}/preview",
+            "POST /admin/schedules/preview",
+            "GET /calendars",
+            "GET /calendars/{name}",
+            "GET /workers/{worker_id}/pinned",
+            "GET /admin/queues/{queue_name}/eligibility",
+            "GET /admin/tasks/{id}/eligibility",
+        ] {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+                "{route} must be classified RouteClass::ReadOnly (issue #776)"
+            );
         }
     }
 }

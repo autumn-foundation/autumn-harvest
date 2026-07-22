@@ -12,14 +12,20 @@ pub use crate::circuit_breaker::{
     AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
     DispatchDecision, DispatchToken,
 };
-pub use crate::context::{ActivityContext, WorkflowContext};
+pub use crate::context::{
+    ActivityContext, AutoHeartbeatGuard, DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard,
+    MutexHandle, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowContext,
+    WorkflowExecutionInfo,
+};
 pub use crate::dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
-    DagTask, DagTaskRef,
+    DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
 };
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::{SideEffectKind, WorkflowEvent};
-pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
+pub use crate::failure::{
+    ActivityFailure, IntoActivityErrorString, IntoWorkflowErrorString, WorkflowFailure,
+};
 #[cfg(feature = "db")]
 pub use crate::handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
@@ -29,7 +35,12 @@ pub use crate::handle::{
 pub use crate::handle_typed::{
     TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
 };
-pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+pub use crate::info::{
+    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+};
+pub use crate::interceptor::{
+    ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,
+};
 pub use crate::policy::{
     CircuitBreakerPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy,
     TaskStatus, TriggerRule, WorkflowSchedule,
@@ -47,10 +58,14 @@ pub use crate::telemetry::{
 };
 pub use crate::types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalSignalId, IdempotencyKey,
-    Priority, TimerId, WorkerId, WorkflowId,
+    Priority, SessionId, TimerId, WorkerId, WorkflowId,
+};
+pub use crate::webhook_trigger::{
+    WebhookCtx, WebhookHandlerError, WebhookTarget, WebhookTriggerInfo, validate_webhook_triggers,
 };
 
 // Re-export macros from autumn-harvest-macros.
 pub use autumn_harvest_macros::{
-    activities, activity, dag, dags, queries, query, signal, update, updates, workflow, workflows,
+    activities, activity, dag, dags, queries, query, signal, signals, update, updates, webhook,
+    webhooks, workflow, workflows,
 };

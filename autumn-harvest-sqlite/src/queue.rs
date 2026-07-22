@@ -1,0 +1,735 @@
+//! Activity task queue and durable timers.
+//!
+//! # Single-writer is load-bearing (replaces `FOR UPDATE SKIP LOCKED`)
+//!
+//! The Postgres backend claims work with `SELECT ... FOR UPDATE SKIP LOCKED` so
+//! many concurrent worker processes can pull disjoint rows without blocking each
+//! other. `SQLite` has no row-level locking and no `SKIP LOCKED`; instead this
+//! backend assumes a **single writer process**. A claim is a `BEGIN IMMEDIATE`
+//! transaction (which takes `SQLite`'s database-level write lock up front) that
+//! `SELECT`s the oldest ready `PENDING` row and flips it to `RUNNING`, then
+//! `COMMIT`s. Under the single-writer assumption this is exactly-once by
+//! construction — no two claimers ever race. **Multi-writer `SQLite` is explicitly
+//! out of scope**; supporting it would need an external lease or a
+//! `busy_timeout`/retry protocol layered on the `BEGIN IMMEDIATE` claim, which is
+//! precisely the complexity the edge/local-first use case avoids.
+//!
+//! # Polling replaces `LISTEN`/`NOTIFY`
+//!
+//! The Postgres backend wakes idle workers with `LISTEN`/`NOTIFY`. `SQLite` has no
+//! push notification, so the driver ([`SqliteRuntime`](crate::SqliteRuntime))
+//! **polls**: it drains all currently-ready tasks and due timers, re-runs the
+//! workflow, and repeats until the run reaches a terminal state or blocks on an
+//! external input. A production edge runtime would wrap this in a
+//! sleep-and-repoll loop; the tests drive the poll explicitly (and advance a
+//! virtual clock) so they never sleep.
+//!
+//! # Orphan reclaim (single-server crash recovery)
+//!
+//! Because there is one server, any task left `RUNNING` when the process starts
+//! is an orphan from a crash — the previous process claimed it, may have run the
+//! body, but did not commit the terminal finalize (see the atomicity discussion
+//! in [`worker`](crate::worker)). [`reclaim_orphaned_running`] flips every such
+//! row back to `PENDING` on [`SqliteRuntime::open`](crate::SqliteRuntime::open)
+//! so the body re-runs. This makes activity execution **at-least-once**.
+
+use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::{ActivityExecId, ExecutionId};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::Value;
+
+use crate::error::{SqliteError, SqliteResult};
+
+/// A claimed activity task ready to run.
+pub struct ClaimedTask {
+    pub task_id: String,
+    pub activity_id: ActivityExecId,
+    pub name: String,
+    pub input: Value,
+    /// Attempts already consumed (0 before the first run).
+    pub attempt: u32,
+    /// Per-call retry cap carried from the scheduling command's
+    /// `retry_policy_override` (issue #1069 P2). `Some` when the workflow used the
+    /// typed `execute_activity`/`execute_activity_with_opts` path (which resolves
+    /// the activity's declared/per-call `RetryPolicy`); `None` for the raw
+    /// `execute_activity_raw` path, in which case the worker falls back to the
+    /// registered [`ActivitySpec`](crate::runtime::ActivitySpec)'s default.
+    pub max_attempts: Option<u32>,
+    /// The workflow's declared/per-call [`RetryPolicy`], carried from the
+    /// scheduling command's `retry_policy_override` (issue #1069 P2, Codex
+    /// `runtime.rs:985`). `Some(policy)` when the workflow used the typed
+    /// `execute_activity`/`execute_activity_with_opts` path (which resolves the
+    /// activity's declared/per-call `RetryPolicy`); `None` for the raw
+    /// `execute_activity_raw` path. The worker reads it to honor the WHOLE policy
+    /// — backoff timing (`compute_retry_delay`) and non-retryable classification
+    /// (`is_non_retryable`, incl. the `non_retryable_errors` list) — not just
+    /// `max_attempts`. `None` = immediate requeue with no policy non-retryable
+    /// list (a typed-payload `non_retryable: true` is still honored).
+    pub retry_policy: Option<RetryPolicy>,
+    /// Per-activity start-to-close budget in milliseconds, carried from the
+    /// scheduling command's `start_to_close_override` (issue #1069 P2). `Some(ms)`
+    /// when the workflow's declared/per-call activity has a start-to-close timeout
+    /// (via `#[activity(start_to_close = "…")]` or `execute_activity_with_opts`);
+    /// `None` = no budget (unbounded, prior behavior). Enforced by the worker as a
+    /// **post-execution outcome**: a synchronous body cannot be cancelled mid-flight
+    /// in a single-writer runtime, but a body whose real wall-clock runtime exceeds
+    /// this budget records a terminal `ActivityTimedOut { StartToClose }` instead of
+    /// `ActivityCompleted` — byte-equivalent to the durable event the Postgres
+    /// timeout scanner (`enforce_activity_timeout`) records.
+    pub start_to_close_ms: Option<i64>,
+    /// The ABSOLUTE epoch-millisecond this task's `ScheduleActivity` command was
+    /// first persisted (== its initial `run_at`), never mutated by a retry requeue.
+    /// The STABLE anchor from which the worker resolves the activity's total
+    /// (cross-retry) `schedule_to_close` deadline at CLAIM time (issue #378, Codex
+    /// #1069 P2 `runtime.rs:944`): `scheduled_at + spec.default_schedule_to_close`.
+    /// Unlike [`Self::run_at`-mutating retries], it always denotes when the activity
+    /// was first scheduled, so a wait for LATE registration cannot extend the budget.
+    pub scheduled_at: i64,
+    /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond,
+    /// **read from the frozen `schedule_to_close_at` column** (issue #1068). For a
+    /// FROZEN task (`defaults_frozen == true`) this is the immutable value resolved
+    /// once at schedule/claim time; for an UNFROZEN task it is whatever is currently
+    /// on the row (`None` until the worker resolves it from the registered spec,
+    /// anchored to [`Self::scheduled_at`], and freezes it — mirroring the Postgres
+    /// worker resolving `ActivityInfo` from its `HandlerRegistry`). `Some(at)` = the
+    /// whole activity (all attempts + back-off sleeps combined) must finish before
+    /// `at`; `None` = no total deadline (the activity has no declared
+    /// `schedule_to_close`, or was raw-registered). Enforced by the worker: a task
+    /// drained at/after `at`, or a retry whose next attempt would land at/after `at`,
+    /// records a terminal `ActivityTimedOut { ScheduleToClose }` instead of
+    /// running/retrying — byte-equivalent to the Postgres
+    /// `schedule_to_close_deadline_exceeded` path.
+    pub schedule_to_close_at: Option<i64>,
+    /// Whether this task's four resolved-default scalars (`retry_policy`,
+    /// `max_attempts`, `start_to_close_ms`, `schedule_to_close_at`) are FROZEN on the
+    /// row (issue #1068). `true` = they were resolved once (at schedule time when the
+    /// activity was already registered, or at first claim for a late-registered one)
+    /// and persisted — the worker reads them VERBATIM and never re-consults the
+    /// mutable registry for them, so an in-flight activity's retry/deadline contract
+    /// is immutable across a crash/reopen or a re-registration under a changed spec.
+    /// `false` = not yet resolved (the activity was scheduled before its
+    /// body/`ActivityInfo` was registered): the worker resolves the four fields from
+    /// the now-present spec, persists them via [`freeze_task_defaults`], and sets this
+    /// to `true`. The activity BODY is always resolved from the registry regardless —
+    /// only the policy/deadline scalars are frozen.
+    pub defaults_frozen: bool,
+}
+
+fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
+    let max: Option<i64> =
+        conn.query_row("SELECT MAX(seq) FROM harvest_tasks", [], |row| row.get(0))?;
+    Ok(max.map_or(0, |m| m + 1))
+}
+
+/// The next monotonic timer arm sequence (the deterministic same-`fire_at`
+/// tie-breaker, issue #1069 P2). Computed as `MAX(arm_seq) + 1` over ALL timer
+/// rows so it is globally monotonic within the database — two timers armed in the
+/// same [`apply_commands`](crate::runtime) transaction (e.g.
+/// `tokio::join!(ctx.timer("a", 1), ctx.timer("b", 1))`) get consecutive values in
+/// command order, because the first `enqueue_timer` commits its row before the
+/// second reads `MAX`. Robust to `VACUUM` (unlike an implicit `rowid`, which
+/// `VACUUM` may renumber).
+fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
+    let max: Option<i64> =
+        conn.query_row("SELECT MAX(arm_seq) FROM harvest_timers", [], |row| {
+            row.get(0)
+        })?;
+    Ok(max.map_or(0, |m| m + 1))
+}
+
+/// Reclaim tasks stranded `RUNNING` by a crash, flipping them back to `PENDING`.
+///
+/// Safe because this backend is single-server: any `RUNNING` row observed at
+/// startup was claimed by a process that has since exited without finalizing.
+/// Returns the number of rows reclaimed.
+pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING'",
+        [],
+    )?;
+    Ok(n)
+}
+
+/// Enqueue a fresh activity task in the `PENDING` state.
+///
+/// `max_attempts` is the per-call retry cap from the scheduling command's
+/// `retry_policy_override` (issue #1069 P2): `Some(n)` honors the workflow's
+/// declared/per-call [`RetryPolicy`](autumn_harvest::policy::RetryPolicy), `None`
+/// leaves the worker to fall back to the registered `ActivitySpec` default.
+///
+/// `start_to_close_ms` is the per-activity start-to-close budget (milliseconds)
+/// from the command's `start_to_close_override` (issue #1069 P2): `Some(ms)`
+/// persists the declared/per-call timeout for the worker to enforce; `None` = no
+/// budget (unbounded).
+///
+/// `retry_policy_json` is the WHOLE serialized [`RetryPolicy`] from the command's
+/// `retry_policy_override` (issue #1069 P2, Codex `runtime.rs:985`): `Some(json)`
+/// persists it so the worker honors backoff timing + non-retryable classification;
+/// `None` for the raw path (immediate requeue, no policy list).
+///
+/// `schedule_to_close_at` is the FROZEN absolute (epoch-millisecond) total
+/// (cross-retry) deadline (issue #1068): `Some(at)` when the activity is registered
+/// at schedule time and declares a `schedule_to_close` (`scheduled_at +
+/// default_schedule_to_close`), `None` otherwise. `defaults_frozen` records whether
+/// the four resolved-default scalars are frozen on this row (`true` when the caller
+/// resolved them from the registered spec at schedule time; `false` when the
+/// activity was scheduled before it was registered, so the worker resolves and
+/// freezes them at first claim). The initial `run_at` is also recorded as the stable
+/// `scheduled_at` anchor so the frozen deadline is always measured from when the
+/// activity was first scheduled, never mutated by a retry requeue.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_activity(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    name: &str,
+    input: &Value,
+    queue: &str,
+    run_at: i64,
+    max_attempts: Option<u32>,
+    retry_policy_json: Option<&str>,
+    start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+    defaults_frozen: bool,
+) -> SqliteResult<()> {
+    let seq = next_task_seq(conn)?;
+    conn.execute(
+        "INSERT INTO harvest_tasks \
+         (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
+          max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, \
+          schedule_to_close_at, defaults_frozen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7, ?12, ?13)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            exec_id.to_string(),
+            activity_id.to_string(),
+            name,
+            serde_json::to_string(input)?,
+            queue,
+            run_at,
+            seq,
+            max_attempts.map(i64::from),
+            retry_policy_json,
+            start_to_close_ms,
+            schedule_to_close_at,
+            i64::from(defaults_frozen),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Freeze the four resolved-default scalars onto a task row and set
+/// `defaults_frozen = 1` (issue #1068).
+///
+/// Called by [`drain_ready`](crate::worker::drain_ready) at CLAIM time for a task
+/// that was scheduled before its activity was registered (`defaults_frozen == 0`):
+/// once the body/`ActivityInfo` is present, the worker resolves `retry_policy_json`,
+/// `max_attempts`, `start_to_close_ms`, and the absolute `schedule_to_close_at` from
+/// the registered spec, persists them here, and reads them verbatim thereafter — so
+/// a later claim (crash/reopen, or a re-registration under a changed spec) sees the
+/// SAME values rather than re-resolving against a mutated registry. A single
+/// `UPDATE` scoped to `task_id`, run **inside the caller's open claim transaction**
+/// (issue #1068; Codex #1080 P2) — `conn` here is the still-open `BEGIN IMMEDIATE`
+/// claim transaction (a `&Transaction` deref-coerces to `&Connection`), NOT a fresh
+/// autocommit connection, so this freeze and the claim's `RUNNING` flip commit
+/// atomically (or roll back together if either fails). A `None` argument is written
+/// as SQL `NULL` (= "resolved to no value"), which the frozen claim path reads back
+/// as `None`.
+pub fn freeze_task_defaults(
+    conn: &Connection,
+    task_id: &str,
+    retry_policy_json: Option<&str>,
+    max_attempts: Option<u32>,
+    start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET retry_policy_json = ?2, max_attempts = ?3, \
+         start_to_close_ms = ?4, schedule_to_close_at = ?5, defaults_frozen = 1 \
+         WHERE task_id = ?1",
+        params![
+            task_id,
+            retry_policy_json,
+            max_attempts.map(i64::from),
+            start_to_close_ms,
+            schedule_to_close_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id`, flipping
+/// it to `RUNNING` inside a `BEGIN IMMEDIATE` transaction — and return the STILL-OPEN
+/// transaction so the caller can freeze the task's resolved defaults in the SAME
+/// transaction before committing (issue #1068; Codex #1080 P2). See the module docs
+/// for why this replaces `SKIP LOCKED`.
+///
+/// The returned transaction is NOT committed. The caller (`worker::drain_ready`)
+/// resolves the activity's registered spec and, for an UNFROZEN (late-registered)
+/// task, calls [`freeze_task_defaults`] through the same transaction, then commits —
+/// so the `RUNNING` flip and the default-freeze commit ATOMICALLY. This closes the
+/// gap where the old (self-committing) claim left a committed `RUNNING`+unfrozen row:
+/// a crash between the claim commit and a SEPARATE freeze commit could then be
+/// reclaimed `PENDING` (still unfrozen) and re-frozen against a CHANGED registry,
+/// silently altering an "already-claimed" late-registered task's frozen contract. If
+/// the caller instead DROPS the transaction (an unregistered activity, or a crash
+/// before commit), the whole claim rolls back and the row stays `PENDING` — no
+/// orphaned `RUNNING` row, and nothing for a reopen to mis-handle.
+///
+/// The `Transaction` is held only across the caller's spec lookup + freeze (a hash
+/// lookup + a pure resolution + one `UPDATE`) — never across the activity BODY, which
+/// runs after the caller commits — so the write lock is held for microseconds.
+pub fn claim_next_ready_task_tx(
+    conn: &mut Connection,
+    exec_id: ExecutionId,
+    now: i64,
+) -> SqliteResult<Option<(Transaction<'_>, ClaimedTask)>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row = tx
+        .query_row(
+            "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
+             retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
+             defaults_frozen \
+             FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
+             ORDER BY seq LIMIT 1",
+            params![exec_id.to_string(), now],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        task_id,
+        act_s,
+        name,
+        input_s,
+        attempt,
+        max_attempts,
+        retry_policy_json,
+        start_to_close_ms,
+        scheduled_at,
+        schedule_to_close_at,
+        defaults_frozen,
+    )) = row
+    else {
+        // No ready task — commit the empty read tx to release the lock cleanly.
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    // Parse the fallible fields BEFORE mutating: a `?`-return here drops `tx`
+    // un-committed, rolling back the `BEGIN IMMEDIATE` transaction so the task
+    // stays `PENDING` and can be re-claimed — a mutate-then-parse ordering would
+    // strand it `RUNNING` on a corrupt-row error.
+    let activity_id = act_s
+        .parse()
+        .map_err(|_| SqliteError::corrupt("activity_id"))?;
+    let input: Value = serde_json::from_str(&input_s)?;
+    let retry_policy = retry_policy_json
+        .as_deref()
+        .map(serde_json::from_str::<RetryPolicy>)
+        .transpose()?;
+
+    // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
+    // (for a late-registered task) in this SAME transaction, then commits both.
+    tx.execute(
+        "UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1",
+        params![task_id],
+    )?;
+
+    let task = ClaimedTask {
+        task_id,
+        activity_id,
+        name,
+        input,
+        attempt: u32::try_from(attempt).unwrap_or(0),
+        max_attempts: max_attempts.and_then(|m| u32::try_from(m).ok()),
+        retry_policy,
+        start_to_close_ms,
+        scheduled_at,
+        // Read straight from the row (issue #1068). For a frozen task this is the
+        // immutable resolved deadline; for an unfrozen task it is whatever is on the
+        // row (`None` until the worker resolves and freezes it from the now-present
+        // registered spec, anchored to `scheduled_at`).
+        schedule_to_close_at,
+        defaults_frozen: defaults_frozen != 0,
+    };
+    Ok(Some((tx, task)))
+}
+
+/// Mark a task terminally done (success or exhausted retries).
+pub fn finish_task(conn: &Connection, task_id: &str) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET state = 'DONE' WHERE task_id = ?1",
+        params![task_id],
+    )?;
+    Ok(())
+}
+
+/// The stored `state` of a task by id (used by the atomicity tests).
+#[cfg(test)]
+pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT state FROM harvest_tasks WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// True iff `exec_id` has any `PENDING` activity task.
+///
+/// When the driver's [`classify_block`](crate::SqliteRuntime) reaches here (the
+/// workflow suspended and neither a command nor a drain made progress this cycle),
+/// any `PENDING` activity task is necessarily one BACKING OFF with a future
+/// `run_at`: a `PENDING` task whose `run_at <= now` would already have been claimed
+/// and run by [`claim_next_ready_task_tx`] in this cycle's `drain_ready` pass. A
+/// delayed retry (`run_at = now + backoff`, issue #1069 P2, Codex `runtime.rs:985`)
+/// is therefore a genuine time-based block — the driver returns
+/// [`RunState::WaitingTimer`](crate::RunState) (a no-progress state) so a poll
+/// before the deadline neither re-runs the body nor spins to `Stuck`; the caller
+/// advances the clock and re-drives.
+pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')",
+        params![exec_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Requeue a task for another attempt at `run_at`, recording the consumed
+/// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
+/// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
+/// (its future `run_at` keeps it out of `claim_next_ready_task_tx`'s `run_at <= now`
+/// window this pass), so keeping its low `seq` is correct and leaves existing
+/// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
+/// [`requeue_task_to_back`] instead.
+pub fn requeue_task(
+    conn: &Connection,
+    task_id: &str,
+    attempt: u32,
+    run_at: i64,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3 WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at],
+    )?;
+    Ok(())
+}
+
+/// Requeue a task for another attempt at `run_at`, moving it to the **BACK** of
+/// the ready queue by assigning it a fresh, highest `seq` (issue #1068, hardening
+/// item 3).
+///
+/// This is the fairness variant of [`requeue_task`], for an IMMEDIATE (zero-delay)
+/// retry — one whose `run_at <= now`, so the just-failed task would otherwise be
+/// re-claimable in the SAME drain pass. Because [`claim_next_ready_task_tx`] selects
+/// the oldest ready task (`ORDER BY seq LIMIT 1`), keeping the failed task's
+/// ORIGINAL (lower) `seq` would let it re-select itself before any ready SIBLING
+/// gets a turn — a low-index `ctx.race()` branch that fails-and-retries with zero
+/// delay could then monopolize the drain and settle the race before a faster
+/// sibling ever runs. Assigning a fresh `MAX(seq) + 1` (the same monotonic
+/// allocator [`enqueue_activity`] uses via [`next_task_seq`]) sorts the requeued
+/// task AFTER every currently-queued task, so the claim loop yields to every other
+/// ready sibling before returning to it — round-robin fairness. Outside a race a
+/// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
+/// simply re-claimed immediately anyway.
+pub fn requeue_task_to_back(
+    conn: &Connection,
+    task_id: &str,
+    attempt: u32,
+    run_at: i64,
+) -> SqliteResult<()> {
+    let seq = next_task_seq(conn)?;
+    conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4 \
+         WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, seq],
+    )?;
+    Ok(())
+}
+
+/// Cancel a still-open (`PENDING`/`RUNNING`) activity task by its `activity_id`,
+/// flipping it to `CANCELLED`. Returns `true` iff a row was actually cancelled.
+///
+/// The loser-cancellation primitive for a losing activity branch of a resolved
+/// `ctx.race()` (issue #600), mirroring the Postgres `queue::cancel_activity_task`.
+/// An activity that
+/// genuinely completed first (a real completion raced the cancellation) is
+/// already `DONE`, matches nothing, and returns `false` — so its real terminal
+/// event is never shadowed by a synthetic one. A `CANCELLED` row is terminal for
+/// this queue: [`claim_next_ready_task_tx`] only selects `state = 'PENDING'`, so a
+/// cancelled loser is never re-run.
+pub fn cancel_activity_task(conn: &Connection, activity_id: ActivityExecId) -> SqliteResult<bool> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'CANCELLED' \
+         WHERE activity_id = ?1 AND state IN ('PENDING', 'RUNNING')",
+        params![activity_id.to_string()],
+    )?;
+    Ok(n > 0)
+}
+
+// ── Durable timers ───────────────────────────────────────────────────────────
+
+pub fn enqueue_timer(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+    fire_at: i64,
+) -> SqliteResult<()> {
+    // `INSERT OR REPLACE` (not `OR IGNORE`) so a timer id can be RE-ARMED under the
+    // same name after a prior fire (the poll-loop idiom). The caller
+    // (`apply_commands`) only reaches this for a genuinely-new arm — occurrence
+    // idempotency (`store::pending_timer_arms == 0`) guarantees no *pending* arm of
+    // this id exists — so any conflicting `(exec_id, timer_id)` row is a spent
+    // (`fired = 1`) row from a previous arm that is safe to supersede with the
+    // fresh unfired arm. `OR IGNORE` would instead silently keep the spent row and
+    // wedge the re-arm at `Stuck`.
+    // Assign a fresh monotonic `arm_seq` so this arm sorts AFTER every timer armed
+    // earlier (issue #1069 P2). A re-arm of the same id (the poll-loop idiom) is an
+    // `INSERT OR REPLACE`, which deletes the spent row and inserts fresh — so it
+    // correctly gets a NEW, higher `arm_seq`, sorting after any concurrently-armed
+    // sibling as its re-arm implies.
+    let arm_seq = next_timer_arm_seq(conn)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![timer_id, exec_id.to_string(), fire_at, arm_seq],
+    )?;
+    Ok(())
+}
+
+/// Return the ids of all unfired timers for `exec_id` whose deadline has passed.
+pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Vec<String>> {
+    // `ORDER BY fire_at, arm_seq`: the secondary `arm_seq` key makes the fire order
+    // of equal-deadline timers deterministic and equal to their `TimerStarted`
+    // append order, which the core matcher requires (issue #1069 P2).
+    let mut stmt = conn.prepare_cached(
+        "SELECT timer_id FROM harvest_timers \
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at, arm_seq",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string(), now], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Return the ids of all unfired timers for `exec_id` that are **both** due
+/// (`fire_at <= now`) **and** whose deadline is at or before `received_at`,
+/// oldest deadline first.
+///
+/// The "fire this timer BEFORE that signal" half of the wake-event ordering
+/// (issue #476). A `wait_for_signal_timeout` deadline that expired at or before a
+/// signal arrived (`fire_at <= received_at`) must be recorded as `TimerFired`
+/// ahead of the `SignalReceived`, so a late signal cannot retroactively flip the
+/// race to the approval branch. Ties (`fire_at == received_at`) go to the timer,
+/// mirroring the Postgres `merge_wake_events` rule (signal-first iff
+/// `received_at < fires_at`). A due timer whose deadline is *after* the signal
+/// arrived is deliberately excluded here — it is fired *after* the signal by the
+/// ordinary [`drain_ready`](crate::worker::drain_ready) pass.
+pub fn due_timers_before_signal(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    now: i64,
+    received_at: i64,
+) -> SqliteResult<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT timer_id FROM harvest_timers \
+         WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 AND fire_at <= ?3 \
+         ORDER BY fire_at, arm_seq",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string(), now, received_at], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// True if `exec_id` has any armed (unfired) durable timer — the ground-truth
+/// signal a no-progress cycle is genuinely waiting on a not-yet-due timer.
+pub fn has_unfired_timer(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
+        params![exec_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+pub fn mark_timer_fired(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_timers SET fired = 1 WHERE exec_id = ?1 AND timer_id = ?2",
+        params![exec_id.to_string(), timer_id],
+    )?;
+    Ok(())
+}
+
+/// Delete a single still-pending (`fired = 0`) durable timer row by its
+/// `timer_id`. A no-op if the timer already fired or does not exist.
+///
+/// The loser-cancellation primitive for a losing timer branch of a resolved race
+/// — `ctx.race()` (issue #600) and, in particular, the deadline timer of a
+/// `wait_for_signal_timeout` / `receive_signal_timeout` whose **signal wins**
+/// (issue #476). Mirrors the Postgres `queue::delete_pending_timer`. Deleting
+/// the unfired row is what keeps the completed workflow from being pinned by a
+/// stray armed timer (and from a stray later `TimerFired`).
+///
+/// Returns `true` iff a row was actually removed. This lets the (idempotent)
+/// re-push of the same teardown on every subsequent replay cycle report *no*
+/// progress once the row is gone, so the decision loop still converges instead
+/// of spinning on a repeated no-op delete.
+pub fn delete_pending_timer(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+) -> SqliteResult<bool> {
+    let n = conn.execute(
+        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
+        params![exec_id.to_string(), timer_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Delete every PENDING task row for an execution (issue #1068) — used by the
+/// reuse-policy `TerminateIfRunning` case when it seals a still-RUNNING prior, so
+/// no orphan task can be claimed against a run that will never be driven again.
+/// Returns the number of rows deleted. DONE/RUNNING rows are left untouched: in
+/// the single-writer runtime no drive is in flight during a start call (a crashed
+/// mid-claim RUNNING row is reset to PENDING by the orphan reclaim on open), so
+/// PENDING is exactly the set of claimable orphans.
+pub fn delete_pending_tasks_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'",
+        params![exec_id.to_string()],
+    )?)
+}
+
+/// Delete every unfired timer row for an execution (issue #1068) — companion to
+/// [`delete_pending_tasks_for_execution`] for the `TerminateIfRunning` seal, so a
+/// durable timer armed by the sealed prior cannot fire against a run that will
+/// never be driven again. Returns the number of rows deleted. Fired timer rows are
+/// left untouched (they are inert audit history).
+pub fn delete_unfired_timers_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
+        params![exec_id.to_string()],
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, params};
+
+    use autumn_harvest::ExecutionId;
+
+    use super::{due_timers, due_timers_before_signal, enqueue_timer};
+    use crate::schema;
+
+    fn open() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+        conn
+    }
+
+    // FINDING 1 (Codex #1069 P2): the deterministic `arm_seq` tie-break makes the
+    // fire order of equal-`fire_at` timers well-defined and equal to arm order.
+    // (SQLite's `ORDER BY fire_at`-only tie order is *unspecified* — it may happen
+    // to coincide with arm order or not — so the hard-falsifiable proof that this
+    // order is load-bearing lives in the end-to-end reversed-history control in
+    // `tests/timer_arm_order.rs`; here we pin the guarantee.) Rows are inserted so
+    // arm order (a, z) is the reverse of insertion (rowid) order (z, a).
+    #[test]
+    fn due_timers_break_equal_deadlines_by_arm_seq() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        conn.execute(
+            "INSERT INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+             VALUES ('z', ?1, 100, 0, 1)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
+             VALUES ('a', ?1, 100, 0, 0)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            due_timers(&conn, exec, 200).unwrap(),
+            vec!["a".to_string(), "z".to_string()],
+            "equal-deadline timers must fire in arm_seq order"
+        );
+        // The signal-interleave query carries the same tie-break.
+        assert_eq!(
+            due_timers_before_signal(&conn, exec, 200, 200).unwrap(),
+            vec!["a".to_string(), "z".to_string()],
+            "due_timers_before_signal must apply the same arm_seq tie-break"
+        );
+    }
+
+    // `enqueue_timer` assigns a strictly increasing `arm_seq` in call order, so two
+    // timers armed in one batch (the `join!` case) fire in `TimerStarted`-append
+    // order — and a re-arm of the same id (INSERT OR REPLACE) gets a fresh, higher
+    // `arm_seq` rather than keeping the spent row's value.
+    #[test]
+    fn enqueue_timer_assigns_monotonic_arm_seq_including_on_rearm() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        enqueue_timer(&conn, exec, "a", 100).unwrap();
+        enqueue_timer(&conn, exec, "b", 100).unwrap();
+        let seq = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT arm_seq FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2",
+                params![exec.to_string(), id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(seq("a") < seq("b"), "a armed before b sorts first");
+        // Both share fire_at=100, so due order follows arm order.
+        assert_eq!(
+            due_timers(&conn, exec, 200).unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+
+        // Re-arm "a" (the poll-loop idiom) — it must get a fresh arm_seq ABOVE b's.
+        enqueue_timer(&conn, exec, "a", 100).unwrap();
+        assert!(
+            seq("a") > seq("b"),
+            "a re-armed after b must get a fresh higher arm_seq, not keep its stale one"
+        );
+    }
+}
