@@ -225,6 +225,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - De-flake the `nd_blocked_cycle_does_not_emit_signal_unhandled` engine test (Refs #1074). Test-code-only.
 
+- 0.5.0 documentation sweep + migration guide (PR #1130): verified every published doc and runnable example against the shipped source, added the `docs/upgrading/0.5.0.md` upgrade guide covering the 0.4.0 → 0.5.0 transition, filled documentation-coverage gaps for features that landed without a corresponding docs page, and cleaned up stale org-rename links across the docs tree. Docs-only — no code, no `WorkflowEvent` variant, no migration, no test change.
+
 ## [0.4.0] - 2026-06-16
 
 ### Added
