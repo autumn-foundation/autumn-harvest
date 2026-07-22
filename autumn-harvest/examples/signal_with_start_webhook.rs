@@ -121,6 +121,9 @@ async fn handle_webhook_after(
             // see docs/getting-started/12-webhooks.md for how a webhook-facing
             // app wires its own WorkflowInfo through this field.
             workflow_info: None,
+            // Fresh-start provenance (issue #740); default records
+            // StartSource::SignalWithStart.
+            start_source_override: None,
         },
     )
     .await?;

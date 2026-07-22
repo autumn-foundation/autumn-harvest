@@ -152,9 +152,11 @@ pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<Ba
     Ok(BatchResult { succeeded, failed })
 }
 
-/// Bounded / windowed fan-out (issue #750): process a large collection with at
-/// most `W` activities in flight at a time, applying natural backpressure to
-/// workers and downstreams instead of scheduling all `N` at once.
+/// Bounded / windowed fan-out (issue #750).
+///
+/// Process a large collection with at most `W` activities in flight at a time,
+/// applying natural backpressure to workers and downstreams instead of
+/// scheduling all `N` at once.
 ///
 /// The entire windowed step is a single method call — replacing the ~30-line
 /// manual "loop / slice / call fan-out per chunk / stitch results" idiom:
