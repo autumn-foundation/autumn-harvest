@@ -20549,6 +20549,93 @@ mod tests {
         Ok(())
     }
 
+    /// RED reproducer for issue #1126: a `ctx.race()` that resolves while a
+    /// LOSING activity branch is still in-flight (its `ActivityStarted` is
+    /// recorded but it has no terminal yet) must NOT leave the loser's
+    /// `ActivityStarted` unconsumed at the matcher cursor. If it does, ANY
+    /// follow-on positional durable command in the same decision cycle (a plain
+    /// activity, `ctx.mutex(k).acquire()`, a timer, etc.) diverges on that
+    /// leftover event -> nd-block -> permanent wedge. This asserts the follow-on
+    /// `match_activity` lands cleanly (NoMatch = fresh dispatch at the live
+    /// frontier) rather than `Diverged`.
+    #[tokio::test]
+    async fn race_with_in_flight_activity_loser_does_not_wedge_a_follow_on_command()
+    -> Result<(), HarvestError> {
+        let winner_id = ActivityExecId::new();
+        let loser_id = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "a"});
+
+        // Live resolving cycle: the winner (branch 0) completed; the loser
+        // (branch 1) was scheduled AND started but has no terminal yet.
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: loser_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: winner_id,
+                worker_id: crate::types::WorkerId::new("test-worker"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: winner_id,
+                output: winner_output.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await?;
+        assert_eq!(
+            winner.index, 0,
+            "branch a resolved first in history and must win"
+        );
+        assert_eq!(winner.value, winner_output);
+
+        // The winner marker + loser cancellation are queued as usual.
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![loser_id]
+            )),
+            "the still-open loser must be queued for cancellation: {commands:?}"
+        );
+
+        // The bug: a follow-on positional command in the SAME cycle must land
+        // cleanly on the live frontier (NoMatch), not diverge on the loser's
+        // leftover in-flight ActivityStarted. Pre-fix this is Diverged
+        // (expected ActivityScheduled(next_step), actual ActivityStarted).
+        let follow_on = ctx.match_history(|m| m.match_activity("next_step"));
+        assert!(
+            matches!(follow_on, HistoryMatch::NoMatch),
+            "issue #1126: a follow-on command after a race with an in-flight \
+             loser must land cleanly (NoMatch = fresh dispatch), not diverge on \
+             the loser's leftover ActivityStarted: {follow_on:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn race_activity_verifies_previously_recorded_winner_without_new_commands()
     -> Result<(), HarvestError> {

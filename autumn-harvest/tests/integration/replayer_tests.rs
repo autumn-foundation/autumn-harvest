@@ -19,7 +19,9 @@ use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId};
+use autumn_harvest::types::{
+    ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId, WorkerId,
+};
 use chrono::Utc;
 use serde_json::Value;
 
@@ -1225,6 +1227,55 @@ fn current_details_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
+/// Issue #1126 replay-neutrality fixture: race two activities (branch 0 wins),
+/// then run a follow-on activity. Proves the recorded post-fix history — winner
+/// marker + follow-on schedule + the synthetic loser `ActivityFailed` — replays
+/// with 100% fidelity. Must pass both before AND after the same-cycle fix.
+fn race_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        // Defensive: the recorded history resolved branch 0; a divergent index
+        // would surface as a workflow error rather than a silent mismatch. In a
+        // faithful replay this guard never fires.
+        if winner.index != 0 {
+            return Err(format!("expected branch 0 to win, got {}", winner.index));
+        }
+        let follow = ctx
+            .execute_activity_raw("next_step", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"winner": winner.value, "follow": follow}))
+    })
+}
+
+/// Issue #1126 replay-neutrality fixture: race two activities (branch 0 wins)
+/// and end at the race with no follow-on command — the exact history shape old
+/// code could record. Must pass both before AND after the same-cycle fix.
+fn race_only_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(winner.value)
+    })
+}
+
 #[allow(clippy::too_many_lines)] // merge of trunk + branch register_fn lists
 fn build_replayer() -> WorkflowReplayer {
     WorkflowReplayer::new()
@@ -1368,6 +1419,8 @@ fn build_replayer() -> WorkflowReplayer {
             "mutex_self_deadlock_caught_workflow",
             mutex_self_deadlock_caught_workflow,
         )
+        .register_fn("race_then_activity_workflow", race_then_activity_workflow)
+        .register_fn("race_only_workflow", race_only_workflow)
 }
 
 /// History recorded by a run whose `charge_card` activity was force-failed by
@@ -2411,6 +2464,173 @@ async fn mutex_self_deadlock_is_checked_before_positional_match() {
         "a self-deadlock caught by the workflow must be raised before the \
          positional history match, so replay succeeds deterministically \
          instead of diverging, got: {report}"
+    );
+}
+
+// ── ctx.race() replay-neutrality fixtures (issue #1126) ─────────────────────
+// These prove the same-cycle fix does NOT change replay of RECORDED histories.
+// They must pass BOTH before and after the fix — they are replay-neutrality
+// coverage, NOT the RED reproducer (the RED case lives in context.rs and
+// exercises the LIVE resolving cycle).
+
+#[tokio::test]
+async fn replay_race_with_in_flight_loser_and_follow_on_activity_succeeds() {
+    // A recorded post-fix history: an activity race (2 branches, branch 0
+    // "fetch_a" wins) followed by a follow-on activity ("next_step"). The loser
+    // ("fetch_b") was scheduled AND started but never got a terminal live; its
+    // synthetic `ActivityFailed` ("lost race to a sibling branch") is appended
+    // by the winner cycle. This full-fidelity history must replay cleanly.
+    let exec_id = ExecutionId::new();
+    let winner_id = ActivityExecId::new();
+    let loser_id = ActivityExecId::new();
+    let next_id = ActivityExecId::new();
+    let winner_output = serde_json::json!({"p": "a"});
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race:1".to_string(),
+            details: Value::from(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: winner_id,
+            name: "fetch_a".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: loser_id,
+            name: "fetch_b".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: loser_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: winner_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: winner_id,
+            output: winner_output.clone(),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race_winner:1".to_string(),
+            details: Value::from(0u64),
+        },
+        // The follow-on activity, scheduled by the winner cycle.
+        WorkflowEvent::ActivityScheduled {
+            activity_id: next_id,
+            name: "next_step".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        // The synthetic loser terminal, appended last by the winner cycle
+        // (`apply_race_loser_cancellations`), interleaved before the follow-on
+        // activity's own terminal.
+        WorkflowEvent::ActivityFailed {
+            activity_id: loser_id,
+            error: "lost race to a sibling branch".to_string(),
+            attempt: 1,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: next_id,
+            output: serde_json::json!("done"),
+        },
+    ];
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("race_then_activity_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1126: a recorded race (in-flight loser) followed by a follow-on \
+         activity must replay with 100% fidelity, got: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replay_race_ending_at_race_no_follow_on_succeeds() {
+    // A pre-fix-shaped history where the workflow ENDS at the race (no follow-on
+    // command). Branch 0 ("fetch_a") wins; the loser's synthetic `ActivityFailed`
+    // is recorded BEFORE the winner marker (mirroring the existing
+    // `race_activity_verifies_previously_recorded_winner_without_new_commands`
+    // ordering) to prove that ordering also replays clean.
+    let exec_id = ExecutionId::new();
+    let winner_id = ActivityExecId::new();
+    let loser_id = ActivityExecId::new();
+    let winner_output = serde_json::json!({"p": "a"});
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race:1".to_string(),
+            details: Value::from(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: winner_id,
+            name: "fetch_a".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: loser_id,
+            name: "fetch_b".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: loser_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityStarted {
+            activity_id: winner_id,
+            worker_id: WorkerId::new("test-worker"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: winner_id,
+            output: winner_output.clone(),
+        },
+        WorkflowEvent::ActivityFailed {
+            activity_id: loser_id,
+            error: "lost race to a sibling branch".to_string(),
+            attempt: 1,
+            error_type: "Error".to_string(),
+            non_retryable: true,
+            details: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "race_winner:1".to_string(),
+            details: Value::from(0u64),
+        },
+    ];
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("race_only_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "issue #1126: a race with an in-flight loser that ends at the race (no \
+         follow-on command) must replay with 100% fidelity, got: {report}"
     );
 }
 
