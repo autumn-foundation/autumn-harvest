@@ -5301,6 +5301,67 @@ impl HistoryMatcher {
         false
     }
 
+    /// After a `ctx.race()` (issue #600) records its winner on the first
+    /// resolving cycle (the else branch of `WorkflowContext::settle_race`),
+    /// consume the still in-flight LOSER branches' progress-frontier events so
+    /// the matcher cursor advances past them, letting a follow-on positional
+    /// command in the SAME decision cycle land cleanly (issue #1126).
+    ///
+    /// The winner's terminal (and its own `ActivityStarted`) are already
+    /// consumed by its own `match_activity`. The loser branches, however,
+    /// resolved as `ActivityInProgress` this cycle — their synthetic
+    /// `ActivityFailed` (from the pending `CancelRaceLosers` command) is
+    /// appended only at *persist* time and is invisible to this cycle's
+    /// matcher, so their in-flight `ActivityStarted` / `ActivityHeartbeat`
+    /// (and, defensively, a losing child's `ChildWorkflowStarted`) are left
+    /// unconsumed straddling the cursor. Without consuming them, the next
+    /// positional `match_*` call diverges on the leftover event -> nd-block.
+    ///
+    /// Consumes ONLY events belonging to the given loser ids, so it is safe
+    /// under `futures::join!(race1, race2)` interleaving (a sibling race's
+    /// events are left untouched). Called ONLY on the first winner-recording
+    /// cycle; later replays take `settle_race`'s `peek_u64_marker` branch,
+    /// where each loser resolves via its recorded terminal and everything is
+    /// already positioned correctly (so this is never invoked then).
+    pub(crate) fn consume_race_loser_frontier(
+        &mut self,
+        loser_activity_ids: &[ActivityExecId],
+        loser_child_ids: &[ExecutionId],
+    ) {
+        if loser_activity_ids.is_empty() && loser_child_ids.is_empty() {
+            return;
+        }
+        let mut scan = self.cursor;
+        while scan < self.events.len() {
+            if !self.is_consumed(scan) {
+                match &self.events[scan] {
+                    WorkflowEvent::ActivityStarted { activity_id, .. }
+                    | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                        if loser_activity_ids.contains(activity_id) =>
+                    {
+                        self.consumed_out_of_order_events.insert(scan);
+                    }
+                    // Defensive: a losing CHILD branch resolves as
+                    // `ChildInProgress`, whose `match_child_workflow` already
+                    // advances the cursor PAST the child's own
+                    // `ChildWorkflowStarted` (a child has no separate started
+                    // event to strand the way an activity does), so in practice
+                    // this arm is unreachable today. Kept so a future child-race
+                    // shape that leaves a child's start unconsumed is handled
+                    // by the same in-cycle consume rather than nd-blocking.
+                    WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                        if loser_child_ids.contains(child_id) =>
+                    {
+                        self.consumed_out_of_order_events.insert(scan);
+                    }
+                    _ => {}
+                }
+            }
+            scan += 1;
+        }
+        self.advance_to_next_unconsumed_event();
+    }
+
     /// Read-only peek: does a recorded `ChildWorkflowStarted` already sit at the
     /// cursor a [`Self::match_child_or_timer`] call would land on (issue #779)?
     ///
