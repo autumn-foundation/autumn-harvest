@@ -1722,6 +1722,166 @@ fn history_only_child_win_race_is_not_reported_open() {
 }
 
 #[test]
+fn history_only_resolved_signal_race_closes_oldest_arm_by_recorded_order() {
+    // Two concurrent same-name signal-or-deadline waiters (issue #476) armed in
+    // ONE suspension: both reserved `__signal_timeout` timers are persisted in a
+    // single transaction, so their `TimerStarted` rows share a `DEFAULT NOW()`
+    // timestamp — modeled here as identical `ts(10)`, with distinct deadlines.
+    // The FIRST approval signal resolves the K=1 (oldest, seq 1) waiter FIFO, so
+    // the surviving K=2 waiter (seq 2, 120s) must keep ITS OWN deadline.
+    //
+    // A timestamp tie-break (`arm.since`) closes an ARBITRARY arm across the two
+    // `open_timer_arms` HashMap entries (HashMap iteration order is
+    // nondeterministic), so the pre-fix code leaves the surviving waiter with
+    // the resolved waiter's 60s deadline ~half the time. The fix closes the
+    // front-most `index.timer_order` arm. Loop many times to defeat the
+    // per-HashMap seed and pin the RED reliably (issue #615 Codex P2).
+    let deadline_120s = ts(10) + ChronoDuration::seconds(120);
+    for _ in 0..1000 {
+        let rows = vec![
+            started_row(ts(0)),
+            (
+                ts(10),
+                WorkflowEvent::TimerStarted {
+                    timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+                    duration_secs: 60,
+                },
+            ),
+            (
+                ts(10),
+                WorkflowEvent::TimerStarted {
+                    timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:2:approval"),
+                    duration_secs: 120,
+                },
+            ),
+            (
+                ts(11),
+                WorkflowEvent::SignalReceived {
+                    signal_name: "approval".into(),
+                    payload: json!({"ok": true}),
+                },
+            ),
+        ];
+        let projection = project_awaitables(
+            &rows,
+            WaitSetInput::HistoryOnly {
+                fire_eligible_timers: None,
+            },
+            AWAITABLE_CATEGORY_CAP,
+        );
+        let signals: Vec<&Awaitable> = projection
+            .awaitables
+            .iter()
+            .filter(|a| a.kind == AwaitableKind::Signal)
+            .collect();
+        assert_eq!(
+            signals.len(),
+            1,
+            "exactly the surviving K=2 signal waiter remains: {:?}",
+            projection.awaitables
+        );
+        assert_eq!(
+            signals[0].deadline,
+            Some(deadline_120s),
+            "the surviving K=2 waiter keeps its own 120s deadline, not the \
+             resolved K=1 waiter's 60s deadline: {:?}",
+            projection.awaitables
+        );
+    }
+}
+
+#[test]
+fn history_only_resolved_child_race_closes_oldest_arm_by_recorded_order() {
+    // The #779 child-or-deadline mirror of the signal test above: two
+    // `fulfillment_flow` children each in a child-or-deadline race, their two
+    // reserved `__child_timeout` timers armed in one suspension (tied `ts(11)`),
+    // with distinct deadlines. Child A (started first, K=1) completes → its race
+    // resolves, so the surviving child B (K=2, 600s) must keep ITS OWN deadline.
+    // A timestamp tie-break closes an arbitrary reserved arm; loop to pin the
+    // RED reliably (issue #615 Codex P2).
+    let child_a = ExecutionId::new();
+    let child_b = ExecutionId::new();
+    let deadline_600s = ts(11) + ChronoDuration::seconds(600);
+    for _ in 0..1000 {
+        let rows = vec![
+            started_row(ts(0)),
+            (
+                ts(10),
+                WorkflowEvent::ChildWorkflowStarted {
+                    child_id: child_a,
+                    workflow_name: "fulfillment_flow".into(),
+                    input: Value::Null,
+                },
+            ),
+            (
+                ts(10),
+                WorkflowEvent::ChildWorkflowStarted {
+                    child_id: child_b,
+                    workflow_name: "fulfillment_flow".into(),
+                    input: Value::Null,
+                },
+            ),
+            (
+                ts(11),
+                WorkflowEvent::TimerStarted {
+                    timer_id: autumn_harvest::types::TimerId::new(
+                        "__child_timeout:1:fulfillment_flow",
+                    ),
+                    duration_secs: 300,
+                },
+            ),
+            (
+                ts(11),
+                WorkflowEvent::TimerStarted {
+                    timer_id: autumn_harvest::types::TimerId::new(
+                        "__child_timeout:2:fulfillment_flow",
+                    ),
+                    duration_secs: 600,
+                },
+            ),
+            (
+                ts(20),
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: child_a,
+                    output: Value::Null,
+                },
+            ),
+        ];
+        let projection = project_awaitables(
+            &rows,
+            WaitSetInput::HistoryOnly {
+                fire_eligible_timers: None,
+            },
+            AWAITABLE_CATEGORY_CAP,
+        );
+        let children: Vec<&Awaitable> = projection
+            .awaitables
+            .iter()
+            .filter(|a| a.kind == AwaitableKind::ChildWorkflow)
+            .collect();
+        assert_eq!(
+            children.len(),
+            1,
+            "exactly the surviving child B remains after child A completes: {:?}",
+            projection.awaitables
+        );
+        assert_eq!(
+            children[0].id.as_deref(),
+            Some(child_b.to_string().as_str()),
+            "the surviving open child is B (K=2): {:?}",
+            projection.awaitables
+        );
+        assert_eq!(
+            children[0].deadline,
+            Some(deadline_600s),
+            "the surviving child B keeps its own 600s deadline, not the resolved \
+             child A's 300s deadline: {:?}",
+            projection.awaitables
+        );
+    }
+}
+
+#[test]
 fn history_only_reports_in_flight_external_signal_and_cancel() {
     // Codex P2: an ExternalSignalRequested / ExternalCancelRequested with no
     // Delivered/Failed terminal is still parked on that external op — the

@@ -490,12 +490,30 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
 /// not report the resolved race as still open. No-op when no open matching arm
 /// exists (timer-win already closed it via its recorded `TimerFired`).
 fn close_race_arm_for(index: &mut HistoryIndex, parse: fn(&str) -> Option<&str>, name: &str) {
+    // Close the OLDEST open reserved arm for `name` in RECORDED timer order,
+    // NOT by `arm.since` timestamp: two same-name race timers armed in one
+    // suspension are persisted in a single transaction and share a
+    // `DEFAULT NOW()` `TimerStarted.timestamp`, so a timestamp tie-break pops an
+    // arbitrary arm across the two `open_timer_arms` HashMap entries (HashMap
+    // iteration order is nondeterministic), leaving the surviving waiter paired
+    // with the wrong deadline. `index.timer_order` is the authoritative recorded
+    // order (insertion == command == increasing reserved seq) and is exactly
+    // what `project_history_only` walks to pair surviving arms with their
+    // deadlines, so closing the front-most `timer_order` arm keeps the two
+    // consistent — the K-th race resolution FIFO-closes the K-th oldest reserved
+    // arm (issue #615 Codex P2). A timer-won arm was already closed by its
+    // recorded `TimerFired` (empty deque), so it is skipped here.
     let candidate = index
-        .open_timer_arms
+        .timer_order
         .iter()
-        .filter(|(id, arms)| !arms.is_empty() && parse(id) == Some(name))
-        .min_by_key(|(_, arms)| arms.front().map(|arm| arm.since))
-        .map(|(id, _)| id.clone());
+        .find(|id| {
+            parse(id.as_str()) == Some(name)
+                && index
+                    .open_timer_arms
+                    .get(id.as_str())
+                    .is_some_and(|arms| !arms.is_empty())
+        })
+        .cloned();
     if let Some(id) = candidate
         && let Some(arms) = index.open_timer_arms.get_mut(&id)
     {
