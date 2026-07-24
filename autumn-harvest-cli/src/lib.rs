@@ -991,6 +991,13 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Show the open awaitables an execution is parked on (pending activities,
+    /// unfired timers, awaited-but-unsent signals, pending children,
+    /// `await_condition` parks, pending updates), replay-derived.
+    Awaitables {
+        /// Workflow execution ID.
+        execution_id: String,
+    },
     /// Reconstruct the ordered continue-as-new run chain a workflow execution
     /// belongs to, resolvable from any member (origin, middle, or tail).
     RunChain {
@@ -4873,6 +4880,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
         ))),
         WorkflowCommand::Timeline { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}/timeline",
+            path_segment(execution_id)
+        ))),
+        WorkflowCommand::Awaitables { execution_id } => Ok(ApiRequest::get(format!(
+            "/workflows/{}/awaitables",
             path_segment(execution_id)
         ))),
         WorkflowCommand::RunChain {

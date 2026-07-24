@@ -202,6 +202,23 @@ fn workflow_list_and_query_use_get_requests() {
     );
     assert_eq!(timeline_request.body, None);
 
+    let awaitables = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "awaitables",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow awaitables args should parse");
+    let awaitables_request = awaitables
+        .api_request()
+        .expect("awaitables request should build");
+    assert_eq!(awaitables_request.method, ApiMethod::Get);
+    assert_eq!(
+        awaitables_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/awaitables"
+    );
+    assert_eq!(awaitables_request.body, None);
+
     let run_chain = Cli::try_parse_from([
         "harvest",
         "workflow",

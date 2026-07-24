@@ -641,6 +641,57 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/awaitables",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Open-awaitables diagnostic (issue #615): names every open awaitable the execution is currently parked on, across six categories — pending activities (regular/local/external), unfired durable timers, awaited-but-unfulfilled signals (by name), pending child workflows (name + child exec id), unresolved await_condition parks, and pending updates — plus mutex acquires (#691) and external-workflow operations (#757) when present. The wait-set is derived by replaying recorded history read-only to the current suspension point (the #612 drive machinery), so it sees awaited-but-ABSENT inputs the side tables cannot (an unsent signal, a never-true condition). Each awaitable carries kind, name/identifier, a since timestamp derived from recorded history, and a deadline where one applies (timer fire time, signal/child race deadline, external schedule-to-close, activity schedule-to-close/start-to-close from the task row). Payload-free: names, ids, and timestamps only — never inputs/payloads/update args — so read-path payload decoding (issue #608) is deliberately skipped. Admin-gated (the eligibility endpoints' posture). Terminal executions return 200 with an empty awaitables list and wait_set = \"terminal\". Each category is bounded to the first category_cap entries with overflow reported in truncated/truncated_kinds. When the replay drive is unavailable (handler not registered on this node, classic DAG, encrypted history without decode, replay timeout/panic, a detected replay divergence, or a replay that reaches terminal on a non-terminal run), wait_set degrades to \"history_only\" with wait_set_reason naming why — activities/timers/children/updates still report from the event-log scan, but awaited-unsent signals and await_condition parks are not observable in that mode. Read path is shard-local (routed via the exec id's embedded shard); no cross-shard fan-out. Appends no events, performs no writes, adds no new WorkflowEvent variant.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "workflow_id",
+          "workflow_name",
+          "state",
+          "is_terminal",
+          "wait_set",
+          "wait_set_reason",
+          "awaitables",
+          "truncated",
+          "truncated_kinds",
+          "category_cap"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID."
+        },
+        {
+          "status": 401,
+          "description": "Admin credentials required."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found (including a classic DAG run, which is not on the execution path)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/run-chain",
       "category": "workflow",
       "read_only": true,
