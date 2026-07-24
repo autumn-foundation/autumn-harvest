@@ -1342,6 +1342,82 @@ fn history_only_child_win_race_is_not_reported_open() {
 }
 
 #[test]
+fn history_only_reports_in_flight_external_signal_and_cancel() {
+    // Codex P2: an ExternalSignalRequested / ExternalCancelRequested with no
+    // Delivered/Failed terminal is still parked on that external op — the
+    // crash-recovery / cross-shard-outbox window. The history-only fallback
+    // (unregistered handler, decode failure) must report it, not drop it into
+    // the catch-all. A resolved signal in the same history is NOT reported.
+    let open_signal_target = ExecutionId::new();
+    let resolved_signal_target = ExecutionId::new();
+    let open_cancel_target = ExecutionId::new();
+    let open_signal_id = autumn_harvest::types::ExternalSignalId::new();
+    let resolved_signal_id = autumn_harvest::types::ExternalSignalId::new();
+    let open_cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(5),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: resolved_signal_id,
+                target: resolved_signal_target,
+                signal_name: "ping".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+        ),
+        (
+            ts(6),
+            WorkflowEvent::ExternalSignalDelivered {
+                signal_id: resolved_signal_id,
+            },
+        ),
+        (
+            ts(10),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: open_signal_id,
+                target: open_signal_target,
+                signal_name: "release".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+        ),
+        (
+            ts(20),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id: open_cancel_id,
+                target: open_cancel_target,
+            },
+        ),
+    ];
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![
+            AwaitableKind::ExternalWorkflow,
+            AwaitableKind::ExternalWorkflow,
+        ],
+        "only the two UNRESOLVED external ops are open: {:?}",
+        projection.awaitables
+    );
+    let signal = &projection.awaitables[0];
+    assert_eq!(signal.name.as_deref(), Some("release"));
+    assert_eq!(
+        signal.id.as_deref(),
+        Some(open_signal_target.to_string().as_str())
+    );
+    assert_eq!(signal.since, Some(ts(10)));
+    let cancel = &projection.awaitables[1];
+    assert_eq!(cancel.name, None, "a cancel request carries no signal name");
+    assert_eq!(
+        cancel.id.as_deref(),
+        Some(open_cancel_target.to_string().as_str())
+    );
+    assert_eq!(cancel.since, Some(ts(20)));
+}
+
+#[test]
 fn history_only_extended_external_deadline_is_cleared() {
     // ActivityExternalDeadlineExtended carries no new deadline value, so the
     // stale original schedule-to-close must be CLEARED, not reported as due.

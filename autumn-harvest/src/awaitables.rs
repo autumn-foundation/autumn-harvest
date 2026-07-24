@@ -262,6 +262,16 @@ struct HistoryIndex {
     /// `await_id` → (target exec id, requested-at) for unresolved external
     /// workflow awaits, in request order.
     open_external_awaits: Vec<(String, String, DateTime<Utc>)>,
+    /// Unresolved external signal (issue #244) / cancel (issue #492) requests,
+    /// each `(target exec id, optional signal name, requested-at)`, in request
+    /// order. A signal request carries the signal name; a cancel request does
+    /// not. These are the in-flight external operations a workflow is parked on
+    /// after appending `External{Signal,Cancel}Requested` but before the
+    /// (possibly cross-shard, outbox-delivered) terminal event — so the
+    /// history-only fallback still reports them in crash-recovery / degraded
+    /// scans, matching the replayed mode's `SignalExternalWorkflow` /
+    /// `RequestCancelExternalWorkflow` command projection.
+    open_external_ops: Vec<(String, Option<String>, DateTime<Utc>)>,
     /// Timestamp of the last recorded event (the suspension point).
     last_event_at: Option<DateTime<Utc>>,
 }
@@ -273,6 +283,11 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
     let mut admitted_updates: Vec<(String, String, DateTime<Utc>)> = Vec::new();
     let mut external_awaits: Vec<(String, String, DateTime<Utc>)> = Vec::new();
     let mut resolved_awaits: HashSet<String> = HashSet::new();
+    // External signal/cancel requests keyed by their correlation id. Signal and
+    // cancel ids are distinct UUIDs, so one resolved set cannot collide across
+    // the two. Tuple: (correlation id, target, optional signal name, at).
+    let mut external_ops: Vec<(String, String, Option<String>, DateTime<Utc>)> = Vec::new();
+    let mut resolved_external_ops: HashSet<String> = HashSet::new();
 
     for (at, event) in rows {
         index.last_event_at = Some(*at);
@@ -398,6 +413,30 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             | WorkflowEvent::ExternalAwaitFailed { await_id, .. } => {
                 resolved_awaits.insert(await_id.to_string());
             }
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                ..
+            } => {
+                external_ops.push((
+                    signal_id.to_string(),
+                    target.to_string(),
+                    Some(signal_name.clone()),
+                    *at,
+                ));
+            }
+            WorkflowEvent::ExternalSignalDelivered { signal_id }
+            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                resolved_external_ops.insert(signal_id.to_string());
+            }
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                external_ops.push((cancel_id.to_string(), target.to_string(), None, *at));
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id }
+            | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                resolved_external_ops.insert(cancel_id.to_string());
+            }
             _ => {}
         }
     }
@@ -409,6 +448,11 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
     index.open_external_awaits = external_awaits
         .into_iter()
         .filter(|(id, _, _)| !resolved_awaits.contains(id))
+        .collect();
+    index.open_external_ops = external_ops
+        .into_iter()
+        .filter(|(id, _, _, _)| !resolved_external_ops.contains(id))
+        .map(|(_, target, name, at)| (target, name, at))
         .collect();
     index
 }
@@ -835,6 +879,18 @@ fn project_history_only(index: &HistoryIndex) -> Vec<Awaitable> {
     for (_, target, since) in &index.open_external_awaits {
         let mut awaitable = Awaitable::new(AwaitableKind::ExternalWorkflow);
         awaitable.id = Some(target.clone());
+        awaitable.since = Some(*since);
+        awaitables.push(awaitable);
+    }
+
+    // Unresolved external signal/cancel requests (issue #244/#492): an
+    // in-flight external operation whose terminal event has not been recorded
+    // yet — the crash-recovery / cross-shard-outbox window the replayed mode
+    // sees via the drained command, and which the fallback must not drop.
+    for (target, name, since) in &index.open_external_ops {
+        let mut awaitable = Awaitable::new(AwaitableKind::ExternalWorkflow);
+        awaitable.id = Some(target.clone());
+        awaitable.name.clone_from(name);
         awaitable.since = Some(*since);
         awaitables.push(awaitable);
     }
