@@ -1194,6 +1194,89 @@ fn orphan_race_timer_falls_back_to_timer_awaitable() {
     );
 }
 
+#[test]
+fn duplicate_signal_race_waiters_each_keep_their_own_deadline() {
+    // Two concurrent signal-or-deadline waits on the SAME signal name with
+    // distinct deadlines — join!(receive_signal_timeout("approval", 60s),
+    // receive_signal_timeout("approval", 120s)) — must each retain their own
+    // deadline. The reserved race deadlines are paired to the Signal awaitables
+    // in command order (per-name FIFO), not collapsed by name (issue #615 Codex
+    // P2 — the old per-name HashMap let the second race overwrite the first, and
+    // the per-name position map only ever updated the first awaitable, so the
+    // second open wait dropped its deadline).
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(10),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 60,
+            },
+        ),
+        (
+            ts(20),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:2:approval"),
+                duration_secs: 120,
+            },
+        ),
+    ];
+    let (s1, _r1) = tokio::sync::oneshot::channel();
+    let (t1, _r2) = tokio::sync::oneshot::channel();
+    let (s2, _r3) = tokio::sync::oneshot::channel();
+    let (t2, _r4) = tokio::sync::oneshot::channel();
+    let commands = vec![
+        WorkflowCommand::WaitForSignal {
+            signal_name: "approval".into(),
+            result_tx: s1,
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+            duration_secs: 60,
+            result_tx: t1,
+        },
+        WorkflowCommand::WaitForSignal {
+            signal_name: "approval".into(),
+            result_tx: s2,
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:2:approval"),
+            duration_secs: 120,
+            result_tx: t2,
+        },
+    ];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    // Both waits are open Signal awaitables (no reserved timer surfaces as its
+    // own row), each with its own deadline and arm time.
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::Signal, AwaitableKind::Signal],
+        "both same-name waits are open signals, no orphan timer rows: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(
+        projection.awaitables[0].deadline,
+        Some(ts(10) + ChronoDuration::seconds(60)),
+        "first waiter keeps the 60s deadline (armed at ts(10)): {:?}",
+        projection.awaitables
+    );
+    assert_eq!(projection.awaitables[0].since, Some(ts(10)));
+    assert_eq!(
+        projection.awaitables[1].deadline,
+        Some(ts(20) + ChronoDuration::seconds(120)),
+        "second waiter keeps the 120s deadline (armed at ts(20)): {:?}",
+        projection.awaitables
+    );
+    assert_eq!(projection.awaitables[1].since, Some(ts(20)));
+}
+
 // ── Child-or-deadline race fold (test review T8, issue #779) ──────────────
 
 #[test]
@@ -1254,6 +1337,104 @@ fn child_timeout_race_folds_deadline_into_child_awaitable() {
         awaitable.deadline,
         Some(ts(61) + ChronoDuration::seconds(600)),
         "the child race deadline is the reserved timer's fire time"
+    );
+}
+
+#[test]
+fn duplicate_child_race_waiters_each_keep_their_own_deadline() {
+    // Mirror of duplicate_signal_race_waiters for the child-or-deadline race
+    // (issue #779): two concurrent child-timeout waits on the SAME child
+    // workflow type with distinct deadlines each retain their own deadline,
+    // paired in command order rather than collapsed by name (issue #615 Codex
+    // P2).
+    let child_a = ExecutionId::new();
+    let child_b = ExecutionId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(10),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(11),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+                duration_secs: 300,
+            },
+        ),
+        (
+            ts(20),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(21),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:2:fulfillment_flow"),
+                duration_secs: 600,
+            },
+        ),
+    ];
+    let (c1, _r1) = tokio::sync::oneshot::channel();
+    let (t1, _r2) = tokio::sync::oneshot::channel();
+    let (c2, _r3) = tokio::sync::oneshot::channel();
+    let (t2, _r4) = tokio::sync::oneshot::channel();
+    let commands = vec![
+        WorkflowCommand::StartChildWorkflow {
+            child_id: child_a,
+            workflow_name: "fulfillment_flow".into(),
+            input: Value::Null,
+            result_tx: c1,
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+            duration_secs: 300,
+            result_tx: t1,
+        },
+        WorkflowCommand::StartChildWorkflow {
+            child_id: child_b,
+            workflow_name: "fulfillment_flow".into(),
+            input: Value::Null,
+            result_tx: c2,
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: autumn_harvest::types::TimerId::new("__child_timeout:2:fulfillment_flow"),
+            duration_secs: 600,
+            result_tx: t2,
+        },
+    ];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::ChildWorkflow, AwaitableKind::ChildWorkflow],
+        "both same-type child waits are open, no orphan timer rows: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(
+        projection.awaitables[0].deadline,
+        Some(ts(11) + ChronoDuration::seconds(300)),
+        "first child waiter keeps the 300s deadline: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(
+        projection.awaitables[1].deadline,
+        Some(ts(21) + ChronoDuration::seconds(600)),
+        "second child waiter keeps the 600s deadline: {:?}",
+        projection.awaitables
     );
 }
 

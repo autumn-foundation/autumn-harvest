@@ -546,8 +546,13 @@ fn activity_awaitable_by_id(index: &HistoryIndex, activity_id: &str) -> Awaitabl
 #[allow(clippy::too_many_lines)]
 fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<Awaitable> {
     let mut awaitables: Vec<Awaitable> = Vec::new();
-    let mut signal_races: HashMap<String, RaceDeadline> = HashMap::new();
-    let mut child_races: HashMap<String, RaceDeadline> = HashMap::new();
+    // Reserved race deadlines, per name, in command order. A `VecDeque` (not a
+    // single `RaceDeadline`) so two concurrent same-name waiters — a `join!` of
+    // two `receive_signal_timeout("approval", ...)` with distinct deadlines —
+    // do not overwrite each other; the K-th wait for a name is paired with the
+    // K-th reserved race for that name in the fold below (issue #615 Codex P2).
+    let mut signal_races: HashMap<String, VecDeque<RaceDeadline>> = HashMap::new();
+    let mut child_races: HashMap<String, VecDeque<RaceDeadline>> = HashMap::new();
     let mut transitioning = false;
     let mut resolved_update_ids: HashSet<String> = HashSet::new();
 
@@ -615,9 +620,15 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 let id = timer_id.to_string();
                 let (since, deadline) = timer_arm_metadata(index, &id, *duration_secs);
                 if let Some(signal_name) = reserved_signal_race_name(&id) {
-                    signal_races.insert(signal_name.to_string(), RaceDeadline { since, deadline });
+                    signal_races
+                        .entry(signal_name.to_string())
+                        .or_default()
+                        .push_back(RaceDeadline { since, deadline });
                 } else if let Some(child_name) = reserved_child_race_name(&id) {
-                    child_races.insert(child_name.to_string(), RaceDeadline { since, deadline });
+                    child_races
+                        .entry(child_name.to_string())
+                        .or_default()
+                        .push_back(RaceDeadline { since, deadline });
                 } else {
                     let mut awaitable = Awaitable::new(AwaitableKind::Timer);
                     awaitable.id = Some(id);
@@ -695,32 +706,43 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
         }
     }
 
-    // Fold race deadlines into their matching signal/child awaitables. A race
-    // timer with no matching wait (defensive — should not occur in a coherent
-    // suspension) is reported as a plain timer so nothing is silently dropped.
-    // Matches are resolved through a one-pass (kind, name) → position index so
-    // a pathological drained buffer (N races × M awaitables) stays O(N + M)
-    // rather than O(N·M).
-    let mut positions: HashMap<(AwaitableKind, String), usize> = HashMap::new();
-    for (position, awaitable) in awaitables.iter().enumerate() {
-        if matches!(
-            awaitable.kind,
-            AwaitableKind::Signal | AwaitableKind::ChildWorkflow
-        ) && let Some(name) = &awaitable.name
-        {
-            positions
-                .entry((awaitable.kind, name.clone()))
-                .or_insert(position);
+    // Fold race deadlines into their matching signal/child awaitables, pairing
+    // per name in COMMAND ORDER so two concurrent same-name waiters each keep
+    // their own deadline. Both the reserved race deadlines and the
+    // Signal/ChildWorkflow awaitables are collected in command order, and the
+    // K-th `receive_signal_timeout`/`execute_child_workflow_timeout` call for a
+    // name contributes both the K-th reserved race and the K-th matching
+    // awaitable for that name — so popping the front of a per-name queue as
+    // each awaitable is visited pairs them correctly (issue #615 Codex P2). A
+    // single pass over the awaitables (M) with O(1) queue ops keeps this
+    // O(N + M), not O(N·M). Any race deadline left unpaired is reported as a
+    // plain timer below so nothing is silently dropped.
+    for awaitable in &mut awaitables {
+        match awaitable.kind {
+            AwaitableKind::Signal => {
+                if let Some(name) = &awaitable.name
+                    && let Some(race) = signal_races.get_mut(name).and_then(VecDeque::pop_front)
+                {
+                    if let Some(since) = race.since {
+                        awaitable.since = Some(since);
+                    }
+                    awaitable.deadline = race.deadline;
+                }
+            }
+            AwaitableKind::ChildWorkflow => {
+                if let Some(name) = &awaitable.name
+                    && let Some(race) = child_races.get_mut(name).and_then(VecDeque::pop_front)
+                {
+                    awaitable.deadline = race.deadline;
+                }
+            }
+            _ => {}
         }
     }
-    for (signal_name, race) in signal_races {
-        if let Some(&position) = positions.get(&(AwaitableKind::Signal, signal_name.clone())) {
-            let awaitable = &mut awaitables[position];
-            if let Some(since) = race.since {
-                awaitable.since = Some(since);
-            }
-            awaitable.deadline = race.deadline;
-        } else {
+    // A reserved race timer with no matching wait (defensive — should not occur
+    // in a coherent suspension) degrades to a plain timer so nothing is dropped.
+    for (signal_name, races) in signal_races {
+        for race in races {
             awaitables.push(orphan_race_timer(
                 SIGNAL_TIMEOUT_TIMER_PREFIX,
                 &signal_name,
@@ -728,11 +750,8 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
             ));
         }
     }
-    for (child_name, race) in child_races {
-        if let Some(&position) = positions.get(&(AwaitableKind::ChildWorkflow, child_name.clone()))
-        {
-            awaitables[position].deadline = race.deadline;
-        } else {
+    for (child_name, races) in child_races {
+        for race in races {
             awaitables.push(orphan_race_timer(
                 crate::context::CHILD_TIMEOUT_TIMER_PREFIX,
                 &child_name,
