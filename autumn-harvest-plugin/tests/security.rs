@@ -345,6 +345,20 @@ async fn eris_unauthenticated_fail_activity_now_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_awaitables_is_blocked() {
+    // Open-awaitables diagnostic (issue #615): admin-only read (the
+    // eligibility endpoints' posture).
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get(
+            "/workflows/00000000-0000-0000-0000-000000000001/awaitables",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_replay_diagnosis_is_blocked() {
     // Single-execution replay diagnosis (issue #614): admin-only read.
     let app = unauthenticated_app();

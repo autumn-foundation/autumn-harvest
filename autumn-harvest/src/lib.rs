@@ -71,6 +71,8 @@ pub mod api_token;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
+/// Open-awaitables diagnostic projection (issue #615).
+pub mod awaitables;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
 /// Batch workflow start types: caps and per-item request/result structs (issue #357).

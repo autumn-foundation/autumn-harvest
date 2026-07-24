@@ -4311,6 +4311,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}/children", get(list_workflow_children))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
+        // Open-awaitables diagnostic (issue #615): admin-gated (the eligibility
+        // endpoints' posture), read-only replay projection of what the
+        // execution is currently parked on.
+        .route(
+            "/workflows/{id}/awaitables",
+            get(get_workflow_awaitables).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/run-chain", get(get_run_chain))
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only.
         // POST (not GET) because it drives a replay of the workflow handler, but
@@ -5299,6 +5306,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
+        ("GET", "/workflows/{id}/awaitables"),
         ("GET", "/workflows/{id}/run-chain"),
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only
         // POST (post_for_body_only). See docs/api-contract.json.
@@ -5994,6 +6002,26 @@ pub const fn management_api_response_fields()
                 "state",
                 "steps",
                 "rollup",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/awaitables",
+            // Issue #615. `wait_set_reason` is omitted when absent
+            // (skip_serializing_if) but declared here so the registry ↔
+            // contract cross-check covers it.
+            Some(&[
+                "execution_id",
+                "workflow_id",
+                "workflow_name",
+                "state",
+                "is_terminal",
+                "wait_set",
+                "wait_set_reason",
+                "awaitables",
+                "truncated",
+                "truncated_kinds",
+                "category_cap",
             ]),
         ),
         (
@@ -10182,6 +10210,291 @@ async fn get_workflow_timeline(
     );
 
     Ok(Json(timeline))
+}
+
+// ── Open-awaitables diagnostic (issue #615) ───────────────────────────────
+
+/// Response of `GET /workflows/{id}/awaitables`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct WorkflowAwaitablesResponse {
+    /// The execution's id (echoed).
+    pub execution_id: String,
+    /// The business workflow id.
+    pub workflow_id: String,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The execution's current state (echoed for terminal runs too).
+    pub state: String,
+    /// `true` when the execution is in a terminal state (empty awaitables).
+    pub is_terminal: bool,
+    /// How the wait-set was derived: `"replayed"` (all six categories
+    /// observable), `"history_only"` (best-effort event-log scan — see
+    /// `wait_set_reason`), or `"terminal"` (nothing to derive).
+    pub wait_set: String,
+    /// Why the wait-set degraded to `history_only`, when it did:
+    /// `handler_not_registered`, `classic_dag`, `payload_decode_required`,
+    /// `replay_reached_terminal`, `replay_timed_out`, or `replay_panicked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_set_reason: Option<String>,
+    /// The open awaitables, bounded per category (see `category_cap`).
+    pub awaitables: Vec<autumn_harvest::awaitables::Awaitable>,
+    /// `true` when any category overflowed `category_cap`.
+    pub truncated: bool,
+    /// The categories that overflowed (first-N kept per category).
+    pub truncated_kinds: Vec<autumn_harvest::awaitables::AwaitableKind>,
+    /// The per-category bound that was applied.
+    pub category_cap: usize,
+}
+
+/// Builds the open-awaitables report for one execution (issue #615): loads the
+/// recorded history from the owning shard, replays it read-only to the current
+/// suspension point (the #612 `drive_query_replay` machinery), and projects the
+/// drained pending-command buffer — the authoritative "what is this run parked
+/// on" set, including awaited-but-unsent signals and `await_condition` parks
+/// that no side table can see — into a bounded, payload-free awaitables list.
+///
+/// Shared by the HTTP handler and the Vantage UI blocked-on panel so the two
+/// can never disagree.
+///
+/// Degradation contract (this is a triage endpoint — it degrades, it does not
+/// error): an unregistered handler, a classic DAG run, an encrypted history
+/// (identity-codec `UnknownPayloadCodec`), or a replay that times out /
+/// panics / reaches terminal on a non-terminal run falls back to a best-effort
+/// history-only scan with `wait_set_reason` naming why.
+///
+/// Read-only by construction: no events appended, no state mutated, no audit
+/// row (classified `RouteClass::ReadOnly`). Shard-local via
+/// `db_conn_for_execution` — no cross-shard fan-out. The connection is dropped
+/// before user code is driven (the #612 pool-slot discipline).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn build_awaitables_report(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowAwaitablesResponse, AutumnError> {
+    use autumn_harvest::awaitables::{
+        AWAITABLE_CATEGORY_CAP, AwaitableKind, WaitSetInput, project_awaitables,
+    };
+
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let execution = match load_execution(&mut conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(HarvestError::NotFound(_)) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        }
+        Err(err) => return Err(map_error(err)),
+    };
+
+    // AC (issue #615): a terminal execution returns an EMPTY awaitables list
+    // with the terminal state echoed — HTTP 200, never an error. Nothing is
+    // loaded or replayed.
+    if is_terminal_state(&execution.state) {
+        return Ok(WorkflowAwaitablesResponse {
+            execution_id: exec_id.to_string(),
+            workflow_id: execution.workflow_id,
+            workflow_name: execution.workflow_name,
+            state: execution.state,
+            is_terminal: true,
+            wait_set: "terminal".to_string(),
+            wait_set_reason: None,
+            awaitables: Vec::new(),
+            truncated: false,
+            truncated_kinds: Vec::new(),
+            category_cap: AWAITABLE_CATEGORY_CAP,
+        });
+    }
+
+    // Raw timestamped rows: the projection's `since`/`deadline` metadata source
+    // and the degraded history-only scan. Raw deserialization — payload fields
+    // ride along as opaque Values (codec envelopes included) and are never
+    // read, so this load cannot fail on an encrypted deployment.
+    let rows = store::load_history_with_timestamps(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+
+    // Task-row deadline enrichment for open activity awaitables: the earliest
+    // of the cross-retry `schedule_to_close_at` (#378) and the current
+    // attempt's start-to-close deadline (`started_at + start_to_close`).
+    let activity_deadlines: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(harvest_task_queue::task_type.eq("activity"))
+            .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+            .select(autumn_harvest::models::TaskQueueItem::as_select())
+            .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .filter_map(|task| {
+                let activity_id = task.activity_id?;
+                let start_to_close_deadline = match (task.started_at, task.start_to_close) {
+                    (Some(started), Some(stc)) => started.checked_add_signed(stc),
+                    _ => None,
+                };
+                let deadline = match (task.schedule_to_close_at, start_to_close_deadline) {
+                    (Some(cross_retry), Some(attempt)) => Some(cross_retry.min(attempt)),
+                    (cross_retry, attempt) => cross_retry.or(attempt),
+                };
+                deadline.map(|deadline| (activity_id.to_string(), deadline))
+            })
+            .collect();
+
+    let workflow = runtime.registry.workflows.get(&execution.workflow_name);
+    let (wait_set, wait_set_reason, mut projection) = if let Some(workflow) = workflow {
+        // Load the history exactly as the live replay path sees it: inflate
+        // offloaded payloads (#524). Identity codec: on an encrypted (#608)
+        // deployment the strict decode fails with `UnknownPayloadCodec` —
+        // degrade to the history-only scan (which needs no payloads) rather
+        // than erroring: the response is payload-free either way, so nothing
+        // encrypted can leak through it.
+        let offloader = runtime.registry.payload_offloader();
+        let identity = PayloadCodecs::default();
+        match store::load_history_inflated(&mut conn, exec_id, &identity, offloader).await {
+            Ok(history) => {
+                // Drop the DB connection before driving user code — the #612
+                // pool-slot discipline.
+                drop(conn);
+                // Thread the same execution-row values hydrate_ctx_for_query
+                // threads (issues #772/#698) so a deadline-aware / parent-aware
+                // / identity-reading workflow replays cleanly instead of
+                // spuriously degrading.
+                let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+                    exec_id,
+                    history.events,
+                    runtime.registry.shared_state(),
+                    runtime.registry.history_policy(),
+                )
+                .with_execution_timeout(execution.execution_timeout)
+                .with_deadline(execution.deadline_at)
+                .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+                .with_workflow_name(execution.workflow_name.clone())
+                .with_workflow_id(execution.workflow_id.clone());
+                let outcome = drive_query_replay_async(
+                    &ctx,
+                    workflow.handler,
+                    execution.input.clone(),
+                    api_state.query_timeout(),
+                )
+                .await;
+                match outcome {
+                    QueryReplayOutcome::Suspended => {
+                        // The drained command buffer at the suspension point IS
+                        // the open wait-set — the six #615 categories.
+                        let commands = ctx.drain_commands();
+                        (
+                            "replayed",
+                            None,
+                            project_awaitables(
+                                &rows,
+                                WaitSetInput::Replayed {
+                                    commands: &commands,
+                                },
+                                AWAITABLE_CATEGORY_CAP,
+                            ),
+                        )
+                    }
+                    // A NON-terminal execution whose replay reaches Poll::Ready
+                    // is either about to complete (the worker has not persisted
+                    // the terminal yet) or has diverged from its recorded
+                    // history (code drift / nd-block). Either way the drained
+                    // command set is not a trustworthy wait-set.
+                    QueryReplayOutcome::ReachedTerminal => (
+                        "history_only",
+                        Some("replay_reached_terminal"),
+                        project_awaitables(
+                            &rows,
+                            WaitSetInput::HistoryOnly,
+                            AWAITABLE_CATEGORY_CAP,
+                        ),
+                    ),
+                    QueryReplayOutcome::TimedOut => (
+                        "history_only",
+                        Some("replay_timed_out"),
+                        project_awaitables(
+                            &rows,
+                            WaitSetInput::HistoryOnly,
+                            AWAITABLE_CATEGORY_CAP,
+                        ),
+                    ),
+                    QueryReplayOutcome::Panicked => (
+                        "history_only",
+                        Some("replay_panicked"),
+                        project_awaitables(
+                            &rows,
+                            WaitSetInput::HistoryOnly,
+                            AWAITABLE_CATEGORY_CAP,
+                        ),
+                    ),
+                }
+            }
+            Err(HarvestError::UnknownPayloadCodec { .. }) => (
+                "history_only",
+                Some("payload_decode_required"),
+                project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+            ),
+            Err(err) => return Err(map_error(err)),
+        }
+    } else {
+        let reason = if runtime.is_registered_dag(&execution.workflow_name) {
+            "classic_dag"
+        } else {
+            "handler_not_registered"
+        };
+        (
+            "history_only",
+            Some(reason),
+            project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+        )
+    };
+
+    // Enrich open activity awaitables with the task-row deadline where the
+    // projection derived none (timers/externals already carry theirs).
+    for awaitable in &mut projection.awaitables {
+        if awaitable.kind == AwaitableKind::Activity
+            && awaitable.deadline.is_none()
+            && let Some(deadline) = awaitable
+                .id
+                .as_ref()
+                .and_then(|id| activity_deadlines.get(id))
+        {
+            awaitable.deadline = Some(*deadline);
+        }
+    }
+
+    Ok(WorkflowAwaitablesResponse {
+        execution_id: exec_id.to_string(),
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+        state: execution.state,
+        is_terminal: false,
+        wait_set: wait_set.to_string(),
+        wait_set_reason: wait_set_reason.map(str::to_string),
+        awaitables: projection.awaitables,
+        truncated: projection.truncated,
+        truncated_kinds: projection.truncated_kinds,
+        category_cap: projection.category_cap,
+    })
+}
+
+/// `GET /workflows/{id}/awaitables` — enumerate what the execution is parked on.
+///
+/// Read-only open-awaitables diagnostic (issue #615): names every open
+/// awaitable across the six categories (pending activities, unfired timers,
+/// awaited-but-unfulfilled signals, pending child workflows, unresolved
+/// `await_condition` parks, pending updates) by replaying recorded history to
+/// the current suspension point. Admin-gated (`require_admin`), same posture as
+/// the eligibility endpoints. Payload-free: names/ids/timestamps only, so
+/// read-path payload decoding (issue #608) is deliberately skipped.
+async fn get_workflow_awaitables(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<WorkflowAwaitablesResponse>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let report = build_awaitables_report(&api_state, exec_id).await?;
+    Ok(Json(report))
 }
 
 /// Upper bound on the number of legacy `WorkflowContinuedAsNew` event hops the

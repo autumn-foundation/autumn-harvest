@@ -321,6 +321,15 @@ struct BlockedOnData {
     external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
+    /// The replay-derived open-awaitables report (issue #615) — the SAME
+    /// report `GET /workflows/{id}/awaitables` serves (built by
+    /// `crate::api::build_awaitables_report`), so the UI panel and the API can
+    /// never disagree about what the run is parked on. Unlike the side-table
+    /// lists above it also names awaited-but-UNSENT signals, pending child
+    /// workflows, and `await_condition` parks. `None` for terminal executions
+    /// or when the report could not be built (best-effort — the page still
+    /// renders the side-table inventory).
+    awaitables: Option<crate::api::WorkflowAwaitablesResponse>,
     /// Default response-side byte cap applied to a pending activity's heartbeat
     /// checkpoint payload before rendering (global #252 activity-result cap,
     /// #503). `0` = uncapped. Used when no per-activity override applies.
@@ -1312,6 +1321,20 @@ async fn workflow_detail_ui(
     )
     .await;
 
+    // Open-awaitables diagnostic (issue #615): re-source the blocked-on panel
+    // from the SAME replay-derived report `GET /workflows/{id}/awaitables`
+    // serves, so the UI and the API can never disagree about why a run is
+    // parked. Best-effort: a failure here (runtime not started, replay error)
+    // degrades to the side-table panels rather than failing the page. The
+    // pooled connection is dropped first so the report's own connection
+    // checkout never overlaps ours (pool-size-1 safety).
+    drop(conn);
+    if !is_terminal_workflow_state(&execution.state) {
+        blocked_on.awaitables = crate::api::build_awaitables_report(&api_state, exec_id)
+            .await
+            .ok();
+    }
+
     Ok(render_workflow_detail(
         &execution,
         total_events,
@@ -1419,6 +1442,7 @@ async fn load_blocked_on_data(
             signals: vec![],
             heartbeat_details_cap,
             heartbeat_caps: std::collections::HashMap::new(),
+            awaitables: None,
         });
     }
 
@@ -1486,6 +1510,7 @@ async fn load_blocked_on_data(
         signals,
         heartbeat_details_cap,
         heartbeat_caps: std::collections::HashMap::new(),
+        awaitables: None,
     })
 }
 
@@ -4644,11 +4669,79 @@ fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
     }
 }
 
+/// Renders the replay-derived open-awaitables section of the blocked-on panel
+/// (issue #615). This surfaces the categories the side-table panels below
+/// cannot see: awaited-but-unsent signals, pending child workflows, and
+/// `await_condition` parks. Sourced from the SAME report the
+/// `GET /workflows/{id}/awaitables` endpoint serves.
+fn render_awaitables_table(report: &crate::api::WorkflowAwaitablesResponse) -> Markup {
+    html! {
+        h3 style="margin-top:8px" { "Waiting on (replay-derived)" }
+        @if report.wait_set == "history_only" {
+            div.empty {
+                "Best-effort view from the event log"
+                @if let Some(reason) = report.wait_set_reason.as_deref() {
+                    " (" code { (reason) } ")"
+                }
+                "."
+            }
+        }
+        table {
+            thead {
+                tr {
+                    th { "Kind" }
+                    th { "Name" }
+                    th { "ID" }
+                    th { "Since" }
+                    th { "Deadline" }
+                }
+            }
+            tbody {
+                @for item in &report.awaitables {
+                    tr {
+                        td {
+                            code { (item.kind.as_str()) }
+                            @if item.local { " (local)" }
+                            @if item.external { " (external)" }
+                        }
+                        td { (item.name.as_deref().unwrap_or("—")) }
+                        td {
+                            @if let Some(id) = item.id.as_deref() {
+                                code { (id) }
+                            } @else {
+                                "—"
+                            }
+                        }
+                        td { (format_timestamp(item.since)) }
+                        td { (format_timestamp(item.deadline)) }
+                    }
+                }
+            }
+        }
+        @if report.truncated {
+            div.empty {
+                "Truncated to the first " (report.category_cap)
+                " per category ("
+                @for (i, kind) in report.truncated_kinds.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    code { (kind.as_str()) }
+                }
+                ")."
+            }
+        }
+    }
+}
+
 fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
+    let has_awaitables = blocked_on
+        .awaitables
+        .as_ref()
+        .is_some_and(|r| !r.awaitables.is_empty());
     let has_anything = !blocked_on.activities.is_empty()
         || !blocked_on.external_tasks.is_empty()
         || !blocked_on.timers.is_empty()
-        || !blocked_on.signals.is_empty();
+        || !blocked_on.signals.is_empty()
+        || has_awaitables;
 
     html! {
         div.card {
@@ -4656,6 +4749,11 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
             @if !has_anything {
                 div.empty { "No pending work items." }
             } @else {
+                @if let Some(report) = blocked_on.awaitables.as_ref() {
+                    @if !report.awaitables.is_empty() {
+                        (render_awaitables_table(report))
+                    }
+                }
                 @if !blocked_on.activities.is_empty() {
                     h3 style="margin-top:8px" { "Pending activities" }
                     (render_pending_activities_table(blocked_on))
@@ -9293,6 +9391,7 @@ mod tests {
             signals: vec![],
             heartbeat_details_cap: 0,
             heartbeat_caps: std::collections::HashMap::new(),
+            awaitables: None,
         }
     }
 
