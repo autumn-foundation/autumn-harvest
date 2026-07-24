@@ -612,6 +612,22 @@ async fn unregistered_handler_degrades_to_history_only_scan() {
     )
     .await;
 
+    // A genuine unfired durable timer has BOTH the `TimerStarted` event AND a
+    // live `harvest_timers` row — that live row is what makes it fire-eligible
+    // and keeps it past the endpoint's dormant-arm filter (issue #768).
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'cooldown', NOW() + interval '300 seconds', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed timer row");
+    }
+
     let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/awaitables"), true).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["wait_set"], "history_only");
@@ -623,6 +639,64 @@ async fn unregistered_handler_degrades_to_history_only_scan() {
         awaitables[0].get("deadline").is_some(),
         "timer awaitable should derive its fire deadline: {body}"
     );
+}
+
+/// A cancellable `ctx.start_timer` arm (issue #768) records a `TimerStarted`
+/// event but inserts NO `harvest_timers` row and cannot fire until
+/// `await_fire()`. In the history-only fallback the endpoint filters such
+/// dormant arms via the live `harvest_timers` table, so a workflow merely
+/// holding an idle/debounce timer while parked reports only the fire-eligible
+/// timer, never the dormant arm.
+#[tokio::test]
+async fn history_only_drops_dormant_cancellable_timer_arm() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(&pool);
+
+    let exec_id = seed_execution(
+        &pool,
+        "ghost_wf", // unregistered → history_only fallback
+        "RUNNING",
+        Value::Null,
+        vec![
+            started_event(Value::Null),
+            WorkflowEvent::TimerStarted {
+                // Dormant cancellable arm: recorded event, NO harvest_timers row.
+                timer_id: TimerId::new("idle_debounce"),
+                duration_secs: 3600,
+            },
+            WorkflowEvent::TimerStarted {
+                // Genuine fire-eligible durable timer (live row seeded below).
+                timer_id: TimerId::new("cooldown"),
+                duration_secs: 300,
+            },
+        ],
+    )
+    .await;
+
+    // Only the genuine timer gets a live `harvest_timers` row.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'cooldown', NOW() + interval '300 seconds', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed genuine timer row");
+    }
+
+    let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/awaitables"), true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["wait_set"], "history_only");
+    // The dormant `idle_debounce` arm is filtered out; only the fire-eligible
+    // `cooldown` timer survives.
+    assert_eq!(kinds(&body), vec!["timer"], "body: {body}");
+    let awaitables = body["awaitables"].as_array().expect("awaitables");
+    assert_eq!(awaitables.len(), 1, "body: {body}");
+    assert_eq!(awaitables[0]["id"], "cooldown", "body: {body}");
 }
 
 /// Serving the report performs zero writes: no events appended, the execution

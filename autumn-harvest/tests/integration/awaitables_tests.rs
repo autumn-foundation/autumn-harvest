@@ -15,13 +15,14 @@
 //! The HTTP status mapping, admin gating, and shard routing are covered by
 //! `autumn-harvest-plugin/tests/awaitables_integration.rs`.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::awaitables::{
-    AWAITABLE_CATEGORY_CAP, Awaitable, AwaitableKind, WaitSetInput, WaitSetSource,
-    project_awaitables,
+    AWAITABLE_CATEGORY_CAP, Awaitable, AwaitableKind, AwaitablesProjection, WaitSetInput,
+    WaitSetSource, project_awaitables, retain_fire_eligible_timers,
 };
 use autumn_harvest::context::{
     WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, empty_shared_state,
@@ -1757,5 +1758,108 @@ fn truncation_is_per_category_not_global() {
             .filter(|a| a.kind == AwaitableKind::Timer)
             .count(),
         AWAITABLE_CATEGORY_CAP
+    );
+}
+
+// ── Dormant cancellable timer arms in history-only mode (Codex P2 #1134) ──
+
+#[test]
+fn history_only_dormant_timer_arm_is_filtered_when_not_fire_eligible() {
+    // A cancellable `ctx.start_timer` arm (issue #768,
+    // `WorkflowCommand::ArmTimer { for_await: false }`) records `TimerStarted`
+    // but inserts NO `harvest_timers` row, so it cannot fire until
+    // `await_fire()`. In the history-only fallback we cannot tell an
+    // armed-but-dormant timer from a fire-eligible one — the authoritative
+    // signal is the live `harvest_timers` table. `retain_fire_eligible_timers`
+    // drops any history-only `Timer` awaitable whose id is not among the live
+    // unfired timer ids, keeping genuine timers and all non-timer waits.
+    let activity_id = ActivityExecId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(5),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge_card".into(),
+                input: Value::Null,
+                queue: "payments".into(),
+            },
+        ),
+        (
+            ts(10),
+            WorkflowEvent::TimerStarted {
+                // Dormant cancellable arm: no `harvest_timers` row exists.
+                timer_id: autumn_harvest::types::TimerId::new("idle_debounce"),
+                duration_secs: 3600,
+            },
+        ),
+        (
+            ts(20),
+            WorkflowEvent::TimerStarted {
+                // Genuine, fire-eligible durable timer.
+                timer_id: autumn_harvest::types::TimerId::new("cooldown"),
+                duration_secs: 300,
+            },
+        ),
+    ];
+    let mut projection =
+        project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+
+    // Pre-filter: history-only reports every unclosed `TimerStarted`.
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![
+            AwaitableKind::Activity,
+            AwaitableKind::Timer,
+            AwaitableKind::Timer
+        ],
+        "history-only reports every unclosed TimerStarted before the fire-eligibility filter"
+    );
+
+    let live_timer_ids: HashSet<String> = HashSet::from(["cooldown".to_string()]);
+    retain_fire_eligible_timers(&mut projection, &live_timer_ids);
+
+    // The dormant `idle_debounce` arm is dropped; the fire-eligible `cooldown`
+    // timer and the unrelated activity survive.
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::Activity, AwaitableKind::Timer]
+    );
+    let timer = projection
+        .awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Timer)
+        .expect("the fire-eligible timer survives");
+    assert_eq!(timer.id.as_deref(), Some("cooldown"));
+}
+
+#[test]
+fn retain_fire_eligible_timers_is_a_noop_for_replayed_projections() {
+    // The replayed mode already excludes dormant arms by construction (it only
+    // matches `ArmTimer { for_await: true }`), so the endpoint-side timer-table
+    // filter must never touch a `Replayed` projection — even when a timer id is
+    // absent from the live set (a genuine `for_await` arm committed in the same
+    // cycle is exactly that: recorded but not yet in `harvest_timers`).
+    let mut projection = AwaitablesProjection {
+        source: WaitSetSource::Replayed,
+        awaitables: vec![Awaitable {
+            kind: AwaitableKind::Timer,
+            name: None,
+            id: Some("cooldown".to_string()),
+            since: None,
+            deadline: None,
+            local: false,
+            external: false,
+        }],
+        truncated: false,
+        truncated_kinds: Vec::new(),
+        category_cap: AWAITABLE_CATEGORY_CAP,
+    };
+    let empty: HashSet<String> = HashSet::new();
+    retain_fire_eligible_timers(&mut projection, &empty);
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::Timer],
+        "a Replayed projection is authoritative — never filtered by the live timer table"
     );
 }

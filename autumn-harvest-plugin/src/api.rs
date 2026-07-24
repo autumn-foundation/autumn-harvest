@@ -10274,6 +10274,7 @@ pub(crate) async fn build_awaitables_report(
 ) -> Result<WorkflowAwaitablesResponse, AutumnError> {
     use autumn_harvest::awaitables::{
         AWAITABLE_CATEGORY_CAP, AwaitableKind, WaitSetInput, project_awaitables,
+        retain_fire_eligible_timers,
     };
 
     let runtime = api_state.runtime().map_err(map_error)?;
@@ -10357,6 +10358,32 @@ pub(crate) async fn build_awaitables_report(
                 deadline.map(|deadline| (activity_id.to_string(), deadline))
             })
             .collect();
+
+    // Live unfired timer ids for the history-only fire-eligibility filter: a
+    // history-only scan reports every unclosed `TimerStarted`, but a cancellable
+    // `ctx.start_timer` arm (issue #768, `ArmTimer { for_await: false }`)
+    // records a `TimerStarted` with NO `harvest_timers` row and cannot fire
+    // until `await_fire()`. The live table is the authoritative fire-eligibility
+    // signal; `retain_fire_eligible_timers` (below) uses it to drop dormant arms
+    // in the fallback. A no-op for the replayed projection (which already
+    // excludes dormant arms by construction). Best-effort: on failure the filter
+    // is skipped (a dormant arm may be over-reported) rather than failing the
+    // whole triage report (PR review).
+    let fire_eligible_timer_ids: Option<std::collections::HashSet<String>> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_timers::fired.eq(false))
+        .select(harvest_timers::timer_id)
+        .load::<String>(&mut conn)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                execution_id = %exec_id,
+                error = %err,
+                "awaitables: live-timer read failed; not filtering dormant timer arms"
+            );
+        })
+        .ok()
+        .map(|ids| ids.into_iter().collect());
 
     // No further DB reads: release the pool slot before any payload-store
     // fetch or user-code drive below (the #612 pool-slot discipline, widened —
@@ -10552,6 +10579,14 @@ pub(crate) async fn build_awaitables_report(
         {
             awaitable.deadline = Some(*deadline);
         }
+    }
+
+    // Drop dormant cancellable `ctx.start_timer` arms (issue #768) that the
+    // history-only fallback over-reports as waits — a no-op for the replayed
+    // projection, which excludes them by construction. Skipped when the
+    // best-effort live-timer read above failed.
+    if let Some(live_timer_ids) = &fire_eligible_timer_ids {
+        retain_fire_eligible_timers(&mut projection, live_timer_ids);
     }
 
     Ok(WorkflowAwaitablesResponse {

@@ -40,7 +40,11 @@
 //! external awaits — it cannot see awaited-unsent signals (except a
 //! signal-or-deadline race, whose reserved timer id encodes the signal name)
 //! or `await_condition` parks, which is exactly the blindness the replayed
-//! mode exists to remove.
+//! mode exists to remove. A history-only scan reports every unclosed
+//! `TimerStarted`, so callers with database access should post-filter the
+//! result through [`retain_fire_eligible_timers`] (with the live unfired timer
+//! ids) to drop dormant cancellable `ctx.start_timer` arms (issue #768) that
+//! recorded a `TimerStarted` but inserted no `harvest_timers` row.
 //!
 //! Known approximations of the replayed mode (replay review, documented rather
 //! than fixed — each is a best-effort triage bound, never a correctness
@@ -976,6 +980,49 @@ pub fn project_awaitables(
         awaitables: kept,
         category_cap: cap,
     }
+}
+
+/// Drops history-only [`AwaitableKind::Timer`] awaitables that are not
+/// fire-eligible.
+///
+/// A cancellable `ctx.start_timer` arm (issue #768,
+/// `WorkflowCommand::ArmTimer` with `for_await: false`) records a
+/// `TimerStarted` event but inserts **no** `harvest_timers` row and cannot fire
+/// until `await_fire()`. The pure [`project_awaitables`] projection cannot
+/// distinguish such a dormant arm from a fire-eligible timer in the
+/// [`WaitSetSource::HistoryOnly`] fallback — the authoritative signal is the
+/// live `harvest_timers` table, which only the DB-holding endpoint can read.
+/// This filter, applied by the endpoint with the set of live *unfired* timer
+/// ids, drops any history-only timer awaitable whose id is absent, so a
+/// workflow parked on a signal/activity while merely holding an idle or debounce
+/// timer is no longer misreported as waiting on that timer.
+///
+/// It is a **no-op** for a [`WaitSetSource::Replayed`] projection: the replayed
+/// mode already excludes dormant arms by construction (it matches only
+/// `ArmTimer { for_await: true }`), and a genuine `for_await` arm committed in
+/// the same replay cycle is deliberately absent from `harvest_timers` and must
+/// not be filtered. A timer awaitable with no `id` is also retained (defensive;
+/// history-only always assigns one).
+///
+/// Applied after [`project_awaitables`] has capped each category, so the
+/// per-category truncation flags are left as computed — a conservative choice
+/// that at worst reports `truncated` for the [`AwaitableKind::Timer`] category
+/// in the pathological case of more than `category_cap` timers where every
+/// dropped over-cap arm was dormant.
+pub fn retain_fire_eligible_timers<S: std::hash::BuildHasher>(
+    projection: &mut AwaitablesProjection,
+    live_timer_ids: &HashSet<String, S>,
+) {
+    if projection.source != WaitSetSource::HistoryOnly {
+        return;
+    }
+    projection.awaitables.retain(|awaitable| {
+        awaitable.kind != AwaitableKind::Timer
+            || awaitable
+                .id
+                .as_ref()
+                .is_none_or(|id| live_timer_ids.contains(id))
+    });
 }
 
 #[cfg(test)]
