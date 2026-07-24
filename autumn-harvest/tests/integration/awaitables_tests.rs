@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::awaitables::{
-    AWAITABLE_CATEGORY_CAP, Awaitable, AwaitableKind, AwaitablesProjection, WaitSetInput,
-    WaitSetSource, project_awaitables, retain_fire_eligible_timers,
+    AWAITABLE_CATEGORY_CAP, Awaitable, AwaitableKind, WaitSetInput, WaitSetSource,
+    project_awaitables,
 };
 use autumn_harvest::context::{
     WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, empty_shared_state,
@@ -460,7 +460,13 @@ fn pending_update_reported_and_resolved_update_not() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
 
     let updates: Vec<&Awaitable> = projection
         .awaitables
@@ -627,7 +633,13 @@ fn history_only_mode_covers_scannable_categories() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
 
     assert_eq!(projection.source, WaitSetSource::HistoryOnly);
     let mut kinds = kinds_of(&projection.awaitables);
@@ -693,7 +705,13 @@ fn history_only_mode_skips_resolved_waits() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert!(
         projection.awaitables.is_empty(),
         "resolved waits are not awaitables: {:?}",
@@ -726,7 +744,13 @@ fn history_only_local_activity_mid_retry_reported() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert_eq!(
         kinds_of(&projection.awaitables),
         vec![AwaitableKind::Activity]
@@ -760,7 +784,13 @@ fn history_only_external_activity_reports_deadline() {
         // Trailing benign event decouples last_event_at from awaiting-since (T1).
         marker_row(ts(99)),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert_eq!(
         kinds_of(&projection.awaitables),
         vec![AwaitableKind::Activity]
@@ -812,7 +842,13 @@ fn terminal_history_projection_is_empty() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert!(projection.awaitables.is_empty());
     assert!(!projection.truncated);
 }
@@ -831,7 +867,13 @@ fn per_category_cap_truncates_with_flag() {
             },
         ));
     }
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
 
     let timers = projection
         .awaitables
@@ -888,7 +930,13 @@ fn ten_thousand_event_history_projects() {
     ));
 
     let start = std::time::Instant::now();
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     let elapsed = start.elapsed();
     println!("10k-event projection took {elapsed:?}");
 
@@ -1460,7 +1508,13 @@ fn history_only_child_timeout_race_folds_deadline() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
 
     assert_eq!(
         kinds_of(&projection.awaitables),
@@ -1469,6 +1523,76 @@ fn history_only_child_timeout_race_folds_deadline() {
     assert_eq!(
         projection.awaitables[0].deadline,
         Some(ts(61) + ChronoDuration::seconds(600))
+    );
+}
+
+#[test]
+fn history_only_duplicate_child_race_waiters_each_keep_their_own_deadline() {
+    // History-only mirror of duplicate_child_race_waiters (issue #615 Codex P2):
+    // two concurrent child-timeout waits on the SAME child workflow type with
+    // distinct deadlines must each retain their own deadline, paired in
+    // recorded order — a per-name FIFO, not a single deadline per name that the
+    // later reserved `TimerStarted` would overwrite.
+    let child_a = ExecutionId::new();
+    let child_b = ExecutionId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(10),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(11),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+                duration_secs: 300,
+            },
+        ),
+        (
+            ts(20),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(21),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:2:fulfillment_flow"),
+                duration_secs: 600,
+            },
+        ),
+    ];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::ChildWorkflow, AwaitableKind::ChildWorkflow],
+        "both same-type child waits are open, no orphan timers: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(
+        projection.awaitables[0].deadline,
+        Some(ts(11) + ChronoDuration::seconds(300)),
+        "first child waiter keeps the 300s deadline: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(
+        projection.awaitables[1].deadline,
+        Some(ts(21) + ChronoDuration::seconds(600)),
+        "second child waiter keeps the 600s deadline (not collapsed): {:?}",
+        projection.awaitables
     );
 }
 
@@ -1498,7 +1622,13 @@ fn history_only_signal_win_race_is_not_reported_open() {
         ),
         marker_row(ts(99)),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert!(
         projection.awaitables.is_empty(),
         "a resolved signal-win race is not an open awaitable: {:?}",
@@ -1533,7 +1663,13 @@ fn history_only_timer_win_late_signal_keeps_arm_closed_once() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert!(
         projection.awaitables.is_empty(),
         "a timer-won race with a late signal reports nothing open: {:?}",
@@ -1571,7 +1707,13 @@ fn history_only_child_win_race_is_not_reported_open() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert!(
         projection.awaitables.is_empty(),
         "a resolved child-win race is not an open awaitable: {:?}",
@@ -1628,7 +1770,13 @@ fn history_only_reports_in_flight_external_signal_and_cancel() {
             },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
 
     assert_eq!(
         kinds_of(&projection.awaitables),
@@ -1679,7 +1827,13 @@ fn history_only_extended_external_deadline_is_cleared() {
             WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token },
         ),
     ];
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert_eq!(
         kinds_of(&projection.awaitables),
         vec![AwaitableKind::Activity]
@@ -1706,7 +1860,13 @@ fn exactly_cap_entries_are_not_truncated() {
             },
         ));
     }
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert_eq!(projection.awaitables.len(), AWAITABLE_CATEGORY_CAP);
     assert!(!projection.truncated, "exactly-cap is NOT truncation");
     assert!(projection.truncated_kinds.is_empty());
@@ -1738,7 +1898,13 @@ fn truncation_is_per_category_not_global() {
             },
         ));
     }
-    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
 
     assert!(projection.truncated);
     assert_eq!(projection.truncated_kinds, vec![AwaitableKind::Timer]);
@@ -1770,9 +1936,10 @@ fn history_only_dormant_timer_arm_is_filtered_when_not_fire_eligible() {
     // but inserts NO `harvest_timers` row, so it cannot fire until
     // `await_fire()`. In the history-only fallback we cannot tell an
     // armed-but-dormant timer from a fire-eligible one — the authoritative
-    // signal is the live `harvest_timers` table. `retain_fire_eligible_timers`
-    // drops any history-only `Timer` awaitable whose id is not among the live
-    // unfired timer ids, keeping genuine timers and all non-timer waits.
+    // signal is the live `harvest_timers` table, threaded in via
+    // `WaitSetInput::HistoryOnly { fire_eligible_timers }`. The projection drops
+    // any `Timer` awaitable whose id is absent from that set, keeping genuine
+    // timers and all non-timer waits.
     let activity_id = ActivityExecId::new();
     let rows = vec![
         started_row(ts(0)),
@@ -1802,25 +1969,36 @@ fn history_only_dormant_timer_arm_is_filtered_when_not_fire_eligible() {
             },
         ),
     ];
-    let mut projection =
-        project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
 
-    // Pre-filter: history-only reports every unclosed `TimerStarted`.
+    // Without the filter (a pure caller with no DB): every unclosed
+    // `TimerStarted` is reported.
+    let unfiltered = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: None,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert_eq!(
-        kinds_of(&projection.awaitables),
+        kinds_of(&unfiltered.awaitables),
         vec![
             AwaitableKind::Activity,
             AwaitableKind::Timer,
             AwaitableKind::Timer
         ],
-        "history-only reports every unclosed TimerStarted before the fire-eligibility filter"
+        "history-only with no live-timer set reports every unclosed TimerStarted"
     );
 
+    // With the live-timer set: the dormant `idle_debounce` arm is dropped; the
+    // fire-eligible `cooldown` timer and the unrelated activity survive.
     let live_timer_ids: HashSet<String> = HashSet::from(["cooldown".to_string()]);
-    retain_fire_eligible_timers(&mut projection, &live_timer_ids);
-
-    // The dormant `idle_debounce` arm is dropped; the fire-eligible `cooldown`
-    // timer and the unrelated activity survive.
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: Some(&live_timer_ids),
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
     assert_eq!(
         kinds_of(&projection.awaitables),
         vec![AwaitableKind::Activity, AwaitableKind::Timer]
@@ -1834,32 +2012,63 @@ fn history_only_dormant_timer_arm_is_filtered_when_not_fire_eligible() {
 }
 
 #[test]
-fn retain_fire_eligible_timers_is_a_noop_for_replayed_projections() {
-    // The replayed mode already excludes dormant arms by construction (it only
-    // matches `ArmTimer { for_await: true }`), so the endpoint-side timer-table
-    // filter must never touch a `Replayed` projection — even when a timer id is
-    // absent from the live set (a genuine `for_await` arm committed in the same
-    // cycle is exactly that: recorded but not yet in `harvest_timers`).
-    let mut projection = AwaitablesProjection {
-        source: WaitSetSource::Replayed,
-        awaitables: vec![Awaitable {
-            kind: AwaitableKind::Timer,
-            name: None,
-            id: Some("cooldown".to_string()),
-            since: None,
-            deadline: None,
-            local: false,
-            external: false,
-        }],
-        truncated: false,
-        truncated_kinds: Vec::new(),
-        category_cap: AWAITABLE_CATEGORY_CAP,
-    };
-    let empty: HashSet<String> = HashSet::new();
-    retain_fire_eligible_timers(&mut projection, &empty);
+fn history_only_fire_eligible_timer_beyond_cap_is_not_crowded_out() {
+    // Filter-before-cap (issue #615 Codex P2): with more than `category_cap`
+    // dormant cancellable arms AHEAD of the single fire-eligible timer, a
+    // filter that ran AFTER the per-category cap would keep only the first
+    // `category_cap` (all dormant) timers, then drop them all — losing the real
+    // timer, which was never kept. Threading the live set into the projection
+    // filters dormant arms BEFORE the cap, so the fire-eligible timer survives.
+    let mut rows = vec![started_row(ts(0))];
+    for i in 0..(AWAITABLE_CATEGORY_CAP + 5) {
+        rows.push((
+            ts(10 + i64::try_from(i).expect("small index")),
+            WorkflowEvent::TimerStarted {
+                // Dormant cancellable arm: no `harvest_timers` row exists.
+                timer_id: autumn_harvest::types::TimerId::new(format!("dormant_{i}")),
+                duration_secs: 3600,
+            },
+        ));
+    }
+    // The one genuine, fire-eligible durable timer, recorded LAST (well beyond
+    // the cap position).
+    rows.push((
+        ts(10_000),
+        WorkflowEvent::TimerStarted {
+            timer_id: autumn_harvest::types::TimerId::new("cooldown"),
+            duration_secs: 300,
+        },
+    ));
+
+    let live_timer_ids: HashSet<String> = HashSet::from(["cooldown".to_string()]);
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers: Some(&live_timer_ids),
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    // Exactly one timer survives — the fire-eligible one that sat beyond the
+    // cap. A filter-after-cap would have dropped all `category_cap` dormant
+    // arms and never recovered `cooldown`.
+    let timers: Vec<&Awaitable> = projection
+        .awaitables
+        .iter()
+        .filter(|a| a.kind == AwaitableKind::Timer)
+        .collect();
     assert_eq!(
-        kinds_of(&projection.awaitables),
-        vec![AwaitableKind::Timer],
-        "a Replayed projection is authoritative — never filtered by the live timer table"
+        timers.len(),
+        1,
+        "only the fire-eligible timer survives: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(timers[0].id.as_deref(), Some("cooldown"));
+    // The dormant arms were filtered before the cap, so the Timer category did
+    // not overflow.
+    assert!(
+        !projection.truncated_kinds.contains(&AwaitableKind::Timer),
+        "the Timer category did not overflow after dormant arms were filtered: {:?}",
+        projection.truncated_kinds
     );
 }

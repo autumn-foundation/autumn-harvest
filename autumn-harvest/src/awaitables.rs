@@ -41,10 +41,12 @@
 //! signal-or-deadline race, whose reserved timer id encodes the signal name)
 //! or `await_condition` parks, which is exactly the blindness the replayed
 //! mode exists to remove. A history-only scan reports every unclosed
-//! `TimerStarted`, so callers with database access should post-filter the
-//! result through [`retain_fire_eligible_timers`] (with the live unfired timer
-//! ids) to drop dormant cancellable `ctx.start_timer` arms (issue #768) that
-//! recorded a `TimerStarted` but inserted no `harvest_timers` row.
+//! `TimerStarted`, so a caller with database access passes the live unfired
+//! timer ids via [`WaitSetInput::HistoryOnly`]'s `fire_eligible_timers` field:
+//! the projection then drops dormant cancellable `ctx.start_timer` arms (issue
+//! #768) that recorded a `TimerStarted` but inserted no `harvest_timers` row,
+//! filtered before the per-category cap so a fire-eligible timer is never
+//! crowded out of the report by dormant arms ahead of it.
 //!
 //! Known approximations of the replayed mode (replay review, documented rather
 //! than fixed — each is a best-effort triage bound, never a correctness
@@ -209,7 +211,24 @@ pub enum WaitSetInput<'a> {
         commands: &'a [WorkflowCommand],
     },
     /// The replay drive was unavailable; scan recorded history alone.
-    HistoryOnly,
+    HistoryOnly {
+        /// The live *unfired* `harvest_timers` ids, when the caller (the
+        /// management endpoint) has database access. A history-only scan
+        /// reports every unclosed `TimerStarted`, but a cancellable
+        /// `ctx.start_timer` arm (issue #768, `ArmTimer { for_await: false }`)
+        /// records a `TimerStarted` with **no** `harvest_timers` row and cannot
+        /// fire until `await_fire()`. When `Some`, a projected `Timer`
+        /// awaitable whose id is absent from the set is dropped as a dormant
+        /// arm — filtered **inside** the projection, before the per-category
+        /// cap, so a fire-eligible timer is never crowded out of the report by
+        /// dormant arms ahead of it (issue #615 Codex P2). `None` (a pure
+        /// caller with no DB, or a failed live-timer read) skips the filter and
+        /// reports every unclosed `TimerStarted`. Fire-eligibility is
+        /// unrepresentable in the `Replayed` mode, which already excludes
+        /// dormant arms by construction (it matches only
+        /// `ArmTimer { for_await: true }`).
+        fire_eligible_timers: Option<&'a HashSet<String>>,
+    },
 }
 
 /// The projected open-awaitables report.
@@ -813,7 +832,19 @@ fn update_awaitable(update_id: &str, name: &str, since: DateTime<Utc>) -> Awaita
 }
 
 /// Projects the best-effort wait-set from recorded history alone.
-fn project_history_only(index: &HistoryIndex) -> Vec<Awaitable> {
+///
+/// `fire_eligible_timers`, when `Some`, is the set of live *unfired*
+/// `harvest_timers` ids used to drop dormant cancellable `ctx.start_timer`
+/// arms (issue #768) — a `TimerStarted` with no `harvest_timers` row that
+/// cannot fire until `await_fire()`. The filter is applied HERE, before the
+/// caller ([`project_awaitables`]) caps each category, so a fire-eligible
+/// timer beyond the cap position is never crowded out by dormant arms ahead of
+/// it (issue #615 Codex P2). `None` reports every unclosed `TimerStarted`.
+#[allow(clippy::too_many_lines)]
+fn project_history_only(
+    index: &HistoryIndex,
+    fire_eligible_timers: Option<&HashSet<String>>,
+) -> Vec<Awaitable> {
     let mut awaitables: Vec<Awaitable> = Vec::new();
 
     // Open regular activities, in scheduling order.
@@ -867,7 +898,17 @@ fn project_history_only(index: &HistoryIndex) -> Vec<Awaitable> {
     // Open timer arms. A reserved signal-race timer id encodes the awaited
     // signal's name, so even without a replay we can name the signal and its
     // deadline; a reserved child-race timer folds into its child below.
-    let mut child_race_deadlines: HashMap<String, DateTime<Utc>> = HashMap::new();
+    //
+    // Per-child-name FIFO (not a single deadline per name): two concurrent
+    // same-type child-or-deadline waiters (issue #779) with distinct deadlines
+    // must each keep their own, paired in recorded order — otherwise a later
+    // reserved `TimerStarted` overwrites the earlier one and both children read
+    // the same deadline. `timer_order` and `child_order` both preserve
+    // recorded order and both derive from the same command order, so popping
+    // the front of a name's queue as each child is visited pairs them
+    // correctly, mirroring the replayed path's per-name `VecDeque` (issue #615
+    // Codex P2).
+    let mut child_race_deadlines: HashMap<String, VecDeque<DateTime<Utc>>> = HashMap::new();
     for timer_id in &index.timer_order {
         let Some(arms) = index.open_timer_arms.get(timer_id) else {
             continue;
@@ -884,9 +925,25 @@ fn project_history_only(index: &HistoryIndex) -> Vec<Awaitable> {
                 awaitables.push(awaitable);
             } else if let Some(child_name) = reserved_child_race_name(timer_id) {
                 if let Some(deadline) = deadline {
-                    child_race_deadlines.insert(child_name.to_string(), deadline);
+                    child_race_deadlines
+                        .entry(child_name.to_string())
+                        .or_default()
+                        .push_back(deadline);
                 }
             } else {
+                // Drop a dormant cancellable `ctx.start_timer` arm (issue #768):
+                // a `TimerStarted` with no live `harvest_timers` row cannot fire
+                // until `await_fire()`. Filtering here — before the caller caps
+                // each category — keeps a fire-eligible timer that sits beyond
+                // the cap position from being crowded out by dormant arms ahead
+                // of it (issue #615 Codex P2). A reserved race timer (handled
+                // above) always arms a real durable timer, so it is never
+                // subject to this filter.
+                if let Some(live) = fire_eligible_timers
+                    && !live.contains(timer_id)
+                {
+                    continue;
+                }
                 let mut awaitable = Awaitable::new(AwaitableKind::Timer);
                 awaitable.id = Some(timer_id.clone());
                 awaitable.since = Some(arm.since);
@@ -896,14 +953,18 @@ fn project_history_only(index: &HistoryIndex) -> Vec<Awaitable> {
         }
     }
 
-    // Open awaited children, in start order.
+    // Open awaited children, in start order. Pop the front of the child's
+    // per-name deadline FIFO so two concurrent same-type child-or-deadline
+    // waiters each keep their own deadline (issue #615 Codex P2).
     for child_id in &index.child_order {
         if let Some((name, since)) = index.children.get(child_id) {
             let mut awaitable = Awaitable::new(AwaitableKind::ChildWorkflow);
             awaitable.id = Some(child_id.clone());
             awaitable.name = Some(name.clone());
             awaitable.since = Some(*since);
-            awaitable.deadline = child_race_deadlines.get(name).copied();
+            awaitable.deadline = child_race_deadlines
+                .get_mut(name)
+                .and_then(VecDeque::pop_front);
             awaitables.push(awaitable);
         }
     }
@@ -955,7 +1016,12 @@ pub fn project_awaitables(
         WaitSetInput::Replayed { commands } => {
             (WaitSetSource::Replayed, project_replayed(&index, commands))
         }
-        WaitSetInput::HistoryOnly => (WaitSetSource::HistoryOnly, project_history_only(&index)),
+        WaitSetInput::HistoryOnly {
+            fire_eligible_timers,
+        } => (
+            WaitSetSource::HistoryOnly,
+            project_history_only(&index, fire_eligible_timers),
+        ),
     };
 
     let cap = cap.max(1);
@@ -980,49 +1046,6 @@ pub fn project_awaitables(
         awaitables: kept,
         category_cap: cap,
     }
-}
-
-/// Drops history-only [`AwaitableKind::Timer`] awaitables that are not
-/// fire-eligible.
-///
-/// A cancellable `ctx.start_timer` arm (issue #768,
-/// `WorkflowCommand::ArmTimer` with `for_await: false`) records a
-/// `TimerStarted` event but inserts **no** `harvest_timers` row and cannot fire
-/// until `await_fire()`. The pure [`project_awaitables`] projection cannot
-/// distinguish such a dormant arm from a fire-eligible timer in the
-/// [`WaitSetSource::HistoryOnly`] fallback — the authoritative signal is the
-/// live `harvest_timers` table, which only the DB-holding endpoint can read.
-/// This filter, applied by the endpoint with the set of live *unfired* timer
-/// ids, drops any history-only timer awaitable whose id is absent, so a
-/// workflow parked on a signal/activity while merely holding an idle or debounce
-/// timer is no longer misreported as waiting on that timer.
-///
-/// It is a **no-op** for a [`WaitSetSource::Replayed`] projection: the replayed
-/// mode already excludes dormant arms by construction (it matches only
-/// `ArmTimer { for_await: true }`), and a genuine `for_await` arm committed in
-/// the same replay cycle is deliberately absent from `harvest_timers` and must
-/// not be filtered. A timer awaitable with no `id` is also retained (defensive;
-/// history-only always assigns one).
-///
-/// Applied after [`project_awaitables`] has capped each category, so the
-/// per-category truncation flags are left as computed — a conservative choice
-/// that at worst reports `truncated` for the [`AwaitableKind::Timer`] category
-/// in the pathological case of more than `category_cap` timers where every
-/// dropped over-cap arm was dormant.
-pub fn retain_fire_eligible_timers<S: std::hash::BuildHasher>(
-    projection: &mut AwaitablesProjection,
-    live_timer_ids: &HashSet<String, S>,
-) {
-    if projection.source != WaitSetSource::HistoryOnly {
-        return;
-    }
-    projection.awaitables.retain(|awaitable| {
-        awaitable.kind != AwaitableKind::Timer
-            || awaitable
-                .id
-                .as_ref()
-                .is_none_or(|id| live_timer_ids.contains(id))
-    });
 }
 
 #[cfg(test)]
@@ -1070,7 +1093,13 @@ mod tests {
 
     #[test]
     fn zero_cap_is_clamped_to_one() {
-        let projection = project_awaitables(&[], WaitSetInput::HistoryOnly, 0);
+        let projection = project_awaitables(
+            &[],
+            WaitSetInput::HistoryOnly {
+                fire_eligible_timers: None,
+            },
+            0,
+        );
         assert_eq!(projection.category_cap, 1);
     }
 }

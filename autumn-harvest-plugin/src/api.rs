@@ -10274,7 +10274,6 @@ pub(crate) async fn build_awaitables_report(
 ) -> Result<WorkflowAwaitablesResponse, AutumnError> {
     use autumn_harvest::awaitables::{
         AWAITABLE_CATEGORY_CAP, AwaitableKind, WaitSetInput, project_awaitables,
-        retain_fire_eligible_timers,
     };
 
     let runtime = api_state.runtime().map_err(map_error)?;
@@ -10364,11 +10363,13 @@ pub(crate) async fn build_awaitables_report(
     // `ctx.start_timer` arm (issue #768, `ArmTimer { for_await: false }`)
     // records a `TimerStarted` with NO `harvest_timers` row and cannot fire
     // until `await_fire()`. The live table is the authoritative fire-eligibility
-    // signal; `retain_fire_eligible_timers` (below) uses it to drop dormant arms
-    // in the fallback. A no-op for the replayed projection (which already
-    // excludes dormant arms by construction). Best-effort: on failure the filter
-    // is skipped (a dormant arm may be over-reported) rather than failing the
-    // whole triage report (PR review).
+    // signal, threaded into the projection via
+    // `WaitSetInput::HistoryOnly { fire_eligible_timers }` below so dormant arms
+    // are dropped BEFORE the per-category cap (a fire-eligible timer beyond the
+    // cap position is never crowded out by dormant arms ahead of it). Unused by
+    // the replayed projection, which excludes dormant arms by construction.
+    // Best-effort: on failure the filter is skipped (`None`, a dormant arm may
+    // be over-reported) rather than failing the whole triage report (PR review).
     let fire_eligible_timer_ids: Option<std::collections::HashSet<String>> = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_timers::fired.eq(false))
@@ -10447,7 +10448,13 @@ pub(crate) async fn build_awaitables_report(
             (
                 "history_only",
                 Some("payload_decode_required"),
-                project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+                project_awaitables(
+                    &rows,
+                    WaitSetInput::HistoryOnly {
+                        fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                    },
+                    AWAITABLE_CATEGORY_CAP,
+                ),
             )
         } else {
             // Thread the same execution-row values hydrate_ctx_for_query
@@ -10514,7 +10521,13 @@ pub(crate) async fn build_awaitables_report(
                 QueryReplayOutcome::Suspended if ctx.take_deferred_nd_error().is_some() => (
                     "history_only",
                     Some("replay_diverged"),
-                    project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
                 ),
                 QueryReplayOutcome::Suspended => {
                     // The drained command buffer at the suspension point IS
@@ -10540,17 +10553,35 @@ pub(crate) async fn build_awaitables_report(
                 QueryReplayOutcome::ReachedTerminal => (
                     "history_only",
                     Some("replay_reached_terminal"),
-                    project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
                 ),
                 QueryReplayOutcome::TimedOut => (
                     "history_only",
                     Some("replay_timed_out"),
-                    project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
                 ),
                 QueryReplayOutcome::Panicked => (
                     "history_only",
                     Some("replay_panicked"),
-                    project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+                    project_awaitables(
+                        &rows,
+                        WaitSetInput::HistoryOnly {
+                            fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                        },
+                        AWAITABLE_CATEGORY_CAP,
+                    ),
                 ),
             }
         }
@@ -10563,7 +10594,13 @@ pub(crate) async fn build_awaitables_report(
         (
             "history_only",
             Some(reason),
-            project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP),
+            project_awaitables(
+                &rows,
+                WaitSetInput::HistoryOnly {
+                    fire_eligible_timers: fire_eligible_timer_ids.as_ref(),
+                },
+                AWAITABLE_CATEGORY_CAP,
+            ),
         )
     };
 
@@ -10579,14 +10616,6 @@ pub(crate) async fn build_awaitables_report(
         {
             awaitable.deadline = Some(*deadline);
         }
-    }
-
-    // Drop dormant cancellable `ctx.start_timer` arms (issue #768) that the
-    // history-only fallback over-reports as waits — a no-op for the replayed
-    // projection, which excludes them by construction. Skipped when the
-    // best-effort live-timer read above failed.
-    if let Some(live_timer_ids) = &fire_eligible_timer_ids {
-        retain_fire_eligible_timers(&mut projection, live_timer_ids);
     }
 
     Ok(WorkflowAwaitablesResponse {
