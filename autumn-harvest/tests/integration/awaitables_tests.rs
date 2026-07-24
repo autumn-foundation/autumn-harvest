@@ -503,13 +503,69 @@ fn in_flight_update_result_command_suppresses_pending_update() {
         },
         AWAITABLE_CATEGORY_CAP,
     );
+    // The cycle's only drained command is a RecordUpdateResult — an in-flight
+    // update-result commit, NOT a command-less `await_condition` cold park. The
+    // result must be empty: the resolving update is suppressed AND no phantom
+    // Condition is inferred (issue #615 Codex P2 — a `RecordUpdateResult` leaves
+    // `awaitables` empty and `transitioning` false, which the old
+    // `awaitables.is_empty() && !transitioning` gate misread as a condition park).
     assert!(
-        projection
-            .awaitables
-            .iter()
-            .all(|a| a.kind != AwaitableKind::Update),
-        "an update resolved in the drained cycle is not pending: {:?}",
+        projection.awaitables.is_empty(),
+        "a RecordUpdateResult-only cycle waits on nothing — no phantom \
+         Condition, no pending update: {:?}",
         projection.awaitables
+    );
+}
+
+#[test]
+fn in_flight_update_result_does_not_mask_a_still_pending_update() {
+    // One update's handler completed this cycle (RecordUpdateResult), a second
+    // update is still admitted-but-unresolved. The resolving one is suppressed,
+    // the pending one is reported — and the RecordUpdateResult must NOT cause a
+    // phantom `await_condition` to be inferred alongside it.
+    let resolving_id = UpdateId::new();
+    let pending_id = UpdateId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(20),
+            WorkflowEvent::UpdateAdmitted {
+                update_id: resolving_id,
+                name: "set_priority".into(),
+                input: json!({}),
+                timestamp: ts(20),
+            },
+        ),
+        (
+            ts(30),
+            WorkflowEvent::UpdateAdmitted {
+                update_id: pending_id,
+                name: "cancel_order".into(),
+                input: json!({}),
+                timestamp: ts(30),
+            },
+        ),
+    ];
+    let commands = vec![WorkflowCommand::RecordUpdateResult {
+        update_id: resolving_id,
+        result: Ok(Value::Null),
+    }];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::Update],
+        "only the still-pending update is reported — no phantom Condition: {:?}",
+        projection.awaitables
+    );
+    assert_eq!(
+        projection.awaitables[0].name.as_deref(),
+        Some("cancel_order")
     );
 }
 

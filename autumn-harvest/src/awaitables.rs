@@ -743,8 +743,18 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
 
     // Condition park: suspended with nothing awaitable and no terminal
     // transition in flight — the only command-less cold park the engine has is
-    // `ctx.await_condition` (issue #612's case-3 discriminator).
-    if awaitables.is_empty() && !transitioning {
+    // `ctx.await_condition` (issue #612's case-3 discriminator). A drained
+    // `RecordUpdateResult` disqualifies the inference: it produces no awaitable
+    // and no transition, but it means an admitted update's result is committing
+    // this cycle (its `UpdateCompleted` not yet persisted) — an in-flight
+    // update-result commit, NOT a condition park. Pure-bookkeeping commands
+    // (`SetCurrentDetails`, `RecordSideEffect`, `RecordMarker`,
+    // `SpawnDetachedChildWorkflow`, `ReleaseMutex`, …) legitimately precede a
+    // cold `await_condition` park and are left alone, so keying on the empty
+    // `resolved_update_ids` set — rather than an empty command buffer — keeps
+    // the inference precise (a real cold park after a `set_current_details`
+    // breadcrumb still reports `Condition`).
+    if awaitables.is_empty() && !transitioning && resolved_update_ids.is_empty() {
         let mut awaitable = Awaitable::new(AwaitableKind::Condition);
         awaitable.since = index.last_event_at;
         awaitables.push(awaitable);
