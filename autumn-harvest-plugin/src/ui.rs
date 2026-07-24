@@ -1309,11 +1309,12 @@ async fn workflow_detail_ui(
     // since those panels never render payload fields (PR #936 review).
     let mut execution = execution;
     let mut page_events = page_events;
+    let session = extension_session(maybe_session);
     decode_and_audit_workflow_detail(
         &api_state,
         &mut conn,
         &headers,
-        extension_session(maybe_session),
+        session.clone(),
         exec_id,
         &mut execution,
         &mut page_events,
@@ -1324,15 +1325,30 @@ async fn workflow_detail_ui(
     // Open-awaitables diagnostic (issue #615): re-source the blocked-on panel
     // from the SAME replay-derived report `GET /workflows/{id}/awaitables`
     // serves, so the UI and the API can never disagree about why a run is
-    // parked. Best-effort: a failure here (runtime not started, replay error)
-    // degrades to the side-table panels rather than failing the page. The
-    // pooled connection is dropped first so the report's own connection
-    // checkout never overlaps ours (pool-size-1 safety).
+    // parked. Gated on harvest-admin access to mirror the API route's
+    // `require_admin` posture (the #608 `read_path_decoder` pattern in this
+    // same handler) — a non-admin principal sees the side-table panels only,
+    // never the replay-derived report the API would deny them. Best-effort: a
+    // failure degrades to the side-table panels rather than failing the page,
+    // with a warn so a persistent failure is diagnosable. The pooled
+    // connection is dropped first so the report's own connection checkout
+    // never overlaps ours (pool-size-1 safety).
     drop(conn);
-    if !is_terminal_workflow_state(&execution.state) {
-        blocked_on.awaitables = crate::api::build_awaitables_report(&api_state, exec_id)
-            .await
-            .ok();
+    if !is_terminal_workflow_state(&execution.state)
+        && crate::api::has_harvest_admin_access(&api_state, session).await
+    {
+        blocked_on.awaitables = match crate::api::build_awaitables_report(&api_state, exec_id).await
+        {
+            Ok(report) => Some(report),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %exec_id,
+                    error = ?err,
+                    "workflow detail: awaitables report failed; falling back to side tables"
+                );
+                None
+            }
+        };
     }
 
     Ok(render_workflow_detail(

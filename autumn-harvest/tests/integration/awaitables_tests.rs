@@ -168,6 +168,20 @@ fn events_of(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> Vec<WorkflowEvent> {
     rows.iter().map(|(_, e)| e.clone()).collect()
 }
 
+/// A benign trailing event: appended AFTER an awaitable's own scheduling event
+/// so `last_event_at` differs from the scheduling timestamp — proving `since`
+/// is derived from the awaitable's own event, not the last-event fallback
+/// (test review T1).
+fn marker_row(at: DateTime<Utc>) -> (DateTime<Utc>, WorkflowEvent) {
+    (
+        at,
+        WorkflowEvent::MarkerRecorded {
+            name: "trailing-benign-marker".into(),
+            details: Value::Null,
+        },
+    )
+}
+
 fn build_ctx(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> WorkflowContext {
     WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -286,6 +300,9 @@ fn pending_activity_reports_name_id_and_since() {
                 queue: "payments".into(),
             },
         ),
+        // Trailing benign event: last_event_at (ts 99) != scheduled-at (ts 30),
+        // so the since assert below proves event-derived provenance (T1).
+        marker_row(ts(99)),
     ];
     let projection = drive_and_project(&rows, activity_workflow);
 
@@ -317,6 +334,8 @@ fn unfired_timer_reports_deadline() {
                 duration_secs: 300,
             },
         ),
+        // Trailing benign event decouples last_event_at from the arm ts (T1).
+        marker_row(ts(99)),
     ];
     let projection = drive_and_project(&rows, timer_workflow);
 
@@ -346,6 +365,8 @@ fn pending_child_reports_name_and_exec_id() {
                 input: json!({"order": 7}),
             },
         ),
+        // Trailing benign event decouples last_event_at from started-at (T1).
+        marker_row(ts(99)),
     ];
     let projection = drive_and_project(&rows, child_parent_workflow);
 
@@ -656,6 +677,11 @@ fn history_only_local_activity_mid_retry_reported() {
     let awaitable = &projection.awaitables[0];
     assert!(awaitable.local, "a local activity carries the local flag");
     assert_eq!(awaitable.name.as_deref(), Some("compute_checksum"));
+    assert_eq!(
+        awaitable.since,
+        Some(ts(1)),
+        "since = the scheduling event, not the mid-retry failure (T1)"
+    );
 }
 
 #[test]
@@ -674,6 +700,8 @@ fn history_only_external_activity_reports_deadline() {
                 schedule_to_close_secs: 86_400,
             },
         ),
+        // Trailing benign event decouples last_event_at from awaiting-since (T1).
+        marker_row(ts(99)),
     ];
     let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
     assert_eq!(
@@ -684,6 +712,11 @@ fn history_only_external_activity_reports_deadline() {
     assert!(
         awaitable.external,
         "an external handoff carries the external flag"
+    );
+    assert_eq!(
+        awaitable.since,
+        Some(ts(9)),
+        "since = when the external handoff was recorded, not the last event"
     );
     assert_eq!(
         awaitable.deadline,
@@ -840,5 +873,576 @@ fn awaitable_kinds_serialize_snake_case() {
     assert!(
         value.get("id").is_none() || value["id"].is_null(),
         "absent fields are omitted or null, never fabricated"
+    );
+}
+
+// ── Multi-awaitable replayed projection (test review T3) ──────────────────
+
+/// Parks on an activity AND a timer concurrently (`futures::join!`).
+fn join_activity_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let (a, t) = futures::join!(
+            ctx.execute_activity_raw("charge_card", json!({"amount": 42}), "payments"),
+            ctx.timer("cooldown", 300),
+        );
+        a.map_err(|e| e.to_string())?;
+        t.map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+#[test]
+fn joined_activity_and_timer_both_reported() {
+    let rows = vec![started_row(ts(0))];
+    let projection = drive_and_project(&rows, join_activity_timer_workflow);
+
+    let mut kinds = kinds_of(&projection.awaitables);
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        vec![AwaitableKind::Activity, AwaitableKind::Timer],
+        "a join! park reports every joined wait: {:?}",
+        projection.awaitables
+    );
+    let activity = projection
+        .awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Activity)
+        .expect("activity awaitable");
+    assert_eq!(activity.name.as_deref(), Some("charge_card"));
+    let timer = projection
+        .awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Timer)
+        .expect("timer awaitable");
+    assert_eq!(timer.id.as_deref(), Some("cooldown"));
+}
+
+// ── Replayed-mode pending update (test review T2) ─────────────────────────
+
+#[test]
+fn replayed_mode_reports_pending_update_alongside_wait() {
+    // A pending (admitted, unresolved) update rides along with whatever wait
+    // the workflow is parked on — the replayed projection reports BOTH.
+    let update_id = UpdateId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(20),
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "set_priority".into(),
+                input: json!({}),
+                timestamp: ts(20),
+            },
+        ),
+        marker_row(ts(99)),
+    ];
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let commands = vec![WorkflowCommand::WaitForSignal {
+        signal_name: "approval".into(),
+        result_tx: tx,
+    }];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    let mut kinds = kinds_of(&projection.awaitables);
+    kinds.sort();
+    assert_eq!(kinds, vec![AwaitableKind::Signal, AwaitableKind::Update]);
+    let update = projection
+        .awaitables
+        .iter()
+        .find(|a| a.kind == AwaitableKind::Update)
+        .expect("pending update awaitable");
+    assert_eq!(update.name.as_deref(), Some("set_priority"));
+    assert_eq!(update.since, Some(ts(20)), "since = admission time (T1)");
+}
+
+// ── Synthetic-buffer arm coverage (test review T5/T6) ─────────────────────
+
+#[test]
+fn external_activity_command_reports_external_with_deadline() {
+    let activity_id = ActivityExecId::new();
+    let token = autumn_harvest::types::ExternalActivityToken::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(9),
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "human_review".into(),
+                input: Value::Null,
+                queue: "reviews".into(),
+                schedule_to_close_secs: 86_400,
+            },
+        ),
+        marker_row(ts(99)),
+    ];
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let commands = vec![WorkflowCommand::ScheduleExternalActivity {
+        activity_id,
+        token,
+        name: "human_review".into(),
+        input: Value::Null,
+        queue: "reviews".into(),
+        schedule_to_close_secs: 86_400,
+        result_tx: tx,
+    }];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::Activity]
+    );
+    let awaitable = &projection.awaitables[0];
+    assert!(awaitable.external);
+    assert_eq!(awaitable.name.as_deref(), Some("human_review"));
+    assert_eq!(awaitable.since, Some(ts(9)));
+    assert_eq!(
+        awaitable.deadline,
+        Some(ts(9) + ChronoDuration::seconds(86_400))
+    );
+}
+
+#[test]
+fn external_workflow_commands_report_targets() {
+    let await_target = ExecutionId::new();
+    let signal_target = ExecutionId::new();
+    let cancel_target = ExecutionId::new();
+    let await_id = autumn_harvest::types::ExternalAwaitId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(7),
+            WorkflowEvent::ExternalAwaitRequested {
+                await_id,
+                target: await_target,
+            },
+        ),
+        marker_row(ts(99)),
+    ];
+    let (await_tx, _r1) = tokio::sync::oneshot::channel();
+    let (signal_tx, _r2) = tokio::sync::oneshot::channel();
+    let (cancel_tx, _r3) = tokio::sync::oneshot::channel();
+    let commands = vec![
+        WorkflowCommand::AwaitExternalWorkflow {
+            await_id,
+            target: await_target,
+            result_tx: await_tx,
+            already_requested: true,
+        },
+        WorkflowCommand::SignalExternalWorkflow {
+            signal_id: autumn_harvest::types::ExternalSignalId::new(),
+            target: signal_target,
+            signal_name: "release".into(),
+            payload: Value::Null,
+            result_tx: signal_tx,
+            already_requested: false,
+            idempotency_key: None,
+        },
+        WorkflowCommand::RequestCancelExternalWorkflow {
+            cancel_id: autumn_harvest::types::ExternalCancelId::new(),
+            target: cancel_target,
+            result_tx: cancel_tx,
+            already_requested: false,
+        },
+    ];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![
+            AwaitableKind::ExternalWorkflow,
+            AwaitableKind::ExternalWorkflow,
+            AwaitableKind::ExternalWorkflow,
+        ]
+    );
+    let awaited = &projection.awaitables[0];
+    assert_eq!(
+        awaited.id.as_deref(),
+        Some(await_target.to_string().as_str())
+    );
+    assert_eq!(
+        awaited.since,
+        Some(ts(7)),
+        "an open external await's since = its recorded request event"
+    );
+    let signalled = &projection.awaitables[1];
+    assert_eq!(signalled.name.as_deref(), Some("release"));
+    assert_eq!(
+        signalled.id.as_deref(),
+        Some(signal_target.to_string().as_str())
+    );
+    let cancelled = &projection.awaitables[2];
+    assert_eq!(
+        cancelled.id.as_deref(),
+        Some(cancel_target.to_string().as_str())
+    );
+}
+
+#[test]
+fn orphan_race_timer_falls_back_to_timer_awaitable() {
+    // Defensive: a reserved race timer with NO matching signal wait in the
+    // drained buffer must not be silently dropped — it degrades to a plain
+    // timer awaitable.
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(10),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 3600,
+            },
+        ),
+    ];
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let commands = vec![WorkflowCommand::StartTimer {
+        timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+        duration_secs: 3600,
+        result_tx: tx,
+    }];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    assert_eq!(kinds_of(&projection.awaitables), vec![AwaitableKind::Timer]);
+    assert_eq!(
+        projection.awaitables[0].deadline,
+        Some(ts(10) + ChronoDuration::seconds(3600)),
+        "the orphan race arm keeps its deadline"
+    );
+}
+
+// ── Child-or-deadline race fold (test review T8, issue #779) ──────────────
+
+#[test]
+fn child_timeout_race_folds_deadline_into_child_awaitable() {
+    let child_id = ExecutionId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(60),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(61),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+                duration_secs: 600,
+            },
+        ),
+        marker_row(ts(99)),
+    ];
+    let (child_tx, _r1) = tokio::sync::oneshot::channel();
+    let (timer_tx, _r2) = tokio::sync::oneshot::channel();
+    let commands = vec![
+        WorkflowCommand::StartChildWorkflow {
+            child_id,
+            workflow_name: "fulfillment_flow".into(),
+            input: Value::Null,
+            result_tx: child_tx,
+        },
+        WorkflowCommand::StartTimer {
+            timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+            duration_secs: 600,
+            result_tx: timer_tx,
+        },
+    ];
+    let projection = project_awaitables(
+        &rows,
+        WaitSetInput::Replayed {
+            commands: &commands,
+        },
+        AWAITABLE_CATEGORY_CAP,
+    );
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::ChildWorkflow],
+        "the reserved child race timer folds into the child, never a timer row: {:?}",
+        projection.awaitables
+    );
+    let awaitable = &projection.awaitables[0];
+    assert_eq!(awaitable.name.as_deref(), Some("fulfillment_flow"));
+    assert_eq!(awaitable.since, Some(ts(60)));
+    assert_eq!(
+        awaitable.deadline,
+        Some(ts(61) + ChronoDuration::seconds(600)),
+        "the child race deadline is the reserved timer's fire time"
+    );
+}
+
+#[test]
+fn history_only_child_timeout_race_folds_deadline() {
+    let child_id = ExecutionId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(60),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(61),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+                duration_secs: 600,
+            },
+        ),
+    ];
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::ChildWorkflow]
+    );
+    assert_eq!(
+        projection.awaitables[0].deadline,
+        Some(ts(61) + ChronoDuration::seconds(600))
+    );
+}
+
+// ── Resolved races leave no stale arms (replay review R3) ─────────────────
+
+#[test]
+fn history_only_signal_win_race_is_not_reported_open() {
+    // A signal-win tears its reserved deadline timer down via an EVENT-LESS
+    // CancelRaceLosers delete — no TimerFired/TimerCancelled is ever recorded.
+    // The SignalReceived closes the arm, so a RESOLVED race must not surface
+    // as a still-open signal awaitable.
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(10),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 3600,
+            },
+        ),
+        (
+            ts(20),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: json!({"ok": true}),
+            },
+        ),
+        marker_row(ts(99)),
+    ];
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    assert!(
+        projection.awaitables.is_empty(),
+        "a resolved signal-win race is not an open awaitable: {:?}",
+        projection.awaitables
+    );
+}
+
+#[test]
+fn history_only_timer_win_late_signal_keeps_arm_closed_once() {
+    // Timer-win: TimerFired closed the arm. A LATE SignalReceived afterwards
+    // must be a no-op (nothing left to close, nothing reported open).
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(10),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 60,
+            },
+        ),
+        (
+            ts(70),
+            WorkflowEvent::TimerFired {
+                timer_id: autumn_harvest::types::TimerId::new("__signal_timeout:1:approval"),
+            },
+        ),
+        (
+            ts(80),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: Value::Null,
+            },
+        ),
+    ];
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    assert!(
+        projection.awaitables.is_empty(),
+        "a timer-won race with a late signal reports nothing open: {:?}",
+        projection.awaitables
+    );
+}
+
+#[test]
+fn history_only_child_win_race_is_not_reported_open() {
+    // Child-win of a child-or-deadline race (issue #779): the reserved timer
+    // is torn down event-lessly; the child terminal closes the arm.
+    let child_id = ExecutionId::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(60),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "fulfillment_flow".into(),
+                input: Value::Null,
+            },
+        ),
+        (
+            ts(61),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("__child_timeout:1:fulfillment_flow"),
+                duration_secs: 600,
+            },
+        ),
+        (
+            ts(90),
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: Value::Null,
+            },
+        ),
+    ];
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    assert!(
+        projection.awaitables.is_empty(),
+        "a resolved child-win race is not an open awaitable: {:?}",
+        projection.awaitables
+    );
+}
+
+#[test]
+fn history_only_extended_external_deadline_is_cleared() {
+    // ActivityExternalDeadlineExtended carries no new deadline value, so the
+    // stale original schedule-to-close must be CLEARED, not reported as due.
+    let activity_id = ActivityExecId::new();
+    let token = autumn_harvest::types::ExternalActivityToken::new();
+    let rows = vec![
+        started_row(ts(0)),
+        (
+            ts(9),
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id,
+                token,
+                name: "human_review".into(),
+                input: Value::Null,
+                queue: "reviews".into(),
+                schedule_to_close_secs: 600,
+            },
+        ),
+        (
+            ts(500),
+            WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, token },
+        ),
+    ];
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    assert_eq!(
+        kinds_of(&projection.awaitables),
+        vec![AwaitableKind::Activity]
+    );
+    let awaitable = &projection.awaitables[0];
+    assert!(awaitable.external);
+    assert_eq!(
+        awaitable.deadline, None,
+        "an extended external deadline is unknown from history — never stale"
+    );
+}
+
+// ── Truncation boundary (test review T10) ─────────────────────────────────
+
+#[test]
+fn exactly_cap_entries_are_not_truncated() {
+    let mut rows = vec![started_row(ts(0))];
+    for i in 0..AWAITABLE_CATEGORY_CAP {
+        rows.push((
+            ts(i64::try_from(i).expect("small index") + 1),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new(format!("t-{i}")),
+                duration_secs: 600,
+            },
+        ));
+    }
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+    assert_eq!(projection.awaitables.len(), AWAITABLE_CATEGORY_CAP);
+    assert!(!projection.truncated, "exactly-cap is NOT truncation");
+    assert!(projection.truncated_kinds.is_empty());
+}
+
+#[test]
+fn truncation_is_per_category_not_global() {
+    // Cap+1 timers truncate the Timer category only; a single activity in the
+    // same projection is untouched.
+    let activity_id = ActivityExecId::new();
+    let mut rows = vec![
+        started_row(ts(0)),
+        (
+            ts(1),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge_card".into(),
+                input: Value::Null,
+                queue: "payments".into(),
+            },
+        ),
+    ];
+    for i in 0..=AWAITABLE_CATEGORY_CAP {
+        rows.push((
+            ts(i64::try_from(i).expect("small index") + 2),
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new(format!("t-{i}")),
+                duration_secs: 600,
+            },
+        ));
+    }
+    let projection = project_awaitables(&rows, WaitSetInput::HistoryOnly, AWAITABLE_CATEGORY_CAP);
+
+    assert!(projection.truncated);
+    assert_eq!(projection.truncated_kinds, vec![AwaitableKind::Timer]);
+    assert_eq!(
+        projection
+            .awaitables
+            .iter()
+            .filter(|a| a.kind == AwaitableKind::Activity)
+            .count(),
+        1,
+        "the activity category is untouched by timer truncation"
+    );
+    assert_eq!(
+        projection
+            .awaitables
+            .iter()
+            .filter(|a| a.kind == AwaitableKind::Timer)
+            .count(),
+        AWAITABLE_CATEGORY_CAP
     );
 }

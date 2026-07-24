@@ -104,6 +104,40 @@ fn child_parent_workflow<'a>(
     })
 }
 
+/// Completes immediately — a RUNNING row whose replay reaches terminal.
+fn completes_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(json!("done")) })
+}
+
+/// Panics on first poll — the replay drive contains it (#782) and reports it.
+fn panics_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move { panic!("deliberate test panic") })
+}
+
+/// Calls `ctx.system_now()` (a deterministic primitive) then parks
+/// command-lessly. Replayed over a history whose recorded side effect has the
+/// WRONG kind, the primitive records a deferred non-determinism error — the
+/// drive still suspends, and the endpoint must degrade rather than serve a
+/// wait-set derived from diverged code.
+fn diverged_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _now = ctx.system_now();
+        ctx.await_condition(|| false)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         mcp: false,
@@ -202,6 +236,9 @@ fn build_api_state(pool: &DbPool) -> HarvestApiState {
                 wf_info("signal_wait_wf", signal_wait_workflow),
                 wf_info("activity_wf", activity_workflow),
                 wf_info("child_wf", child_parent_workflow),
+                wf_info("completes_wf", completes_workflow),
+                wf_info("panics_wf", panics_workflow),
+                wf_info("diverged_wf", diverged_workflow),
             ],
             vec![],
         )),
@@ -405,6 +442,92 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
         got_deadline.starts_with("2026-07-01T13:00:00"),
         "deadline should come from schedule_to_close_at: {got_deadline}"
     );
+
+    // T12: when the current attempt's start-to-close deadline
+    // (started_at + start_to_close) is EARLIER than the cross-retry
+    // schedule_to_close_at, the enrichment picks the earliest of the two.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET state = 'RUNNING', started_at = $2, start_to_close = interval '600 seconds' \
+             WHERE activity_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(
+            Utc.with_ymd_and_hms(2026, 7, 1, 12, 30, 0).unwrap(),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("update task row");
+    }
+    let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/awaitables"), true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let awaitables = body["awaitables"].as_array().expect("awaitables");
+    let got_deadline = awaitables[0]["deadline"]
+        .as_str()
+        .expect("deadline enriched from task row");
+    assert!(
+        got_deadline.starts_with("2026-07-01T12:40:00"),
+        "the EARLIEST of start-to-close (12:40) and schedule-to-close (13:00) wins: {got_deadline}"
+    );
+}
+
+/// T7: a RUNNING row whose replay reaches `Poll::Ready` degrades with
+/// `replay_reached_terminal`; a panicking handler degrades with
+/// `replay_panicked`; a deferred non-determinism divergence degrades with
+/// `replay_diverged`. Each still serves 200 with the history-only scan.
+#[tokio::test]
+async fn replay_failure_modes_degrade_with_named_reasons() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(&pool);
+
+    let reached = seed_execution(
+        &pool,
+        "completes_wf",
+        "RUNNING",
+        Value::Null,
+        vec![started_event(Value::Null)],
+    )
+    .await;
+    let (status, body) = get_json(&app, &format!("/workflows/{reached}/awaitables"), true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["wait_set"], "history_only");
+    assert_eq!(body["wait_set_reason"], "replay_reached_terminal");
+
+    let panicked = seed_execution(
+        &pool,
+        "panics_wf",
+        "RUNNING",
+        Value::Null,
+        vec![started_event(Value::Null)],
+    )
+    .await;
+    let (status, body) = get_json(&app, &format!("/workflows/{panicked}/awaitables"), true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["wait_set"], "history_only");
+    assert_eq!(body["wait_set_reason"], "replay_panicked");
+
+    let diverged = seed_execution(
+        &pool,
+        "diverged_wf",
+        "RUNNING",
+        Value::Null,
+        vec![
+            started_event(Value::Null),
+            WorkflowEvent::SideEffectRecorded {
+                kind: autumn_harvest::event::SideEffectKind::Random,
+                name: None,
+                value: json!(7),
+            },
+        ],
+    )
+    .await;
+    let (status, body) = get_json(&app, &format!("/workflows/{diverged}/awaitables"), true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["wait_set"], "history_only", "body: {body}");
+    assert_eq!(body["wait_set_reason"], "replay_diverged", "body: {body}");
 }
 
 /// A pending child workflow reports the child's workflow name and exec id.
@@ -512,6 +635,12 @@ async fn report_is_read_only_zero_writes() {
         execution_row: Value,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         events: i64,
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        task_rows: Value,
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        timer_rows: Value,
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        signal_rows: Value,
     }
 
     let (url, _guard) = setup_database().await;
@@ -520,15 +649,67 @@ async fn report_is_read_only_zero_writes() {
 
     let exec_id = seed_execution(
         &pool,
-        "signal_wait_wf",
+        "activity_wf",
         "RUNNING",
         Value::Null,
-        vec![started_event(Value::Null)],
+        vec![
+            started_event(Value::Null),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "charge_card".into(),
+                input: json!({"amount": 42}),
+                queue: "payments".into(),
+            },
+        ],
     )
     .await;
 
+    // Seed side-table rows too (test review T4): the deadline-enrichment query
+    // reads harvest_task_queue, and a mutation of ANY side table would violate
+    // the read-only contract even if the execution row survived.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, activity_name, \
+              input, state, priority, attempt, max_attempts, scheduled_at) \
+             VALUES ($1, 'payments', 'activity', $2, 'charge_card', \
+                     '{}'::jsonb, 'PENDING', 0, 1, 3, NOW())",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed task row");
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'cooldown', NOW() + interval '300 seconds', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed timer row");
+        diesel::sql_query(
+            "INSERT INTO harvest_signals \
+             (id, workflow_exec_id, signal_name, payload, received_at, consumed) \
+             VALUES ($1, $2, 'approval', 'null'::jsonb, NOW(), false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed signal row");
+    }
+
     let snapshot_sql = "SELECT to_jsonb(w.*) AS execution_row, \
-         (SELECT COUNT(*) FROM harvest_events e WHERE e.workflow_exec_id = w.id) AS events \
+         (SELECT COUNT(*) FROM harvest_events e WHERE e.workflow_exec_id = w.id) AS events, \
+         (SELECT COALESCE(jsonb_agg(to_jsonb(t.*) ORDER BY t.id), '[]'::jsonb) \
+            FROM harvest_task_queue t WHERE t.workflow_exec_id = w.id) AS task_rows, \
+         (SELECT COALESCE(jsonb_agg(to_jsonb(ti.*) ORDER BY ti.id), '[]'::jsonb) \
+            FROM harvest_timers ti WHERE ti.workflow_exec_id = w.id) AS timer_rows, \
+         (SELECT COALESCE(jsonb_agg(to_jsonb(s.*) ORDER BY s.id), '[]'::jsonb) \
+            FROM harvest_signals s WHERE s.workflow_exec_id = w.id) AS signal_rows \
          FROM harvest_workflow_executions w WHERE w.id = $1";
     let before: Snapshot = {
         let mut conn = pool.get().await.expect("pooled conn");
@@ -555,6 +736,12 @@ async fn report_is_read_only_zero_writes() {
         "execution row must be untouched"
     );
     assert_eq!(before.events, after.events, "no events may be appended");
+    assert_eq!(before.task_rows, after.task_rows, "task rows untouched");
+    assert_eq!(before.timer_rows, after.timer_rows, "timer rows untouched");
+    assert_eq!(
+        before.signal_rows, after.signal_rows,
+        "signal rows untouched"
+    );
 }
 
 /// Unknown execution → 404; malformed id → 400. (The unauthenticated 401
@@ -603,8 +790,60 @@ async fn ui_blocked_on_panel_shows_awaited_unsent_signal() {
         html.contains("approval"),
         "the awaited-but-unsent signal name must be visible"
     );
+}
+
+/// T9: the UI panel renders a pending child workflow (name + child exec id) —
+/// and a TERMINAL execution renders no awaitables section at all.
+#[tokio::test]
+async fn ui_blocked_on_panel_renders_children_and_skips_terminal_runs() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let ui_app = build_ui_app(&pool);
+
+    let child_id = ExecutionId::new();
+    let exec_id = seed_execution(
+        &pool,
+        "child_wf",
+        "RUNNING",
+        Value::Null,
+        vec![
+            started_event(Value::Null),
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "fulfillment_flow".into(),
+                input: json!({"order": 7}),
+            },
+        ],
+    )
+    .await;
+    let (status, html) = fetch_html(&ui_app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("signal"),
-        "the awaitable kind must be visible"
+        html.contains("Waiting on (replay-derived)"),
+        "detail page should render the awaitables section"
+    );
+    assert!(
+        html.contains("fulfillment_flow"),
+        "the pending child's workflow name must be visible"
+    );
+    assert!(
+        html.contains(&child_id.to_string()),
+        "the pending child's exec id must be visible"
+    );
+
+    // Negative control: a terminal run renders NO awaitables section.
+    let terminal = seed_execution(
+        &pool,
+        "signal_wait_wf",
+        "COMPLETED",
+        Value::Null,
+        vec![started_event(Value::Null)],
+    )
+    .await;
+    let (status, html) = fetch_html(&ui_app, &format!("/workflows/{terminal}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !html.contains("Waiting on (replay-derived)"),
+        "a terminal run must not render the awaitables section"
     );
 }

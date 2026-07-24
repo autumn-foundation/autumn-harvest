@@ -41,6 +41,27 @@
 //! signal-or-deadline race, whose reserved timer id encodes the signal name)
 //! or `await_condition` parks, which is exactly the blindness the replayed
 //! mode exists to remove.
+//!
+//! Known approximations of the replayed mode (replay review, documented rather
+//! than fixed — each is a best-effort triage bound, never a correctness
+//! surface):
+//!
+//! - The #612 drive stops at the FIRST poll that emits a command, so a
+//!   `tokio::join!` sibling whose wait would only be pushed on a later poll
+//!   (after an intervening `yield_now`-style self-wake) can be absent from the
+//!   drained buffer. In practice every ctx wait primitive pushes its command on
+//!   its first poll, so joined siblings land in one batch; the gap needs a
+//!   hand-rolled future that yields before awaiting.
+//! - A [`AwaitableKind::Condition`] awaitable is inferred from a command-less
+//!   suspension. A workflow that parks command-lessly for a *wrong* reason — an
+//!   author determinism violation absorbed by an infallible primitive — could
+//!   look identical; callers are expected to check the context's deferred
+//!   non-determinism slot after the drive and degrade instead (the management
+//!   endpoint does).
+//! - A cancellable timer's (`ArmTimer { for_await: true }`) reported deadline
+//!   is anchored at its recorded ARM time; the true deadline is anchored at
+//!   `await_fire` time (issue #768), which history does not record, so the
+//!   reported deadline can be conservatively early.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -283,6 +304,16 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                     .external_activities
                     .insert(activity_id.to_string(), (name.clone(), *at, deadline));
             }
+            WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
+                // The extension event carries no new deadline value (the real
+                // deadline lives only in the `harvest_external_tasks` row), so
+                // clear the recorded one: reporting the ORIGINAL
+                // schedule-to-close as still due after an operator extended it
+                // would be actively misleading (replay review).
+                if let Some(meta) = index.external_activities.get_mut(&activity_id.to_string()) {
+                    meta.2 = None;
+                }
+            }
             WorkflowEvent::LocalActivityScheduled {
                 activity_id, name, ..
             } => {
@@ -318,6 +349,18 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
                     arms.pop_front();
                 }
             }
+            // A signal-win of a signal-or-deadline race (issue #476) tears its
+            // reserved deadline timer down via an EVENT-LESS
+            // `CancelRaceLosers` row delete — no `TimerFired`/`TimerCancelled`
+            // is ever recorded for the losing arm. Treat the oldest open
+            // reserved arm for this signal name as closed at the
+            // `SignalReceived`, so history-only mode does not report a
+            // resolved race as a still-open signal awaitable (replay review
+            // R3). A timer-win recorded `TimerFired` first (arm already
+            // closed), so a genuinely LATE signal is a no-op here.
+            WorkflowEvent::SignalReceived { signal_name, .. } => {
+                close_race_arm_for(&mut index, reserved_signal_race_name, signal_name);
+            }
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
                 workflow_name,
@@ -329,7 +372,15 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
             | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
-                index.children.remove(&child_id.to_string());
+                // Mirror of the SignalReceived arm above for the
+                // child-or-deadline race (issue #779): a child-win tears the
+                // reserved deadline timer down event-lessly, so close the
+                // oldest open reserved arm matching the child's workflow name
+                // at its terminal. On a timer-win the fired arm was already
+                // closed and the loser's synthetic terminal is a no-op here.
+                if let Some((child_name, _)) = index.children.remove(&child_id.to_string()) {
+                    close_race_arm_for(&mut index, reserved_child_race_name, &child_name);
+                }
             }
             WorkflowEvent::UpdateAdmitted {
                 update_id, name, ..
@@ -360,6 +411,29 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
         .filter(|(id, _, _)| !resolved_awaits.contains(id))
         .collect();
     index
+}
+
+/// Closes the oldest open reserved race arm whose id parses (via `parse`) to
+/// `name`.
+///
+/// A resolved signal-or-deadline / child-or-deadline race tears its reserved
+/// deadline timer down via an event-less `CancelRaceLosers` row delete, so the
+/// arm never records a closing `TimerFired`/`TimerCancelled`. Called from the
+/// history-index pass at each race-resolving event so history-only mode does
+/// not report the resolved race as still open. No-op when no open matching arm
+/// exists (timer-win already closed it via its recorded `TimerFired`).
+fn close_race_arm_for(index: &mut HistoryIndex, parse: fn(&str) -> Option<&str>, name: &str) {
+    let candidate = index
+        .open_timer_arms
+        .iter()
+        .filter(|(id, arms)| !arms.is_empty() && parse(id) == Some(name))
+        .min_by_key(|(_, arms)| arms.front().map(|arm| arm.since))
+        .map(|(id, _)| id.clone());
+    if let Some(id) = candidate
+        && let Some(arms) = index.open_timer_arms.get_mut(&id)
+    {
+        arms.pop_front();
+    }
 }
 
 /// Parses the signal name out of a reserved signal-or-deadline race timer id
@@ -477,6 +551,13 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 }
                 awaitables.push(awaitable);
             }
+            // Known approximation: a cancellable timer's real deadline is
+            // anchored at `await_fire` time (issue #768 round 4), but the
+            // recorded `TimerStarted` is at ARM time — so an
+            // `ArmTimer { for_await: true }` deadline computed from the arm's
+            // recorded `since` can UNDERSTATE the true fire time by the
+            // arm-to-await gap. The await instant is not recoverable from
+            // history, so the earlier (conservative) deadline is reported.
             WorkflowCommand::StartTimer {
                 timer_id,
                 duration_secs,
@@ -573,11 +654,24 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
     // Fold race deadlines into their matching signal/child awaitables. A race
     // timer with no matching wait (defensive — should not occur in a coherent
     // suspension) is reported as a plain timer so nothing is silently dropped.
-    for (signal_name, race) in signal_races {
-        if let Some(awaitable) = awaitables
-            .iter_mut()
-            .find(|a| a.kind == AwaitableKind::Signal && a.name.as_deref() == Some(&signal_name))
+    // Matches are resolved through a one-pass (kind, name) → position index so
+    // a pathological drained buffer (N races × M awaitables) stays O(N + M)
+    // rather than O(N·M).
+    let mut positions: HashMap<(AwaitableKind, String), usize> = HashMap::new();
+    for (position, awaitable) in awaitables.iter().enumerate() {
+        if matches!(
+            awaitable.kind,
+            AwaitableKind::Signal | AwaitableKind::ChildWorkflow
+        ) && let Some(name) = &awaitable.name
         {
+            positions
+                .entry((awaitable.kind, name.clone()))
+                .or_insert(position);
+        }
+    }
+    for (signal_name, race) in signal_races {
+        if let Some(&position) = positions.get(&(AwaitableKind::Signal, signal_name.clone())) {
+            let awaitable = &mut awaitables[position];
             if let Some(since) = race.since {
                 awaitable.since = Some(since);
             }
@@ -591,10 +685,9 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
         }
     }
     for (child_name, race) in child_races {
-        if let Some(awaitable) = awaitables.iter_mut().find(|a| {
-            a.kind == AwaitableKind::ChildWorkflow && a.name.as_deref() == Some(&child_name)
-        }) {
-            awaitable.deadline = race.deadline;
+        if let Some(&position) = positions.get(&(AwaitableKind::ChildWorkflow, child_name.clone()))
+        {
+            awaitables[position].deadline = race.deadline;
         } else {
             awaitables.push(orphan_race_timer(
                 crate::context::CHILD_TIMEOUT_TIMER_PREFIX,
