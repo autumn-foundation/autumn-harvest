@@ -1110,6 +1110,38 @@ fn build_ramp_set_body_fields_are_documented() {
 
 // ── Scoped API tokens (issue #942) ────────────────────────────────────────────
 
+// ── Task-queue pause/resume (issue #619) ──────────────────────────────────────
+
+#[test]
+fn queue_pause_is_covered() {
+    assert_covered(&["queue", "pause", "email-workers", "--reason", "outage"]);
+    assert_body_fields_documented(&["queue", "pause", "email-workers", "--reason", "outage"]);
+}
+
+#[test]
+fn queue_pause_with_shard_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "outage",
+        "--shard-id",
+        "1",
+    ]);
+}
+
+#[test]
+fn queue_resume_is_covered() {
+    assert_covered(&["queue", "resume", "email-workers"]);
+    assert_body_fields_documented(&["queue", "resume", "email-workers", "--shard-id", "1"]);
+}
+
+#[test]
+fn queue_list_paused_is_covered() {
+    assert_covered(&["queue", "list-paused"]);
+}
+
 #[test]
 fn token_create_is_covered() {
     assert_covered(&["token", "create", "ci-bot", "--scope", "read"]);

@@ -12919,6 +12919,82 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
+/// Spawn the paused-queue sampler (issue #619).
+///
+/// Emits the `harvest.queue.paused` gauge (`1`/`0` per queue) so an operator
+/// hold is visible on a dashboard and can drive an alert if it is left on too
+/// long (AC8). Iterates every shard pool so a shard-scoped pause is surfaced
+/// while the other shards keep dispatching; a queue paused on *any* shard reads
+/// `1`, which is the honest fleet-wide reading of "work on this queue is being
+/// held somewhere".
+///
+/// Zero-fill: a queue that was reported paused on a previous cycle but is no
+/// longer paused is emitted once with `false`, so a resumed queue's series drops
+/// to `0` instead of going stale at `1` forever. Skipped entirely when no
+/// metrics recorder is configured — the per-shard query is not free.
+#[cfg(feature = "db")]
+fn spawn_queue_pause_sampler(
+    // One pool per shard to aggregate over (see spawn_queue_depth_sampler).
+    pools: Vec<DbPool>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        // Queues reported paused on the previous cycle, so a resume can be
+        // zero-filled exactly once rather than leaving a stale `1`.
+        let mut previously_paused: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut currently_paused: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut read_failed = false;
+
+            for pool in &pools {
+                let Ok(mut conn) = pool.get().await else {
+                    read_failed = true;
+                    continue;
+                };
+                match crate::queue_pause::paused_queue_names(&mut conn).await {
+                    Ok(names) => currently_paused.extend(names),
+                    Err(error) => {
+                        read_failed = true;
+                        tracing::debug!(error = %error, "queue pause sample failed");
+                    }
+                }
+            }
+
+            // A shard we could not read might be holding a queue we would
+            // otherwise zero-fill. Skip the whole cycle rather than falsely
+            // reporting a hold as released during a database blip.
+            if read_failed {
+                continue;
+            }
+
+            for queue in &currently_paused {
+                telemetry.metrics.record_queue_paused(queue, true);
+            }
+            for queue in previously_paused.difference(&currently_paused) {
+                telemetry.metrics.record_queue_paused(queue, false);
+            }
+            previously_paused = currently_paused;
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 /// Spawn the overdue-schedule sampler (issue #696).
 ///
 /// Emits the `harvest.schedule.overdue` gauge (`1`/`0` per schedule) so a
@@ -13437,6 +13513,8 @@ struct WorkerMonitoringHandles {
     /// Overdue-schedule gauge sampler (issue #696). `Some` under `db` (the task
     /// itself no-ops when metrics are disabled); `None` without `db`.
     schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Paused-queue gauge sampler (issue #619). `None` without the `db` feature.
+    queue_pause_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
@@ -14555,6 +14633,11 @@ impl Worker {
         {
             tracing::warn!(error = %error, "schedule overdue sampler failed during shutdown");
         }
+        if let Some(handle) = monitors.queue_pause_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "queue pause sampler failed during shutdown");
+        }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "slot tuner loop failed during shutdown");
@@ -14720,6 +14803,16 @@ impl Worker {
             self.registry.telemetry().clone(),
             self.config.poll_interval,
         );
+        // Issue #619: surface operator queue holds on dashboards.
+        #[cfg(feature = "db")]
+        let queue_pause_sampler = Some(spawn_queue_pause_sampler(
+            sampler_pools.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        ));
+        #[cfg(not(feature = "db"))]
+        let queue_pause_sampler: Option<tokio::task::JoinHandle<()>> = None;
         // Poison-pill reclaimer, pause auto-resumer, and timeout checker all run
         // per-shard so that orphaned tasks, over-long pauses, and timed-out
         // tasks/executions on every assigned shard are recovered (fix #3,
@@ -15038,6 +15131,7 @@ impl Worker {
             worker_slot_sampler,
             stranded_work_sampler,
             schedule_overdue_sampler,
+            queue_pause_sampler,
             slot_tuners,
             workflow_slot_target,
             activity_slot_target,
@@ -15259,6 +15353,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "schedule overdue sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.queue_pause_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "queue pause sampler failed during shutdown"
             );
         }
         for handle in monitors.slot_tuners {

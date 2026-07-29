@@ -2405,6 +2405,10 @@ async fn list_workers_ui(
     // state regardless of the active UI filter.
     let shard_results = load_workers_from_shards(&pool, None, stale_threshold).await;
 
+    // Issue #619: paused queues are the most likely explanation for idle
+    // workers alongside a full queue, so surface them on the fleet page.
+    let paused_queues = load_paused_queues_from_shards(&pool).await;
+
     let stats = compute_fleet_stats(&shard_results);
     let banner_state = determine_banner_state(&stats);
     let is_multi_shard = shard_results.len() > 1;
@@ -2473,6 +2477,7 @@ async fn list_workers_ui(
     Ok(render_workers_page(
         &stats,
         banner_state,
+        &paused_queues,
         &grouped,
         &shard_errors,
         is_multi_shard,
@@ -2513,6 +2518,114 @@ fn parse_worker_ui_filters(
         }
     };
     Ok((status_filter, stale_only))
+}
+
+/// A paused queue as rendered on the Workers page, merged across shards.
+///
+/// Issue #619: an operator queue pause is the single most likely explanation
+/// for "workers are idle but the queue is full", so it is surfaced on the
+/// fleet page an operator lands on during exactly that incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PausedQueueBannerRow {
+    pub queue_name: String,
+    pub reason: String,
+    pub paused_by: String,
+    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub held_task_count: i64,
+}
+
+/// Merge per-shard paused-queue rows into one banner row per queue name.
+///
+/// Held counts are summed across shards; the earliest `paused_at` wins (it is
+/// the one an operator reasons about — "how long has this been held?"), and its
+/// shard's `reason`/`paused_by` are shown with it so the provenance is coherent.
+/// Rows are sorted by queue name so the banner is stable across refreshes.
+pub(crate) fn merge_paused_queue_banner_rows(
+    per_shard: Vec<autumn_harvest::queue_pause::PausedQueue>,
+) -> Vec<PausedQueueBannerRow> {
+    let mut merged: std::collections::BTreeMap<String, PausedQueueBannerRow> =
+        std::collections::BTreeMap::new();
+    for row in per_shard {
+        merged
+            .entry(row.queue_name.clone())
+            .and_modify(|existing| {
+                existing.held_task_count += row.held_task_count;
+                if row.paused_at < existing.paused_at {
+                    existing.paused_at = row.paused_at;
+                    existing.reason.clone_from(&row.reason);
+                    existing.paused_by.clone_from(&row.paused_by);
+                }
+            })
+            .or_insert_with(|| PausedQueueBannerRow {
+                queue_name: row.queue_name,
+                reason: row.reason,
+                paused_by: row.paused_by,
+                paused_at: row.paused_at,
+                held_task_count: row.held_task_count,
+            });
+    }
+    merged.into_values().collect()
+}
+
+/// Render the paused-queues banner (issue #619). Empty when nothing is paused,
+/// so a healthy fleet page is byte-identical to before.
+pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Markup {
+    if rows.is_empty() {
+        return html! {};
+    }
+    let held_total: i64 = rows.iter().map(|r| r.held_task_count).sum();
+    html! {
+        div.banner.Degraded {
+            strong { "Queue dispatch paused" }
+            " — "
+            (rows.len()) " queue(s) held | " (held_total) " task(s) waiting"
+        }
+        table {
+            thead {
+                tr {
+                    th { "Queue" }
+                    th { "Held tasks" }
+                    th { "Paused at" }
+                    th { "By" }
+                    th { "Reason" }
+                }
+            }
+            tbody {
+                @for row in rows {
+                    tr {
+                        td { code { (row.queue_name) } }
+                        td { (row.held_task_count) }
+                        td { (row.paused_at.to_rfc3339()) }
+                        td { (row.paused_by) }
+                        td { (row.reason) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load paused queues across every shard for the Workers-page banner.
+///
+/// Best-effort: an unreachable shard is skipped rather than failing the page —
+/// the banner is a diagnostic aid, never a gate on rendering the fleet.
+async fn load_paused_queues_from_shards(pool: &crate::HarvestDbPool) -> Vec<PausedQueueBannerRow> {
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(_shard_id, shard_pool)| async move {
+            let mut conn = acquire_conn(shard_pool).await.ok()?;
+            autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+                .await
+                .ok()
+        })
+        .collect();
+    let per_shard: Vec<autumn_harvest::queue_pause::PausedQueue> = futures::future::join_all(futs)
+        .await
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    merge_paused_queue_banner_rows(per_shard)
 }
 
 async fn load_workers_from_shards(
@@ -3387,6 +3500,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
 fn render_workers_page(
     stats: &WorkerFleetStats,
     banner_state: Option<BannerState>,
+    paused_queues: &[PausedQueueBannerRow],
     grouped: &[(ShardId, Vec<WorkerRow>)],
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
@@ -3406,6 +3520,9 @@ fn render_workers_page(
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
+
+        // Paused-queue banner (issue #619) -- empty when nothing is held.
+        (render_paused_queues_banner(paused_queues))
 
         // Filters
         (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
@@ -8521,6 +8638,89 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #619: with nothing paused the banner must render nothing at all,
+    /// so a healthy Workers page is byte-identical to before the feature.
+    #[test]
+    fn paused_queues_banner_is_empty_when_nothing_is_paused() {
+        assert_eq!(render_paused_queues_banner(&[]).into_string(), "");
+    }
+
+    /// AC6: the banner surfaces the queue name, held count, actor and reason so
+    /// an operator can see WHO paused WHAT and WHY without leaving the page.
+    #[test]
+    fn paused_queues_banner_surfaces_reason_actor_and_held_count() {
+        let rows = vec![PausedQueueBannerRow {
+            queue_name: "email-workers".to_string(),
+            reason: "SMTP provider outage".to_string(),
+            paused_by: "alice".to_string(),
+            paused_at: chrono::Utc::now(),
+            held_task_count: 42,
+        }];
+        let html = render_paused_queues_banner(&rows).into_string();
+        assert!(html.contains("email-workers"), "queue name: {html}");
+        assert!(html.contains("SMTP provider outage"), "reason: {html}");
+        assert!(html.contains("alice"), "actor: {html}");
+        assert!(html.contains("42"), "held count: {html}");
+    }
+
+    /// AC7: pause is fleet-wide by default, so the same queue paused on two
+    /// shards is ONE banner row whose held count is the fleet-wide sum.
+    #[test]
+    fn paused_queue_rows_merge_across_shards_summing_held_counts() {
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let later = chrono::Utc::now();
+        let merged = merge_paused_queue_banner_rows(vec![
+            autumn_harvest::queue_pause::PausedQueue {
+                queue_name: "email-workers".to_string(),
+                reason: "later shard".to_string(),
+                paused_by: "bob".to_string(),
+                paused_at: later,
+                scope_shard_id: Some(1),
+                held_task_count: 3,
+            },
+            autumn_harvest::queue_pause::PausedQueue {
+                queue_name: "email-workers".to_string(),
+                reason: "earliest pause wins".to_string(),
+                paused_by: "alice".to_string(),
+                paused_at: earlier,
+                scope_shard_id: Some(0),
+                held_task_count: 4,
+            },
+        ]);
+        assert_eq!(merged.len(), 1, "one row per queue name");
+        assert_eq!(
+            merged[0].held_task_count, 7,
+            "held counts sum across shards"
+        );
+        assert_eq!(
+            merged[0].paused_at, earlier,
+            "the earliest pause instant is the one an operator reasons about"
+        );
+        assert_eq!(
+            merged[0].reason, "earliest pause wins",
+            "provenance travels with the earliest pause, not a mix"
+        );
+        assert_eq!(merged[0].paused_by, "alice");
+    }
+
+    /// Merged rows are sorted by queue name so the banner is stable across
+    /// refreshes (shard iteration order must not shuffle it).
+    #[test]
+    fn paused_queue_rows_are_sorted_by_queue_name() {
+        let now = chrono::Utc::now();
+        let mk = |name: &str| autumn_harvest::queue_pause::PausedQueue {
+            queue_name: name.to_string(),
+            reason: "r".to_string(),
+            paused_by: "a".to_string(),
+            paused_at: now,
+            scope_shard_id: None,
+            held_task_count: 1,
+        };
+        let merged = merge_paused_queue_banner_rows(vec![mk("zeta"), mk("alpha"), mk("mid")]);
+        let names: Vec<&str> = merged.iter().map(|r| r.queue_name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
 
     #[test]
     fn url_encode_preserves_unreserved_and_encodes_space() {

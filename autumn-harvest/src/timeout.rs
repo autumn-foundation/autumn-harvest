@@ -130,12 +130,25 @@ pub const fn start_to_close_timeout_query() -> &'static str {
 /// ([`crate::execution::shift_schedule_to_close_on_resume_query`]) so the
 /// row does not get instantly killed post-resume with a schedule-to-start
 /// budget the pause consumed.
+///
+/// Queue-pause carve-out (issue #619): a task held by a **queue** pause is
+/// likewise not a genuine worker-capacity signal — it is unclaimable because an
+/// operator deliberately froze its queue, not because the fleet is short of
+/// capacity. Enforcing schedule-to-start against it would fail exactly the work
+/// the hold exists to protect (AC3/AC4). Unlike the frozen-row carve-out above,
+/// this exclusion is unconditional for the queue: every PENDING row on a paused
+/// queue is unclaimable by construction, whatever its `schedule_to_close_at`.
+/// The absolute `schedule_to_close` deadline keeps ticking during a queue pause
+/// (an explicit out-of-scope decision in #619), so that scanner is deliberately
+/// *not* given a matching carve-out.
 #[must_use]
 pub const fn schedule_to_start_timeout_query() -> &'static str {
     "SELECT t.* FROM harvest_task_queue t \
      WHERE t.state = 'PENDING' \
      AND t.schedule_to_start IS NOT NULL \
      AND t.scheduled_at + t.schedule_to_start < NOW() \
+     AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+         WHERE qp.queue_name = t.queue_name) \
      AND NOT (\
          t.schedule_to_close_at IS NOT NULL \
          AND t.schedule_to_close_at <= NOW() \
@@ -863,6 +876,33 @@ async fn enforce_activity_timeout(
             Utc::now(),
         ) {
             return Ok(false);
+        }
+        // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
+        // is a non-locking snapshot, so a queue pause committing after the
+        // scan would otherwise let this transaction schedule-to-start-fail the
+        // very task the hold was meant to protect.
+        //
+        // Unlike the execution-pause re-check above — which is authoritative
+        // because both sides lock the *execution row* — `pause_queue` shares no
+        // row with this transaction, so a bare re-read would not serialize: a
+        // pause could commit in the window between the read and this
+        // transaction's own commit. Both sides therefore take the same
+        // queue-scoped advisory lock first, so a pause is either fully visible
+        // here or blocked until this enforcement commits.
+        //
+        // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
+        // — the absolute `schedule_to_close` deadline keeps ticking during a
+        // queue pause, and heartbeat/start-to-close apply to RUNNING rows that
+        // a pause never touches — so the lock is taken only for that reason and
+        // never on the far more common in-flight timeout paths.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            crate::queue_pause::lock_queue_for_pause(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
+                return Ok(false);
+            }
         }
         let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
             Ok(Some(activity_id)) => activity_id,

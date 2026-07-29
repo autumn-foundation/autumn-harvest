@@ -162,7 +162,63 @@ Common reason codes and their fixes:
 
 ---
 
-### 5. `healthy`
+### 5. `queue_paused` — an operator is deliberately holding this queue
+
+**What it means**: An operator has paused dispatch on the whole task queue
+(issue #619), typically to ride out a downstream outage without failing,
+retrying, or dead-lettering the affected work. **This is not an incident.** Held
+tasks stay `PENDING`, already-`RUNNING` tasks finish naturally, and the
+`schedule_to_start` timer is suspended for the duration of the hold.
+
+> **A pause does not stop the `schedule_to_close` clock.** Only the *relative*
+> `schedule_to_start` timer is suspended. An activity declaring an **absolute**
+> `schedule_to_close` deadline (issue #378) will still be timed out during a
+> long hold — a pause is not an SLA extension. Before holding a queue for longer
+> than the shortest `schedule_to_close` on it, check what the affected
+> activities declare; that work will fail on its own deadline even though the
+> queue is frozen. Crediting held time back to `schedule_to_close` is explicitly
+> out of scope for issue #619.
+
+It is listed **first** in the eligibility explainer's reason set precisely
+because it is the operator's own deliberate action — check it before chasing a
+capacity or routing cause.
+
+**How to verify**:
+
+```bash
+harvest queue list-paused
+# or: curl -s .../api/harvest/admin/queues/paused | jq
+```
+
+The response gives, per held queue: `reason` (why), `paused_by` (who),
+`paused_at` (since when), and `held_task_count` (how much work is waiting). The
+same information appears as a banner on the Vantage **Workers** page, and the
+`harvest.queue.paused` gauge reads `1` for held queues.
+
+**This is the single most common cause of a false capacity page.** A rising
+`harvest_queue_depth` while `harvest_queue_paused` is `1` is the hold working as
+designed — not a shortage of workers.
+
+**Corrective Actions**:
+- Confirm the downstream named in `reason` has actually recovered.
+- Release the hold:
+
+  ```bash
+  harvest queue resume email-workers
+  ```
+
+  Held tasks become claimable immediately. The time they spent held is credited
+  back to their `scheduled_at`, so a thaw does **not** retroactively
+  schedule-to-start-time-out the backlog, and the schedule-to-start histogram
+  does not spike on release.
+- If the outage is still ongoing, leave the hold in place. The
+  `harvest_queue_paused_too_long` alert exists to make sure a forgotten freeze
+  eventually gets attention — see
+  [that runbook section](harvest-alerts.md#harvest_queue_paused_too_long).
+
+---
+
+### 6. `healthy`
 
 **What it means**: Eligible workers with available capacity are connected and polling.
 

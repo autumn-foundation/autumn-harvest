@@ -423,6 +423,12 @@ enum Commands {
         #[command(subcommand)]
         command: RetentionCommand,
     },
+    /// Hold or release dispatch on a named task queue (issue #619).
+    #[command(alias = "queues")]
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
     /// Inspect cluster-wide per-activity concurrency caps.
     Concurrency {
         #[command(subcommand)]
@@ -1604,6 +1610,41 @@ enum ConcurrencyCommand {
     Status,
 }
 
+/// Task-queue pause/resume (issue #619): hold dispatch on a whole queue while a
+/// downstream dependency is down, then thaw it.
+///
+/// A pause never fails, retries, or dead-letters work — held tasks stay
+/// `PENDING` and become claimable again the instant the queue is resumed, with
+/// the time they spent held credited back so the thaw does not retroactively
+/// schedule-to-start-time-out the backlog.
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Hold dispatch on a task queue.
+    Pause {
+        /// Task queue name.
+        queue_name: String,
+        /// Why the queue is being held (recorded on the pause row, surfaced by
+        /// `harvest queue list-paused` and the Vantage Workers page).
+        #[arg(long)]
+        reason: String,
+        /// Restrict the hold to one shard. Omit for a fleet-wide pause (the
+        /// default).
+        #[arg(long)]
+        shard_id: Option<i32>,
+    },
+    /// Release a held task queue; held tasks become immediately claimable.
+    Resume {
+        /// Task queue name.
+        queue_name: String,
+        /// Restrict the release to one shard. Omit for fleet-wide (the default).
+        #[arg(long)]
+        shard_id: Option<i32>,
+    },
+    /// List every currently-paused queue with its reason and held-task count.
+    #[command(alias = "list", alias = "status")]
+    ListPaused,
+}
+
 /// Per-execution legal hold (issue #747): exempt an execution's history from
 /// retention deletion and PII erasure until released or auto-expired.
 #[derive(Debug, Subcommand)]
@@ -2002,6 +2043,7 @@ impl Cli {
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::CompletionDelivery { command } => Ok(completion_delivery_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
+            Commands::Queue { command } => Ok(queue_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
             Commands::Batch { command } => batch_request(command),
@@ -5696,6 +5738,44 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
             ),
             None,
         ),
+    }
+}
+
+/// Map `harvest queue …` onto the three management routes (issue #619).
+///
+/// `--shard-id` is omitted from the body entirely when unset, so the default is
+/// a fleet-wide hold rather than a shard-scoped one.
+fn queue_request(command: &QueueCommand) -> ApiRequest {
+    match command {
+        QueueCommand::Pause {
+            queue_name,
+            reason,
+            shard_id,
+        } => {
+            let mut body = Map::new();
+            body.insert("reason".to_string(), Value::String(reason.clone()));
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), Value::from(*shard));
+            }
+            ApiRequest::post(
+                format!("/admin/queues/{}/pause", path_segment(queue_name)),
+                Some(Value::Object(body)),
+            )
+        }
+        QueueCommand::Resume {
+            queue_name,
+            shard_id,
+        } => {
+            let mut body = Map::new();
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), Value::from(*shard));
+            }
+            ApiRequest::post(
+                format!("/admin/queues/{}/resume", path_segment(queue_name)),
+                Some(Value::Object(body)),
+            )
+        }
+        QueueCommand::ListPaused => ApiRequest::get("/admin/queues/paused"),
     }
 }
 

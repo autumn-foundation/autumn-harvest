@@ -39,17 +39,17 @@ use autumn_harvest::audit::{
     OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN,
     OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY,
     OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE,
-    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
-    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
-    deny_readonly_mutation,
+    OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
+    OP_QUEUE_RESUME, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
+    OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET,
+    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED,
+    STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RETENTION, TARGET_SCHEDULE,
+    TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -4549,6 +4549,18 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(force_close_circuit).route_layer(require_admin.clone()),
         )
         .route("/admin/queues/scaling", get(queues_scaling_signal))
+        // Task-queue pause/resume (issue #619): hold dispatch on a named queue
+        // during a scoped downstream outage. GET is read-only; the two
+        // mutations are admin-gated (they change what the whole fleet claims).
+        .route("/admin/queues/paused", get(list_paused_queues_handler))
+        .route(
+            "/admin/queues/{queue_name}/pause",
+            post(pause_queue_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/queues/{queue_name}/resume",
+            post(resume_queue_handler).route_layer(require_admin.clone()),
+        )
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
         .route("/admin/external-handoffs", get(list_external_handoffs))
@@ -5447,6 +5459,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/circuits/{activity_name}/force-open"),
         ("POST", "/admin/circuits/{activity_name}/force-close"),
         ("GET", "/admin/queues/scaling"),
+        // ── task-queue pause/resume (issue #619) ─────────────────────────
+        ("GET", "/admin/queues/paused"),
+        ("POST", "/admin/queues/{queue_name}/pause"),
+        ("POST", "/admin/queues/{queue_name}/resume"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/external-handoffs"),
@@ -5898,6 +5914,17 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&[])),
+        // ── task-queue pause/resume (issue #619) ─────────────────────────
+        (
+            "POST",
+            "/admin/queues/{queue_name}/pause",
+            Some(&["reason", "shard_id"]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/resume",
+            Some(&["shard_id"]),
+        ),
         // ── scoped API tokens (issue #942) ────────────────────────────────────
         (
             "POST",
@@ -6704,6 +6731,43 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("GET", "/admin/queues/scaling", None),
+        // ── task-queue pause/resume (issue #619) ─────────────────────────
+        (
+            "GET",
+            "/admin/queues/paused",
+            Some(&["paused_queues", "status", "unavailable_shards"]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/pause",
+            Some(&[
+                "ok",
+                "status",
+                "queue_name",
+                "newly_paused",
+                "reason",
+                "paused_by",
+                "paused_at",
+                "scope_shard_id",
+                "held_task_count",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/resume",
+            Some(&[
+                "ok",
+                "status",
+                "queue_name",
+                "newly_resumed",
+                "released_task_count",
+                "paused_duration_secs",
+                "released_reason",
+                "released_paused_by",
+                "partial_failures",
+            ]),
+        ),
         ("GET", "/admin/metrics", None),
         (
             "GET",
@@ -27427,6 +27491,733 @@ async fn queues_scaling_signal(
     Ok(Json(signals).into_response())
 }
 
+// ── Task-queue pause / resume (issue #619) ───────────────────────────────────
+
+/// Body of `POST /admin/queues/{queue_name}/pause`.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct PauseQueueRequest {
+    /// Human-readable reason for the hold, surfaced on the read API and in the
+    /// Vantage UI. Required — an unexplained hold is an incident-response
+    /// hazard for the next operator.
+    pub reason: String,
+    /// `None` (default) = fleet-wide: the hold is applied on every shard.
+    /// `Some(n)` scopes it to shard `n` only.
+    #[serde(default)]
+    pub shard_id: Option<i32>,
+}
+
+/// Body of `POST /admin/queues/{queue_name}/resume`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct ResumeQueueRequest {
+    /// `None` (default) = release the hold on every shard. `Some(n)` releases
+    /// only shard `n`.
+    #[serde(default)]
+    pub shard_id: Option<i32>,
+}
+
+/// The shards a queue pause/resume will touch, and any shard the router knows
+/// about that this process has no pool for.
+type QueuePauseTargets = (Vec<(i32, ::autumn_harvest::worker::DbPool)>, Vec<i32>);
+
+/// Resolve the shard pools a pause/resume should touch, plus any shard the
+/// router knows about that this process has no pool for.
+///
+/// `None` → every shard (fleet-wide, the default). `Some(n)` → shard `n` only.
+///
+/// The expected-shard set comes from [`shard_fanout::expected_shards`], not
+/// from the local pool map, for the reason that helper documents: a shard the
+/// router knows but this process has no pool for yet (mid a shard-add rollout)
+/// must be *reported*, never silently omitted. Omitting it would let a
+/// fleet-wide pause return an unqualified success while that shard kept
+/// dispatching into the outage — with no diagnostic at all, which is strictly
+/// worse than the partial-failure signal.
+///
+/// A poolless-but-known shard named explicitly is a `503`, not a `400`: the
+/// shard id is real, this process just cannot reach it, and "unknown
+/// `shard_id`" would point the operator at a typo instead of the actual
+/// condition.
+fn queue_pause_target_pools(
+    api_state: &HarvestApiState,
+    shard_id: Option<i32>,
+) -> Result<QueuePauseTargets, AutumnError> {
+    if api_state.storage_pool().is_err() {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest storage pool is not configured",
+        ));
+    }
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+    match shard_id {
+        None => {
+            let mut targets = Vec::new();
+            let mut unreachable = Vec::new();
+            for shard in expected {
+                if let Some(pool) = pools.get(&shard) {
+                    targets.push((shard, pool.clone()));
+                } else {
+                    unreachable.push(shard);
+                }
+            }
+            Ok((targets, unreachable))
+        }
+        Some(target) => pools.get(&target).map_or_else(
+            || {
+                if expected.contains(&target) {
+                    Err(AutumnError::service_unavailable_msg(format!(
+                        "shard {target} is known to the router but has no pool in this process"
+                    )))
+                } else {
+                    Err(AutumnError::bad_request_msg(format!(
+                        "unknown shard_id {target}"
+                    )))
+                }
+            },
+            |pool| Ok((vec![(target, pool.clone())], Vec::new())),
+        ),
+    }
+}
+
+/// A hold that did not reach every target shard is NOT in effect fleet-wide:
+/// the shards it missed keep dispatching into exactly the outage the operator
+/// is trying to ride out. Reporting that as `200 {"ok": true}` (with the detail
+/// buried in a string field) is the one way this feature can silently fail an
+/// incident, so a partial application is `207` with `ok: false` and the same
+/// `status` / `partial_failures` vocabulary the read side already uses.
+/// Re-issuing is safe — both operations are idempotent.
+const fn queue_pause_partial_status(partial: Option<&str>) -> (StatusCode, bool, &'static str) {
+    if partial.is_some() {
+        (StatusCode::MULTI_STATUS, false, "partial")
+    } else {
+        (StatusCode::OK, true, "complete")
+    }
+}
+
+/// Fold a partial-failure summary into a pause/resume response payload.
+fn queue_pause_attach_partial(payload: &mut Value, partial: Option<String>) {
+    if let Some(partial) = partial
+        && let Some(map) = payload.as_object_mut()
+    {
+        map.insert("partial_failures".to_string(), Value::String(partial));
+    }
+}
+
+/// The `(actor, source, request_id)` triple every pause/resume audit row needs.
+type QueuePauseAuditCtx = (String, String, Option<String>);
+
+/// Audit a rejected pause/resume and turn the error into a response.
+///
+/// A rejected hold attempt on a fleet-wide dispatch kill switch is exactly what
+/// an incident review needs to see, so every rejection path is audited
+/// (symmetric with `fail_activity_now`'s malformed-id handling).
+async fn reject_queue_pause(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    operation: &'static str,
+    route: &'static str,
+    queue_name: &str,
+    status_error: AutumnError,
+    summary: &str,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit;
+    write_queue_pause_rejection_audit(
+        api_state,
+        actor,
+        source,
+        request_id.as_deref(),
+        operation,
+        route,
+        queue_name,
+        summary,
+    )
+    .await;
+    status_error.into_response()
+}
+
+/// Validate the queue name and resolve the target shards for a pause/resume.
+///
+/// On rejection the audit row is written here and a ready-to-send response is
+/// returned in `Err`, so both handlers share one rejection contract. The
+/// returned `Vec<String>` seeds the per-shard failure list with any shard the
+/// router knows about but this process cannot reach.
+async fn prepare_queue_pause_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    queue_name: &str,
+    shard_id: Option<i32>,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<
+    (
+        String,
+        Vec<(i32, ::autumn_harvest::worker::DbPool)>,
+        Vec<String>,
+    ),
+    axum::response::Response,
+> {
+    let canonical_queue = match ::autumn_harvest::queue_pause::validate_queue_name(queue_name) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            let summary = error.to_string();
+            return Err(reject_queue_pause(
+                api_state,
+                audit,
+                operation,
+                route,
+                queue_name,
+                map_error(error),
+                &summary,
+            )
+            .await);
+        }
+    };
+    let (targets, unreachable) = match queue_pause_target_pools(api_state, shard_id) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let summary = format!("{error:?}");
+            return Err(reject_queue_pause(
+                api_state, audit, operation, route, queue_name, error, &summary,
+            )
+            .await);
+        }
+    };
+    let failures = unreachable
+        .iter()
+        .map(|shard| format!("shard {shard}: known to the router but has no pool in this process"))
+        .collect();
+    Ok((canonical_queue, targets, failures))
+}
+
+/// Parse and validate a pause request body.
+///
+/// A hold with no stated reason is an incident-response hazard for the next
+/// operator, so an empty `reason` is rejected here rather than stored. On
+/// rejection the audit row is written and a ready-to-send response returned in
+/// `Err`, matching [`prepare_queue_pause_targets`]'s contract.
+async fn parse_pause_request(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    queue_name: &str,
+    body: &axum::body::Bytes,
+    route: &'static str,
+) -> Result<PauseQueueRequest, axum::response::Response> {
+    let request: PauseQueueRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => {
+            let summary = format!("invalid request body: {error}");
+            return Err(reject_queue_pause(
+                api_state,
+                audit,
+                OP_QUEUE_PAUSE,
+                route,
+                queue_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await);
+        }
+    };
+    if request.reason.trim().is_empty() {
+        let summary = "a queue pause requires a non-empty reason";
+        return Err(reject_queue_pause(
+            api_state,
+            audit,
+            OP_QUEUE_PAUSE,
+            route,
+            queue_name,
+            AutumnError::bad_request_msg(summary),
+            summary,
+        )
+        .await);
+    }
+    Ok(request)
+}
+
+/// The fleet-wide roll-up of a pause applied shard by shard.
+struct PauseApplication {
+    /// True when at least one shard transitioned from dispatching to held.
+    newly_paused: bool,
+    /// Held tasks summed across every shard the hold reached.
+    held_task_count: i64,
+    /// The first successful shard's row, echoed back as the canonical
+    /// provenance. `None` when every target shard failed.
+    effective: Option<::autumn_harvest::queue_pause::PauseOutcome>,
+}
+
+/// Apply the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting — one unreachable shard must not stop the
+/// others from being held.
+async fn apply_pause_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_queue: &str,
+    reason: &str,
+    actor: &str,
+    scope_shard_id: Option<i32>,
+    failures: &mut Vec<String>,
+) -> PauseApplication {
+    let mut applied = PauseApplication {
+        newly_paused: false,
+        held_task_count: 0,
+        effective: None,
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::queue_pause::pause_queue(
+            &mut conn,
+            canonical_queue,
+            reason,
+            actor,
+            scope_shard_id,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                applied.newly_paused |= outcome.newly_paused;
+                applied.held_task_count += outcome.held_task_count;
+                if applied.effective.is_none() {
+                    applied.effective = Some(outcome);
+                }
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// The fleet-wide roll-up of a resume applied shard by shard.
+struct ResumeApplication {
+    /// True when at least one shard actually released a hold.
+    newly_resumed: bool,
+    /// Tasks credited their held time back, summed across shards.
+    released_task_count: i64,
+    /// The longest hold released, in seconds.
+    paused_duration_secs: i64,
+    /// Provenance of the released hold, echoed back before the row is gone.
+    released_reason: Option<String>,
+    /// Operator who placed the released hold.
+    released_paused_by: Option<String>,
+    /// True when at least one shard completed without error.
+    any_ok: bool,
+}
+
+/// Release the hold on every target shard, appending any per-shard error to
+/// `failures` rather than aborting.
+async fn apply_resume_across_shards(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    canonical_queue: &str,
+    actor: &str,
+    failures: &mut Vec<String>,
+) -> ResumeApplication {
+    let mut applied = ResumeApplication {
+        newly_resumed: false,
+        released_task_count: 0,
+        paused_duration_secs: 0,
+        released_reason: None,
+        released_paused_by: None,
+        any_ok: false,
+    };
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                failures.push(format!("shard {shard_id}: {error}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::queue_pause::resume_queue(&mut conn, canonical_queue, actor).await {
+            Ok(outcome) => {
+                applied.any_ok = true;
+                applied.newly_resumed |= outcome.newly_resumed;
+                applied.released_task_count += outcome.released_task_count;
+                applied.paused_duration_secs = applied
+                    .paused_duration_secs
+                    .max(outcome.paused_duration_secs);
+                // The pause row is deleted by the resume, so this is the last
+                // moment the *why* is recoverable — echo it back so an operator
+                // closing out an incident sees which hold they released.
+                if applied.released_reason.is_none() {
+                    applied.released_reason = outcome.released_reason;
+                    applied.released_paused_by = outcome.released_paused_by;
+                }
+            }
+            Err(error) => failures.push(format!("shard {shard_id}: {error}")),
+        }
+    }
+    applied
+}
+
+/// Best-effort audit row for a queue pause/resume.
+///
+/// Written on the first reachable target shard — the operation is a fleet-wide
+/// control, so one row per request (not per shard) is the honest record.
+#[allow(clippy::too_many_arguments)]
+async fn write_queue_pause_audit(
+    targets: &[(i32, ::autumn_harvest::worker::DbPool)],
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    queue_name: &str,
+    shard_id: Option<i32>,
+    status: &str,
+    error_summary: Option<&str>,
+) {
+    for (_, pool) in targets {
+        if let Ok(mut conn) = acquire_conn(pool).await {
+            let ar = NewAuditRecord {
+                actor,
+                operation,
+                target_type: TARGET_QUEUE,
+                target_id: Some(queue_name),
+                route_or_command: route,
+                request_id,
+                idempotency_key: None,
+                status,
+                error_summary,
+                shard_id,
+                source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return;
+        }
+    }
+}
+
+/// Best-effort `STATUS_FAILED` audit row for a *rejected* pause/resume.
+///
+/// A rejection happens before any shard target is resolved, so it cannot reuse
+/// [`write_queue_pause_audit`]'s target list — it writes to the first shard
+/// pool it can reach. Rejected attempts on a fleet-wide dispatch kill switch
+/// are exactly what an incident review needs, so a malformed body, a bad queue
+/// name, a missing reason, or an unroutable shard all leave a trail (symmetric
+/// with `fail_activity_now`'s malformed-id handling).
+///
+/// `queue_name` is the raw path segment, deliberately un-canonicalised: on the
+/// rejection path it may be the very thing that was invalid.
+#[allow(clippy::too_many_arguments)]
+async fn write_queue_pause_rejection_audit(
+    api_state: &HarvestApiState,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &str,
+    route: &'static str,
+    queue_name: &str,
+    error_summary: &str,
+) {
+    let pools: Vec<_> = shard_fanout::pools_by_shard(api_state)
+        .into_iter()
+        .collect();
+    write_queue_pause_audit(
+        &pools,
+        actor,
+        source,
+        request_id,
+        operation,
+        route,
+        queue_name,
+        None,
+        STATUS_FAILED,
+        Some(error_summary),
+    )
+    .await;
+}
+
+/// `POST /admin/queues/{queue_name}/pause` — hold dispatch on a task queue.
+///
+/// Held tasks stay `PENDING`: a pause never fails, retries, or dead-letters
+/// work, and never aborts an already-`RUNNING` task (issue #619 AC2/AC3).
+/// Idempotent — re-pausing an already-paused queue is a `200` no-op that
+/// preserves the original reason and operator.
+async fn pause_queue_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /admin/queues/{queue_name}/pause";
+    let audit = audit_context(&headers, &api_state);
+
+    let request = match parse_pause_request(&api_state, &audit, &queue_name, &body, ROUTE).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    // Bound the durable operator reason at the API boundary so the core never
+    // sees an arbitrarily long string — it is stored, re-serialized on every
+    // read poll, and rendered into the Vantage Workers page (the very page an
+    // operator lands on during a queue-pause incident). Same cap and rationale
+    // as every other operator reason on this router.
+    let reason = truncate_operator_reason(&request.reason);
+
+    let (canonical_queue, targets, mut failures) = match prepare_queue_pause_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        request.shard_id,
+        OP_QUEUE_PAUSE,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let PauseApplication {
+        newly_paused,
+        held_task_count,
+        effective,
+    } = apply_pause_across_shards(
+        &targets,
+        &canonical_queue,
+        &reason,
+        &actor,
+        request.shard_id,
+        &mut failures,
+    )
+    .await;
+
+    let Some(effective) = effective else {
+        // Every target shard failed: report it rather than claiming a hold that
+        // is not in effect anywhere.
+        let summary = failures.join("; ");
+        write_queue_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_QUEUE_PAUSE,
+            ROUTE,
+            &canonical_queue,
+            request.shard_id,
+            STATUS_FAILED,
+            Some(summary.as_str()),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("queue pause failed: {summary}"))
+            .into_response();
+    };
+
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_QUEUE_PAUSE,
+        ROUTE,
+        &canonical_queue,
+        request.shard_id,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        partial.as_deref(),
+    )
+    .await;
+
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "queue_name": canonical_queue,
+        "newly_paused": newly_paused,
+        "reason": effective.reason,
+        "paused_by": effective.paused_by,
+        "paused_at": effective.paused_at,
+        "scope_shard_id": request.shard_id,
+        "held_task_count": held_task_count,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// `POST /admin/queues/{queue_name}/resume` — release the hold.
+///
+/// Held tasks become immediately claimable again, and the time they spent held
+/// is credited back to `scheduled_at` so the thaw does not retroactively
+/// schedule-to-start-time-out the whole backlog (AC4/AC5). Idempotent —
+/// resuming a queue that is not paused is a `200` no-op.
+async fn resume_queue_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /admin/queues/{queue_name}/resume";
+    let audit = audit_context(&headers, &api_state);
+
+    // The body is optional: a bare POST resumes fleet-wide.
+    let request: ResumeQueueRequest = if body.is_empty() {
+        ResumeQueueRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                let summary = format!("invalid request body: {error}");
+                return reject_queue_pause(
+                    &api_state,
+                    &audit,
+                    OP_QUEUE_RESUME,
+                    ROUTE,
+                    &queue_name,
+                    AutumnError::bad_request_msg(summary.clone()),
+                    &summary,
+                )
+                .await;
+            }
+        }
+    };
+
+    let (canonical_queue, targets, mut failures) = match prepare_queue_pause_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        request.shard_id,
+        OP_QUEUE_RESUME,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let ResumeApplication {
+        newly_resumed,
+        released_task_count,
+        paused_duration_secs,
+        released_reason,
+        released_paused_by,
+        any_ok,
+    } = apply_resume_across_shards(&targets, &canonical_queue, &actor, &mut failures).await;
+
+    if !any_ok {
+        let summary = failures.join("; ");
+        write_queue_pause_audit(
+            &targets,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_QUEUE_RESUME,
+            ROUTE,
+            &canonical_queue,
+            request.shard_id,
+            STATUS_FAILED,
+            Some(summary.as_str()),
+        )
+        .await;
+        return AutumnError::internal_server_error_msg(format!("queue resume failed: {summary}"))
+            .into_response();
+    }
+
+    // A resume that did not reach every target shard leaves work still held on
+    // the shards it missed. That is the safe direction, but reporting it as an
+    // unqualified success would leave an operator believing the thaw is
+    // complete while a backlog silently sits frozen, so it is surfaced with the
+    // same 207 / `status` vocabulary as a partial pause.
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_QUEUE_RESUME,
+        ROUTE,
+        &canonical_queue,
+        request.shard_id,
+        if partial.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        partial.as_deref(),
+    )
+    .await;
+
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "queue_name": canonical_queue,
+        "newly_resumed": newly_resumed,
+        "released_task_count": released_task_count,
+        "paused_duration_secs": paused_duration_secs,
+        "released_reason": released_reason,
+        "released_paused_by": released_paused_by,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// `GET /admin/queues/paused` — every currently-paused queue (AC7).
+///
+/// Cross-shard: a shard-scoped pause lists with its `scope_shard_id`, and an
+/// unreachable shard degrades the response to `partial` rather than failing the
+/// whole read.
+async fn list_paused_queues_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Value>, AutumnError> {
+    let observations = observe_shards(&api_state, |shard_id, mut conn| async move {
+        ::autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (shard_id, row))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    let collected = shard_fanout::collect_fanout_rows(observations);
+
+    // A fleet-wide pause writes one row per shard; merge them into one entry so
+    // the operator sees "the payments queue is held", not N copies of it.
+    let mut merged: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (shard_id, row) in collected.rows {
+        let entry = merged
+            .entry(row.queue_name.clone())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "queue_name": row.queue_name,
+                    "reason": row.reason,
+                    "paused_by": row.paused_by,
+                    "paused_at": row.paused_at,
+                    "scope_shard_id": row.scope_shard_id,
+                    "held_task_count": 0,
+                    "shards": Vec::<i32>::new(),
+                })
+            })
+            .as_object_mut()
+            .expect("json object literal");
+        let held = entry
+            .get("held_task_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            + row.held_task_count;
+        entry.insert("held_task_count".to_string(), Value::from(held));
+        if let Some(shards) = entry.get_mut("shards").and_then(Value::as_array_mut) {
+            shards.push(Value::from(shard_id));
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "paused_queues": merged.into_values().collect::<Vec<_>>(),
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
 async fn prometheus_metrics(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<axum::response::Response, AutumnError> {
@@ -33440,6 +34231,10 @@ pub struct TaskEligibilityResponse {
 /// breaker (`has_cb`) enforces rate limiting at dispatch, not at claim, so a
 /// stale `rate_limit_exhausted` reason is never surfaced for it — its
 /// impediment is the circuit reason instead.
+///
+/// Queue pause (issue #619): a held queue is reported as `queue_paused`. It is
+/// listed first because it is the *operator's own deliberate action* — the one
+/// impediment a triaging operator should see before anything else.
 fn task_intrinsic_impediment_reasons(
     activity_name: Option<&str>,
     rate_limit_key: Option<&str>,
@@ -33447,8 +34242,17 @@ fn task_intrinsic_impediment_reasons(
     saturated_rate_limits: &std::collections::HashSet<String>,
     concurrency_saturated: bool,
     cb_phase: &std::collections::HashMap<String, &'static str>,
+    queue_paused: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+
+    // Issue #619: an operator queue pause blocks every worker equally, so
+    // without this the explainer would report an EMPTY reason set for a held
+    // task — a false "no impediment" during exactly the idle-worker triage
+    // this endpoint exists for.
+    if queue_paused {
+        reasons.push("queue_paused".to_string());
+    }
 
     if concurrency_saturated {
         reasons.push("concurrency_saturated".to_string());
@@ -33735,6 +34539,16 @@ async fn evaluate_eligibility_for_shard(
         }
     }
 
+    // Issue #619: a queue held by an operator pause is unclaimable for a reason
+    // that has nothing to do with worker capacity, so surface it explicitly
+    // rather than reporting an empty (falsely "unimpeded") reason set.
+    let paused_queues: std::collections::HashSet<String> =
+        autumn_harvest::queue_pause::paused_queue_names(&mut conn)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
     let mut eligible_workers = Vec::new();
     let mut ineligible_workers = Vec::new();
 
@@ -33858,6 +34672,7 @@ async fn evaluate_eligibility_for_shard(
                     &saturated_rate_limits,
                     concurrency_saturated,
                     &cb_phase,
+                    paused_queues.contains(&t.queue_name),
                 ));
 
                 let parsed_reqs = if t.task_type == "activity" {
@@ -34213,6 +35028,36 @@ mod eligibility_reason_tests {
 
     // AC1: a task deferred solely because its rate-limit bucket is exhausted
     // reports `rate_limit_exhausted` — never `concurrency_saturated`.
+    /// Issue #619: a queue held by an operator pause must surface as
+    /// `queue_paused`, listed first, and must not suppress the other
+    /// task-intrinsic impediments that also apply.
+    #[test]
+    fn queue_paused_is_reported_first_and_composes_with_other_reasons() {
+        let saturated = std::collections::HashSet::new();
+        let cb_phase = std::collections::HashMap::new();
+
+        let only_pause = task_intrinsic_impediment_reasons(
+            None, None, false, &saturated, false, &cb_phase, true,
+        );
+        assert_eq!(only_pause, vec!["queue_paused".to_string()]);
+
+        let with_concurrency =
+            task_intrinsic_impediment_reasons(None, None, false, &saturated, true, &cb_phase, true);
+        assert_eq!(
+            with_concurrency,
+            vec![
+                "queue_paused".to_string(),
+                "concurrency_saturated".to_string()
+            ],
+            "a pause is listed first but never hides a co-occurring impediment"
+        );
+
+        let unpaused = task_intrinsic_impediment_reasons(
+            None, None, false, &saturated, false, &cb_phase, false,
+        );
+        assert!(unpaused.is_empty(), "an unpaused queue contributes nothing");
+    }
+
     #[test]
     fn rate_limit_only_reports_rate_limit_exhausted() {
         let reasons = task_intrinsic_impediment_reasons(
@@ -34222,6 +35067,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &HashMap::new(),
+            false,
         );
         assert_eq!(reasons, vec!["rate_limit_exhausted".to_string()]);
     }
@@ -34237,6 +35083,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &HashMap::new(),
+            false,
         );
         assert_eq!(reasons, vec!["concurrency_saturated".to_string()]);
     }
@@ -34252,6 +35099,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "open")]),
+            false,
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -34270,6 +35118,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "half_open")]),
+            false,
         );
         assert!(
             reasons.contains(&"circuit_half_open".to_string()),
@@ -34287,6 +35136,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &phases(&[("charge_card", "closed")]),
+            false,
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -34302,6 +35152,7 @@ mod eligibility_reason_tests {
             &saturated(&["rl-key"]),
             false,
             &phases(&[("charge_card", "open")]),
+            false,
         );
         assert!(
             reasons.contains(&"circuit_open".to_string()),
@@ -34323,6 +35174,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             true,
             &phases(&[("charge_card", "open")]),
+            false,
         );
         assert!(
             reasons.contains(&"concurrency_saturated".to_string()),
@@ -34344,6 +35196,7 @@ mod eligibility_reason_tests {
             &HashSet::new(),
             false,
             &HashMap::new(),
+            false,
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
@@ -34362,6 +35215,7 @@ mod eligibility_reason_tests {
             &saturated(&["k"]),
             false,
             &phases(&[("a", "closed")]),
+            false,
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }

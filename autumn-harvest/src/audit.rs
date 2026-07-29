@@ -158,6 +158,11 @@ pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
 /// new route exists.
 pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
 /// Audit operation: minted a scoped API token (issue #942).
+/// Operation: an operator paused dispatch on a task queue (issue #619).
+pub const OP_QUEUE_PAUSE: &str = "queue.pause";
+/// Operation: an operator resumed dispatch on a task queue (issue #619).
+pub const OP_QUEUE_RESUME: &str = "queue.resume";
+
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";
@@ -185,6 +190,8 @@ pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
 /// Audit target type for scoped API token operations (issue #942).
 pub const TARGET_TOKEN: &str = "token";
+/// Target type: a named task queue (issue #619).
+pub const TARGET_QUEUE: &str = "queue";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -592,6 +599,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/circuits", RouteClass::ReadOnly),
     ("GET /admin/circuits/{activity_name}", RouteClass::ReadOnly),
     ("GET /admin/queues/scaling", RouteClass::ReadOnly),
+    // Task-queue pause/resume (issue #619): the hold control for a scoped
+    // downstream outage. GET is read-only; the two mutations are admin-gated.
+    ("GET /admin/queues/paused", RouteClass::ReadOnly),
+    (
+        "POST /admin/queues/{queue_name}/pause",
+        RouteClass::Mutating,
+    ),
+    (
+        "POST /admin/queues/{queue_name}/resume",
+        RouteClass::Mutating,
+    ),
     ("GET /admin/metrics", RouteClass::ReadOnly),
     ("GET /admin/completion-triggers", RouteClass::ReadOnly),
     ("GET /admin/schedules/{id}", RouteClass::ReadOnly),
@@ -716,6 +734,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_CIRCUIT_FORCE_OPEN,
     OP_CIRCUIT_FORCE_CLOSE,
     // Scoped API tokens (issue #942)
+    // Task-queue pause/resume (issue #619)
+    OP_QUEUE_PAUSE,
+    OP_QUEUE_RESUME,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
 ];
@@ -816,6 +837,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/circuits",
     "GET /admin/circuits/{activity_name}",
     "GET /admin/queues/scaling",
+    // Paused-queue list is read-only.
+    "GET /admin/queues/paused",
     "GET /admin/metrics",
     "GET /admin/completion-triggers",
     "GET /admin/schedules/{id}",
@@ -1093,6 +1116,15 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/circuits", None),
     ("GET /admin/circuits/{activity_name}", None),
     ("GET /admin/queues/scaling", None),
+    ("GET /admin/queues/paused", None),
+    (
+        "POST /admin/queues/{queue_name}/pause",
+        Some(OP_QUEUE_PAUSE),
+    ),
+    (
+        "POST /admin/queues/{queue_name}/resume",
+        Some(OP_QUEUE_RESUME),
+    ),
     ("GET /admin/metrics", None),
     ("GET /admin/completion-triggers", None),
     ("GET /admin/schedules/{id}", None),

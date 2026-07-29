@@ -6625,6 +6625,157 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queues/paused",
+      "category": "admin",
+      "read_only": true,
+      "description": "List every currently-paused task queue (issue #619), with the reason for the hold, the operator who placed it, when it was placed, and how many PENDING tasks it is holding. Cross-shard: a shard-scoped pause lists with its `scope_shard_id`, and an unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "paused_queues",
+          "status",
+          "unavailable_shards"
+        ],
+        "notes": "Each entry in paused_queues carries queue_name, reason, paused_by, paused_at, scope_shard_id, held_task_count, and a shards array naming the shards the hold is in effect on."
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/queues/{queue_name}/pause",
+      "category": "admin",
+      "read_only": false,
+      "description": "Hold dispatch on a named task queue during a scoped downstream outage (issue #619). While paused, no worker claims NEW tasks from the queue; held tasks stay PENDING and are never failed, retried, or dead-lettered, and an already-RUNNING task finishes naturally. The relative `schedule_to_start` timer is suspended for held tasks; the absolute `schedule_to_close` deadline (issue #378) keeps ticking, so a long hold can still time out work carrying one \u2014 a pause is not an SLA extension. Idempotent: re-pausing an already-paused queue is a 200 no-op that preserves the original reason and operator (`newly_paused: false`). The operator `reason` is truncated to 500 characters at the API boundary. A partially-applied fleet-wide hold is reported as 207, not 200 \u2014 see the success-response notes. Admin only; audited as `queue.pause`, including rejected attempts.",
+      "idempotency": "Re-pausing an already-paused queue returns 200 with `newly_paused: false` and preserves the original reason, operator and `paused_at`.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "The task queue to hold. Leading/trailing whitespace is trimmed to the canonical name actually stored and matched."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable reason for the hold, surfaced on the read API and in the Vantage UI. Truncated to 500 characters."
+          },
+          {
+            "name": "shard_id",
+            "required": false,
+            "description": "Omit (default) for a fleet-wide hold applied on every shard; set to scope the hold to a single shard."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "queue_name",
+          "newly_paused",
+          "reason",
+          "paused_by",
+          "paused_at",
+          "scope_shard_id",
+          "held_task_count",
+          "partial_failures"
+        ],
+        "notes": "A hold applied to only SOME target shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case \u2014 the missed shards keep dispatching \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name, blank reason, malformed body, or an unknown shard_id."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every target shard failed; no hold is in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, or the named shard_id is known to the router but has no pool in this process (mid a shard-add rollout)."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/queues/{queue_name}/resume",
+      "category": "admin",
+      "read_only": false,
+      "description": "Release an operator queue pause (issue #619). Held tasks become immediately claimable again, and the time each task spent held is credited back to its `scheduled_at` so the thaw does not retroactively schedule-to-start-time-out the whole backlog. Body is optional; a bare POST resumes fleet-wide. `released_reason`/`released_paused_by` echo the provenance of the hold that was released \u2014 the pause row is deleted by the resume, so this is the last moment the *why* is recoverable. Idempotent: resuming a queue that is not paused is a 200 no-op (`newly_resumed: false`). A partially-applied resume is reported as 207, not 200. Admin only; audited as `queue.resume`, including rejected attempts.",
+      "idempotency": "Resuming a queue that is not paused returns 200 with `newly_resumed: false`.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "The task queue to release. Leading/trailing whitespace is trimmed to the canonical name."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "shard_id",
+            "required": false,
+            "description": "Omit (default) to release the hold on every shard; set to release only one shard."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "status",
+          "queue_name",
+          "newly_resumed",
+          "released_task_count",
+          "paused_duration_secs",
+          "released_reason",
+          "released_paused_by",
+          "partial_failures"
+        ],
+        "notes": "A resume applied to only SOME target shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached \u2014 the safe direction, but not a completed thaw \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Blank or oversized queue name, malformed body, or an unknown shard_id."
+        },
+        {
+          "status": 401,
+          "description": "Admin access required."
+        },
+        {
+          "status": 500,
+          "description": "Every target shard failed; the hold may still be in effect."
+        },
+        {
+          "status": 503,
+          "description": "Harvest storage pool is not configured, or the named shard_id is known to the router but has no pool in this process (mid a shard-add rollout)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/queues/{queue_name}/eligibility",
       "category": "queue",
       "read_only": true,

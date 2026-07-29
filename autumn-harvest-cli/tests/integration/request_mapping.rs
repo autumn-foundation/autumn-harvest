@@ -2261,6 +2261,107 @@ fn legal_hold_release_maps_to_post_with_no_body() {
     assert_eq!(request.body, None);
 }
 
+// ── Task-queue pause/resume (issue #619) ──────────────────────────────────────
+
+#[test]
+fn queue_pause_maps_to_post_with_reason() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "SMTP provider outage",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/queues/email-workers/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "SMTP provider outage" })),
+        "omitting --shard-id must send NO shard_id field: the default is a \
+         fleet-wide hold, not shard 0"
+    );
+}
+
+#[test]
+fn queue_pause_with_shard_id_scopes_the_hold() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "one shard only",
+        "--shard-id",
+        "2",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "one shard only", "shard_id": 2 }))
+    );
+}
+
+#[test]
+fn queue_resume_maps_to_post_with_empty_body() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "resume", "email-workers"])
+        .expect("queue resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/queues/email-workers/resume");
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn queue_list_paused_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "list-paused"])
+        .expect("queue list-paused args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queues/paused");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_pause_percent_encodes_the_queue_name() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email workers/eu",
+        "--reason",
+        "x",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/email%20workers%2Feu/pause",
+        "a queue name with a space or slash must not break out of the path segment"
+    );
+}
+
+#[test]
+fn queue_pause_requires_a_reason() {
+    // A hold with no stated cause is unauditable -- clap must reject it.
+    assert!(
+        Cli::try_parse_from(["harvest", "queue", "pause", "email-workers"]).is_err(),
+        "queue pause must require --reason"
+    );
+}
+
 // ── Scoped API tokens (issue #942) ────────────────────────────────────────────
 
 #[test]

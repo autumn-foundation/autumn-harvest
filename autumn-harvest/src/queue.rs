@@ -497,127 +497,26 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 
     Ok(task_id)
 }
-
-/// Atomically claim the highest-priority pending task from the given queues.
+// NOTE (issue #619): the queue-pause anti-join above is embedded verbatim
+// rather than interpolated so this stays a `const fn` with no per-claim
+// allocation. It is drift-locked to
+// `queue_pause::queue_pause_anti_join("harvest_task_queue")` by
+// `claim_query_embeds_the_shared_queue_pause_predicate` below.
+/// The task-claim query — extracted as a `const fn` (mirroring the
+/// `timeout.rs` `*_query()` convention) so its eligibility predicate is
+/// shape-testable without a database.
 ///
-/// Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never contend on the
-/// same row. Returns `None` if no eligible task is available.
-///
-/// # Priority and anti-starvation
-///
-/// Tasks are ordered `priority DESC, available_at ASC` so higher-priority work
-/// is claimed first.  When `priority_aging_secs` is `Some(K)`, each task's
-/// effective priority is boosted by `+1` for every `K` seconds it has been
-/// waiting in `PENDING` state.  This bounds the maximum starvation time for
-/// `Low` priority tasks even under sustained high-priority load.
-///
-/// # Sticky routing
-///
-/// When a row has `sticky_worker_id` set and `sticky_until > NOW()`, only that
-/// worker may claim it. Once `sticky_until` elapses, any worker becomes
-/// eligible, so a crashed or slow sticky worker never blocks progress.
-/// Within the eligible set, rows pinned to the caller are sorted ahead of
-/// unpinned rows to maximize cache locality.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Binds: `$1` worker id, `$2` queue names, `$3` worker build id,
+/// `$4` priority-aging seconds, `$5` circuit-breaker-tracked activities,
+/// `$6` ineligible activities. The queue-pause anti-join (issue #619) needs no
+/// bind — it correlates purely on `queue_name`.
+// The body is one SQL string literal; the line count is the query's, not
+// control flow's. `claim_task` carried the same allow before this query was
+// extracted for shape-testing.
 #[allow(clippy::too_many_lines)]
-pub async fn claim_task(
-    conn: &mut AsyncPgConnection,
-    queues: &[String],
-    worker_id: &str,
-    worker_build_id: &str,
-    priority_aging_secs: Option<u32>,
-    circuit_breaker_activities: &[String],
-    ineligible_activities: &[String],
-) -> HarvestResult<Option<TaskQueueItem>> {
-    // Two-phase claim using a CTE to avoid holding advisory locks during
-    // broad WHERE filtering.
-    //
-    // Phase 1 (CTE): select the best PENDING candidate using the cap check
-    // alone (no advisory lock). FOR UPDATE SKIP LOCKED prevents two workers
-    // from picking the same row.
-    //
-    // Phase 2 (UPDATE): for capped keys, acquire pg_try_advisory_xact_lock
-    // only for the single selected candidate and re-verify the cap. This
-    // closes the race window where two workers could both pass the cap check
-    // in the same poll cycle before either commits. If the advisory lock fails
-    // (another worker holds it) or the re-check shows the cap is now
-    // saturated, the UPDATE matches 0 rows and the transaction commits with no
-    // change; the PENDING row is immediately available for the next poll.
-    //
-    // Acquiring the lock only for the final candidate (not during broad
-    // filtering) means a worker never transiently holds locks for keys it will
-    // not actually claim, keeping throughput high under contention.
-    //
-    // The partial index harvest_task_queue_concurrency_key_running makes the
-    // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
-    //
-    // Build routing filter (issue #171): a task with required_build_id can only
-    // be claimed by a worker whose build_id matches, is declared compatible, OR
-    // the worker has an empty build_id (legacy worker — can claim anything).
-    // When priority_aging_secs is Some(K), each task's effective priority is
-    // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
-    // A NULL value (or 0, which the builder normalizes to None) disables aging.
-    //
-    // Circuit-breaker rate limiting (issue #369, $5 = the static set of activity
-    // names that have a circuit-breaker policy): for these activities the
-    // rate-limit *gate* and token *debit* are BOTH skipped at claim time. Rate
-    // limiting is instead enforced authoritatively at dispatch, gated on the real
-    // `on_dispatch` decision in process_activity_task: a genuine downstream call
-    // atomically consumes a token (`try_consume_rate_limit_token`, rescheduling
-    // if none is available) while a `CircuitOpen` short-circuit consumes nothing.
-    //
-    // This avoids the claim-vs-dispatch staleness race: the breaker state is
-    // in-process and can change between claim and dispatch, so any claim-time
-    // rate-limit decision keyed on breaker phase is necessarily approximate.
-    // Moving it to dispatch lets short-circuits stay claimable at full speed
-    // during an outage (no gate) while guaranteeing a real call never runs
-    // without a token (authoritative debit). Non-circuit rate-limited activities
-    // are unaffected — they gate and debit at claim as before.
-    //
-    // The concurrency cap is never bypassed: a real call must always respect
-    // `max_concurrent`.
-    //
-    // Known limitation — safe-side rate-limit token leak under concurrency
-    // contention (pre-existing, shared with the static-rate path; issue #699
-    // review, #9): the `rate_limit_debit` CTE debits a token whenever the
-    // candidate's bucket has one, but the `claimed` UPDATE can still match 0 rows
-    // if a per-key concurrency (`concurrency_key`) advisory-lock race is lost or
-    // the re-checked cap is now saturated. In that case the token is spent but
-    // the task is NOT claimed. This is SAFE-SIDE (it over-throttles: the
-    // protective invariant "a real call always holds a token" is never violated —
-    // the leak only ever *reduces* dispatch below budget, never allows a claim
-    // without a token), bounded (at most one token per lost claim attempt), and
-    // self-healing (the bucket refills at `refill_rate`, so a leaked token is
-    // recovered within one refill interval). Fixing it would require moving the
-    // debit inside the `claimed` UPDATE's success condition — a change to this
-    // hot-path CTE for a pre-existing, harmless-direction edge — so it is
-    // deliberately left as-is; a scoped follow-up may revisit it. It applies
-    // identically to a task carrying both a per-key concurrency cap and any rate
-    // limit (static #332 or dynamic per-key #699).
-    //
-    // Pause gating (issue #383): workflow tasks whose execution is in the
-    // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
-    // execution is resumed, at which point they become claimable again. This is
-    // the single executor-layer chokepoint that defers timer fires, signal
-    // deliveries, and activity-completion wakes uniformly while paused — no
-    // workflow-author cooperation required. In-flight activity tasks are not
-    // `task_type = 'workflow'` and so continue to run to completion.
-    //
-    // Worker-session hard pin (issue #606): a row with a non-NULL `session_id`
-    // is claimable *only* by its `sticky_worker_id` -- unlike the ordinary
-    // sticky gate above, this condition ignores `sticky_until` entirely, so a
-    // session member activity never fails over to a different worker even
-    // after the (purely bookkeeping) sticky lease expires. The session's
-    // local state (a downloaded file, GPU memory, ...) only exists on the
-    // host worker, so failover would silently produce wrong results rather
-    // than a safe-but-slow retry.
-    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
-
-    let result: Vec<TaskQueueItem> = diesel::sql_query(
-        "WITH worker_info AS ( \
+#[must_use]
+pub const fn claim_task_query() -> &'static str {
+    "WITH worker_info AS ( \
              SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
          ), \
          candidate AS ( \
@@ -627,6 +526,8 @@ pub async fn claim_task(
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
+               AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+         WHERE qp.queue_name = harvest_task_queue.queue_name) \
                AND ( \
                    schedule_to_close_at IS NULL \
                    OR schedule_to_close_at > NOW() \
@@ -758,17 +659,137 @@ pub async fn claim_task(
               ) \
             RETURNING harvest_task_queue.* \
         ) \
-        SELECT * FROM claimed",
-    )
-    .bind::<diesel::sql_types::Text, _>(worker_id)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .bind::<diesel::sql_types::Text, _>(worker_build_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+        SELECT * FROM claimed"
+}
+
+/// Atomically claim the highest-priority pending task from the given queues.
+///
+/// Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never contend on the
+/// same row. Returns `None` if no eligible task is available.
+///
+/// # Priority and anti-starvation
+///
+/// Tasks are ordered `priority DESC, available_at ASC` so higher-priority work
+/// is claimed first.  When `priority_aging_secs` is `Some(K)`, each task's
+/// effective priority is boosted by `+1` for every `K` seconds it has been
+/// waiting in `PENDING` state.  This bounds the maximum starvation time for
+/// `Low` priority tasks even under sustained high-priority load.
+///
+/// # Sticky routing
+///
+/// When a row has `sticky_worker_id` set and `sticky_until > NOW()`, only that
+/// worker may claim it. Once `sticky_until` elapses, any worker becomes
+/// eligible, so a crashed or slow sticky worker never blocks progress.
+/// Within the eligible set, rows pinned to the caller are sorted ahead of
+/// unpinned rows to maximize cache locality.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines)]
+pub async fn claim_task(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+) -> HarvestResult<Option<TaskQueueItem>> {
+    // Two-phase claim using a CTE to avoid holding advisory locks during
+    // broad WHERE filtering.
+    //
+    // Phase 1 (CTE): select the best PENDING candidate using the cap check
+    // alone (no advisory lock). FOR UPDATE SKIP LOCKED prevents two workers
+    // from picking the same row.
+    //
+    // Phase 2 (UPDATE): for capped keys, acquire pg_try_advisory_xact_lock
+    // only for the single selected candidate and re-verify the cap. This
+    // closes the race window where two workers could both pass the cap check
+    // in the same poll cycle before either commits. If the advisory lock fails
+    // (another worker holds it) or the re-check shows the cap is now
+    // saturated, the UPDATE matches 0 rows and the transaction commits with no
+    // change; the PENDING row is immediately available for the next poll.
+    //
+    // Acquiring the lock only for the final candidate (not during broad
+    // filtering) means a worker never transiently holds locks for keys it will
+    // not actually claim, keeping throughput high under contention.
+    //
+    // The partial index harvest_task_queue_concurrency_key_running makes the
+    // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
+    //
+    // Build routing filter (issue #171): a task with required_build_id can only
+    // be claimed by a worker whose build_id matches, is declared compatible, OR
+    // the worker has an empty build_id (legacy worker — can claim anything).
+    // When priority_aging_secs is Some(K), each task's effective priority is
+    // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
+    // A NULL value (or 0, which the builder normalizes to None) disables aging.
+    //
+    // Circuit-breaker rate limiting (issue #369, $5 = the static set of activity
+    // names that have a circuit-breaker policy): for these activities the
+    // rate-limit *gate* and token *debit* are BOTH skipped at claim time. Rate
+    // limiting is instead enforced authoritatively at dispatch, gated on the real
+    // `on_dispatch` decision in process_activity_task: a genuine downstream call
+    // atomically consumes a token (`try_consume_rate_limit_token`, rescheduling
+    // if none is available) while a `CircuitOpen` short-circuit consumes nothing.
+    //
+    // This avoids the claim-vs-dispatch staleness race: the breaker state is
+    // in-process and can change between claim and dispatch, so any claim-time
+    // rate-limit decision keyed on breaker phase is necessarily approximate.
+    // Moving it to dispatch lets short-circuits stay claimable at full speed
+    // during an outage (no gate) while guaranteeing a real call never runs
+    // without a token (authoritative debit). Non-circuit rate-limited activities
+    // are unaffected — they gate and debit at claim as before.
+    //
+    // The concurrency cap is never bypassed: a real call must always respect
+    // `max_concurrent`.
+    //
+    // Known limitation — safe-side rate-limit token leak under concurrency
+    // contention (pre-existing, shared with the static-rate path; issue #699
+    // review, #9): the `rate_limit_debit` CTE debits a token whenever the
+    // candidate's bucket has one, but the `claimed` UPDATE can still match 0 rows
+    // if a per-key concurrency (`concurrency_key`) advisory-lock race is lost or
+    // the re-checked cap is now saturated. In that case the token is spent but
+    // the task is NOT claimed. This is SAFE-SIDE (it over-throttles: the
+    // protective invariant "a real call always holds a token" is never violated —
+    // the leak only ever *reduces* dispatch below budget, never allows a claim
+    // without a token), bounded (at most one token per lost claim attempt), and
+    // self-healing (the bucket refills at `refill_rate`, so a leaked token is
+    // recovered within one refill interval). Fixing it would require moving the
+    // debit inside the `claimed` UPDATE's success condition — a change to this
+    // hot-path CTE for a pre-existing, harmless-direction edge — so it is
+    // deliberately left as-is; a scoped follow-up may revisit it. It applies
+    // identically to a task carrying both a per-key concurrency cap and any rate
+    // limit (static #332 or dynamic per-key #699).
+    //
+    // Pause gating (issue #383): workflow tasks whose execution is in the
+    // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
+    // execution is resumed, at which point they become claimable again. This is
+    // the single executor-layer chokepoint that defers timer fires, signal
+    // deliveries, and activity-completion wakes uniformly while paused — no
+    // workflow-author cooperation required. In-flight activity tasks are not
+    // `task_type = 'workflow'` and so continue to run to completion.
+    //
+    // Worker-session hard pin (issue #606): a row with a non-NULL `session_id`
+    // is claimable *only* by its `sticky_worker_id` -- unlike the ordinary
+    // sticky gate above, this condition ignores `sticky_until` entirely, so a
+    // session member activity never fails over to a different worker even
+    // after the (purely bookkeeping) sticky lease expires. The session's
+    // local state (a downloaded file, GPU memory, ...) only exists on the
+    // host worker, so failover would silently produce wrong results rather
+    // than a safe-but-slow retry.
+    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+
+    let result: Vec<TaskQueueItem> = diesel::sql_query(claim_task_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .bind::<diesel::sql_types::Text, _>(worker_build_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     Ok(result.into_iter().next())
 }
@@ -1207,6 +1228,58 @@ pub async fn queue_depths(
 
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
+/// The `oldest_pending_ages` gauge query — extracted so its claim-gate mirror
+/// (including the issue #619 queue-pause anti-join) is shape-testable.
+///
+/// Binds: `$1` queue names, `$2` circuit-breaker-tracked activities.
+#[must_use]
+pub const fn oldest_pending_ages_query() -> &'static str {
+    "SELECT queue_name, \
+                GREATEST( \
+                    EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
+                    0 \
+                )::DOUBLE PRECISION AS age_secs \
+         FROM harvest_task_queue \
+         WHERE queue_name = ANY($1) \
+           AND state = 'PENDING' \
+           AND scheduled_at <= NOW() \
+           AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+         WHERE qp.queue_name = harvest_task_queue.queue_name) \
+           AND ( \
+               schedule_to_close_at IS NULL \
+               OR schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               task_type <> 'workflow' \
+               OR workflow_exec_id IS NULL \
+               OR NOT EXISTS ( \
+                   SELECT 1 FROM harvest_workflow_executions e \
+                   WHERE e.id = harvest_task_queue.workflow_exec_id \
+                     AND e.state = 'PAUSED' \
+               ) \
+           ) \
+           AND ( \
+               concurrency_key IS NULL \
+               OR concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                     AND inner_q.task_type = harvest_task_queue.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < harvest_task_queue.concurrency_cap \
+           ) \
+           AND ( \
+               rate_limit_key IS NULL \
+               OR activity_name = ANY($2) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = harvest_task_queue.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
+         GROUP BY queue_name"
+}
 
 /// Returns the age in seconds of the oldest currently-*claimable* eligible task
 /// per queue.
@@ -1263,56 +1336,12 @@ pub async fn oldest_pending_ages(
         age_secs: f64,
     }
 
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT queue_name, \
-                GREATEST( \
-                    EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
-                    0 \
-                )::DOUBLE PRECISION AS age_secs \
-         FROM harvest_task_queue \
-         WHERE queue_name = ANY($1) \
-           AND state = 'PENDING' \
-           AND scheduled_at <= NOW() \
-           AND ( \
-               schedule_to_close_at IS NULL \
-               OR schedule_to_close_at > NOW() \
-           ) \
-           AND ( \
-               task_type <> 'workflow' \
-               OR workflow_exec_id IS NULL \
-               OR NOT EXISTS ( \
-                   SELECT 1 FROM harvest_workflow_executions e \
-                   WHERE e.id = harvest_task_queue.workflow_exec_id \
-                     AND e.state = 'PAUSED' \
-               ) \
-           ) \
-           AND ( \
-               concurrency_key IS NULL \
-               OR concurrency_cap IS NULL \
-               OR ( \
-                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
-                   WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
-                     AND inner_q.task_type = harvest_task_queue.task_type \
-                     AND inner_q.state = 'RUNNING' \
-                     AND inner_q.worker_id IS NOT NULL \
-               ) < harvest_task_queue.concurrency_cap \
-           ) \
-           AND ( \
-               rate_limit_key IS NULL \
-               OR activity_name = ANY($2) \
-               OR EXISTS ( \
-                   SELECT 1 FROM harvest_rate_limit_buckets b \
-                   WHERE b.key = harvest_task_queue.rate_limit_key \
-                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
-               ) \
-           ) \
-         GROUP BY queue_name",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let rows: Vec<Row> = diesel::sql_query(oldest_pending_ages_query())
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     Ok(rows
         .into_iter()
@@ -2454,6 +2483,71 @@ pub struct ClaimablePendingDemand {
     pub activity_name: Option<String>,
     pub count: i64,
 }
+/// The `claimable_pending_demand_by_queue` query — extracted so the real call
+/// site and the drift test share one source of truth.
+///
+/// Mirrors **every** claim-time gate in [`claim_task_query`], including the
+/// issue #619 queue-pause anti-join. Bind: `$1` circuit-breaker-tracked
+/// activities.
+#[must_use]
+pub fn claimable_pending_demand_query() -> String {
+    // `sticky_owner` is NULL unless an unexpired lease binds the row to a
+    // specific worker; the CASE mirrors claim_task's sticky predicate (a row
+    // with sticky_until <= NOW() or NULL is freely claimable). It is both
+    // selected and repeated in GROUP BY.
+    let sticky_owner_expr = "CASE WHEN tq.sticky_worker_id IS NOT NULL \
+                                  AND tq.sticky_until IS NOT NULL \
+                                  AND tq.sticky_until > NOW() \
+                             THEN tq.sticky_worker_id ELSE NULL END";
+
+    // Issue #619: a paused queue's backlog is deliberately held, not stalled,
+    // so it must not surface as unmet demand (which would drive a false
+    // worker-capacity alert during the hold). Generated from the shared
+    // renderer, correlated against this query's `tq` alias.
+    let queue_pause_gate = crate::queue_pause::queue_pause_anti_join("tq");
+    format!(
+        "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+                {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
+                COUNT(*)::BIGINT AS cnt \
+         FROM harvest_task_queue tq \
+         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
+         WHERE tq.state = 'PENDING' \
+           AND tq.scheduled_at <= NOW() \
+           AND {queue_pause_gate} \
+           AND ( \
+               tq.schedule_to_close_at IS NULL \
+               OR tq.schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               tq.task_type <> 'workflow' \
+               OR tq.workflow_exec_id IS NULL \
+               OR e.id IS NULL \
+               OR e.state <> 'PAUSED' \
+           ) \
+           AND ( \
+               tq.concurrency_key IS NULL \
+               OR tq.concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = tq.concurrency_key \
+                     AND inner_q.task_type = tq.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < tq.concurrency_cap \
+           ) \
+           AND ( \
+               tq.rate_limit_key IS NULL \
+               OR tq.activity_name = ANY($1) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = tq.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
+         GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+                  {sticky_owner_expr}, tq.activity_name"
+    )
+}
 
 /// Per-queue, per-constraint claimable-demand breakdown for the stranded-work
 /// sampler and the shard-health coverage gate (issue #522).
@@ -2506,59 +2600,11 @@ pub async fn claimable_pending_demand_by_queue(
         cnt: i64,
     }
 
-    // `sticky_owner` is NULL unless an unexpired lease binds the row to a
-    // specific worker; the CASE mirrors claim_task's sticky predicate (a row
-    // with sticky_until <= NOW() or NULL is freely claimable). It is both
-    // selected and repeated in GROUP BY.
-    let sticky_owner_expr = "CASE WHEN tq.sticky_worker_id IS NOT NULL \
-                                  AND tq.sticky_until IS NOT NULL \
-                                  AND tq.sticky_until > NOW() \
-                             THEN tq.sticky_worker_id ELSE NULL END";
-    let rows: Vec<DemandRow> = diesel::sql_query(format!(
-        "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
-                {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
-                COUNT(*)::BIGINT AS cnt \
-         FROM harvest_task_queue tq \
-         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
-         WHERE tq.state = 'PENDING' \
-           AND tq.scheduled_at <= NOW() \
-           AND ( \
-               tq.schedule_to_close_at IS NULL \
-               OR tq.schedule_to_close_at > NOW() \
-           ) \
-           AND ( \
-               tq.task_type <> 'workflow' \
-               OR tq.workflow_exec_id IS NULL \
-               OR e.id IS NULL \
-               OR e.state <> 'PAUSED' \
-           ) \
-           AND ( \
-               tq.concurrency_key IS NULL \
-               OR tq.concurrency_cap IS NULL \
-               OR ( \
-                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
-                   WHERE inner_q.concurrency_key = tq.concurrency_key \
-                     AND inner_q.task_type = tq.task_type \
-                     AND inner_q.state = 'RUNNING' \
-                     AND inner_q.worker_id IS NOT NULL \
-               ) < tq.concurrency_cap \
-           ) \
-           AND ( \
-               tq.rate_limit_key IS NULL \
-               OR tq.activity_name = ANY($1) \
-               OR EXISTS ( \
-                   SELECT 1 FROM harvest_rate_limit_buckets b \
-                   WHERE b.key = tq.rate_limit_key \
-                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
-               ) \
-           ) \
-         GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, \
-                  {sticky_owner_expr}, tq.activity_name"
-    ))
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let rows: Vec<DemandRow> = diesel::sql_query(claimable_pending_demand_query())
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     Ok(rows
         .into_iter()
@@ -2718,6 +2764,50 @@ pub async fn sample_rate_limit_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Queue pause: claim gate + its mirrors (issue #619) ──────────────────
+
+    /// The hot claim path embeds the pause anti-join as a literal (no
+    /// per-claim allocation); this locks that literal to the shared renderer so
+    /// the two can never drift.
+    #[test]
+    fn claim_query_embeds_the_shared_queue_pause_predicate() {
+        let rendered = crate::queue_pause::queue_pause_anti_join("harvest_task_queue");
+        assert!(
+            claim_task_query().contains(&rendered),
+            "claim_task_query() must embed the shared queue-pause anti-join verbatim"
+        );
+    }
+
+    /// Both queries that document "mirrors every claim-time gate" must mirror
+    /// the pause gate too — otherwise a deliberately-held backlog surfaces as
+    /// unmet demand / a stale oldest-pending age and drives a false alert.
+    #[test]
+    fn claim_gate_mirrors_carry_the_queue_pause_predicate() {
+        assert!(
+            oldest_pending_ages_query().contains(&crate::queue_pause::queue_pause_anti_join(
+                "harvest_task_queue"
+            )),
+            "oldest_pending_ages must mirror the queue-pause gate"
+        );
+        assert!(
+            claimable_pending_demand_query()
+                .contains(&crate::queue_pause::queue_pause_anti_join("tq")),
+            "claimable_pending_demand_by_queue must mirror the queue-pause gate"
+        );
+    }
+
+    /// A pause holds *dispatch*: the gate lives in the PENDING-selection
+    /// predicate, never in the terminal/RUNNING paths, so in-flight work is
+    /// untouched (AC2).
+    #[test]
+    fn queue_pause_gate_appears_once_in_the_claim_candidate_scan() {
+        assert_eq!(
+            claim_task_query().matches("harvest_queue_pauses").count(),
+            1,
+            "the pause gate belongs only in the candidate (PENDING) scan"
+        );
+    }
 
     // ── Dynamic per-key rate-limit bucket keys (issue #699) ─────────────────
 

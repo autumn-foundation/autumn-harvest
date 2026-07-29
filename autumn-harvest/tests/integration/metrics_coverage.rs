@@ -12,13 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_DISPATCHED, METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED,
-    METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
-    METRIC_SCHEDULE_SKIPPED, METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED,
-    METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED,
-    METRIC_UPDATE_REJECTED, METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_PAUSED, METRIC_RETENTION_DELETED,
+    METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
+    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
+    METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
+    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +132,16 @@ impl MetricsRecorder for RecordingMetrics {
         self.samples.lock().unwrap().push(MetricSample {
             name: METRIC_DLQ_ENTRIES,
             labels: vec![("shard", shard.to_string()), ("depth", depth.to_string())],
+        });
+    }
+
+    fn record_queue_paused(&self, queue: &str, paused: bool) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_QUEUE_PAUSED,
+            labels: vec![
+                ("queue", queue.to_owned()),
+                ("paused", u8::from(paused).to_string()),
+            ],
         });
     }
 
@@ -338,6 +349,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_timer_started(30.0);
     rec.record_queue_depth("default", 5);
     rec.record_dlq_entries(0, 2);
+    rec.record_queue_paused("email-workers", true);
     rec.record_schedule_run("workflow", "nightly");
     rec.record_schedule_skipped("workflow", "nightly", "paused");
     rec.record_schedule_decision_write_failed();
@@ -452,6 +464,7 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_timer_started(10.0);
     rec.record_queue_depth("default", 0);
     rec.record_dlq_entries(0, 0);
+    rec.record_queue_paused("email-workers", false);
     rec.record_workflow_active("wf", "running", 0);
     rec.record_schedule_run("dag", "my_dag");
     rec.record_schedule_skipped("dag", "my_dag", "max_active_runs_reached");
@@ -698,6 +711,7 @@ fn noop_metrics_implements_all_catalogue_methods() {
     rec.record_timer_started(5.0);
     rec.record_queue_depth("q", 0);
     rec.record_dlq_entries(0, 0);
+    rec.record_queue_paused("email-workers", false);
     rec.record_schedule_run("workflow", "wf");
     rec.record_schedule_skipped("workflow", "wf", "paused");
     rec.record_schedule_decision_write_failed();

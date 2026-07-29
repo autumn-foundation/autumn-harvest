@@ -21,6 +21,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_update_rejected_rate",
     "harvest_signal_unhandled_rate",
     "harvest_workflow_population_leak",
+    "harvest_queue_paused_too_long",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -54,6 +55,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_queue_schedule_to_start_bucket",
     "harvest_queue_oldest_pending_age",
     "harvest_dlq_entries",
+    "harvest_queue_paused",
     "harvest_schedule_runs_total",
     "harvest_schedule_skipped_total",
     "harvest_schedule_overdue",
