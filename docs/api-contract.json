@@ -6639,7 +6639,7 @@
           "status",
           "unavailable_shards"
         ],
-        "notes": "Each entry in paused_queues carries queue_name, reason, paused_by, paused_at, scope_shard_id, held_task_count, and a shards array naming the shards the hold is in effect on."
+        "notes": "Each entry in paused_queues carries queue_name, held_task_count (summed across shards), provenance_uniform, and a shards array of per-shard objects {shard_id, reason, paused_by, paused_at, scope_shard_id, held_task_count}. The top-level reason/paused_by/paused_at/scope_shard_id summarise the EARLIEST hold. Because pause is idempotent and preserves the original provenance on a re-pause, a fleet-wide hold landing over a pre-existing shard-scoped hold (or two independent scoped holds) can leave shards disagreeing; provenance_uniform is false in that case and the shards array carries each shard's own story. Uniformity compares reason/paused_by/scope_shard_id and deliberately not paused_at, since each shard stamps its own NOW()."
       },
       "error_responses": [
         {

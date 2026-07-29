@@ -791,7 +791,24 @@ pub async fn claim_task(
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(result.into_iter().next())
+    let Some(task) = result.into_iter().next() else {
+        return Ok(None);
+    };
+
+    // Authoritative queue-pause re-check (issue #619). The anti-join above is
+    // evaluated against this statement's snapshot, taken at statement start, so
+    // a pause committing while the claim was in flight is invisible to it and
+    // the task would be dispatched into the very outage the hold exists to ride
+    // out. This runs in a *fresh* statement — hence a fresh snapshot — and
+    // releases the claim back to PENDING if the queue is now held. See
+    // `queue_pause::release_claim_if_queue_paused` for why this is preferred
+    // over taking a queue-scoped lock inside the claim itself (which would
+    // serialize all claims for a queue and defeat SKIP LOCKED).
+    if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id).await? {
+        return Ok(None);
+    }
+
+    Ok(Some(task))
 }
 
 // ---------------------------------------------------------------------------

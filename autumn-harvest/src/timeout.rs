@@ -850,6 +850,48 @@ async fn enforce_activity_timeout(
     // moved on)? Only a real enforcement should count toward the breaker.
     let enforced = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         let error = error.clone();
+
+        // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
+        // is a non-locking snapshot, so a queue pause committing after the scan
+        // would otherwise let this transaction schedule-to-start-fail the very
+        // task the hold was meant to protect.
+        //
+        // Unlike the execution-pause re-check further down — which is
+        // authoritative because both sides lock the *execution row* —
+        // `pause_queue` shares no row with this transaction, so a bare re-read
+        // would not serialize: a pause could commit in the window between the
+        // read and this transaction's own commit. Both sides therefore take the
+        // same queue-scoped advisory lock, so a pause is either fully visible
+        // here or blocked until this enforcement commits.
+        //
+        // LOCK ORDERING (load-bearing): this runs FIRST, before the execution
+        // and task row locks below, because `resume_queue` takes the very same
+        // advisory lock and *then* row-locks every PENDING task on the queue via
+        // its `scheduled_at` shift. Taking the rows first here and the advisory
+        // lock after would invert that order — enforcement holding a task row
+        // and waiting on the advisory lock while resume holds the advisory lock
+        // and waits on that task row — and Postgres would abort one of them,
+        // failing either the timeout pass or the operator's resume. Both paths
+        // now take advisory-then-rows. (Same convention as the
+        // `harvest_external_tasks` task-row -> execution-row ordering documented
+        // in `enforce_external_task_timeouts`.)
+        //
+        // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
+        // — the absolute `schedule_to_close` deadline keeps ticking during a
+        // queue pause, and heartbeat/start-to-close apply to RUNNING rows that a
+        // pause never touches — so the lock is taken only for that reason and
+        // never on the far more common in-flight timeout paths. Bailing here
+        // also skips the row locks and history load entirely for a held task.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            crate::queue_pause::lock_queue_for_pause(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
+                return Ok(false);
+            }
+        }
+
         let (execution, history) =
             lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
         let Some((state, row_schedule_to_close_at)) =
@@ -877,33 +919,8 @@ async fn enforce_activity_timeout(
         ) {
             return Ok(false);
         }
-        // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
-        // is a non-locking snapshot, so a queue pause committing after the
-        // scan would otherwise let this transaction schedule-to-start-fail the
-        // very task the hold was meant to protect.
-        //
-        // Unlike the execution-pause re-check above — which is authoritative
-        // because both sides lock the *execution row* — `pause_queue` shares no
-        // row with this transaction, so a bare re-read would not serialize: a
-        // pause could commit in the window between the read and this
-        // transaction's own commit. Both sides therefore take the same
-        // queue-scoped advisory lock first, so a pause is either fully visible
-        // here or blocked until this enforcement commits.
-        //
-        // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
-        // — the absolute `schedule_to_close` deadline keeps ticking during a
-        // queue pause, and heartbeat/start-to-close apply to RUNNING rows that
-        // a pause never touches — so the lock is taken only for that reason and
-        // never on the far more common in-flight timeout paths.
-        if matches!(reason, TimeoutReason::ScheduleToStart) {
-            crate::queue_pause::lock_queue_for_pause(conn, &task.queue_name).await?;
-            if crate::queue_pause::queue_pause_suppresses_timeout(
-                reason,
-                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
-            ) {
-                return Ok(false);
-            }
-        }
+        // (The queue-pause re-check runs at the TOP of this transaction, before
+        // the row locks above — see the lock-ordering note there.)
         let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
             Ok(Some(activity_id)) => activity_id,
             Ok(None) => return Ok(false),

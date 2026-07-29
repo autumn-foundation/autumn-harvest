@@ -913,3 +913,317 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
          honoured by the enforcer's authoritative re-check (AC2/AC3/AC4)"
     );
 }
+
+/// Lock-ordering guard: the `schedule_to_start` enforcer must take the queue
+/// advisory lock BEFORE it row-locks the execution and the task.
+///
+/// `resume_queue` takes the advisory lock and *then* row-locks every PENDING
+/// task on the queue (its `scheduled_at` shift). If the enforcer took the rows
+/// first and the advisory lock after, the two would form an ABBA cycle --
+/// enforcement holding a task row while waiting on the advisory lock, resume
+/// holding the advisory lock while waiting on that task row -- and Postgres
+/// would abort one of them, failing either the timeout pass or the operator's
+/// resume request.
+///
+/// Proven deterministically without provoking an actual deadlock (mirrors the
+/// issue #779 `materializer_locks_execution_row_before_timers_no_abba` probe):
+/// hold the advisory lock, start the enforcer so it blocks on it, then probe
+/// both row locks with `FOR UPDATE NOWAIT` from a third connection. Both must
+/// still be free -- under the inverted order the enforcer would already hold
+/// them and the probe would fail with `lock_not_available`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("abba-order");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET scheduled_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("backdate");
+
+    // Stand in for `resume_queue`'s first lock: hold the queue advisory lock so
+    // the enforcer must block on it.
+    let mut holder = connect(&url).await;
+    holder.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .execute(&mut holder)
+        .await
+        .expect("take the queue lock");
+
+    let url_for_task = url.clone();
+    let enforcer = tokio::spawn(async move {
+        let mut conn = connect(&url_for_task).await;
+        autumn_harvest::timeout::enforce_timeouts_once(
+            &mut conn,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(60),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+
+    // Give the enforcer time to reach (and block on) the advisory lock.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mut probe = connect(&url).await;
+    probe.batch_execute("BEGIN").await.expect("probe begin");
+    let task_free =
+        diesel::sql_query("SELECT id FROM harvest_task_queue WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .execute(&mut probe)
+            .await
+            .is_ok();
+    assert!(
+        task_free,
+        "the enforcer must still be blocked on the QUEUE ADVISORY LOCK, not \
+         holding the task row -- holding it here is the ABBA cycle against \
+         resume_queue's scheduled_at shift"
+    );
+    let exec_free = diesel::sql_query(
+        "SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE NOWAIT",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut probe)
+    .await
+    .is_ok();
+    assert!(
+        exec_free,
+        "the enforcer must not have taken the execution row lock before the \
+         queue advisory lock"
+    );
+    probe.batch_execute("COMMIT").await.expect("probe commit");
+
+    holder.batch_execute("COMMIT").await.expect("release lock");
+    let _ = enforcer.await.expect("join");
+}
+
+/// The release statement only ever undoes *this* worker's own claim, and it
+/// restores the attempt the claim consumed.
+#[test]
+fn release_claim_query_is_guarded_and_restores_the_attempt() {
+    let sql = queue_pause::release_claim_if_queue_paused_query();
+    assert!(
+        sql.contains("state = 'RUNNING'") && sql.contains("worker_id = $2"),
+        "the release must be guarded on this worker's own RUNNING claim so it \
+         can never disturb another worker's task: {sql}"
+    );
+    assert!(
+        sql.contains("attempt = GREATEST(attempt - 1, 0)"),
+        "a held task never ran, so the release must give back the attempt the \
+         claim consumed -- otherwise a pause burns retry budget, which AC3 \
+         forbids: {sql}"
+    );
+    assert!(
+        sql.contains("EXISTS (SELECT 1 FROM harvest_queue_pauses qp"),
+        "the release must be conditional on the queue actually being paused, \
+         so an ordinary claim is never rolled back: {sql}"
+    );
+}
+
+/// AC2/AC3 — a claim that won the race against a pause is released back to
+/// `PENDING` with its attempt restored, so the worker never dispatches it.
+#[tokio::test]
+async fn a_claim_that_beat_the_pause_is_released_with_its_attempt_restored() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("claim-release");
+
+    let task_id = enqueue_activity(&mut conn, &q, None).await;
+    let claimed = claim_one(&mut conn, &q).await;
+    assert_eq!(claimed, Some(task_id), "the unpaused claim must succeed");
+
+    // The pause commits after the claim -- exactly the state the post-claim
+    // re-check is reached with when a claim's snapshot predates the pause.
+    queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+
+    let released = queue_pause::release_claim_if_queue_paused(&mut conn, task_id, "w1")
+        .await
+        .expect("release");
+    assert!(released, "a claim on a now-paused queue must be released");
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        worker_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT state, attempt, worker_id, started_at FROM harvest_task_queue WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .get_result(&mut conn)
+    .await
+    .expect("load task");
+
+    assert_eq!(
+        row.state, "PENDING",
+        "the task must be held, not dispatched"
+    );
+    assert_eq!(
+        row.attempt, 0,
+        "a hold must consume no retry budget (AC3) -- the claim's attempt \
+         increment has to be given back"
+    );
+    assert!(row.worker_id.is_none(), "the claim must be fully undone");
+    assert!(row.started_at.is_none(), "the claim must be fully undone");
+}
+
+/// The re-check must not disturb an ordinary claim: with no pause in effect it
+/// is a no-op and the task stays `RUNNING`.
+#[tokio::test]
+async fn an_ordinary_claim_is_not_released_when_the_queue_is_not_paused() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("claim-noop");
+
+    let task_id = enqueue_activity(&mut conn, &q, None).await;
+    assert_eq!(claim_one(&mut conn, &q).await, Some(task_id));
+
+    let released = queue_pause::release_claim_if_queue_paused(&mut conn, task_id, "w1")
+        .await
+        .expect("release");
+    assert!(
+        !released,
+        "an unpaused queue's claim must never be rolled back"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    let row: Row = diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("load task");
+    assert_eq!(row.state, "RUNNING");
+    assert_eq!(row.attempt, 1, "the ordinary claim's attempt must stand");
+}
+
+/// AC2, the authoritative half of the *claim* path: a pause committing while a
+/// claim statement is already in flight must still hold the task.
+///
+/// `claim_task` is a single autocommit statement, so under `READ COMMITTED` its
+/// anti-join is evaluated against one snapshot taken at statement start. A
+/// pause committing after that snapshot is invisible to it, and the claim goes
+/// on to transition the task to `RUNNING` -- handing it to a worker that
+/// dispatches straight into the outage the operator is riding out.
+///
+/// Reproduced deterministically by stalling the claim mid-statement on its
+/// rate-limit debit (the one part of the CTE that can block, since the
+/// candidate scan uses `SKIP LOCKED`): hold the bucket row from another
+/// transaction, start the claim, commit the pause while the claim is parked,
+/// then release the bucket. The claim then commits with a stale snapshot, and
+/// the post-claim re-check -- a fresh statement, hence a fresh snapshot -- must
+/// catch it and release the task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_pause_committed_mid_claim_still_holds_the_task() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("mid-claim");
+    let rl_key = format!("{q}-bucket");
+
+    queue::ensure_rate_limit_bucket(&mut conn, &rl_key, 100.0, 100.0)
+        .await
+        .expect("bucket");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(rl_key.clone());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    // Hold the rate-limit bucket row so the claim's debit blocks mid-statement,
+    // freezing its snapshot from before the pause.
+    let mut bucket_holder = connect(&url).await;
+    bucket_holder.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET last_refilled_at = last_refilled_at WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&rl_key)
+    .execute(&mut bucket_holder)
+    .await
+    .expect("hold the bucket row");
+
+    let url_for_claim = url.clone();
+    let q_for_claim = q.clone();
+    let claim_in_flight = tokio::spawn(async move {
+        let mut conn = connect(&url_for_claim).await;
+        claim_task(&mut conn, &[q_for_claim], "w1", "", None, &[], &[])
+            .await
+            .expect("claim")
+            .map(|t| t.id)
+    });
+
+    // Let the claim reach (and block on) the bucket row.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    queue_pause::pause_queue(&mut conn, &q, "outage started mid-claim", "alice", None)
+        .await
+        .expect("pause");
+    bucket_holder
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the bucket row");
+
+    let claimed = claim_in_flight.await.expect("join");
+    assert!(
+        claimed.is_none(),
+        "a claim whose snapshot predated the pause must NOT be handed to the \
+         worker -- the post-claim re-check has to release it, or the task is \
+         dispatched into exactly the outage the hold exists to ride out"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+    }
+    let row: Row = diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("load task");
+    assert_eq!(row.state, "PENDING", "the task must be held (AC3)");
+    assert_eq!(
+        row.attempt, 0,
+        "the hold must consume no retry budget (AC3)"
+    );
+}

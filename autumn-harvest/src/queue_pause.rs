@@ -90,6 +90,82 @@ pub fn queue_pause_anti_join(outer_table: &str) -> String {
 pub const QUEUE_PAUSE_CLAIM_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
          WHERE qp.queue_name = harvest_task_queue.queue_name)";
 
+/// Releases a just-claimed task back to `PENDING` when its queue turns out to
+/// be paused (issue #619).
+///
+/// # Why a second statement is required
+///
+/// [`crate::queue::claim_task`] is a single autocommit statement, so under
+/// `READ COMMITTED` its whole CTE — including the
+/// [`QUEUE_PAUSE_CLAIM_PREDICATE`] anti-join — evaluates against **one snapshot
+/// taken at statement start**. A pause that commits after that snapshot is
+/// invisible to it, so a claim already in flight when the operator paused can
+/// still transition its task to `RUNNING` and hand it to a worker that
+/// dispatches into the outage. The window is normally sub-millisecond but is
+/// unbounded in principle: the claim's rate-limit debit can block on a row lock
+/// held by a competing claim, and Postgres's `EvalPlanQual` re-check on unblock
+/// only re-evaluates conditions on the *locked row*, never a correlated
+/// subquery over another table.
+///
+/// Taking a queue-scoped lock inside the claim path would close the window but
+/// serialize every claim for a queue against every other, defeating
+/// `FOR UPDATE SKIP LOCKED`'s parallel claiming for a feature that is inactive
+/// almost all of the time. Re-checking in a **fresh statement** gets a fresh
+/// snapshot for the cost of one indexed primary-key probe per *successful*
+/// claim (never per empty poll), and yields a crisp contract: **a pause
+/// committed before this re-check's statement begins always wins.** A pause
+/// that commits after it did not beat the claim, and AC2 explicitly allows an
+/// already-`RUNNING` task to finish naturally.
+///
+/// The release is guarded on `state = 'RUNNING' AND worker_id = $2` so it can
+/// only ever undo *this* worker's own claim, and it restores `attempt` — the
+/// task never ran, so a hold must not consume retry budget (AC3). The
+/// rate-limit token the claim debited is not refunded; that is the same
+/// safe-side, self-healing leak already documented for a lost claim in
+/// [`crate::queue::claim_task`] (it only ever under-dispatches).
+///
+/// Returns `true` when the claim was released (the caller must behave as if no
+/// task was claimed).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn release_claim_if_queue_paused(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    let released = diesel::sql_query(release_claim_if_queue_paused_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
+}
+
+/// SQL for [`release_claim_if_queue_paused`], exposed for shape tests.
+///
+/// One statement, so it takes a fresh `READ COMMITTED` snapshot and therefore
+/// sees any pause committed before it began — which is the entire point (see
+/// [`release_claim_if_queue_paused`]).
+#[must_use]
+pub const fn release_claim_if_queue_paused_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         attempt = GREATEST(attempt - 1, 0) \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+                   WHERE qp.queue_name = harvest_task_queue.queue_name)"
+}
+
 /// Validate an operator-supplied queue name and return its canonical form.
 ///
 /// Rejects blank (or whitespace-only) names and anything longer than
@@ -436,6 +512,16 @@ pub async fn resume_queue(
         conn.transaction::<ResumeOutcome, HarvestError, _>(async |conn| {
             // Same lock the pause path and the timeout enforcer take, so a
             // resume cannot interleave with either.
+            //
+            // LOCK ORDERING (load-bearing): advisory lock FIRST, then the
+            // PENDING task rows the `scheduled_at` shift below updates. The
+            // `schedule_to_start` enforcer takes the same two in the same order
+            // (see the lock-ordering note in `timeout::enforce_activity_timeout`).
+            // Inverting either side would let enforcement hold a task row while
+            // waiting on this advisory lock and this transaction hold the
+            // advisory lock while waiting on that task row — an ABBA deadlock
+            // Postgres would break by aborting one, failing either the timeout
+            // pass or the operator's resume.
             lock_queue_for_pause(conn, &queue_owned).await?;
 
             // Delete-and-return: a single statement that is both the

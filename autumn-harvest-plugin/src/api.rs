@@ -28181,41 +28181,90 @@ async fn list_paused_queues_handler(
 
     let collected = shard_fanout::collect_fanout_rows(observations);
 
-    // A fleet-wide pause writes one row per shard; merge them into one entry so
-    // the operator sees "the payments queue is held", not N copies of it.
-    let mut merged: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-    for (shard_id, row) in collected.rows {
-        let entry = merged
-            .entry(row.queue_name.clone())
-            .or_insert_with(|| {
-                serde_json::json!({
-                    "queue_name": row.queue_name,
-                    "reason": row.reason,
-                    "paused_by": row.paused_by,
-                    "paused_at": row.paused_at,
-                    "scope_shard_id": row.scope_shard_id,
-                    "held_task_count": 0,
-                    "shards": Vec::<i32>::new(),
-                })
-            })
-            .as_object_mut()
-            .expect("json object literal");
-        let held = entry
-            .get("held_task_count")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            + row.held_task_count;
-        entry.insert("held_task_count".to_string(), Value::from(held));
-        if let Some(shards) = entry.get_mut("shards").and_then(Value::as_array_mut) {
-            shards.push(Value::from(shard_id));
-        }
-    }
-
     Ok(Json(serde_json::json!({
-        "paused_queues": merged.into_values().collect::<Vec<_>>(),
+        "paused_queues": merge_paused_queue_rows(collected.rows),
         "status": collected.status,
         "unavailable_shards": collected.unavailable_shards,
     })))
+}
+
+/// Merge per-shard pause rows into one entry per queue, preserving each shard's
+/// own provenance (issue #619 review).
+///
+/// A fleet-wide pause writes one row per shard, so the common case must read as
+/// "the payments queue is held", not N copies of it. But the shards' rows are
+/// **not** guaranteed to agree: `pause_queue` is idempotent and deliberately
+/// preserves the *original* reason and operator on a re-pause, so a fleet-wide
+/// hold landing over a pre-existing shard-scoped hold leaves that shard with
+/// the older story — as does pausing the same queue on two shards separately,
+/// which the `shard_id` parameter explicitly supports. Keeping whichever shard
+/// happened to be iterated first would then show the operator a reason and
+/// scope that are simply not true for part of the fleet.
+///
+/// So: the top-level provenance is the **earliest** hold (a deterministic rule,
+/// and the same one the Vantage banner uses, so the two surfaces never
+/// disagree), `shards` carries every shard's own provenance, and
+/// `provenance_uniform` is a single field a script can gate on.
+///
+/// Uniformity compares `(reason, paused_by, scope_shard_id)` and deliberately
+/// **not** `paused_at`: each shard stamps its own `NOW()`, so including it would
+/// report almost every healthy fleet-wide hold as divergent.
+fn merge_paused_queue_rows(
+    rows: Vec<(i32, ::autumn_harvest::queue_pause::PausedQueue)>,
+) -> Vec<Value> {
+    let mut by_queue: std::collections::BTreeMap<
+        String,
+        Vec<(i32, ::autumn_harvest::queue_pause::PausedQueue)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in rows {
+        by_queue
+            .entry(row.queue_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    by_queue
+        .into_values()
+        .map(|mut shard_rows| {
+            shard_rows.sort_by_key(|(shard_id, _)| *shard_id);
+
+            // Deterministic top-level summary: the hold that started first.
+            // Tie-broken by shard id so the choice never depends on fan-out order.
+            let earliest = shard_rows
+                .iter()
+                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+                .map(|(_, row)| row)
+                .expect("group is non-empty by construction");
+
+            let uniform = shard_rows.iter().all(|(_, row)| {
+                row.reason == earliest.reason
+                    && row.paused_by == earliest.paused_by
+                    && row.scope_shard_id == earliest.scope_shard_id
+            });
+            let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
+
+            serde_json::json!({
+                "queue_name": earliest.queue_name,
+                "reason": earliest.reason,
+                "paused_by": earliest.paused_by,
+                "paused_at": earliest.paused_at,
+                "scope_shard_id": earliest.scope_shard_id,
+                "held_task_count": held_total,
+                "provenance_uniform": uniform,
+                "shards": shard_rows
+                    .iter()
+                    .map(|(shard_id, row)| serde_json::json!({
+                        "shard_id": shard_id,
+                        "reason": row.reason,
+                        "paused_by": row.paused_by,
+                        "paused_at": row.paused_at,
+                        "scope_shard_id": row.scope_shard_id,
+                        "held_task_count": row.held_task_count,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 async fn prometheus_metrics(
@@ -35229,6 +35278,123 @@ mod tests {
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    // ── #619 per-shard pause provenance merge (pure, no DB) ────────────────
+    fn paused_row(
+        queue: &str,
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::queue_pause::PausedQueue {
+        ::autumn_harvest::queue_pause::PausedQueue {
+            queue_name: queue.to_string(),
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    /// The ordinary fleet-wide hold: one entry, counts summed, every shard
+    /// listed, and `provenance_uniform` true even though each shard stamped its
+    /// own `paused_at`.
+    #[test]
+    fn merge_paused_queues_collapses_a_uniform_fleet_wide_hold() {
+        let merged = merge_paused_queue_rows(vec![
+            (
+                0,
+                paused_row("payments", "stripe outage", "alice", 30, None, 4),
+            ),
+            (
+                1,
+                paused_row("payments", "stripe outage", "alice", 29, None, 6),
+            ),
+        ]);
+        assert_eq!(merged.len(), 1, "one hold must read as one entry");
+        let e = &merged[0];
+        assert_eq!(e["queue_name"], "payments");
+        assert_eq!(e["reason"], "stripe outage");
+        assert_eq!(e["held_task_count"], 10, "held counts must be summed");
+        assert_eq!(
+            e["provenance_uniform"], true,
+            "per-shard paused_at always differs (each shard stamps its own \
+             NOW()), so it must not make a healthy fleet-wide hold look divergent"
+        );
+        assert_eq!(e["shards"].as_array().expect("shards").len(), 2);
+    }
+
+    /// Divergent provenance must not be silently dropped.
+    ///
+    /// This state is produced by our own idempotency rule: a re-pause preserves
+    /// the ORIGINAL reason/actor, so a fleet-wide hold landing over a
+    /// pre-existing shard-scoped hold leaves that shard telling a different
+    /// story. Showing only one of them would hand the operator a reason and
+    /// scope that are not true for part of the fleet.
+    #[test]
+    fn merge_paused_queues_preserves_divergent_per_shard_provenance() {
+        let merged = merge_paused_queue_rows(vec![
+            // Later fleet-wide hold on shard 1...
+            (
+                1,
+                paused_row("payments", "fleet-wide freeze", "bob", 10, None, 2),
+            ),
+            // ...over an OLDER shard-scoped hold on shard 0, whose provenance
+            // the idempotent re-pause deliberately preserved.
+            (
+                0,
+                paused_row("payments", "shard-0 provider down", "alice", 90, Some(0), 5),
+            ),
+        ]);
+        assert_eq!(merged.len(), 1);
+        let e = &merged[0];
+        assert_eq!(
+            e["provenance_uniform"], false,
+            "the shards disagree, and a single boolean is what lets a script \
+             notice that in one field"
+        );
+        assert_eq!(
+            e["reason"], "shard-0 provider down",
+            "the top-level summary must be the EARLIEST hold -- a deterministic \
+             rule, not whichever shard the fan-out happened to reach first"
+        );
+        assert_eq!(e["scope_shard_id"], 0);
+        assert_eq!(e["held_task_count"], 7);
+
+        let shards = e["shards"].as_array().expect("shards");
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0]["shard_id"], 0, "shards must be ordered by id");
+        assert_eq!(shards[0]["reason"], "shard-0 provider down");
+        assert_eq!(shards[0]["scope_shard_id"], 0);
+        assert_eq!(shards[1]["shard_id"], 1);
+        assert_eq!(
+            shards[1]["reason"], "fleet-wide freeze",
+            "each shard's own reason must survive the merge"
+        );
+        assert_eq!(shards[1]["held_task_count"], 2);
+    }
+
+    /// Two independently-held queues stay two entries, keyed by queue name.
+    #[test]
+    fn merge_paused_queues_keeps_distinct_queues_separate() {
+        let merged = merge_paused_queue_rows(vec![
+            (0, paused_row("email", "sendgrid down", "carol", 5, None, 1)),
+            (
+                0,
+                paused_row("payments", "stripe outage", "alice", 5, None, 2),
+            ),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["queue_name"], "email");
+        assert_eq!(merged[1]["queue_name"], "payments");
+    }
+
+    #[test]
+    fn merge_paused_queues_is_empty_when_nothing_is_held() {
+        assert!(merge_paused_queue_rows(Vec::new()).is_empty());
+    }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values
