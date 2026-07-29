@@ -735,3 +735,58 @@ async fn an_oversized_reason_is_truncated_not_stored_whole() {
         stored.len()
     );
 }
+
+/// An idempotent re-pause must echo the hold that is actually in effect —
+/// including its **scope** (issue #619 review, Codex).
+///
+/// `pause_queue` deliberately preserves the ORIGINAL provenance on a re-pause,
+/// and the handler already echoes the preserved `reason`/`paused_by`/`paused_at`.
+/// The scope must travel with them: re-pausing a shard-scoped hold with a
+/// fleet-wide request previously reported `scope_shard_id: null` alongside
+/// `newly_paused: false` and the original reason — describing a hold that
+/// covers one shard as though it covered the fleet, which is exactly the
+/// mis-read that lets an operator believe an outage is contained when it is not.
+#[tokio::test]
+async fn an_idempotent_repause_echoes_the_effective_scope_not_the_request() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Original hold: scoped to shard 0.
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/pause",
+        json!({ "reason": "shard-0 provider degraded", "shard_id": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first pause must apply: {body}");
+    assert_eq!(body["newly_paused"], true);
+    assert_eq!(body["scope_shard_id"], 0);
+
+    // Re-pause with NO shard_id (a fleet-wide request). The core preserves the
+    // original row, so the response must describe THAT row, not this request.
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/pause",
+        json!({ "reason": "different reason, ignored on a no-op" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "re-pause is an idempotent no-op: {body}"
+    );
+    assert_eq!(
+        body["newly_paused"], false,
+        "the queue was already held, so nothing transitioned: {body}"
+    );
+    assert_eq!(
+        body["reason"], "shard-0 provider degraded",
+        "the ORIGINAL reason is preserved (pre-existing contract): {body}"
+    );
+    assert_eq!(
+        body["scope_shard_id"], 0,
+        "the effective scope must be preserved alongside the reason -- reporting \
+         null here would describe a shard-scoped hold as fleet-wide: {body}"
+    );
+}

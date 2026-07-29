@@ -28033,7 +28033,12 @@ async fn pause_queue_handler(
         "reason": effective.reason,
         "paused_by": effective.paused_by,
         "paused_at": effective.paused_at,
-        "scope_shard_id": request.shard_id,
+        // The EFFECTIVE scope, not the request's. `pause_queue` preserves the
+        // original row on an idempotent re-pause, so echoing `request.shard_id`
+        // here would pair the preserved reason/actor/time with this request's
+        // scope -- describing a shard-scoped hold as fleet-wide (issue #619
+        // review).
+        "scope_shard_id": effective.scope_shard_id,
         "held_task_count": held_task_count,
     });
     queue_pause_attach_partial(&mut payload, partial);

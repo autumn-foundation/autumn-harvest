@@ -2531,59 +2531,102 @@ pub(crate) struct PausedQueueBannerRow {
     pub reason: String,
     pub paused_by: String,
     pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub scope_shard_id: Option<i32>,
     pub held_task_count: i64,
+    /// False when the shards holding this queue disagree on
+    /// `(reason, paused_by, scope_shard_id)` — the displayed provenance then
+    /// describes only part of the fleet and the banner says so.
+    pub provenance_uniform: bool,
 }
 
 /// Merge per-shard paused-queue rows into one banner row per queue name.
 ///
-/// Held counts are summed across shards; the earliest `paused_at` wins (it is
-/// the one an operator reasons about — "how long has this been held?"), and its
-/// shard's `reason`/`paused_by` are shown with it so the provenance is coherent.
-/// Rows are sorted by queue name so the banner is stable across refreshes.
+/// Held counts are summed across shards. The top-level provenance is the
+/// **earliest** hold (the one an operator reasons about — "how long has this
+/// been held?"), tie-broken by shard id so the choice never depends on
+/// fan-out order. Rows are sorted by queue name so the banner is stable
+/// across refreshes.
+///
+/// The shards' rows are **not** guaranteed to agree: `pause_queue` is
+/// idempotent and preserves the *original* reason and operator on a re-pause,
+/// and the `shard_id` parameter explicitly supports holding the same queue on
+/// two shards separately. Summing every shard's held tasks under a single
+/// shard's reason would then tell the operator a story that is simply not true
+/// for part of the fleet, so `provenance_uniform` records the disagreement and
+/// `render_paused_queues_banner` marks it visibly.
+///
+/// The uniformity rule is identical to the one `GET /admin/queues/paused` uses
+/// (`api::merge_paused_queue_rows`) — including comparing
+/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`,
+/// since each shard stamps its own `NOW()` — so the two surfaces can never
+/// disagree about whether a hold is uniform.
 pub(crate) fn merge_paused_queue_banner_rows(
-    per_shard: Vec<autumn_harvest::queue_pause::PausedQueue>,
+    per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
 ) -> Vec<PausedQueueBannerRow> {
-    let mut merged: std::collections::BTreeMap<String, PausedQueueBannerRow> =
-        std::collections::BTreeMap::new();
-    for row in per_shard {
-        merged
+    let mut by_queue: std::collections::BTreeMap<
+        String,
+        Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in per_shard {
+        by_queue
             .entry(row.queue_name.clone())
-            .and_modify(|existing| {
-                existing.held_task_count += row.held_task_count;
-                if row.paused_at < existing.paused_at {
-                    existing.paused_at = row.paused_at;
-                    existing.reason.clone_from(&row.reason);
-                    existing.paused_by.clone_from(&row.paused_by);
-                }
-            })
-            .or_insert_with(|| PausedQueueBannerRow {
-                queue_name: row.queue_name,
-                reason: row.reason,
-                paused_by: row.paused_by,
-                paused_at: row.paused_at,
-                held_task_count: row.held_task_count,
-            });
+            .or_default()
+            .push((shard_id, row));
     }
-    merged.into_values().collect()
+
+    by_queue
+        .into_values()
+        .map(|shard_rows| {
+            let earliest = shard_rows
+                .iter()
+                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+                .map(|(_, row)| row)
+                .expect("group is non-empty by construction");
+            let provenance_uniform = shard_rows.iter().all(|(_, row)| {
+                row.reason == earliest.reason
+                    && row.paused_by == earliest.paused_by
+                    && row.scope_shard_id == earliest.scope_shard_id
+            });
+            PausedQueueBannerRow {
+                queue_name: earliest.queue_name.clone(),
+                reason: earliest.reason.clone(),
+                paused_by: earliest.paused_by.clone(),
+                paused_at: earliest.paused_at,
+                scope_shard_id: earliest.scope_shard_id,
+                held_task_count: shard_rows.iter().map(|(_, row)| row.held_task_count).sum(),
+                provenance_uniform,
+            }
+        })
+        .collect()
 }
 
 /// Render the paused-queues banner (issue #619). Empty when nothing is paused,
 /// so a healthy fleet page is byte-identical to before.
+///
+/// A row whose shards disagree on provenance is marked "mixed across shards"
+/// rather than silently attributing the fleet-wide held total to one shard's
+/// reason and operator — see [`merge_paused_queue_banner_rows`].
 pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Markup {
     if rows.is_empty() {
         return html! {};
     }
     let held_total: i64 = rows.iter().map(|r| r.held_task_count).sum();
+    let mixed = rows.iter().filter(|r| !r.provenance_uniform).count();
     html! {
         div.banner.Degraded {
             strong { "Queue dispatch paused" }
             " — "
             (rows.len()) " queue(s) held | " (held_total) " task(s) waiting"
+            @if mixed > 0 {
+                " | " (mixed) " with mixed provenance across shards \
+                       (see GET /admin/queues/paused for the per-shard holds)"
+            }
         }
         table {
             thead {
                 tr {
                     th { "Queue" }
+                    th { "Scope" }
                     th { "Held tasks" }
                     th { "Paused at" }
                     th { "By" }
@@ -2594,10 +2637,22 @@ pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Mark
                 @for row in rows {
                     tr {
                         td { code { (row.queue_name) } }
+                        td {
+                            @match row.scope_shard_id {
+                                Some(shard) => { "shard " (shard) }
+                                None => { "fleet-wide" }
+                            }
+                        }
                         td { (row.held_task_count) }
                         td { (row.paused_at.to_rfc3339()) }
-                        td { (row.paused_by) }
-                        td { (row.reason) }
+                        td {
+                            (row.paused_by)
+                            @if !row.provenance_uniform { " (mixed across shards)" }
+                        }
+                        td {
+                            (row.reason)
+                            @if !row.provenance_uniform { " (mixed across shards)" }
+                        }
                     }
                 }
             }
@@ -2612,19 +2667,25 @@ pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Mark
 async fn load_paused_queues_from_shards(pool: &crate::HarvestDbPool) -> Vec<PausedQueueBannerRow> {
     let futs: Vec<_> = pool
         .iter_shards()
-        .map(|(_shard_id, shard_pool)| async move {
+        .map(|(shard_id, shard_pool)| async move {
             let mut conn = acquire_conn(shard_pool).await.ok()?;
-            autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+            let rows = autumn_harvest::queue_pause::list_paused_queues(&mut conn)
                 .await
-                .ok()
+                .ok()?;
+            Some(
+                rows.into_iter()
+                    .map(|row| (shard_id.as_i32(), row))
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect();
-    let per_shard: Vec<autumn_harvest::queue_pause::PausedQueue> = futures::future::join_all(futs)
-        .await
-        .into_iter()
-        .flatten()
-        .flatten()
-        .collect();
+    let per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)> =
+        futures::future::join_all(futs)
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
     merge_paused_queue_banner_rows(per_shard)
 }
 
@@ -8655,13 +8716,20 @@ mod tests {
             reason: "SMTP provider outage".to_string(),
             paused_by: "alice".to_string(),
             paused_at: chrono::Utc::now(),
+            scope_shard_id: None,
             held_task_count: 42,
+            provenance_uniform: true,
         }];
         let html = render_paused_queues_banner(&rows).into_string();
         assert!(html.contains("email-workers"), "queue name: {html}");
         assert!(html.contains("SMTP provider outage"), "reason: {html}");
         assert!(html.contains("alice"), "actor: {html}");
         assert!(html.contains("42"), "held count: {html}");
+        assert!(html.contains("fleet-wide"), "scope: {html}");
+        assert!(
+            !html.contains("mixed across shards"),
+            "a uniform hold must NOT be marked mixed: {html}"
+        );
     }
 
     /// AC7: pause is fleet-wide by default, so the same queue paused on two
@@ -8671,22 +8739,28 @@ mod tests {
         let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
         let later = chrono::Utc::now();
         let merged = merge_paused_queue_banner_rows(vec![
-            autumn_harvest::queue_pause::PausedQueue {
-                queue_name: "email-workers".to_string(),
-                reason: "later shard".to_string(),
-                paused_by: "bob".to_string(),
-                paused_at: later,
-                scope_shard_id: Some(1),
-                held_task_count: 3,
-            },
-            autumn_harvest::queue_pause::PausedQueue {
-                queue_name: "email-workers".to_string(),
-                reason: "earliest pause wins".to_string(),
-                paused_by: "alice".to_string(),
-                paused_at: earlier,
-                scope_shard_id: Some(0),
-                held_task_count: 4,
-            },
+            (
+                1,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "email-workers".to_string(),
+                    reason: "later shard".to_string(),
+                    paused_by: "bob".to_string(),
+                    paused_at: later,
+                    scope_shard_id: Some(1),
+                    held_task_count: 3,
+                },
+            ),
+            (
+                0,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "email-workers".to_string(),
+                    reason: "earliest pause wins".to_string(),
+                    paused_by: "alice".to_string(),
+                    paused_at: earlier,
+                    scope_shard_id: Some(0),
+                    held_task_count: 4,
+                },
+            ),
         ]);
         assert_eq!(merged.len(), 1, "one row per queue name");
         assert_eq!(
@@ -8704,6 +8778,97 @@ mod tests {
         assert_eq!(merged[0].paused_by, "alice");
     }
 
+    /// Issue #619 review: two shards holding the same queue with *different*
+    /// reasons/actors is a supported case (`shard_id` scoping, plus the
+    /// idempotent re-pause that preserves the original provenance). The banner
+    /// sums both shards' held tasks, so labelling that fleet-wide total with
+    /// only one shard's story would tell the operator something untrue about
+    /// the rest of the fleet. It must be flagged instead.
+    #[test]
+    fn divergent_shard_provenance_is_flagged_and_visibly_marked() {
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let later = chrono::Utc::now();
+        let merged = merge_paused_queue_banner_rows(vec![
+            (
+                0,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "payments".to_string(),
+                    reason: "shard-0 provider degraded".to_string(),
+                    paused_by: "alice".to_string(),
+                    paused_at: earlier,
+                    scope_shard_id: Some(0),
+                    held_task_count: 4,
+                },
+            ),
+            (
+                1,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "payments".to_string(),
+                    reason: "shard-1 unrelated incident".to_string(),
+                    paused_by: "bob".to_string(),
+                    paused_at: later,
+                    scope_shard_id: Some(1),
+                    held_task_count: 9,
+                },
+            ),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].held_task_count, 13, "the total is fleet-wide");
+        assert!(
+            !merged[0].provenance_uniform,
+            "the shards disagree on reason, actor AND scope"
+        );
+
+        let html = render_paused_queues_banner(&merged).into_string();
+        assert!(
+            html.contains("mixed across shards"),
+            "divergent provenance must be visible, not silently attributed to \
+             one shard: {html}"
+        );
+        assert!(
+            html.contains("mixed provenance across shards"),
+            "the banner summary must count the divergent queue(s): {html}"
+        );
+    }
+
+    /// The uniformity rule must match `api::merge_paused_queue_rows` exactly,
+    /// including comparing `(reason, paused_by, scope_shard_id)` and NOT
+    /// `paused_at` — each shard stamps its own `NOW()`, so a fleet-wide hold
+    /// whose shards agree on the story must never be flagged as mixed.
+    #[test]
+    fn differing_paused_at_alone_does_not_flag_divergence() {
+        let merged = merge_paused_queue_banner_rows(vec![
+            (
+                0,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "payments".to_string(),
+                    reason: "provider outage".to_string(),
+                    paused_by: "alice".to_string(),
+                    paused_at: chrono::Utc::now() - chrono::Duration::seconds(3),
+                    scope_shard_id: None,
+                    held_task_count: 2,
+                },
+            ),
+            (
+                1,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "payments".to_string(),
+                    reason: "provider outage".to_string(),
+                    paused_by: "alice".to_string(),
+                    paused_at: chrono::Utc::now(),
+                    scope_shard_id: None,
+                    held_task_count: 5,
+                },
+            ),
+        ]);
+        assert!(
+            merged[0].provenance_uniform,
+            "a fleet-wide hold's per-shard NOW() skew is not a divergence"
+        );
+        let html = render_paused_queues_banner(&merged).into_string();
+        assert!(!html.contains("mixed across shards"), "{html}");
+    }
+
     /// Merged rows are sorted by queue name so the banner is stable across
     /// refreshes (shard iteration order must not shuffle it).
     #[test]
@@ -8717,7 +8882,8 @@ mod tests {
             scope_shard_id: None,
             held_task_count: 1,
         };
-        let merged = merge_paused_queue_banner_rows(vec![mk("zeta"), mk("alpha"), mk("mid")]);
+        let merged =
+            merge_paused_queue_banner_rows(vec![(0, mk("zeta")), (0, mk("alpha")), (0, mk("mid"))]);
         let names: Vec<&str> = merged.iter().map(|r| r.queue_name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }

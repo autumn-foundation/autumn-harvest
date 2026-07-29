@@ -6654,7 +6654,7 @@
       "category": "admin",
       "read_only": false,
       "description": "Hold dispatch on a named task queue during a scoped downstream outage (issue #619). While paused, no worker claims NEW tasks from the queue; held tasks stay PENDING and are never failed, retried, or dead-lettered, and an already-RUNNING task finishes naturally. The relative `schedule_to_start` timer is suspended for held tasks; the absolute `schedule_to_close` deadline (issue #378) keeps ticking, so a long hold can still time out work carrying one \u2014 a pause is not an SLA extension. Idempotent: re-pausing an already-paused queue is a 200 no-op that preserves the original reason and operator (`newly_paused: false`). The operator `reason` is truncated to 500 characters at the API boundary. A partially-applied fleet-wide hold is reported as 207, not 200 \u2014 see the success-response notes. Admin only; audited as `queue.pause`, including rejected attempts.",
-      "idempotency": "Re-pausing an already-paused queue returns 200 with `newly_paused: false` and preserves the original reason, operator and `paused_at`.",
+      "idempotency": "Re-pausing an already-paused queue returns 200 with `newly_paused: false` and preserves the original reason, operator, `paused_at` AND `scope_shard_id`. The response always describes the hold that is actually in effect, not the request: re-pausing a shard-scoped hold with a fleet-wide request reports the preserved `scope_shard_id`, never `null`.",
       "params": [
         {
           "name": "queue_name",
