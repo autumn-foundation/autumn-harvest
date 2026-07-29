@@ -27978,6 +27978,54 @@ fn summarise_resume_provenance(
     }
 }
 
+/// Build the durable audit `error_summary` for a queue pause/resume, carrying
+/// the effective **reason** alongside any partial-failure text.
+///
+/// `harvest_queue_pauses` holds the reason only while the hold is in effect —
+/// a resume `DELETE`s the row — so without this the audit trail could say who
+/// paused a queue but never *why*, which is precisely the question a
+/// post-incident review asks. `harvest_audit_log` has no metadata/details
+/// column, and adding one would touch all ~188 `NewAuditRecord` construction
+/// sites for a shared primitive (out of scope here), so the reason is carried
+/// in the one free-text field the record already has. It is labelled so the
+/// two contributions stay distinguishable, and the reason is already bounded by
+/// [`truncate_operator_reason`] at the request boundary.
+///
+/// `error_summary` is non-`None` on a fully successful pause as a result. That
+/// is deliberate: `status` (`STATUS_SUCCEEDED` / `STATUS_FAILED`) remains the
+/// outcome discriminator, and the labelled prefixes keep a `reason:` context
+/// row from reading as a failure.
+fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        parts.push(format!("reason: {reason}"));
+    }
+    if let Some(partial) = partial.map(str::trim).filter(|p| !p.is_empty()) {
+        parts.push(format!("failures: {partial}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// The reason released by a resume, rendered for the audit trail.
+///
+/// The resume `DELETE`s the pause row, so this audit row plus the response body
+/// are the only surviving record of the hold's provenance. When the released
+/// shards disagree the summary is explicitly marked non-uniform rather than
+/// silently presenting one shard's story as the fleet's.
+fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String> {
+    let reason = provenance.released_reason.as_deref()?;
+    let by = provenance
+        .released_paused_by
+        .as_deref()
+        .unwrap_or("unknown");
+    let qualifier = if provenance.uniform {
+        ""
+    } else {
+        " (shards disagreed; longest hold shown)"
+    };
+    Some(format!("released hold by {by}: {reason}{qualifier}"))
+}
+
 /// Best-effort audit row for a queue pause/resume.
 ///
 /// Written on the first reachable target shard — the operation is a fleet-wide
@@ -28125,7 +28173,7 @@ async fn pause_queue_handler(
             &canonical_queue,
             request.shard_id,
             STATUS_FAILED,
-            Some(summary.as_str()),
+            queue_pause_audit_context(Some(&reason), Some(summary.as_str())).as_deref(),
         )
         .await;
         return AutumnError::internal_server_error_msg(format!("queue pause failed: {summary}"))
@@ -28133,6 +28181,9 @@ async fn pause_queue_handler(
     };
 
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // Carry the operator's reason into the audit row: the pause row that holds
+    // it is deleted on resume, so this is its only permanent home.
+    let audit_context = queue_pause_audit_context(Some(&reason), partial.as_deref());
     write_queue_pause_audit(
         &targets,
         &actor,
@@ -28147,7 +28198,7 @@ async fn pause_queue_handler(
         } else {
             STATUS_SUCCEEDED
         },
-        partial.as_deref(),
+        audit_context.as_deref(),
     )
     .await;
 
@@ -28228,16 +28279,11 @@ async fn resume_queue_handler(
     };
     let (actor, source, request_id) = audit;
 
-    let ResumeApplication {
-        newly_resumed,
-        released_task_count,
-        paused_duration_secs,
-        per_shard,
-        any_ok,
-    } = apply_resume_across_shards(&targets, &canonical_queue, &actor, &mut failures).await;
-    let provenance = summarise_resume_provenance(&per_shard);
+    let applied =
+        apply_resume_across_shards(&targets, &canonical_queue, &actor, &mut failures).await;
+    let provenance = summarise_resume_provenance(&applied.per_shard);
 
-    if !any_ok {
+    if !applied.any_ok {
         let summary = failures.join("; ");
         write_queue_pause_audit(
             &targets,
@@ -28249,7 +28295,11 @@ async fn resume_queue_handler(
             &canonical_queue,
             request.shard_id,
             STATUS_FAILED,
-            Some(summary.as_str()),
+            queue_pause_audit_context(
+                resume_released_audit_reason(&provenance).as_deref(),
+                Some(summary.as_str()),
+            )
+            .as_deref(),
         )
         .await;
         return AutumnError::internal_server_error_msg(format!("queue resume failed: {summary}"))
@@ -28262,6 +28312,12 @@ async fn resume_queue_handler(
     // complete while a backlog silently sits frozen, so it is surfaced with the
     // same 207 / `status` vocabulary as a partial pause.
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    // The resume DELETEs the pause row, so record what was released here: this
+    // audit row and the response body are the only surviving record of it.
+    let audit_context = queue_pause_audit_context(
+        resume_released_audit_reason(&provenance).as_deref(),
+        partial.as_deref(),
+    );
     write_queue_pause_audit(
         &targets,
         &actor,
@@ -28276,18 +28332,31 @@ async fn resume_queue_handler(
         } else {
             STATUS_SUCCEEDED
         },
-        partial.as_deref(),
+        audit_context.as_deref(),
     )
     .await;
 
+    resume_queue_response(&canonical_queue, &applied, &provenance, partial)
+}
+
+/// Build the `POST /admin/queues/{queue_name}/resume` response body.
+///
+/// Split out of the handler so the (already long) handler stays under the
+/// line cap; the response shape is also the interesting part to read on its own.
+fn resume_queue_response(
+    canonical_queue: &str,
+    applied: &ResumeApplication,
+    provenance: &ResumeProvenance,
+    partial: Option<String>,
+) -> axum::response::Response {
     let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
     let mut payload = serde_json::json!({
         "ok": ok,
         "status": status,
         "queue_name": canonical_queue,
-        "newly_resumed": newly_resumed,
-        "released_task_count": released_task_count,
-        "paused_duration_secs": paused_duration_secs,
+        "newly_resumed": applied.newly_resumed,
+        "released_task_count": applied.released_task_count,
+        "paused_duration_secs": applied.paused_duration_secs,
         // The resume DELETES the pause rows, so this is the only surviving
         // record of what was released. The summary describes the LONGEST hold
         // (the same shard `paused_duration_secs` reports, so the two are
@@ -28324,8 +28393,17 @@ async fn list_paused_queues_handler(
 
     let collected = shard_fanout::collect_fanout_rows(observations);
 
+    // A fleet-wide pause that only reached some shards persists
+    // `scope_shard_id = NULL` on the shards it reached and no row on the ones it
+    // missed, so real coverage is derived from the EXPECTED shard set rather
+    // than the stored intent (issue #619 review).
+    let pools = shard_fanout::pools_by_shard(&api_state);
+    let expected: Vec<i32> = shard_fanout::expected_shards(&api_state, &pools)
+        .into_iter()
+        .collect();
+
     Ok(Json(serde_json::json!({
-        "paused_queues": merge_paused_queue_rows(collected.rows),
+        "paused_queues": merge_paused_queue_rows(collected.rows, &expected),
         "status": collected.status,
         "unavailable_shards": collected.unavailable_shards,
     })))
@@ -28352,8 +28430,17 @@ async fn list_paused_queues_handler(
 /// Uniformity compares `(reason, paused_by, scope_shard_id)` and deliberately
 /// **not** `paused_at`: each shard stamps its own `NOW()`, so including it would
 /// report almost every healthy fleet-wide hold as divergent.
+///
+/// `effective_scope` is derived from `expected_shards` rather than from the
+/// stored `scope_shard_id`, because a fleet-wide pause that only reached some
+/// shards writes `scope_shard_id = NULL` on the shards it reached and **no row**
+/// on the ones it missed — so intent alone cannot distinguish a complete hold
+/// from a partially-applied one that leaves part of the fleet dispatching
+/// (issue #619 review). `scope_shard_id` is still reported verbatim as the
+/// recorded intent.
 fn merge_paused_queue_rows(
     rows: Vec<(i32, ::autumn_harvest::queue_pause::PausedQueue)>,
+    expected_shards: &[i32],
 ) -> Vec<Value> {
     let mut by_queue: std::collections::BTreeMap<
         String,
@@ -28386,12 +28473,24 @@ fn merge_paused_queue_rows(
             });
             let held_total: i64 = shard_rows.iter().map(|(_, row)| row.held_task_count).sum();
 
+            let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+            let scopes: Vec<Option<i32>> = shard_rows
+                .iter()
+                .map(|(_, row)| row.scope_shard_id)
+                .collect();
+            let coverage = ::autumn_harvest::queue_pause::classify_pause_coverage(
+                &holding,
+                &scopes,
+                expected_shards,
+            );
+
             serde_json::json!({
                 "queue_name": earliest.queue_name,
                 "reason": earliest.reason,
                 "paused_by": earliest.paused_by,
                 "paused_at": earliest.paused_at,
                 "scope_shard_id": earliest.scope_shard_id,
+                "effective_scope": coverage,
                 "held_task_count": held_total,
                 "provenance_uniform": uniform,
                 "shards": shard_rows
@@ -35446,16 +35545,19 @@ mod tests {
     /// own `paused_at`.
     #[test]
     fn merge_paused_queues_collapses_a_uniform_fleet_wide_hold() {
-        let merged = merge_paused_queue_rows(vec![
-            (
-                0,
-                paused_row("payments", "stripe outage", "alice", 30, None, 4),
-            ),
-            (
-                1,
-                paused_row("payments", "stripe outage", "alice", 29, None, 6),
-            ),
-        ]);
+        let merged = merge_paused_queue_rows(
+            vec![
+                (
+                    0,
+                    paused_row("payments", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_row("payments", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
         assert_eq!(merged.len(), 1, "one hold must read as one entry");
         let e = &merged[0];
         assert_eq!(e["queue_name"], "payments");
@@ -35478,19 +35580,22 @@ mod tests {
     /// scope that are not true for part of the fleet.
     #[test]
     fn merge_paused_queues_preserves_divergent_per_shard_provenance() {
-        let merged = merge_paused_queue_rows(vec![
-            // Later fleet-wide hold on shard 1...
-            (
-                1,
-                paused_row("payments", "fleet-wide freeze", "bob", 10, None, 2),
-            ),
-            // ...over an OLDER shard-scoped hold on shard 0, whose provenance
-            // the idempotent re-pause deliberately preserved.
-            (
-                0,
-                paused_row("payments", "shard-0 provider down", "alice", 90, Some(0), 5),
-            ),
-        ]);
+        let merged = merge_paused_queue_rows(
+            vec![
+                // Later fleet-wide hold on shard 1...
+                (
+                    1,
+                    paused_row("payments", "fleet-wide freeze", "bob", 10, None, 2),
+                ),
+                // ...over an OLDER shard-scoped hold on shard 0, whose provenance
+                // the idempotent re-pause deliberately preserved.
+                (
+                    0,
+                    paused_row("payments", "shard-0 provider down", "alice", 90, Some(0), 5),
+                ),
+            ],
+            &[0, 1],
+        );
         assert_eq!(merged.len(), 1);
         let e = &merged[0];
         assert_eq!(
@@ -35681,13 +35786,16 @@ mod tests {
     /// Two independently-held queues stay two entries, keyed by queue name.
     #[test]
     fn merge_paused_queues_keeps_distinct_queues_separate() {
-        let merged = merge_paused_queue_rows(vec![
-            (0, paused_row("email", "sendgrid down", "carol", 5, None, 1)),
-            (
-                0,
-                paused_row("payments", "stripe outage", "alice", 5, None, 2),
-            ),
-        ]);
+        let merged = merge_paused_queue_rows(
+            vec![
+                (0, paused_row("email", "sendgrid down", "carol", 5, None, 1)),
+                (
+                    0,
+                    paused_row("payments", "stripe outage", "alice", 5, None, 2),
+                ),
+            ],
+            &[0],
+        );
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0]["queue_name"], "email");
         assert_eq!(merged[1]["queue_name"], "payments");
@@ -35695,7 +35803,127 @@ mod tests {
 
     #[test]
     fn merge_paused_queues_is_empty_when_nothing_is_held() {
-        assert!(merge_paused_queue_rows(Vec::new()).is_empty());
+        assert!(merge_paused_queue_rows(Vec::new(), &[0]).is_empty());
+    }
+
+    /// Issue #619 review: `effective_scope` must be derived from the shards that
+    /// actually hold the queue, not from the stored `scope_shard_id`.
+    ///
+    /// A fleet-wide pause that only reached some shards writes
+    /// `scope_shard_id = NULL` on the shards it reached and **no row** on the
+    /// ones it missed — so the stored intent is byte-identical to a complete
+    /// hold, while the missed shards keep dispatching.
+    #[test]
+    fn effective_scope_reflects_real_coverage_not_stored_intent() {
+        // One of two expected shards holds it: intent says fleet, reality does not.
+        let partial = merge_paused_queue_rows(
+            vec![(
+                0,
+                paused_row("payments", "stripe outage", "alice", 30, None, 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(
+            partial[0]["effective_scope"], "partial_fleet",
+            "a partially-applied fleet-wide hold must be reported as such"
+        );
+        assert_eq!(
+            partial[0]["scope_shard_id"],
+            serde_json::Value::Null,
+            "the recorded intent is still reported verbatim"
+        );
+
+        // Both expected shards hold it: the same intent now really is fleet-wide.
+        let complete = merge_paused_queue_rows(
+            vec![
+                (
+                    0,
+                    paused_row("payments", "stripe outage", "alice", 30, None, 4),
+                ),
+                (
+                    1,
+                    paused_row("payments", "stripe outage", "alice", 29, None, 6),
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(complete[0]["effective_scope"], "fleet");
+
+        // A deliberately shard-scoped hold is not "partially applied".
+        let scoped = merge_paused_queue_rows(
+            vec![(
+                0,
+                paused_row("payments", "shard-0 only", "alice", 30, Some(0), 4),
+            )],
+            &[0, 1],
+        );
+        assert_eq!(scoped[0]["effective_scope"], "shard");
+    }
+
+    /// Issue #619 review: the operator's reason must reach the durable audit
+    /// row, because `harvest_queue_pauses` (its only other home) is `DELETE`d on
+    /// resume — leaving a post-incident review able to see *who* paused a queue
+    /// but never *why*.
+    #[test]
+    fn pause_audit_context_carries_the_reason_on_full_success() {
+        let ctx = queue_pause_audit_context(Some("stripe outage"), None)
+            .expect("a fully successful pause must still record its reason");
+        assert_eq!(ctx, "reason: stripe outage");
+    }
+
+    /// The reason and any partial-failure text are both preserved, and stay
+    /// distinguishable — `status` remains the outcome discriminator.
+    #[test]
+    fn pause_audit_context_labels_reason_and_failures_separately() {
+        let ctx = queue_pause_audit_context(Some("stripe outage"), Some("shard 1: no pool"))
+            .expect("both contributions present");
+        assert_eq!(ctx, "reason: stripe outage | failures: shard 1: no pool");
+
+        // Failure-only (a resume that released nothing) keeps today's shape,
+        // just labelled.
+        assert_eq!(
+            queue_pause_audit_context(None, Some("shard 1: no pool")).as_deref(),
+            Some("failures: shard 1: no pool")
+        );
+        // Nothing to say stays None rather than writing an empty string.
+        assert!(queue_pause_audit_context(None, None).is_none());
+        assert!(queue_pause_audit_context(Some("   "), Some("")).is_none());
+    }
+
+    /// A resume deletes the pause row, so the audit row must capture what it
+    /// released — including an explicit marker when the shards disagreed.
+    #[test]
+    fn resume_audit_reason_records_the_released_hold() {
+        let uniform = summarise_resume_provenance(&[(
+            0,
+            resume_outcome(Some("stripe outage"), Some("alice"), 60, 4),
+        )]);
+        assert_eq!(
+            resume_released_audit_reason(&uniform).as_deref(),
+            Some("released hold by alice: stripe outage")
+        );
+
+        let divergent = summarise_resume_provenance(&[
+            (
+                0,
+                resume_outcome(Some("shard-0 hold"), Some("alice"), 900, 1),
+            ),
+            (1, resume_outcome(Some("fleet freeze"), Some("bob"), 60, 2)),
+        ]);
+        let rendered = resume_released_audit_reason(&divergent).expect("a hold was released");
+        assert!(
+            rendered.contains("shard-0 hold") && rendered.contains("alice"),
+            "the longest hold's own story must be the one shown; got {rendered}"
+        );
+        assert!(
+            rendered.contains("shards disagreed"),
+            "a divergent release must say so rather than presenting one shard's \
+             reason as the fleet's; got {rendered}"
+        );
+
+        // Releasing nothing records nothing.
+        let noop = summarise_resume_provenance(&[(0, resume_outcome(None, None, 0, 0))]);
+        assert!(resume_released_audit_reason(&noop).is_none());
     }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {

@@ -172,30 +172,54 @@ pub const fn release_claim_if_queue_paused_query() -> &'static str {
 /// [`MAX_QUEUE_NAME_LEN`]. Pure — no database access — so the management API
 /// can reject a typo with a `400` before touching a connection.
 ///
-/// The returned name is **trimmed**, and every read and write in this module
-/// uses that canonical form. Validating a trimmed name while storing the raw
-/// one would be a silent no-op pause: the anti-join matches on exact equality,
-/// so a stray trailing space from a copy-paste (`--queue "payments "`) would
-/// insert a row matching no task, and the API would report a successful hold
-/// (`newly_paused: true`, `held_task_count: 0`) on a queue that keeps
-/// dispatching.
+/// Surrounding whitespace is **rejected**, not trimmed, and the name is
+/// otherwise used verbatim by every read and write in this module.
+///
+/// Both halves of that rule matter, because the anti-join matches on exact
+/// equality and `EnqueueParams` stores `queue_name` verbatim (it does not
+/// normalise), so a queue genuinely named `"payments "` is reachable:
+///
+/// - Storing the **raw** name while validating a trimmed one would insert a row
+///   matching no task, reporting a successful hold (`newly_paused: true`,
+///   `held_task_count: 0`) on a queue that keeps dispatching.
+/// - **Trimming** is no better, just quieter: pausing `"payments "` would
+///   insert a row for `"payments"`, so the hold would silently target a
+///   *different, valid* queue while the real one kept dispatching — and the API
+///   would again report success.
+///
+/// Rejecting is the only option that cannot lie. In the overwhelmingly common
+/// case a stray space is a copy-paste typo, and the operator gets a `400`
+/// naming it instead of a false green. In the pathological case the queue
+/// really does carry surrounding whitespace, it is not pausable through this
+/// API — an honest refusal, and strictly safer than a silent success against
+/// the wrong queue during an outage. Normalising queue names at *creation* time
+/// is the alternative fix, but that reaches across every enqueue path and is
+/// out of scope here.
 ///
 /// # Errors
 ///
-/// [`HarvestError::Config`] when the name is blank or oversized.
+/// [`HarvestError::Config`] when the name is blank, carries surrounding
+/// whitespace, or is oversized.
 pub fn validate_queue_name(queue_name: &str) -> HarvestResult<String> {
-    let trimmed = queue_name.trim();
-    if trimmed.is_empty() {
+    if queue_name.trim().is_empty() {
         return Err(crate::error::HarvestError::Config(
             "queue name must not be empty".to_string(),
         ));
     }
-    if trimmed.len() > MAX_QUEUE_NAME_LEN {
+    if queue_name != queue_name.trim() {
+        return Err(crate::error::HarvestError::Config(
+            "queue name must not have leading or trailing whitespace; \
+             a queue name is matched exactly, so a stray space would hold a \
+             different queue than the one intended"
+                .to_string(),
+        ));
+    }
+    if queue_name.len() > MAX_QUEUE_NAME_LEN {
         return Err(crate::error::HarvestError::Config(format!(
             "queue name exceeds {MAX_QUEUE_NAME_LEN} bytes"
         )));
     }
-    Ok(trimmed.to_string())
+    Ok(queue_name.to_string())
 }
 
 /// Serialize pause/resume against the timeout enforcer for one queue.
@@ -227,6 +251,83 @@ pub async fn lock_queue_for_pause(
         .execute(conn)
         .await?;
     Ok(())
+}
+
+/// How much of the fleet a hold is **actually** in effect on.
+///
+/// Distinct from the stored `scope_shard_id`, which records the *intent* of the
+/// request that wrote a row (`NULL` = "this was a fleet-wide request"), not its
+/// coverage. A fleet-wide pause that only reached some shards persists
+/// `scope_shard_id = NULL` on the shards it reached and **no row at all** on the
+/// ones it missed, so reading intent alone would present a partially-applied
+/// hold as fleet-wide while the missed shards keep dispatching (issue #619
+/// review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseCoverage {
+    /// Every expected shard holds the queue.
+    Fleet,
+    /// At least one row was written by a fleet-wide request, but at least one
+    /// expected shard does not hold the queue — so part of the fleet is still
+    /// dispatching.
+    PartialFleet,
+    /// Every row is explicitly shard-scoped, and they do not cover the fleet.
+    Shard,
+}
+
+impl PauseCoverage {
+    /// Operator-facing label, shared by the API and the Vantage banner so the
+    /// two surfaces cannot describe the same hold differently.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fleet => "fleet-wide",
+            Self::PartialFleet => "fleet-wide (partially applied)",
+            Self::Shard => "shard-scoped",
+        }
+    }
+
+    /// True when part of the fleet is still dispatching despite the hold.
+    #[must_use]
+    pub const fn is_incomplete_fleet(self) -> bool {
+        matches!(self, Self::PartialFleet)
+    }
+}
+
+/// Classify a hold's real coverage from the shards that actually hold it.
+///
+/// `holding_shards` are the shards whose read returned a row for this queue;
+/// `scope_shard_ids` are those rows' stored scopes; `expected_shards` is the
+/// shard set the fleet is *supposed* to span (`shard_fanout::expected_shards`,
+/// i.e. every pool plus every shard the router knows about).
+///
+/// Using **expected** rather than merely-inspected shards is deliberate and is
+/// the safe direction: a shard that could not be read might well be
+/// dispatching, so a hold is only ever reported as `Fleet` when every shard the
+/// fleet is supposed to have is known to hold it.
+///
+/// An empty `expected_shards` (a degenerate configuration) falls back to the
+/// holding set, so a single-shard deployment still reads `Fleet`.
+#[must_use]
+pub fn classify_pause_coverage(
+    holding_shards: &[i32],
+    scope_shard_ids: &[Option<i32>],
+    expected_shards: &[i32],
+) -> PauseCoverage {
+    let covers_fleet = if expected_shards.is_empty() {
+        true
+    } else {
+        expected_shards
+            .iter()
+            .all(|shard| holding_shards.contains(shard))
+    };
+    if covers_fleet {
+        PauseCoverage::Fleet
+    } else if scope_shard_ids.iter().any(Option::is_none) {
+        PauseCoverage::PartialFleet
+    } else {
+        PauseCoverage::Shard
+    }
 }
 
 /// Whether a queue pause suspends enforcement of `reason` for a held task.
@@ -683,6 +784,78 @@ mod tests {
         assert!(validate_queue_name("   ").is_err());
         assert!(validate_queue_name("\t\n").is_err());
         assert!(validate_queue_name(&"q".repeat(MAX_QUEUE_NAME_LEN + 1)).is_err());
+    }
+
+    /// Issue #619 review: a partially-applied fleet-wide pause must not read as
+    /// `fleet-wide`. The missed shards persist **no row**, so intent
+    /// (`scope_shard_id = NULL`) alone cannot tell the two apart.
+    #[test]
+    fn coverage_is_derived_from_shards_that_actually_hold_the_queue() {
+        // Fleet-wide request that reached both expected shards.
+        assert_eq!(
+            classify_pause_coverage(&[0, 1], &[None, None], &[0, 1]),
+            PauseCoverage::Fleet
+        );
+        // Same stored intent, but shard 1 was missed -- it is still dispatching.
+        assert_eq!(
+            classify_pause_coverage(&[0], &[None], &[0, 1]),
+            PauseCoverage::PartialFleet
+        );
+        // Deliberately shard-scoped holds are not "partially applied".
+        assert_eq!(
+            classify_pause_coverage(&[0], &[Some(0)], &[0, 1]),
+            PauseCoverage::Shard
+        );
+        // Scoped holds that between them cover the fleet are effectively fleet.
+        assert_eq!(
+            classify_pause_coverage(&[0, 1], &[Some(0), Some(1)], &[0, 1]),
+            PauseCoverage::Fleet
+        );
+        // Single-shard deployment: one row is the whole fleet.
+        assert_eq!(
+            classify_pause_coverage(&[0], &[None], &[0]),
+            PauseCoverage::Fleet
+        );
+        // Degenerate empty expectation falls back to the holding set.
+        assert_eq!(
+            classify_pause_coverage(&[3], &[None], &[]),
+            PauseCoverage::Fleet
+        );
+        // An unreachable shard counts as expected-but-not-holding: safe side.
+        assert_eq!(
+            classify_pause_coverage(&[0, 1], &[None, None], &[0, 1, 2]),
+            PauseCoverage::PartialFleet
+        );
+    }
+
+    #[test]
+    fn coverage_labels_are_distinct_and_flag_the_incomplete_case() {
+        assert_eq!(PauseCoverage::Fleet.label(), "fleet-wide");
+        assert!(
+            PauseCoverage::PartialFleet.label().contains("partially"),
+            "an operator must be able to see the gap at a glance"
+        );
+        assert!(PauseCoverage::PartialFleet.is_incomplete_fleet());
+        assert!(!PauseCoverage::Fleet.is_incomplete_fleet());
+        assert!(!PauseCoverage::Shard.is_incomplete_fleet());
+    }
+
+    /// Surrounding whitespace is rejected rather than trimmed: a queue named
+    /// `"payments "` is genuinely reachable (`EnqueueParams` stores names
+    /// verbatim), so trimming would hold a *different, valid* queue while
+    /// reporting success.
+    #[test]
+    fn validate_queue_name_rejects_surrounding_whitespace() {
+        for name in ["payments ", " payments", "\tpayments", "payments\n"] {
+            let err = validate_queue_name(name)
+                .expect_err("surrounding whitespace must be rejected, not trimmed");
+            assert!(
+                err.to_string().contains("whitespace"),
+                "the message must name the problem; got {err}"
+            );
+        }
+        // Interior whitespace is a legitimate (if unusual) queue name.
+        assert!(validate_queue_name("two words").is_ok());
     }
 
     #[cfg(feature = "db")]

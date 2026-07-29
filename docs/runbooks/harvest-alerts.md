@@ -1388,6 +1388,21 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
    The Vantage **Workers** page shows the same thing as a banner — the fleet
    page an operator lands on when investigating idle workers.
 
+   Check `effective_scope` on each entry (the banner's **Scope** column shows
+   the same thing). It reports what the hold *actually* covers, derived from the
+   shards that hold the queue versus the expected shard set — not the
+   `scope_shard_id` intent recorded when the row was written:
+
+   - `fleet` — every expected shard holds it.
+   - `partial_fleet` — **some shards are still dispatching.** A fleet-wide pause
+     that only reached part of the fleet writes `scope_shard_id: null` on the
+     shards it reached and *no row* on the ones it missed, so intent alone cannot
+     tell this apart from a complete hold. Re-issue the pause (it is idempotent);
+     the original reason and operator are preserved. An unreachable shard also
+     reports `partial_fleet` — it may still be dispatching, so that is the safe
+     reading.
+   - `shard` — a deliberately shard-scoped hold.
+
 2. **Confirm the downstream is actually back.** The reason field records why the
    hold was placed (`"SMTP provider outage"`). Verify that dependency is healthy
    before thawing, or the backlog will simply fail on release.
@@ -1405,7 +1420,26 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
    Held tasks become immediately claimable. The response echoes the
    `released_reason` and `released_paused_by` of the hold you just released —
    the pause row is deleted on resume, so this is the last moment the *why* is
-   recoverable.
+   recoverable *from that row*.
+
+   For a **post-incident** review after the row is gone, read the audit log
+   instead — who/why/when survives the resume permanently there:
+
+   ```bash
+   harvest audit list --operation queue.pause --target-id email-workers
+   harvest audit list --operation queue.resume --target-id email-workers
+   ```
+
+   The reason is carried in the record's **`error_summary`** field, which is the
+   only free-text column on `harvest_audit_log` (there is no metadata column) —
+   so it is populated on `succeeded` rows too, not just failures. It reads:
+
+   - `reason: <why>` on a `queue.pause` row;
+   - `reason: released hold by <actor>: <why>` on the matching `queue.resume`
+     row (with `(shards disagreed; longest hold shown)` appended when the shards
+     carried different holds);
+   - `... | failures: <detail>` appended on either when the operation only
+     partially applied, naming the shards it did not reach.
 
 5. **Confirm the thaw.** `harvest queue list-paused` should now be empty and the
    `harvest_queue_depth` / `harvest_queue_oldest_pending_age` panels should
@@ -1419,9 +1453,13 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
   This is the failure mode the alert exists for.
 - **A pause placed on the wrong queue name.** Check `list-paused` against the
   queue you meant to freeze; a typo produces a hold on a queue nobody is
-  watching.
+  watching. (A name with *surrounding whitespace* is rejected with a `400`
+  rather than accepted: queue names are matched exactly, so a stray space would
+  hold a different queue than the one intended.)
 - **A shard-scoped pause left behind** after a fleet-wide one was released
   (`shard_id` is surfaced on the read endpoint).
+- **A fleet-wide pause that only partially applied** — `effective_scope:
+  "partial_fleet"`. The shards it missed never stopped dispatching; re-issue it.
 
 ### False positives
 

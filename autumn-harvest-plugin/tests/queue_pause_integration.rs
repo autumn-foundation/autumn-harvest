@@ -21,6 +21,11 @@
 //!       (the "plugin restart" proxy): a fresh router over the same database
 //!       still reports the queue as held, because the gate is a row, not a
 //!       process-local cache.
+//!   (i) AC7 — the read endpoint's `effective_scope` reports what a hold
+//!       ACTUALLY covers (`fleet` / `partial_fleet` / `shard`), derived from the
+//!       shards that hold the queue rather than the recorded `scope_shard_id`
+//!       intent, which is identical for a complete and a partially-applied
+//!       fleet-wide hold.
 
 // Test-code style lints, consistent with `queue_pause_tests.rs` in the core
 // crate: the module docs name response/database fields verbatim.
@@ -709,6 +714,128 @@ async fn rejected_pause_attempts_are_audited() {
         rows.iter().all(|r| r.actor == TEST_ACTOR),
         "a rejected attempt must record WHO attempted it: {rows:?}"
     );
+}
+
+/// A partially-applied hold must READ BACK as `partial_fleet`, not `fleet`
+/// (issue #619 review, Codex).
+///
+/// The `207` on the pause request only helps the operator who is watching that
+/// request. Minutes later — a different operator, a fresh process, the Vantage
+/// banner — the only surface is `GET /admin/queues/paused`, and the stored
+/// `scope_shard_id: null` is byte-identical to a complete fleet-wide hold: the
+/// shards that were missed persist **no row at all**. Reading intent there would
+/// present a half-open queue as fully held while it kept dispatching into the
+/// outage.
+///
+/// Exercises the real fan-out (`pools_by_shard` + `expected_shards`) that the
+/// pure `effective_scope_reflects_real_coverage_not_stored_intent` unit test
+/// mocks: shard 1 is unreachable, so it is expected-but-not-holding.
+#[tokio::test]
+async fn a_partially_applied_hold_reads_back_as_partial_fleet_not_fleet_wide() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_two_shard_app(&pool);
+
+    // Fleet-wide request that can only reach shard 0.
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/pause",
+        json!({ "reason": "provider outage" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "partial write: {body}");
+
+    let (status, body) = get_json(&app, "/admin/queues/paused").await;
+    assert_eq!(status, StatusCode::OK, "the read must not 500: {body}");
+    let entries = body["paused_queues"]
+        .as_array()
+        .expect("paused_queues array");
+    let entry = entries
+        .iter()
+        .find(|e| e["queue_name"] == "payments")
+        .unwrap_or_else(|| panic!("the held queue must be listed: {body}"));
+
+    assert_eq!(
+        entry["effective_scope"], "partial_fleet",
+        "shard 1 never stopped dispatching, so this hold does not cover the \
+         fleet -- reporting `fleet` here is the mis-read that lets an operator \
+         believe an outage is contained when it is not: {body}"
+    );
+    // The recorded INTENT is still reported verbatim, and is exactly what makes
+    // deriving coverage necessary: it is null for both a complete and a
+    // partially-applied fleet-wide hold.
+    assert!(
+        entry["scope_shard_id"].is_null(),
+        "the stored intent is unchanged (fleet-wide request): {body}"
+    );
+}
+
+/// The complementary case: a hold that really does cover every expected shard
+/// reads back as `fleet`, so the partial signal above is not simply always-on.
+#[tokio::test]
+async fn a_complete_hold_reads_back_as_fleet_wide() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/pause",
+        json!({ "reason": "provider outage" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "single-shard write is complete: {body}"
+    );
+
+    let (status, body) = get_json(&app, "/admin/queues/paused").await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = body["paused_queues"]
+        .as_array()
+        .expect("paused_queues array")
+        .iter()
+        .find(|e| e["queue_name"] == "payments")
+        .unwrap_or_else(|| panic!("the held queue must be listed: {body}"))
+        .clone();
+    assert_eq!(
+        entry["effective_scope"], "fleet",
+        "every expected shard holds the queue: {body}"
+    );
+}
+
+/// A deliberately shard-scoped hold is not "partially applied" — the operator
+/// asked for one shard and got one shard.
+#[tokio::test]
+async fn a_shard_scoped_hold_reads_back_as_shard_not_partial() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_two_shard_app(&pool);
+
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/pause",
+        json!({ "reason": "shard-0 provider degraded", "shard_id": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a scoped write is complete: {body}");
+
+    let (status, body) = get_json(&app, "/admin/queues/paused").await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = body["paused_queues"]
+        .as_array()
+        .expect("paused_queues array")
+        .iter()
+        .find(|e| e["queue_name"] == "payments")
+        .unwrap_or_else(|| panic!("the held queue must be listed: {body}"))
+        .clone();
+    assert_eq!(
+        entry["effective_scope"], "shard",
+        "an intentional shard-scoped hold must not be flagged as an incomplete \
+         fleet-wide one -- that would train operators to ignore the signal: {body}"
+    );
+    assert_eq!(entry["scope_shard_id"], 0, "recorded intent: {body}");
 }
 
 /// The operator `reason` is bounded at the API boundary, so it can never be

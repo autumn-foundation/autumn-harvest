@@ -271,6 +271,10 @@ fn queue_name_validation_rejects_blank_and_oversized() {
     assert!(queue_pause::validate_queue_name("   ").is_err());
     assert!(queue_pause::validate_queue_name(&"q".repeat(MAX_QUEUE_NAME_LEN)).is_ok());
     assert!(queue_pause::validate_queue_name(&"q".repeat(MAX_QUEUE_NAME_LEN + 1)).is_err());
+    // Surrounding whitespace is rejected, never trimmed -- see
+    // `a_padded_queue_name_is_rejected_not_silently_retargeted`.
+    assert!(queue_pause::validate_queue_name("payments ").is_err());
+    assert!(queue_pause::validate_queue_name(" payments").is_err());
 }
 
 /// The resume shift must never push a held task's `scheduled_at` past NOW()
@@ -711,52 +715,91 @@ async fn pause_and_resume_leave_the_event_history_byte_identical() {
 
 // ── Post-review hardening (correctness + AC-compliance review) ────────────────
 
-/// The queue name is **canonicalised** (trimmed) on the write path, not merely
-/// validated as non-blank.
+/// A queue name carrying surrounding whitespace is **rejected**, never
+/// silently retargeted at a different queue.
 ///
-/// Validating `name.trim()` while storing the raw string would be a silent
-/// no-op hold: the claim anti-join matches on exact equality, so a stray
-/// trailing space from a copy-paste (`--queue "payments "`) would insert a row
-/// matching no task, and the API would report a successful hold on a queue that
-/// keeps dispatching. This asserts the *behaviour* an operator cares about —
-/// the padded name really holds the queue — not just the stored string.
+/// `EnqueueParams` stores `queue_name` verbatim (it does not normalise) and the
+/// claim anti-join matches on exact equality, so `"payments "` and `"payments"`
+/// are two genuinely distinct, independently reachable queues. That makes both
+/// of the quieter options a lie:
+///
+/// - Validating `name.trim()` while storing the **raw** string inserts a row
+///   matching no task -- a reported hold on a queue that keeps dispatching.
+/// - **Trimming** inserts a row for `"payments"`, so pausing `"payments "`
+///   would hold a *different, valid* queue while the real one kept dispatching
+///   -- and the API would still report success.
+///
+/// This test proves the two names really are distinct queues (so trimming would
+/// have conflated them), and that the padded form is refused with a
+/// `Config`-shaped error (a `400`) rather than quietly holding the wrong one.
 #[tokio::test]
-async fn a_padded_queue_name_still_holds_the_real_queue() {
+async fn a_padded_queue_name_is_rejected_not_silently_retargeted() {
     let (mut conn, _c) = setup_db().await;
-    let q = unique_queue("trim");
-    let padded = format!("  {q}\t");
+    let plain = unique_queue("trim");
+    let padded_name = format!("{plain} ");
 
-    let params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
-    queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    // Two genuinely distinct queues -- one task each. `enqueue` stores the name
+    // verbatim, so the trailing-space queue is real and independently claimable.
+    for name in [plain.as_str(), padded_name.as_str()] {
+        let params = EnqueueParams::new(name, TaskType::Activity, serde_json::json!({}));
+        queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    }
 
-    let outcome = queue_pause::pause_queue(&mut conn, &padded, "outage", "alice", None)
+    // Pausing the exact padded name is refused, not applied to `plain`.
+    let err = queue_pause::pause_queue(&mut conn, &padded_name, "outage", "alice", None)
         .await
-        .expect("pause with a padded name");
-    assert_eq!(
-        outcome.queue_name, q,
-        "the stored name must be the canonical (trimmed) one"
-    );
-    assert_eq!(
-        outcome.held_task_count, 1,
-        "the padded name must resolve to the real queue and see its held task"
+        .expect_err("a queue name with surrounding whitespace must be rejected");
+    assert!(
+        matches!(err, autumn_harvest::HarvestError::Config(_)),
+        "must surface as a Config error (a 400), not a 500; got {err:?}"
     );
     assert!(
-        queue_pause::is_queue_paused(&mut conn, &q)
+        err.to_string().contains("whitespace"),
+        "the message must name the actual problem so an operator can fix the \
+         typo mid-incident; got {err}"
+    );
+
+    // Crucially: the refusal did not silently hold the *other* queue.
+    assert!(
+        !queue_pause::is_queue_paused(&mut conn, &plain)
             .await
             .expect("is_paused"),
-        "the UNPADDED queue must actually be held -- a padded name must never \
-         create a phantom hold that matches no task"
+        "rejecting the padded name must never hold the trimmed queue -- that \
+         would be the silent-retarget bug this rejection exists to prevent"
+    );
+    assert!(
+        !queue_pause::is_queue_paused(&mut conn, &padded_name)
+            .await
+            .expect("is_paused"),
+        "a rejected pause must leave no row at all"
     );
 
-    // And the padded form releases the same hold.
-    let resumed = queue_pause::resume_queue(&mut conn, &padded, "alice")
+    // And the two names really are separate queues: holding `plain` leaves the
+    // whitespace-named queue dispatching. If the write path trimmed, pausing
+    // the padded name would have held THIS queue instead.
+    queue_pause::pause_queue(&mut conn, &plain, "outage", "alice", None)
         .await
-        .expect("resume with a padded name");
-    assert!(resumed.newly_resumed);
+        .expect("pause the plain queue");
     assert!(
-        !queue_pause::is_queue_paused(&mut conn, &q)
+        claim_one(&mut conn, &plain).await.is_none(),
+        "the held queue must not dispatch"
+    );
+    assert!(
+        claim_one(&mut conn, &padded_name).await.is_some(),
+        "the whitespace-named queue is a DIFFERENT queue and must keep \
+         dispatching -- proving a trim-based pause would have hit the wrong one"
+    );
+
+    // Resume is symmetric: the padded form is refused there too.
+    let err = queue_pause::resume_queue(&mut conn, &padded_name, "alice")
+        .await
+        .expect_err("resume must reject a padded name too");
+    assert!(matches!(err, autumn_harvest::HarvestError::Config(_)));
+    assert!(
+        queue_pause::is_queue_paused(&mut conn, &plain)
             .await
-            .expect("is_paused")
+            .expect("is_paused"),
+        "a rejected resume must not release the trimmed queue's hold"
     );
 }
 
