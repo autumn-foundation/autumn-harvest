@@ -6750,6 +6750,8 @@ pub const fn management_api_response_fields()
                 "paused_at",
                 "scope_shard_id",
                 "held_task_count",
+                "provenance_uniform",
+                "shards",
                 "partial_failures",
             ]),
         ),
@@ -6765,6 +6767,8 @@ pub const fn management_api_response_fields()
                 "paused_duration_secs",
                 "released_reason",
                 "released_paused_by",
+                "provenance_uniform",
+                "shards",
                 "partial_failures",
             ]),
         ),
@@ -27738,9 +27742,15 @@ struct PauseApplication {
     newly_paused: bool,
     /// Held tasks summed across every shard the hold reached.
     held_task_count: i64,
-    /// The first successful shard's row, echoed back as the canonical
-    /// provenance. `None` when every target shard failed.
-    effective: Option<::autumn_harvest::queue_pause::PauseOutcome>,
+    /// Every shard that applied the hold, with its own effective row.
+    ///
+    /// Kept per-shard rather than collapsed to the first success: a re-pause
+    /// preserves each shard's ORIGINAL provenance, so a fleet-wide request
+    /// landing over pre-existing scoped holds leaves the shards disagreeing.
+    /// Labelling the fleet-wide `held_task_count` with one shard's reason,
+    /// actor, timestamp and scope would then be untrue for the rest of the
+    /// fleet (issue #619 review).
+    per_shard: Vec<(i32, ::autumn_harvest::queue_pause::PauseOutcome)>,
 }
 
 /// Apply the hold on every target shard, appending any per-shard error to
@@ -27757,7 +27767,7 @@ async fn apply_pause_across_shards(
     let mut applied = PauseApplication {
         newly_paused: false,
         held_task_count: 0,
-        effective: None,
+        per_shard: Vec::new(),
     };
     for (shard_id, pool) in targets {
         let mut conn = match acquire_conn(pool).await {
@@ -27779,14 +27789,65 @@ async fn apply_pause_across_shards(
             Ok(outcome) => {
                 applied.newly_paused |= outcome.newly_paused;
                 applied.held_task_count += outcome.held_task_count;
-                if applied.effective.is_none() {
-                    applied.effective = Some(outcome);
-                }
+                applied.per_shard.push((*shard_id, outcome));
             }
             Err(error) => failures.push(format!("shard {shard_id}: {error}")),
         }
     }
     applied
+}
+
+/// The cross-shard provenance summary of a pause, plus each shard's own row.
+struct PauseProvenance<'a> {
+    /// The earliest hold — the deterministic top-level summary.
+    effective: &'a ::autumn_harvest::queue_pause::PauseOutcome,
+    /// False when the shards disagree on `(reason, paused_by, scope_shard_id)`.
+    uniform: bool,
+    /// Per-shard detail, so a divergent hold loses nothing.
+    shards: Vec<Value>,
+}
+
+/// Summarise a fleet-wide pause without discarding any shard's provenance.
+///
+/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
+/// same rule `merge_paused_queue_rows` and the Vantage banner use, so the
+/// mutation response, the read endpoint and the UI can never tell an operator
+/// three different stories about one hold. `uniform` compares
+/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`:
+/// each shard stamps its own `NOW()`, so including it would flag essentially
+/// every healthy fleet-wide hold as divergent.
+///
+/// Returns `None` only when every target shard failed.
+fn summarise_pause_provenance(
+    per_shard: &[(i32, ::autumn_harvest::queue_pause::PauseOutcome)],
+) -> Option<PauseProvenance<'_>> {
+    let (_, effective) = per_shard
+        .iter()
+        .min_by_key(|(shard_id, outcome)| (outcome.paused_at, *shard_id))?;
+    let uniform = per_shard.iter().all(|(_, outcome)| {
+        outcome.reason == effective.reason
+            && outcome.paused_by == effective.paused_by
+            && outcome.scope_shard_id == effective.scope_shard_id
+    });
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_paused": outcome.newly_paused,
+                "reason": outcome.reason,
+                "paused_by": outcome.paused_by,
+                "paused_at": outcome.paused_at,
+                "scope_shard_id": outcome.scope_shard_id,
+                "held_task_count": outcome.held_task_count,
+            })
+        })
+        .collect();
+    Some(PauseProvenance {
+        effective,
+        uniform,
+        shards,
+    })
 }
 
 /// The fleet-wide roll-up of a resume applied shard by shard.
@@ -27797,10 +27858,13 @@ struct ResumeApplication {
     released_task_count: i64,
     /// The longest hold released, in seconds.
     paused_duration_secs: i64,
-    /// Provenance of the released hold, echoed back before the row is gone.
-    released_reason: Option<String>,
-    /// Operator who placed the released hold.
-    released_paused_by: Option<String>,
+    /// Every shard that completed, with the provenance it released.
+    ///
+    /// Per-shard rather than first-success: the resume DELETES the pause rows,
+    /// so anything dropped here is gone for good. Independently-paused shards
+    /// legitimately carry different reasons and operators, and an operator
+    /// closing out an incident needs all of them (issue #619 review).
+    per_shard: Vec<(i32, ::autumn_harvest::queue_pause::ResumeOutcome)>,
     /// True when at least one shard completed without error.
     any_ok: bool,
 }
@@ -27817,8 +27881,7 @@ async fn apply_resume_across_shards(
         newly_resumed: false,
         released_task_count: 0,
         paused_duration_secs: 0,
-        released_reason: None,
-        released_paused_by: None,
+        per_shard: Vec::new(),
         any_ok: false,
     };
     for (shard_id, pool) in targets {
@@ -27838,17 +27901,81 @@ async fn apply_resume_across_shards(
                     .paused_duration_secs
                     .max(outcome.paused_duration_secs);
                 // The pause row is deleted by the resume, so this is the last
-                // moment the *why* is recoverable — echo it back so an operator
-                // closing out an incident sees which hold they released.
-                if applied.released_reason.is_none() {
-                    applied.released_reason = outcome.released_reason;
-                    applied.released_paused_by = outcome.released_paused_by;
-                }
+                // moment the *why* is recoverable — keep EVERY shard's, not
+                // just the first, so an operator closing out an incident sees
+                // all the holds they released.
+                applied.per_shard.push((*shard_id, outcome));
             }
             Err(error) => failures.push(format!("shard {shard_id}: {error}")),
         }
     }
     applied
+}
+
+/// The cross-shard provenance summary of a resume, plus each shard's own row.
+struct ResumeProvenance {
+    /// Reason of the longest-held (i.e. earliest-placed) released hold.
+    released_reason: Option<String>,
+    /// Operator who placed that same hold.
+    released_paused_by: Option<String>,
+    /// False when the shards that actually released disagree on
+    /// `(released_reason, released_paused_by)`.
+    uniform: bool,
+    /// Per-shard detail. The pause rows are already deleted, so this is the
+    /// only surviving record of the other shards' provenance.
+    shards: Vec<Value>,
+}
+
+/// Summarise a fleet-wide resume without discarding any shard's provenance.
+///
+/// The top-level reason/operator come from the **longest** hold released,
+/// tie-broken by shard id. That is deliberately the same shard the existing
+/// `paused_duration_secs` maximum describes, so the summary is internally
+/// coherent — previously the duration could come from one shard while the
+/// reason came from another.
+///
+/// Only shards that actually released a hold carry provenance (a shard that
+/// was not paused returns `None`), so both the summary and the uniformity
+/// check consider just those; a fleet-wide no-op is trivially uniform.
+fn summarise_resume_provenance(
+    per_shard: &[(i32, ::autumn_harvest::queue_pause::ResumeOutcome)],
+) -> ResumeProvenance {
+    let released: Vec<(i32, &::autumn_harvest::queue_pause::ResumeOutcome)> = per_shard
+        .iter()
+        .filter(|(_, outcome)| outcome.released_reason.is_some())
+        .map(|(shard_id, outcome)| (*shard_id, outcome))
+        .collect();
+    let longest: Option<&::autumn_harvest::queue_pause::ResumeOutcome> = released
+        .iter()
+        .max_by_key(|(shard_id, outcome)| {
+            (outcome.paused_duration_secs, std::cmp::Reverse(*shard_id))
+        })
+        .map(|(_, outcome)| *outcome);
+    let uniform = longest.is_none_or(|anchor| {
+        released.iter().all(|(_, outcome)| {
+            outcome.released_reason == anchor.released_reason
+                && outcome.released_paused_by == anchor.released_paused_by
+        })
+    });
+    let shards = per_shard
+        .iter()
+        .map(|(shard_id, outcome)| {
+            serde_json::json!({
+                "shard_id": shard_id,
+                "newly_resumed": outcome.newly_resumed,
+                "released_task_count": outcome.released_task_count,
+                "paused_duration_secs": outcome.paused_duration_secs,
+                "released_reason": outcome.released_reason,
+                "released_paused_by": outcome.released_paused_by,
+            })
+        })
+        .collect();
+    ResumeProvenance {
+        released_reason: longest.and_then(|o| o.released_reason.clone()),
+        released_paused_by: longest.and_then(|o| o.released_paused_by.clone()),
+        uniform,
+        shards,
+    }
 }
 
 /// Best-effort audit row for a queue pause/resume.
@@ -27973,7 +28100,7 @@ async fn pause_queue_handler(
     let PauseApplication {
         newly_paused,
         held_task_count,
-        effective,
+        per_shard,
     } = apply_pause_across_shards(
         &targets,
         &canonical_queue,
@@ -27984,7 +28111,7 @@ async fn pause_queue_handler(
     )
     .await;
 
-    let Some(effective) = effective else {
+    let Some(provenance) = summarise_pause_provenance(&per_shard) else {
         // Every target shard failed: report it rather than claiming a hold that
         // is not in effect anywhere.
         let summary = failures.join("; ");
@@ -28030,16 +28157,20 @@ async fn pause_queue_handler(
         "status": status,
         "queue_name": canonical_queue,
         "newly_paused": newly_paused,
-        "reason": effective.reason,
-        "paused_by": effective.paused_by,
-        "paused_at": effective.paused_at,
-        // The EFFECTIVE scope, not the request's. `pause_queue` preserves the
-        // original row on an idempotent re-pause, so echoing `request.shard_id`
-        // here would pair the preserved reason/actor/time with this request's
-        // scope -- describing a shard-scoped hold as fleet-wide (issue #619
-        // review).
-        "scope_shard_id": effective.scope_shard_id,
+        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
+        // rather than whichever shard the fan-out reached first. `pause_queue`
+        // preserves each shard's original row on an idempotent re-pause, so
+        // echoing the request (or a first-success pick) would pair one story
+        // with a fleet-wide `held_task_count` that is true for other shards
+        // (issue #619 review). `shards` keeps every shard's own row and
+        // `provenance_uniform` flags the divergence in one field.
+        "reason": provenance.effective.reason,
+        "paused_by": provenance.effective.paused_by,
+        "paused_at": provenance.effective.paused_at,
+        "scope_shard_id": provenance.effective.scope_shard_id,
         "held_task_count": held_task_count,
+        "provenance_uniform": provenance.uniform,
+        "shards": provenance.shards,
     });
     queue_pause_attach_partial(&mut payload, partial);
     (status_code, Json(payload)).into_response()
@@ -28101,10 +28232,10 @@ async fn resume_queue_handler(
         newly_resumed,
         released_task_count,
         paused_duration_secs,
-        released_reason,
-        released_paused_by,
+        per_shard,
         any_ok,
     } = apply_resume_across_shards(&targets, &canonical_queue, &actor, &mut failures).await;
+    let provenance = summarise_resume_provenance(&per_shard);
 
     if !any_ok {
         let summary = failures.join("; ");
@@ -28157,8 +28288,15 @@ async fn resume_queue_handler(
         "newly_resumed": newly_resumed,
         "released_task_count": released_task_count,
         "paused_duration_secs": paused_duration_secs,
-        "released_reason": released_reason,
-        "released_paused_by": released_paused_by,
+        // The resume DELETES the pause rows, so this is the only surviving
+        // record of what was released. The summary describes the LONGEST hold
+        // (the same shard `paused_duration_secs` reports, so the two are
+        // coherent), `shards` keeps every shard's own released provenance, and
+        // `provenance_uniform` flags divergence (issue #619 review).
+        "released_reason": provenance.released_reason,
+        "released_paused_by": provenance.released_paused_by,
+        "provenance_uniform": provenance.uniform,
+        "shards": provenance.shards,
     });
     queue_pause_attach_partial(&mut payload, partial);
     (status_code, Json(payload)).into_response()
@@ -35379,6 +35517,165 @@ mod tests {
             "each shard's own reason must survive the merge"
         );
         assert_eq!(shards[1]["held_task_count"], 2);
+    }
+
+    fn pause_outcome(
+        reason: &str,
+        actor: &str,
+        secs_ago: i64,
+        scope: Option<i32>,
+        held: i64,
+    ) -> ::autumn_harvest::queue_pause::PauseOutcome {
+        ::autumn_harvest::queue_pause::PauseOutcome {
+            queue_name: "payments".to_string(),
+            newly_paused: false,
+            reason: reason.to_string(),
+            paused_by: actor.to_string(),
+            paused_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            scope_shard_id: scope,
+            held_task_count: held,
+        }
+    }
+
+    fn resume_outcome(
+        reason: Option<&str>,
+        actor: Option<&str>,
+        duration_secs: i64,
+        released: i64,
+    ) -> ::autumn_harvest::queue_pause::ResumeOutcome {
+        ::autumn_harvest::queue_pause::ResumeOutcome {
+            queue_name: "payments".to_string(),
+            newly_resumed: reason.is_some(),
+            released_task_count: released,
+            paused_duration_secs: duration_secs,
+            released_reason: reason.map(str::to_string),
+            released_paused_by: actor.map(str::to_string),
+        }
+    }
+
+    /// Issue #619 review: the PAUSE response must not label a fleet-wide
+    /// `held_task_count` with one shard's story.
+    ///
+    /// A re-pause preserves each shard's ORIGINAL provenance, so a fleet-wide
+    /// request landing over a pre-existing scoped hold leaves the shards
+    /// disagreeing. Keeping the first success would report shard 0's reason,
+    /// actor and scope next to a total that is true for neither shard alone.
+    #[test]
+    fn pause_summary_is_earliest_and_keeps_every_shards_provenance() {
+        let per_shard = vec![
+            // Fan-out order deliberately puts the LATER hold first, so a
+            // first-success pick would produce a different answer.
+            (1, pause_outcome("fleet-wide freeze", "bob", 10, None, 2)),
+            (
+                0,
+                pause_outcome("shard-0 provider down", "alice", 90, Some(0), 5),
+            ),
+        ];
+        let p = summarise_pause_provenance(&per_shard).expect("a shard applied the hold");
+
+        assert!(!p.uniform, "the shards disagree on reason, actor and scope");
+        assert_eq!(
+            p.effective.reason, "shard-0 provider down",
+            "the summary must be the EARLIEST hold -- deterministic, not \
+             whichever shard the fan-out reached first"
+        );
+        assert_eq!(p.effective.paused_by, "alice");
+        assert_eq!(p.effective.scope_shard_id, Some(0));
+
+        assert_eq!(p.shards.len(), 2);
+        assert_eq!(p.shards[0]["shard_id"], 1);
+        assert_eq!(
+            p.shards[0]["reason"], "fleet-wide freeze",
+            "the shard the summary did NOT pick must still be recoverable"
+        );
+        assert_eq!(p.shards[1]["shard_id"], 0);
+        assert_eq!(p.shards[1]["reason"], "shard-0 provider down");
+    }
+
+    /// A healthy fleet-wide hold is uniform even though each shard stamps its
+    /// own `NOW()` -- the same rule the list endpoint and the banner use.
+    #[test]
+    fn pause_summary_is_uniform_when_only_paused_at_differs() {
+        let per_shard = vec![
+            (0, pause_outcome("stripe outage", "alice", 3, None, 2)),
+            (1, pause_outcome("stripe outage", "alice", 1, None, 5)),
+        ];
+        let p = summarise_pause_provenance(&per_shard).expect("hold applied");
+        assert!(p.uniform, "per-shard NOW() skew is not a divergence");
+        assert_eq!(p.effective.paused_at, per_shard[0].1.paused_at);
+    }
+
+    /// Every target shard failed: no provenance to report.
+    #[test]
+    fn pause_summary_is_none_when_no_shard_applied() {
+        assert!(summarise_pause_provenance(&[]).is_none());
+    }
+
+    /// Issue #619 review: a fleet-wide RESUME deletes every pause row, so any
+    /// provenance dropped here is gone for good.
+    ///
+    /// Independently-paused shards legitimately carry different reasons and
+    /// operators; an operator closing out an incident needs all of them, and
+    /// the summary must describe the same shard `paused_duration_secs` does.
+    #[test]
+    fn resume_summary_keeps_every_shards_released_provenance() {
+        let per_shard = vec![
+            (0, resume_outcome(Some("sendgrid down"), Some("bob"), 30, 2)),
+            (
+                1,
+                resume_outcome(Some("stripe outage"), Some("alice"), 900, 5),
+            ),
+        ];
+        let p = summarise_resume_provenance(&per_shard);
+
+        assert!(!p.uniform, "the two shards released different incidents");
+        assert_eq!(
+            p.released_reason.as_deref(),
+            Some("stripe outage"),
+            "the summary must describe the LONGEST hold -- the same shard \
+             paused_duration_secs reports, so the two are coherent"
+        );
+        assert_eq!(p.released_paused_by.as_deref(), Some("alice"));
+
+        assert_eq!(p.shards.len(), 2);
+        assert_eq!(
+            p.shards[0]["released_reason"], "sendgrid down",
+            "the shard the summary did NOT pick must still be recoverable -- \
+             its pause row is already deleted"
+        );
+        assert_eq!(p.shards[0]["released_paused_by"], "bob");
+        assert_eq!(p.shards[1]["released_reason"], "stripe outage");
+    }
+
+    /// Shards that were not paused carry no provenance, so they must not drag
+    /// the summary or falsely flag divergence.
+    #[test]
+    fn resume_summary_ignores_shards_that_were_not_paused() {
+        let per_shard = vec![
+            (0, resume_outcome(None, None, 0, 0)),
+            (
+                1,
+                resume_outcome(Some("stripe outage"), Some("alice"), 60, 4),
+            ),
+        ];
+        let p = summarise_resume_provenance(&per_shard);
+        assert!(p.uniform, "one released hold cannot disagree with itself");
+        assert_eq!(p.released_reason.as_deref(), Some("stripe outage"));
+        assert_eq!(p.shards.len(), 2, "every shard is still reported");
+        assert_eq!(p.shards[0]["newly_resumed"], false);
+    }
+
+    /// A fleet-wide no-op (nothing was paused) is trivially uniform.
+    #[test]
+    fn resume_summary_of_a_full_noop_is_uniform_and_empty() {
+        let p = summarise_resume_provenance(&[
+            (0, resume_outcome(None, None, 0, 0)),
+            (1, resume_outcome(None, None, 0, 0)),
+        ]);
+        assert!(p.uniform);
+        assert!(p.released_reason.is_none());
+        assert!(p.released_paused_by.is_none());
+        assert_eq!(p.shards.len(), 2);
     }
 
     /// Two independently-held queues stay two entries, keyed by queue name.

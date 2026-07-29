@@ -6691,9 +6691,11 @@
           "paused_at",
           "scope_shard_id",
           "held_task_count",
+          "provenance_uniform",
+          "shards",
           "partial_failures"
         ],
-        "notes": "A hold applied to only SOME target shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case \u2014 the missed shards keep dispatching \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`."
+        "notes": "A hold applied to only SOME target shards returns 207 Multi-Status with `ok: false` and `status: \"partial\"`, plus a `partial_failures` string naming the shards that were not reached (including a shard the router knows about but this process has no pool for). The hold is NOT in effect fleet-wide in that case \u2014 the missed shards keep dispatching \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`, and omits `partial_failures`. Cross-shard provenance: `held_task_count` is the fleet-wide sum, while the top-level `reason`/`paused_by`/`paused_at`/`scope_shard_id` describe the EARLIEST hold (tie-broken by shard id \u2014 the same rule `GET /admin/queues/paused` and the Vantage banner use, so the three surfaces never disagree). Because an idempotent re-pause preserves each shard's ORIGINAL provenance, a fleet-wide request landing over pre-existing scoped holds leaves the shards disagreeing: `shards` then carries every shard's own `{shard_id, newly_paused, reason, paused_by, paused_at, scope_shard_id, held_task_count}` and `provenance_uniform` is false. `provenance_uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately NOT `paused_at`, since each shard stamps its own NOW()."
       },
       "error_responses": [
         {
@@ -6751,9 +6753,11 @@
           "paused_duration_secs",
           "released_reason",
           "released_paused_by",
+          "provenance_uniform",
+          "shards",
           "partial_failures"
         ],
-        "notes": "A resume applied to only SOME target shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached \u2014 the safe direction, but not a completed thaw \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`."
+        "notes": "A resume applied to only SOME target shards returns 207 Multi-Status with `ok: false`, `status: \"partial\"` and a `partial_failures` string. Work remains held on the shards that were not reached \u2014 the safe direction, but not a completed thaw \u2014 so re-issue the request (it is idempotent). A fully applied request returns 200 with `ok: true` and `status: \"complete\"`. Cross-shard provenance: the resume DELETES the pause rows, so this response is the ONLY surviving record of what was released. `released_task_count` is the fleet-wide sum and `paused_duration_secs` the longest hold; the top-level `released_reason`/`released_paused_by` describe THAT same longest-held shard (tie-broken by lowest shard id), so the duration and the story it is paired with always come from one shard. `shards` carries every shard's own `{shard_id, newly_resumed, released_task_count, paused_duration_secs, released_reason, released_paused_by}` so independently-paused shards lose nothing, and `provenance_uniform` is false when the released shards disagree on `(released_reason, released_paused_by)`. A shard that was not paused contributes null provenance and is ignored by the summary."
       },
       "error_responses": [
         {
