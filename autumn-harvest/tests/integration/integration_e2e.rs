@@ -177,7 +177,14 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #617: chain_execution_timeout/chain_deadline_at columns on
     // harvest_workflow_executions.
-    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql")
+    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql"),
+    "\n",
+    // issue #619: harvest_queue_pauses. REQUIRED, not optional — `claim_task`'s
+    // pause anti-join references this table on every claim, so without it every
+    // claim in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `relation "harvest_queue_pauses" does not exist`.
+    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -10772,4 +10779,68 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
         .filter(|e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:")))
         .count();
     assert_eq!(markers, 1, "exactly one fan_out marker recorded");
+}
+
+/// Guard: `INIT_SQL` must create every `harvest_*` table the claim path
+/// references.
+///
+/// [`INIT_SQL`] is a deliberately-partial, hand-maintained bundle (it omits the
+/// workflow-start-uniqueness migration on purpose), so it is one of the few
+/// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
+/// it a standing drift hazard: `queue::claim_task` runs on essentially every
+/// test in this suite — and in every suite that borrows
+/// `setup_test_database_url_or_env` from here (`child_timeout_tests`,
+/// `chain_timeout_tests`, `rate_limit_key_tests`, `workflow_retry_tests`) — so a
+/// migration that adds a table to the claim query and forgets this bundle takes
+/// out five suites at once with `relation "..." does not exist`.
+///
+/// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
+/// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable
+/// as a pure string comparison, so this pins it as a fast no-DB check instead.
+///
+/// The rule is mechanical: every `harvest_*` identifier named in the real
+/// `claim_task_query()` SQL must appear in `INIT_SQL`. Deriving the table set
+/// from the live query rather than a hardcoded list means a future claim-path
+/// table is caught automatically, with no second list to maintain.
+#[test]
+fn init_sql_creates_every_table_the_claim_path_references() {
+    let claim_sql = autumn_harvest::queue::claim_task_query();
+
+    let mut tables: Vec<String> = Vec::new();
+    let bytes = claim_sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &claim_sql[start..i];
+            if word.starts_with("harvest_") && !tables.contains(&word.to_string()) {
+                tables.push(word.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    assert!(
+        !tables.is_empty(),
+        "expected to find harvest_* identifiers in claim_task_query(); the token scan is broken"
+    );
+
+    let missing: Vec<&String> = tables
+        .iter()
+        .filter(|table| !INIT_SQL.contains(table.as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "INIT_SQL is missing table(s) the claim path references: {missing:?}\n\
+         Add the migration that creates them to the INIT_SQL concat! in this file. \
+         Without it every claim in this suite -- and in child_timeout_tests, \
+         chain_timeout_tests, rate_limit_key_tests and workflow_retry_tests, which \
+         reuse setup_test_database_url_or_env from here -- fails with \
+         `relation \"...\" does not exist` (issue #619)."
+    );
 }
