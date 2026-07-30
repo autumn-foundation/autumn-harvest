@@ -2827,3 +2827,100 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
         .expect("the enforcer task must not panic")
         .expect("enforcement must succeed");
 }
+
+/// Round-22 P2: a `schedule_to_start` sweep must not deadlock a concurrent
+/// per-execution resume.
+///
+/// The documented `harvest_task_queue` order is **execution row -> task row**.
+/// `resume_workflow_execution` follows it: it holds the execution row
+/// `FOR UPDATE` and then shifts this execution's task rows with a plain,
+/// *waiting* `UPDATE` (unlike its external-task sibling, that shift has no
+/// `SKIP LOCKED` escape). Round 18's locked `schedule_to_start` re-read ran
+/// before the execution lock and inverted the order, so enforcement held a task
+/// row while waiting on the execution row exactly as the resume held the
+/// execution row and waited on that task row. Postgres detects the cycle and
+/// aborts one side — failing either the timeout sweep or the operator's resume.
+///
+/// Sequenced deterministically rather than raced. A holder takes the execution
+/// row `FOR UPDATE` (standing in for a resume that has just entered its
+/// transaction) and the enforcer is started so it must reach the execution row;
+/// a `FOR UPDATE NOWAIT` probe from a third connection then proves the enforcer
+/// is NOT holding the task row while it waits. Under the inverted order that
+/// probe fails with `lock_not_available` — which is precisely the state that
+/// closes the deadlock cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn schedule_to_start_sweep_does_not_hold_a_task_row_while_awaiting_the_execution() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("lockorder");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    backdate_scheduled_at(&mut conn, task_id, 3600).await;
+
+    // Stand in for a resume that has entered its transaction: hold the
+    // EXECUTION row, the first lock that path takes.
+    let mut holder = connect(&url).await;
+    holder.batch_execute("BEGIN").await.expect("holder begin");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .execute(&mut holder)
+        .await
+        .expect("hold the execution row");
+
+    let enforcer_url = url.clone();
+    let enforcer = tokio::spawn(async move {
+        let mut c = connect(&enforcer_url).await;
+        autumn_harvest::timeout::enforce_timeouts_once(
+            &mut c,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(60),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+
+    // Give the enforcer time to reach (and block on) the execution row.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // The task row must still be free. Under the inverted order the enforcer
+    // would already hold it while waiting on the execution row above — the
+    // second edge of the deadlock cycle.
+    let mut probe = connect(&url).await;
+    probe.batch_execute("BEGIN").await.expect("probe begin");
+    let task_free =
+        diesel::sql_query("SELECT id FROM harvest_task_queue WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .execute(&mut probe)
+            .await
+            .is_ok();
+    probe.batch_execute("ROLLBACK").await.expect("probe end");
+
+    assert!(
+        task_free,
+        "the schedule_to_start sweep is holding a task row while waiting on the \
+         execution row: that inverts the documented execution-row -> task-row \
+         order and forms an ABBA cycle with resume_workflow_execution, which \
+         holds the execution row and then waits on this execution's task rows"
+    );
+
+    holder.batch_execute("COMMIT").await.expect("release");
+    enforcer
+        .await
+        .expect("the enforcer task must not panic")
+        .expect("enforcement must succeed once the execution row is free");
+}
