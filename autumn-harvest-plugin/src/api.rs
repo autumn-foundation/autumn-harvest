@@ -7881,6 +7881,59 @@ mod operator_reason_tests {
         assert_eq!(truncated.chars().count(), OPERATOR_REASON_MAX_CHARS);
         assert!(truncated.chars().all(|c| c == '\u{2603}'));
     }
+
+    /// Issue #619: truncating a reason that was validated *before* normalization
+    /// can produce a whitespace-only value, which the core then rejects on every
+    /// shard — an opaque 500 with the queue still dispatching, where the route
+    /// promises an audited 400.
+    ///
+    /// `parse_pause_request` closes this by trimming at the point of validation.
+    /// This pins the composition it relies on: once trimmed, no non-empty prefix
+    /// can be whitespace-only, because the first character is not whitespace.
+    #[test]
+    fn trimming_before_truncation_can_never_yield_a_whitespace_only_reason() {
+        for raw in [
+            // The reported case: leading whitespace longer than the whole cap.
+            &format!("{}Stripe outage", " ".repeat(600)) as &str,
+            // Exactly at the cap boundary, either side.
+            &format!("{}x", " ".repeat(OPERATOR_REASON_MAX_CHARS)),
+            &format!("{}x", " ".repeat(OPERATOR_REASON_MAX_CHARS - 1)),
+            // Mixed Unicode whitespace, and trailing padding.
+            "\u{2003}\u{00a0}\t\n  INC-42  \n",
+            "INC-42",
+        ] {
+            // Precondition the route enforces before normalizing.
+            assert!(
+                !raw.trim().is_empty(),
+                "fixture must pass validation: {raw:?}"
+            );
+
+            let stored = truncate_operator_reason(raw.trim());
+
+            assert!(
+                !stored.trim().is_empty(),
+                "trim-then-truncate must stay non-empty, or the core rejects it \
+                 and the audited 400 becomes a 500; raw={raw:?} stored={stored:?}"
+            );
+            assert!(stored.chars().count() <= OPERATOR_REASON_MAX_CHARS);
+        }
+
+        // And the bug is real without the trim: this is what the pre-fix
+        // ordering produced for the reported input.
+        let reported = format!("{}Stripe outage", " ".repeat(600));
+        assert!(
+            truncate_operator_reason(&reported).trim().is_empty(),
+            "the pre-fix ordering must be demonstrably broken, or this guard is vacuous"
+        );
+    }
+
+    /// The operator's actual words must survive the cap, not be evicted by
+    /// padding that carries no information.
+    #[test]
+    fn trimming_keeps_the_operator_words_inside_the_budget() {
+        let raw = format!("{}Stripe outage", " ".repeat(490));
+        assert_eq!(truncate_operator_reason(raw.trim()), "Stripe outage");
+    }
 }
 
 #[cfg(test)]
@@ -27721,7 +27774,7 @@ async fn parse_pause_request(
     body: &axum::body::Bytes,
     route: &'static str,
 ) -> Result<PauseQueueRequest, axum::response::Response> {
-    let request: PauseQueueRequest = match serde_json::from_slice(body) {
+    let mut request: PauseQueueRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => {
             let summary = format!("invalid request body: {error}");
@@ -27750,6 +27803,22 @@ async fn parse_pause_request(
         )
         .await);
     }
+    // Normalize here, in the same place the non-empty rule is enforced, so the
+    // value we validated IS the value we store.
+    //
+    // The handler bounds this reason with `truncate_operator_reason` before the
+    // core sees it, and the core independently re-rejects a whitespace-only
+    // reason. Validating the raw string and then truncating a *different* one
+    // lets the two disagree: a reason of 500+ leading spaces followed by real
+    // text passes the check above (it trims to something), truncates to pure
+    // whitespace, and is then rejected by every shard — surfacing as an opaque
+    // 500 with the queue still dispatching, instead of the audited 400 this
+    // route promises. Trimming first makes that impossible by construction
+    // rather than by a second check: the trimmed string is non-empty and starts
+    // with a non-whitespace character, so any non-empty prefix of it still
+    // contains one. It also stops leading whitespace from eating the operator's
+    // actual words out of the 500-character budget.
+    request.reason = request.reason.trim().to_string();
     Ok(request)
 }
 

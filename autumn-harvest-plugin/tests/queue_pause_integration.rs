@@ -458,6 +458,69 @@ async fn invalid_queue_names_are_rejected_with_400() {
     );
 }
 
+/// A reason padded past the truncation cap must still hold the queue.
+///
+/// The route validates the reason for non-emptiness and then bounds it with
+/// `truncate_operator_reason`. Validating the raw string but storing a truncated
+/// one let the two disagree: 500+ leading spaces followed by real text passed the
+/// check (it trims to something) but truncated to pure whitespace, which the core
+/// then rejected on every shard — surfacing as an opaque 500 with the queue still
+/// dispatching, exactly when the operator needs the hold. Normalizing at the
+/// point of validation makes the two agree, and preserves the operator's words
+/// instead of letting padding eat the budget.
+#[tokio::test]
+async fn a_reason_padded_past_the_cap_still_holds_the_queue() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let queue = "padded-reason-workers";
+    seed_pending_tasks(&pool, queue, 1).await;
+
+    // 600 spaces then the real reason: passes the non-empty check, and a
+    // pre-normalization truncation to 500 chars would leave only whitespace.
+    let padded = format!("{}Stripe outage", " ".repeat(600));
+    let (status, body) = post_json(
+        &app,
+        &format!("/admin/queues/{queue}/pause"),
+        json!({ "reason": padded }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a padded reason must not become a 500 with the queue still \
+         dispatching: {body}"
+    );
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(
+        body["reason"], "Stripe outage",
+        "the operator's actual words must survive the cap, not be evicted by \
+         padding: {body}"
+    );
+
+    // The hold is genuinely in effect, not merely reported.
+    let (status, body) = get_json(&app, "/admin/queues/paused").await;
+    assert_eq!(status, StatusCode::OK);
+    let queues = body["paused_queues"].as_array().expect("queues array");
+    assert_eq!(queues.len(), 1, "the queue must actually be held: {body}");
+    assert_eq!(queues[0]["queue_name"], queue);
+    assert_eq!(queues[0]["reason"], "Stripe outage");
+
+    // A genuinely blank reason is still the audited 400 the route promises.
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/blank-reason-workers/pause",
+        json!({ "reason": "   \t\n  " }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a whitespace-only reason must stay a 400: {body}"
+    );
+}
+
 // ── (g): admin gate ─────────────────────────────────────────────────────────
 
 /// Without the outer auth boundary the built-in admin guard rejects both

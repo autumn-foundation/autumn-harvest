@@ -1476,7 +1476,10 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
   before escalating a backlog alert.
 - **`harvest_queue_schedule_to_start` does not spike on a thaw.** Resume credits
   the held time back to each task's `scheduled_at`, so a queue held for six
-  hours does not report six hours of schedule-to-start latency on release.
+  hours does not report six hours of schedule-to-start latency on release. The
+  credit is measured against the live clock at release, so the time the resume
+  itself takes — waiting on its queue lock and shifting a large backlog — is
+  credited too, and does not count against any task's `schedule_to_start`.
 
 ### Safe actions
 

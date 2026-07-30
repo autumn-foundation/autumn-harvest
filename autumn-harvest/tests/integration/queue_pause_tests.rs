@@ -277,15 +277,27 @@ fn queue_name_validation_rejects_blank_and_oversized() {
     assert!(queue_pause::validate_queue_name(" payments").is_err());
 }
 
-/// The resume shift must never push a held task's `scheduled_at` past NOW()
-/// (that would make a thawed task *un*claimable — the inverse of AC5).
+/// The resume shift must never push a held task's `scheduled_at` past the thaw
+/// instant (that would make a thawed task *un*claimable — the inverse of AC5).
+///
+/// The clock is `clock_timestamp()`, not `NOW()`: `NOW()` is frozen at
+/// transaction start, before the advisory-lock wait and the bulk update, so it
+/// silently charges the resume's own runtime to every held task. See
+/// `resume_credits_the_time_the_resume_itself_spends_waiting` for the behavioural
+/// proof and the query's own doc comment for the full rationale.
 #[test]
 fn resume_shift_query_never_pushes_scheduled_at_past_now() {
     let sql = queue_pause::resume_shift_scheduled_at_query();
     assert!(sql.contains("GREATEST"), "expected the held-span formula");
     assert!(
-        sql.contains("scheduled_at <= NOW()"),
-        "only rows that are actually due may be shifted; got:\n{sql}"
+        sql.contains("scheduled_at <= clock_timestamp()"),
+        "only rows that are actually due may be shifted, measured against the \
+         live clock; got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("NOW()"),
+        "the frozen transaction clock omits the resume's own runtime from the \
+         credit; got:\n{sql}"
     );
     assert!(
         sql.contains("'PENDING'"),
@@ -445,6 +457,96 @@ async fn resume_shifts_scheduled_at_by_held_time_only() {
     assert!(
         (95..=115).contains(&age_now),
         "pre-pause waiting must be preserved (~100s), got {age_now}s"
+    );
+    assert!(
+        after <= chrono::Utc::now(),
+        "AC5: the shift must never push a held task into the future"
+    );
+}
+
+/// The resume's **own** runtime must be credited too, not just the pause span.
+///
+/// `NOW()` is `transaction_timestamp()`, frozen before `resume_queue` waits on
+/// the advisory lock, deletes the pause row, and runs the bulk shift — yet the
+/// hold stays in force until that transaction commits. With `NOW()`, every
+/// second the resume itself spends is charged to the task: a backlog whose
+/// `schedule_to_start` is shorter than the resume's runtime times out the
+/// instant the queue thaws, which is exactly the AC3/AC4 promise ("never failed
+/// *solely because* of the pause") being broken by the thaw itself.
+///
+/// The delay is injected the way it actually happens in production — by holding
+/// the same advisory lock `resume_queue` takes — rather than by patching a
+/// timestamp, so this exercises the real contended path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
+    const LOCK_HOLD_SECS: u64 = 3;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("thawclock");
+    let task = enqueue_activity(&mut conn, &q, None).await;
+    queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    // Genuinely waited 100s before the pause, then held 600s.
+    backdate_scheduled_at(&mut conn, task, 700).await;
+    backdate_paused_at(&mut conn, &q, 600).await;
+
+    // Hold the advisory lock `resume_queue` needs, so the resume blocks on it
+    // for a wall-clock span the frozen transaction clock cannot see.
+    let holder_url = url.clone();
+    let holder_queue = q.clone();
+    let holder = tokio::spawn(async move {
+        let mut holder = connect(&holder_url).await;
+        holder
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtext('{holder_queue}'))"
+            ))
+            .await
+            .expect("take advisory lock");
+        tokio::time::sleep(std::time::Duration::from_secs(LOCK_HOLD_SECS)).await;
+        holder.batch_execute("COMMIT").await.expect("release lock");
+    });
+
+    // Give the holder a moment to actually acquire the lock before resuming.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mut resumer = connect(&url).await;
+    let started = std::time::Instant::now();
+    queue_pause::resume_queue(&mut resumer, &q, "alice")
+        .await
+        .expect("resume");
+    let resume_wall = started.elapsed();
+    holder.await.expect("holder task");
+
+    let after = scheduled_at(&mut conn, task).await;
+    let apparent_wait = (chrono::Utc::now() - after).num_seconds();
+
+    // The task genuinely waited ~100s pre-pause. The frozen-clock bug charges
+    // the resume's own runtime on top of that, so the assertion tolerance has to
+    // be strictly SMALLER than the delay we injected — otherwise it could not
+    // tell the fixed and broken behaviours apart. Prove that first, so a slow or
+    // descheduled runner turns this into a clear failure rather than a test that
+    // silently stops falsifying anything.
+    const TOLERANCE_SECS: i64 = 1;
+    let charged = resume_wall.as_secs_f64();
+    assert!(
+        charged > TOLERANCE_SECS as f64 + 0.5,
+        "the resume must block long enough to exceed the {TOLERANCE_SECS}s \
+         assertion tolerance, or this test cannot falsify the frozen-clock \
+         behaviour; the resume took only {resume_wall:?}"
+    );
+
+    assert!(
+        (100 - TOLERANCE_SECS..=100 + TOLERANCE_SECS).contains(&apparent_wait),
+        "the resume's own {charged:.1}s must not be charged to the task: apparent \
+         wait {apparent_wait}s, but the genuine pre-pause wait was ~100s (with a \
+         frozen NOW() this reads ~{:.0}s)",
+        100.0 + charged
     );
     assert!(
         after <= chrono::Utc::now(),

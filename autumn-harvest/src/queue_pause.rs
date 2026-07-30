@@ -361,35 +361,59 @@ pub const fn queue_pause_suppresses_timeout(
 /// exactly the failure AC4/AC5 exist to prevent.
 ///
 /// For each `PENDING` row on the queue that is actually **due**
-/// (`scheduled_at <= NOW()`), it credits back only the time the row was
-/// genuinely held:
+/// (`scheduled_at <= clock_timestamp()`), it credits back only the time the row
+/// was genuinely held:
 ///
 /// ```text
-/// scheduled_at += NOW() - GREATEST(scheduled_at, paused_at)
+/// scheduled_at += clock_timestamp() - GREATEST(scheduled_at, paused_at)
 /// ```
 ///
 /// - **Eligible before the pause** (`scheduled_at <= paused_at`): shifted by the
 ///   full pause span, so pre-pause waiting is preserved (a task that had already
 ///   waited 100 s still shows 100 s of wait after the thaw).
-/// - **Became eligible mid-pause** (`paused_at < scheduled_at <= NOW()`):
-///   collapses to `NOW()` — it was held from the instant it became due, so it
-///   accrues no wait.
-/// - **Not yet due** (`scheduled_at > NOW()`, e.g. a retry backoff): excluded
+/// - **Became eligible mid-pause** (`paused_at < scheduled_at <= now`):
+///   collapses to the thaw instant — it was held from the moment it became due,
+///   so it accrues no wait.
+/// - **Not yet due** (`scheduled_at > now`, e.g. a retry backoff): excluded
 ///   entirely. It was never held, so its backoff must not be extended.
 ///
-/// The result is provably `<= NOW()` in every branch, so a thawed task is never
-/// pushed into the future (which would make it *un*claimable — the inverse of
-/// AC5). `RUNNING` rows are untouched, and `schedule_to_close_at` is untouched
-/// so the absolute deadline keeps ticking.
+/// # Why `clock_timestamp()` and not `NOW()`
+///
+/// `NOW()` is `transaction_timestamp()` — frozen at **transaction start**, which
+/// here is *before* the advisory-lock wait, before the pause-row `DELETE`, and
+/// before this bulk `UPDATE` runs. But the hold stays in force until this
+/// transaction **commits**, so a frozen `NOW()` silently omits the resume's own
+/// duration from the credit. Measured directly: with a task that had genuinely
+/// waited 100 s pre-pause and a resume that spent 3 s on the lock, `NOW()`
+/// leaves it looking like it waited 103 s the instant the queue thaws — so any
+/// task whose `schedule_to_start` is shorter than the resume's own runtime times
+/// out immediately after the thaw, which is precisely the AC3/AC4 failure
+/// ("never failed *solely because* of the pause") this query exists to prevent.
+/// The same frozen value also excluded rows that fell due *during* the
+/// transaction from the predicate.
+///
+/// `clock_timestamp()` is volatile and re-read per row at execution time, so it
+/// sees the real wall clock after the lock is held and advances as the scan
+/// progresses.
+///
+/// It is still a **lower bound**, deliberately: the true thaw instant is commit
+/// time, which no in-statement expression can know, so each row is under-credited
+/// by at most the remaining duration of this `UPDATE`. That is the *safe*
+/// direction — over-crediting past commit time would push `scheduled_at` into
+/// the future and make the task **un**claimable, the inverse of AC5.
+///
+/// The result stays provably `<= clock_timestamp()` at evaluation, hence
+/// `<= commit time`, in every branch. `RUNNING` rows are untouched, and
+/// `schedule_to_close_at` is untouched so the absolute deadline keeps ticking.
 ///
 /// Binds: `$1` = queue name, `$2` = `paused_at`.
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
     "UPDATE harvest_task_queue \
-     SET scheduled_at = scheduled_at + (NOW() - GREATEST(scheduled_at, $2)) \
+     SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
-       AND scheduled_at <= NOW()"
+       AND scheduled_at <= clock_timestamp()"
 }
 
 /// Count of `PENDING` tasks currently held on a queue (`$1` = queue name).
@@ -897,9 +921,40 @@ mod tests {
         let sql = resume_shift_scheduled_at_query();
         assert!(sql.contains("GREATEST(scheduled_at, $2)"));
         assert!(sql.contains("state = 'PENDING'"));
-        assert!(sql.contains("scheduled_at <= NOW()"));
+        assert!(sql.contains("scheduled_at <= clock_timestamp()"));
         // The absolute deadline must NOT be shifted (issue #619 out-of-scope).
         assert!(!sql.contains("schedule_to_close_at"));
+    }
+
+    /// The shift must measure the thaw with the **real** clock, not the frozen
+    /// transaction timestamp.
+    ///
+    /// `NOW()` is `transaction_timestamp()`, fixed before the advisory-lock
+    /// wait, the pause-row `DELETE`, and this `UPDATE` — yet the hold stays in
+    /// force until commit. Using it silently omits the resume's own runtime from
+    /// the credit, so a task whose `schedule_to_start` is shorter than the
+    /// resume duration times out the instant the queue thaws: the exact AC3/AC4
+    /// violation ("never failed *solely because* of the pause") this query
+    /// exists to prevent. This guard exists because the fix is a one-word
+    /// change that a later "simplification" could quietly undo.
+    #[test]
+    fn resume_shift_never_uses_the_frozen_transaction_clock() {
+        let sql = resume_shift_scheduled_at_query();
+        assert!(
+            !sql.contains("NOW()"),
+            "the resume shift must not use the frozen transaction clock; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("transaction_timestamp()") && !sql.contains("statement_timestamp()"),
+            "only clock_timestamp() advances during the transaction; got:\n{sql}"
+        );
+        // Both the credit and the due-ness predicate must use the live clock, or
+        // rows that fall due mid-transaction are silently skipped.
+        assert_eq!(
+            sql.matches("clock_timestamp()").count(),
+            2,
+            "both the SET credit and the due predicate must read the live clock; got:\n{sql}"
+        );
     }
 
     /// The drift lock: the `const` the hot claim path embeds must be exactly

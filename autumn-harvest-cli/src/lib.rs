@@ -7784,6 +7784,43 @@ mod reuse_policy_tests {
         );
     }
 
+    #[test]
+    fn non_ascii_queue_names_survive_as_exactly_one_path_segment() {
+        // The exhaustive sweep above can only walk printable ASCII, because a
+        // lone byte >= 0x80 is not valid UTF-8 and so is not expressible as a
+        // `&str` queue name at all. The reachable non-ASCII case is a real
+        // multi-byte character, and it is worth pinning rather than assuming:
+        // `utf8_percent_encode` percent-encodes every non-ASCII byte regardless
+        // of the `AsciiSet`, so such a name has no separator hazard -- but that
+        // is a property of the encoding crate, and this asserts we actually get
+        // it instead of trusting it.
+        for raw in [
+            "paiements-europe-é",
+            "支払い",
+            "очередь",
+            "emoji-🚀-queue",
+            // A combining sequence, so normalization differences would show up.
+            "e\u{0301}-queue",
+        ] {
+            let encoded = path_segment(raw);
+            let url = format!("http://host/admin/queues/{encoded}/pause");
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("{raw:?} produced an unparseable URL: {e}"));
+            let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+            assert_eq!(
+                segments.len(),
+                4,
+                "{raw:?} encoded to {encoded:?} but split into {:?}",
+                parsed.path()
+            );
+            assert_eq!(
+                percent_decode(segments[2]),
+                raw,
+                "{raw:?} encoded to {encoded:?} but did not decode back intact"
+            );
+        }
+    }
+
     fn percent_decode(value: &str) -> String {
         percent_encoding::percent_decode_str(value)
             .decode_utf8_lossy()
