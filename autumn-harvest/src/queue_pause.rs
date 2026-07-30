@@ -55,30 +55,120 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
-/// Advisory-lock class id for queue-pause locks (issue #619).
+/// Domain separator for [`queue_lock_keys`] (issue #619 round-23 review).
 ///
-/// Occupies the two-argument `pg_advisory_xact_lock(int, int)` keyspace, which
-/// is disjoint from the single-argument `bigint` keyspace several unrelated
-/// features hash raw text into. See [`lock_queue_for_pause`] for why that
-/// separation is load-bearing. The value is the issue number, purely so a
-/// `pg_locks` row is self-identifying during an incident.
-pub const QUEUE_PAUSE_LOCK_CLASS: i32 = 619;
+/// Mirrors `crate::build_routing`'s `RAMP_HASH_DOMAIN_SEP`: the digest is this
+/// feature's alone, so a queue name can never derive the same key as an
+/// unrelated subsystem that happens to hash the same string. The `v1` marker
+/// makes a future re-keying an explicit, greppable decision rather than a
+/// silent behaviour change — see [`queue_lock_keys`] on why re-keying is not
+/// a rolling-deploy-safe operation.
+const QUEUE_PAUSE_LOCK_DOMAIN: &str = "harvest:queue_pause:v1:";
+
+/// Derive the `(key1, key2)` advisory-lock key that identifies `queue_name`.
+///
+/// Every queue-pause lock — [`lock_queue_for_pause`],
+/// [`lock_queue_for_timeout_recheck`], [`try_lock_queue_for_claim`] — keys on
+/// this pair, so they mutually exclude on exactly the queue they name.
+///
+/// # Why the whole 64 bits are spent on identity (issue #619 round-23 review)
+///
+/// Postgres exposes two *disjoint* advisory-lock keyspaces: a 64-bit one
+/// (`pg_advisory_xact_lock(bigint)`) and a 2×32-bit one
+/// (`pg_advisory_xact_lock(int, int)`). A key in one can never collide with a
+/// key in the other, and **every other advisory-lock user in this engine is in
+/// the single-argument one** — the per-key concurrency gate on the hot claim
+/// path (`crate::queue::claim_task`), `crate::mutex`, `crate::wasm_store` and
+/// `crate::admission_gate`. So the two-argument keyspace belongs to this
+/// feature alone, which is the load-bearing separation round 16 established and
+/// this function preserves. A source-level guard test keeps it true.
+///
+/// Round 16 spent the first 32 bits on a constant class id and derived the
+/// second from `hashtext(queue_name)`, which is only 32 bits wide. That left
+/// **queue identity** at 32 bits: two unrelated queue names collide with
+/// probability ≈ n²/2³³, and the consequence is precisely the failure this
+/// feature exists to prevent. An exclusive pause on queue `a` makes
+/// [`try_lock_queue_for_claim`] fail for the colliding queue `b`, and because
+/// that call uses the *try* variant the failure is silent — `b`'s workers
+/// release every claim and stop dispatching for as long as `a`'s pause or
+/// (potentially long) resume runs, on a queue that was never paused.
+///
+/// The fix is to stop spending half the key on a constant: `key1` and `key2`
+/// are the high and low halves of a domain-separated SHA-256 digest, so
+/// identity is the full 64 bits and a false share needs a 64-bit collision.
+///
+/// # Why not two locks, or the single-argument form
+///
+/// **Two locks** (a class-scoped pair, 32 identity bits each) would make this
+/// *worse*, not better: lock conflicts are evaluated per key, so a claim
+/// needing both locks fails if **either** collides. That doubles the
+/// false-share probability rather than squaring it away.
+///
+/// **The single-argument 64-bit form** would give the same identity width but
+/// drop us into the keyspace `claim_task`'s concurrency gate already hashes raw
+/// text into — trading an intra-feature collision for a cross-feature one whose
+/// blast radius is strictly worse and far harder to diagnose.
+///
+/// # Diagnosing in `pg_locks`
+///
+/// The constant `619` is no longer in the key, so it no longer labels the row.
+/// It does not need to: `pg_locks` reports `objsubid = 1` for the two-key form
+/// (`2` for the `bigint` form), and this feature is its only user, so
+///
+/// ```sql
+/// SELECT * FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1;
+/// ```
+///
+/// selects exactly the queue-pause locks. Match a specific queue by computing
+/// its pair with this function.
+///
+/// # Why SHA-256 rather than a fast hash
+///
+/// The same reason issue #699's rate-limit bucket keys use it: a collision here
+/// silently shares state between two unrelated queues, and queue names are
+/// influenced from outside this module. The digest is computed once per lock
+/// call, in-process, so it costs nothing next to the round trip it rides on.
+///
+/// # Compatibility
+///
+/// The key derivation is part of the *runtime* protocol between concurrently
+/// running processes, not a persisted format — nothing stores it. Changing it
+/// (including the domain separator) is therefore safe across a restart but
+/// **not** across a rolling deploy: two processes on different derivations
+/// would take non-conflicting locks for the same queue and lose mutual
+/// exclusion for the length of the rollout.
+#[must_use]
+pub fn queue_lock_keys(queue_name: &str) -> (i32, i32) {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(QUEUE_PAUSE_LOCK_DOMAIN.as_bytes());
+    hasher.update(queue_name.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    let key = u64::from_be_bytes(head);
+
+    #[allow(clippy::cast_possible_wrap)]
+    ((key >> 32) as u32 as i32, (key & 0xFFFF_FFFF) as u32 as i32)
+}
 
 /// SQL for [`lock_queue_for_pause`], exposed for shape tests.
 ///
-/// `$1` = [`QUEUE_PAUSE_LOCK_CLASS`], `$2` = queue name.
+/// `$1`/`$2` = the queue's [`queue_lock_keys`] pair.
 #[must_use]
 pub const fn lock_queue_for_pause_query() -> &'static str {
-    "SELECT pg_advisory_xact_lock($1, hashtext($2))"
+    "SELECT pg_advisory_xact_lock($1, $2)"
 }
 
 /// SQL for [`lock_queue_for_timeout_recheck`], exposed for shape tests.
 ///
-/// `$1` = [`QUEUE_PAUSE_LOCK_CLASS`], `$2` = queue name. Same key as
+/// `$1`/`$2` = the queue's [`queue_lock_keys`] pair — the same key as
 /// [`lock_queue_for_pause_query`], **shared** mode.
 #[must_use]
 pub const fn lock_queue_for_timeout_recheck_query() -> &'static str {
-    "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))"
+    "SELECT pg_advisory_xact_lock_shared($1, $2)"
 }
 
 /// Upper bound on a pausable queue name.
@@ -251,10 +341,10 @@ pub async fn release_claim(
 
 /// SQL for [`try_lock_queue_for_claim`], exposed for shape tests.
 ///
-/// `$1` = [`QUEUE_PAUSE_LOCK_CLASS`], `$2` = queue name.
+/// `$1`/`$2` = the queue's [`queue_lock_keys`] pair.
 #[must_use]
 pub const fn try_lock_queue_for_claim_query() -> &'static str {
-    "SELECT pg_try_advisory_xact_lock_shared($1, hashtext($2)) AS acquired"
+    "SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired"
 }
 
 /// Commit-order barrier between a claim and a concurrent pause (issue #619
@@ -309,9 +399,10 @@ pub async fn try_lock_queue_for_claim(
         acquired: bool,
     }
 
+    let (key1, key2) = queue_lock_keys(queue_name);
     let row: AcquiredRow = diesel::sql_query(try_lock_queue_for_claim_query())
-        .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .bind::<diesel::sql_types::Integer, _>(key1)
+        .bind::<diesel::sql_types::Integer, _>(key2)
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -390,15 +481,10 @@ pub fn validate_queue_name(queue_name: &str) -> HarvestResult<String> {
 ///
 /// # Why the two-argument lock form (issue #619 round-16 review)
 ///
-/// Postgres exposes two *disjoint* advisory-lock keyspaces: a 64-bit one
-/// (`pg_advisory_xact_lock(bigint)`) and a 2×32-bit one
-/// (`pg_advisory_xact_lock(int, int)`). A key in one can never collide with a
-/// key in the other.
-///
-/// This lock deliberately uses the **two-argument** form under a dedicated
-/// class id, because the single-argument `hashtext(<some text>)` keyspace is
-/// already shared, unnamespaced, by several unrelated features — most
-/// importantly the per-key concurrency gate on the hot claim path
+/// It uses the **two-argument** keyspace, which no other advisory-lock user in
+/// this engine touches, because the single-argument `hashtext(<some text>)`
+/// keyspace is already shared, unnamespaced, by several unrelated features —
+/// most importantly the per-key concurrency gate on the hot claim path
 /// (`queue::claim_task`'s
 /// `pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint)`).
 ///
@@ -413,8 +499,9 @@ pub fn validate_queue_name(queue_name: &str) -> HarvestResult<String> {
 /// whole feature exists to prevent, so the namespace separation is load-bearing
 /// rather than hygiene.
 ///
-/// `hashtext` returns `integer`, so it feeds the second argument directly with
-/// no cast; [`QUEUE_PAUSE_LOCK_CLASS`] fills the first.
+/// Round 23 kept that separation and closed the *intra*-feature half of the
+/// same hazard: see [`queue_lock_keys`] for why both key slots are now spent on
+/// queue identity rather than one on a constant class id.
 ///
 /// # Errors
 ///
@@ -426,9 +513,10 @@ pub async fn lock_queue_for_pause(
 ) -> HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
+    let (key1, key2) = queue_lock_keys(queue_name);
     diesel::sql_query(lock_queue_for_pause_query())
-        .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .bind::<diesel::sql_types::Integer, _>(key1)
+        .bind::<diesel::sql_types::Integer, _>(key2)
         .execute(conn)
         .await?;
     Ok(())
@@ -485,9 +573,10 @@ pub async fn lock_queue_for_timeout_recheck(
 ) -> HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
+    let (key1, key2) = queue_lock_keys(queue_name);
     diesel::sql_query(lock_queue_for_timeout_recheck_query())
-        .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .bind::<diesel::sql_types::Integer, _>(key1)
+        .bind::<diesel::sql_types::Integer, _>(key2)
         .execute(conn)
         .await?;
     Ok(())
@@ -720,17 +809,62 @@ pub const fn queue_pause_suppresses_timeout(
 /// claim keeps the wait it had already accrued; it is now credited correctly by
 /// pass 2 rather than relying on being unreachable in this window.
 ///
-/// Binds: `$1` = queue name, `$2` = `paused_at`. Returns the ids it shifted, for
+/// # Why the ids never leave Postgres (issue #619 round-23 review)
+///
+/// The shifted ids are captured straight into a transaction-scoped scratch
+/// table ([`resume_shifted_scratch_query`]) by a data-modifying CTE, rather
+/// than loaded into the API process and sent back as an array bind for pass 2.
+///
+/// Loading them was linear in the released backlog *twice over* — one `Uuid`
+/// per shifted task in application memory, then that whole array re-serialised
+/// onto the wire and re-materialised server-side by `unnest` — all while this
+/// transaction holds the queue's exclusive advisory lock. A multi-million-row
+/// outage backlog is exactly the case an operator reaches for this feature in,
+/// and is the case where that allocation could exhaust the API process or
+/// blow the bind size, failing the resume and rolling back the thaw the
+/// operator is waiting on. Round 11 already refused `RETURNING id` on the
+/// notify path for the same reason (see [`resumed_queue_notify_task_query`]).
+///
+/// Keeping the set server-side makes the resume's application-side memory O(1)
+/// in the backlog, and shortens the lock hold by the round trip it removes.
+///
+/// Binds: `$1` = queue name, `$2` = `paused_at`. The statement's row count is
+/// the number of tasks shifted; the ids land in the scratch table for
 /// [`resume_shift_late_arrivals_query`] to exclude.
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
-     WHERE queue_name = $1 \
-       AND state = 'PENDING' \
-       AND scheduled_at <= clock_timestamp() \
-       AND (created_at IS NULL OR created_at < $2) \
-     RETURNING id"
+    "WITH shifted AS ( \
+       UPDATE harvest_task_queue \
+       SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
+       WHERE queue_name = $1 \
+         AND state = 'PENDING' \
+         AND scheduled_at <= clock_timestamp() \
+         AND (created_at IS NULL OR created_at < $2) \
+       RETURNING id \
+     ) \
+     INSERT INTO harvest_resume_shifted (id) SELECT id FROM shifted"
+}
+
+/// Transaction-scoped scratch table for the resume's shifted-id set.
+///
+/// [`resume_shift_scheduled_at_query`] writes into it and
+/// [`resume_shift_late_arrivals_query`] anti-joins it, so the ids never enter
+/// application memory (issue #619 round-23 review).
+///
+/// `ON COMMIT DROP` ties its lifetime to `resume_queue`'s own transaction, so
+/// it is gone on either commit or rollback and cannot leak onto a pooled
+/// connection. Temp tables are session-scoped, so concurrent resumes on
+/// different connections never collide, and the deliberate absence of
+/// `IF NOT EXISTS` means a second `resume_queue` inside one transaction would
+/// fail loudly rather than silently credit against a stale id set.
+///
+/// The `PRIMARY KEY` is not for uniqueness — the ids are unique by construction
+/// — but to bound the plan: a freshly created temp table carries no statistics,
+/// and the index keeps even a nested-loop anti-join at O(rows × log ids)
+/// instead of the O(rows × ids) scan the round-19 note rejected `<> ALL` for.
+#[must_use]
+pub const fn resume_shifted_scratch_query() -> &'static str {
+    "CREATE TEMP TABLE harvest_resume_shifted (id uuid PRIMARY KEY) ON COMMIT DROP"
 }
 
 /// Second pass of the resume shift: credit rows **enqueued during the thaw
@@ -771,15 +905,14 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// credited here, whichever side it belongs to. An empty `$3` — the primary
 /// pass shifted nothing — correctly leaves every row to this pass.
 ///
-/// The exclusion is written as `NOT EXISTS (… unnest($3) …)` rather than
-/// `id <> ALL($3)` deliberately: the latter is a per-row linear scan of the
-/// array, while the former lets the planner build a hash anti-join, so the cost
-/// is O(rows + ids) rather than O(rows × ids). The array itself is one UUID per
-/// row the primary pass already rewrote, on an operator-initiated resume that
-/// is by definition doing a bulk `UPDATE` of those same rows — a small fraction
-/// of work already being paid. (Round 11 rejected this exclusion on the
-/// strength of the `<> ALL` cost; the objection was to that spelling, not to
-/// the approach.)
+/// The exclusion is written as `NOT EXISTS (… scratch table …)` rather than
+/// `id <> ALL(<array>)` deliberately: the latter is a per-row linear scan of
+/// the array, while the former lets the planner build a hash anti-join, so the
+/// cost is O(rows + ids) rather than O(rows × ids). (Round 11 rejected this
+/// exclusion on the strength of the `<> ALL` cost; the objection was to that
+/// spelling, not to the approach.) Round 23 moved the id set from an array bind
+/// into [`resume_shifted_scratch_query`], so it is O(1) in application memory —
+/// see the note on [`resume_shift_scheduled_at_query`].
 ///
 /// # Irreducible residual
 ///
@@ -797,8 +930,8 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// paying to recover a sub-millisecond credit — so the residual is documented
 /// rather than eliminated.
 ///
-/// Binds: `$1` = queue name, `$2` = the hold's `paused_at`, `$3` = the ids the
-/// primary pass shifted.
+/// Binds: `$1` = queue name, `$2` = the hold's `paused_at`. The ids the primary
+/// pass shifted are read from [`resume_shifted_scratch_query`]'s table.
 #[must_use]
 pub const fn resume_shift_late_arrivals_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -811,7 +944,7 @@ pub const fn resume_shift_late_arrivals_query() -> &'static str {
        AND state = 'PENDING' \
        AND scheduled_at <= clock_timestamp() \
        AND NOT EXISTS ( \
-             SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
+             SELECT 1 FROM harvest_resume_shifted already \
              WHERE already.id = harvest_task_queue.id \
            )"
 }
@@ -1008,17 +1141,6 @@ struct CountRow {
 struct ClockRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     now: DateTime<Utc>,
-}
-
-/// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
-/// can exclude exactly the rows the first pass shifted rather than re-deriving
-/// that set from a `created_at` predicate that cannot see commit order
-/// (issue #619 round-19 review).
-#[cfg(feature = "db")]
-#[derive(diesel::QueryableByName)]
-struct ShiftedTaskId {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    id: uuid::Uuid,
 }
 
 #[cfg(feature = "db")]
@@ -1305,14 +1427,17 @@ pub async fn resume_queue(
 
             // The ids this pass shifts are what pass 2 excludes -- see the
             // round-19 notes on both queries for why a `created_at` predicate
-            // cannot do that job.
-            let shifted: Vec<ShiftedTaskId> = diesel::sql_query(resume_shift_scheduled_at_query())
+            // cannot do that job, and the round-23 note on why they are handed
+            // over in a transaction-scoped scratch table rather than an array
+            // bind through this process.
+            diesel::sql_query(resume_shifted_scratch_query())
+                .execute(conn)
+                .await?;
+            let released = diesel::sql_query(resume_shift_scheduled_at_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-                .load(conn)
+                .execute(conn)
                 .await?;
-            let released = shifted.len();
-            let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
 
             // Second pass, LAST so it sees the freshest snapshot: a task still
             // held (our DELETE has not committed, so concurrent claimers still
@@ -1327,7 +1452,6 @@ pub async fn resume_queue(
             let late = diesel::sql_query(resume_shift_late_arrivals_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
                 .execute(conn)
                 .await?;
 
@@ -1848,13 +1972,20 @@ mod tests {
              to cover (round-19 P2); got:\n{late}"
         );
         assert!(
-            late.contains("unnest($3::uuid[])") && late.contains("NOT EXISTS"),
+            late.contains("harvest_resume_shifted") && late.contains("NOT EXISTS"),
             "pass 2 must exclude by the shifted-id set; got:\n{late}"
         );
         assert!(
             !late.contains("<> ALL"),
-            "`<> ALL` is a per-row linear scan of the array; the NOT EXISTS \
-             + unnest spelling lets the planner hash it; got:\n{late}"
+            "`<> ALL` is a per-row linear scan; the NOT EXISTS spelling lets the \
+             planner hash the id set; got:\n{late}"
+        );
+        // Round-23 P2: the id set must stay server-side. An array bind would
+        // put one UUID per shifted task through this process, twice over.
+        assert!(
+            !late.contains("unnest(") && !late.contains("uuid[]"),
+            "pass 2 must read the shifted ids from the scratch table, not from \
+             an array bind proportional to the released backlog; got:\n{late}"
         );
 
         // Same queue, same PENDING/due gate on both sides, or a row could leak
@@ -1993,7 +2124,7 @@ mod tests {
     fn claim_barrier_is_a_shared_try_lock_on_the_pause_key() {
         let sql = try_lock_queue_for_claim_query();
         assert!(
-            sql.contains("pg_try_advisory_xact_lock_shared($1, hashtext($2))"),
+            sql.contains("pg_try_advisory_xact_lock_shared($1, $2)"),
             "the claim barrier must be the shared TRY lock in the two-argument \
              keyspace; got:\n{sql}"
         );
@@ -2005,6 +2136,8 @@ mod tests {
             "pg_advisory_xact_lock_shared($1",
             // Single-argument keyspace: collides with the concurrency_key gate.
             "pg_try_advisory_xact_lock_shared(hashtext($1))",
+            // Round-23: a 32-bit key slot is not enough for queue identity.
+            "hashtext($2)",
         ] {
             assert!(
                 !sql.contains(wrong),
@@ -2012,8 +2145,8 @@ mod tests {
             );
         }
         assert!(
-            lock_queue_for_pause_query().contains("hashtext($2)"),
-            "the pause side must key on the same (classid, hashtext(queue)) pair, \
+            lock_queue_for_pause_query().contains("($1, $2)"),
+            "the pause side must key on the same (key1, key2) pair, \
              or the shared/exclusive pair would not actually exclude"
         );
     }
@@ -2031,14 +2164,14 @@ mod tests {
     fn timeout_recheck_lock_is_shared_and_blocking_on_the_pause_key() {
         let sql = lock_queue_for_timeout_recheck_query();
         assert!(
-            sql.contains("pg_advisory_xact_lock_shared($1, hashtext($2))"),
+            sql.contains("pg_advisory_xact_lock_shared($1, $2)"),
             "the timeout re-check must take the shared, BLOCKING lock in the \
              two-argument keyspace; got:\n{sql}"
         );
         for wrong in [
             // Exclusive: blocks every claim's shared barrier for the whole
             // enforcement transaction, on a queue that is not even paused.
-            "pg_advisory_xact_lock($1, hashtext($2))",
+            "pg_advisory_xact_lock($1, $2)",
             "pg_try_advisory_xact_lock($1",
             // Try: would silently skip the pause re-check under contention.
             "pg_try_advisory_xact_lock_shared($1",
@@ -2053,9 +2186,8 @@ mod tests {
         // Shared and exclusive only exclude each other if they name the same
         // key, so the two spellings must agree beyond the mode.
         assert!(
-            sql.contains("($1, hashtext($2))")
-                && lock_queue_for_pause_query().contains("($1, hashtext($2))"),
-            "the re-check and the pause must key on the same (classid, hashtext(queue)) \
+            sql.contains("($1, $2)") && lock_queue_for_pause_query().contains("($1, $2)"),
+            "the re-check and the pause must key on the same (key1, key2) \
              pair, or they would not actually serialize"
         );
     }
@@ -2124,8 +2256,8 @@ mod tests {
     fn queue_pause_lock_uses_its_own_advisory_namespace() {
         let sql = lock_queue_for_pause_query();
         assert!(
-            sql.contains("pg_advisory_xact_lock($1, hashtext($2))"),
-            "the queue-pause lock must use the two-argument (classid, objid) form \
+            sql.contains("pg_advisory_xact_lock($1, $2)"),
+            "the queue-pause lock must use the two-argument (key1, key2) form \
              so it cannot collide with the single-argument hashtext keyspace; got:\n{sql}"
         );
         // The single-argument shapes that WOULD collide with concurrency_key.
@@ -2138,9 +2270,191 @@ mod tests {
                 "must not use the shared single-argument keyspace ({colliding}); got:\n{sql}"
             );
         }
+    }
+
+    /// Round-23 P2: the advisory key identifies the *queue*, deterministically.
+    #[test]
+    fn queue_lock_keys_are_deterministic_and_name_sensitive() {
         assert_eq!(
-            QUEUE_PAUSE_LOCK_CLASS, 619,
-            "the class id is the issue number so a pg_locks row is self-identifying"
+            queue_lock_keys("payments"),
+            queue_lock_keys("payments"),
+            "the key must be a pure function of the queue name -- two processes \
+             deriving different keys for one queue would lose mutual exclusion"
+        );
+        for (a, b) in [
+            ("payments", "emails"),
+            ("payments", "payment"),
+            ("payments", "Payments"),
+            ("payments", "payments2"),
+            ("", "\0"),
+        ] {
+            assert_ne!(
+                queue_lock_keys(a),
+                queue_lock_keys(b),
+                "distinct queue names must not share a lock key ({a:?} vs {b:?})"
+            );
+        }
+    }
+
+    /// Round-23 P2: **both** key slots carry queue identity.
+    ///
+    /// This is the falsifiable core of the round-23 fix. Before it, slot 1 was
+    /// the constant class id `619` and only slot 2 (a 32-bit `hashtext`) told
+    /// queues apart, so identity was 32 bits wide and two unrelated queues
+    /// collided with probability n²/2³³ -- silently stalling the colliding
+    /// queue's dispatch for the length of an unrelated pause or resume.
+    ///
+    /// Asserting slot 1 *varies* is what fails against that design: a constant
+    /// first slot cannot vary no matter which names are sampled.
+    #[test]
+    fn queue_lock_keys_spend_both_slots_on_queue_identity() {
+        let names = [
+            "payments",
+            "emails",
+            "warehouse",
+            "billing",
+            "search",
+            "webhooks",
+        ];
+        let firsts: std::collections::HashSet<i32> =
+            names.iter().map(|n| queue_lock_keys(n).0).collect();
+        let seconds: std::collections::HashSet<i32> =
+            names.iter().map(|n| queue_lock_keys(n).1).collect();
+
+        assert!(
+            firsts.len() > 1,
+            "key1 must carry queue identity, not a constant class id -- a fixed \
+             slot halves the key to 32 bits and reintroduces the round-23 collision"
+        );
+        assert!(
+            seconds.len() > 1,
+            "key2 must carry queue identity too; got a constant"
+        );
+        assert_eq!(
+            firsts.len(),
+            names.len(),
+            "no two of these names should share key1"
+        );
+    }
+
+    /// Round-23 P2: this feature owns the two-argument advisory keyspace.
+    ///
+    /// [`queue_lock_keys`] spends all 64 bits on queue identity rather than
+    /// reserving 32 for a class id, so the *only* thing keeping queue-pause
+    /// locks from colliding with another subsystem is that no other subsystem
+    /// uses the two-argument form. Every other advisory-lock user in the engine
+    /// is in the single-argument `bigint` keyspace (`queue::claim_task`'s
+    /// concurrency gate, `mutex`, `wasm_store`, `admission_gate`), and this
+    /// walks the crate to keep that true -- turning a documented convention
+    /// into a CI-enforced one.
+    #[test]
+    fn queue_pause_owns_the_two_argument_advisory_keyspace() {
+        /// Does `src` call an advisory-lock function with two arguments?
+        fn calls_two_arg_advisory_lock(src: &str) -> Option<String> {
+            // Comments describe the keyspace split at length; only code counts.
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut from = 0usize;
+            while let Some(hit) = code[from..].find("advisory_xact_lock") {
+                let open = from + hit;
+                let Some(paren) = code[open..].find('(') else {
+                    break;
+                };
+                let mut depth = 0usize;
+                for (i, ch) in code[open + paren..].char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ',' if depth == 1 => {
+                            let end = open + paren + i;
+                            return Some(code[open..end].to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                from = open + paren;
+            }
+            None
+        }
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src_root];
+        let mut checked = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                if path.file_name().and_then(|f| f.to_str()) == Some("queue_pause.rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).expect("read source");
+                checked += 1;
+                assert!(
+                    calls_two_arg_advisory_lock(&src).is_none(),
+                    "{} uses the two-argument advisory-lock keyspace, which \
+                     queue_pause owns: its keys spend all 64 bits on the queue \
+                     name and reserve no class id, so a second user there would \
+                     silently stall queue dispatch. Use the single-argument \
+                     bigint form (see queue_lock_keys). Offending call:\n{}",
+                    path.display(),
+                    calls_two_arg_advisory_lock(&src).unwrap_or_default()
+                );
+            }
+        }
+        assert!(checked > 10, "the source walk found only {checked} files");
+
+        // The detector must actually fire, or the walk above proves nothing.
+        assert!(
+            calls_two_arg_advisory_lock("pg_advisory_xact_lock($1, $2)").is_some(),
+            "the two-argument detector failed to match the form it looks for"
+        );
+        assert!(
+            calls_two_arg_advisory_lock("pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+                .is_none(),
+            "the detector must not flag the single-argument form"
+        );
+    }
+
+    /// Round-23 P2: the resume's shifted-id set stays inside Postgres.
+    #[test]
+    fn resume_shift_hands_the_id_set_over_server_side() {
+        let scratch = resume_shifted_scratch_query();
+        let primary = resume_shift_scheduled_at_query();
+
+        assert!(
+            scratch.contains("CREATE TEMP TABLE") && scratch.contains("ON COMMIT DROP"),
+            "the scratch table must be transaction-scoped so it cannot leak onto \
+             a pooled connection; got:\n{scratch}"
+        );
+        assert!(
+            !scratch.contains("IF NOT EXISTS"),
+            "a second resume inside one transaction must fail loudly rather than \
+             credit against a stale id set; got:\n{scratch}"
+        );
+        assert!(
+            primary.contains("INSERT INTO harvest_resume_shifted"),
+            "pass 1 must capture its ids straight into the scratch table rather \
+             than returning them to the client; got:\n{primary}"
+        );
+        assert!(
+            primary.trim_start().starts_with("WITH shifted AS ("),
+            "the capture must be a data-modifying CTE, so the UPDATE and the \
+             capture share one statement and one snapshot; got:\n{primary}"
         );
     }
 

@@ -35,12 +35,12 @@ use uuid::Uuid;
 
 // ── DB setup ──────────────────────────────────────────────────────────────────
 
-/// One id returned by the primary resume pass's `RETURNING id`.
+/// One id the primary resume pass captured into its scratch table.
 ///
 /// The second pass excludes the rows the first one actually shifted rather than
-/// re-deriving them from a predicate (issue #619 round 19), so any test that
-/// drives the two passes by hand has to thread these ids through exactly the way
-/// `resume_queue` does.
+/// re-deriving them from a predicate (issue #619 round 19), and since round 23
+/// that set is handed over inside Postgres rather than through this process, so
+/// a test driving the two passes by hand reads it back from the scratch table.
 #[derive(diesel::QueryableByName)]
 struct ShiftedTaskIdRow {
     #[diesel(sql_type = diesel::sql_types::Uuid)]
@@ -552,11 +552,9 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     let holder_queue = q.clone();
     let holder = tokio::spawn(async move {
         let mut holder = connect(&holder_url).await;
-        let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
+        let (k1, k2) = autumn_harvest::queue_pause::queue_lock_keys(&holder_queue);
         holder
-            .batch_execute(&format!(
-                "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{holder_queue}'))"
-            ))
+            .batch_execute(&format!("BEGIN; SELECT pg_advisory_xact_lock({k1}, {k2})"))
             .await
             .expect("take advisory lock");
         tokio::time::sleep(std::time::Duration::from_secs(LOCK_HOLD_SECS)).await;
@@ -639,25 +637,28 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     // Open resume_queue's transaction by hand: advisory lock, then release the
     // hold. The DELETE stays uncommitted for the rest of this test.
     let mut resumer = connect(&url).await;
-    let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
+    let (k1, k2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
     resumer
         .batch_execute(&format!(
-            "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{q}')); \
+            "BEGIN; SELECT pg_advisory_xact_lock({k1}, {k2}); \
              DELETE FROM harvest_queue_pauses WHERE queue_name = '{q}'"
         ))
         .await
         .expect("begin, lock, release the hold");
 
-    // Pass 1 — the primary shift.
-    let primary_ids: Vec<ShiftedTaskIdRow> =
-        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-            .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-            .load(&mut resumer)
-            .await
-            .expect("primary shift");
-    let primary = primary_ids.len();
-    let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
+    // Pass 1 — the primary shift. Its ids land in the transaction-scoped
+    // scratch table pass 2 reads, exactly as `resume_queue` drives them
+    // (issue #619 round-23: they never enter this process).
+    diesel::sql_query(queue_pause::resume_shifted_scratch_query())
+        .execute(&mut resumer)
+        .await
+        .expect("create the shifted-id scratch table");
+    let primary = diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .execute(&mut resumer)
+        .await
+        .expect("primary shift");
 
     // ── THE WINDOW ──────────────────────────────────────────────────────────
     let late = enqueue_activity(&mut conn, &q, None).await;
@@ -683,7 +684,6 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -780,22 +780,32 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     // so `transaction_timestamp() > straddler.created_at` and the old predicate
     // would place it on the primary side, where pass 1 cannot see it.
     let mut resumer = connect(&url).await;
-    let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
+    let (k1, k2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
     resumer
         .batch_execute(&format!(
-            "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{q}')); \
+            "BEGIN; SELECT pg_advisory_xact_lock({k1}, {k2}); \
              DELETE FROM harvest_queue_pauses WHERE queue_name = '{q}'"
         ))
         .await
         .expect("begin, lock, release the hold");
 
+    diesel::sql_query(queue_pause::resume_shifted_scratch_query())
+        .execute(&mut resumer)
+        .await
+        .expect("create the shifted-id scratch table");
+    diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .execute(&mut resumer)
+        .await
+        .expect("primary shift");
+    // Read the captured set back out of Postgres -- that is where pass 2 will
+    // read it from too (issue #619 round-23).
     let primary_ids: Vec<ShiftedTaskIdRow> =
-        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-            .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        diesel::sql_query("SELECT id FROM harvest_resume_shifted ORDER BY id")
             .load(&mut resumer)
             .await
-            .expect("primary shift");
+            .expect("read the shifted-id scratch table");
     let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
     assert_eq!(
         shifted_ids,
@@ -813,7 +823,6 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -1402,6 +1411,7 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
     let q = unique_queue("race-timeout");
+    let (qk1, qk2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
 
     // A task already past its schedule_to_start deadline, so the scanner picks
     // it up on its very next pass.
@@ -1425,8 +1435,8 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
     let mut pauser = connect(&url).await;
     pauser.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
-        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Integer, _>(qk1)
+        .bind::<diesel::sql_types::Integer, _>(qk2)
         .execute(&mut pauser)
         .await
         .expect("take the queue lock");
@@ -1504,6 +1514,7 @@ async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
     let q = unique_queue("abba-order");
+    let (qk1, qk2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
 
     let exec_id = insert_execution(&mut conn).await;
     let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
@@ -1525,8 +1536,8 @@ async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
     let mut holder = connect(&url).await;
     holder.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
-        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Integer, _>(qk1)
+        .bind::<diesel::sql_types::Integer, _>(qk2)
         .execute(&mut holder)
         .await
         .expect("take the queue lock");
@@ -1980,11 +1991,9 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
     let holder_queue = q.clone();
     let holder = tokio::spawn(async move {
         let mut holder = connect(&holder_url).await;
-        let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
+        let (k1, k2) = autumn_harvest::queue_pause::queue_lock_keys(&holder_queue);
         holder
-            .batch_execute(&format!(
-                "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{holder_queue}'))"
-            ))
+            .batch_execute(&format!("BEGIN; SELECT pg_advisory_xact_lock({k1}, {k2})"))
             .await
             .expect("take advisory lock");
         tokio::time::sleep(std::time::Duration::from_secs(LOCK_HOLD_SECS)).await;
@@ -2098,6 +2107,7 @@ async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() 
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
     let q = unique_queue("race-wf-timeout");
+    let (qk1, qk2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
 
     let exec_id = insert_execution(&mut conn).await;
     let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
@@ -2122,8 +2132,8 @@ async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() 
     let mut pauser = connect(&url).await;
     pauser.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
-        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Integer, _>(qk1)
+        .bind::<diesel::sql_types::Integer, _>(qk2)
         .execute(&mut pauser)
         .await
         .expect("take the queue lock");
@@ -2300,6 +2310,215 @@ async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
 ///
 /// Note what makes this a genuine regression test rather than a restatement of
 /// the round-2 guard: **no pause row is committed**, so the anti-join and the
+/// Round-23 P2: a pause on one queue must not stall a queue whose name merely
+/// **hash-collides** with it.
+///
+/// This is the money test for the collision fix, and it reproduces the reported
+/// failure directly rather than asserting a property about the key. Before the
+/// fix the advisory key was `(619, hashtext(queue))` — 32 bits of queue
+/// identity — so two unrelated names could map to the same lock. An exclusive
+/// pause on one then made the *other* queue's `try_lock_queue_for_claim` fail,
+/// and because that call is the `try` variant the failure is silent: the
+/// colliding queue's workers hand every claim back and stop dispatching for the
+/// length of an unrelated pause or (potentially long) resume, on a queue that
+/// was never paused.
+///
+/// The colliding pair is *found*, not hard-coded: `hashtext` is a Postgres
+/// internal whose values are not part of any contract, so the test searches for
+/// a real collision in a 32-bit space (a birthday collision needs only ~2¹⁶
+/// samples, so 300k candidates finds several) and then asserts the two names
+/// still take different queue-pause locks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut finder = connect(&url).await;
+
+    #[derive(diesel::QueryableByName)]
+    struct CollisionRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        a: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        b: String,
+    }
+
+    // Two distinct names that `hashtext` maps to one 32-bit value.
+    let pair: Vec<CollisionRow> = diesel::sql_query(
+        "SELECT min(n) AS a, max(n) AS b \
+         FROM (SELECT 'q-' || g AS n FROM generate_series(1, 300000) g) s \
+         GROUP BY hashtext(n) HAVING count(*) > 1 LIMIT 1",
+    )
+    .load(&mut finder)
+    .await
+    .expect("search for a hashtext collision");
+    let Some(pair) = pair.into_iter().next() else {
+        panic!(
+            "no hashtext collision found in 300k candidates; the search space \
+                is 2^32 so this should be overwhelmingly unlikely"
+        );
+    };
+    let (paused, colliding) = (pair.a, pair.b);
+    assert_ne!(
+        paused, colliding,
+        "the pair must be two distinct queue names"
+    );
+
+    // The old key would have been identical for both: same class id, same
+    // hashtext. Assert that premise so the test cannot pass vacuously on a
+    // pair that never actually collided.
+    #[derive(diesel::QueryableByName)]
+    struct HashRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        h: i32,
+    }
+    let hashes: Vec<HashRow> =
+        diesel::sql_query("SELECT hashtext($1) AS h UNION ALL SELECT hashtext($2)")
+            .bind::<diesel::sql_types::Text, _>(&paused)
+            .bind::<diesel::sql_types::Text, _>(&colliding)
+            .load(&mut finder)
+            .await
+            .expect("read both hashtext values");
+    assert_eq!(
+        hashes[0].h, hashes[1].h,
+        "the search must return a genuine hashtext collision, or the pre-fix \
+         key would not have been shared and this test would prove nothing"
+    );
+
+    // ── the pre-fix behaviour, demonstrated live ────────────────────────────
+    // Take the *old* key by hand -- `(619, hashtext(queue))` -- and show that a
+    // pause on one queue really did make the colliding queue's shared barrier
+    // fail. This is what makes the assertion below meaningful rather than a
+    // property nothing was ever violating.
+    let mut old_lock_holder = connect(&url).await;
+    old_lock_holder.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("SELECT pg_advisory_xact_lock(619, hashtext($1))")
+        .bind::<diesel::sql_types::Text, _>(&paused)
+        .execute(&mut old_lock_holder)
+        .await
+        .expect("take the pre-fix exclusive lock");
+
+    #[derive(diesel::QueryableByName)]
+    struct AcquiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        acquired: bool,
+    }
+
+    let mut old_claimer = connect(&url).await;
+    old_claimer.batch_execute("BEGIN").await.expect("begin");
+    let old_barrier: AcquiredRow =
+        diesel::sql_query("SELECT pg_try_advisory_xact_lock_shared(619, hashtext($1)) AS acquired")
+            .bind::<diesel::sql_types::Text, _>(&colliding)
+            .get_result(&mut old_claimer)
+            .await
+            .expect("probe the pre-fix barrier");
+    assert!(
+        !old_barrier.acquired,
+        "the pre-fix key must actually stall the colliding queue, or this test \
+         asserts a property nothing was violating"
+    );
+    for mut c in [old_lock_holder, old_claimer] {
+        c.batch_execute("ROLLBACK").await.expect("rollback");
+    }
+
+    // ── the behaviour ───────────────────────────────────────────────────────
+    // An in-flight, uncommitted pause on `paused` holding its exclusive lock.
+    let mut lock_holder = connect(&url).await;
+    lock_holder.batch_execute("BEGIN").await.expect("begin");
+    autumn_harvest::queue_pause::lock_queue_for_pause(&mut lock_holder, &paused)
+        .await
+        .expect("take the exclusive queue lock");
+
+    // A claim on the *colliding* queue must still get its shared barrier.
+    let mut claimer = connect(&url).await;
+    claimer.batch_execute("BEGIN").await.expect("claimer begin");
+    let acquired = autumn_harvest::queue_pause::try_lock_queue_for_claim(&mut claimer, &colliding)
+        .await
+        .expect("probe the claim barrier on the colliding queue");
+    assert!(
+        acquired,
+        "a pause on {paused:?} must not stall {colliding:?}: the two names \
+         collide under hashtext, so a 32-bit key made the unrelated queue's \
+         claims silently fail their barrier and stop dispatching"
+    );
+
+    // ...while the paused queue's own claims are still correctly excluded, so
+    // the fix cannot have simply disabled the barrier.
+    let mut same = connect(&url).await;
+    same.batch_execute("BEGIN").await.expect("same begin");
+    let same_acquired = autumn_harvest::queue_pause::try_lock_queue_for_claim(&mut same, &paused)
+        .await
+        .expect("probe the claim barrier on the paused queue");
+    assert!(
+        !same_acquired,
+        "the barrier must still exclude claims on the queue actually being paused"
+    );
+
+    for mut c in [lock_holder, claimer, same] {
+        c.batch_execute("ROLLBACK").await.expect("rollback");
+    }
+}
+
+/// Round-23 P2: the resume's shifted-id scratch table is transaction-scoped.
+///
+/// The ids pass 1 shifts are handed to pass 2 inside Postgres rather than
+/// through this process, which means `resume_queue` now creates a temp table on
+/// a **pooled** connection. `ON COMMIT DROP` is what keeps that from leaking:
+/// without it the table survives the resume's transaction and the next resume
+/// to land on the same connection fails with "already exists", so an operator's
+/// second thaw of the day would error out.
+///
+/// Two resumes driven back-to-back on one connection is the falsifiable form of
+/// that — it fails if the scratch table is not transaction-scoped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resume_scratch_table_does_not_leak_across_transactions() {
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+
+    for round in 0..3 {
+        let q = unique_queue(&format!("scratch-{round}"));
+        let task = enqueue_activity(&mut conn, &q, None).await;
+        backdate_scheduled_at(&mut conn, task, 100).await;
+
+        queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+            .await
+            .expect("pause");
+        let outcome = queue_pause::resume_queue(&mut conn, &q, "alice")
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "resume {round} on the same pooled connection failed ({e}); the \
+                     shifted-id scratch table must be ON COMMIT DROP or it survives \
+                     the transaction and the next resume cannot create it"
+                )
+            });
+        assert!(outcome.newly_resumed, "round {round} released the hold");
+        assert_eq!(
+            outcome.released_task_count, 1,
+            "round {round} credited its held task"
+        );
+    }
+
+    // And it is genuinely gone afterwards, not merely re-creatable.
+    #[derive(diesel::QueryableByName)]
+    struct RegRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        reg: Option<String>,
+    }
+    use diesel_async::RunQueryDsl;
+    let reg: Vec<RegRow> =
+        diesel::sql_query("SELECT to_regclass('harvest_resume_shifted')::text AS reg")
+            .load(&mut conn)
+            .await
+            .expect("probe for the scratch table");
+    assert!(
+        reg[0].reg.is_none(),
+        "the scratch table must not outlive the resume transaction on a pooled \
+         connection; found {:?}",
+        reg[0].reg
+    );
+}
+
 /// re-check both legitimately see an unpaused queue. Before the barrier the
 /// task is claimed; after it, the claim is given back untouched — same state,
 /// same attempt, immediately re-claimable once the pause transaction settles.
@@ -2310,6 +2529,7 @@ async fn a_claim_declines_while_a_pause_transaction_is_committing() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
     let q = unique_queue("claim-barrier");
+    let (qk1, qk2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
 
     let params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
@@ -2319,8 +2539,8 @@ async fn a_claim_declines_while_a_pause_transaction_is_committing() {
     let mut pauser = connect(&url).await;
     pauser.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
-        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Integer, _>(qk1)
+        .bind::<diesel::sql_types::Integer, _>(qk2)
         .execute(&mut pauser)
         .await
         .expect("take the exclusive queue lock");
@@ -2391,6 +2611,7 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
     let (url, _c) = setup_db_url().await;
     let mut conn = connect(&url).await;
     let q = unique_queue("stale-scan");
+    let (qk1, qk2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
 
     let exec_id = insert_execution(&mut conn).await;
     let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
@@ -2413,8 +2634,8 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
     let mut shifter = connect(&url).await;
     shifter.batch_execute("BEGIN").await.expect("begin");
     diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
-        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
-        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Integer, _>(qk1)
+        .bind::<diesel::sql_types::Integer, _>(qk2)
         .execute(&mut shifter)
         .await
         .expect("take the queue lock");
@@ -2551,14 +2772,29 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
             .expect("the hold exists")
             .paused_at;
 
+    // Open `resume_queue`'s transaction by hand. Both passes must run inside
+    // ONE transaction, exactly as `resume_queue` drives them: the scratch table
+    // is `ON COMMIT DROP`, so in autocommit it would be gone the instant the
+    // CREATE's implicit transaction ended. READ COMMITTED still gives pass 2 a
+    // fresh snapshot -- which is the whole point of this test.
+    driver.batch_execute("BEGIN").await.expect("begin resume");
+
     // Pass 1. The slow enqueue is still uncommitted, so this cannot see it.
+    diesel::sql_query(queue_pause::resume_shifted_scratch_query())
+        .execute(&mut driver)
+        .await
+        .expect("create the shifted-id scratch table");
+    diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .execute(&mut driver)
+        .await
+        .expect("primary shift");
     let shifted: Vec<ShiftedTaskIdRow> =
-        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-            .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        diesel::sql_query("SELECT id FROM harvest_resume_shifted ORDER BY id")
             .load(&mut driver)
             .await
-            .expect("primary shift");
+            .expect("read the shifted-id scratch table");
     let shifted_ids: Vec<Uuid> = shifted.into_iter().map(|r| r.id).collect();
     assert_eq!(
         shifted_ids,
@@ -2576,10 +2812,11 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut driver)
         .await
         .expect("second pass");
+
+    driver.batch_execute("COMMIT").await.expect("commit resume");
 
     // Both rows were due 2h ago and held for 1h, so both keep the 1h of wait
     // they had accrued *before* the hold and none of the hold itself.
@@ -2730,6 +2967,7 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
 
     // An expired schedule_to_start task on a queue that is NOT paused.
     let q = unique_queue("sharedlock");
+    let (qk1, qk2) = autumn_harvest::queue_pause::queue_lock_keys(&q);
     let exec_id = insert_execution(&mut conn).await;
     let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id);
@@ -2780,10 +3018,8 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
     claimer.batch_execute("BEGIN").await.expect("claimer begin");
     let claim_barrier: AcquiredRow =
         diesel::sql_query(autumn_harvest::queue_pause::try_lock_queue_for_claim_query())
-            .bind::<diesel::sql_types::Integer, _>(
-                autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS,
-            )
-            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Integer, _>(qk1)
+            .bind::<diesel::sql_types::Integer, _>(qk2)
             .get_result(&mut claimer)
             .await
             .expect("probe the claim barrier");
@@ -2805,11 +3041,9 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
     let mut pauser = connect(&url).await;
     pauser.batch_execute("BEGIN").await.expect("pauser begin");
     let pause_lock: AcquiredRow =
-        diesel::sql_query("SELECT pg_try_advisory_xact_lock($1, hashtext($2)) AS acquired")
-            .bind::<diesel::sql_types::Integer, _>(
-                autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS,
-            )
-            .bind::<diesel::sql_types::Text, _>(&q)
+        diesel::sql_query("SELECT pg_try_advisory_xact_lock($1, $2) AS acquired")
+            .bind::<diesel::sql_types::Integer, _>(qk1)
+            .bind::<diesel::sql_types::Integer, _>(qk2)
             .get_result(&mut pauser)
             .await
             .expect("probe the exclusive pause lock");

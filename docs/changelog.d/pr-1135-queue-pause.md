@@ -56,3 +56,79 @@
 **Post-review hardening, round 21 (one Codex P2, confirmed genuine):** **A `schedule_to_start` timeout enforcement stalled dispatch on a queue that was not paused at all.** Both enforcement paths took `lock_queue_for_pause` — the **exclusive** advisory lock — so a pause committing after the scan could not slip past the re-check. From round 18 onward that became a dispatch outage: `try_lock_queue_for_claim` takes the **shared** mode of that very key on every claim, and exclusive blocks shared, so for the full duration of an enforcement transaction every claim on the queue failed its `try` and released its task. The workflow sibling holds the lock across `store::append_events`, `apply_parent_close_cascade` and `evaluate_triggers_for_execution`, so a backlog of expired tasks could repeatedly halt unrelated work — and because the claim path uses the *try* variant, the failure is silent (the claim simply yields no task), the same "silently stops dispatching" mode the round-16 advisory-class separation exists to prevent, reached from the other side. Fixed with a new shared, **blocking** `queue_pause::lock_queue_for_timeout_recheck` (`pg_advisory_xact_lock_shared($1, hashtext($2))`, same class id and key), used by both enforcement paths; `lock_queue_for_pause` remains exclusive and is still what pause and resume themselves take. Shared is exactly sufficient: the lock's only job is to order the enforcement against pause/resume (shared and exclusive still mutually exclude), while shared/shared lets claims proceed and two concurrent enforcements — which act on distinct tasks and already serialize on the task rows they lock — need no mutual exclusion. It stays **blocking** rather than `try` because, unlike the claim barrier, it is the first statement in the transaction and so cannot join a wait cycle; bailing on contention would skip the pause re-check and let a stale snapshot terminally fail the very task an in-flight pause was protecting. **No new `WorkflowEvent` variant, no migration, no schema change.** RED-verified by `timeout_enforcement_does_not_block_claims_on_an_unpaused_queue`, which parks the real enforcer inside the window by holding its **execution row** `FOR UPDATE` (a table lock on `harvest_queue_pauses` does *not* work — `find_timed_out_tasks` consults that table for the scan's own carve-out, so the enforcer blocks before ever taking the advisory lock) and then probes both halves: the shared claim barrier must succeed, and a `try` **exclusive** acquire must still fail. Both are asserted because removing the lock entirely would satisfy the first while silently destroying the round-2/round-15 serialization. Two pure guards accompany it: `timeout_recheck_lock_is_shared_and_blocking_on_the_pause_key` (shared, not exclusive; blocking, not `try`; two-argument keyspace; same key as the pause side) and `timeout_enforcement_never_takes_the_exclusive_queue_lock`, a source-level check that neither enforcement path reaches for the exclusive helper.
 
 **Post-review hardening, round 22 (one Codex P2, confirmed genuine):** **The `schedule_to_start` sweep could deadlock a concurrent per-execution resume.** The documented `harvest_task_queue` lock order is **execution row → task row**, and `resume_workflow_execution` (issue #383/#609) follows it: it takes the execution row `FOR UPDATE` and then shifts that execution's task rows with `shift_schedule_to_close_on_resume_query`, a plain **waiting** `UPDATE` — unlike its external-task sibling `shift_external_schedule_to_close_on_resume_query`, which was given `FOR UPDATE SKIP LOCKED` in the issue #609 round-9 hardening precisely so it could never join a lock cycle. Round 18's `schedule_to_start_still_expired` placed a task-row `FOR UPDATE` **before** the execution-row lock in both enforcement paths, inverting that order for the `ScheduleToStart` reason: enforcement held a task row and waited on the execution row exactly as a resume held the execution row and waited on that task row, so Postgres would detect the cycle and abort one side — failing either the timeout sweep or the operator's resume. (The activity path locks the execution row explicitly via `lock_workflow_execution_row_and_load_history`; the workflow path took it *implicitly*, inside `store::append_events`, so it was inverted too.) Fixed by splitting the re-read in two, the same fast-path/authoritative shape `worker::process_workflow_task` already uses for its PAUSED re-check: a new **non-locking** `schedule_to_start_still_expired_unlocked` runs early (bailing out of the common held-task case before the execution-row lock and history load, taking no lock and so unable to invert anything), and the **authoritative** locked `schedule_to_start_still_expired` moved to *after* the execution row is held. On the activity path it now runs immediately after `task_state_and_deadline_for_update`, which already holds that task row in the correct order, so it costs no additional lock; on the workflow path the previously-unlocked `load_workflow_execution` + separate `store::load_history` were replaced with the existing `lock_workflow_execution_row_and_load_history`, which locks the execution row explicitly and loads the history in one call (`load_workflow_execution` had no remaining callers and was removed). Trusting only the unlocked check would be wrong — a resume can commit between it and enforcement — and trusting only the locked one would restore the inversion; the split keeps the early bail *and* the serialization. **No new `WorkflowEvent` variant, no migration, no schema change.** RED-verified by `schedule_to_start_sweep_does_not_hold_a_task_row_while_awaiting_the_execution`, which sequences the race deterministically rather than provoking a real deadlock (mirroring `enforcer_takes_the_queue_lock_before_the_row_locks_no_abba`): a holder takes the execution row `FOR UPDATE`, the real enforcer is started so it must block on it, and a `FOR UPDATE NOWAIT` probe from a third connection proves the enforcer is not holding the task row while it waits — the second edge of the cycle. Two pure guards accompany it: `locked_deadline_reread_never_precedes_the_execution_lock` (source-level, per enforcement function, since the hazard is *statement order* that no SQL-shape assertion can see) and `the_two_deadline_queries_differ_only_by_for_update` (the fast path and the authoritative check must never disagree about the expiry predicate).
+
+### Round 23 — Codex automated review (94ba32f)
+
+Two P2s, both in `queue_pause.rs`, both genuine.
+
+- **P2 — a resume materialised one UUID per shifted task in the API process.**
+  The two-pass `scheduled_at` shift needs pass 2 to exclude exactly the rows
+  pass 1 shifted (round 19: a `created_at` predicate cannot do that job), and it
+  was carrying that set through this process — `RETURNING id` loaded into a
+  `Vec<Uuid>`, then re-serialised onto the wire as an array bind for `unnest`.
+  Linear in the released backlog *twice over*, all while the resume holds the
+  queue's exclusive advisory lock. A multi-million-row outage backlog is exactly
+  the case an operator reaches for this feature in, and exactly the case where
+  that allocation could exhaust the API process or blow the bind size — failing
+  the resume and rolling back the thaw. Worth noting the module had already
+  refused `RETURNING id` on the notify path for this reason (round 11,
+  `resumed_queue_notify_task_query`); the shift path just never got the same
+  treatment.
+
+  The passes genuinely need two statements — pass 2 exists to catch rows that
+  committed after pass 1's snapshot, and one statement has one snapshot — so
+  merging them into a CTE would defeat the round-19 fix. Fixed instead by
+  keeping the id set **server-side**: pass 1 is now a data-modifying CTE feeding
+  a transaction-scoped scratch table (`resume_shifted_scratch_query`,
+  `ON COMMIT DROP`), and pass 2 anti-joins against that table instead of an
+  array bind. Application-side memory is O(1) in the backlog, and the lock hold
+  shrinks by the round trip removed. The `PRIMARY KEY` is not for uniqueness
+  (the ids are unique by construction) but to bound the plan: a fresh temp table
+  has no statistics, and the index keeps even a nested-loop anti-join at
+  O(rows × log ids) rather than the O(rows × ids) scan round 19 rejected
+  `<> ALL` for.
+
+- **P2 — two queue names could share one advisory lock.** Round 16 put this
+  feature's lock in the two-argument `pg_advisory_xact_lock(int, int)` keyspace
+  under a dedicated class id, because the single-argument `bigint` keyspace is
+  already shared unnamespaced by several features — most importantly
+  `claim_task`'s own `concurrency_key` gate. That separation is load-bearing and
+  still is. But spending 32 of the 64 bits on a constant class left **queue
+  identity** at the 32 bits of `hashtext`, so two unrelated queue names collide
+  with probability ≈ n²/2³³ — and the consequence is precisely the failure this
+  feature exists to prevent. An exclusive pause on queue `a` makes
+  `try_lock_queue_for_claim` fail for the colliding `b`, and since that call is
+  the *try* variant the failure is silent: `b`'s workers release every claim and
+  stop dispatching for the length of an unrelated pause or resume, on a queue
+  that was never paused.
+
+  Fixed by spending **both** slots on identity: `queue_lock_keys` derives
+  `(key1, key2)` from the halves of a domain-separated SHA-256 digest, so a
+  false share now needs a 64-bit collision. Two rejected alternatives are worth
+  recording. A *pair* of class-scoped locks (32 identity bits each) would make
+  it **worse** — lock conflicts are per key, so a claim needing both fails if
+  **either** collides, doubling the false-share probability rather than squaring
+  it away. The *single-argument* 64-bit form gives the same width but drops us
+  into the keyspace `claim_task` already hashes into, trading an intra-feature
+  collision for a cross-feature one with a worse blast radius. SHA-256 over a
+  fast hash for the same reason issue #699's rate-limit bucket keys use it: a
+  collision here silently shares state between unrelated queues, and it is
+  computed once per lock call in-process, so it costs nothing next to the round
+  trip it rides on.
+
+  Dropping the class id costs the self-identifying `619` in `pg_locks`, which is
+  recovered differently: `objsubid = 1` is the two-key form, and this feature is
+  its only user, so `locktype = 'advisory' AND objsubid = 1` selects exactly the
+  queue-pause locks. That "only user" claim is no longer a convention — a source
+  guard walks the crate and fails if any other module reaches for the
+  two-argument form.
+
+Both are RED-verified. The collision fix's money test is **self-falsifying**
+rather than depending on a code revert: it *searches* Postgres for a real
+`hashtext` collision (a 32-bit space, so ~300k candidates finds several),
+asserts the pair genuinely collides, then demonstrates the pre-fix key stalling
+the unrelated queue **live** — holding `pg_advisory_xact_lock(619, hashtext(a))`
+and showing `pg_try_advisory_xact_lock_shared(619, hashtext(b))` fails — before
+asserting the shipped key does not, while still excluding claims on the queue
+actually being paused. The scratch table's own test drives three resumes
+back-to-back on one pooled connection, which fails without `ON COMMIT DROP`.
