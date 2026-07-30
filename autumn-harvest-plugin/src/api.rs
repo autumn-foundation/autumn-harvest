@@ -29252,7 +29252,13 @@ pub(crate) async fn load_workflows(
 /// letting a completeness `status` read `complete` even though that shard was
 /// never inspected (issue #756 review). This mirrors the exact-resolution
 /// `pools.get(&shard_id)` guard `resolve_workflow_by_business_id` already uses.
-fn resolve_expected_shard_pools<'a>(
+///
+/// `pub(crate)` so the Vantage Workers-page pause loader resolves shards through
+/// this exact function rather than a second copy of the rule: iterating only
+/// `pool.iter_shards()` there would give a router-known-but-poolless shard no
+/// future at all, so it could never be reported unreadable — the same
+/// presence-vs-coverage gap, reached from the UI side (issue #619 round 11).
+pub(crate) fn resolve_expected_shard_pools<'a>(
     expected: &std::collections::BTreeSet<i32>,
     pools: &'a BTreeMap<i32, DbPool>,
 ) -> Vec<(i32, Option<&'a DbPool>)> {

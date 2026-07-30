@@ -425,8 +425,37 @@ pub const fn queue_pause_suppresses_timeout(
 /// and in SQL a comparison against `NULL` is `NULL`, not `false` — so without the
 /// explicit `IS NULL` arm such a row would satisfy *neither* predicate and be
 /// credited by *neither* pass. It belongs on this side: a row with no
-/// `created_at` was certainly enqueued before this resume began. The partition
-/// is therefore total — every due `PENDING` row matches exactly one pass.
+/// `created_at` was certainly enqueued before this resume began.
+///
+/// # Scope of the totality claim
+///
+/// The partition is total **within a single snapshot**: every due `PENDING` row
+/// visible to one statement matches exactly one predicate. It is *not* total
+/// across the two statements, because a row can change state between their
+/// snapshots — a `RUNNING` row re-pended after this pass's snapshot is invisible
+/// here, and carries a `created_at` predating this transaction, so it also fails
+/// [`resume_shift_late_arrivals_query`]'s predicate (issue #619 review).
+///
+/// Every reachable re-pend path is nevertheless benign, because each one
+/// *refreshes* `scheduled_at` to the re-pend instant, which lies inside this
+/// resume: `crate::queue::requeue_for_retry` (`scheduled_at = now + backoff`),
+/// `crate::poison_pill` reclaim (`scheduled_at = now()`), and
+/// `primary_repend_workflow_task` (which refreshes `created_at` too, so it lands
+/// on the late-arrival side and is credited there). Such a row only *became* due
+/// during the thaw, so it accrued no held time, and its under-credit is bounded
+/// by this transaction's remaining runtime — the same residual documented on
+/// [`resume_shift_late_arrivals_query`].
+///
+/// The one path that re-pends while *preserving* a pre-pause `scheduled_at` is
+/// [`release_claim_if_queue_paused`], which does so deliberately so a released
+/// claim keeps the wait it had already accrued. It is not reachable in this
+/// window in practice: it runs in the same function call as the claim it undoes,
+/// so it fires at pause-creation time, not hours later during a resume. Closing
+/// it exactly would need pass 1 to return its row ids for pass 2 to exclude
+/// (`id <> ALL($ids)`), which does not scale to a large backlog; the alternative
+/// of taking the queue's advisory lock in the release is explicitly rejected,
+/// since that statement runs on *every* claim and would serialize them per queue,
+/// defeating `SKIP LOCKED` (see `crate::queue::claim_task`).
 ///
 /// Binds: `$1` = queue name, `$2` = `paused_at`.
 #[must_use]
@@ -602,6 +631,64 @@ struct UpsertedPauseRow {
     newly_paused: bool,
 }
 
+/// The pause upsert.
+///
+/// A single upsert, not `INSERT ... DO NOTHING` + a fallback `SELECT`:
+/// `DO NOTHING` does not lock the conflicting row, so a concurrent resume could
+/// delete it between the two statements, leaving the fallback `SELECT` with zero
+/// rows — a `500` and, worse, a queue left *unpaused* for an operator who was
+/// told the pause failed.
+///
+/// The no-op `SET queue_name = ...` preserves the ORIGINAL provenance on a
+/// re-pause while still taking the row lock, and `xmax = 0` is the standard
+/// discriminator for "this tuple was inserted, not updated".
+///
+/// # Why `paused_at` is stamped explicitly, not left to `DEFAULT NOW()`
+///
+/// The column defaults to `NOW()`, which is `transaction_timestamp()` — frozen
+/// at **transaction start**, i.e. *before* [`lock_queue_for_pause`] waits. The
+/// hold does not become effective until that lock is held (and, strictly, until
+/// this transaction commits), so a defaulted `paused_at` predates the effective
+/// hold by the entire lock wait — which is unbounded in principle, since it can
+/// queue behind a large concurrent resume shifting a big backlog.
+///
+/// Two consequences, both real:
+///
+/// - **Reported start and duration are overstated.** `GET /admin/queues/paused`
+///   and the Vantage banner show `paused_at`, the resume response derives
+///   `paused_duration_secs` from it, and the `harvest_queue_paused_too_long`
+///   alert exists precisely so an operator reasons about *how long* a hold has
+///   been in place. All of them read too long by the lock wait.
+/// - **The resume shift over-credits.** `resume_shift_scheduled_at_query`
+///   credits `clock_timestamp() - GREATEST(scheduled_at, paused_at)`, so an
+///   understated `paused_at` credits an interval the task was not actually
+///   held, eroding the pre-pause wait the shift exists to preserve.
+///
+/// Note the *direction* of that second one: the shift's `GREATEST` clamps its
+/// result to `<= clock_timestamp()` in every branch, so an understated
+/// `paused_at` can never push `scheduled_at` into the future and make a task
+/// **un**claimable (the AC5 inverse). It reduces the apparent wait, which is the
+/// safe side for `schedule_to_start` — but it is still lost fidelity in exactly
+/// the value round 9 fixed the other half of.
+///
+/// `clock_timestamp()` in the `VALUES` list is evaluated when this statement
+/// executes, which is after the advisory lock is held — the same volatile-clock
+/// reasoning as [`resume_shift_scheduled_at_query`]. It appears **only** in the
+/// `INSERT` half: the `DO UPDATE` deliberately does not touch `paused_at`, so an
+/// idempotent re-pause still preserves the original hold's start time.
+///
+/// Binds: `$1` = queue name, `$2` = reason, `$3` = actor, `$4` = scope shard id.
+#[must_use]
+pub const fn pause_upsert_query() -> &'static str {
+    "INSERT INTO harvest_queue_pauses \
+         (queue_name, reason, paused_by, scope_shard_id, paused_at) \
+     VALUES ($1, $2, $3, $4, clock_timestamp()) \
+     ON CONFLICT (queue_name) DO UPDATE \
+         SET queue_name = harvest_queue_pauses.queue_name \
+     RETURNING queue_name, reason, paused_by, paused_at, scope_shard_id, \
+               (xmax = 0) AS newly_paused"
+}
+
 /// Pause dispatch on `queue_name`.
 ///
 /// Runs in one transaction so the insert and the held-task count agree. Held
@@ -638,31 +725,16 @@ pub async fn pause_queue(
             // `lock_queue_for_pause`).
             lock_queue_for_pause(conn, &queue_owned).await?;
 
-            // A single upsert, not INSERT ... DO NOTHING + a fallback SELECT.
-            // DO NOTHING does not lock the conflicting row, so a concurrent
-            // resume could delete it between the two statements, leaving the
-            // fallback SELECT with zero rows — a 500 and, worse, a queue left
-            // *unpaused* for an operator who was told the pause failed.
-            //
-            // The no-op `SET queue_name = ...` preserves the ORIGINAL
-            // provenance on a re-pause while still taking the row lock, and
-            // `xmax = 0` is the standard discriminator for "this tuple was
-            // inserted, not updated".
-            let row: UpsertedPauseRow = diesel::sql_query(
-                "INSERT INTO harvest_queue_pauses \
-                         (queue_name, reason, paused_by, scope_shard_id) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (queue_name) DO UPDATE \
-                         SET queue_name = harvest_queue_pauses.queue_name \
-                     RETURNING queue_name, reason, paused_by, paused_at, scope_shard_id, \
-                               (xmax = 0) AS newly_paused",
-            )
-            .bind::<diesel::sql_types::Text, _>(&queue_owned)
-            .bind::<diesel::sql_types::Text, _>(&reason_owned)
-            .bind::<diesel::sql_types::Text, _>(&actor_owned)
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
-            .get_result(conn)
-            .await?;
+            // Stamps `paused_at` from `clock_timestamp()` (read here, after the
+            // lock above) rather than letting it default to the frozen
+            // transaction clock — see `pause_upsert_query`.
+            let row: UpsertedPauseRow = diesel::sql_query(pause_upsert_query())
+                .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .bind::<diesel::sql_types::Text, _>(&reason_owned)
+                .bind::<diesel::sql_types::Text, _>(&actor_owned)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
+                .get_result(conn)
+                .await?;
             let newly_paused = row.newly_paused;
 
             let held: CountRow = diesel::sql_query(held_task_count_query())
@@ -1055,6 +1127,75 @@ mod tests {
         assert!(
             where_clause.contains("created_at < transaction_timestamp()"),
             "the primary pass must exclude rows enqueued during the resume; got:\n{sql}"
+        );
+    }
+
+    /// `paused_at` must be stamped from the live clock, not left to the column's
+    /// `DEFAULT NOW()`.
+    ///
+    /// `NOW()` is frozen at transaction start — before `lock_queue_for_pause`
+    /// waits — so a defaulted `paused_at` predates the effective hold by the
+    /// whole lock wait, overstating the reported start/duration and
+    /// over-crediting the resume shift. The exact mirror of the round-9 finding,
+    /// on the write side.
+    #[test]
+    fn pause_upsert_stamps_paused_at_from_the_live_clock() {
+        let sql = pause_upsert_query();
+        assert!(
+            sql.contains("clock_timestamp()"),
+            "paused_at must be stamped from the live clock, read after the queue \
+             lock is held, not left to the column's frozen DEFAULT NOW(); got:\n{sql}"
+        );
+        for frozen in ["NOW()", "transaction_timestamp()", "statement_timestamp()"] {
+            assert!(
+                !sql.contains(frozen),
+                "the pause upsert must not read the frozen clock ({frozen}); got:\n{sql}"
+            );
+        }
+        // Naming the column in the insert list is what overrides the DEFAULT.
+        assert!(
+            sql.contains("paused_at"),
+            "paused_at must be named explicitly in the insert list; got:\n{sql}"
+        );
+    }
+
+    /// An idempotent re-pause must preserve the ORIGINAL hold's start time, so
+    /// the live-clock stamp above must appear only in the `INSERT` half.
+    ///
+    /// Without this, re-issuing a pause (which the runbook explicitly tells an
+    /// operator to do to repair a `partial_fleet` hold) would reset `paused_at`
+    /// and erase how long the queue had really been held — and the resume shift
+    /// would then credit only from the re-pause, silently under-crediting the
+    /// backlog it was supposed to protect.
+    #[test]
+    fn pause_upsert_does_not_restamp_paused_at_on_a_repause() {
+        let sql = pause_upsert_query();
+        let (insert_half, after_update) = sql
+            .split_once("DO UPDATE")
+            .expect("the pause upsert is an INSERT ... ON CONFLICT DO UPDATE");
+        // Judge only the conflict SET clause. `RETURNING` sits after it and
+        // legitimately names `paused_at` — the handler echoes the EFFECTIVE
+        // (preserved) value, which is the round-3 fix.
+        let (update_set, returning) = after_update
+            .split_once("RETURNING")
+            .expect("the pause upsert RETURNs the effective row");
+        assert!(
+            insert_half.contains("clock_timestamp()"),
+            "the INSERT half must stamp the live clock; got:\n{sql}"
+        );
+        assert!(
+            !update_set.contains("paused_at"),
+            "the DO UPDATE SET clause must not touch paused_at, or a re-pause \
+             would erase the original hold's start time; got:\n{sql}"
+        );
+        assert!(
+            !update_set.contains("clock_timestamp()"),
+            "the DO UPDATE SET clause must not re-read the clock; got:\n{sql}"
+        );
+        assert!(
+            returning.contains("paused_at"),
+            "the effective paused_at must still be returned so the handler \
+             echoes the preserved value; got:\n{sql}"
         );
     }
 

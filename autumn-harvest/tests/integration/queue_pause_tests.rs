@@ -1558,3 +1558,132 @@ async fn a_pause_committed_mid_claim_still_holds_the_task() {
         "the hold must consume no retry budget (AC3)"
     );
 }
+
+/// `paused_at` must be stamped when the hold becomes effective, not at
+/// transaction start (round 11 P2).
+///
+/// The column defaults to `NOW()`, which Postgres freezes at transaction
+/// start — before `lock_queue_for_pause` waits. A pause that queues behind a
+/// large concurrent resume therefore records a `paused_at` that predates the
+/// effective hold by the whole lock wait, so:
+///
+/// - `GET /admin/queues/paused`, the Vantage banner, the resume response's
+///   `paused_duration_secs`, and the `harvest_queue_paused_too_long` alert all
+///   report a hold that started earlier (and has lasted longer) than it has;
+/// - the resume shift credits `clock_timestamp() - GREATEST(scheduled_at,
+///   paused_at)`, so it credits an interval the task was never held, eroding the
+///   pre-pause wait the shift exists to preserve.
+///
+/// The delay is injected the way production produces it — by holding the very
+/// advisory lock `pause_queue` takes — and the tolerance is strictly smaller
+/// than the injected delay, so a slow runner fails loudly rather than silently
+/// stopping falsifying anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
+    const LOCK_HOLD_SECS: u64 = 3;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("pauseclock");
+
+    // Hold the advisory lock `pause_queue` needs, so the pause blocks on it for
+    // a wall-clock span the frozen transaction clock cannot see.
+    let holder_url = url.clone();
+    let holder_queue = q.clone();
+    let holder = tokio::spawn(async move {
+        let mut holder = connect(&holder_url).await;
+        holder
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtext('{holder_queue}'))"
+            ))
+            .await
+            .expect("take advisory lock");
+        tokio::time::sleep(std::time::Duration::from_secs(LOCK_HOLD_SECS)).await;
+        holder.batch_execute("COMMIT").await.expect("release lock");
+    });
+
+    // Let the holder actually acquire the lock before the pause starts.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Anchor BEFORE the pause transaction opens: this is the instant a frozen
+    // `NOW()` would (approximately) record.
+    let before_pause = chrono::Utc::now();
+
+    let mut pauser = connect(&url).await;
+    let started = std::time::Instant::now();
+    queue_pause::pause_queue(&mut pauser, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    let pause_wall = started.elapsed();
+    holder.await.expect("holder task");
+
+    // The pause genuinely blocked for the injected span, so the test is
+    // exercising the window at all.
+    assert!(
+        pause_wall.as_secs_f64() >= f64::from(u32::try_from(LOCK_HOLD_SECS).unwrap()) - 1.0,
+        "the pause must have actually blocked on the lock for ~{LOCK_HOLD_SECS}s, \
+         otherwise this test proves nothing; blocked {pause_wall:?}"
+    );
+
+    let stored = paused_at_of(&mut conn, &q).await;
+    let lag = (stored - before_pause).num_milliseconds();
+
+    // Tolerance is strictly SMALLER than the injected delay so it can actually
+    // falsify: the frozen clock records ~0ms of lag, the live clock ~3000ms.
+    assert!(
+        lag >= 2_000,
+        "paused_at must be stamped AFTER the lock wait (expected >= ~{LOCK_HOLD_SECS}s \
+         of lag past the pre-pause anchor, got {lag}ms) — a frozen transaction \
+         clock records the hold as starting before it was effective"
+    );
+    // And it must not be in the future.
+    assert!(
+        stored <= chrono::Utc::now(),
+        "paused_at must not be stamped in the future; got {stored}"
+    );
+}
+
+/// An idempotent re-pause must preserve the ORIGINAL `paused_at`.
+///
+/// The runbook explicitly tells an operator to re-issue a pause to repair a
+/// `partial_fleet` hold, so re-stamping would erase how long the queue had
+/// really been held — and the resume shift would then credit only from the
+/// re-pause, under-crediting the very backlog the hold was protecting.
+#[tokio::test]
+async fn a_repause_preserves_the_original_paused_at() {
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("repausestamp");
+    queue_pause::pause_queue(&mut conn, &q, "stripe outage", "alice", None)
+        .await
+        .expect("first pause");
+    // Backdate so a re-stamp would be unmistakable.
+    backdate_paused_at(&mut conn, &q, 600).await;
+    let original = paused_at_of(&mut conn, &q).await;
+
+    let second = queue_pause::pause_queue(&mut conn, &q, "fleet freeze", "bob", None)
+        .await
+        .expect("re-pause");
+
+    assert!(!second.newly_paused, "a re-pause is not a fresh hold");
+    let after = paused_at_of(&mut conn, &q).await;
+    assert_eq!(
+        after, original,
+        "a re-pause must preserve the original hold's start time"
+    );
+    assert_eq!(
+        second.paused_at, original,
+        "the echoed paused_at must be the preserved value, not the re-pause instant"
+    );
+    // Provenance is preserved too (the round-1 idempotency rule).
+    assert_eq!(second.reason, "stripe outage");
+    assert_eq!(second.paused_by, "alice");
+}

@@ -2407,7 +2407,7 @@ async fn list_workers_ui(
 
     // Issue #619: paused queues are the most likely explanation for idle
     // workers alongside a full queue, so surface them on the fleet page.
-    let paused_queues = load_paused_queues_from_shards(&api_state, &pool).await;
+    let paused_queues = load_paused_queues_from_shards(&api_state).await;
 
     let stats = compute_fleet_stats(&shard_results);
     let banner_state = determine_banner_state(&stats);
@@ -2760,14 +2760,55 @@ pub(crate) fn render_paused_queues_banner(
 /// An unread shard counts as not-holding for *coverage*, which is the safe
 /// direction (it may still be dispatching) — the warning is what tells the
 /// operator the shown `Scope` could understate the real coverage.
-async fn load_paused_queues_from_shards(
-    api_state: &HarvestApiState,
-    pool: &crate::HarvestDbPool,
+async fn load_paused_queues_from_shards(api_state: &HarvestApiState) -> PausedQueueScan {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected_set = crate::shard_fanout::expected_shards(api_state, &pools);
+
+    // Fan out over the EXPECTED shard set, not just `pool.iter_shards()`.
+    //
+    // `expected_shards` deliberately includes a shard the router advertises but
+    // this process has no pool for yet (mid a shard-add rollout). Iterating only
+    // the pools would give such a shard no future at all, so it could never
+    // enter `unreadable_shards` — and if it is the ONLY shard holding a queue,
+    // the Workers page would again render no pause warning whatsoever. That is
+    // the same presence-vs-coverage gap the unreadable-shard warning exists to
+    // close, reached through a missing pool instead of a failing read.
+    //
+    // Resolution goes through the API's own `resolve_expected_shard_pools` (one
+    // shared function, not a second copy of the rule) so a poolless shard maps
+    // to `None` and is reported, never silently resolved through
+    // `ShardedDbPool::pool_for`'s default-shard fallback — which would query the
+    // DEFAULT shard's database in its place and let coverage read `fleet`.
+    let expected: Vec<i32> = expected_set.iter().copied().collect();
+    let resolved = crate::api::resolve_expected_shard_pools(&expected_set, &pools);
+    scan_paused_queues(resolved, &expected).await
+}
+
+/// Read the pause table on each resolved shard and fold the outcomes into a
+/// [`PausedQueueScan`].
+///
+/// Split out from [`load_paused_queues_from_shards`] so the reporting half is
+/// directly testable: reaching a poolless-but-expected shard through
+/// `api_state` requires an installed runtime with a widened router, but the
+/// rule under test — *a `None` pool is reported, never dropped* — needs
+/// neither. Its counterpart, that a router-known poolless shard resolves to
+/// `None` rather than a default-fallback pool, is guarded on the API side by
+/// `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+///
+/// `expected` is the same shard set `resolved` was built from, threaded through
+/// for the coverage calculation in [`merge_paused_queue_banner_rows`].
+async fn scan_paused_queues(
+    resolved: Vec<(i32, Option<&autumn_harvest::worker::DbPool>)>,
+    expected: &[i32],
 ) -> PausedQueueScan {
-    let futs: Vec<_> = pool
-        .iter_shards()
-        .map(|(shard_id, shard_pool)| async move {
-            let shard = shard_id.as_i32();
+    let futs: Vec<_> = resolved
+        .into_iter()
+        .map(|(shard, maybe_pool)| async move {
+            // No pool for a shard the router advertises: unread, not "holding
+            // nothing". Dropping it here is exactly the invisible-hold bug.
+            let Some(shard_pool) = maybe_pool else {
+                return Err(shard);
+            };
             let read = async {
                 let mut conn = acquire_conn(shard_pool).await.ok()?;
                 autumn_harvest::queue_pause::list_paused_queues(&mut conn)
@@ -2791,12 +2832,8 @@ async fn load_paused_queues_from_shards(
         }
     }
     unreadable_shards.sort_unstable();
-    let pools = crate::shard_fanout::pools_by_shard(api_state);
-    let expected: Vec<i32> = crate::shard_fanout::expected_shards(api_state, &pools)
-        .into_iter()
-        .collect();
     PausedQueueScan {
-        rows: merge_paused_queue_banner_rows(per_shard, &expected),
+        rows: merge_paused_queue_banner_rows(per_shard, expected),
         unreadable_shards,
     }
 }
@@ -8818,6 +8855,66 @@ mod tests {
     #[test]
     fn paused_queues_banner_is_empty_when_nothing_is_paused() {
         assert_eq!(render_paused_queues_banner(&[], &[]).into_string(), "");
+    }
+
+    /// A pool that is never connected to; `.build()` is lazy, so constructing it
+    /// performs no I/O and `acquire_conn` on it fails fast.
+    fn never_connecting_pool() -> autumn_harvest::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://harvest:harvest@127.0.0.1:1/never");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool builds without connecting")
+    }
+
+    /// Issue #619 review (round 11): mid a shard-add rollout the router
+    /// advertises a shard this process has no pool for. Fanning out over the
+    /// pools alone would give that shard no future at all, so it could never
+    /// reach `unreadable_shards` — and if it is the only shard holding a queue,
+    /// the Workers page renders no pause warning whatsoever, the exact
+    /// invisible-hold bug the warning exists to prevent.
+    ///
+    /// This guards the *reporting* half (a `None` pool is reported, never
+    /// dropped). Its counterpart — that a router-known poolless shard resolves
+    /// to `None` rather than a default-fallback pool — is guarded on the API
+    /// side by `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+    #[tokio::test]
+    async fn scan_reports_an_expected_shard_that_has_no_local_pool() {
+        let live = never_connecting_pool();
+        // Shard 0 has a pool (whose read will fail); shard 1 is the poolless,
+        // router-known shard. Both must be reported.
+        let scan = scan_paused_queues(vec![(0, Some(&live)), (1, None)], &[0, 1]).await;
+        assert!(
+            scan.unreadable_shards.contains(&1),
+            "a poolless expected shard must be reported unreadable, not dropped: {:?}",
+            scan.unreadable_shards
+        );
+        assert_eq!(
+            scan.unreadable_shards,
+            vec![0, 1],
+            "both an unreadable pool and a missing pool are reported, sorted"
+        );
+        assert!(
+            scan.rows.is_empty(),
+            "no shard was read, so there are no rows to show"
+        );
+        // And the banner is therefore non-empty: silence here is the lie.
+        assert!(
+            !render_paused_queues_banner(&scan.rows, &scan.unreadable_shards)
+                .into_string()
+                .is_empty(),
+            "an unread/poolless shard must never render as a clean page"
+        );
+    }
+
+    /// The poolless shard is reported even when it is the ONLY expected shard —
+    /// i.e. the fold does not depend on some other shard producing a future.
+    #[tokio::test]
+    async fn scan_reports_a_lone_poolless_shard() {
+        let scan = scan_paused_queues(vec![(7, None)], &[7]).await;
+        assert_eq!(scan.unreadable_shards, vec![7]);
     }
 
     /// Issue #619 review: a shard whose pause state could not be read makes the
