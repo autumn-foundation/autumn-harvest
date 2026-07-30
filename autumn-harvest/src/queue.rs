@@ -849,6 +849,29 @@ pub async fn claim_task(
                     return Ok(None);
                 };
 
+                // Commit-order barrier (issue #619 round-18 review). The
+                // re-check below reads a snapshot taken *before* this
+                // transaction commits, so on its own it cannot stop a pause
+                // from committing — and being acknowledged to the operator —
+                // in the window between that snapshot and our COMMIT. Taking
+                // the *shared* mode of the key `pause_queue` takes exclusively
+                // makes that impossible: a pause cannot commit while any claim
+                // holds it, so a claim can only ever commit *before* the hold
+                // is acknowledged.
+                //
+                // It must be the `try` variant and it must be here rather than
+                // before the claim: the queue is not known until a task is in
+                // hand, so this path holds task rows and then wants the lock,
+                // the inverse of `resume_queue`'s advisory-then-rows order. A
+                // blocking acquire would be an ABBA deadlock; a failed `try`
+                // simply means a pause or resume is committing right now, so we
+                // give the claim back and let the next poll re-decide against
+                // committed state. See `queue_pause::try_lock_queue_for_claim`.
+                if !crate::queue_pause::try_lock_queue_for_claim(conn, &task.queue_name).await? {
+                    crate::queue_pause::release_claim(conn, task.id, worker_id).await?;
+                    return Ok(None);
+                }
+
                 // Authoritative queue-pause re-check (issue #619). The anti-join in
                 // the claim above is evaluated against that statement's snapshot,
                 // so a pause committing while the claim was in flight is invisible
@@ -856,10 +879,11 @@ pub async fn claim_task(
                 // hold exists to ride out. This is a *separate statement* and so
                 // takes a fresh snapshot (guaranteed by the pinned `READ COMMITTED`
                 // above), releasing the claim back to `PENDING` if the queue is now
-                // held. See `queue_pause::release_claim_if_queue_paused` for why
-                // this is preferred over taking a queue-scoped lock inside the
-                // claim itself, which would serialize all claims for a queue and
-                // defeat `SKIP LOCKED`.
+                // held. Holding the shared queue lock above makes its verdict
+                // authoritative *through commit* rather than only as of its own
+                // snapshot. See `queue_pause::release_claim_if_queue_paused` for
+                // why an exclusive lock inside the claim itself was rejected: it
+                // would serialize all claims for a queue and defeat `SKIP LOCKED`.
                 if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id)
                     .await?
                 {

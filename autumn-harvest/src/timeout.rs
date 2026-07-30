@@ -567,6 +567,63 @@ async fn task_state_and_deadline_for_update(
         .map_err(crate::error::database_error)
 }
 
+/// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
+///
+/// `FOR UPDATE` so the read serializes against `resume_queue`'s `scheduled_at`
+/// shift, and `clock_timestamp()` rather than `NOW()` because `NOW()` is frozen
+/// at transaction start — i.e. before this transaction waited on the queue
+/// advisory lock — which would judge the deadline against a stale instant.
+#[cfg(feature = "db")]
+#[must_use]
+const fn schedule_to_start_still_expired_query() -> &'static str {
+    "SELECT COALESCE(scheduled_at + schedule_to_start < clock_timestamp(), false) AS expired \
+     FROM harvest_task_queue \
+     WHERE id = $1 AND schedule_to_start IS NOT NULL \
+     FOR UPDATE"
+}
+
+/// Locked re-read of a task's *row-current* schedule-to-start deadline (issue
+/// #619 round-18 review).
+///
+/// [`find_timed_out_tasks`] produces a snapshot, and a whole pause/resume cycle
+/// can complete before a given row in a large batch is reached. Resume credits
+/// the held time back by shifting `scheduled_at` forward and then **deletes**
+/// the pause row, so by the time enforcement runs the pause re-check finds
+/// nothing to suppress on — and, without this, enforcement proceeds on the
+/// scan-time deadline and times the task out immediately after its deadline was
+/// credited. On the workflow path that seals the entire execution `TIMED_OUT`,
+/// which is exactly what AC3/AC4 forbid.
+///
+/// Returns `false` — meaning *do not enforce* — when the row is gone, when it
+/// carries no `schedule_to_start` at all, or when the row-current deadline is no
+/// longer in the past. Safe in the conservative direction: a task that is
+/// genuinely still expired is caught on this or any later scan.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+async fn schedule_to_start_still_expired(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ExpiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        expired: bool,
+    }
+
+    let row: Option<ExpiredRow> = diesel::sql_query(schedule_to_start_still_expired_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.is_some_and(|r| r.expired))
+}
+
 /// Returns the set of task states that are valid for a given timeout reason.
 ///
 /// `enforce_activity_timeout` skips rows whose current state is not in this
@@ -888,6 +945,14 @@ async fn enforce_activity_timeout(
                 reason,
                 crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
             ) {
+                return Ok(false);
+            }
+            // A *completed* pause/resume cycle leaves nothing for the check
+            // above to suppress on, but resume has already credited the held
+            // time back into `scheduled_at`. Re-read the row-current deadline
+            // under the queue lock before trusting the scan snapshot, or a task
+            // is timed out the instant its deadline was extended.
+            if !schedule_to_start_still_expired(conn, task.id).await? {
                 return Ok(false);
             }
         }
@@ -1337,6 +1402,13 @@ async fn enforce_workflow_timeout(
                 reason,
                 crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
             ) {
+                return Ok(None);
+            }
+            // Same stale-scan guard as the activity path, and it matters more
+            // here: this path seals the whole execution `TIMED_OUT` rather than
+            // failing one task, so acting on a deadline a completed resume has
+            // already credited forward destroys the run the hold was protecting.
+            if !schedule_to_start_still_expired(conn, task.id).await? {
                 return Ok(None);
             }
         }
@@ -3319,6 +3391,44 @@ mod tests {
         assert!(
             sql.contains("started_at"),
             "should reference started_at column"
+        );
+    }
+
+    /// Round-18 P2: the stale-scan guard must re-read the row under a lock and
+    /// judge it against *real* current time.
+    ///
+    /// `FOR UPDATE` is what serializes this read against `resume_queue`'s
+    /// `scheduled_at` shift; `clock_timestamp()` rather than `NOW()` is what
+    /// keeps it honest, since `NOW()` is frozen at transaction start — before
+    /// this transaction waited on the queue advisory lock — and would judge the
+    /// deadline against a stale instant.
+    #[cfg(feature = "db")]
+    #[test]
+    fn stale_scan_guard_relocks_the_row_and_uses_real_time() {
+        let sql = schedule_to_start_still_expired_query();
+        assert!(
+            sql.contains("FOR UPDATE"),
+            "the re-read must lock the row so it serializes against the resume \
+             shift; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("clock_timestamp()"),
+            "must compare against real current time, not the transaction's frozen \
+             NOW(); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("NOW()"),
+            "NOW() is frozen at transaction start, i.e. before the advisory-lock \
+             wait, so it would judge a credited-forward deadline as still expired; \
+             got:\n{sql}"
+        );
+        assert!(
+            sql.contains("scheduled_at + schedule_to_start"),
+            "must recompute the deadline from the row's current columns; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("schedule_to_start IS NOT NULL"),
+            "a row with no schedule-to-start has no such deadline to enforce; got:\n{sql}"
         );
     }
 

@@ -124,15 +124,22 @@ pub const QUEUE_PAUSE_CLAIM_PREDICATE: &str = "NOT EXISTS (SELECT 1 FROM harvest
 /// only re-evaluates conditions on the *locked row*, never a correlated
 /// subquery over another table.
 ///
-/// Taking a queue-scoped lock inside the claim path would close the window but
-/// serialize every claim for a queue against every other, defeating
-/// `FOR UPDATE SKIP LOCKED`'s parallel claiming for a feature that is inactive
-/// almost all of the time. Re-checking in a **fresh statement** gets a fresh
-/// snapshot for the cost of one indexed primary-key probe per *successful*
+/// Taking an *exclusive* queue-scoped lock inside the claim path would close
+/// the window but serialize every claim for a queue against every other,
+/// defeating `FOR UPDATE SKIP LOCKED`'s parallel claiming for a feature that is
+/// inactive almost all of the time. Re-checking in a **fresh statement** gets a
+/// fresh snapshot for the cost of one indexed primary-key probe per *successful*
 /// claim (never per empty poll), and yields a crisp contract: **a pause
-/// committed before this re-check's statement begins always wins.** A pause
-/// that commits after it did not beat the claim, and AC2 explicitly allows an
-/// already-`RUNNING` task to finish naturally.
+/// committed before this re-check's statement begins always wins.**
+///
+/// That contract is only sound if the claim is *durable* by the time the pause
+/// commits. Round 17 wrapped the claim and this re-check in one transaction (so
+/// a re-check error can no longer strand a `RUNNING` row), which moved the
+/// claim's commit *after* the re-check's snapshot and opened a new window: a
+/// pause committing in between would be acknowledged to the operator and the
+/// claim would still commit afterwards. [`try_lock_queue_for_claim`] closes it
+/// with a **shared** lock on the same key `pause_queue` takes exclusively — see
+/// there for why the *try* variant is what keeps this deadlock-free.
 ///
 /// The release is guarded on `state = 'RUNNING' AND worker_id = $2` so it can
 /// only ever undo *this* worker's own claim, and it restores `attempt` — the
@@ -164,6 +171,26 @@ pub async fn release_claim_if_queue_paused(
     Ok(released > 0)
 }
 
+/// The shared prefix of both claim-release statements.
+///
+/// A macro rather than a `const` so the two `const fn`s below can `concat!` it
+/// with their own tail at compile time. Both releases must restore `attempt`
+/// and be guarded on `state = 'RUNNING' AND worker_id = $2` identically; keeping
+/// one copy makes that structural rather than a convention two sites must
+/// remember.
+macro_rules! release_claim_prefix {
+    () => {
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             attempt = GREATEST(attempt - 1, 0) \
+         WHERE id = $1 \
+           AND state = 'RUNNING' \
+           AND worker_id = $2"
+    };
+}
+
 /// SQL for [`release_claim_if_queue_paused`], exposed for shape tests.
 ///
 /// One statement, so it takes a fresh `READ COMMITTED` snapshot and therefore
@@ -171,16 +198,115 @@ pub async fn release_claim_if_queue_paused(
 /// [`release_claim_if_queue_paused`]).
 #[must_use]
 pub const fn release_claim_if_queue_paused_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         attempt = GREATEST(attempt - 1, 0) \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
-                   WHERE qp.queue_name = harvest_task_queue.queue_name)"
+    concat!(
+        release_claim_prefix!(),
+        " AND EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+           WHERE qp.queue_name = harvest_task_queue.queue_name)"
+    )
+}
+
+/// SQL for [`release_claim`], exposed for shape tests.
+#[must_use]
+pub const fn release_claim_query() -> &'static str {
+    release_claim_prefix!()
+}
+
+/// Release this worker's own just-made claim **unconditionally**.
+///
+/// The sibling of [`release_claim_if_queue_paused`] for the one case where the
+/// pause table cannot be consulted: [`try_lock_queue_for_claim`] failed, so
+/// some pause or resume transaction is mid-flight on this queue and its rows
+/// are, by definition, not yet visible to us. Guarded and attempt-restoring
+/// exactly like the paused variant, so a barrier miss costs a task nothing
+/// beyond one poll interval.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn release_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    let released = diesel::sql_query(release_claim_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
+}
+
+/// SQL for [`try_lock_queue_for_claim`], exposed for shape tests.
+///
+/// `$1` = [`QUEUE_PAUSE_LOCK_CLASS`], `$2` = queue name.
+#[must_use]
+pub const fn try_lock_queue_for_claim_query() -> &'static str {
+    "SELECT pg_try_advisory_xact_lock_shared($1, hashtext($2)) AS acquired"
+}
+
+/// Commit-order barrier between a claim and a concurrent pause (issue #619
+/// round-18 review).
+///
+/// Takes the **shared** mode of the very key [`lock_queue_for_pause`] takes
+/// exclusively, so while a claim transaction holds it a `pause_queue` cannot
+/// commit — and therefore cannot acknowledge a hold to the operator — until
+/// that claim has committed. That is the ordering guarantee the post-claim
+/// re-check alone cannot provide: the re-check's snapshot is taken before its
+/// own transaction commits, so without this a pause could slot in between and
+/// still be beaten by a claim it had already reported as held.
+///
+/// # Why *shared*, and why *try*
+///
+/// **Shared** because claims must stay parallel: shared mode is compatible with
+/// itself, so an arbitrary number of workers claim concurrently and only the
+/// (rare, brief) exclusive pause/resume transaction is excluded. An exclusive
+/// lock here would serialize every claim on a queue and defeat
+/// `FOR UPDATE SKIP LOCKED` — the reason the round-2 review's literal
+/// suggestion was rejected.
+///
+/// **Try** because of lock ordering. This is necessarily called *after* the
+/// claim query, since the queue to lock is not known until a task is in hand,
+/// so the claim path holds task rows and then wants this lock — the exact
+/// inverse of `resume_queue`, which holds this lock and then row-locks every
+/// `PENDING` task on the queue for its `scheduled_at` shift. A *blocking*
+/// acquire would therefore reintroduce the ABBA deadlock the round-2 review
+/// found (and Postgres would abort either the claim or the operator's resume).
+/// `pg_try_advisory_xact_lock_shared` never waits, so it cannot participate in
+/// a wait cycle at all.
+///
+/// Returning `false` means "a pause or resume is committing on this queue right
+/// now"; the caller must release its claim rather than dispatch. That is
+/// deliberately conservative in the safe direction — a resume is not a hold, so
+/// releasing during one costs at most one poll interval, while dispatching
+/// during a *pause* is the failure this whole feature exists to prevent.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn try_lock_queue_for_claim(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct AcquiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        acquired: bool,
+    }
+
+    let row: AcquiredRow = diesel::sql_query(try_lock_queue_for_claim_query())
+        .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(row.acquired)
 }
 
 /// Validate an operator-supplied queue name and return its canonical form.
@@ -1573,6 +1699,76 @@ mod tests {
     /// `pg_try_advisory_xact_lock` fail -- silently, since it is the *try*
     /// variant -- for as long as a large resume held the lock, so an unpaused
     /// queue would stop dispatching during an unrelated queue's resume.
+    /// Round-18 P1: the claim-side barrier must be the *shared*, *try* variant
+    /// of exactly the key `pause_queue` takes exclusively.
+    ///
+    /// Each of the three properties is load-bearing and independently
+    /// falsifiable: exclusive would serialize every claim on a queue and defeat
+    /// `SKIP LOCKED`; a blocking acquire would be an ABBA deadlock against
+    /// `resume_queue`'s advisory-then-rows order; and the single-argument
+    /// keyspace would collide with `claim_task`'s own `concurrency_key` gate.
+    #[test]
+    fn claim_barrier_is_a_shared_try_lock_on_the_pause_key() {
+        let sql = try_lock_queue_for_claim_query();
+        assert!(
+            sql.contains("pg_try_advisory_xact_lock_shared($1, hashtext($2))"),
+            "the claim barrier must be the shared TRY lock in the two-argument \
+             keyspace; got:\n{sql}"
+        );
+        for wrong in [
+            // Exclusive: would serialize claims against each other.
+            "pg_try_advisory_xact_lock($1",
+            "pg_advisory_xact_lock($1",
+            // Blocking: would deadlock against resume_queue (rows-then-lock here).
+            "pg_advisory_xact_lock_shared($1",
+            // Single-argument keyspace: collides with the concurrency_key gate.
+            "pg_try_advisory_xact_lock_shared(hashtext($1))",
+        ] {
+            assert!(
+                !sql.contains(wrong),
+                "claim barrier must not use `{wrong}`; got:\n{sql}"
+            );
+        }
+        assert!(
+            lock_queue_for_pause_query().contains("hashtext($2)"),
+            "the pause side must key on the same (classid, hashtext(queue)) pair, \
+             or the shared/exclusive pair would not actually exclude"
+        );
+    }
+
+    /// Round-18 P1: both claim releases share one prefix, so the guard and the
+    /// attempt restoration cannot drift apart — and only the paused variant
+    /// consults the pause table.
+    #[test]
+    fn both_claim_releases_share_the_guard_and_restore_the_attempt() {
+        let unconditional = release_claim_query();
+        let paused = release_claim_if_queue_paused_query();
+        for sql in [unconditional, paused] {
+            assert!(
+                sql.contains("attempt = GREATEST(attempt - 1, 0)"),
+                "a released claim must give back the attempt it consumed (AC3); got:\n{sql}"
+            );
+            assert!(
+                sql.contains("AND state = 'RUNNING'") && sql.contains("AND worker_id = $2"),
+                "a release must only ever undo this worker's own claim; got:\n{sql}"
+            );
+        }
+        assert!(
+            paused.starts_with(unconditional),
+            "the paused release must be the unconditional one plus its EXISTS tail, \
+             so the shared prefix cannot drift"
+        );
+        assert!(
+            paused.contains("harvest_queue_pauses"),
+            "the paused variant must still consult the pause table"
+        );
+        assert!(
+            !unconditional.contains("harvest_queue_pauses"),
+            "the unconditional variant is used precisely when the pause table cannot \
+             be trusted (a pause/resume is mid-commit), so it must not consult it"
+        );
+    }
+
     #[test]
     fn queue_pause_lock_uses_its_own_advisory_namespace() {
         let sql = lock_queue_for_pause_query();

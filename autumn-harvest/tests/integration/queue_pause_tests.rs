@@ -2261,3 +2261,200 @@ async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
         "the execution must still be sealed TIMED_OUT when nothing is holding it"
     );
 }
+
+/// Round-18 P1 — a claim must never commit *after* a pause has been
+/// acknowledged.
+///
+/// Round 17 wrapped the claim and its authoritative pause re-check in one
+/// transaction so a re-check error could no longer strand a `RUNNING` row. That
+/// moved the claim's commit *after* the re-check's snapshot, opening a window:
+/// a pause committing in between is invisible to the re-check, the pause API
+/// returns success, and the claim commits afterwards anyway — a worker
+/// dispatching into an outage the operator has already been told is contained.
+///
+/// The barrier is `try_lock_queue_for_claim`, the **shared** mode of the key
+/// `pause_queue` takes exclusively. This test holds that exclusive lock from a
+/// second connection (an in-flight, uncommitted pause transaction) and asserts
+/// the claim declines rather than dispatching.
+///
+/// Note what makes this a genuine regression test rather than a restatement of
+/// the round-2 guard: **no pause row is committed**, so the anti-join and the
+/// re-check both legitimately see an unpaused queue. Before the barrier the
+/// task is claimed; after it, the claim is given back untouched — same state,
+/// same attempt, immediately re-claimable once the pause transaction settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_declines_while_a_pause_transaction_is_committing() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("claim-barrier");
+
+    let params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    // An in-flight pause: it holds the exclusive queue lock but has NOT
+    // committed, so its pause row is invisible to every other transaction.
+    let mut pauser = connect(&url).await;
+    pauser.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .execute(&mut pauser)
+        .await
+        .expect("take the exclusive queue lock");
+
+    let claimed = claim_one(&mut conn, &q).await;
+    assert!(
+        claimed.is_none(),
+        "a claim must not be handed out while a pause transaction is committing: \
+         its own re-check cannot see the uncommitted pause, so without the shared-lock \
+         barrier the claim commits after the pause is acknowledged"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct TaskRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        worker_id: Option<String>,
+    }
+
+    let row: TaskRow =
+        diesel::sql_query("SELECT state, attempt, worker_id FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load task");
+    assert_eq!(
+        row.state, "PENDING",
+        "the declined claim must be given back"
+    );
+    assert_eq!(row.attempt, 0, "declining must not consume retry budget");
+    assert_eq!(
+        row.worker_id, None,
+        "the declined claim must clear worker_id"
+    );
+
+    // Once the pause transaction settles (here: rolls back, so the queue was
+    // never actually held), the task is immediately claimable again — the
+    // barrier costs at most one poll interval.
+    pauser.batch_execute("ROLLBACK").await.expect("rollback");
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        Some(task_id),
+        "with no pause in force the task must be claimable again immediately"
+    );
+}
+
+/// Round-18 P2 — a stale scan result must not time out a task whose deadline a
+/// completed resume has already credited forward.
+///
+/// `find_timed_out_tasks` produces a snapshot and a large batch takes time, so
+/// a whole pause/resume cycle can complete before a given row is reached.
+/// Resume shifts `scheduled_at` forward to credit the held time and then
+/// **deletes** the pause row — so the pause re-check finds nothing to suppress
+/// on, and enforcement proceeds on the scan-time deadline, timing the task out
+/// the instant its deadline was extended. On this (workflow) path that seals
+/// the entire execution `TIMED_OUT`, which is exactly what AC3/AC4 forbid.
+///
+/// The advisory lock sequences it deterministically: the enforcer scans, then
+/// blocks on the queue lock, while the held transaction performs the very
+/// `scheduled_at` shift `resume_queue` performs and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("stale-scan");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET scheduled_at = NOW() - INTERVAL '1 hour', \
+             schedule_to_start = INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("make the workflow task timeout-eligible");
+
+    // Hold the queue lock so the enforcer's scan lands first and its
+    // per-row enforcement blocks, standing in for the batch delay.
+    let mut shifter = connect(&url).await;
+    shifter.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .execute(&mut shifter)
+        .await
+        .expect("take the queue lock");
+
+    let url_for_enforcer = url.clone();
+    let enforcer = tokio::spawn(async move {
+        let mut conn = connect(&url_for_enforcer).await;
+        autumn_harvest::timeout::enforce_timeouts_once(
+            &mut conn,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(60),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Exactly the row mutation `resume_queue` performs when it credits held
+    // time back, committed while the enforcer is blocked on the queue lock and
+    // leaving NO pause row behind for the re-check to find.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET scheduled_at = NOW() + INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut shifter)
+    .await
+    .expect("credit the held time back");
+    shifter.batch_execute("COMMIT").await.expect("commit shift");
+
+    let _ = enforcer.await.expect("join");
+
+    #[derive(diesel::QueryableByName)]
+    struct StateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+
+    let task: StateRow = diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("load task");
+    assert_eq!(
+        task.state, "PENDING",
+        "a task whose deadline was credited forward before enforcement reached it \
+         must not be failed on the stale scan result"
+    );
+
+    let execution: StateRow =
+        diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load execution");
+    assert_ne!(
+        execution.state, "TIMED_OUT",
+        "sealing the whole execution on a credited-forward deadline is the AC3/AC4 violation"
+    );
+}
