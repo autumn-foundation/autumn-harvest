@@ -2598,3 +2598,94 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
          a second time; got {visible_age}s"
     );
 }
+
+/// Round-20 P2: the backlog scan's own duration must be credited back on resume.
+///
+/// The queue becomes effectively held the instant `lock_queue_for_pause` is
+/// granted — round 18's `try_lock_queue_for_claim` takes the **shared** mode of
+/// that very key, so from then on every claim fails its `try` and gives the task
+/// back. Round 14 nonetheless stamped `paused_at` *after* the
+/// `held_task_count_query` backlog `COUNT(*)`, on the (then-true, now-false)
+/// premise that claimers share neither the lock nor visibility of the uncommitted
+/// pause row. That scan is unbounded in principle on a large `PENDING` backlog,
+/// so its whole duration was held-but-uncredited: a task with a short
+/// `schedule_to_start` could be timed out immediately after the thaw for time the
+/// pause transaction itself blocked it.
+///
+/// Made deterministic rather than hoped for: a second connection holds an
+/// `ACCESS EXCLUSIVE` lock on `harvest_task_queue`, which blocks the `COUNT(*)`
+/// (a plain `SELECT` does wait on that lock) while leaving the advisory lock and
+/// the `harvest_queue_pauses` insert untouched. The pause therefore stalls
+/// *exactly* in the window under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn pause_credits_the_backlog_scan_interval() {
+    use diesel_async::RunQueryDsl;
+
+    const BLOCK_SECS: u64 = 3;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("scanstamp");
+    let task = enqueue_activity(&mut conn, &q, None).await;
+    backdate_scheduled_at(&mut conn, task, 100).await;
+
+    // Block the backlog COUNT(*) — and nothing else the pause touches.
+    let mut blocker = connect(&url).await;
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE harvest_task_queue IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("hold the task table");
+
+    let pause_url = url.clone();
+    let pause_queue_name = q.clone();
+    let pausing = tokio::spawn(async move {
+        let mut c = connect(&pause_url).await;
+        queue_pause::pause_queue(&mut c, &pause_queue_name, "scan stall", "alice", None)
+            .await
+            .expect("pause")
+    });
+
+    // Let the pause take the advisory lock, read the clock, and park on the scan.
+    tokio::time::sleep(std::time::Duration::from_secs(BLOCK_SECS)).await;
+
+    // The instant just before the scan can proceed. A correctly-stamped
+    // `paused_at` was taken ~BLOCK_SECS ago and so sits strictly before this.
+    #[derive(diesel::QueryableByName)]
+    struct NowRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        now: chrono::DateTime<chrono::Utc>,
+    }
+    let unblock_at: NowRow = diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result(&mut conn)
+        .await
+        .expect("read the unblock instant");
+
+    blocker.batch_execute("COMMIT").await.expect("release");
+    let outcome = pausing.await.expect("the pause task must not panic");
+
+    let lead = (unblock_at.now - outcome.paused_at).num_milliseconds();
+    assert!(
+        lead >= (BLOCK_SECS as i64 - 1) * 1000,
+        "paused_at must be stamped when the queue actually became held (at lock \
+         acquisition, ~{BLOCK_SECS}s before the scan could run), not after the \
+         scan — otherwise the whole held-but-blocked interval is credited to \
+         nobody and a short schedule_to_start fails the task right after the \
+         thaw. paused_at leads the unblock instant by only {lead}ms"
+    );
+
+    // And the credit is real: resuming restores the pre-pause wait without
+    // charging the task for the scan stall.
+    queue_pause::resume_queue(&mut conn, &q, "alice")
+        .await
+        .expect("resume");
+    let wait = (chrono::Utc::now() - scheduled_at(&mut conn, task).await).num_seconds();
+    assert!(
+        (99..=103).contains(&wait),
+        "the task's 100s pre-pause wait must survive the thaw, with the held scan \
+         interval credited back; apparent wait {wait}s"
+    );
+}

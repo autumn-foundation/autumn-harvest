@@ -933,6 +933,15 @@ struct CountRow {
     count: i64,
 }
 
+/// The wall clock read immediately after [`lock_queue_for_pause`] returns —
+/// the instant the hold actually takes effect. See [`pause_clock_query`].
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ClockRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    now: DateTime<Utc>,
+}
+
 /// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
 /// can exclude exactly the rows the first pass shifted rather than re-deriving
 /// that set from a `created_at` predicate that cannot see commit order
@@ -1017,33 +1026,74 @@ struct UpsertedPauseRow {
 /// safe side for `schedule_to_start` — but it is still lost fidelity in exactly
 /// the value round 9 fixed the other half of.
 ///
-/// `clock_timestamp()` in the `VALUES` list is evaluated when this statement
-/// executes, which is after the advisory lock is held — the same volatile-clock
-/// reasoning as [`resume_shift_scheduled_at_query`]. It appears **only** in the
-/// `INSERT` half: the `DO UPDATE` deliberately does not touch `paused_at`, so an
+/// `paused_at` is therefore **bound** (`$5`), read by [`pause_clock_query`]
+/// immediately after the advisory lock is granted rather than evaluated inline
+/// when this statement runs — see below. It appears **only** in the `INSERT`
+/// half: the `DO UPDATE` deliberately does not touch `paused_at`, so an
 /// idempotent re-pause still preserves the original hold's start time.
 ///
-/// # Why the caller runs this LAST
+/// # Why the stamp is taken at lock acquisition, not later (issue #619 round-20 review)
 ///
-/// The same argument applies in the other direction, to everything between the
-/// stamp and `COMMIT`. Claimers share neither the advisory lock nor visibility
-/// of the uncommitted pause row, so they keep dispatching for that whole
-/// interval: the hold only becomes effective at `COMMIT`. [`pause_queue`]
-/// therefore runs the [`held_task_count_query`] backlog scan — unbounded in
-/// principle on a large `PENDING` queue — *before* this statement, leaving only
-/// the commit itself after the stamp. That residue is irreducible; the scan was
-/// not. Guarded by `pause_scans_the_backlog_before_stamping_paused_at`.
+/// Earlier revisions read `clock_timestamp()` inline here and had [`pause_queue`]
+/// run the [`held_task_count_query`] backlog scan *first*, so the stamp landed as
+/// close to `COMMIT` as possible. The reasoning was that claimers share neither
+/// the advisory lock nor visibility of the uncommitted pause row, so they keep
+/// dispatching until `COMMIT` — making everything before it *unheld* time that
+/// must not be credited back on resume.
 ///
-/// Binds: `$1` = queue name, `$2` = reason, `$3` = actor, `$4` = scope shard id.
+/// The first half of that is no longer true. [`try_lock_queue_for_claim`] takes
+/// the **shared** mode of the very key [`lock_queue_for_pause`] takes
+/// exclusively, so from the moment this transaction is granted that lock every
+/// claim on the queue fails its `try` and gives the task back. The queue is
+/// therefore **effectively held from lock acquisition**, not from `COMMIT` — and
+/// stamping after the scan credits none of the scan interval, which is unbounded
+/// in principle on a large `PENDING` backlog. A task with a short
+/// `schedule_to_start` could then be timed out immediately after the thaw for
+/// time it spent blocked by the pause transaction itself: the exact AC3/AC4
+/// failure the shift exists to prevent.
+///
+/// Note the *direction*. The shift is
+/// `scheduled_at += clock_timestamp() - GREATEST(scheduled_at, paused_at)`, so a
+/// **later** `paused_at` shrinks the credit (under-credit → spurious timeouts,
+/// the dangerous side), while an **earlier** one only grows it, and the
+/// `GREATEST` clamps the result to `<= clock_timestamp()` in every branch — so
+/// it can never push `scheduled_at` into the future and make a task
+/// **un**claimable (the AC5 inverse). Stamping at lock acquisition is thus both
+/// the correct instant *and* the safe direction.
+///
+/// The lock is acquired in its own statement and the clock read in the next, not
+/// together in one target list: Postgres does not guarantee evaluation order
+/// within a select list, so a combined statement could read the clock *before*
+/// the blocking lock call and silently reintroduce the lock-wait as
+/// over-credit. Guarded by
+/// `pause_stamps_paused_at_at_lock_acquisition_not_after_the_scan`.
+///
+/// The genuinely irreducible residue is now only `COMMIT` itself: a claim
+/// released by the barrier between the stamp and commit is held but uncredited,
+/// bounded by this transaction's remaining runtime.
+///
+/// Binds: `$1` = queue name, `$2` = reason, `$3` = actor, `$4` = scope shard id,
+/// `$5` = the lock-acquisition instant.
 #[must_use]
 pub const fn pause_upsert_query() -> &'static str {
     "INSERT INTO harvest_queue_pauses \
          (queue_name, reason, paused_by, scope_shard_id, paused_at) \
-     VALUES ($1, $2, $3, $4, clock_timestamp()) \
+     VALUES ($1, $2, $3, $4, $5) \
      ON CONFLICT (queue_name) DO UPDATE \
          SET queue_name = harvest_queue_pauses.queue_name \
      RETURNING queue_name, reason, paused_by, paused_at, scope_shard_id, \
                (xmax = 0) AS newly_paused"
+}
+
+/// Read the wall clock at the instant the queue hold takes effect.
+///
+/// Run by [`pause_queue`] immediately after [`lock_queue_for_pause`] returns, in
+/// its own statement so the blocking lock acquisition provably happens first.
+/// `clock_timestamp()` (volatile, real current time) rather than `NOW()`, which
+/// is frozen at transaction start — before the lock wait.
+#[must_use]
+pub const fn pause_clock_query() -> &'static str {
+    "SELECT clock_timestamp() AS now"
 }
 
 /// Pause dispatch on `queue_name`.
@@ -1082,28 +1132,31 @@ pub async fn pause_queue(
             // `lock_queue_for_pause`).
             lock_queue_for_pause(conn, &queue_owned).await?;
 
-            // Scan the backlog FIRST, so the stamp below lands as close to
-            // COMMIT as possible. This `COUNT(*)` is unbounded in principle on a
-            // large `PENDING` backlog, and the hold is not effective until this
-            // transaction commits: claimers share neither the advisory lock
-            // above nor visibility of the uncommitted pause row, so they keep
-            // dispatching throughout. Stamping before this scan would credit
-            // that unheld interval back to every task on resume — see
-            // `pause_upsert_query`. The two statements touch different tables,
-            // so the order is otherwise immaterial.
+            // The hold takes effect HERE, not at COMMIT: `try_lock_queue_for_claim`
+            // takes the shared mode of the key just locked exclusively, so every
+            // claim on this queue now fails its `try` and gives the task back.
+            // Read the clock in its own statement, immediately after the lock, so
+            // the whole rest of this transaction — the unbounded backlog scan
+            // below included — is credited back on resume. See
+            // `pause_upsert_query` for why a later stamp under-credits and can
+            // spuriously time a task out after the thaw.
+            let clock: ClockRow = diesel::sql_query(pause_clock_query())
+                .get_result(conn)
+                .await?;
+
             let held: CountRow = diesel::sql_query(held_task_count_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .get_result(conn)
                 .await?;
 
-            // Stamps `paused_at` from `clock_timestamp()` (read here, after both
-            // the lock and the scan above) rather than letting it default to the
-            // frozen transaction clock — see `pause_upsert_query`.
+            // `paused_at` is bound from the lock-acquisition instant above, not
+            // evaluated inline here — see `pause_upsert_query`.
             let row: UpsertedPauseRow = diesel::sql_query(pause_upsert_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .bind::<diesel::sql_types::Text, _>(&reason_owned)
                 .bind::<diesel::sql_types::Text, _>(&actor_owned)
                 .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
+                .bind::<diesel::sql_types::Timestamptz, _>(clock.now)
                 .get_result(conn)
                 .await?;
             let newly_paused = row.newly_paused;
@@ -1533,15 +1586,24 @@ mod tests {
     #[test]
     fn pause_upsert_stamps_paused_at_from_the_live_clock() {
         let sql = pause_upsert_query();
+        let clock = pause_clock_query();
+        // Round 20 moved the read out of this statement and into its own, taken
+        // at lock acquisition; the live-clock requirement now belongs there.
         assert!(
-            sql.contains("clock_timestamp()"),
+            clock.contains("clock_timestamp()"),
             "paused_at must be stamped from the live clock, read after the queue \
-             lock is held, not left to the column's frozen DEFAULT NOW(); got:\n{sql}"
+             lock is held, not left to the column's frozen DEFAULT NOW(); got:\n{clock}"
+        );
+        assert!(
+            sql.contains("$5"),
+            "the upsert must BIND that instant rather than re-reading a clock at \
+             statement time; got:\n{sql}"
         );
         for frozen in ["NOW()", "transaction_timestamp()", "statement_timestamp()"] {
             assert!(
-                !sql.contains(frozen),
-                "the pause upsert must not read the frozen clock ({frozen}); got:\n{sql}"
+                !sql.contains(frozen) && !clock.contains(frozen),
+                "neither the pause upsert nor the stamp read may use the frozen \
+                 clock ({frozen}); got:\n{sql}\n{clock}"
             );
         }
         // Naming the column in the insert list is what overrides the DEFAULT.
@@ -1572,8 +1634,9 @@ mod tests {
             .split_once("RETURNING")
             .expect("the pause upsert RETURNs the effective row");
         assert!(
-            insert_half.contains("clock_timestamp()"),
-            "the INSERT half must stamp the live clock; got:\n{sql}"
+            insert_half.contains("$5"),
+            "the INSERT half must stamp the bound lock-acquisition instant; \
+             got:\n{sql}"
         );
         assert!(
             !update_set.contains("paused_at"),
@@ -1581,8 +1644,9 @@ mod tests {
              would erase the original hold's start time; got:\n{sql}"
         );
         assert!(
-            !update_set.contains("clock_timestamp()"),
-            "the DO UPDATE SET clause must not re-read the clock; got:\n{sql}"
+            !update_set.contains("clock_timestamp()") && !update_set.contains("$5"),
+            "the DO UPDATE SET clause must not re-stamp the hold's start; \
+             got:\n{sql}"
         );
         assert!(
             returning.contains("paused_at"),
@@ -1591,36 +1655,44 @@ mod tests {
         );
     }
 
-    /// The backlog scan must run BEFORE the pause stamp.
+    /// Round-20 P2: `paused_at` must be stamped at **lock acquisition**, before
+    /// the backlog scan — the inverse of what round 14 pinned here.
     ///
-    /// Round 11 moved `paused_at` off the frozen transaction clock so it stops
-    /// predating the *lock wait*. The same argument applies to everything that
-    /// runs after the stamp and before `COMMIT`, and `held_task_count_query`'s
-    /// `COUNT(*)` over a large `PENDING` backlog is exactly that: unbounded in
-    /// principle, and squarely between the two.
+    /// Round 14 had `pause_queue` scan the backlog first so the stamp landed as
+    /// close to `COMMIT` as possible, on the premise that claimers share neither
+    /// [`lock_queue_for_pause`]'s advisory lock nor visibility of the uncommitted
+    /// pause row, and so keep dispatching until `COMMIT`. That premise was true
+    /// then and round 18 made it false: [`try_lock_queue_for_claim`] takes the
+    /// **shared** mode of the very key the pause takes exclusively, so the queue
+    /// is effectively held from the instant the lock is granted. Stamping after
+    /// an unbounded `COUNT(*)` therefore credits none of that genuinely-held
+    /// interval back on resume, and a task with a short `schedule_to_start` can
+    /// be timed out immediately after the thaw for time the pause transaction
+    /// itself blocked it.
     ///
-    /// It matters because claimers do **not** share
-    /// [`lock_queue_for_pause`]'s advisory lock (it serializes pause/resume
-    /// against the `schedule_to_start` enforcer only) and cannot see the
-    /// uncommitted pause row, so they keep dispatching for that entire
-    /// interval. The hold is not effective until `COMMIT`, so every microsecond
-    /// between the stamp and `COMMIT` is time the queue was *not* held —
-    /// overstating the reported duration and, worse, over-crediting
-    /// `resume_shift_scheduled_at_query`.
+    /// Three things are pinned, because breaking any one of them silently
+    /// restores the old behaviour:
     ///
-    /// This is asserted on the source rather than on wall-clock timing: the
-    /// interval is real but unmeasurable in a test (there is no way to make
-    /// `COUNT(*)` reliably slow), while the *ordering* is the whole invariant.
-    /// Mirrors the file-reading guards in `migration_hygiene`/`ci_run_coverage`.
+    /// 1. the clock read comes **after** the lock (order within `pause_queue`),
+    /// 2. it comes **before** the scan,
+    /// 3. the upsert **binds** `paused_at` rather than evaluating
+    ///    `clock_timestamp()` inline, which would re-read it at statement time.
+    ///
+    /// Asserted on the source because the ordering *is* the invariant; the
+    /// wall-clock consequence is covered by the DB test
+    /// `pause_credits_the_backlog_scan_interval` (which makes the scan slow
+    /// deterministically by holding an `ACCESS EXCLUSIVE` lock on
+    /// `harvest_task_queue`). Mirrors the file-reading guards in
+    /// `migration_hygiene`/`ci_run_coverage`.
     #[test]
-    fn pause_scans_the_backlog_before_stamping_paused_at() {
+    fn pause_stamps_paused_at_at_lock_acquisition_not_after_the_scan() {
         let src = std::fs::read_to_string(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/queue_pause.rs"),
         )
         .expect("this file must be readable");
 
-        // Narrow to `pause_queue`'s body: the doc comments above it name both
-        // queries, so a whole-file search would pass vacuously.
+        // Narrow to `pause_queue`'s body: the doc comments above it name every
+        // query, so a whole-file search would pass vacuously.
         let from_fn = src
             .find("pub async fn pause_queue(")
             .map(|at| &src[at..])
@@ -1630,21 +1702,49 @@ mod tests {
             .map(|at| &from_fn[..at])
             .expect("pause_queue must be followed by the resume fn's doc comment");
 
+        let lock_at = body
+            .find("lock_queue_for_pause(conn")
+            .expect("pause_queue must take the queue advisory lock");
+        let clock_at = body
+            .find("pause_clock_query()")
+            .expect("pause_queue must read the clock at lock acquisition");
         let scan_at = body
             .find("held_task_count_query()")
             .expect("pause_queue must scan the held backlog");
-        let stamp_at = body
-            .find("pause_upsert_query()")
-            .expect("pause_queue must stamp the pause");
 
         assert!(
-            scan_at < stamp_at,
-            "the backlog COUNT(*) must run BEFORE the pause upsert so \
-             clock_timestamp() is read as close to COMMIT as possible; claimers \
-             neither share the queue advisory lock nor see the uncommitted pause \
-             row, so a stamp taken before the scan credits unheld time back to \
-             every task's scheduled_at on resume (scan at {scan_at}, stamp at \
-             {stamp_at})"
+            lock_at < clock_at,
+            "the clock must be read AFTER the advisory lock is granted, or the \
+             stamp predates the hold by the whole lock wait (lock at {lock_at}, \
+             clock at {clock_at})"
+        );
+        assert!(
+            clock_at < scan_at,
+            "the clock must be read BEFORE the backlog COUNT(*): the queue is \
+             already held once the exclusive lock is granted (round-18's shared \
+             try-lock barrier declines every claim), so a stamp taken after an \
+             unbounded scan credits none of that held interval back on resume and \
+             can spuriously schedule-to-start-fail a task after the thaw (clock at \
+             {clock_at}, scan at {scan_at})"
+        );
+
+        let upsert = pause_upsert_query();
+        assert!(
+            upsert.contains("VALUES ($1, $2, $3, $4, $5)"),
+            "paused_at must be BOUND from the lock-acquisition instant, not \
+             evaluated inline (which would re-read the clock at statement time and \
+             silently restore the post-scan stamp): {upsert}"
+        );
+        assert!(
+            !upsert.contains("clock_timestamp()"),
+            "the pause upsert must not call clock_timestamp() at all: {upsert}"
+        );
+        assert!(
+            pause_clock_query().contains("clock_timestamp()")
+                && !pause_clock_query().contains("NOW()"),
+            "the stamp must come from the volatile clock, not the frozen \
+             transaction clock: {}",
+            pause_clock_query()
         );
     }
 
