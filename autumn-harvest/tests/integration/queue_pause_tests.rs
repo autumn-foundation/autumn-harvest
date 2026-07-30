@@ -35,6 +35,18 @@ use uuid::Uuid;
 
 // ── DB setup ──────────────────────────────────────────────────────────────────
 
+/// One id returned by the primary resume pass's `RETURNING id`.
+///
+/// The second pass excludes the rows the first one actually shifted rather than
+/// re-deriving them from a predicate (issue #619 round 19), so any test that
+/// drives the two passes by hand has to thread these ids through exactly the way
+/// `resume_queue` does.
+#[derive(diesel::QueryableByName)]
+struct ShiftedTaskIdRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+}
+
 async fn connect(url: &str) -> AsyncPgConnection {
     <AsyncPgConnection as diesel_async::AsyncConnection>::establish(url)
         .await
@@ -637,12 +649,15 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
         .expect("begin, lock, release the hold");
 
     // Pass 1 — the primary shift.
-    let primary = diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-        .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .execute(&mut resumer)
-        .await
-        .expect("primary shift");
+    let primary_ids: Vec<ShiftedTaskIdRow> =
+        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .load(&mut resumer)
+            .await
+            .expect("primary shift");
+    let primary = primary_ids.len();
+    let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
 
     // ── THE WINDOW ──────────────────────────────────────────────────────────
     let late = enqueue_activity(&mut conn, &q, None).await;
@@ -663,10 +678,12 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
          {before_pass2}s"
     );
 
-    // Pass 2 — the late-arrivals credit.
+    // Pass 2 — the late-arrivals credit. It covers every due row the primary
+    // pass did *not* shift, excluded by id rather than by predicate.
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -772,14 +789,17 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
         .await
         .expect("begin, lock, release the hold");
 
-    let primary = diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-        .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .execute(&mut resumer)
-        .await
-        .expect("primary shift");
+    let primary_ids: Vec<ShiftedTaskIdRow> =
+        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .load(&mut resumer)
+            .await
+            .expect("primary shift");
+    let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
     assert_eq!(
-        primary, 1,
+        shifted_ids,
+        vec![early],
         "pass 1 sees only the committed backlog; the straddler is still \
          uncommitted and invisible to it"
     );
@@ -793,6 +813,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -2456,5 +2477,124 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
     assert_ne!(
         execution.state, "TIMED_OUT",
         "sealing the whole execution on a credited-forward deadline is the AC3/AC4 violation"
+    );
+}
+
+/// Round-19 P2 (issue #619): a row whose enqueue *executed* before the pause but
+/// *committed* after the primary resume shift's snapshot must still be credited.
+///
+/// This is the case the round-16 semantic partition could not reach. The
+/// partition is total and visibility-independent — every due `PENDING` row
+/// belongs to exactly one side whenever it becomes visible — but totality of the
+/// *predicates* is not coverage by the *passes*. Such a row is on pass 1's side
+/// (`created_at < paused_at`) yet invisible to pass 1's snapshot, and the old
+/// pass 2 excluded it by re-testing that very predicate. Credited by neither, it
+/// thawed carrying its whole held wait and was immediately
+/// `schedule_to_start`-failable — the AC3/AC4 failure the shift exists to prevent.
+///
+/// The race is sequenced deterministically rather than hoped for: a second
+/// connection holds the enqueue open across pass 1 and commits before pass 2, so
+/// the two statements are driven with exactly the binds `resume_queue` uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited() {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct PausedAtRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        paused_at: chrono::DateTime<chrono::offset::Utc>,
+    }
+
+    let (url, _c) = setup_db_url().await;
+    let mut driver = connect(&url).await;
+    let mut slow = connect(&url).await;
+    let q = unique_queue("late-commit");
+
+    // An ordinary pre-pause task the primary pass WILL see. Its presence is what
+    // makes the exclusion set non-empty, so this also proves the id-exclusion
+    // does not double-shift a row pass 1 already credited.
+    let visible = enqueue_activity(&mut driver, &q, None).await;
+    backdate_scheduled_at(&mut driver, visible, 7200).await;
+
+    // The slow enqueue: INSERT executes now (so `created_at` will predate the
+    // pause once we backdate it), but the transaction stays open across pass 1.
+    diesel::sql_query("BEGIN")
+        .execute(&mut slow)
+        .await
+        .expect("open the slow enqueue transaction");
+    let late_commit = enqueue_activity(&mut slow, &q, None).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET created_at = NOW() - INTERVAL '2 hours', \
+             scheduled_at = NOW() - INTERVAL '2 hours' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(late_commit)
+    .execute(&mut slow)
+    .await
+    .expect("age the uncommitted row onto the primary pass's side");
+
+    // Hold for an hour: created_at (2h ago) < paused_at (1h ago), so this row is
+    // squarely on the PRIMARY pass's side of the partition.
+    queue_pause::pause_queue(&mut driver, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    backdate_paused_at(&mut driver, &q, 3600).await;
+    let paused_at =
+        diesel::sql_query("SELECT paused_at FROM harvest_queue_pauses WHERE queue_name = $1")
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .load::<PausedAtRow>(&mut driver)
+            .await
+            .expect("read paused_at")
+            .into_iter()
+            .next()
+            .expect("the hold exists")
+            .paused_at;
+
+    // Pass 1. The slow enqueue is still uncommitted, so this cannot see it.
+    let shifted: Vec<ShiftedTaskIdRow> =
+        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .load(&mut driver)
+            .await
+            .expect("primary shift");
+    let shifted_ids: Vec<Uuid> = shifted.into_iter().map(|r| r.id).collect();
+    assert_eq!(
+        shifted_ids,
+        vec![visible],
+        "pass 1 must shift exactly the row it can see"
+    );
+
+    // The enqueue lands between the two snapshots — the whole point.
+    diesel::sql_query("COMMIT")
+        .execute(&mut slow)
+        .await
+        .expect("commit the slow enqueue");
+
+    // Pass 2, excluding exactly what pass 1 reported.
+    diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+        .execute(&mut driver)
+        .await
+        .expect("second pass");
+
+    // Both rows were due 2h ago and held for 1h, so both keep the 1h of wait
+    // they had accrued *before* the hold and none of the hold itself.
+    let late_age =
+        (chrono::Utc::now() - scheduled_at(&mut driver, late_commit).await).num_seconds();
+    assert!(
+        (3540..=3660).contains(&late_age),
+        "a pre-pause enqueue that committed after the primary pass must still be \
+         credited the held hour; got {late_age}s (uncredited would be ~7200s)"
+    );
+
+    let visible_age = (chrono::Utc::now() - scheduled_at(&mut driver, visible).await).num_seconds();
+    assert!(
+        (3540..=3660).contains(&visible_age),
+        "the row pass 1 already shifted must be excluded from pass 2, not shifted \
+         a second time; got {visible_age}s"
     );
 }

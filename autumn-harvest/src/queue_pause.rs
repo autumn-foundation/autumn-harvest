@@ -611,40 +611,49 @@ pub const fn queue_pause_suppresses_timeout(
 /// credited by *neither* pass. It belongs on this side: a row with no
 /// `created_at` predates that migration and therefore predates any pause.
 ///
-/// # Scope of the totality claim
+/// # Why a total partition was still not enough (issue #619 round-19 review)
 ///
-/// The partition itself is total and visibility-independent: every due
+/// The partition above is total and visibility-independent — every due
 /// `PENDING` row matches exactly one predicate, whenever it becomes visible.
-/// What is *not* total is coverage across the two statements, because a row can
-/// change **state** between their snapshots — a `RUNNING` row re-pended after
-/// this pass's snapshot is invisible here, and if it was created before the
-/// pause it also falls outside [`resume_shift_late_arrivals_query`]'s side of
-/// the partition (issue #619 review).
+/// That is a statement about the *predicates*, and an earlier revision wrongly
+/// read it as a statement about **coverage**. It is not: a row on *this* pass's
+/// side that is invisible to *this* pass's snapshot is simply never shifted,
+/// and it cannot be picked up later, because the second pass used to test the
+/// same `created_at` predicate and so excluded it by construction.
 ///
-/// Every reachable re-pend path is nevertheless benign, because each one
-/// *refreshes* `scheduled_at` to the re-pend instant, which lies inside this
-/// resume: `crate::queue::requeue_for_retry` (`scheduled_at = now + backoff`),
-/// `crate::poison_pill` reclaim (`scheduled_at = now()`), and
-/// `primary_repend_workflow_task` (which refreshes `created_at` to the re-pend
-/// instant — necessarily after `paused_at` — so it lands on the late-arrival
-/// side and is credited there). Such a row only *became* due
-/// during the thaw, so it accrued no held time, and its under-credit is bounded
-/// by this transaction's remaining runtime — the same residual documented on
-/// [`resume_shift_late_arrivals_query`].
+/// Concretely: an enqueue whose `INSERT` *executes* before the pause (so
+/// `created_at < paused_at`, this pass's side) but whose transaction *commits*
+/// after this statement's snapshot is invisible here and was rejected there —
+/// thawing with its entire held wait uncredited, and so immediately
+/// `schedule_to_start`-failable. Fixing the partition (round 16) removed the
+/// dependence on visibility for *which side a row belongs to*; it could not
+/// remove the dependence on visibility for *whether a pass sees the row at all*.
 ///
+/// The fix is to stop deriving pass 2's exclusion from a predicate and derive
+/// it from the rows this pass **actually shifted**: this statement now
+/// `RETURNING id`s them, and [`resume_shift_late_arrivals_query`] covers *both*
+/// sides of the partition for every row not in that set. Coverage is then total
+/// across the two snapshots by construction, for any commit order.
+///
+/// The remaining, genuinely irreducible residual — a row committing after pass
+/// 2's snapshot — is documented on [`resume_shift_late_arrivals_query`].
+///
+/// # Re-pend paths
+///
+/// A row can also change **state** between the two snapshots: a `RUNNING` row
+/// re-pended after this pass's snapshot is invisible here. Every such row is
+/// now covered by pass 2 regardless of which side of the partition it lands on,
+/// so this is no longer a correctness argument — but it is still worth
+/// recording that each reachable re-pend path *refreshes* `scheduled_at` to the
+/// re-pend instant (`crate::queue::requeue_for_retry`, `crate::poison_pill`
+/// reclaim, `primary_repend_workflow_task`) and so accrued no held time anyway.
 /// The one path that re-pends while *preserving* a pre-pause `scheduled_at` is
 /// [`release_claim_if_queue_paused`], which does so deliberately so a released
-/// claim keeps the wait it had already accrued. It is not reachable in this
-/// window in practice: it runs in the same function call as the claim it undoes,
-/// so it fires at pause-creation time, not hours later during a resume. Closing
-/// it exactly would need pass 1 to return its row ids for pass 2 to exclude
-/// (`id <> ALL($ids)`), which is O(n) per row against the returned array and so
-/// does not scale to a large backlog; the alternative
-/// of taking the queue's advisory lock in the release is explicitly rejected,
-/// since that statement runs on *every* claim and would serialize them per queue,
-/// defeating `SKIP LOCKED` (see `crate::queue::claim_task`).
+/// claim keeps the wait it had already accrued; it is now credited correctly by
+/// pass 2 rather than relying on being unreachable in this window.
 ///
-/// Binds: `$1` = queue name, `$2` = `paused_at`.
+/// Binds: `$1` = queue name, `$2` = `paused_at`. Returns the ids it shifted, for
+/// [`resume_shift_late_arrivals_query`] to exclude.
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -652,7 +661,8 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
        AND scheduled_at <= clock_timestamp() \
-       AND (created_at IS NULL OR created_at < $2)"
+       AND (created_at IS NULL OR created_at < $2) \
+     RETURNING id"
 }
 
 /// Second pass of the resume shift: credit rows **enqueued during the thaw
@@ -667,12 +677,41 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// `schedule_to_start` scanner for time it spent held — the AC3/AC4 failure the
 /// primary shift exists to prevent.
 ///
-/// `SET scheduled_at = clock_timestamp()` (absolute), not the primary pass's
-/// relative `+=` delta, because a row created during the hold has no pre-pause
-/// wait to preserve: it was held from the moment it became due, so it accrues
-/// none. Being absolute also makes the statement **idempotent** — re-running it
-/// can only move `scheduled_at` to a later instant that is still
-/// `<= clock_timestamp() <= commit time`, never into the future.
+/// # Why this pass covers *both* sides of the partition (issue #619 round-19 review)
+///
+/// It is not enough for this pass to own only the rows created during the hold.
+/// A row on the *primary* pass's side (`created_at < paused_at`) that was
+/// invisible to that pass's snapshot — an enqueue that executed before the
+/// pause but committed after the primary shift ran — would otherwise be
+/// credited by neither pass and thaw with its whole held wait uncredited. See
+/// the round-19 note on [`resume_shift_scheduled_at_query`].
+///
+/// So this statement applies the **same per-side formula** the partition
+/// defines, via a `CASE`, and derives its exclusion from the ids the primary
+/// pass actually shifted (`$3`) rather than from a `created_at` predicate:
+///
+/// - `created_at IS NULL OR created_at < $2` → the primary pass's *relative*
+///   `+=` delta, preserving the wait the row accrued before the hold.
+/// - otherwise → `clock_timestamp()` (absolute), because a row created during
+///   the hold has no pre-pause wait to preserve: it was held from the moment it
+///   became due, so it accrues none.
+///
+/// Excluding by id rather than by predicate is what makes coverage total for
+/// *any* commit order: a row the primary pass shifted is in `$3` and is skipped
+/// here (a second application of the relative formula would erase the very
+/// pre-pause wait it exists to preserve), and every other due `PENDING` row is
+/// credited here, whichever side it belongs to. An empty `$3` — the primary
+/// pass shifted nothing — correctly leaves every row to this pass.
+///
+/// The exclusion is written as `NOT EXISTS (… unnest($3) …)` rather than
+/// `id <> ALL($3)` deliberately: the latter is a per-row linear scan of the
+/// array, while the former lets the planner build a hash anti-join, so the cost
+/// is O(rows + ids) rather than O(rows × ids). The array itself is one UUID per
+/// row the primary pass already rewrote, on an operator-initiated resume that
+/// is by definition doing a bulk `UPDATE` of those same rows — a small fraction
+/// of work already being paid. (Round 11 rejected this exclusion on the
+/// strength of the `<> ALL` cost; the objection was to that spelling, not to
+/// the approach.)
 ///
 /// # Irreducible residual
 ///
@@ -690,15 +729,23 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// paying to recover a sub-millisecond credit — so the residual is documented
 /// rather than eliminated.
 ///
-/// Binds: `$1` = queue name.
+/// Binds: `$1` = queue name, `$2` = the hold's `paused_at`, `$3` = the ids the
+/// primary pass shifted.
 #[must_use]
 pub const fn resume_shift_late_arrivals_query() -> &'static str {
     "UPDATE harvest_task_queue \
-     SET scheduled_at = clock_timestamp() \
+     SET scheduled_at = CASE \
+           WHEN created_at IS NULL OR created_at < $2 \
+             THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
+           ELSE clock_timestamp() \
+         END \
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
        AND scheduled_at <= clock_timestamp() \
-       AND created_at >= $2"
+       AND NOT EXISTS ( \
+             SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
+             WHERE already.id = harvest_task_queue.id \
+           )"
 }
 
 /// The `GET /admin/queues/paused` read, and the Vantage Workers banner's source.
@@ -884,6 +931,17 @@ pub struct ResumeOutcome {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
+}
+
+/// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
+/// can exclude exactly the rows the first pass shifted rather than re-deriving
+/// that set from a `created_at` predicate that cannot see commit order
+/// (issue #619 round-19 review).
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ShiftedTaskId {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
 }
 
 #[cfg(feature = "db")]
@@ -1124,21 +1182,31 @@ pub async fn resume_queue(
                 });
             };
 
-            let released = diesel::sql_query(resume_shift_scheduled_at_query())
+            // The ids this pass shifts are what pass 2 excludes -- see the
+            // round-19 notes on both queries for why a `created_at` predicate
+            // cannot do that job.
+            let shifted: Vec<ShiftedTaskId> = diesel::sql_query(resume_shift_scheduled_at_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-                .execute(conn)
+                .load(conn)
                 .await?;
+            let released = shifted.len();
+            let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
 
-            // Second pass, LAST so it sees the freshest snapshot: a task created
-            // during the hold is still held (our DELETE has not committed, so
-            // concurrent claimers still see the pause row) and may be invisible
-            // to the primary shift above. The two are disjoint by `created_at`
-            // vs `paused_at` -- a SEMANTIC split, not a visibility one -- so the
-            // counts sum exactly and no row is shifted twice.
+            // Second pass, LAST so it sees the freshest snapshot: a task still
+            // held (our DELETE has not committed, so concurrent claimers still
+            // see the pause row) may be invisible to the primary shift above --
+            // whether it was created during the hold, or created *before* it by
+            // an enqueue that only committed just now. This pass covers BOTH
+            // sides of the partition and excludes exactly the rows the primary
+            // pass reported shifting, so the two are disjoint by construction
+            // (the counts sum exactly, no row is shifted twice) for any commit
+            // order rather than only for the ones a `created_at` test happens
+            // to separate.
             let late = diesel::sql_query(resume_shift_late_arrivals_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
                 .execute(conn)
                 .await?;
 
@@ -1580,18 +1648,49 @@ mod tests {
         );
     }
 
-    /// The two passes must partition the due `PENDING` rows on `created_at`, not
-    /// overlap: the primary pass's `+=` credit is *relative*, so applying it to a
-    /// row twice would erase the pre-pause wait it exists to preserve, and the
-    /// summed `released_task_count` would double-count.
+    /// Round-19 P2: the two passes must be made disjoint by the **ids the first
+    /// pass actually shifted**, never by re-testing `created_at`.
+    ///
+    /// A `created_at` predicate on pass 2 is what left the round-19 hole: a row
+    /// on pass 1's side that pass 1's snapshot could not see (its enqueue
+    /// committed late) was excluded from pass 2 by that very predicate and so
+    /// credited by neither pass. Excluding by id instead makes coverage total
+    /// for any commit order, while still guaranteeing no row is shifted twice —
+    /// pass 1's `+=` credit is *relative*, so a second application would erase
+    /// the pre-pause wait it exists to preserve and double-count
+    /// `released_task_count`.
     #[test]
-    fn the_two_resume_passes_partition_on_created_at() {
+    fn the_second_resume_pass_excludes_by_shifted_id_not_created_at() {
         let primary = resume_shift_scheduled_at_query();
         let late = resume_shift_late_arrivals_query();
-        assert!(primary.contains("created_at < $2)"));
-        assert!(late.contains("created_at >= $2"));
-        // Same queue, same PENDING/due gate on both sides, or the partition would
-        // leak rows out of one pass without the other picking them up.
+
+        assert!(
+            primary.contains("RETURNING id"),
+            "pass 1 must report the rows it shifted, or pass 2 has nothing sound \
+             to exclude by; got:\n{primary}"
+        );
+
+        let (_, late_where) = late
+            .split_once(" WHERE ")
+            .expect("the second pass is an UPDATE ... WHERE");
+        assert!(
+            !late_where.contains("created_at"),
+            "pass 2 must NOT re-test created_at in its WHERE clause -- that is \
+             exactly what excluded the late-committing pre-pause row it now has \
+             to cover (round-19 P2); got:\n{late}"
+        );
+        assert!(
+            late.contains("unnest($3::uuid[])") && late.contains("NOT EXISTS"),
+            "pass 2 must exclude by the shifted-id set; got:\n{late}"
+        );
+        assert!(
+            !late.contains("<> ALL"),
+            "`<> ALL` is a per-row linear scan of the array; the NOT EXISTS \
+             + unnest spelling lets the planner hash it; got:\n{late}"
+        );
+
+        // Same queue, same PENDING/due gate on both sides, or a row could leak
+        // out of one pass without the other picking it up.
         for sql in [primary, late] {
             assert!(sql.contains("queue_name = $1"), "got:\n{sql}");
             assert!(sql.contains("state = 'PENDING'"), "got:\n{sql}");
@@ -1616,12 +1715,15 @@ mod tests {
             primary.contains("(created_at IS NULL OR created_at < $2)"),
             "a legacy row with no created_at must still be credited; got:\n{primary}"
         );
-        // ...and must NOT also match the late-arrivals pass, or it would be
-        // shifted twice by two different formulas.
+        // Pass 2 now covers both sides, so the same NULL arm must appear in its
+        // CASE -- otherwise a legacy row pass 1 could not see would fall to the
+        // absolute arm and be handed a full fresh budget instead of keeping the
+        // wait it accrued before the hold.
         let late = resume_shift_late_arrivals_query();
         assert!(
-            !late.contains("IS NULL"),
-            "a NULL created_at is not a late arrival; got:\n{late}"
+            late.contains("WHEN created_at IS NULL OR created_at < $2"),
+            "pass 2's CASE must route a NULL created_at to the relative arm, \
+             same as pass 1; got:\n{late}"
         );
     }
 
@@ -1658,31 +1760,43 @@ mod tests {
         );
     }
 
+    /// Round-19 P2: pass 2 applies the SAME per-side formula the partition
+    /// defines, so a row it has to cover on pass 1's behalf is credited exactly
+    /// as pass 1 would have credited it.
+    ///
+    /// Both arms are load-bearing and independently falsifiable. Collapsing to
+    /// the absolute arm alone hands a pre-pause row a full fresh
+    /// `schedule_to_start` budget, erasing the wait it had already accrued;
+    /// collapsing to the relative arm alone credits a row born during the hold
+    /// for wait it never accrued.
     #[test]
-    fn late_arrivals_pass_is_absolute_and_bounded() {
+    fn second_pass_applies_the_correct_formula_per_side() {
         let sql = resume_shift_late_arrivals_query();
-        assert!(
-            sql.contains("SET scheduled_at = clock_timestamp()"),
-            "must be an absolute assignment to the live clock; got:\n{sql}"
-        );
-        assert!(
-            !sql.contains("GREATEST(") && !sql.contains("scheduled_at + "),
-            "must NOT reuse the relative credit formula; got:\n{sql}"
-        );
-        // It binds paused_at as $2, but ONLY as the partition boundary -- never
-        // in the assignment, which stays absolute. Round 16 moved the partition
-        // off `transaction_timestamp()` onto this bound value so a row's side no
-        // longer depends on when its enqueuing transaction became visible.
-        assert!(
-            sql.contains("created_at >= $2"),
-            "the partition must key on the bound paused_at; got:\n{sql}"
-        );
         let (set_clause, _where_clause) = sql
             .split_once(" WHERE ")
-            .expect("the late pass is an UPDATE ... WHERE");
+            .expect("the second pass is an UPDATE ... WHERE");
+
         assert!(
-            !set_clause.contains("$2"),
-            "paused_at must not reach the assignment -- this pass is absolute; got:\n{sql}"
+            set_clause.contains("ELSE clock_timestamp()"),
+            "a row created during the hold has no pre-pause wait to preserve, so \
+             its arm must be an absolute assignment; got:\n{sql}"
+        );
+        assert!(
+            set_clause
+                .contains("THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2))"),
+            "a row created before the hold must get the SAME relative credit \
+             pass 1 would have given it, or covering it here silently changes \
+             its semantics; got:\n{sql}"
+        );
+        // The two arms must be exactly pass 1's assignment and the absolute one
+        // -- not some third formula that drifted from the primary pass.
+        let primary = resume_shift_scheduled_at_query();
+        assert!(
+            primary.contains(
+                "SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2))"
+            ),
+            "pass 1's assignment changed; pass 2's relative arm must be updated \
+             in lockstep; got:\n{primary}"
         );
         // Same out-of-scope invariant as the primary pass.
         assert!(!sql.contains("schedule_to_close_at"), "got:\n{sql}");
