@@ -1687,3 +1687,212 @@ async fn a_repause_preserves_the_original_paused_at() {
     assert_eq!(second.reason, "stripe outage");
     assert_eq!(second.paused_by, "alice");
 }
+
+/// A queue pause committing after the scan must also suppress the **workflow**
+/// schedule-to-start timeout, not just the activity one (issue #619 round-15
+/// review).
+///
+/// `find_timed_out_tasks` does not filter on `task_type`, so a PENDING workflow
+/// task carrying `schedule_to_start` is routed to `enforce_workflow_timeout`
+/// exactly as an activity task is routed to `enforce_activity_timeout` — but
+/// only the latter had the authoritative queue-pause re-check. The blast radius
+/// on this path is strictly larger: it appends `WorkflowFailed` and seals the
+/// whole execution `TIMED_OUT`, where the activity path fails one task.
+///
+/// No supported product path sets `schedule_to_start` on a workflow task (every
+/// workflow enqueue site leaves it `None`; the one site that sets it is
+/// hard-coded `TaskType::Activity`), so the row is crafted here with a raw
+/// UPDATE — the same technique `child_policy_tests::
+/// workflow_task_timeout_cascades_detached_children` already uses to exercise
+/// this enforcement path. The state is nonetheless reachable by an embedder,
+/// since `queue::enqueue` and `EnqueueParams::schedule_to_start` are both public.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("race-wf-timeout");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    // Craft the state no product path produces: a workflow task that is already
+    // past a schedule_to_start deadline, so the scanner selects it next pass.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET scheduled_at = NOW() - INTERVAL '1 hour', \
+             schedule_to_start = INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("make the workflow task timeout-eligible");
+
+    // Hold the queue-pause advisory lock, simulating a pause transaction that
+    // began before the enforcer ran and commits while it is mid-flight.
+    let mut pauser = connect(&url).await;
+    pauser.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .execute(&mut pauser)
+        .await
+        .expect("take the queue lock");
+    diesel::sql_query(
+        "INSERT INTO harvest_queue_pauses (queue_name, reason, paused_by) VALUES ($1, $2, $3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&q)
+    .bind::<diesel::sql_types::Text, _>("outage")
+    .bind::<diesel::sql_types::Text, _>("alice")
+    .execute(&mut pauser)
+    .await
+    .expect("insert the pause row (uncommitted)");
+
+    // The enforcer's scan snapshot predates the pause, so it selects the task;
+    // its authoritative re-check must then block on the lock above.
+    let url_for_task = url.clone();
+    let enforcer = tokio::spawn(async move {
+        let mut conn = connect(&url_for_task).await;
+        autumn_harvest::timeout::enforce_timeouts_once(
+            &mut conn,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(60),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    pauser.batch_execute("COMMIT").await.expect("commit pause");
+    let _ = enforcer.await.expect("join");
+
+    #[derive(diesel::QueryableByName)]
+    struct StateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    let task: StateRow = diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("load task");
+    assert_eq!(
+        task.state, "PENDING",
+        "a held WORKFLOW task must NOT be schedule-to-start-failed because its \
+         queue was being paused (AC3/AC4)"
+    );
+
+    let execution: StateRow =
+        diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load execution");
+    assert_ne!(
+        execution.state, "TIMED_OUT",
+        "the pause must not let the enforcer seal the whole execution -- this is \
+         the blast radius that makes the workflow path worse than the activity one"
+    );
+
+    let events: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type = 'WorkflowFailed'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result(&mut conn)
+    .await
+    .expect("count WorkflowFailed events");
+    assert_eq!(
+        events.count, 0,
+        "no WorkflowFailed may be appended for a task held by a queue pause"
+    );
+}
+
+/// The companion to the test above: with **no** pause in force, a workflow task
+/// past its `schedule_to_start` deadline must still be timed out.
+///
+/// Without this, the queue-pause guard added to `enforce_workflow_timeout` could
+/// silently suppress *every* workflow schedule-to-start timeout (e.g. if the
+/// `is_queue_paused` sense were inverted, or the `matches!` reason scope
+/// widened) and the paused-side test above would still pass. This is also the
+/// local-Postgres stand-in for `child_policy_tests::
+/// workflow_task_timeout_cascades_detached_children`, which exercises the same
+/// enforcement path but is testcontainers-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("wf-to-fires");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET scheduled_at = NOW() - INTERVAL '1 hour', \
+             schedule_to_start = INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("make the workflow task timeout-eligible");
+
+    autumn_harvest::timeout::enforce_timeouts_once(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        std::time::Duration::from_secs(60),
+        &None,
+        &[],
+        None,
+        None,
+        60,
+    )
+    .await
+    .expect("enforce");
+
+    #[derive(diesel::QueryableByName)]
+    struct StateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+
+    let task: StateRow = diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("load task");
+    assert_eq!(
+        task.state, "FAILED",
+        "with no pause in force the workflow schedule-to-start timeout must \
+         still fire -- the guard must suppress a HELD task, not every task"
+    );
+
+    let execution: StateRow =
+        diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(exec_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load execution");
+    assert_eq!(
+        execution.state, "TIMED_OUT",
+        "the execution must still be sealed TIMED_OUT when nothing is holding it"
+    );
+}

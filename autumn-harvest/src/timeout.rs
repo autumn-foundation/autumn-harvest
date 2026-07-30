@@ -1306,40 +1306,78 @@ async fn enforce_workflow_timeout(
     reason: &TimeoutReason,
     metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
-    let execution = load_workflow_execution(conn, exec_id).await?;
-    let error = timeout_error(&execution.workflow_name, reason);
-    let history = store::load_history(conn, exec_id).await?;
-    let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+    let enforced = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
+        // the one in `enforce_activity_timeout` — see that function for the full
+        // rationale on why an advisory lock (not a bare re-read) is required and
+        // why the lock must be taken BEFORE any row is touched.
+        //
+        // This path needs it for the same reason: `find_timed_out_tasks` does
+        // not filter on `task_type`, so a PENDING **workflow** task carrying
+        // `schedule_to_start` reaches here exactly as an activity task does, and
+        // the scan's queue-pause carve-out is only a non-locking snapshot. A
+        // pause committing after that snapshot would otherwise let this
+        // transaction append `WorkflowFailed` and seal the whole execution
+        // `TIMED_OUT` — strictly worse than the activity case, which fails one
+        // task, and precisely the outcome AC3/AC4 forbid.
+        //
+        // Bailing here also skips the execution/history loads below, so the
+        // advisory-lock wait cannot widen the window between reading
+        // `history.next_event_id` and appending at it (those loads used to sit
+        // outside this transaction; they are inside it now for that reason).
+        //
+        // Returning `None` — rather than proceeding with no writes — is
+        // load-bearing beyond the appends: it also skips
+        // `maybe_increment_schedule_failure_counter` below, so a deliberately
+        // held task can never count toward the schedule auto-pause threshold
+        // (issue #360). A hold is not a schedule failure.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            crate::queue_pause::lock_queue_for_pause(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
+                return Ok(None);
+            }
+        }
 
-    let (deferred_starts, closed_children) =
-        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            let error = error.clone();
-            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
-            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-            queue::fail_task(conn, task.id, &error).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+        let execution = load_workflow_execution(conn, exec_id).await?;
+        let error = timeout_error(&execution.workflow_name, reason);
+        let history = store::load_history(conn, exec_id).await?;
+        let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+
+        store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+        update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+        queue::fail_task(conn, task.id, &error).await?;
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::TimedOut,
+            Some(metrics),
+        )
+        .await?;
+        deferred.extend(triggers);
+        if execution.parent_close_policy.is_none()
+            && let Some(parent_uuid) = execution.parent_id
+        {
+            wake_parent_for_child_timeout(
                 conn,
+                execution_id_from_uuid(parent_uuid),
                 exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                Some(metrics),
+                &error,
             )
             .await?;
-            deferred.extend(triggers);
-            if execution.parent_close_policy.is_none()
-                && let Some(parent_uuid) = execution.parent_id
-            {
-                wake_parent_for_child_timeout(
-                    conn,
-                    execution_id_from_uuid(parent_uuid),
-                    exec_id,
-                    &error,
-                )
-                .await?;
-            }
-            Ok((deferred, closed_children))
-        }))
-        .await?;
+        }
+        Ok(Some((execution, deferred, closed_children)))
+    }))
+    .await?;
+
+    // Suppressed by a queue pause: nothing was written, so there is nothing to
+    // cascade, no handler check to run, and no schedule failure to count.
+    let Some((execution, deferred_starts, closed_children)) = enforced else {
+        return Ok(());
+    };
 
     for start in deferred_starts {
         start.spawn();
