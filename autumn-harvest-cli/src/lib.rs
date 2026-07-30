@@ -13,6 +13,17 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
+/// Characters percent-encoded when a caller-supplied value becomes one URL path
+/// segment.
+///
+/// `/` and `\` are both here because the URL parser reqwest uses treats **both**
+/// as path separators for special (http/https) URLs, so either one would split a
+/// single value into extra segments and silently retarget the request at a
+/// different route — and `\` additionally re-enables `..` traversal inside what
+/// should be one opaque segment (`payments\..\admin` resolved to
+/// `/admin/queues/admin/pause`). `%` is here so a caller-supplied `%2e` cannot
+/// become a dot-segment; the LITERAL `.`/`..` forms cannot be encoded away at
+/// all and are rejected instead — see `is_url_dot_segment`.
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -24,7 +35,8 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'`')
     .add(b'{')
     .add(b'}')
-    .add(b'/');
+    .add(b'/')
+    .add(b'\\');
 
 /// Top-level CLI arguments for the `harvest` binary.
 #[derive(Debug, Parser)]
@@ -7714,6 +7726,68 @@ mod reuse_policy_tests {
         assert_eq!(workflow_reachability_exit_code(&value), 2);
         let unavailable = json!({ "status": "unavailable", "items": [] });
         assert_eq!(workflow_reachability_exit_code(&unavailable), 2);
+    }
+
+    #[test]
+    fn path_segment_encodes_both_path_separators() {
+        // The URL parser treats `\` as a path separator for http/https, so an
+        // unencoded backslash splits one value into extra segments and the
+        // request silently lands on a different route. Route-wide: every caller
+        // of `path_segment` (queue names, workflow ids, keys, ...) depends on
+        // this, not just queue pause/resume.
+        assert_eq!(path_segment(r"payments\eu"), "payments%5Ceu");
+        assert_eq!(path_segment(r"a\b\c"), "a%5Cb%5Cc");
+        assert_eq!(path_segment("payments/eu"), "payments%2Feu");
+        // Worse than a missed route: a backslash re-enables `..` traversal
+        // inside what should be one opaque segment, past the whole-segment
+        // dot-segment guard.
+        assert_eq!(path_segment(r"payments\..\admin"), "payments%5C..%5Cadmin");
+        // An ordinary name is untouched.
+        assert_eq!(path_segment("orders-eu"), "orders-eu");
+    }
+
+    /// Exhaustive guard for the whole path-separator / normalization class.
+    ///
+    /// Every printable ASCII byte, embedded in a value that becomes one path
+    /// segment, must survive `path_segment` + URL parsing as **exactly one**
+    /// segment that decodes back to the original. This is the test that would
+    /// have caught the missing `\` (the URL parser treats it as a path
+    /// separator for http/https), and it fails if any separator-class character
+    /// is ever dropped from `PATH_SEGMENT_ENCODE_SET`.
+    ///
+    /// Scope: *embedded* bytes. A whole-segment `.`/`..` cannot be encoded away
+    /// at all and is rejected instead (`is_url_dot_segment`); control
+    /// characters are covered by `CONTROLS`.
+    #[test]
+    fn every_printable_ascii_byte_survives_as_exactly_one_path_segment() {
+        let mut offenders = Vec::new();
+        for byte in 0x20u8..=0x7e {
+            let raw = format!("q{}z", byte as char);
+            let encoded = path_segment(&raw);
+            let url = format!("http://host/admin/queues/{encoded}/pause");
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("byte {byte:#04x} produced an unparseable URL: {e}"));
+            let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+            let intact = segments.len() == 4 && percent_decode(segments[2]) == raw;
+            if !intact {
+                offenders.push(format!(
+                    "byte {byte:#04x} ({:?}) encoded to {encoded:?} but parsed as {:?}",
+                    byte as char,
+                    parsed.path()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these bytes did not survive as one intact path segment:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    fn percent_decode(value: &str) -> String {
+        percent_encoding::percent_decode_str(value)
+            .decode_utf8_lossy()
+            .to_string()
     }
 
     #[test]

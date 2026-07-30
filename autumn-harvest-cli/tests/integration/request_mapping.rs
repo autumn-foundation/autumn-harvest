@@ -2392,6 +2392,43 @@ fn queue_resume_rejects_url_dot_segment_queue_names() {
 }
 
 #[test]
+fn queue_pause_percent_encodes_a_backslash_in_the_queue_name() {
+    // The URL parser treats `\` as a path separator for http/https, so an
+    // unencoded backslash splits the segment and the request silently lands on
+    // a different route -- and it re-enables `..` traversal inside what should
+    // be one opaque segment, past the whole-segment dot-segment guard.
+    // Encoding IS the right fix here (unlike the literal `.`/`..` forms):
+    // `%5C` is not collapsed, so a queue whose name genuinely carries a
+    // backslash stays pausable.
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        r"payments\..\admin",
+        "--reason",
+        "x",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/payments%5C..%5Cadmin/pause",
+        "a backslash must not split the path segment or enable traversal"
+    );
+}
+
+#[test]
+fn queue_resume_percent_encodes_a_backslash_in_the_queue_name() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "resume", r"payments\eu"])
+        .expect("queue resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.path, "/admin/queues/payments%5Ceu/resume");
+}
+
+#[test]
 fn queue_pause_still_accepts_names_that_merely_contain_dots() {
     // Only a WHOLE-segment `.`/`..` is a dot-segment -- `a.b` is a perfectly
     // ordinary queue name and must not be swept up by the rejection.
