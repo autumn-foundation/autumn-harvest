@@ -34780,6 +34780,23 @@ fn sort_reason_codes(reason_codes: &mut [String]) {
 /// cannot disagree about the string that carries the priority.
 const QUEUE_PAUSED_REASON_CODE: &str = "queue_paused";
 
+/// Whether a worker's only *worker-level* impediment is that it is draining.
+///
+/// [`QUEUE_PAUSED_REASON_CODE`] is filtered out because it describes the QUEUE,
+/// not the worker: the `all_draining` diagnosis is a statement about fleet
+/// state, and it stays true when an operator additionally holds the queue
+/// (issue #619). Reporting the pause therefore never silently downgrades the
+/// diagnosis — the two independent facts surface on their own channels, the
+/// diagnosis and the worker's `reason_codes`.
+fn is_worker_draining_only(reason_codes: &[String]) -> bool {
+    let worker_level: Vec<&str> = reason_codes
+        .iter()
+        .map(String::as_str)
+        .filter(|code| *code != QUEUE_PAUSED_REASON_CODE)
+        .collect();
+    worker_level == ["worker_draining"]
+}
+
 /// Compute the reason codes that depend only on the task and shared runtime
 /// state — not on any particular worker (issue #611).
 ///
@@ -35119,6 +35136,11 @@ async fn evaluate_eligibility_for_shard(
             .into_iter()
             .collect();
 
+    // Hoisted out of the worker loop: the pause is a property of the queue under
+    // evaluation, so both the worker-reason short-circuit and the per-task loop
+    // below read the same answer.
+    let queue_is_paused = paused_queues.contains(queue_name);
+
     let mut eligible_workers = Vec::new();
     let mut ineligible_workers = Vec::new();
 
@@ -35189,6 +35211,22 @@ async fn evaluate_eligibility_for_shard(
         }
 
         if !worker_reasons.is_empty() {
+            // Issue #619: a queue pause blocks every worker equally, so it has
+            // to be reported on this path too. It returns before the per-task
+            // loop below, so a fleet that is entirely unsubscribed / off-shard /
+            // draining / stopped — e.g. drained for the very outage the operator
+            // paused for — would otherwise never surface the operator's own hold
+            // on the one endpoint that answers "why is nothing being claimed?".
+            //
+            // `queue_name` is the right key in both call paths: the queue
+            // endpoint filters tasks to it, and the single-task endpoint passes
+            // that task's own `queue_name`.
+            if queue_is_paused {
+                worker_reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
+            }
+            // The per-task path below sorts; this one did not, so the pause
+            // would trail the worker reasons alphabetically instead of leading.
+            sort_reason_codes(&mut worker_reasons);
             ineligible_workers.push(IneligibleWorkerInfo {
                 worker_id: w_id,
                 reason_codes: worker_reasons,
@@ -35339,7 +35377,7 @@ async fn evaluate_eligibility_for_shard(
             && !ineligible_workers.is_empty()
             && ineligible_workers
                 .iter()
-                .all(|w| w.reason_codes == vec!["worker_draining".to_string()]);
+                .all(|w| is_worker_draining_only(&w.reason_codes));
         if all_draining {
             "all_draining".to_string()
         } else {
@@ -35794,6 +35832,35 @@ mod eligibility_reason_tests {
             false,
         );
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
+    }
+
+    /// The `all_draining` diagnosis describes the WORKER fleet, so an operator's
+    /// queue hold must not downgrade it (issue #619). Surfacing `queue_paused`
+    /// on the worker-reason short-circuit would otherwise flip the diagnosis to
+    /// the vaguer `no_eligible_workers` for an unrelated reason.
+    #[test]
+    fn draining_only_ignores_a_queue_pause_but_not_a_real_worker_reason() {
+        let owned =
+            |codes: &[&str]| -> Vec<String> { codes.iter().map(|c| (*c).to_string()).collect() };
+
+        assert!(super::is_worker_draining_only(&owned(&["worker_draining"])));
+        // The pause rides alongside without changing the fleet verdict, in
+        // either order (`sort_reason_codes` puts it first).
+        assert!(super::is_worker_draining_only(&owned(&[
+            "queue_paused",
+            "worker_draining"
+        ])));
+
+        // A genuine second worker-level condition still disqualifies it.
+        assert!(!super::is_worker_draining_only(&owned(&[
+            "queue_paused",
+            "worker_draining",
+            "wrong_shard_assignment"
+        ])));
+        assert!(!super::is_worker_draining_only(&owned(&["worker_stopped"])));
+        // A queue hold alone is not a draining fleet.
+        assert!(!super::is_worker_draining_only(&owned(&["queue_paused"])));
+        assert!(!super::is_worker_draining_only(&[]));
     }
 }
 

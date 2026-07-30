@@ -677,6 +677,17 @@ struct UpsertedPauseRow {
 /// `INSERT` half: the `DO UPDATE` deliberately does not touch `paused_at`, so an
 /// idempotent re-pause still preserves the original hold's start time.
 ///
+/// # Why the caller runs this LAST
+///
+/// The same argument applies in the other direction, to everything between the
+/// stamp and `COMMIT`. Claimers share neither the advisory lock nor visibility
+/// of the uncommitted pause row, so they keep dispatching for that whole
+/// interval: the hold only becomes effective at `COMMIT`. [`pause_queue`]
+/// therefore runs the [`held_task_count_query`] backlog scan — unbounded in
+/// principle on a large `PENDING` queue — *before* this statement, leaving only
+/// the commit itself after the stamp. That residue is irreducible; the scan was
+/// not. Guarded by `pause_scans_the_backlog_before_stamping_paused_at`.
+///
 /// Binds: `$1` = queue name, `$2` = reason, `$3` = actor, `$4` = scope shard id.
 #[must_use]
 pub const fn pause_upsert_query() -> &'static str {
@@ -725,9 +736,23 @@ pub async fn pause_queue(
             // `lock_queue_for_pause`).
             lock_queue_for_pause(conn, &queue_owned).await?;
 
-            // Stamps `paused_at` from `clock_timestamp()` (read here, after the
-            // lock above) rather than letting it default to the frozen
-            // transaction clock — see `pause_upsert_query`.
+            // Scan the backlog FIRST, so the stamp below lands as close to
+            // COMMIT as possible. This `COUNT(*)` is unbounded in principle on a
+            // large `PENDING` backlog, and the hold is not effective until this
+            // transaction commits: claimers share neither the advisory lock
+            // above nor visibility of the uncommitted pause row, so they keep
+            // dispatching throughout. Stamping before this scan would credit
+            // that unheld interval back to every task on resume — see
+            // `pause_upsert_query`. The two statements touch different tables,
+            // so the order is otherwise immaterial.
+            let held: CountRow = diesel::sql_query(held_task_count_query())
+                .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .get_result(conn)
+                .await?;
+
+            // Stamps `paused_at` from `clock_timestamp()` (read here, after both
+            // the lock and the scan above) rather than letting it default to the
+            // frozen transaction clock — see `pause_upsert_query`.
             let row: UpsertedPauseRow = diesel::sql_query(pause_upsert_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
                 .bind::<diesel::sql_types::Text, _>(&reason_owned)
@@ -736,11 +761,6 @@ pub async fn pause_queue(
                 .get_result(conn)
                 .await?;
             let newly_paused = row.newly_paused;
-
-            let held: CountRow = diesel::sql_query(held_task_count_query())
-                .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .get_result(conn)
-                .await?;
 
             Ok(PauseOutcome {
                 queue_name: row.queue_name,
@@ -1196,6 +1216,63 @@ mod tests {
             returning.contains("paused_at"),
             "the effective paused_at must still be returned so the handler \
              echoes the preserved value; got:\n{sql}"
+        );
+    }
+
+    /// The backlog scan must run BEFORE the pause stamp.
+    ///
+    /// Round 11 moved `paused_at` off the frozen transaction clock so it stops
+    /// predating the *lock wait*. The same argument applies to everything that
+    /// runs after the stamp and before `COMMIT`, and `held_task_count_query`'s
+    /// `COUNT(*)` over a large `PENDING` backlog is exactly that: unbounded in
+    /// principle, and squarely between the two.
+    ///
+    /// It matters because claimers do **not** share
+    /// [`lock_queue_for_pause`]'s advisory lock (it serializes pause/resume
+    /// against the `schedule_to_start` enforcer only) and cannot see the
+    /// uncommitted pause row, so they keep dispatching for that entire
+    /// interval. The hold is not effective until `COMMIT`, so every microsecond
+    /// between the stamp and `COMMIT` is time the queue was *not* held —
+    /// overstating the reported duration and, worse, over-crediting
+    /// `resume_shift_scheduled_at_query`.
+    ///
+    /// This is asserted on the source rather than on wall-clock timing: the
+    /// interval is real but unmeasurable in a test (there is no way to make
+    /// `COUNT(*)` reliably slow), while the *ordering* is the whole invariant.
+    /// Mirrors the file-reading guards in `migration_hygiene`/`ci_run_coverage`.
+    #[test]
+    fn pause_scans_the_backlog_before_stamping_paused_at() {
+        let src = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/queue_pause.rs"),
+        )
+        .expect("this file must be readable");
+
+        // Narrow to `pause_queue`'s body: the doc comments above it name both
+        // queries, so a whole-file search would pass vacuously.
+        let from_fn = src
+            .find("pub async fn pause_queue(")
+            .map(|at| &src[at..])
+            .expect("pause_queue must exist");
+        let body = from_fn
+            .find("/// Resume dispatch on `queue_name`")
+            .map(|at| &from_fn[..at])
+            .expect("pause_queue must be followed by the resume fn's doc comment");
+
+        let scan_at = body
+            .find("held_task_count_query()")
+            .expect("pause_queue must scan the held backlog");
+        let stamp_at = body
+            .find("pause_upsert_query()")
+            .expect("pause_queue must stamp the pause");
+
+        assert!(
+            scan_at < stamp_at,
+            "the backlog COUNT(*) must run BEFORE the pause upsert so \
+             clock_timestamp() is read as close to COMMIT as possible; claimers \
+             neither share the queue advisory lock nor see the uncommitted pause \
+             row, so a stamp taken before the scan credits unheld time back to \
+             every task's scheduled_at on resume (scan at {scan_at}, stamp at \
+             {stamp_at})"
         );
     }
 
