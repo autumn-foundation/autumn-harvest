@@ -27998,18 +27998,142 @@ async fn apply_resume_across_shards(
     applied
 }
 
+/// Identity of one released hold: `(reason, operator)`.
+///
+/// A named alias rather than an inline tuple so the grouping map below stays
+/// under `clippy::type_complexity`.
+type ReleasedHoldKey = (String, Option<String>);
+
+/// Cross-shard accumulator for one [`ReleasedHoldKey`].
+///
+/// The hold's identity lives in the map key, so this carries only the parts that
+/// have to be folded across shards; [`ReleasedHoldGroup`] is assembled from the
+/// two together by [`Self::finish`].
+struct HoldGroupFold {
+    shard_ids: Vec<i32>,
+    anchor_secs: i64,
+    anchor_shard_id: i32,
+}
+
+impl HoldGroupFold {
+    /// Seeded below the range of any real hold (`paused_duration_secs` is never
+    /// negative) so the first shard observed always becomes the anchor.
+    const fn new() -> Self {
+        Self {
+            shard_ids: Vec::new(),
+            anchor_secs: i64::MIN,
+            anchor_shard_id: i32::MAX,
+        }
+    }
+
+    /// Fold in one shard's release, keeping the group's longest hold as the
+    /// anchor (lowest shard id on a tie, matching the single-anchor `max_by_key`
+    /// this replaced).
+    fn observe(&mut self, shard_id: i32, paused_duration_secs: i64) {
+        self.shard_ids.push(shard_id);
+        if (paused_duration_secs, std::cmp::Reverse(shard_id))
+            > (self.anchor_secs, std::cmp::Reverse(self.anchor_shard_id))
+        {
+            self.anchor_secs = paused_duration_secs;
+            self.anchor_shard_id = shard_id;
+        }
+    }
+
+    fn finish(mut self, (reason, paused_by): ReleasedHoldKey) -> ReleasedHoldGroup {
+        self.shard_ids.sort_unstable();
+        ReleasedHoldGroup {
+            reason,
+            paused_by,
+            shard_ids: self.shard_ids,
+            anchor_secs: self.anchor_secs,
+            anchor_shard_id: self.anchor_shard_id,
+        }
+    }
+}
+
+/// One distinct released hold — a `(reason, operator)` pair — and the shards it
+/// covered.
+///
+/// Shards paused independently for the *same* incident collapse into one entry,
+/// so the durable audit row grows with the number of genuinely distinct holds (a
+/// small, operator-authored quantity) rather than with the shard count, and the
+/// common fleet-wide case still renders as a single line.
+struct ReleasedHoldGroup {
+    /// Always `Some` at the source (the group is built only from outcomes that
+    /// released a hold), so this is unwrapped to a `String` here.
+    reason: String,
+    paused_by: Option<String>,
+    /// Ascending.
+    shard_ids: Vec<i32>,
+    /// This group's longest hold, and the shard that held it (lowest shard id on
+    /// an internal tie).
+    ///
+    /// Ordering groups by `(anchor_secs, Reverse(anchor_shard_id))` descending
+    /// reproduces exactly the single-anchor `max_by_key` the response's
+    /// top-level fields use, so `released_groups[0]` is always the shard
+    /// `paused_duration_secs` reports.
+    anchor_secs: i64,
+    anchor_shard_id: i32,
+}
+
+impl ReleasedHoldGroup {
+    /// A hold whose operator is unrecorded still has to contribute its reason,
+    /// so the missing name renders rather than dropping the entry.
+    fn operator_label(&self) -> &str {
+        self.paused_by.as_deref().unwrap_or("unknown")
+    }
+
+    /// `shards 0,2 by alice: stripe outage (held 900s)`
+    fn render(&self) -> String {
+        let ids = self
+            .shard_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let label = if self.shard_ids.len() == 1 {
+            "shard"
+        } else {
+            "shards"
+        };
+        format!(
+            "{label} {ids} by {}: {} (held {}s)",
+            self.operator_label(),
+            self.reason,
+            self.anchor_secs
+        )
+    }
+}
+
 /// The cross-shard provenance summary of a resume, plus each shard's own row.
 struct ResumeProvenance {
     /// Reason of the longest-held (i.e. earliest-placed) released hold.
     released_reason: Option<String>,
     /// Operator who placed that same hold.
     released_paused_by: Option<String>,
+    /// Every released hold, deduplicated by `(reason, operator)` and ordered
+    /// longest-held first.
+    ///
+    /// The pause rows are already deleted by the time this exists, so this — not
+    /// the transient [`Self::shards`] response array — is what the durable audit
+    /// row must carry.
+    released_groups: Vec<ReleasedHoldGroup>,
+    /// Per-shard detail for the HTTP response. The pause rows are already
+    /// deleted, so this is the only surviving record of the other shards'
+    /// operational counters.
+    shards: Vec<Value>,
+}
+
+impl ResumeProvenance {
     /// False when the shards that actually released disagree on
     /// `(released_reason, released_paused_by)`.
-    uniform: bool,
-    /// Per-shard detail. The pause rows are already deleted, so this is the
-    /// only surviving record of the other shards' provenance.
-    shards: Vec<Value>,
+    ///
+    /// Derived from the grouping rather than computed separately, so the flag
+    /// and the audit rendering can never disagree about what "uniform" means.
+    /// A fleet-wide no-op releases nothing and is trivially uniform.
+    const fn uniform(&self) -> bool {
+        self.released_groups.len() <= 1
+    }
 }
 
 /// Summarise a fleet-wide resume without discarding any shard's provenance.
@@ -28021,28 +28145,33 @@ struct ResumeProvenance {
 /// reason came from another.
 ///
 /// Only shards that actually released a hold carry provenance (a shard that
-/// was not paused returns `None`), so both the summary and the uniformity
-/// check consider just those; a fleet-wide no-op is trivially uniform.
+/// was not paused returns `None`), so both the summary and the grouping consider
+/// just those.
 fn summarise_resume_provenance(
     per_shard: &[(i32, ::autumn_harvest::queue_pause::ResumeOutcome)],
 ) -> ResumeProvenance {
-    let released: Vec<(i32, &::autumn_harvest::queue_pause::ResumeOutcome)> = per_shard
-        .iter()
-        .filter(|(_, outcome)| outcome.released_reason.is_some())
-        .map(|(shard_id, outcome)| (*shard_id, outcome))
+    // Keyed by the hold's identity so shards sharing one incident collapse;
+    // `BTreeMap` so groups that tie on the sort key below resolve
+    // deterministically.
+    let mut grouped: std::collections::BTreeMap<ReleasedHoldKey, HoldGroupFold> =
+        std::collections::BTreeMap::new();
+    for (shard_id, outcome) in per_shard {
+        // A shard that was not paused releases no hold and must not drag the
+        // summary or falsely flag divergence.
+        let Some(reason) = outcome.released_reason.as_ref() else {
+            continue;
+        };
+        let fold = grouped
+            .entry((reason.clone(), outcome.released_paused_by.clone()))
+            .or_insert_with(HoldGroupFold::new);
+        fold.observe(*shard_id, outcome.paused_duration_secs);
+    }
+    let mut released_groups: Vec<ReleasedHoldGroup> = grouped
+        .into_iter()
+        .map(|(key, fold)| fold.finish(key))
         .collect();
-    let longest: Option<&::autumn_harvest::queue_pause::ResumeOutcome> = released
-        .iter()
-        .max_by_key(|(shard_id, outcome)| {
-            (outcome.paused_duration_secs, std::cmp::Reverse(*shard_id))
-        })
-        .map(|(_, outcome)| *outcome);
-    let uniform = longest.is_none_or(|anchor| {
-        released.iter().all(|(_, outcome)| {
-            outcome.released_reason == anchor.released_reason
-                && outcome.released_paused_by == anchor.released_paused_by
-        })
-    });
+    released_groups
+        .sort_by_key(|group| (std::cmp::Reverse(group.anchor_secs), group.anchor_shard_id));
     let shards = per_shard
         .iter()
         .map(|(shard_id, outcome)| {
@@ -28057,9 +28186,17 @@ fn summarise_resume_provenance(
         })
         .collect();
     ResumeProvenance {
-        released_reason: longest.and_then(|o| o.released_reason.clone()),
-        released_paused_by: longest.and_then(|o| o.released_paused_by.clone()),
-        uniform,
+        // `.as_slice()` and not `Vec::first`: diesel's `QueryDsl::first` is in
+        // scope here and shadows the inherent slice method on `Vec`.
+        released_reason: released_groups
+            .as_slice()
+            .first()
+            .map(|group| group.reason.clone()),
+        released_paused_by: released_groups
+            .as_slice()
+            .first()
+            .and_then(|group| group.paused_by.clone()),
+        released_groups,
         shards,
     }
 }
@@ -28092,24 +28229,43 @@ fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Opt
     (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
-/// The reason released by a resume, rendered for the audit trail.
+/// Every hold released by a resume, rendered for the durable audit trail.
 ///
-/// The resume `DELETE`s the pause row, so this audit row plus the response body
-/// are the only surviving record of the hold's provenance. When the released
-/// shards disagree the summary is explicitly marked non-uniform rather than
-/// silently presenting one shard's story as the fleet's.
+/// The resume `DELETE`s the pause rows, so once the HTTP response is gone this
+/// audit row is the *only* surviving record of the holds' provenance. It
+/// therefore carries **every** released `(reason, operator)` with the shards it
+/// covered, not just the longest hold plus a "shards disagreed" marker — the
+/// per-shard array in the response body is transient, so a later post-incident
+/// review could not otherwise recover why the other shards were held (issue
+/// #619 review).
+///
+/// The longest hold leads, so the row stays coherent with the response's
+/// top-level `released_reason` / `paused_duration_secs`.
+///
+/// A single released hold — the overwhelmingly common case, including a
+/// fleet-wide hold placed by one operator for one incident — keeps the plain
+/// single-line form. Its shard list is deliberately omitted there: with one
+/// `(reason, operator)` group there is nothing distinguishing to attribute, and
+/// the response already reports the counts.
 fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String> {
-    let reason = provenance.released_reason.as_deref()?;
-    let by = provenance
-        .released_paused_by
-        .as_deref()
-        .unwrap_or("unknown");
-    let qualifier = if provenance.uniform {
-        ""
-    } else {
-        " (shards disagreed; longest hold shown)"
-    };
-    Some(format!("released hold by {by}: {reason}{qualifier}"))
+    let (leading, rest) = provenance.released_groups.split_first()?;
+    if rest.is_empty() {
+        return Some(format!(
+            "released hold by {}: {}",
+            leading.operator_label(),
+            leading.reason
+        ));
+    }
+    let count = provenance.released_groups.len();
+    let detail = provenance
+        .released_groups
+        .iter()
+        .map(ReleasedHoldGroup::render)
+        .collect::<Vec<_>>()
+        // `; ` and not ` | `: the latter separates this contribution from the
+        // partial-failure text in `queue_pause_audit_context`.
+        .join("; ");
+    Some(format!("released {count} holds (longest first); {detail}"))
 }
 
 /// Best-effort audit row for a queue pause/resume.
@@ -28450,7 +28606,7 @@ fn resume_queue_response(
         // `provenance_uniform` flags divergence (issue #619 review).
         "released_reason": provenance.released_reason,
         "released_paused_by": provenance.released_paused_by,
-        "provenance_uniform": provenance.uniform,
+        "provenance_uniform": provenance.uniform(),
         "shards": provenance.shards,
     });
     queue_pause_attach_partial(&mut payload, partial);
@@ -35862,7 +36018,7 @@ mod tests {
         ];
         let p = summarise_resume_provenance(&per_shard);
 
-        assert!(!p.uniform, "the two shards released different incidents");
+        assert!(!p.uniform(), "the two shards released different incidents");
         assert_eq!(
             p.released_reason.as_deref(),
             Some("stripe outage"),
@@ -35893,7 +36049,7 @@ mod tests {
             ),
         ];
         let p = summarise_resume_provenance(&per_shard);
-        assert!(p.uniform, "one released hold cannot disagree with itself");
+        assert!(p.uniform(), "one released hold cannot disagree with itself");
         assert_eq!(p.released_reason.as_deref(), Some("stripe outage"));
         assert_eq!(p.shards.len(), 2, "every shard is still reported");
         assert_eq!(p.shards[0]["newly_resumed"], false);
@@ -35906,7 +36062,7 @@ mod tests {
             (0, resume_outcome(None, None, 0, 0)),
             (1, resume_outcome(None, None, 0, 0)),
         ]);
-        assert!(p.uniform);
+        assert!(p.uniform());
         assert!(p.released_reason.is_none());
         assert!(p.released_paused_by.is_none());
         assert_eq!(p.shards.len(), 2);
@@ -36020,7 +36176,7 @@ mod tests {
     }
 
     /// A resume deletes the pause row, so the audit row must capture what it
-    /// released — including an explicit marker when the shards disagreed.
+    /// released.
     #[test]
     fn resume_audit_reason_records_the_released_hold() {
         let uniform = summarise_resume_provenance(&[(
@@ -36029,7 +36185,9 @@ mod tests {
         )]);
         assert_eq!(
             resume_released_audit_reason(&uniform).as_deref(),
-            Some("released hold by alice: stripe outage")
+            Some("released hold by alice: stripe outage"),
+            "a single released hold keeps the plain single-line form -- a shard \
+             list would be noise when every released shard tells one story"
         );
 
         let divergent = summarise_resume_provenance(&[
@@ -36042,10 +36200,10 @@ mod tests {
         let rendered = resume_released_audit_reason(&divergent).expect("a hold was released");
         assert!(
             rendered.contains("shard-0 hold") && rendered.contains("alice"),
-            "the longest hold's own story must be the one shown; got {rendered}"
+            "the longest hold must lead; got {rendered}"
         );
         assert!(
-            rendered.contains("shards disagreed"),
+            rendered.contains("2 holds"),
             "a divergent release must say so rather than presenting one shard's \
              reason as the fleet's; got {rendered}"
         );
@@ -36053,6 +36211,79 @@ mod tests {
         // Releasing nothing records nothing.
         let noop = summarise_resume_provenance(&[(0, resume_outcome(None, None, 0, 0))]);
         assert!(resume_released_audit_reason(&noop).is_none());
+    }
+
+    /// EVERY released reason must survive in the durable audit row, not just
+    /// the longest hold's.
+    ///
+    /// `resume_queue` has already `DELETE`d every pause row by the time this
+    /// renders, and the per-shard detail goes only to the transient HTTP
+    /// response body, so an audit row that keeps one shard's story plus a
+    /// generic "shards disagreed" marker leaves the other shards' *why*
+    /// permanently unrecoverable (issue #619 review).
+    #[test]
+    fn resume_audit_reason_preserves_every_released_hold() {
+        let provenance = summarise_resume_provenance(&[
+            (
+                0,
+                resume_outcome(Some("stripe outage"), Some("alice"), 900, 1),
+            ),
+            (1, resume_outcome(Some("pg failover"), Some("bob"), 60, 2)),
+            (
+                2,
+                resume_outcome(Some("stripe outage"), Some("alice"), 120, 3),
+            ),
+        ]);
+        let rendered = resume_released_audit_reason(&provenance).expect("holds were released");
+
+        // Both incidents and both operators -- nothing discarded.
+        for fragment in ["stripe outage", "alice", "pg failover", "bob"] {
+            assert!(
+                rendered.contains(fragment),
+                "'{fragment}' is unrecoverable anywhere else once the pause row \
+                 is deleted; got {rendered}"
+            );
+        }
+
+        // Attribution: which shards each distinct hold covered. Shards sharing
+        // one story collapse into a single entry so the common fleet-wide case
+        // stays short.
+        assert!(
+            rendered.contains("shards 0,2"),
+            "the two shards sharing one incident must collapse into one entry; \
+             got {rendered}"
+        );
+        assert!(rendered.contains("shard 1"), "got {rendered}");
+        assert_eq!(
+            rendered.matches("stripe outage").count(),
+            1,
+            "the shared reason must not be repeated per shard; got {rendered}"
+        );
+
+        // The longest hold still leads, so the audit row stays coherent with the
+        // response's top-level released_reason and paused_duration_secs.
+        let stripe = rendered.find("stripe outage").expect("present");
+        let pg = rendered.find("pg failover").expect("present");
+        assert!(stripe < pg, "the longest hold must lead; got {rendered}");
+    }
+
+    /// A hold whose operator is unknown must still contribute its reason -- the
+    /// missing name must not drop the whole entry.
+    #[test]
+    fn resume_audit_reason_renders_a_hold_with_no_operator() {
+        let provenance = summarise_resume_provenance(&[
+            (
+                0,
+                resume_outcome(Some("stripe outage"), Some("alice"), 900, 1),
+            ),
+            (1, resume_outcome(Some("orphaned hold"), None, 60, 2)),
+        ]);
+        let rendered = resume_released_audit_reason(&provenance).expect("holds were released");
+        assert!(rendered.contains("orphaned hold"), "got {rendered}");
+        assert!(
+            rendered.contains("unknown"),
+            "an absent operator renders as 'unknown', not an empty gap; got {rendered}"
+        );
     }
 
     /// A typo in a queue-control body must be REJECTED, not silently widened

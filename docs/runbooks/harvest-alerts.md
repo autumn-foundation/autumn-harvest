@@ -1436,8 +1436,14 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
 
    - `reason: <why>` on a `queue.pause` row;
    - `reason: released hold by <actor>: <why>` on the matching `queue.resume`
-     row (with `(shards disagreed; longest hold shown)` appended when the shards
-     carried different holds);
+     row;
+   - when independently-paused shards carried **different** holds, the resume row
+     instead lists every one of them, longest first, so no shard's *why* is lost
+     once its pause row is deleted:
+     `reason: released 2 holds (longest first); shards 0,2 by alice: stripe
+     outage (held 900s); shard 1 by bob: pg failover (held 60s)`. Shards sharing
+     one incident collapse into a single entry, so this grows with the number of
+     distinct holds, not the shard count;
    - `... | failures: <detail>` appended on either when the operation only
      partially applied, naming the shards it did not reach.
 
