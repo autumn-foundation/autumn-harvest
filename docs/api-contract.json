@@ -6660,7 +6660,7 @@
           "name": "queue_name",
           "in": "path",
           "required": true,
-          "description": "The task queue to hold. Leading/trailing whitespace is trimmed to the canonical name actually stored and matched."
+          "description": "The task queue to hold, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed: queue names are stored verbatim at enqueue time, so `\"payments \"` and `\"payments\"` are two genuinely distinct, independently reachable queues and trimming would silently hold the wrong one while reporting success. Send the exact name. Interior whitespace is allowed."
         }
       ],
       "request_body": {
@@ -6728,7 +6728,7 @@
           "name": "queue_name",
           "in": "path",
           "required": true,
-          "description": "The task queue to release. Leading/trailing whitespace is trimmed to the canonical name."
+          "description": "The task queue to release, matched EXACTLY. Leading or trailing whitespace is rejected with a 400 rather than trimmed, symmetrically with the pause route — see its description for why. Send the exact name."
         }
       ],
       "request_body": {

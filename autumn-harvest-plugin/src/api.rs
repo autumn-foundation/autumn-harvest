@@ -27498,7 +27498,16 @@ async fn queues_scaling_signal(
 // ── Task-queue pause / resume (issue #619) ───────────────────────────────────
 
 /// Body of `POST /admin/queues/{queue_name}/pause`.
+///
+/// `deny_unknown_fields` because `shard_id`'s **absence** is meaningful here: it
+/// selects the fleet-wide default. Serde's default leniency would accept a typo
+/// like `{"reason": "…", "shard": 1}` as `shard_id: None`, silently widening a
+/// shard-scoped request to the whole fleet — and on the resume sibling that
+/// releases every hold mid-outage while reporting success (issue #619 review).
+/// The body is parsed with `serde_json::from_slice`, so the resulting error
+/// already flows through this route's audited `400`.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PauseQueueRequest {
     /// Human-readable reason for the hold, surfaced on the read API and in the
     /// Vantage UI. Required — an unexplained hold is an incident-response
@@ -27511,7 +27520,15 @@ pub(crate) struct PauseQueueRequest {
 }
 
 /// Body of `POST /admin/queues/{queue_name}/resume`.
+///
+/// `deny_unknown_fields` for the reason on [`PauseQueueRequest`], which bites
+/// harder here: this is the *destructive* direction. A typo'd `shard` field
+/// would release every shard's hold rather than the one named, so the blast
+/// radius of a one-character mistake is the entire fleet's dispatch resuming
+/// into an outage. An empty body is still accepted (fleet-wide by design) — it
+/// never reaches the deserializer.
 #[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResumeQueueRequest {
     /// `None` (default) = release the hold on every shard. `Some(n)` releases
     /// only shard `n`.
@@ -34507,6 +34524,31 @@ pub struct TaskEligibilityResponse {
     pub summary: EligibilitySummary,
 }
 
+/// Order a merged `reason_codes` array for the eligibility explainer.
+///
+/// The operator's own deliberate queue hold (`queue_paused`, issue #619) leads;
+/// everything else is alphabetical so the array is stable across polls.
+///
+/// This exists because [`task_intrinsic_impediment_reasons`] pushes
+/// `queue_paused` first but *both* eligibility merges collapse the per-task
+/// reason lists through a `HashSet` — destroying insertion order — and then
+/// re-sort. A plain `sort()` puts `concurrency_saturated` ahead of
+/// `queue_paused`, so the helper's documented priority never reached the
+/// response an operator actually reads (issue #619 review). Both merge sites
+/// call *this* function rather than sorting by hand, so they cannot drift.
+fn sort_reason_codes(reason_codes: &mut [String]) {
+    reason_codes.sort_by(|a, b| {
+        let rank = |code: &str| u8::from(code != QUEUE_PAUSED_REASON_CODE);
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
+}
+
+/// The eligibility reason code for a task held by an operator queue pause.
+///
+/// Named so [`sort_reason_codes`] and [`task_intrinsic_impediment_reasons`]
+/// cannot disagree about the string that carries the priority.
+const QUEUE_PAUSED_REASON_CODE: &str = "queue_paused";
+
 /// Compute the reason codes that depend only on the task and shared runtime
 /// state — not on any particular worker (issue #611).
 ///
@@ -34542,7 +34584,7 @@ fn task_intrinsic_impediment_reasons(
     // task — a false "no impediment" during exactly the idle-worker triage
     // this endpoint exists for.
     if queue_paused {
-        reasons.push("queue_paused".to_string());
+        reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
     }
 
     if concurrency_saturated {
@@ -35037,7 +35079,10 @@ async fn evaluate_eligibility_for_shard(
                     }
                 }
                 let mut reason_codes: Vec<String> = merged_reasons.into_iter().collect();
-                reason_codes.sort();
+                // `merged_reasons` is a HashSet, so the producer's ordering is
+                // already gone; this restores the documented queue-pause
+                // priority rather than sorting plain-alphabetically (#619).
+                sort_reason_codes(&mut reason_codes);
                 if reason_codes.is_empty() {
                     reason_codes.push("unknown".to_string());
                 }
@@ -35220,7 +35265,10 @@ async fn get_queue_eligibility(
             eligible_workers.push(w_info.clone());
         } else if let Some(reasons_set) = shard_ineligible.get(&w_id) {
             let mut reason_codes: Vec<String> = reasons_set.iter().cloned().collect();
-            reason_codes.sort();
+            // Second destructive merge (cross-shard): the per-shard arrays are
+            // unioned through another HashSet, so the priority has to be
+            // re-established here too (#619).
+            sort_reason_codes(&mut reason_codes);
             ineligible_workers.push(IneligibleWorkerInfo {
                 worker_id: w_id,
                 reason_codes,
@@ -35924,6 +35972,105 @@ mod tests {
         // Releasing nothing records nothing.
         let noop = summarise_resume_provenance(&[(0, resume_outcome(None, None, 0, 0))]);
         assert!(resume_released_audit_reason(&noop).is_none());
+    }
+
+    /// A typo in a queue-control body must be REJECTED, not silently widened
+    /// (issue #619 review).
+    ///
+    /// Serde ignores unknown fields by default, so `{"shard": 1}` on the resume
+    /// route would deserialize to `shard_id: None` — which this feature reads as
+    /// the *fleet-wide* default. A one-character typo would therefore release
+    /// every shard's hold mid-outage while reporting success, the exact quiet-
+    /// and-dangerous direction the `207`/`effective_scope` work exists to close.
+    #[test]
+    fn a_typo_in_a_queue_control_body_is_rejected_not_widened_to_fleet_wide() {
+        // The precise scenario from the review: `shard` instead of `shard_id`.
+        let typo = serde_json::json!({ "shard": 1 });
+        assert!(
+            serde_json::from_value::<ResumeQueueRequest>(typo).is_err(),
+            "a resume body with an unknown field must be rejected — accepting it \
+             silently promotes a shard-scoped release to fleet-wide"
+        );
+        assert!(
+            serde_json::from_value::<PauseQueueRequest>(serde_json::json!({
+                "reason": "outage",
+                "shard": 1,
+            }))
+            .is_err(),
+            "a pause body with an unknown field must be rejected symmetrically"
+        );
+
+        // The legitimate shapes still parse, including the shard-scoped one the
+        // typo was reaching for and the empty resume body (fleet-wide default).
+        let scoped: ResumeQueueRequest =
+            serde_json::from_value(serde_json::json!({ "shard_id": 1 })).expect("valid");
+        assert_eq!(scoped.shard_id, Some(1));
+        let fleet: ResumeQueueRequest =
+            serde_json::from_value(serde_json::json!({})).expect("valid");
+        assert_eq!(fleet.shard_id, None);
+        let paused: PauseQueueRequest = serde_json::from_value(serde_json::json!({
+            "reason": "stripe outage",
+            "shard_id": 0,
+        }))
+        .expect("valid");
+        assert_eq!(paused.reason, "stripe outage");
+        assert_eq!(paused.shard_id, Some(0));
+    }
+
+    /// `queue_paused` keeps its documented first position in the FINAL response
+    /// (issue #619 review).
+    ///
+    /// `task_intrinsic_impediment_reasons` pushes it first, but both eligibility
+    /// merges collapse reasons through a `HashSet` and re-sort — and
+    /// `concurrency_saturated` sorts before `queue_paused` alphabetically. The
+    /// helper's own doc comment and `harvest-alerts.md` both promise the operator
+    /// sees the deliberate hold first, so the ordering has to survive the merge,
+    /// not just the helper.
+    #[test]
+    fn queue_paused_stays_first_through_the_reason_code_merge() {
+        let mut merged = vec![
+            "sticky_owned_by_other_worker".to_string(),
+            "concurrency_saturated".to_string(),
+            "queue_paused".to_string(),
+            "circuit_open".to_string(),
+        ];
+        sort_reason_codes(&mut merged);
+        assert_eq!(
+            merged,
+            vec![
+                "queue_paused".to_string(),
+                "circuit_open".to_string(),
+                "concurrency_saturated".to_string(),
+                "sticky_owned_by_other_worker".to_string(),
+            ],
+            "the operator's own deliberate hold must lead, with the rest \
+             alphabetical so the array stays stable across polls"
+        );
+
+        // Without a hold the order is exactly today's plain alphabetical sort,
+        // so no existing consumer's expectations change.
+        let mut no_hold = vec![
+            "rate_limit_exhausted".to_string(),
+            "concurrency_saturated".to_string(),
+        ];
+        sort_reason_codes(&mut no_hold);
+        assert_eq!(
+            no_hold,
+            vec![
+                "concurrency_saturated".to_string(),
+                "rate_limit_exhausted".to_string(),
+            ]
+        );
+
+        // Idempotent, and a lone hold is untouched.
+        let mut single = vec!["queue_paused".to_string()];
+        sort_reason_codes(&mut single);
+        sort_reason_codes(&mut single);
+        assert_eq!(single, vec!["queue_paused".to_string()]);
+
+        let mut empty: Vec<String> = Vec::new();
+        sort_reason_codes(&mut empty);
+        assert!(empty.is_empty());
     }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {

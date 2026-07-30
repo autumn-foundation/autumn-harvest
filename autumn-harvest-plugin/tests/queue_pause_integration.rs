@@ -26,6 +26,9 @@
 //!       shards that hold the queue rather than the recorded `scope_shard_id`
 //!       intent, which is identical for a complete and a partially-applied
 //!       fleet-wide hold.
+//!   (j) A typo'd field in a queue-control body is rejected 400 rather than
+//!       silently widening a shard-scoped request to fleet-wide — on the resume
+//!       route that would release every hold mid-outage.
 
 // Test-code style lints, consistent with `queue_pause_tests.rs` in the core
 // crate: the module docs name response/database fields verbatim.
@@ -836,6 +839,72 @@ async fn a_shard_scoped_hold_reads_back_as_shard_not_partial() {
          fleet-wide one -- that would train operators to ignore the signal: {body}"
     );
     assert_eq!(entry["scope_shard_id"], 0, "recorded intent: {body}");
+}
+
+/// A typo'd body field must not widen a scoped request to the whole fleet
+/// (issue #619 review).
+///
+/// `shard_id`'s *absence* means fleet-wide, so serde's default leniency turns
+/// `{"shard": 1}` into `shard_id: None` — and on resume that releases **every**
+/// shard's hold while returning success. This drives the destructive direction
+/// end to end: hold two shards, send the typo, and assert the holds survive.
+#[tokio::test]
+async fn a_typod_resume_field_is_rejected_and_the_hold_survives() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/pause",
+        json!({ "reason": "provider outage" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pause must apply: {body}");
+
+    // `shard` instead of `shard_id` — one character short of a scoped release.
+    let (status, body) =
+        post_json(&app, "/admin/queues/payments/resume", json!({ "shard": 0 })).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown field must be a 400, not a silent fleet-wide release: {body}"
+    );
+
+    // The hold is still in effect: the typo released nothing.
+    let (status, body) = get_json(&app, "/admin/queues/paused").await;
+    assert_eq!(status, StatusCode::OK, "read must not 500: {body}");
+    let still_held = body["paused_queues"]
+        .as_array()
+        .expect("paused_queues array")
+        .iter()
+        .any(|e| e["queue_name"] == "payments");
+    assert!(
+        still_held,
+        "the rejected resume must leave the hold untouched -- releasing it would \
+         resume dispatch into the very outage the operator is riding out: {body}"
+    );
+
+    // The rejection is audited, like every other queue-control rejection.
+    let resume_audits = audit_rows(&pool, "queue.resume").await;
+    assert!(
+        resume_audits.iter().any(|r| r.status == "failed"),
+        "a rejected fleet-wide-kill-switch request must leave an audit trail: \
+         {resume_audits:?}"
+    );
+
+    // The correctly-spelled field still works, so the guard is not over-broad.
+    let (status, body) = post_json(
+        &app,
+        "/admin/queues/payments/resume",
+        json!({ "shard_id": 0 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the legitimate scoped release must still be accepted: {body}"
+    );
 }
 
 /// The operator `reason` is bounded at the API boundary, so it can never be
