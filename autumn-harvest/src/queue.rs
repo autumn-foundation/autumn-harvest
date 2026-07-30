@@ -780,35 +780,98 @@ pub async fn claim_task(
     // than a safe-but-slow retry.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
-    let result: Vec<TaskQueueItem> = diesel::sql_query(claim_task_query())
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-        .bind::<diesel::sql_types::Text, _>(worker_build_id)
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
-        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    // The claim and the authoritative queue-pause re-check run in ONE
+    // explicitly-`READ COMMITTED` transaction (issue #619 round-17 review).
+    //
+    // # Why one transaction
+    //
+    // As two autocommit statements, the claim commits on its own. If the
+    // re-check then fails — a transient connection error, a statement
+    // cancellation, a pool timeout — the `?` propagates while the task is
+    // already `RUNNING` with its `attempt` consumed and **no** worker holding
+    // it. Recovery is worse than it first looks: the poison-pill reclaimer
+    // (issue #367) only reclaims `RUNNING` rows whose `worker_id` has no live
+    // `harvest_workers` heartbeat, and this worker is alive and still
+    // heartbeating, so it never qualifies. An activity configured with neither
+    // `start_to_close` nor `heartbeat_timeout` would therefore stay stranded
+    // for as long as the worker lives. Inside a transaction, a re-check error
+    // rolls the claim back: the row returns to `PENDING` with its `attempt`
+    // intact and the next poll re-claims it.
+    //
+    // # Why the isolation level is pinned rather than inherited
+    //
+    // The round-2 contract — *a pause committed before the re-check begins
+    // always wins* — depends entirely on the re-check getting a **fresh**
+    // snapshot. Under `READ COMMITTED` each statement takes its own snapshot,
+    // so that holds inside a transaction exactly as it did across two
+    // autocommit statements. Under `REPEATABLE READ` it does **not**: both
+    // statements would share the transaction's single snapshot and the
+    // re-check could never observe a pause committed after the claim began,
+    // silently reinstating the very P1 this re-check exists to close.
+    //
+    // Two autocommit statements were immune to that by construction (each is
+    // its own single-statement transaction, snapshotted at statement start
+    // whatever the isolation level), so wrapping them without pinning would
+    // hand an operator a way to disable the guarantee from outside the code —
+    // a `default_transaction_isolation = repeatable read` set on the database
+    // or the role. `build_transaction().read_committed()` emits the level on
+    // the `BEGIN` itself, so the guarantee travels with the query.
+    //
+    // # Cost
+    //
+    // The claim's `FOR UPDATE SKIP LOCKED` row locks (and its rate-limit
+    // bucket lock) are now held for one extra indexed primary-key `UPDATE`
+    // against the row this transaction already locked. Competing claimers
+    // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
+    // the added contention is the duration of a single PK probe.
+    let mut tx = conn.build_transaction().read_committed();
+    let claimed: Option<TaskQueueItem> = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<Option<TaskQueueItem>> {
+                let result: Vec<TaskQueueItem> = diesel::sql_query(claim_task_query())
+                    .bind::<diesel::sql_types::Text, _>(worker_id)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+                    .bind::<diesel::sql_types::Text, _>(worker_build_id)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
+                        aging_secs_i64,
+                    )
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                        circuit_breaker_activities,
+                    )
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
+                        ineligible_activities,
+                    )
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
 
-    let Some(task) = result.into_iter().next() else {
-        return Ok(None);
-    };
+                let Some(task) = result.into_iter().next() else {
+                    return Ok(None);
+                };
 
-    // Authoritative queue-pause re-check (issue #619). The anti-join above is
-    // evaluated against this statement's snapshot, taken at statement start, so
-    // a pause committing while the claim was in flight is invisible to it and
-    // the task would be dispatched into the very outage the hold exists to ride
-    // out. This runs in a *fresh* statement — hence a fresh snapshot — and
-    // releases the claim back to PENDING if the queue is now held. See
-    // `queue_pause::release_claim_if_queue_paused` for why this is preferred
-    // over taking a queue-scoped lock inside the claim itself (which would
-    // serialize all claims for a queue and defeat SKIP LOCKED).
-    if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id).await? {
-        return Ok(None);
-    }
+                // Authoritative queue-pause re-check (issue #619). The anti-join in
+                // the claim above is evaluated against that statement's snapshot,
+                // so a pause committing while the claim was in flight is invisible
+                // to it and the task would be dispatched into the very outage the
+                // hold exists to ride out. This is a *separate statement* and so
+                // takes a fresh snapshot (guaranteed by the pinned `READ COMMITTED`
+                // above), releasing the claim back to `PENDING` if the queue is now
+                // held. See `queue_pause::release_claim_if_queue_paused` for why
+                // this is preferred over taking a queue-scoped lock inside the
+                // claim itself, which would serialize all claims for a queue and
+                // defeat `SKIP LOCKED`.
+                if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id)
+                    .await?
+                {
+                    return Ok(None);
+                }
 
-    Ok(Some(task))
+                Ok(Some(task))
+            },
+        )
+        .await?;
+
+    Ok(claimed)
 }
 
 // ---------------------------------------------------------------------------

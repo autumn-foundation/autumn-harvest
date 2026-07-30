@@ -614,6 +614,75 @@ pub const fn held_task_count_query() -> &'static str {
      WHERE queue_name = $1 AND state = 'PENDING'"
 }
 
+/// One claimable task id on a just-resumed queue, used only as the payload for
+/// the resume's wake notification (`$1` = queue name).
+///
+/// `LIMIT 1` because the notification is a *doorbell*, not a work assignment:
+/// [`crate::notify::QueueListener`] hands the payload back to the poll loop,
+/// which ignores it and re-polls the queue normally. One indexed row is
+/// therefore all this needs, and it deliberately does **not** use
+/// `RETURNING id` on the shift statements — that would materialise an id array
+/// proportional to the whole released backlog to carry a single value.
+///
+/// The predicate mirrors the shift passes' own due-row filter, so the id is one
+/// of the rows this resume just made claimable rather than a future-scheduled
+/// retry that is still not due.
+#[must_use]
+pub const fn resumed_queue_notify_task_query() -> &'static str {
+    "SELECT id FROM harvest_task_queue \
+     WHERE queue_name = $1 \
+       AND state = 'PENDING' \
+       AND scheduled_at <= clock_timestamp() \
+     LIMIT 1"
+}
+
+/// Ring the queue's `LISTEN`/`NOTIFY` doorbell so parked workers re-poll as
+/// soon as this resume commits (issue #619 round-17 review).
+///
+/// Must be called **inside** the resume transaction: Postgres queues `NOTIFY`
+/// and delivers it at `COMMIT`, so listeners wake exactly when the hold lifts —
+/// never earlier (an early wake would still see the uncommitted pause row and
+/// skip the queue) and never at all if the resume rolls back.
+///
+/// Reuses [`crate::notify::notify_task_enqueued`] rather than introducing a
+/// second channel or payload shape, because [`crate::notify::QueueListener`]
+/// **parses** the payload as `NotifyPayload { task_id }` and surfaces a parse
+/// failure as an error — which the poll loop handles by logging and sleeping a
+/// full `poll_interval`, i.e. strictly worse than sending nothing. A synthetic
+/// or nil id would be a lie in a field that is typed as a real task; a genuine
+/// id is both honest and free (one indexed row).
+///
+/// A queue that raced to empty between the shift and this lookup needs no
+/// doorbell, so the lookup returning nothing is a silent no-op.
+///
+/// # Errors
+///
+/// Database errors.
+#[cfg(feature = "db")]
+pub async fn notify_resumed_queue(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+
+    let rows: Vec<IdRow> = diesel::sql_query(resumed_queue_notify_task_query())
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if let Some(row) = rows.into_iter().next() {
+        crate::notify::notify_task_enqueued(conn, queue_name, row.id).await?;
+    }
+    Ok(())
+}
+
 /// A currently-paused queue, as surfaced by the read API and the Vantage UI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PausedQueue {
@@ -946,6 +1015,34 @@ pub async fn resume_queue(
                 .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
                 .execute(conn)
                 .await?;
+
+            // Wake sleeping listeners (issue #619 round-17 review).
+            //
+            // AC5 promises held tasks are claimable *immediately* on resume,
+            // but a worker with `notification_database_url` set parks in
+            // `wait_for_notification(poll_interval)` and only re-polls when a
+            // `NOTIFY` arrives on the queue channel. Every held row was
+            // enqueued *before* the pause, so its enqueue notification fired
+            // long ago and was consumed (or missed) while the queue was held —
+            // and nothing about a resume enqueues anything new. Without a
+            // notification here the queue therefore stays idle for up to a full
+            // `poll_interval` after the thaw. That is invisible at the 500 ms
+            // default, but `poll_interval` is configurable and raising it is
+            // precisely why an operator configures LISTEN/NOTIFY in the first
+            // place, so the deployments most likely to be tuned this way are
+            // the ones that would sit idle longest.
+            //
+            // Emitted INSIDE this transaction on purpose: Postgres queues
+            // `NOTIFY` and delivers it at COMMIT, so listeners are woken
+            // exactly when the hold actually lifts — never before (a worker
+            // woken early would still see the uncommitted pause row and skip
+            // the queue) and never lost to a rollback.
+            //
+            // Skipped when nothing was released: there is no held backlog to
+            // wake for, and a spurious wake would just burn a poll cycle.
+            if released.saturating_add(late) > 0 {
+                notify_resumed_queue(conn, &queue_owned).await?;
+            }
 
             Ok(ResumeOutcome {
                 queue_name: queue_owned,
@@ -1407,6 +1504,34 @@ mod tests {
     /// pre-pause wait to preserve, and an absolute assignment is idempotent under
     /// repetition (it can only move `scheduled_at` to a later instant that is
     /// still `<= clock_timestamp() <= commit time`, never into the future).
+    /// The resume's wake doorbell must pick a genuinely **claimable** row.
+    ///
+    /// A future-scheduled retry backoff is deliberately not shifted by either
+    /// resume pass, so using one as the notify payload would name a task the
+    /// woken worker cannot claim. The predicate therefore mirrors the shift
+    /// passes' own due-row filter, and stays `LIMIT 1` — this is a doorbell,
+    /// not a work assignment.
+    #[test]
+    fn resume_notify_payload_comes_from_a_claimable_row() {
+        let sql = resumed_queue_notify_task_query();
+        assert!(
+            sql.contains("state = 'PENDING'"),
+            "must be a held row: {sql}"
+        );
+        assert!(
+            sql.contains("scheduled_at <= clock_timestamp()"),
+            "must be DUE, so a future-scheduled retry is never named: {sql}"
+        );
+        assert!(
+            sql.contains("queue_name = $1"),
+            "must be scoped to the resumed queue: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT 1"),
+            "a doorbell needs exactly one id, not the whole backlog: {sql}"
+        );
+    }
+
     #[test]
     fn late_arrivals_pass_is_absolute_and_bounded() {
         let sql = resume_shift_late_arrivals_query();

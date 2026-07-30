@@ -874,6 +874,85 @@ async fn resume_credits_a_legacy_task_with_no_created_at() {
     );
 }
 
+/// Issue #619 round-17 review — a resume must **wake parked workers**, not just
+/// make the backlog claimable and wait for the next poll tick.
+///
+/// A worker configured with `notification_database_url` parks in
+/// `wait_for_notification(poll_interval)` and only re-polls on a queue
+/// notification or the timeout. The resume flips held rows to claimable but
+/// emitted nothing, so on a fleet tuned for a long `poll_interval` (the whole
+/// point of running with LISTEN/NOTIFY) the thawed backlog sat idle for up to a
+/// full interval after the operator declared the outage over — with the
+/// dashboard showing the queue live and nothing moving.
+///
+/// The notify is emitted **inside the resume transaction**: Postgres queues
+/// `NOTIFY` and delivers at `COMMIT`, so listeners wake exactly when the hold
+/// lifts — never earlier (an early wake would still see the pause row and skip
+/// the queue) and never at all if the resume rolls back.
+///
+/// Asserted through a real [`QueueListener`], the same type the worker's poll
+/// loop uses. The payload assertion is load-bearing beyond "something arrived":
+/// the listener *parses* `NotifyPayload { task_id }` and surfaces a parse
+/// failure as an error the poll loop handles by sleeping a full interval — so a
+/// synthetic or nil id would be both a lie and strictly worse than sending
+/// nothing. Requiring the real claimable task id pins that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn resume_notifies_parked_listeners_so_they_re_poll_immediately() {
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("resumenotify");
+
+    let task = enqueue_activity(&mut conn, &q, None).await;
+    queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    backdate_scheduled_at(&mut conn, task, 700).await;
+    backdate_paused_at(&mut conn, &q, 600).await;
+
+    let mut listener =
+        autumn_harvest::notify::QueueListener::connect(&url, std::slice::from_ref(&q))
+            .await
+            .expect("listen on the paused queue");
+
+    // Baseline: nothing is ringing the doorbell while the hold is in place, so a
+    // wake after the resume cannot be attributed to unrelated traffic.
+    let quiet = listener
+        .wait_for_notification(std::time::Duration::from_millis(300))
+        .await
+        .expect("baseline wait");
+    assert!(
+        quiet.is_none(),
+        "the paused queue must be silent before the resume, or this test cannot \
+         attribute the wake below to the resume itself"
+    );
+
+    queue_pause::resume_queue(&mut conn, &q, "alice")
+        .await
+        .expect("resume");
+
+    let woken = listener
+        .wait_for_notification(std::time::Duration::from_secs(5))
+        .await
+        .expect("notification payload must parse")
+        .expect(
+            "a resume that releases held tasks must ring the queue doorbell; \
+             without it a parked worker sleeps out its whole poll_interval \
+             before noticing the thaw",
+        );
+    assert_eq!(
+        woken.task_id, task,
+        "the payload must name a genuinely claimable task: the listener parses \
+         this field, and a synthetic or nil id would be a lie in a field typed \
+         as a real task"
+    );
+
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        Some(task),
+        "AC5: the woken worker finds the task claimable"
+    );
+}
+
 /// A task that became due *during* the pause accrues zero wait — its shifted
 /// `scheduled_at` collapses to the resume instant.
 #[tokio::test]
@@ -1692,6 +1771,154 @@ async fn a_pause_committed_mid_claim_still_holds_the_task() {
     assert_eq!(
         row.attempt, 0,
         "the hold must consume no retry budget (AC3)"
+    );
+}
+
+/// Issue #619 round-17 review — the post-claim pause re-check must be **atomic
+/// with the claim**, so a re-check that fails cannot strand the task.
+///
+/// The re-check has to run in its own statement (a fresh `READ COMMITTED`
+/// snapshot is the entire mechanism that lets it see a pause the claim's own
+/// snapshot predated). But two *autocommit* statements are not atomic: if the
+/// re-check errors, the claim is already durable, so the row is left `RUNNING`
+/// with its attempt consumed while `claim_task` returns `Err` and the worker
+/// never receives the task. Nothing recovers it in bounded time:
+///
+/// - the poison-pill reclaimer (#367) keys on a **missing worker heartbeat**,
+///   and this worker is alive and polling, so it never touches the row;
+/// - `start_to_close` / `heartbeat_timeout` would eventually reclaim it, but
+///   both are optional — an activity declaring neither strands indefinitely.
+///
+/// So the claim and the re-check run inside one `READ COMMITTED` transaction:
+/// each statement still gets its own snapshot (the re-check keeps working),
+/// and a re-check failure rolls the claim back. The isolation level is
+/// **pinned on the `BEGIN`** rather than inherited, because under `REPEATABLE
+/// READ` both statements would share one snapshot and the re-check would go
+/// blind to the pause — silently reinstating the round-2 P1 this guard exists
+/// to close.
+///
+/// Injection: the same mid-claim harness as above (hold the rate-limit bucket
+/// row so the pause commits while the claim is blocked, which is what makes the
+/// re-check fire at all), plus a `BEFORE UPDATE` trigger that raises only on the
+/// release-shaped update — `RUNNING -> PENDING` with `worker_id` cleared, which
+/// the claim's own `PENDING -> RUNNING` update cannot match. `claim_task`
+/// returns `Err` under both designs, so the assertion is purely on the row: the
+/// question is whether the claim survived the failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_failed_pause_recheck_rolls_the_claim_back_instead_of_stranding_it() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    let q = unique_queue("recheck-fail");
+    let rl_key = format!("{q}-bucket");
+
+    queue::ensure_rate_limit_bucket(&mut conn, &rl_key, 100.0, 100.0)
+        .await
+        .expect("bucket");
+
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.rate_limit_key = Some(rl_key.clone());
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+    // Fail exactly the release update, and only for this test's queue: the
+    // claim moves PENDING -> RUNNING and sets a worker, the release moves
+    // RUNNING -> PENDING and clears it, so the shapes cannot be confused.
+    let trigger_fn = format!("fail_release_{}", q.replace('-', "_"));
+    conn.batch_execute(&format!(
+        "CREATE FUNCTION {trigger_fn}() RETURNS trigger AS $$
+         BEGIN
+           IF OLD.queue_name = '{q}'
+              AND OLD.state = 'RUNNING'
+              AND NEW.state = 'PENDING'
+              AND NEW.worker_id IS NULL THEN
+             RAISE EXCEPTION 'injected re-check failure';
+           END IF;
+           RETURN NEW;
+         END; $$ LANGUAGE plpgsql;
+         CREATE TRIGGER {trigger_fn}_trg BEFORE UPDATE ON harvest_task_queue
+           FOR EACH ROW EXECUTE FUNCTION {trigger_fn}()"
+    ))
+    .await
+    .expect("install release-failure trigger");
+
+    // Hold the rate-limit bucket row so the claim blocks mid-statement and the
+    // pause lands underneath it -- otherwise the claim's own anti-join skips the
+    // queue and there is no claim to roll back.
+    let mut bucket_holder = connect(&url).await;
+    bucket_holder.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET last_refilled_at = last_refilled_at WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&rl_key)
+    .execute(&mut bucket_holder)
+    .await
+    .expect("hold the bucket row");
+
+    let url_for_claim = url.clone();
+    let q_for_claim = q.clone();
+    let claim_in_flight = tokio::spawn(async move {
+        let mut conn = connect(&url_for_claim).await;
+        claim_task(&mut conn, &[q_for_claim], "w1", "", None, &[], &[]).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    queue_pause::pause_queue(&mut conn, &q, "outage started mid-claim", "alice", None)
+        .await
+        .expect("pause");
+    bucket_holder
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the bucket row");
+
+    let outcome = claim_in_flight.await.expect("join");
+    assert!(
+        outcome.is_err(),
+        "the injected trigger must surface as a claim error under both designs; \
+         if it does not, the injection missed the release statement and this \
+         test is no longer falsifying anything"
+    );
+
+    // Drop the trigger before asserting so a failure leaves a usable database.
+    conn.batch_execute(&format!(
+        "DROP TRIGGER {trigger_fn}_trg ON harvest_task_queue; DROP FUNCTION {trigger_fn}()"
+    ))
+    .await
+    .expect("drop trigger");
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        worker_id: Option<String>,
+    }
+    let row: Row =
+        diesel::sql_query("SELECT state, attempt, worker_id FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load task");
+
+    assert_eq!(
+        row.state, "PENDING",
+        "a failed re-check must roll the claim back, not leave the task RUNNING \
+         under a worker that never received it (nothing reclaims it: the \
+         poison-pill sweep keys on a dead worker, and this one is alive)"
+    );
+    assert_eq!(
+        row.attempt, 0,
+        "the rolled-back claim must not consume a retry attempt (AC3)"
+    );
+    assert_eq!(
+        row.worker_id, None,
+        "the rolled-back claim must leave no worker ownership behind"
     );
 }
 
