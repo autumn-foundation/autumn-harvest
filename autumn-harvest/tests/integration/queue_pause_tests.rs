@@ -144,8 +144,25 @@ async fn scheduled_at(
 /// Backdate a task's `scheduled_at` so it looks like it has been waiting.
 async fn backdate_scheduled_at(conn: &mut AsyncPgConnection, id: Uuid, secs: i64) {
     use diesel_async::RunQueryDsl;
+    // `created_at` moves with `scheduled_at`, because that is the only shape a
+    // real row can have: `crate::queue::enqueue` sets
+    // `created_at = NOW(), scheduled_at = NOW() + delay`, so a task that has
+    // been *due* for N seconds was necessarily *created* at least N seconds
+    // ago. Backdating `scheduled_at` alone would fabricate a row that claims to
+    // have been waiting since before it existed — invisible while the resume
+    // partition keyed on `transaction_timestamp()`, but it decides the row's
+    // side now that the split is `created_at` vs `paused_at` (issue #619
+    // round-16 review), and would silently move a pre-pause backlog row onto the
+    // late-arrival side.
+    //
+    // A row whose `created_at` is already `NULL` keeps it: that is the legacy
+    // pre-`20260619000000` shape one test deliberately constructs, and the
+    // `IS NULL` arm of the primary pass exists precisely for it.
     diesel::sql_query(
-        "UPDATE harvest_task_queue SET scheduled_at = NOW() - ($2 || ' seconds')::interval \
+        "UPDATE harvest_task_queue \
+         SET scheduled_at = NOW() - ($2 || ' seconds')::interval, \
+             created_at = CASE WHEN created_at IS NULL THEN NULL \
+                               ELSE NOW() - ($2 || ' seconds')::interval END \
          WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(id)
@@ -523,9 +540,10 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     let holder_queue = q.clone();
     let holder = tokio::spawn(async move {
         let mut holder = connect(&holder_url).await;
+        let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
         holder
             .batch_execute(&format!(
-                "BEGIN; SELECT pg_advisory_xact_lock(hashtext('{holder_queue}'))"
+                "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{holder_queue}'))"
             ))
             .await
             .expect("take advisory lock");
@@ -609,9 +627,10 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     // Open resume_queue's transaction by hand: advisory lock, then release the
     // hold. The DELETE stays uncommitted for the rest of this test.
     let mut resumer = connect(&url).await;
+    let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
     resumer
         .batch_execute(&format!(
-            "BEGIN; SELECT pg_advisory_xact_lock(hashtext('{q}')); \
+            "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{q}')); \
              DELETE FROM harvest_queue_pauses WHERE queue_name = '{q}'"
         ))
         .await
@@ -647,6 +666,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     // Pass 2 — the late-arrivals credit.
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -686,6 +706,120 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
         claim_one(&mut conn, &q).await,
         Some(early),
         "AC5: after the thaw the longest-waiting task is claimable again"
+    );
+}
+
+/// Issue #619 round-16 review — the partition between the two resume passes must
+/// be decided by values that are **fixed on the row**, not by when a statement
+/// happens to *see* it.
+///
+/// An earlier revision split on `created_at < transaction_timestamp()`
+/// ("existed when this resume began"). But `created_at` records when the
+/// enqueuing `INSERT` *executed*, while visibility is decided by when that
+/// enqueuing transaction **committed** — and the two can straddle the resume.
+/// A row inserted *before* the resume began but committed *after* the primary
+/// pass took its snapshot therefore satisfied neither predicate: invisible to
+/// pass 1, and excluded from pass 2 by its own `created_at` test. It thawed with
+/// its entire held wait uncredited and could be schedule-to-start-failed the
+/// instant the queue came back — the exact AC3/AC4 failure the shift exists to
+/// prevent.
+///
+/// Constructed deterministically by holding the enqueuing transaction open
+/// across pass 1, which is the only way to separate insert time from commit
+/// time. Note this row is *not* the same as the one in
+/// `resume_credits_a_task_enqueued_between_the_two_shift_passes`: that one is
+/// inserted **and** committed inside the window, so its `created_at` is after
+/// the resume's transaction start and the old predicate caught it too. Only an
+/// insert-before / commit-after row distinguishes the two designs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("latecommit");
+    let early = enqueue_activity(&mut conn, &q, None).await;
+    queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    backdate_scheduled_at(&mut conn, early, 700).await;
+    backdate_paused_at(&mut conn, &q, 600).await;
+    let paused_at = paused_at_of(&mut conn, &q).await;
+
+    // Enqueue on a connection whose transaction stays open: the row's INSERT
+    // (and therefore its `created_at`) happens now, but nothing else can see it
+    // until this transaction commits, several statements from now.
+    let mut inserter = connect(&url).await;
+    inserter.batch_execute("BEGIN").await.expect("begin insert");
+    let straddler = enqueue_activity(&mut inserter, &q, None).await;
+    // Give it a visible pre-credit wait so an uncredited outcome is detectable.
+    backdate_scheduled_at(&mut inserter, straddler, 100).await;
+
+    // Now open the resume's transaction — strictly after the straddler's INSERT,
+    // so `transaction_timestamp() > straddler.created_at` and the old predicate
+    // would place it on the primary side, where pass 1 cannot see it.
+    let mut resumer = connect(&url).await;
+    let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
+    resumer
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{q}')); \
+             DELETE FROM harvest_queue_pauses WHERE queue_name = '{q}'"
+        ))
+        .await
+        .expect("begin, lock, release the hold");
+
+    let primary = diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .execute(&mut resumer)
+        .await
+        .expect("primary shift");
+    assert_eq!(
+        primary, 1,
+        "pass 1 sees only the committed backlog; the straddler is still \
+         uncommitted and invisible to it"
+    );
+
+    // The straddler becomes visible only now — after pass 1's snapshot.
+    inserter
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit the straddling enqueue");
+
+    let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .execute(&mut resumer)
+        .await
+        .expect("late-arrivals shift");
+    resumer
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit resume");
+
+    assert_eq!(
+        late_shifted, 1,
+        "a row inserted before the resume but committed after pass 1 is still \
+         genuinely held, so pass 2 must own it; partitioning on \
+         transaction_timestamp() drops it from both passes"
+    );
+
+    let wait = (chrono::Utc::now() - scheduled_at(&mut conn, straddler).await).num_seconds();
+    assert!(
+        (0..=2).contains(&wait),
+        "the straddling row must be credited for the time it spent held; \
+         apparent wait {wait}s (uncredited it reads ~100s)"
+    );
+
+    // The committed backlog keeps the wait it genuinely accrued before the hold.
+    let early_wait = (chrono::Utc::now() - scheduled_at(&mut conn, early).await).num_seconds();
+    assert!(
+        (99..=101).contains(&early_wait),
+        "the pre-pause wait must survive both passes: apparent wait {early_wait}s"
     );
 }
 
@@ -1190,7 +1324,8 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
     // began before the enforcer ran and commits while it is mid-flight.
     let mut pauser = connect(&url).await;
     pauser.batch_execute("BEGIN").await.expect("begin");
-    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+    diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
         .bind::<diesel::sql_types::Text, _>(&q)
         .execute(&mut pauser)
         .await
@@ -1289,7 +1424,8 @@ async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
     // the enforcer must block on it.
     let mut holder = connect(&url).await;
     holder.batch_execute("BEGIN").await.expect("begin");
-    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+    diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
         .bind::<diesel::sql_types::Text, _>(&q)
         .execute(&mut holder)
         .await
@@ -1596,9 +1732,10 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
     let holder_queue = q.clone();
     let holder = tokio::spawn(async move {
         let mut holder = connect(&holder_url).await;
+        let cls = autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS;
         holder
             .batch_execute(&format!(
-                "BEGIN; SELECT pg_advisory_xact_lock(hashtext('{holder_queue}'))"
+                "BEGIN; SELECT pg_advisory_xact_lock({cls}, hashtext('{holder_queue}'))"
             ))
             .await
             .expect("take advisory lock");
@@ -1736,7 +1873,8 @@ async fn a_pause_committed_after_the_scan_suppresses_the_workflow_timeout_too() 
     // began before the enforcer ran and commits while it is mid-flight.
     let mut pauser = connect(&url).await;
     pauser.batch_execute("BEGIN").await.expect("begin");
-    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+    diesel::sql_query(autumn_harvest::queue_pause::lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS)
         .bind::<diesel::sql_types::Text, _>(&q)
         .execute(&mut pauser)
         .await

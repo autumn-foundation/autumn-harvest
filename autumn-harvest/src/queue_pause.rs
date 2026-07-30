@@ -55,6 +55,23 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
+/// Advisory-lock class id for queue-pause locks (issue #619).
+///
+/// Occupies the two-argument `pg_advisory_xact_lock(int, int)` keyspace, which
+/// is disjoint from the single-argument `bigint` keyspace several unrelated
+/// features hash raw text into. See [`lock_queue_for_pause`] for why that
+/// separation is load-bearing. The value is the issue number, purely so a
+/// `pg_locks` row is self-identifying during an incident.
+pub const QUEUE_PAUSE_LOCK_CLASS: i32 = 619;
+
+/// SQL for [`lock_queue_for_pause`], exposed for shape tests.
+///
+/// `$1` = [`QUEUE_PAUSE_LOCK_CLASS`], `$2` = queue name.
+#[must_use]
+pub const fn lock_queue_for_pause_query() -> &'static str {
+    "SELECT pg_advisory_xact_lock($1, hashtext($2))"
+}
+
 /// Upper bound on a pausable queue name.
 ///
 /// Queue names are free-form `TEXT` everywhere else in the engine, but this
@@ -236,6 +253,34 @@ pub fn validate_queue_name(queue_name: &str) -> HarvestResult<String> {
 /// engine. It is keyed on the queue name alone, so unrelated queues never
 /// contend.
 ///
+/// # Why the two-argument lock form (issue #619 round-16 review)
+///
+/// Postgres exposes two *disjoint* advisory-lock keyspaces: a 64-bit one
+/// (`pg_advisory_xact_lock(bigint)`) and a 2×32-bit one
+/// (`pg_advisory_xact_lock(int, int)`). A key in one can never collide with a
+/// key in the other.
+///
+/// This lock deliberately uses the **two-argument** form under a dedicated
+/// class id, because the single-argument `hashtext(<some text>)` keyspace is
+/// already shared, unnamespaced, by several unrelated features — most
+/// importantly the per-key concurrency gate on the hot claim path
+/// (`queue::claim_task`'s
+/// `pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint)`).
+///
+/// Sharing it would be a genuine cross-feature outage, not a theoretical one:
+/// a queue name that merely hash-collides with some *other* queue's
+/// `concurrency_key` would make that key's `pg_try_advisory_xact_lock` fail for
+/// as long as a large `resume_queue` held this lock while shifting its backlog.
+/// Because the claim path uses the *try* variant, the failure is silent — the
+/// claim simply yields no task — so tasks on a queue that was never paused
+/// would quietly stop dispatching for the duration of an unrelated queue's
+/// resume. That is precisely the "silently stops dispatching" failure mode this
+/// whole feature exists to prevent, so the namespace separation is load-bearing
+/// rather than hygiene.
+///
+/// `hashtext` returns `integer`, so it feeds the second argument directly with
+/// no cast; [`QUEUE_PAUSE_LOCK_CLASS`] fills the first.
+///
 /// # Errors
 ///
 /// Database errors.
@@ -246,7 +291,8 @@ pub async fn lock_queue_for_pause(
 ) -> HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
-    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
+    diesel::sql_query(lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
         .bind::<diesel::sql_types::Text, _>(queue_name)
         .execute(conn)
         .await?;
@@ -406,42 +452,56 @@ pub const fn queue_pause_suppresses_timeout(
 /// `<= commit time`, in every branch. `RUNNING` rows are untouched, and
 /// `schedule_to_close_at` is untouched so the absolute deadline keeps ticking.
 ///
-/// # Why `created_at < transaction_timestamp()`
+/// # Why the partition is `created_at` vs `paused_at`
 ///
-/// This pass owns only the backlog that already existed when the resume began.
-/// Rows enqueued *during* the resume are handled by
-/// [`resume_shift_late_arrivals_query`], and the two predicates partition the
-/// due `PENDING` rows on `created_at` so no row is shifted twice — a second
-/// application of this *relative* `+=` formula would erase the pre-pause wait it
-/// exists to preserve.
+/// This pass owns the rows that had already accrued wait *before* the hold
+/// began; [`resume_shift_late_arrivals_query`] owns the rows created *during*
+/// it. The two predicates partition the due `PENDING` rows so no row is shifted
+/// twice — a second application of this *relative* `+=` formula would erase the
+/// pre-pause wait it exists to preserve.
 ///
-/// `transaction_timestamp()` is exactly "when this resume began": the same
-/// frozen-at-transaction-start property that makes it wrong for the credit
-/// *amount* makes it precisely right as the partition marker, and it needs no
-/// extra round trip or bind. Rows created during the advisory-lock wait fall on
-/// the late-arrival side, which is correct — they were held from creation.
+/// The split is **semantic, not temporal** (issue #619 round-16 review). An
+/// earlier revision partitioned on `created_at < transaction_timestamp()`
+/// ("existed when this resume began"), which is subtly wrong: `created_at`
+/// records when the enqueuing `INSERT` *executed*, while whether this pass can
+/// *see* the row is decided by when that enqueuing transaction **committed**. A
+/// row inserted before the resume began but committed after this statement took
+/// its snapshot therefore satisfied neither predicate — invisible to this pass,
+/// and excluded from the late pass by its own `created_at` test — so it thawed
+/// with its entire held wait uncredited and could be schedule-to-start-failed
+/// immediately after the thaw.
+///
+/// Comparing against `paused_at` removes visibility from the question
+/// altogether: `created_at` and `paused_at` are both fixed values on rows that
+/// already exist, so a row's side is the same no matter which statement first
+/// observes it, and a row that becomes visible late is still credited correctly
+/// by whichever pass owns it. It also happens to be the more meaningful split —
+/// "did this task accrue wait before the hold, or was it held from birth?" —
+/// which is exactly the distinction the two formulas encode.
 ///
 /// `created_at` is **nullable** (a pre-`20260619000000` `PENDING` row has none),
 /// and in SQL a comparison against `NULL` is `NULL`, not `false` — so without the
 /// explicit `IS NULL` arm such a row would satisfy *neither* predicate and be
 /// credited by *neither* pass. It belongs on this side: a row with no
-/// `created_at` was certainly enqueued before this resume began.
+/// `created_at` predates that migration and therefore predates any pause.
 ///
 /// # Scope of the totality claim
 ///
-/// The partition is total **within a single snapshot**: every due `PENDING` row
-/// visible to one statement matches exactly one predicate. It is *not* total
-/// across the two statements, because a row can change state between their
-/// snapshots — a `RUNNING` row re-pended after this pass's snapshot is invisible
-/// here, and carries a `created_at` predating this transaction, so it also fails
-/// [`resume_shift_late_arrivals_query`]'s predicate (issue #619 review).
+/// The partition itself is total and visibility-independent: every due
+/// `PENDING` row matches exactly one predicate, whenever it becomes visible.
+/// What is *not* total is coverage across the two statements, because a row can
+/// change **state** between their snapshots — a `RUNNING` row re-pended after
+/// this pass's snapshot is invisible here, and if it was created before the
+/// pause it also falls outside [`resume_shift_late_arrivals_query`]'s side of
+/// the partition (issue #619 review).
 ///
 /// Every reachable re-pend path is nevertheless benign, because each one
 /// *refreshes* `scheduled_at` to the re-pend instant, which lies inside this
 /// resume: `crate::queue::requeue_for_retry` (`scheduled_at = now + backoff`),
 /// `crate::poison_pill` reclaim (`scheduled_at = now()`), and
-/// `primary_repend_workflow_task` (which refreshes `created_at` too, so it lands
-/// on the late-arrival side and is credited there). Such a row only *became* due
+/// `primary_repend_workflow_task` (which refreshes `created_at` to the re-pend
+/// instant — necessarily after `paused_at` — so it lands on the late-arrival
+/// side and is credited there). Such a row only *became* due
 /// during the thaw, so it accrued no held time, and its under-credit is bounded
 /// by this transaction's remaining runtime — the same residual documented on
 /// [`resume_shift_late_arrivals_query`].
@@ -452,7 +512,8 @@ pub const fn queue_pause_suppresses_timeout(
 /// window in practice: it runs in the same function call as the claim it undoes,
 /// so it fires at pause-creation time, not hours later during a resume. Closing
 /// it exactly would need pass 1 to return its row ids for pass 2 to exclude
-/// (`id <> ALL($ids)`), which does not scale to a large backlog; the alternative
+/// (`id <> ALL($ids)`), which is O(n) per row against the returned array and so
+/// does not scale to a large backlog; the alternative
 /// of taking the queue's advisory lock in the release is explicitly rejected,
 /// since that statement runs on *every* claim and would serialize them per queue,
 /// defeating `SKIP LOCKED` (see `crate::queue::claim_task`).
@@ -465,7 +526,7 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
        AND scheduled_at <= clock_timestamp() \
-       AND (created_at IS NULL OR created_at < transaction_timestamp())"
+       AND (created_at IS NULL OR created_at < $2)"
 }
 
 /// Second pass of the resume shift: credit rows **enqueued during the thaw
@@ -511,7 +572,39 @@ pub const fn resume_shift_late_arrivals_query() -> &'static str {
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
        AND scheduled_at <= clock_timestamp() \
-       AND created_at >= transaction_timestamp()"
+       AND created_at >= $2"
+}
+
+/// The `GET /admin/queues/paused` read, and the Vantage Workers banner's source.
+///
+/// # Why a correlated count rather than a grouped join (issue #619 round-16 review)
+///
+/// The obvious shape — `LEFT JOIN (SELECT queue_name, COUNT(*) … GROUP BY
+/// queue_name)` — aggregates the **entire** `PENDING` backlog of every queue on
+/// the shard and only then joins the result to the (tiny) pause table. Postgres
+/// cannot reliably push the pause table's queue names down into that grouped
+/// subquery, so the cost scales with the whole shard's backlog rather than with
+/// the paused queues.
+///
+/// That is backwards for this query specifically: it is a **diagnostic read**,
+/// executed per shard by both the management endpoint and the Workers-page
+/// banner, and it is consulted during exactly the incident where the backlog is
+/// largest. Making the operator's "what is on hold?" view slow (or time out) in
+/// proportion to unrelated pending work defeats its purpose.
+///
+/// The correlated `COUNT(*)` instead runs once per **paused queue** — a set
+/// bounded by the number of rows in `harvest_queue_pauses`, normally a handful —
+/// and each one is a selective `(queue_name, state)` lookup rather than a full
+/// aggregation. It also drops the `COALESCE`: a correlated count returns `0`
+/// for a paused queue with no held work, so such a queue still lists rather
+/// than disappearing, which was the only reason the `LEFT JOIN` existed.
+#[must_use]
+pub const fn list_paused_queues_query() -> &'static str {
+    "SELECT p.queue_name, p.reason, p.paused_by, p.paused_at, p.scope_shard_id, \
+            (SELECT COUNT(*) FROM harvest_task_queue t \
+             WHERE t.queue_name = p.queue_name AND t.state = 'PENDING') AS held_task_count \
+     FROM harvest_queue_pauses p \
+     ORDER BY p.paused_at ASC, p.queue_name ASC"
 }
 
 /// Count of `PENDING` tasks currently held on a queue (`$1` = queue name).
@@ -842,14 +935,15 @@ pub async fn resume_queue(
                 .execute(conn)
                 .await?;
 
-            // Second pass, LAST so it sees the freshest snapshot: a task enqueued
-            // while this resume was running is still held (our DELETE has not
-            // committed, so concurrent claimers still see the pause row) but is
-            // invisible to the primary shift above. Disjoint from it by
-            // `created_at` vs `transaction_timestamp()`, so the counts sum exactly
-            // and no row is shifted twice.
+            // Second pass, LAST so it sees the freshest snapshot: a task created
+            // during the hold is still held (our DELETE has not committed, so
+            // concurrent claimers still see the pause row) and may be invisible
+            // to the primary shift above. The two are disjoint by `created_at`
+            // vs `paused_at` -- a SEMANTIC split, not a visibility one -- so the
+            // counts sum exactly and no row is shifted twice.
             let late = diesel::sql_query(resume_shift_late_arrivals_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
                 .execute(conn)
                 .await?;
 
@@ -892,20 +986,9 @@ pub async fn list_paused_queues(conn: &mut AsyncPgConnection) -> HarvestResult<V
         held_task_count: i64,
     }
 
-    // One pass: LEFT JOIN the PENDING backlog so a paused queue with no held
-    // work still lists (with a zero count) rather than disappearing.
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT p.queue_name, p.reason, p.paused_by, p.paused_at, p.scope_shard_id, \
-                COALESCE(t.held, 0) AS held_task_count \
-         FROM harvest_queue_pauses p \
-         LEFT JOIN ( \
-             SELECT queue_name, COUNT(*) AS held \
-             FROM harvest_task_queue WHERE state = 'PENDING' GROUP BY queue_name \
-         ) t ON t.queue_name = p.queue_name \
-         ORDER BY p.paused_at ASC, p.queue_name ASC",
-    )
-    .load(conn)
-    .await?;
+    let rows: Vec<Row> = diesel::sql_query(list_paused_queues_query())
+        .load(conn)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -1117,24 +1200,22 @@ mod tests {
     #[test]
     fn resume_shift_never_uses_the_frozen_transaction_clock() {
         let sql = resume_shift_scheduled_at_query();
-        // The frozen clock may appear ONLY in the created_at partition predicate
-        // (where "when did this resume begin" is exactly what it means), never in
-        // the credit arithmetic. Split at WHERE so the two halves are judged
-        // separately instead of by a whole-string ban that the partition would
-        // have to weaken.
-        let (set_clause, where_clause) = sql
-            .split_once(" WHERE ")
-            .expect("the shift is an UPDATE ... WHERE");
+        // Since the partition moved off `transaction_timestamp()` onto the bound
+        // `paused_at` (round 16), NO frozen clock belongs anywhere in this query
+        // -- not in the credit arithmetic, not in the due predicate, and not in
+        // the partition. The earlier carve-out that allowed one in the WHERE half
+        // is exactly what the visibility bug hid behind, so the ban is now whole
+        // -string and unconditional.
         for frozen in ["NOW()", "transaction_timestamp()", "statement_timestamp()"] {
             assert!(
-                !set_clause.contains(frozen),
-                "the credit must not be computed from the frozen clock ({frozen}); got:\n{sql}"
+                !sql.contains(frozen),
+                "the shift must read only the live clock and bound values, never \
+                 the frozen clock ({frozen}); got:\n{sql}"
             );
         }
-        assert!(
-            !where_clause.contains("NOW()") && !where_clause.contains("statement_timestamp()"),
-            "the due predicate must read the live clock; got:\n{sql}"
-        );
+        let (_set_clause, where_clause) = sql
+            .split_once(" WHERE ")
+            .expect("the shift is an UPDATE ... WHERE");
         // Both the credit and the due-ness predicate must use the live clock, or
         // rows that fall due mid-transaction are silently skipped.
         assert_eq!(
@@ -1145,7 +1226,7 @@ mod tests {
         // The frozen clock's one legitimate use: partitioning off the rows the
         // late-arrivals pass owns, so neither pass shifts a row twice.
         assert!(
-            where_clause.contains("created_at < transaction_timestamp()"),
+            where_clause.contains("created_at < $2)"),
             "the primary pass must exclude rows enqueued during the resume; got:\n{sql}"
         );
     }
@@ -1284,8 +1365,8 @@ mod tests {
     fn the_two_resume_passes_partition_on_created_at() {
         let primary = resume_shift_scheduled_at_query();
         let late = resume_shift_late_arrivals_query();
-        assert!(primary.contains("created_at < transaction_timestamp()"));
-        assert!(late.contains("created_at >= transaction_timestamp()"));
+        assert!(primary.contains("created_at < $2)"));
+        assert!(late.contains("created_at >= $2"));
         // Same queue, same PENDING/due gate on both sides, or the partition would
         // leak rows out of one pass without the other picking them up.
         for sql in [primary, late] {
@@ -1309,7 +1390,7 @@ mod tests {
     fn the_partition_is_total_for_a_null_created_at() {
         let primary = resume_shift_scheduled_at_query();
         assert!(
-            primary.contains("(created_at IS NULL OR created_at < transaction_timestamp())"),
+            primary.contains("(created_at IS NULL OR created_at < $2)"),
             "a legacy row with no created_at must still be credited; got:\n{primary}"
         );
         // ...and must NOT also match the late-arrivals pass, or it would be
@@ -1337,11 +1418,20 @@ mod tests {
             !sql.contains("GREATEST(") && !sql.contains("scheduled_at + "),
             "must NOT reuse the relative credit formula; got:\n{sql}"
         );
-        // It takes no paused_at bind at all -- there is no pre-pause span to
-        // measure -- so a stray $2 would be a wiring bug.
+        // It binds paused_at as $2, but ONLY as the partition boundary -- never
+        // in the assignment, which stays absolute. Round 16 moved the partition
+        // off `transaction_timestamp()` onto this bound value so a row's side no
+        // longer depends on when its enqueuing transaction became visible.
         assert!(
-            !sql.contains("$2"),
-            "takes only the queue name; got:\n{sql}"
+            sql.contains("created_at >= $2"),
+            "the partition must key on the bound paused_at; got:\n{sql}"
+        );
+        let (set_clause, _where_clause) = sql
+            .split_once(" WHERE ")
+            .expect("the late pass is an UPDATE ... WHERE");
+        assert!(
+            !set_clause.contains("$2"),
+            "paused_at must not reach the assignment -- this pass is absolute; got:\n{sql}"
         );
         // Same out-of-scope invariant as the primary pass.
         assert!(!sql.contains("schedule_to_close_at"), "got:\n{sql}");
@@ -1349,6 +1439,64 @@ mod tests {
 
     /// The drift lock: the `const` the hot claim path embeds must be exactly
     /// what the renderer produces for the unaliased table.
+    /// The queue-pause lock must live in the two-argument advisory keyspace,
+    /// which is disjoint from the single-argument `bigint` one that
+    /// `claim_task`'s per-key concurrency gate hashes `concurrency_key` into.
+    ///
+    /// Sharing that keyspace is not hygiene: a queue name hash-colliding with
+    /// some other queue's `concurrency_key` would make that key's
+    /// `pg_try_advisory_xact_lock` fail -- silently, since it is the *try*
+    /// variant -- for as long as a large resume held the lock, so an unpaused
+    /// queue would stop dispatching during an unrelated queue's resume.
+    #[test]
+    fn queue_pause_lock_uses_its_own_advisory_namespace() {
+        let sql = lock_queue_for_pause_query();
+        assert!(
+            sql.contains("pg_advisory_xact_lock($1, hashtext($2))"),
+            "the queue-pause lock must use the two-argument (classid, objid) form \
+             so it cannot collide with the single-argument hashtext keyspace; got:\n{sql}"
+        );
+        // The single-argument shapes that WOULD collide with concurrency_key.
+        for colliding in [
+            "pg_advisory_xact_lock(hashtext($1))",
+            "pg_advisory_xact_lock(hashtext($1)::bigint)",
+        ] {
+            assert!(
+                !sql.contains(colliding),
+                "must not use the shared single-argument keyspace ({colliding}); got:\n{sql}"
+            );
+        }
+        assert_eq!(
+            QUEUE_PAUSE_LOCK_CLASS, 619,
+            "the class id is the issue number so a pg_locks row is self-identifying"
+        );
+    }
+
+    /// The paused-queue read must count per paused queue, not aggregate the
+    /// whole shard's PENDING backlog and then join.
+    ///
+    /// This is the diagnostic an operator opens *during* a backlog incident, so
+    /// its cost must scale with the number of paused queues (a handful) rather
+    /// than with the unrelated pending work (potentially millions of rows).
+    #[test]
+    fn list_paused_queues_counts_per_paused_queue_not_the_whole_backlog() {
+        let sql = list_paused_queues_query();
+        assert!(
+            sql.contains("WHERE t.queue_name = p.queue_name AND t.state = 'PENDING'"),
+            "the held count must be correlated to the pause row; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("GROUP BY"),
+            "an ungrouped correlated count replaces the whole-backlog aggregate; got:\n{sql}"
+        );
+        // A correlated COUNT(*) already yields 0, so the LEFT JOIN + COALESCE
+        // that existed only to keep a zero-held paused queue listed is gone.
+        assert!(
+            !sql.contains("LEFT JOIN") && !sql.contains("COALESCE"),
+            "got:\n{sql}"
+        );
+    }
+
     #[test]
     fn const_matches_the_renderer() {
         assert_eq!(
