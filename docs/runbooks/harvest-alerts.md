@@ -1479,7 +1479,11 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
   hours does not report six hours of schedule-to-start latency on release. The
   credit is measured against the live clock at release, so the time the resume
   itself takes — waiting on its queue lock and shifting a large backlog — is
-  credited too, and does not count against any task's `schedule_to_start`.
+  credited too, and does not count against any task's `schedule_to_start`. A
+  task *enqueued while the resume is running* is credited as well: the hold is in
+  force until the resume commits, so a second pass picks up those late arrivals.
+  The one residual is sub-millisecond (a row committed during that final pass's
+  own execution), far below any usable `schedule_to_start`.
 
 ### Safe actions
 

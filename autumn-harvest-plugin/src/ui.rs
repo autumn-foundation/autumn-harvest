@@ -2543,6 +2543,25 @@ pub(crate) struct PausedQueueBannerRow {
     pub coverage: autumn_harvest::queue_pause::PauseCoverage,
 }
 
+/// Outcome of the Workers-page paused-queue scan: the merged banner rows plus
+/// the shards whose pause state could not be read at all.
+///
+/// Issue #619 review: a shard whose connection or pause read fails contributes
+/// **no rows**, which is indistinguishable from "that shard is not holding
+/// anything". For *coverage classification* that is the safe reading (a
+/// not-holding shard makes the hold `partial_fleet`, i.e. possibly still
+/// dispatching). For *presence* it is not safe at all: a hold that exists
+/// **only** on an unread shard vanishes from the banner entirely, so an
+/// operator investigating idle workers sees a clean page and looks elsewhere
+/// while dispatch is in fact held. The failed shard ids are therefore carried
+/// alongside the rows and rendered as a warning even when `rows` is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PausedQueueScan {
+    pub rows: Vec<PausedQueueBannerRow>,
+    /// Shards whose pause state is **unknown**, not "not paused". Sorted.
+    pub unreadable_shards: Vec<i32>,
+}
+
 /// Merge per-shard paused-queue rows into one banner row per queue name.
 ///
 /// Held counts are summed across shards. The top-level provenance is the
@@ -2623,16 +2642,30 @@ pub(crate) fn merge_paused_queue_banner_rows(
         .collect()
 }
 
-/// Render the paused-queues banner (issue #619). Empty when nothing is paused,
-/// so a healthy fleet page is byte-identical to before.
+/// Render the paused-queues banner (issue #619). Empty when nothing is paused
+/// **and** every shard's pause state was readable, so a healthy fleet page is
+/// byte-identical to before.
 ///
 /// A row whose shards disagree on provenance is marked "mixed across shards"
 /// rather than silently attributing the fleet-wide held total to one shard's
 /// reason and operator — see [`merge_paused_queue_banner_rows`].
-pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Markup {
-    if rows.is_empty() {
+///
+/// `unreadable_shards` renders its own warning **even when `rows` is empty**:
+/// an unread shard's pause state is unknown, so an absent banner would otherwise
+/// read as "nothing is held" on exactly the page an operator lands on when
+/// investigating idle workers — see [`PausedQueueScan`].
+pub(crate) fn render_paused_queues_banner(
+    rows: &[PausedQueueBannerRow],
+    unreadable_shards: &[i32],
+) -> Markup {
+    if rows.is_empty() && unreadable_shards.is_empty() {
         return html! {};
     }
+    let unreadable_list = unreadable_shards
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let held_total: i64 = rows.iter().map(|r| r.held_task_count).sum();
     let mixed = rows.iter().filter(|r| !r.provenance_uniform).count();
     // A fleet-wide hold that did not reach every shard leaves part of the fleet
@@ -2643,52 +2676,67 @@ pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Mark
         .filter(|r| r.coverage.is_incomplete_fleet())
         .count();
     html! {
-        div.banner.Degraded {
-            strong { "Queue dispatch paused" }
-            " — "
-            (rows.len()) " queue(s) held | " (held_total) " task(s) waiting"
-            @if incomplete > 0 {
-                " | " (incomplete) " only PARTIALLY applied — some shards are \
-                       still dispatching; re-issue the pause"
-            }
-            @if mixed > 0 {
-                " | " (mixed) " with mixed provenance across shards \
-                       (see GET /admin/queues/paused for the per-shard holds)"
+        // Rendered FIRST and unconditionally on a read failure: if this is the
+        // only thing on the banner, the honest answer is "we do not know whether
+        // dispatch is held", not the silent clean page an absent banner implies.
+        @if !unreadable_shards.is_empty() {
+            div.banner.Degraded {
+                strong { "Queue pause state incomplete" }
+                " — could not read shard(s) " (unreadable_list) ". "
+                "A hold that exists only on an unread shard is MISSING from this \
+                 banner, and a hold shown below may cover more shards than its \
+                 Scope column says. Check GET /admin/queues/paused before \
+                 concluding dispatch is flowing."
             }
         }
-        table {
-            thead {
-                tr {
-                    th { "Queue" }
-                    th { "Scope" }
-                    th { "Held tasks" }
-                    th { "Paused at" }
-                    th { "By" }
-                    th { "Reason" }
+        @if !rows.is_empty() {
+            div.banner.Degraded {
+                strong { "Queue dispatch paused" }
+                " — "
+                (rows.len()) " queue(s) held | " (held_total) " task(s) waiting"
+                @if incomplete > 0 {
+                    " | " (incomplete) " only PARTIALLY applied — some shards are \
+                           still dispatching; re-issue the pause"
+                }
+                @if mixed > 0 {
+                    " | " (mixed) " with mixed provenance across shards \
+                           (see GET /admin/queues/paused for the per-shard holds)"
                 }
             }
-            tbody {
-                @for row in rows {
+            table {
+                thead {
                     tr {
-                        td { code { (row.queue_name) } }
-                        td {
-                            // Real coverage, not the stored intent: a
-                            // fleet-wide request that missed a shard must not
-                            // read "fleet-wide".
-                            (row.coverage.label())
-                            @if let Some(shard) = row.scope_shard_id {
-                                " (shard " (shard) ")"
+                        th { "Queue" }
+                        th { "Scope" }
+                        th { "Held tasks" }
+                        th { "Paused at" }
+                        th { "By" }
+                        th { "Reason" }
+                    }
+                }
+                tbody {
+                    @for row in rows {
+                        tr {
+                            td { code { (row.queue_name) } }
+                            td {
+                                // Real coverage, not the stored intent: a
+                                // fleet-wide request that missed a shard must not
+                                // read "fleet-wide".
+                                (row.coverage.label())
+                                @if let Some(shard) = row.scope_shard_id {
+                                    " (shard " (shard) ")"
+                                }
                             }
-                        }
-                        td { (row.held_task_count) }
-                        td { (row.paused_at.to_rfc3339()) }
-                        td {
-                            (row.paused_by)
-                            @if !row.provenance_uniform { " (mixed across shards)" }
-                        }
-                        td {
-                            (row.reason)
-                            @if !row.provenance_uniform { " (mixed across shards)" }
+                            td { (row.held_task_count) }
+                            td { (row.paused_at.to_rfc3339()) }
+                            td {
+                                (row.paused_by)
+                                @if !row.provenance_uniform { " (mixed across shards)" }
+                            }
+                            td {
+                                (row.reason)
+                                @if !row.provenance_uniform { " (mixed across shards)" }
+                            }
                         }
                     }
                 }
@@ -2699,44 +2747,58 @@ pub(crate) fn render_paused_queues_banner(rows: &[PausedQueueBannerRow]) -> Mark
 
 /// Load paused queues across every shard for the Workers-page banner.
 ///
-/// Best-effort: an unreachable shard is skipped rather than failing the page —
-/// the banner is a diagnostic aid, never a gate on rendering the fleet.
+/// Best-effort: an unreachable shard never fails the page — the banner is a
+/// diagnostic aid, never a gate on rendering the fleet. It is **not** silent
+/// about it either: the failed shard ids come back in
+/// [`PausedQueueScan::unreadable_shards`] and are rendered as their own warning,
+/// because a hold that exists only on an unread shard is otherwise invisible
+/// here (issue #619 review).
 ///
 /// The **expected** shard set (pools plus every shard the router knows about) is
 /// resolved from `api_state`, identical to `GET /admin/queues/paused`, so a
 /// partially-applied fleet-wide hold is labelled the same way on both surfaces.
-/// A shard that is skipped here therefore correctly counts as not-holding: it
-/// might well still be dispatching.
+/// An unread shard counts as not-holding for *coverage*, which is the safe
+/// direction (it may still be dispatching) — the warning is what tells the
+/// operator the shown `Scope` could understate the real coverage.
 async fn load_paused_queues_from_shards(
     api_state: &HarvestApiState,
     pool: &crate::HarvestDbPool,
-) -> Vec<PausedQueueBannerRow> {
+) -> PausedQueueScan {
     let futs: Vec<_> = pool
         .iter_shards()
         .map(|(shard_id, shard_pool)| async move {
-            let mut conn = acquire_conn(shard_pool).await.ok()?;
-            let rows = autumn_harvest::queue_pause::list_paused_queues(&mut conn)
-                .await
-                .ok()?;
-            Some(
-                rows.into_iter()
-                    .map(|row| (shard_id.as_i32(), row))
-                    .collect::<Vec<_>>(),
-            )
+            let shard = shard_id.as_i32();
+            let read = async {
+                let mut conn = acquire_conn(shard_pool).await.ok()?;
+                autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+                    .await
+                    .ok()
+            }
+            .await;
+            // Err(shard) carries WHICH shard failed, so the banner can say so
+            // instead of silently reporting it as holding nothing.
+            read.map_or(Err(shard), |rows| {
+                Ok(rows.into_iter().map(|row| (shard, row)).collect::<Vec<_>>())
+            })
         })
         .collect();
-    let per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)> =
-        futures::future::join_all(futs)
-            .await
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect();
+    let mut per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)> = Vec::new();
+    let mut unreadable_shards: Vec<i32> = Vec::new();
+    for outcome in futures::future::join_all(futs).await {
+        match outcome {
+            Ok(rows) => per_shard.extend(rows),
+            Err(shard) => unreadable_shards.push(shard),
+        }
+    }
+    unreadable_shards.sort_unstable();
     let pools = crate::shard_fanout::pools_by_shard(api_state);
     let expected: Vec<i32> = crate::shard_fanout::expected_shards(api_state, &pools)
         .into_iter()
         .collect();
-    merge_paused_queue_banner_rows(per_shard, &expected)
+    PausedQueueScan {
+        rows: merge_paused_queue_banner_rows(per_shard, &expected),
+        unreadable_shards,
+    }
 }
 
 async fn load_workers_from_shards(
@@ -3611,7 +3673,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
 fn render_workers_page(
     stats: &WorkerFleetStats,
     banner_state: Option<BannerState>,
-    paused_queues: &[PausedQueueBannerRow],
+    paused_queues: &PausedQueueScan,
     grouped: &[(ShardId, Vec<WorkerRow>)],
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
@@ -3633,7 +3695,7 @@ fn render_workers_page(
         (render_fleet_banner(stats, banner_state))
 
         // Paused-queue banner (issue #619) -- empty when nothing is held.
-        (render_paused_queues_banner(paused_queues))
+        (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
         (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
@@ -8750,11 +8812,81 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
 mod tests {
     use super::*;
 
-    /// Issue #619: with nothing paused the banner must render nothing at all,
-    /// so a healthy Workers page is byte-identical to before the feature.
+    /// Issue #619: with nothing paused **and** every shard readable, the banner
+    /// must render nothing at all, so a healthy Workers page is byte-identical to
+    /// before the feature.
     #[test]
     fn paused_queues_banner_is_empty_when_nothing_is_paused() {
-        assert_eq!(render_paused_queues_banner(&[]).into_string(), "");
+        assert_eq!(render_paused_queues_banner(&[], &[]).into_string(), "");
+    }
+
+    /// Issue #619 review: a shard whose pause state could not be read makes the
+    /// banner's silence a lie — a hold that exists ONLY on that shard is absent
+    /// from `rows` entirely. The warning must therefore render even with zero
+    /// rows, because that is exactly the case an operator misreads as "dispatch
+    /// is flowing, look elsewhere".
+    #[test]
+    fn unreadable_shard_warns_even_with_no_visible_holds() {
+        let html = render_paused_queues_banner(&[], &[1, 3]).into_string();
+        assert!(
+            !html.is_empty(),
+            "an unread shard must never render as a clean page"
+        );
+        assert!(
+            html.contains("Queue pause state incomplete"),
+            "must name the condition: {html}"
+        );
+        assert!(html.contains("1, 3"), "must name the failed shards: {html}");
+        assert!(
+            html.contains("MISSING"),
+            "must say a hold could be missing entirely: {html}"
+        );
+        assert!(
+            html.contains("/admin/queues/paused"),
+            "must point at the authoritative per-shard read: {html}"
+        );
+        // No hold is visible, so there is nothing to tabulate.
+        assert!(
+            !html.contains("Queue dispatch paused") && !html.contains("<table"),
+            "with zero rows there must be no hold banner or table: {html}"
+        );
+    }
+
+    /// The two warnings are independent: a visible hold PLUS an unread shard must
+    /// show both, because the shown `Scope` can understate the real coverage.
+    #[test]
+    fn unreadable_shard_warning_composes_with_a_visible_hold() {
+        let rows = vec![PausedQueueBannerRow {
+            queue_name: "email-workers".to_string(),
+            reason: "SMTP provider outage".to_string(),
+            paused_by: "alice".to_string(),
+            paused_at: chrono::Utc::now(),
+            scope_shard_id: None,
+            held_task_count: 7,
+            provenance_uniform: true,
+            coverage: autumn_harvest::queue_pause::PauseCoverage::PartialFleet,
+        }];
+        let html = render_paused_queues_banner(&rows, &[2]).into_string();
+        assert!(
+            html.contains("Queue pause state incomplete"),
+            "read-failure warning: {html}"
+        );
+        assert!(
+            html.contains("Queue dispatch paused"),
+            "hold banner still rendered: {html}"
+        );
+        assert!(
+            html.contains("email-workers"),
+            "table still rendered: {html}"
+        );
+        // The incomplete-read warning must come FIRST: "we do not know" outranks
+        // the partial-coverage detail it may itself explain.
+        let read_at = html.find("Queue pause state incomplete").unwrap();
+        let hold_at = html.find("Queue dispatch paused").unwrap();
+        assert!(
+            read_at < hold_at,
+            "the unknown-state warning must precede the hold banner: {html}"
+        );
     }
 
     /// AC6: the banner surfaces the queue name, held count, actor and reason so
@@ -8771,7 +8903,7 @@ mod tests {
             provenance_uniform: true,
             coverage: autumn_harvest::queue_pause::PauseCoverage::Fleet,
         }];
-        let html = render_paused_queues_banner(&rows).into_string();
+        let html = render_paused_queues_banner(&rows, &[]).into_string();
         assert!(html.contains("email-workers"), "queue name: {html}");
         assert!(html.contains("SMTP provider outage"), "reason: {html}");
         assert!(html.contains("alice"), "actor: {html}");
@@ -8876,7 +9008,7 @@ mod tests {
             "the shards disagree on reason, actor AND scope"
         );
 
-        let html = render_paused_queues_banner(&merged).into_string();
+        let html = render_paused_queues_banner(&merged, &[]).into_string();
         assert!(
             html.contains("mixed across shards"),
             "divergent provenance must be visible, not silently attributed to \
@@ -8925,7 +9057,7 @@ mod tests {
             merged[0].provenance_uniform,
             "a fleet-wide hold's per-shard NOW() skew is not a divergence"
         );
-        let html = render_paused_queues_banner(&merged).into_string();
+        let html = render_paused_queues_banner(&merged, &[]).into_string();
         assert!(!html.contains("mixed across shards"), "{html}");
     }
 
@@ -8962,7 +9094,7 @@ mod tests {
             "one of two expected shards holds the queue -- intent says \
              fleet-wide, reality does not"
         );
-        let html = render_paused_queues_banner(&partial).into_string();
+        let html = render_paused_queues_banner(&partial, &[]).into_string();
         assert!(
             html.contains("partially applied"),
             "the Scope cell must not claim fleet-wide coverage: {html}"
@@ -8979,7 +9111,7 @@ mod tests {
             complete[0].coverage,
             autumn_harvest::queue_pause::PauseCoverage::Fleet
         );
-        let html = render_paused_queues_banner(&complete).into_string();
+        let html = render_paused_queues_banner(&complete, &[]).into_string();
         assert!(html.contains("fleet-wide"), "{html}");
         assert!(
             !html.contains("partially applied") && !html.contains("still dispatching"),

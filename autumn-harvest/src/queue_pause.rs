@@ -406,6 +406,28 @@ pub const fn queue_pause_suppresses_timeout(
 /// `<= commit time`, in every branch. `RUNNING` rows are untouched, and
 /// `schedule_to_close_at` is untouched so the absolute deadline keeps ticking.
 ///
+/// # Why `created_at < transaction_timestamp()`
+///
+/// This pass owns only the backlog that already existed when the resume began.
+/// Rows enqueued *during* the resume are handled by
+/// [`resume_shift_late_arrivals_query`], and the two predicates partition the
+/// due `PENDING` rows on `created_at` so no row is shifted twice — a second
+/// application of this *relative* `+=` formula would erase the pre-pause wait it
+/// exists to preserve.
+///
+/// `transaction_timestamp()` is exactly "when this resume began": the same
+/// frozen-at-transaction-start property that makes it wrong for the credit
+/// *amount* makes it precisely right as the partition marker, and it needs no
+/// extra round trip or bind. Rows created during the advisory-lock wait fall on
+/// the late-arrival side, which is correct — they were held from creation.
+///
+/// `created_at` is **nullable** (a pre-`20260619000000` `PENDING` row has none),
+/// and in SQL a comparison against `NULL` is `NULL`, not `false` — so without the
+/// explicit `IS NULL` arm such a row would satisfy *neither* predicate and be
+/// credited by *neither* pass. It belongs on this side: a row with no
+/// `created_at` was certainly enqueued before this resume began. The partition
+/// is therefore total — every due `PENDING` row matches exactly one pass.
+///
 /// Binds: `$1` = queue name, `$2` = `paused_at`.
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
@@ -413,7 +435,54 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
      SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
      WHERE queue_name = $1 \
        AND state = 'PENDING' \
-       AND scheduled_at <= clock_timestamp()"
+       AND scheduled_at <= clock_timestamp() \
+       AND (created_at IS NULL OR created_at < transaction_timestamp())"
+}
+
+/// Second pass of the resume shift: credit rows **enqueued during the thaw
+/// itself** (issue #619 review).
+///
+/// The hold stays in force until `resume_queue`'s transaction *commits* — a
+/// concurrent claimer's snapshot still sees the not-yet-committed pause row, so
+/// it still skips the queue. A task enqueued after
+/// [`resume_shift_scheduled_at_query`]'s snapshot is therefore genuinely held,
+/// yet that statement can never see it, so without this pass it would thaw
+/// carrying an uncredited `scheduled_at` and could be timed out by the
+/// `schedule_to_start` scanner for time it spent held — the AC3/AC4 failure the
+/// primary shift exists to prevent.
+///
+/// `SET scheduled_at = clock_timestamp()` (absolute), not the primary pass's
+/// relative `+=` delta, because a row created during the hold has no pre-pause
+/// wait to preserve: it was held from the moment it became due, so it accrues
+/// none. Being absolute also makes the statement **idempotent** — re-running it
+/// can only move `scheduled_at` to a later instant that is still
+/// `<= clock_timestamp() <= commit time`, never into the future.
+///
+/// # Irreducible residual
+///
+/// This narrows the uncredited window from "the whole bulk `UPDATE`" to "this
+/// final, small statement", but cannot close it: a row committed after *this*
+/// statement's snapshot and before this transaction commits is still held and
+/// still gets no credit. The under-credit is bounded by the remaining duration of
+/// this statement (microseconds for a queue with no late arrivals), the same
+/// safe direction as the primary pass's lower-bound credit.
+///
+/// Closing it completely would require serializing **enqueue** behind the queue's
+/// advisory lock, putting a queue-scoped serialization point on the hot enqueue
+/// path for every task on every queue, paused or not. That is the exact trade
+/// this module's design notes reject for the claim path, and it is not worth
+/// paying to recover a sub-millisecond credit — so the residual is documented
+/// rather than eliminated.
+///
+/// Binds: `$1` = queue name.
+#[must_use]
+pub const fn resume_shift_late_arrivals_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET scheduled_at = clock_timestamp() \
+     WHERE queue_name = $1 \
+       AND state = 'PENDING' \
+       AND scheduled_at <= clock_timestamp() \
+       AND created_at >= transaction_timestamp()"
 }
 
 /// Count of `PENDING` tasks currently held on a queue (`$1` = queue name).
@@ -475,6 +544,10 @@ pub struct ResumeOutcome {
     /// `false` when the queue was not paused (no-op).
     pub newly_resumed: bool,
     /// Tasks whose `scheduled_at` was credited back the held time.
+    ///
+    /// The sum of both resume passes — the backlog that existed when the resume
+    /// began plus anything enqueued while it ran. The two partition on
+    /// `created_at`, so this is an exact row count, never a double count.
     pub released_task_count: i64,
     /// How long the queue was held, in seconds (`0` on a no-op).
     pub paused_duration_secs: i64,
@@ -677,10 +750,22 @@ pub async fn resume_queue(
                 .execute(conn)
                 .await?;
 
+            // Second pass, LAST so it sees the freshest snapshot: a task enqueued
+            // while this resume was running is still held (our DELETE has not
+            // committed, so concurrent claimers still see the pause row) but is
+            // invisible to the primary shift above. Disjoint from it by
+            // `created_at` vs `transaction_timestamp()`, so the counts sum exactly
+            // and no row is shifted twice.
+            let late = diesel::sql_query(resume_shift_late_arrivals_query())
+                .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .execute(conn)
+                .await?;
+
             Ok(ResumeOutcome {
                 queue_name: queue_owned,
                 newly_resumed: true,
-                released_task_count: i64::try_from(released).unwrap_or(i64::MAX),
+                released_task_count: i64::try_from(released.saturating_add(late))
+                    .unwrap_or(i64::MAX),
                 paused_duration_secs: (Utc::now() - row.paused_at).num_seconds().max(0),
                 released_reason: Some(row.reason),
                 released_paused_by: Some(row.paused_by),
@@ -940,13 +1025,23 @@ mod tests {
     #[test]
     fn resume_shift_never_uses_the_frozen_transaction_clock() {
         let sql = resume_shift_scheduled_at_query();
+        // The frozen clock may appear ONLY in the created_at partition predicate
+        // (where "when did this resume begin" is exactly what it means), never in
+        // the credit arithmetic. Split at WHERE so the two halves are judged
+        // separately instead of by a whole-string ban that the partition would
+        // have to weaken.
+        let (set_clause, where_clause) = sql
+            .split_once(" WHERE ")
+            .expect("the shift is an UPDATE ... WHERE");
+        for frozen in ["NOW()", "transaction_timestamp()", "statement_timestamp()"] {
+            assert!(
+                !set_clause.contains(frozen),
+                "the credit must not be computed from the frozen clock ({frozen}); got:\n{sql}"
+            );
+        }
         assert!(
-            !sql.contains("NOW()"),
-            "the resume shift must not use the frozen transaction clock; got:\n{sql}"
-        );
-        assert!(
-            !sql.contains("transaction_timestamp()") && !sql.contains("statement_timestamp()"),
-            "only clock_timestamp() advances during the transaction; got:\n{sql}"
+            !where_clause.contains("NOW()") && !where_clause.contains("statement_timestamp()"),
+            "the due predicate must read the live clock; got:\n{sql}"
         );
         // Both the credit and the due-ness predicate must use the live clock, or
         // rows that fall due mid-transaction are silently skipped.
@@ -955,6 +1050,83 @@ mod tests {
             2,
             "both the SET credit and the due predicate must read the live clock; got:\n{sql}"
         );
+        // The frozen clock's one legitimate use: partitioning off the rows the
+        // late-arrivals pass owns, so neither pass shifts a row twice.
+        assert!(
+            where_clause.contains("created_at < transaction_timestamp()"),
+            "the primary pass must exclude rows enqueued during the resume; got:\n{sql}"
+        );
+    }
+
+    /// The two passes must partition the due `PENDING` rows on `created_at`, not
+    /// overlap: the primary pass's `+=` credit is *relative*, so applying it to a
+    /// row twice would erase the pre-pause wait it exists to preserve, and the
+    /// summed `released_task_count` would double-count.
+    #[test]
+    fn the_two_resume_passes_partition_on_created_at() {
+        let primary = resume_shift_scheduled_at_query();
+        let late = resume_shift_late_arrivals_query();
+        assert!(primary.contains("created_at < transaction_timestamp()"));
+        assert!(late.contains("created_at >= transaction_timestamp()"));
+        // Same queue, same PENDING/due gate on both sides, or the partition would
+        // leak rows out of one pass without the other picking them up.
+        for sql in [primary, late] {
+            assert!(sql.contains("queue_name = $1"), "got:\n{sql}");
+            assert!(sql.contains("state = 'PENDING'"), "got:\n{sql}");
+            assert!(
+                sql.contains("scheduled_at <= clock_timestamp()"),
+                "got:\n{sql}"
+            );
+        }
+    }
+
+    /// The partition must be **total**, and `created_at` is nullable (a
+    /// pre-`20260619000000` `PENDING` row has none). In SQL a comparison against
+    /// `NULL` yields `NULL`, not `false`, so a bare `<` / `>=` split would leave
+    /// such a row matching *neither* pass and credited by neither — a silent
+    /// regression against the pre-partition query, which had no `created_at`
+    /// predicate at all and shifted it. It belongs to the primary pass: no
+    /// `created_at` means it was certainly enqueued before this resume began.
+    #[test]
+    fn the_partition_is_total_for_a_null_created_at() {
+        let primary = resume_shift_scheduled_at_query();
+        assert!(
+            primary.contains("(created_at IS NULL OR created_at < transaction_timestamp())"),
+            "a legacy row with no created_at must still be credited; got:\n{primary}"
+        );
+        // ...and must NOT also match the late-arrivals pass, or it would be
+        // shifted twice by two different formulas.
+        let late = resume_shift_late_arrivals_query();
+        assert!(
+            !late.contains("IS NULL"),
+            "a NULL created_at is not a late arrival; got:\n{late}"
+        );
+    }
+
+    /// The late-arrivals pass must be an **absolute** assignment, never the
+    /// primary pass's relative `+=` delta: a row enqueued during the hold has no
+    /// pre-pause wait to preserve, and an absolute assignment is idempotent under
+    /// repetition (it can only move `scheduled_at` to a later instant that is
+    /// still `<= clock_timestamp() <= commit time`, never into the future).
+    #[test]
+    fn late_arrivals_pass_is_absolute_and_bounded() {
+        let sql = resume_shift_late_arrivals_query();
+        assert!(
+            sql.contains("SET scheduled_at = clock_timestamp()"),
+            "must be an absolute assignment to the live clock; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("GREATEST(") && !sql.contains("scheduled_at + "),
+            "must NOT reuse the relative credit formula; got:\n{sql}"
+        );
+        // It takes no paused_at bind at all -- there is no pre-pause span to
+        // measure -- so a stray $2 would be a wiring bug.
+        assert!(
+            !sql.contains("$2"),
+            "takes only the queue name; got:\n{sql}"
+        );
+        // Same out-of-scope invariant as the primary pass.
+        assert!(!sql.contains("schedule_to_close_at"), "got:\n{sql}");
     }
 
     /// The drift lock: the `const` the hot claim path embeds must be exactly

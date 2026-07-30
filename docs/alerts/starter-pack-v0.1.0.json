@@ -857,7 +857,7 @@
       "default_threshold": "Ticket when any queue has been held for more than 1 hour. Page when held for more than 4 hours. Both are starter defaults, not universal SLOs: tune them to how long your longest downstream outage is expected to last.",
       "severity": "ticket",
       "owner_persona": "service on-call",
-      "description": "A task queue has had dispatch held by an operator for longer than expected. A pause is safe (nothing fails, retries, or dead-letters) but it is also silent: work accumulates as PENDING and no other alert fires, so a forgotten pause looks exactly like a healthy idle queue until the backlog breaches an SLA.",
+      "description": "A task queue has had dispatch held by an operator for longer than expected. A pause holds work rather than failing it (a held task stays PENDING; it is never failed, retried, or dead-lettered because of the hold) and the relative schedule_to_start deadline is suspended and credited back on resume. It is NOT unconditionally safe: an activity carrying the absolute schedule_to_close deadline keeps its clock running during the hold, so a long pause can still let that cross-retry deadline expire and time the work out. It is also silent: work accumulates as PENDING and no other alert fires, so a forgotten pause looks exactly like a healthy idle queue until the backlog breaches an SLA. Before leaving a hold in place past this threshold, check whether the held activities declare schedule_to_close and whether the remaining budget covers the expected outage.",
       "first_action": "harvest queue list-paused",
       "dependencies": [
         {

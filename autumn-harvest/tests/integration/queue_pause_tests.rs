@@ -155,6 +155,26 @@ async fn backdate_scheduled_at(conn: &mut AsyncPgConnection, id: Uuid, secs: i64
     .expect("backdate");
 }
 
+/// Read a pause's `paused_at`, so a hand-driven resume binds exactly what
+/// `resume_queue` binds.
+async fn paused_at_of(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+) -> chrono::DateTime<chrono::offset::Utc> {
+    use diesel_async::RunQueryDsl;
+    #[derive(diesel::QueryableByName)]
+    struct P {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        paused_at: chrono::DateTime<chrono::offset::Utc>,
+    }
+    diesel::sql_query("SELECT paused_at FROM harvest_queue_pauses WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .get_result::<P>(conn)
+        .await
+        .expect("paused_at")
+        .paused_at
+}
+
 /// Backdate a pause's `paused_at` so a resume computes a non-trivial span.
 async fn backdate_paused_at(conn: &mut AsyncPgConnection, queue: &str, secs: i64) {
     use diesel_async::RunQueryDsl;
@@ -294,10 +314,11 @@ fn resume_shift_query_never_pushes_scheduled_at_past_now() {
         "only rows that are actually due may be shifted, measured against the \
          live clock; got:\n{sql}"
     );
+    let (set_clause, _) = sql.split_once(" WHERE ").expect("UPDATE ... WHERE");
     assert!(
-        !sql.contains("NOW()"),
+        !set_clause.contains("NOW()") && !set_clause.contains("transaction_timestamp()"),
         "the frozen transaction clock omits the resume's own runtime from the \
-         credit; got:\n{sql}"
+         credit; it may appear only in the created_at partition predicate; got:\n{sql}"
     );
     assert!(
         sql.contains("'PENDING'"),
@@ -551,6 +572,171 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     assert!(
         after <= chrono::Utc::now(),
         "AC5: the shift must never push a held task into the future"
+    );
+}
+
+/// Issue #619 review — a task enqueued *during* the resume is still held: the
+/// pause row's `DELETE` is uncommitted, so a concurrent claimer's snapshot still
+/// sees the hold and skips the queue. But it lands after the primary shift's
+/// snapshot, so that statement can never see it, and without the late-arrivals
+/// pass it thaws carrying its full uncredited wait — letting the
+/// `schedule_to_start` scanner kill it for time it spent held (AC3/AC4).
+///
+/// Driven by hand because the window exists only *inside* `resume_queue`'s
+/// transaction, between its two statements: no end-to-end call can produce it.
+/// The statements, their order and their binds are exactly what `resume_queue`
+/// issues, so this tests the real composition rather than a paraphrase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    let q = unique_queue("latearrival");
+    let early = enqueue_activity(&mut conn, &q, None).await;
+    queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    // Pre-existing backlog: genuinely waited 100s before the pause, held 600s.
+    backdate_scheduled_at(&mut conn, early, 700).await;
+    backdate_paused_at(&mut conn, &q, 600).await;
+    let paused_at = paused_at_of(&mut conn, &q).await;
+
+    // Open resume_queue's transaction by hand: advisory lock, then release the
+    // hold. The DELETE stays uncommitted for the rest of this test.
+    let mut resumer = connect(&url).await;
+    resumer
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtext('{q}')); \
+             DELETE FROM harvest_queue_pauses WHERE queue_name = '{q}'"
+        ))
+        .await
+        .expect("begin, lock, release the hold");
+
+    // Pass 1 — the primary shift.
+    let primary = diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .execute(&mut resumer)
+        .await
+        .expect("primary shift");
+
+    // ── THE WINDOW ──────────────────────────────────────────────────────────
+    let late = enqueue_activity(&mut conn, &q, None).await;
+    backdate_scheduled_at(&mut conn, late, 100).await;
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        None,
+        "the hold is still in force mid-resume: its DELETE has not committed, so \
+         a task enqueued now is genuinely held and owed a credit"
+    );
+    // Prove the primary pass genuinely missed it, so the pass-2 assertion below
+    // cannot be vacuous.
+    let before_pass2 = (chrono::Utc::now() - scheduled_at(&mut conn, late).await).num_seconds();
+    assert!(
+        (99..=101).contains(&before_pass2),
+        "the primary shift cannot see a row enqueued after its snapshot; if this \
+         already read ~0s the second pass would be untested. apparent wait \
+         {before_pass2}s"
+    );
+
+    // Pass 2 — the late-arrivals credit.
+    let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
+        .bind::<diesel::sql_types::Text, _>(&q)
+        .execute(&mut resumer)
+        .await
+        .expect("late-arrivals shift");
+    resumer
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit resume");
+
+    // The passes partition: exactly one row each, never both on one row.
+    assert_eq!(
+        primary, 1,
+        "the pre-existing backlog is the primary pass's row"
+    );
+    assert_eq!(
+        late_shifted, 1,
+        "the task enqueued mid-resume must be credited by the second pass"
+    );
+
+    let late_wait = (chrono::Utc::now() - scheduled_at(&mut conn, late).await).num_seconds();
+    assert!(
+        (0..=1).contains(&late_wait),
+        "a task enqueued during the thaw was held from the moment it became due, \
+         so it accrues no wait; apparent wait {late_wait}s (uncredited it reads \
+         ~{before_pass2}s)"
+    );
+
+    // ...and the pre-pause wait the primary pass preserved is untouched by it.
+    let early_wait = (chrono::Utc::now() - scheduled_at(&mut conn, early).await).num_seconds();
+    assert!(
+        (99..=101).contains(&early_wait),
+        "the second pass must not re-shift the pre-existing backlog (its relative \
+         += credit is not idempotent): apparent wait {early_wait}s, expected the \
+         genuine ~100s pre-pause wait"
+    );
+
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        Some(early),
+        "AC5: after the thaw the longest-waiting task is claimable again"
+    );
+}
+
+/// The `created_at` partition between the two resume passes must be **total**.
+/// `harvest_task_queue.created_at` is nullable — a `PENDING` row enqueued before
+/// migration `20260619000000` has none — and in SQL a comparison against `NULL`
+/// yields `NULL`, not `false`. A bare `<` / `>=` split would therefore leave such
+/// a legacy row matching *neither* pass and credited by *neither*, silently
+/// regressing against the pre-partition query (which had no `created_at`
+/// predicate and shifted it). It must land on the primary side: no `created_at`
+/// means it was certainly enqueued before this resume began.
+#[tokio::test]
+async fn resume_credits_a_legacy_task_with_no_created_at() {
+    use diesel_async::RunQueryDsl;
+
+    let (mut conn, _c) = setup_db().await;
+    let q = unique_queue("legacycreated");
+    let task = enqueue_activity(&mut conn, &q, None).await;
+    // Simulate a row that predates the created_at column.
+    diesel::sql_query("UPDATE harvest_task_queue SET created_at = NULL WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task)
+        .execute(&mut conn)
+        .await
+        .expect("null out created_at");
+
+    queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
+        .await
+        .expect("pause");
+    // Genuinely waited 100s before the pause, then held 600s.
+    backdate_scheduled_at(&mut conn, task, 700).await;
+    backdate_paused_at(&mut conn, &q, 600).await;
+
+    let resumed = queue_pause::resume_queue(&mut conn, &q, "alice")
+        .await
+        .expect("resume");
+    assert_eq!(
+        resumed.released_task_count, 1,
+        "a legacy NULL-created_at row must be counted as released, not skipped by \
+         both passes"
+    );
+
+    let wait = (chrono::Utc::now() - scheduled_at(&mut conn, task).await).num_seconds();
+    assert!(
+        (99..=101).contains(&wait),
+        "the legacy row must be credited the 600s it was held and keep its genuine \
+         ~100s pre-pause wait; apparent wait {wait}s (uncredited it reads ~700s)"
+    );
+    assert_eq!(
+        claim_one(&mut conn, &q).await,
+        Some(task),
+        "AC5: it is claimable again after the thaw"
     );
 }
 
