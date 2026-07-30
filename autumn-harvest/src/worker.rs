@@ -12974,19 +12974,16 @@ fn spawn_queue_pause_sampler(
             }
 
             // A shard we could not read might be holding a queue we would
-            // otherwise zero-fill. Skip the whole cycle rather than falsely
-            // reporting a hold as released during a database blip.
-            if read_failed {
-                continue;
+            // otherwise zero-fill, so an incomplete scan suppresses the
+            // zero-fill only — never the holds it did observe, which are true
+            // regardless of the failed shard. See
+            // `compute_queue_pause_emissions`.
+            let (emissions, next_previously_paused) =
+                compute_queue_pause_emissions(&previously_paused, &currently_paused, read_failed);
+            for (queue, paused) in emissions {
+                telemetry.metrics.record_queue_paused(&queue, paused);
             }
-
-            for queue in &currently_paused {
-                telemetry.metrics.record_queue_paused(queue, true);
-            }
-            for queue in previously_paused.difference(&currently_paused) {
-                telemetry.metrics.record_queue_paused(queue, false);
-            }
-            previously_paused = currently_paused;
+            previously_paused = next_previously_paused;
 
             if cancel.is_cancelled() {
                 break;
@@ -13757,6 +13754,61 @@ impl ActiveWorkflowState {
 /// same set of `(workflow, state, count)` tuples), but the returned `Vec`'s
 /// order follows `HashMap` iteration and is **not** order-stable. That is fine:
 /// the consumer calls `.set()` once per series, order-independently.
+/// Decide what the `harvest.queue.paused` gauge emits for one sampler cycle
+/// (issue #619), and what the next cycle should treat as previously paused.
+///
+/// Returns `(emissions, next_previously_paused)` where each emission is
+/// `(queue_name, paused)`.
+///
+/// # Why an incomplete scan still emits the holds it saw
+///
+/// A pause is **boolean per queue**, so a hold observed on a readable shard is
+/// correct regardless of what an unreadable shard would have said — "work on
+/// this queue is being held somewhere" is already true. Suppressing the whole
+/// cycle on any read failure (as this originally did) meant a queue genuinely
+/// paused on a healthy shard never set the gauge to `1`, so the dashboard showed
+/// nothing and `harvest_queue_paused_too_long` could not fire for the entire
+/// duration of an *unrelated* shard outage — AC8 broken in exactly the
+/// compound-incident case an operator most needs it (issue #619 review).
+///
+/// This is the opposite call from [`compute_active_gauge_emissions`], and
+/// deliberately so: that gauge reports a *count*, where a partial fan-out is a
+/// wrong number, so skipping the tick is the only honest option there.
+///
+/// # What an incomplete scan must still suppress
+///
+/// The **zero-fill**. A queue absent from a partial scan may simply live on the
+/// shard we could not read, so emitting `false` would claim the hold was
+/// released during a database blip — the inverse lie. Such a queue is instead
+/// *retained* in the returned set (union, not replace), so it is neither
+/// forgotten nor falsely cleared, and a later **complete** scan that finds it
+/// genuinely resumed zero-fills it exactly once rather than leaving it stale at
+/// `1` forever.
+pub(crate) fn compute_queue_pause_emissions(
+    previously_paused: &std::collections::BTreeSet<String>,
+    currently_paused: &std::collections::BTreeSet<String>,
+    read_failed: bool,
+) -> (Vec<(String, bool)>, std::collections::BTreeSet<String>) {
+    // Always report what we actually observed.
+    let mut emissions: Vec<(String, bool)> = currently_paused
+        .iter()
+        .map(|queue| (queue.clone(), true))
+        .collect();
+
+    if read_failed {
+        // Union: keep any hold we could not re-observe this cycle so it stays
+        // zero-fillable, without asserting it was released.
+        let mut retained = previously_paused.clone();
+        retained.extend(currently_paused.iter().cloned());
+        return (emissions, retained);
+    }
+
+    for queue in previously_paused.difference(currently_paused) {
+        emissions.push((queue.clone(), false));
+    }
+    (emissions, currently_paused.clone())
+}
+
 pub(crate) fn compute_active_gauge_emissions(
     last_keys: &std::collections::HashSet<(String, ActiveWorkflowState)>,
     this_counts: &std::collections::HashMap<(String, ActiveWorkflowState), u64>,
@@ -16582,6 +16634,111 @@ mod tests {
     fn active_workflow_state_label_strings_are_lowercase() {
         assert_eq!(ActiveWorkflowState::Running.as_str(), "running");
         assert_eq!(ActiveWorkflowState::Paused.as_str(), "paused");
+    }
+
+    /// Issue #619 review (round 12): a hold observed on a **readable** shard must
+    /// reach the gauge even when an unrelated shard's read failed. Suppressing it
+    /// leaves `harvest.queue.paused` unset, so the dashboard shows nothing and
+    /// `harvest_queue_paused_too_long` cannot fire — for the whole duration of an
+    /// outage that has nothing to do with the paused queue (AC8).
+    ///
+    /// Unlike the active-workflow *count* gauge, where a partial fan-out would be
+    /// a wrong number, pause is boolean-per-queue: an observed hold is correct
+    /// regardless of what the other shards would have said.
+    #[test]
+    fn queue_pause_emissions_report_observed_holds_on_an_incomplete_scan() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = BTreeSet::new();
+        let current: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+
+        let (emissions, next_previous) =
+            compute_queue_pause_emissions(&previous, &current, /* read_failed */ true);
+
+        assert_eq!(
+            emissions,
+            vec![("payments".to_owned(), true)],
+            "an observed hold must be emitted even when another shard failed"
+        );
+        assert!(
+            next_previous.contains("payments"),
+            "the observed hold must be retained so it can be zero-filled later"
+        );
+    }
+
+    /// The zero-fill is what an incomplete scan must suppress: a shard we could
+    /// not read might still be holding the queue, so reporting it released would
+    /// claim the hold is gone during a database blip.
+    #[test]
+    fn queue_pause_emissions_never_zero_fill_on_an_incomplete_scan() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+        let current: BTreeSet<String> = BTreeSet::new();
+
+        let (emissions, next_previous) =
+            compute_queue_pause_emissions(&previous, &current, /* read_failed */ true);
+
+        assert!(
+            emissions.is_empty(),
+            "a queue absent from an incomplete scan must not be reported released: {emissions:?}"
+        );
+        assert!(
+            next_previous.contains("payments"),
+            "it must stay remembered so a later COMPLETE scan can zero-fill it exactly once"
+        );
+    }
+
+    /// A complete scan keeps the round-10 behaviour: emit every hold, zero-fill
+    /// exactly the queues that dropped out, and replace the previous set.
+    #[test]
+    fn queue_pause_emissions_zero_fill_once_on_a_complete_scan() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = ["payments".to_owned(), "email".to_owned()]
+            .into_iter()
+            .collect();
+        let current: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+
+        let (emissions, next_previous) =
+            compute_queue_pause_emissions(&previous, &current, /* read_failed */ false);
+
+        assert!(emissions.contains(&("payments".to_owned(), true)));
+        assert!(
+            emissions.contains(&("email".to_owned(), false)),
+            "a resumed queue must drop to 0 rather than going stale at 1: {emissions:?}"
+        );
+        assert_eq!(next_previous, current, "a complete scan replaces the set");
+    }
+
+    /// A queue held on the shard we could not read is retained across the
+    /// incomplete scan and then zero-filled exactly once when the shard recovers
+    /// and reports it resumed — never left stale at `1` forever.
+    #[test]
+    fn queue_pause_emissions_zero_fill_a_forgotten_hold_after_recovery() {
+        use std::collections::BTreeSet;
+
+        let previous: BTreeSet<String> = std::iter::once("payments".to_owned()).collect();
+
+        // Cycle 1: shard holding `payments` is unreadable.
+        let (_, after_blip) =
+            compute_queue_pause_emissions(&previous, &BTreeSet::new(), /* read_failed */ true);
+        assert!(
+            after_blip.contains("payments"),
+            "not forgotten during the blip"
+        );
+
+        // Cycle 2: shard recovers and the queue has since been resumed.
+        let (emissions, after_recovery) = compute_queue_pause_emissions(
+            &after_blip,
+            &BTreeSet::new(),
+            /* read_failed */ false,
+        );
+        assert_eq!(emissions, vec![("payments".to_owned(), false)]);
+        assert!(
+            after_recovery.is_empty(),
+            "zero-filled exactly once, then dropped"
+        );
     }
 
     #[test]
