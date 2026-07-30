@@ -72,6 +72,15 @@ pub const fn lock_queue_for_pause_query() -> &'static str {
     "SELECT pg_advisory_xact_lock($1, hashtext($2))"
 }
 
+/// SQL for [`lock_queue_for_timeout_recheck`], exposed for shape tests.
+///
+/// `$1` = [`QUEUE_PAUSE_LOCK_CLASS`], `$2` = queue name. Same key as
+/// [`lock_queue_for_pause_query`], **shared** mode.
+#[must_use]
+pub const fn lock_queue_for_timeout_recheck_query() -> &'static str {
+    "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))"
+}
+
 /// Upper bound on a pausable queue name.
 ///
 /// Queue names are free-form `TEXT` everywhere else in the engine, but this
@@ -418,6 +427,65 @@ pub async fn lock_queue_for_pause(
     use diesel_async::RunQueryDsl;
 
     diesel::sql_query(lock_queue_for_pause_query())
+        .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
+        .bind::<diesel::sql_types::Text, _>(queue_name)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Serialize a `schedule_to_start` timeout enforcement against a concurrent
+/// pause or resume — **without** blocking ordinary claims (issue #619 round-21
+/// review).
+///
+/// Takes the *same* key as [`lock_queue_for_pause`] in **shared** mode, giving
+/// the enforcer exactly the mutual exclusion it needs and nothing more:
+///
+/// | Held by | Wanted by | Compatible? |
+/// |---|---|---|
+/// | this (shared) | `pause_queue` / `resume_queue` (exclusive) | **no** — the serialization the re-check depends on |
+/// | this (shared) | [`try_lock_queue_for_claim`] (shared) | **yes** — claims keep dispatching |
+/// | this (shared) | another enforcement (shared) | yes — they serialize on task rows instead |
+///
+/// # Why not the exclusive lock
+///
+/// The enforcer originally reused [`lock_queue_for_pause`]. Exclusive mode
+/// blocks shared, so from round 18 — when [`try_lock_queue_for_claim`] began
+/// taking the shared mode of this key on every claim — an enforcement
+/// transaction stalled *all* dispatch on its queue for its full duration, on a
+/// queue with **no pause at all**. The workflow sibling holds the lock across
+/// `append_events`, the parent-close cascade and trigger evaluation, so a
+/// backlog of expired tasks could repeatedly halt unrelated work. Claims fail
+/// their `try` silently and simply yield no task, which is the same
+/// "silently stops dispatching" failure the class-id separation documented on
+/// [`lock_queue_for_pause`] exists to prevent — reached from a different side.
+///
+/// Shared mode is sufficient because this lock's only job is to order the
+/// enforcement against pause/resume. Two concurrent enforcements need no mutual
+/// exclusion: they act on distinct tasks and already serialize on the task rows
+/// they lock.
+///
+/// # Why blocking, not `try`
+///
+/// Unlike [`try_lock_queue_for_claim`] — which is called *after* the claim
+/// query, so it must never wait — this is the **first** statement in the
+/// enforcement transaction, before any row lock, so it cannot participate in a
+/// wait cycle (see the lock-ordering note in `enforce_activity_timeout`). It
+/// must actually wait: bailing out on contention would skip the pause re-check
+/// and let the enforcement proceed against a stale snapshot, terminally failing
+/// the very task an in-flight pause was protecting.
+///
+/// # Errors
+///
+/// Database errors.
+#[cfg(feature = "db")]
+pub async fn lock_queue_for_timeout_recheck(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    diesel::sql_query(lock_queue_for_timeout_recheck_query())
         .bind::<diesel::sql_types::Integer, _>(QUEUE_PAUSE_LOCK_CLASS)
         .bind::<diesel::sql_types::Text, _>(queue_name)
         .execute(conn)
@@ -1947,6 +2015,75 @@ mod tests {
             lock_queue_for_pause_query().contains("hashtext($2)"),
             "the pause side must key on the same (classid, hashtext(queue)) pair, \
              or the shared/exclusive pair would not actually exclude"
+        );
+    }
+
+    /// Round-21 P2: the timeout re-check takes the **shared** mode of the pause
+    /// key, so it orders against pause/resume without blocking claims.
+    ///
+    /// Three independently falsifiable properties. Exclusive mode (what this
+    /// used to be) blocks the shared claim barrier, so an enforcement
+    /// transaction stalls all dispatch on an unpaused queue. The `try` variant
+    /// would skip the pause re-check under contention and let a stale snapshot
+    /// terminally fail a held task. The single-argument keyspace would collide
+    /// with `claim_task`'s `concurrency_key` gate.
+    #[test]
+    fn timeout_recheck_lock_is_shared_and_blocking_on_the_pause_key() {
+        let sql = lock_queue_for_timeout_recheck_query();
+        assert!(
+            sql.contains("pg_advisory_xact_lock_shared($1, hashtext($2))"),
+            "the timeout re-check must take the shared, BLOCKING lock in the \
+             two-argument keyspace; got:\n{sql}"
+        );
+        for wrong in [
+            // Exclusive: blocks every claim's shared barrier for the whole
+            // enforcement transaction, on a queue that is not even paused.
+            "pg_advisory_xact_lock($1, hashtext($2))",
+            "pg_try_advisory_xact_lock($1",
+            // Try: would silently skip the pause re-check under contention.
+            "pg_try_advisory_xact_lock_shared($1",
+            // Single-argument keyspace: collides with the concurrency_key gate.
+            "pg_advisory_xact_lock_shared(hashtext($1))",
+        ] {
+            assert!(
+                !sql.contains(wrong),
+                "the timeout re-check must not use `{wrong}`; got:\n{sql}"
+            );
+        }
+        // Shared and exclusive only exclude each other if they name the same
+        // key, so the two spellings must agree beyond the mode.
+        assert!(
+            sql.contains("($1, hashtext($2))")
+                && lock_queue_for_pause_query().contains("($1, hashtext($2))"),
+            "the re-check and the pause must key on the same (classid, hashtext(queue)) \
+             pair, or they would not actually serialize"
+        );
+    }
+
+    /// Round-21 P2: neither `schedule_to_start` enforcement path may reach for
+    /// the exclusive lock.
+    ///
+    /// Source-level because the hazard is a *call site* choosing the wrong
+    /// helper — the exclusive function is still correct, and still used, for
+    /// pause and resume themselves. The workflow path is the worse of the two:
+    /// it holds the lock across `append_events`, the parent-close cascade and
+    /// trigger evaluation.
+    #[test]
+    fn timeout_enforcement_never_takes_the_exclusive_queue_lock() {
+        let src = include_str!("timeout.rs");
+        assert!(
+            !src.contains("queue_pause::lock_queue_for_pause("),
+            "a timeout enforcement path is taking the EXCLUSIVE queue lock; that \
+             blocks every claim's shared barrier for the whole transaction and \
+             stalls dispatch on an unpaused queue -- use \
+             `lock_queue_for_timeout_recheck` (shared)"
+        );
+        assert_eq!(
+            src.matches("queue_pause::lock_queue_for_timeout_recheck(")
+                .count(),
+            2,
+            "both schedule_to_start enforcement paths (activity and workflow) must \
+             take the shared re-check lock"
         );
     }
 

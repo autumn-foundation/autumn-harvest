@@ -939,8 +939,14 @@ async fn enforce_activity_timeout(
         // pause never touches — so the lock is taken only for that reason and
         // never on the far more common in-flight timeout paths. Bailing here
         // also skips the row locks and history load entirely for a held task.
+        //
+        // SHARED mode (round-21 review): exclusive would block every claim's
+        // `try_lock_queue_for_claim` for this whole transaction, stalling
+        // dispatch on a queue that is not paused at all. Shared still mutually
+        // excludes the exclusive pause/resume, which is the only ordering this
+        // re-check needs. See `lock_queue_for_timeout_recheck`.
         if matches!(reason, TimeoutReason::ScheduleToStart) {
-            crate::queue_pause::lock_queue_for_pause(conn, &task.queue_name).await?;
+            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
             if crate::queue_pause::queue_pause_suppresses_timeout(
                 reason,
                 crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
@@ -1397,7 +1403,12 @@ async fn enforce_workflow_timeout(
         // held task can never count toward the schedule auto-pause threshold
         // (issue #360). A hold is not a schedule failure.
         if matches!(reason, TimeoutReason::ScheduleToStart) {
-            crate::queue_pause::lock_queue_for_pause(conn, &task.queue_name).await?;
+            // Shared mode, exactly as in `enforce_activity_timeout` — and it
+            // matters more here, because this transaction holds the lock across
+            // `append_events`, the parent-close cascade and trigger evaluation,
+            // so an exclusive lock would stall dispatch on an unpaused queue for
+            // that entire span. See `lock_queue_for_timeout_recheck`.
+            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
             if crate::queue_pause::queue_pause_suppresses_timeout(
                 reason,
                 crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,

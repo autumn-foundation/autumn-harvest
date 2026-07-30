@@ -2689,3 +2689,141 @@ async fn pause_credits_the_backlog_scan_interval() {
          interval credited back; apparent wait {wait}s"
     );
 }
+
+/// Round-21 P2: a timeout enforcement must not stall dispatch on an unpaused queue.
+///
+/// The `schedule_to_start` enforcer takes the queue advisory lock so a pause
+/// committing after its scan still suppresses the timeout. It originally took the
+/// **exclusive** mode — the same one `pause_queue`/`resume_queue` take. From round
+/// 18 onward that is a dispatch outage: `try_lock_queue_for_claim` takes the
+/// **shared** mode of that key on every claim, and exclusive blocks shared, so for
+/// the whole enforcement transaction every claim on the queue fails its `try` and
+/// releases its task — on a queue with no pause at all. The workflow sibling holds
+/// the lock across `append_events`, the parent-close cascade and trigger
+/// evaluation, so a backlog of expired tasks can halt unrelated work repeatedly.
+///
+/// Shared mode is exactly enough: it still mutually excludes the exclusive
+/// pause/resume (the ordering the re-check depends on) while being compatible with
+/// the claim barrier.
+///
+/// Both halves are asserted, because dropping the lock entirely would also make
+/// the first half pass while silently destroying the round-2/round-15 guarantee.
+///
+/// Parking the enforcer *inside* the window is the whole difficulty. A table lock
+/// on `harvest_queue_pauses` does not work: `find_timed_out_tasks` consults it for
+/// the scan's own carve-out, so the enforcer blocks in the scan, *before* taking
+/// the advisory lock — the probes then measure nothing (and the second half
+/// passes off the probe connection's own shared lock). It is instead parked on the
+/// **execution row**: the enforcer takes the advisory lock, clears both re-checks,
+/// and only then calls `lock_workflow_execution_row_and_load_history`, so holding
+/// that row `FOR UPDATE` elsewhere stalls it with the queue lock held. The scan
+/// takes no execution-row locks, so it still runs to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
+    use diesel_async::RunQueryDsl;
+
+    let (url, _c) = setup_db_url().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("DELETE FROM harvest_queue_pauses")
+        .await
+        .expect("scrub pauses");
+
+    // An expired schedule_to_start task on a queue that is NOT paused.
+    let q = unique_queue("sharedlock");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(&q, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id);
+    params.activity_name = Some("noop".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    backdate_scheduled_at(&mut conn, task_id, 3600).await;
+
+    // Park the enforcer with the advisory lock held: it clears both re-checks and
+    // then row-locks the execution, which this holder owns for the duration.
+    let mut blocker = connect(&url).await;
+    blocker.batch_execute("BEGIN").await.expect("blocker begin");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .execute(&mut blocker)
+        .await
+        .expect("hold the execution row");
+
+    let enforcer_url = url.clone();
+    let enforcer = tokio::spawn(async move {
+        let mut c = connect(&enforcer_url).await;
+        autumn_harvest::timeout::enforce_timeouts_once(
+            &mut c,
+            &autumn_harvest::telemetry::NoOpMetrics,
+            std::time::Duration::from_secs(60),
+            &None,
+            &[],
+            None,
+            None,
+            60,
+        )
+        .await
+    });
+
+    // Let it reach (and park inside) the locked window.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    #[derive(diesel::QueryableByName)]
+    struct AcquiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        acquired: bool,
+    }
+
+    // Half 1 — a claim's barrier must still succeed. This is the shared/shared
+    // pair; under the exclusive lock it returns false and the claim is released.
+    let mut claimer = connect(&url).await;
+    claimer.batch_execute("BEGIN").await.expect("claimer begin");
+    let claim_barrier: AcquiredRow =
+        diesel::sql_query(autumn_harvest::queue_pause::try_lock_queue_for_claim_query())
+            .bind::<diesel::sql_types::Integer, _>(
+                autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS,
+            )
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .get_result(&mut claimer)
+            .await
+            .expect("probe the claim barrier");
+    assert!(
+        claim_barrier.acquired,
+        "a timeout enforcement must not block claims on an unpaused queue: the \
+         claim barrier takes the SHARED mode of the queue key, so an enforcement \
+         holding it EXCLUSIVELY silently stops dispatch for its whole transaction"
+    );
+    // Drop it before probing the exclusive side, or half 2 would be satisfied by
+    // this probe's own shared lock rather than by the enforcer's.
+    claimer
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("claimer end");
+
+    // Half 2 — pause/resume must still be excluded. Probed with the non-blocking
+    // TRY exclusive so the assertion is deterministic rather than a timeout.
+    let mut pauser = connect(&url).await;
+    pauser.batch_execute("BEGIN").await.expect("pauser begin");
+    let pause_lock: AcquiredRow =
+        diesel::sql_query("SELECT pg_try_advisory_xact_lock($1, hashtext($2)) AS acquired")
+            .bind::<diesel::sql_types::Integer, _>(
+                autumn_harvest::queue_pause::QUEUE_PAUSE_LOCK_CLASS,
+            )
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .get_result(&mut pauser)
+            .await
+            .expect("probe the exclusive pause lock");
+    assert!(
+        !pause_lock.acquired,
+        "the shared re-check lock must still exclude the exclusive pause/resume, \
+         or a pause could commit between the enforcer's re-check and its own \
+         commit and the task would be timed out because its queue was paused"
+    );
+
+    pauser.batch_execute("ROLLBACK").await.expect("pauser end");
+    blocker.batch_execute("COMMIT").await.expect("release");
+    enforcer
+        .await
+        .expect("the enforcer task must not panic")
+        .expect("enforcement must succeed");
+}
