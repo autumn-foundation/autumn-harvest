@@ -2354,6 +2354,56 @@ fn queue_pause_percent_encodes_the_queue_name() {
 }
 
 #[test]
+fn queue_pause_rejects_url_dot_segment_queue_names() {
+    // A literal `.` or `..` queue name is NOT percent-encodable out of the
+    // problem: the WHATWG URL parser that reqwest uses collapses dot-segments
+    // *after* `ApiRequest.path` is built, so a `.` name silently rewrites the
+    // request to `/admin/queues/pause` -- a DIFFERENT route. Rejection at
+    // request-construction time is the only correct handling.
+    //
+    // The `%2e` spellings are additionally rejected as defense in depth: they
+    // are already neutralized today by `PATH_SEGMENT_ENCODE_SET` encoding `%`
+    // (they reach the URL as `%252e`), and the guard should not silently depend
+    // on that staying true.
+    for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
+        let cli = Cli::try_parse_from(["harvest", "queue", "pause", bad, "--reason", "x"])
+            .expect("queue pause args should parse");
+
+        assert!(
+            cli.api_request().is_err(),
+            "queue name {bad:?} normalizes away in the URL path and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn queue_resume_rejects_url_dot_segment_queue_names() {
+    // Same hazard on the destructive direction: a `..` resume must never be
+    // allowed to silently target `/admin/pause`.
+    for bad in [".", "..", "%2e", "%2E"] {
+        let cli = Cli::try_parse_from(["harvest", "queue", "resume", bad])
+            .expect("queue resume args should parse");
+
+        assert!(
+            cli.api_request().is_err(),
+            "queue name {bad:?} normalizes away in the URL path and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn queue_pause_still_accepts_names_that_merely_contain_dots() {
+    // Only a WHOLE-segment `.`/`..` is a dot-segment -- `a.b` is a perfectly
+    // ordinary queue name and must not be swept up by the rejection.
+    let cli = Cli::try_parse_from(["harvest", "queue", "pause", "orders.eu", "--reason", "x"])
+        .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.path, "/admin/queues/orders.eu/pause");
+}
+
+#[test]
 fn queue_pause_requires_a_reason() {
     // A hold with no stated cause is unauditable -- clap must reject it.
     assert!(

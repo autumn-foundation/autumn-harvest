@@ -34875,10 +34875,16 @@ async fn evaluate_eligibility_for_shard(
     // Issue #619: a queue held by an operator pause is unclaimable for a reason
     // that has nothing to do with worker capacity, so surface it explicitly
     // rather than reporting an empty (falsely "unimpeded") reason set.
+    //
+    // The lookup PROPAGATES on failure rather than defaulting to empty: this
+    // explainer exists to answer "why is nothing being claimed?" during an
+    // incident, and swallowing a database error would answer it with a
+    // confident, wrong "nothing is holding this queue". Matches the sibling
+    // rate-limit read above.
     let paused_queues: std::collections::HashSet<String> =
         autumn_harvest::queue_pause::paused_queue_names(&mut conn)
             .await
-            .unwrap_or_default()
+            .map_err(map_error)?
             .into_iter()
             .collect();
 

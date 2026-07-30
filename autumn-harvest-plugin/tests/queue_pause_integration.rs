@@ -29,6 +29,9 @@
 //!   (j) A typo'd field in a queue-control body is rejected 400 rather than
 //!       silently widening a shard-scoped request to fleet-wide — on the resume
 //!       route that would release every hold mid-outage.
+//!   (k) A failed pause-state lookup on the eligibility explainer propagates as
+//!       a 5xx rather than being read as "no queues paused", which would tell a
+//!       triaging operator a held queue is unimpeded.
 
 // Test-code style lints, consistent with `queue_pause_tests.rs` in the core
 // crate: the module docs name response/database fields verbatim.
@@ -984,5 +987,51 @@ async fn an_idempotent_repause_echoes_the_effective_scope_not_the_request() {
         body["scope_shard_id"], 0,
         "the effective scope must be preserved alongside the reason -- reporting \
          null here would describe a shard-scoped hold as fleet-wide: {body}"
+    );
+}
+
+/// A pause-state lookup that FAILS must not be read as "no queues paused".
+///
+/// The eligibility explainer's whole job during an incident is to answer "why
+/// is nothing being claimed from this queue?". Swallowing a database error into
+/// an empty paused set answers that question with a confident, wrong "nothing is
+/// holding it" — the single most misleading thing this endpoint can say. The
+/// sibling rate-limit read in the same function already propagates, so this is
+/// also an internal-consistency fix.
+///
+/// The fault is injected by dropping `harvest_queue_pauses`, which is the one
+/// way to make the lookup fail without reaching into the pool internals; the
+/// lookup is a plain query with no `to_regclass` guard, so a missing table is a
+/// genuine error rather than a silent empty result.
+#[tokio::test]
+async fn a_failed_pause_lookup_surfaces_as_an_error_not_an_empty_paused_set() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // A pending task so the explainer has something to reason about.
+    seed_pending_tasks(&pool, "payments", 1).await;
+
+    // Sanity: the explainer works before the fault is injected.
+    let (status, _body) = get_json(&app, "/admin/queues/payments/eligibility").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the explainer must be healthy before the fault is injected"
+    );
+
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query("DROP TABLE harvest_queue_pauses")
+            .execute(&mut conn)
+            .await
+            .expect("drop the pause table to fail the lookup");
+    }
+
+    let (status, body) = get_json(&app, "/admin/queues/payments/eligibility").await;
+    assert!(
+        status.is_server_error(),
+        "a failed pause-state lookup must propagate, not be reported as \
+         'no queues paused' with a 200: got {status} {body}"
     );
 }

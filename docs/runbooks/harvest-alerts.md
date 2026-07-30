@@ -1487,6 +1487,12 @@ value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
 - `harvest queue pause <queue> --reason "<why>"` — re-freezing is idempotent and
   **preserves the original reason and operator**, so a re-pause never overwrites
   the provenance of an existing hold.
+- Both mutating commands **exit non-zero when a fleet-wide hold only partially
+  applied** (HTTP `207`): the shards the request missed keep dispatching into the
+  outage, so a scripted `harvest queue pause` step fails loudly rather than
+  reporting success. Re-issue it — both operations are idempotent — and confirm
+  with `harvest queue list-paused` that `effective_scope` reads `fleet` rather
+  than `partial_fleet`.
 - Inspecting a held task with `harvest workflow stack <id>` or the eligibility
   explainer (`GET /admin/queues/{queue}/eligibility`), which reports
   `queue_paused` as the first impediment.
