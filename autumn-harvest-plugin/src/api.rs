@@ -1,7 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -9891,8 +9891,20 @@ fn parse_lineage_query(pairs: &[(String, String)]) -> Result<LineageQueryParams,
                 })?);
             }
             "summary" => {
+                // Rejected rather than defaulted to `false`: a caller who
+                // typos the value and silently receives a full tree with a
+                // 200 has no way to notice, and every other bound on this
+                // route is a hard 400 on an invalid value.
                 let v = value.trim();
-                summary = v.eq_ignore_ascii_case("true") || v == "1";
+                summary = match v {
+                    _ if v.eq_ignore_ascii_case("true") || v == "1" => true,
+                    _ if v.eq_ignore_ascii_case("false") || v == "0" => false,
+                    _ => {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid summary '{value}' (expected true or false)"
+                        )));
+                    }
+                };
             }
             _ => {}
         }
@@ -9929,6 +9941,11 @@ async fn build_lineage_report(
     let mut walk = LineageWalk::new(root_row.exec_id, limits);
     let mut frontier = vec![root_row.exec_id.as_uuid()];
     let mut shard_errors: BTreeMap<i32, String> = BTreeMap::new();
+    // Evidence, not arithmetic: a shard is only "inspected" once it has
+    // actually answered. Deriving this as `expected - errors` would claim a
+    // complete read on a path where zero shards were queried (a budget that
+    // only fits the root breaks the loop before the first round).
+    let mut observed: BTreeSet<i32> = BTreeSet::new();
 
     for depth in 1..=limits.max_depth {
         if frontier.is_empty() || walk.is_exhausted() {
@@ -9948,13 +9965,26 @@ async fn build_lineage_report(
         }))
         .await;
 
-        let rows = absorb_lineage_observations(observations, &mut shard_errors);
+        // A shard whose window came back full may have had rows cut by the
+        // SQL LIMIT that the budget sentinel never got to observe.
+        let saturated = observations
+            .iter()
+            .any(|o| i64::try_from(o.rows.len()).unwrap_or(i64::MAX) >= fetch_limit);
+        let rows = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
         frontier = walk.admit_level(depth, rows);
+        if saturated {
+            walk.note_saturated_fetch_window();
+        }
     }
 
     // Existence probe: name ONLY the unexpanded leaves that provably have
     // children, so a childless leaf is never reported as a dropped subtree.
-    let probe_targets = walk.unexpanded_frontier();
+    //
+    // The live `frontier` is the authoritative unexpanded set on every exit
+    // path — empty when the tree completed naturally, the deepest admitted
+    // level on a depth exit, and `[root]` when the budget was spent before a
+    // single round ran.
+    let probe_targets = frontier;
     if !probe_targets.is_empty() {
         let observations = futures::future::join_all(expected.iter().map(|shard_id| {
             lineage_probe_on_shard(
@@ -9965,12 +9995,12 @@ async fn build_lineage_report(
         }))
         .await;
 
-        let parents = absorb_lineage_observations(observations, &mut shard_errors);
+        let parents = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
         walk.record_probe_result(&parents);
     }
 
     let mut report = walk.finish(lineage_root_node(root_row));
-    let inspected = expected.len().saturating_sub(shard_errors.len());
+    let inspected = observed.len();
     report.status = FanoutStatus::from_counts(inspected, shard_errors.len());
     report.unavailable_shards = shard_errors
         .into_iter()
@@ -10053,7 +10083,7 @@ async fn lineage_probe_on_shard(
 }
 
 /// Fold one level's (or the probe's) per-shard observations into a flat row set,
-/// recording the first error seen per shard.
+/// recording the first error seen per shard and which shards actually answered.
 ///
 /// First-error-per-shard is deliberate: a shard that is down stays down for
 /// every level, so this collapses to one `unavailable_shards` entry rather than
@@ -10061,11 +10091,14 @@ async fn lineage_probe_on_shard(
 fn absorb_lineage_observations<R>(
     observations: Vec<ShardObservation<R>>,
     shard_errors: &mut BTreeMap<i32, String>,
+    observed: &mut BTreeSet<i32>,
 ) -> Vec<R> {
     let mut rows = Vec::new();
     for observation in observations {
         if let Some(error) = observation.error {
             shard_errors.entry(observation.shard_id).or_insert(error);
+        } else {
+            observed.insert(observation.shard_id);
         }
         rows.extend(observation.rows);
     }

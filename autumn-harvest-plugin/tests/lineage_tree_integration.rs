@@ -421,6 +421,19 @@ async fn a_detached_child_reports_its_parent_close_policy() {
         Spec::child(root, "detached", 2).detached("terminate"),
     )
     .await;
+    // `await_mode` is derived as "detached iff the stored policy parses", so
+    // every accepted spelling must be exercised — an unparsed one would
+    // silently report a detached child as awaited.
+    insert(
+        &mut conn,
+        Spec::child(root, "detached-abandon", 3).detached("abandon"),
+    )
+    .await;
+    insert(
+        &mut conn,
+        Spec::child(root, "detached-cancel", 4).detached("request_cancel"),
+    )
+    .await;
 
     let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
     assert_eq!(status, StatusCode::OK);
@@ -438,6 +451,71 @@ async fn a_detached_child_reports_its_parent_close_policy() {
         .expect("detached child");
     assert_eq!(detached["await_mode"], "detached");
     assert_eq!(detached["parent_close_policy"], "terminate");
+
+    for (wf_id, policy) in [
+        ("detached-abandon", "abandon"),
+        ("detached-cancel", "request_cancel"),
+    ] {
+        let node = kids
+            .iter()
+            .find(|c| c["workflow_id"] == wf_id)
+            .unwrap_or_else(|| panic!("{wf_id} child"));
+        assert_eq!(node["await_mode"], "detached", "{wf_id}");
+        assert_eq!(node["parent_close_policy"], policy, "{wf_id}");
+    }
+}
+
+/// The root's OWN projection is easy to leave unasserted, because every other
+/// test roots at a live workflow. Rooting at a *finished* saga is the common
+/// triage case, so its terminal timestamp and identity must survive.
+#[tokio::test]
+async fn a_terminal_root_reports_its_own_closed_at_and_identity() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("done").in_state("COMPLETED")).await;
+    insert(&mut conn, Spec::child(root, "kid", 1)).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
+    assert_eq!(status, StatusCode::OK);
+    let node = &body["root"];
+    assert_eq!(node["execution_id"], root.to_string());
+    assert_eq!(node["workflow_name"], "root_wf");
+    assert_eq!(node["workflow_id"], "done");
+    assert_eq!(node["state"], "COMPLETED");
+    assert_eq!(node["depth"], 0);
+    assert!(
+        !node["closed_at"].is_null(),
+        "a terminal root must report when it closed, got {node}"
+    );
+    assert!(!node["started_at"].is_null());
+}
+
+/// A budget that fits the whole tree exactly is a COMPLETE answer. This is the
+/// guard against over-correcting the truncation fixes into false positives.
+#[tokio::test]
+async fn a_budget_that_fits_the_tree_exactly_is_not_reported_as_truncated() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("exact")).await;
+    insert(&mut conn, Spec::child(root, "a", 1)).await;
+    insert(&mut conn, Spec::child(root, "b", 2)).await;
+
+    // root + 2 children == 3, and there are no grandchildren.
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?max_nodes=3")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_count"], 3);
+    assert_eq!(
+        body["truncated"], false,
+        "the whole tree fit; nothing was cut"
+    );
+    assert!(body["truncation_reason"].is_null());
+    assert!(
+        body["truncated_parent_ids"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
 }
 
 // ── Cross-shard (the headline AC) ────────────────────────────────────────
@@ -531,6 +609,21 @@ async fn an_unreachable_shard_degrades_to_partial_instead_of_failing_the_whole_c
     assert_eq!(unavailable[0]["shard_id"], 1, "the down shard is named");
     // The reachable shard's rows still flow.
     assert!(body.to_string().contains(&child.to_string()));
+
+    // Summary mode must carry the SAME verdict. A roll-up that reads
+    // `complete` during an outage is worse than a partial tree, because the
+    // counts look authoritative.
+    let (status, summary) = get_json(&app, &format!("/workflows/{root}/tree?summary=true")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        summary["status"], "partial",
+        "the summary must not claim a complete read"
+    );
+    let summary_unavailable = summary["unavailable_shards"]
+        .as_array()
+        .expect("summary names the down shard too");
+    assert_eq!(summary_unavailable.len(), 1);
+    assert_eq!(summary_unavailable[0]["shard_id"], 1);
 }
 
 // ── Bounds (AC: no silent cap) ───────────────────────────────────────────
@@ -606,6 +699,144 @@ async fn max_nodes_truncation_flags_the_reason_and_names_the_dropped_parent() {
     assert!(
         dropped.contains(&Value::String(root.to_string())),
         "the parent whose children were dropped is named"
+    );
+}
+
+/// `max_nodes=1` spends the entire budget on the root, so the walk breaks
+/// before querying a single shard. That must still be reported as a
+/// truncation — a root with children is otherwise indistinguishable from a
+/// leaf, which is exactly the silent cap AC4 forbids.
+#[tokio::test]
+async fn a_budget_that_only_fits_the_root_is_still_reported_as_truncated() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("budget-one")).await;
+    insert(&mut conn, Spec::child(root, "only-child", 0)).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?max_nodes=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_count"], 1);
+    assert_eq!(
+        body["truncated"], true,
+        "the root provably has a child that did not fit the budget"
+    );
+    assert_eq!(body["truncation_reason"], "max_nodes");
+    let dropped = body["truncated_parent_ids"].as_array().expect("array");
+    assert!(
+        dropped.contains(&Value::String(root.to_string())),
+        "the root is named so the operator can re-root with a bigger budget"
+    );
+}
+
+/// The mirror of the test above: when the root genuinely has no children, a
+/// budget of one is a *complete* answer, not a truncated one.
+#[tokio::test]
+async fn a_childless_root_at_the_budget_floor_is_not_reported_as_truncated() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("budget-one-leaf")).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?max_nodes=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_count"], 1);
+    assert_eq!(body["truncated"], false, "a leaf is a complete answer");
+    assert!(body["truncation_reason"].is_null());
+}
+
+/// A budget that is spent EXACTLY (no row is ever rejected for budget) still
+/// stopped the walk for `max_nodes`, not `max_depth`. An alerting consumer
+/// keys on the wire string, so raising the wrong bound must not be suggested.
+#[tokio::test]
+async fn an_exactly_spent_budget_reports_max_nodes_not_max_depth() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    // root -> a -> c : a chain, so each level admits exactly one node.
+    let root = insert(&mut conn, Spec::root("chain-root")).await;
+    let a = insert(&mut conn, Spec::child(root, "a", 0)).await;
+    insert(&mut conn, Spec::child(a, "c", 1)).await;
+
+    // root + a fits exactly; `c` is never fetched and nothing is rejected.
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows/{root}/tree?max_nodes=2&max_depth=20"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_count"], 2);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(
+        body["truncation_reason"], "max_nodes",
+        "the node budget is what stopped the walk; max_depth was nowhere near"
+    );
+}
+
+/// An unrecognised `summary` value must be rejected, not silently treated as
+/// `false` — a caller asking for a roll-up and receiving a full tree with a
+/// 200 has no way to notice the typo.
+#[tokio::test]
+async fn an_unrecognised_summary_value_is_rejected() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+    let root = insert(&mut conn, Spec::root("summary-typo")).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?summary=yes")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("summary"),
+        "the error names the offending parameter, got {body}"
+    );
+
+    // The accepted spellings still work, in both cases.
+    for (value, expect_summary) in [
+        ("true", true),
+        ("TRUE", true),
+        ("1", true),
+        ("false", false),
+    ] {
+        let (status, body) =
+            get_json(&app, &format!("/workflows/{root}/tree?summary={value}")).await;
+        assert_eq!(status, StatusCode::OK, "summary={value}");
+        assert_eq!(
+            body.get("counts").is_some(),
+            expect_summary,
+            "summary={value} should{} produce a roll-up",
+            if expect_summary { "" } else { " not" }
+        );
+    }
+}
+
+/// `status` must be evidence-based. A shard that was never queried cannot be
+/// reported as inspected — otherwise a total outage reads `complete`.
+#[tokio::test]
+async fn a_shard_that_was_never_queried_is_not_reported_as_inspected() {
+    let (admin, _guard) = setup_server().await;
+    let shard0 = create_shard_db(&admin, &unique("lineage_s0")).await;
+    let pool0 = build_pool(&shard0);
+
+    // Shard 1 is known to the router but its pool points nowhere reachable.
+    let dead = replace_database(&admin, "definitely_not_a_database");
+    let pools = std::collections::BTreeMap::from([
+        (ShardId::new(0), pool0.clone()),
+        (ShardId::new(1), build_pool(&dead)),
+    ]);
+    let app = build_app(
+        HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0))),
+        router_for(&[0, 1]),
+    );
+    let mut conn = pool0.get().await.expect("shard 0 conn");
+
+    let root = insert(&mut conn, Spec::root("never-queried")).await;
+    insert(&mut conn, Spec::child(root, "kid", 0)).await;
+
+    // Budget of one: the walk breaks before touching either shard.
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?max_nodes=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        body["status"], "complete",
+        "no shard was queried, so the read cannot claim to be complete"
     );
 }
 

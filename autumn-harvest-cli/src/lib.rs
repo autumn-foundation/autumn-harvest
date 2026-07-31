@@ -1045,10 +1045,10 @@ enum WorkflowCommand {
         #[arg(long)]
         summary: bool,
         /// Recursion depth cap below the root (1-50, default 20).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=50))]
         max_depth: Option<u32>,
         /// Total node cap including the root (1-10000, default 1000).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
         max_nodes: Option<u32>,
         /// Emit raw JSON instead of the default rendering.
         #[arg(long)]
@@ -9166,11 +9166,20 @@ mod completion_delivery_cli_tests {
                     "depth": 1,
                     "await_mode": "detached",
                     "parent_close_policy": "request_cancel",
-                    "children": []
+                    "children": [{
+                        "execution_id": "33333333-3333-3333-3333-333333333333",
+                        "workflow_name": "refund_card",
+                        "workflow_id": "refund-42",
+                        "state": "COMPLETED",
+                        "depth": 2,
+                        "await_mode": "awaited",
+                        "parent_close_policy": null,
+                        "children": []
+                    }]
                 }]
             },
-            "node_count": 2,
-            "max_depth_reached": 1,
+            "node_count": 3,
+            "max_depth_reached": 2,
             "truncated": false,
             "truncated_parent_ids": [],
             "truncated_parents_capped": false,
@@ -9197,7 +9206,46 @@ mod completion_delivery_cli_tests {
             lines[1].contains("[detached:request_cancel]"),
             "a detached child must surface its parent-close policy"
         );
-        assert!(rendered.contains("2 node(s), max depth 1"));
+        // Depth 2 is what proves the indent GROWS per level rather than being
+        // a constant applied to every non-root node.
+        assert!(
+            lines[2].starts_with("    "),
+            "the grandchild must be indented one level deeper again, got {:?}",
+            lines[2]
+        );
+        assert!(lines[2].contains("33333333-3333-3333-3333-333333333333"));
+        assert!(rendered.contains("3 node(s), max depth 2"));
+    }
+
+    #[test]
+    fn lineage_tree_bounds_are_rejected_locally_when_out_of_range() {
+        // The server rejects these too, but a local rejection saves a
+        // pointless round-trip — matching the adjacent `workflow children`.
+        for args in [
+            vec!["harvest", "workflow", "tree", "abc", "--max-depth", "0"],
+            vec!["harvest", "workflow", "tree", "abc", "--max-depth", "51"],
+            vec!["harvest", "workflow", "tree", "abc", "--max-nodes", "0"],
+            vec!["harvest", "workflow", "tree", "abc", "--max-nodes", "10001"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} should be rejected at parse time"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "workflow",
+                "tree",
+                "abc",
+                "--max-depth",
+                "50",
+                "--max-nodes",
+                "10000",
+            ])
+            .is_ok(),
+            "the ceilings themselves are inclusive"
+        );
     }
 
     #[test]

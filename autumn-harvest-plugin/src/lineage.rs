@@ -316,9 +316,8 @@ pub fn root_row_from_execution(execution: &WorkflowExecution) -> LineageChildRow
 /// (across shards), hand them to [`admit_level`](Self::admit_level), and repeat
 /// with the returned next frontier until it is empty, the depth cap is reached,
 /// or [`is_exhausted`](Self::is_exhausted) reports the node budget is spent.
-/// Then probe [`unexpanded_frontier`](Self::unexpanded_frontier) for surviving
-/// children, feed the answer to
-/// [`record_probe_result`](Self::record_probe_result), and
+/// Then probe that final, unexpanded frontier for surviving children, feed the
+/// answer to [`record_probe_result`](Self::record_probe_result), and
 /// [`finish`](Self::finish).
 #[derive(Debug)]
 pub struct LineageWalk {
@@ -331,7 +330,6 @@ pub struct LineageWalk {
     nodes: Vec<LineageChildRow>,
     /// Ids admitted at the most recent level — the leaves the walk never
     /// expanded, and therefore the existence probe's input.
-    last_level_ids: Vec<uuid::Uuid>,
     /// Parents whose children were observed and dropped for budget, plus any
     /// the probe confirmed. Sorted/deduped by the `BTreeSet`.
     dropped_parents: BTreeSet<uuid::Uuid>,
@@ -349,7 +347,6 @@ impl LineageWalk {
             limits,
             visited,
             nodes: Vec::new(),
-            last_level_ids: Vec::new(),
             dropped_parents: BTreeSet::new(),
             reason: None,
             max_depth_reached: 0,
@@ -392,13 +389,6 @@ impl LineageWalk {
         self.dropped_parents.iter().copied().collect()
     }
 
-    /// The leaves the walk admitted but never expanded — the existence probe's
-    /// input. Empty when the tree was fully walked.
-    #[must_use]
-    pub fn unexpanded_frontier(&self) -> Vec<uuid::Uuid> {
-        self.last_level_ids.clone()
-    }
-
     /// Admit one level's discovered rows and return the next frontier.
     ///
     /// Rows arrive per-shard and are therefore re-sorted `(started_at,
@@ -423,13 +413,16 @@ impl LineageWalk {
             if self.is_exhausted() {
                 // Over budget: keep scanning (rather than breaking) so every
                 // observed dropped parent is named, not just the first.
+                //
+                // The id stays in `visited`. Exhaustion is monotone — once
+                // `is_exhausted()` is true it never becomes false again — so
+                // no admission can follow a rejection, and leaving the id
+                // marked keeps a duplicate of a rejected row from being
+                // admitted if that invariant is ever relaxed.
                 self.reason.get_or_insert(TruncationReason::MaxNodes);
                 if let Some(parent) = row.parent_id {
                     self.dropped_parents.insert(parent.as_uuid());
                 }
-                // Un-visit so the id is not silently swallowed if the caller
-                // ever re-walks with a larger budget.
-                self.visited.remove(&uuid);
                 continue;
             }
             next.push(uuid);
@@ -439,24 +432,48 @@ impl LineageWalk {
         if !next.is_empty() {
             self.max_depth_reached = self.max_depth_reached.max(depth);
         }
-        self.last_level_ids.clone_from(&next);
         next
     }
 
     /// Record which unexpanded leaves provably have children.
     ///
     /// Only ids returned by the probe are named as dropped subtrees, so a
-    /// childless leaf is never reported as truncated. When no bound has fired
-    /// yet, a non-empty result means the depth cap is what stopped the walk.
+    /// childless leaf is never reported as truncated. An empty result is the
+    /// signal that the walk genuinely finished — it must not truncate.
+    ///
+    /// Which bound to blame is decided by the live budget rather than assumed
+    /// to be the depth cap: a level can spend the budget *exactly* (no row is
+    /// ever rejected, so `admit_level` never sets a reason) and still be what
+    /// stopped the walk. Blaming `max_depth` there would send an operator to
+    /// raise a bound that was nowhere near its limit.
     pub fn record_probe_result(&mut self, parents_with_children: &[uuid::Uuid]) {
         if parents_with_children.is_empty() {
             return;
         }
-        // `get_or_insert` preserves a MaxNodes verdict: that bound terminated
-        // the walk first, so it stays the reported reason.
-        self.reason.get_or_insert(TruncationReason::MaxDepth);
+        let bound = if self.is_exhausted() {
+            TruncationReason::MaxNodes
+        } else {
+            TruncationReason::MaxDepth
+        };
+        // `get_or_insert` preserves a verdict already set by a budget-rejected
+        // row: that bound terminated the walk first, so it stays reported.
+        self.reason.get_or_insert(bound);
         self.dropped_parents
             .extend(parents_with_children.iter().copied());
+    }
+
+    /// Note that a shard's fetch window came back full.
+    ///
+    /// `fetch_limit` is `remaining_budget + 1` precisely so an overflow row is
+    /// *observed* and its parent named. That sentinel is defeated when a row
+    /// in the window is dropped by the cycle/duplicate guard, which consumes a
+    /// slot without consuming budget — the SQL `LIMIT` may then have cut real
+    /// rows that were never seen. A saturated window with no budget rejection
+    /// is therefore reported as a `MaxNodes` truncation: over-reporting sends
+    /// an operator to re-root needlessly, while under-reporting is the silent
+    /// cap the bounds exist to prevent.
+    pub fn note_saturated_fetch_window(&mut self) {
+        self.reason.get_or_insert(TruncationReason::MaxNodes);
     }
 
     /// Nest the admitted rows beneath `root` and produce the report.
@@ -715,6 +732,113 @@ mod tests {
     }
 
     #[test]
+    fn a_saturated_fetch_window_is_reported_as_a_budget_truncation() {
+        // The `remaining + 1` fetch sentinel assumes the overflow row reaches
+        // the budget check. A row dropped by the cycle/duplicate guard
+        // consumes a window slot WITHOUT consuming budget, so the SQL LIMIT
+        // may have cut real rows that were never observed. Over-reporting is
+        // the safe direction; a silent cap is the one the bounds forbid.
+        let root = id(1);
+        let mut walk = LineageWalk::new(
+            root,
+            LineageLimits {
+                max_depth: 20,
+                max_nodes: 3,
+            },
+        );
+        // Window is [duplicate-of-root, c1]: the first is deduped (no budget
+        // spent), the second fits — so nothing is ever budget-rejected.
+        walk.admit_level(
+            1,
+            vec![
+                row(root, root, "RUNNING", 0),
+                row(id(2), root, "RUNNING", 1),
+            ],
+        );
+        assert!(
+            !walk.truncated(),
+            "nothing has signalled a cut yet at this point"
+        );
+
+        walk.note_saturated_fetch_window();
+        assert!(
+            walk.truncated(),
+            "a full window means rows may have been cut"
+        );
+        assert_eq!(walk.truncation_reason(), Some(TruncationReason::MaxNodes));
+    }
+
+    #[test]
+    fn a_saturated_window_does_not_override_an_existing_verdict() {
+        let root = id(1);
+        let mut walk = LineageWalk::new(
+            root,
+            LineageLimits {
+                max_depth: 20,
+                max_nodes: 2,
+            },
+        );
+        walk.admit_level(
+            1,
+            vec![
+                row(id(2), root, "RUNNING", 1),
+                row(id(3), root, "RUNNING", 2),
+            ],
+        );
+        assert_eq!(walk.truncation_reason(), Some(TruncationReason::MaxNodes));
+        walk.note_saturated_fetch_window();
+        assert_eq!(
+            walk.truncation_reason(),
+            Some(TruncationReason::MaxNodes),
+            "the reason already set by a rejected row stands"
+        );
+    }
+
+    #[test]
+    fn admit_level_sorts_by_started_at_not_by_execution_id() {
+        // Ids are DECORRELATED from timestamps here on purpose: real
+        // execution ids are random, so a fixture where uuid order happens to
+        // match `started_at` order cannot tell a correct sort from one keyed
+        // on the id. `started_at` must win.
+        let root = id(1);
+        let mut walk = LineageWalk::new(root, generous());
+        let next = walk.admit_level(
+            1,
+            vec![
+                row(id(100), root, "RUNNING", 30), // lowest id, NEWEST
+                row(id(300), root, "RUNNING", 10), // highest id, OLDEST
+                row(id(200), root, "RUNNING", 20),
+            ],
+        );
+        assert_eq!(
+            next,
+            vec![id(300).as_uuid(), id(200).as_uuid(), id(100).as_uuid()],
+            "oldest-first by started_at, which here is the REVERSE of id order"
+        );
+    }
+
+    #[test]
+    fn admit_level_breaks_started_at_ties_by_execution_id() {
+        // Without a total order, two rows sharing a timestamp could survive a
+        // truncation in either order depending on shard iteration.
+        let root = id(1);
+        let mut walk = LineageWalk::new(root, generous());
+        let next = walk.admit_level(
+            1,
+            vec![
+                row(id(900), root, "RUNNING", 5),
+                row(id(400), root, "RUNNING", 5),
+                row(id(700), root, "RUNNING", 5),
+            ],
+        );
+        assert_eq!(
+            next,
+            vec![id(400).as_uuid(), id(700).as_uuid(), id(900).as_uuid()],
+            "identical started_at falls back to exec_id, matching the SQL ORDER BY"
+        );
+    }
+
+    #[test]
     fn admit_level_sorts_cross_shard_rows_deterministically() {
         // Rows arrive per-shard, so the merged level must be re-sorted before
         // any node-budget cut — otherwise which rows survive truncation would
@@ -821,20 +945,6 @@ mod tests {
         walk.admit_level(2, vec![row(id(3), id(2), "RUNNING", 2)]);
         assert_eq!(walk.remaining_budget(), 0);
         assert!(walk.is_exhausted());
-    }
-
-    // ── Unexpanded frontier (drives the existence probe) ─────────────────
-
-    #[test]
-    fn the_last_admitted_level_is_reported_as_the_unexpanded_frontier() {
-        let root = id(1);
-        let mut walk = LineageWalk::new(root, generous());
-        walk.admit_level(1, vec![row(id(2), root, "RUNNING", 1)]);
-        assert_eq!(
-            walk.unexpanded_frontier(),
-            vec![id(2).as_uuid()],
-            "the walk must hand the probe exactly the leaves it never expanded"
-        );
     }
 
     #[test]
