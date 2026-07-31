@@ -840,6 +840,137 @@ async fn a_shard_that_was_never_queried_is_not_reported_as_inspected() {
     );
 }
 
+// ── Retention-summarised lineage (issue #752) ─────────────────────────────
+
+/// Insert a `harvest_execution_summaries` row for a child that was demoted by
+/// tiered summary retention and had its execution row collected.
+async fn demote_child_to_summary(
+    conn: &mut AsyncPgConnection,
+    child: ExecutionId,
+    parent: ExecutionId,
+    state: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_execution_summaries \
+         (execution_id, workflow_name, workflow_id, state, started_at, completed_at, \
+          shard_id, parent_id, summarized_at) \
+         VALUES ($1, 'demoted_child', 'demoted-1', $2, NOW(), NOW(), 0, $3, NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(child.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(state.to_string())
+    .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
+    .execute(conn)
+    .await
+    .expect("insert summary row");
+}
+
+/// A terminal child demoted into a retention summary is invisible to a walk of
+/// `harvest_workflow_executions`. The tree must not then claim completeness —
+/// otherwise a FAILED child yields `truncated: false` and `counts.failed == 0`,
+/// the exact silent omission the bounds machinery exists to prevent.
+#[tokio::test]
+async fn a_child_demoted_into_a_retention_summary_is_reported_not_silently_dropped() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("saga")).await;
+    let live = insert(&mut conn, Spec::child(root, "live_child", 0)).await;
+
+    // A FAILED child that retention already demoted: summary row only, no
+    // execution row.
+    let demoted = ExecutionId::new_for_shard(ShardId::new(0));
+    demote_child_to_summary(&mut conn, demoted, root, "FAILED").await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The live child is still returned normally.
+    let kids = body["root"]["children"].as_array().expect("children array");
+    assert_eq!(kids.len(), 1, "only the live child can be nested: {body}");
+    assert_eq!(kids[0]["execution_id"], live.to_string());
+
+    // ...but the omission must be surfaced, naming the live parent to act from.
+    let named = body["retained_summary_parent_ids"]
+        .as_array()
+        .expect("retained_summary_parent_ids must be present");
+    assert!(
+        named.iter().any(|v| v == &json!(root.to_string())),
+        "the root has a retention-summarised child and must be named: {body}"
+    );
+}
+
+/// The signal must not fire on the default configuration — with summary
+/// retention off there are no summary rows, so an ordinary tree stays clean.
+#[tokio::test]
+async fn a_tree_with_no_summarised_children_reports_none_omitted() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("saga")).await;
+    insert(&mut conn, Spec::child(root, "kid", 0)).await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["retained_summary_parent_ids"],
+        json!([]),
+        "no summaries exist, so nothing may be reported as omitted: {body}"
+    );
+    assert_eq!(body["truncated"], json!(false));
+    assert_eq!(body["status"], json!("complete"));
+}
+
+/// A summarised child hanging off a *non-root* node must also be caught — the
+/// probe covers every admitted id, not just the unexpanded frontier.
+#[tokio::test]
+async fn a_summarised_child_of_an_interior_node_is_reported() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("saga")).await;
+    let mid = insert(&mut conn, Spec::child(root, "mid", 0)).await;
+
+    let demoted = ExecutionId::new_for_shard(ShardId::new(0));
+    demote_child_to_summary(&mut conn, demoted, mid, "FAILED").await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
+    assert_eq!(status, StatusCode::OK);
+    let named = body["retained_summary_parent_ids"]
+        .as_array()
+        .expect("retained_summary_parent_ids must be present");
+    assert!(
+        named.iter().any(|v| v == &json!(mid.to_string())),
+        "the interior node, not just the root, must be named: {body}"
+    );
+}
+
+/// The roll-up carries the same signal, so a `--summary` triage pass cannot
+/// read `failed: 0` as authoritative when lineage was omitted.
+#[tokio::test]
+async fn summary_mode_also_reports_retained_summary_parents() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("saga")).await;
+    let demoted = ExecutionId::new_for_shard(ShardId::new(0));
+    demote_child_to_summary(&mut conn, demoted, root, "FAILED").await;
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?summary=true")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["counts"]["failed"],
+        json!(0),
+        "the demoted child is not counted"
+    );
+    let named = body["retained_summary_parent_ids"]
+        .as_array()
+        .expect("summary shape must carry the signal too");
+    assert!(
+        named.iter().any(|v| v == &json!(root.to_string())),
+        "a zero failed-count must not read as authoritative: {body}"
+    );
+}
+
 // ── Root resolution vs. the default-shard fallback ────────────────────────
 
 /// The root lookup must not silently fall back to the default shard.

@@ -16,7 +16,7 @@ use diesel_async::RunQueryDsl;
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
-use crate::schema::{harvest_events, harvest_workflow_executions};
+use crate::schema::{harvest_events, harvest_execution_summaries, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -1465,6 +1465,54 @@ pub async fn load_parents_with_children(
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq_any(parents))
         .select(harvest_workflow_executions::parent_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
+/// Bounded existence probe against **retained summaries**: which of the given
+/// `parent_ids` have a demoted child on this shard? (issues #621, #752)
+///
+/// "Demoted" means the child now lives only in `harvest_execution_summaries`.
+/// Tiered summary retention is opt-in, but when it is on, a *terminal* child is
+/// independently retention-eligible: it can be demoted into a summary and have
+/// its `harvest_workflow_executions` row deleted while its long-running parent
+/// is still live. [`load_workflow_children_batch`] reads only the executions
+/// table, so such a child — and everything beneath it — is invisible to a
+/// lineage walk. Without this probe a `FAILED` demoted child would produce a
+/// tree that reports itself complete, which is precisely the silent omission
+/// the walk's bounds machinery exists to prevent.
+///
+/// Retention deliberately preserves `harvest_execution_summaries.parent_id` for
+/// exactly this case (it skips the terminal-child `parent_id` null-out when
+/// summary retention is enabled), and [`crate::erase`]'s cascade already unions
+/// both tables on it; this is the read-side counterpart.
+///
+/// Returns only the *nearest live ancestors* of omitted lineage. A summary
+/// child's own children are not enumerated — naming the live node an operator
+/// can actually act from is the useful signal, and it keeps the probe a single
+/// `DISTINCT` per shard.
+///
+/// When summary retention is disabled (the default) the table is empty and this
+/// returns nothing, so the walk is unaffected.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_parents_with_summary_children(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_execution_summaries::table
+        .filter(harvest_execution_summaries::parent_id.eq_any(parents))
+        .select(harvest_execution_summaries::parent_id)
         .distinct()
         .load::<Option<uuid::Uuid>>(conn)
         .await

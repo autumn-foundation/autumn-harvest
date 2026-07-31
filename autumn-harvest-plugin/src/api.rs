@@ -6063,6 +6063,7 @@ pub const fn management_api_response_fields()
                 "unavailable_shards",
                 "counts",
                 "total_descendants",
+                "retained_summary_parent_ids",
             ]),
         ),
         (
@@ -10008,6 +10009,26 @@ async fn build_lineage_report(
         walk.record_probe_result(&parents);
     }
 
+    // Retained-summary probe (issue #752). A terminal child can be demoted into
+    // `harvest_execution_summaries` and have its execution row collected while
+    // its parent is still live, so it is invisible to the walk above. Probing
+    // EVERY admitted id (not just the unexpanded frontier) is required: such a
+    // child can hang off any node in the tree, not only a leaf.
+    let summary_targets = walk.admitted_ids();
+    if !summary_targets.is_empty() {
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_summary_probe_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                summary_targets.clone(),
+            )
+        }))
+        .await;
+
+        let parents = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        walk.record_retained_summary_parents(&parents);
+    }
+
     let mut report = walk.finish(lineage_root_node(root_row));
     let inspected = observed.len();
     report.status = FanoutStatus::from_counts(inspected, shard_errors.len());
@@ -10082,6 +10103,40 @@ async fn lineage_probe_on_shard(
         );
     };
     match store::load_parents_with_children(&mut conn, &parents).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// One shard's contribution to the **retained-summary** probe (issue #752):
+/// which of the given nodes have a child that was demoted into
+/// `harvest_execution_summaries` and so is absent from the tree.
+///
+/// Structurally identical to [`lineage_probe_on_shard`] — same degrade-to-
+/// `partial` failure handling — but against the summaries table, so a shard
+/// that predates the summaries migration degrades rather than 500s.
+async fn lineage_summary_probe_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    parents: Vec<uuid::Uuid>,
+) -> ShardObservation<uuid::Uuid> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_parents_with_summary_children(&mut conn, &parents).await {
         Ok(rows) => ShardObservation {
             shard_id,
             rows,

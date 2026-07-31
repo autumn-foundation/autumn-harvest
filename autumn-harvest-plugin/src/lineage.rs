@@ -227,6 +227,20 @@ pub struct LineageTreeReport {
     /// Shards that could not be read, named with a reason. Empty when
     /// `status == complete`.
     pub unavailable_shards: Vec<UnavailableShard>,
+    /// Execution ids of nodes in the returned tree that have at least one child
+    /// **demoted into a retention summary** (issue #752) and therefore omitted
+    /// from the tree, along with anything beneath it.
+    ///
+    /// Empty on the default configuration: tiered summary retention is opt-in,
+    /// and with it off there are no summary rows to omit. When it is on, a
+    /// terminal child can be collected independently of its still-live parent,
+    /// so `truncated == false` and `status == complete` alone do NOT mean every
+    /// descendant is present — check this list too. The demoted rows remain
+    /// readable via `GET /workflows/summaries`.
+    ///
+    /// Only the *nearest live ancestor* of omitted lineage is named; a summary
+    /// child's own children are not enumerated.
+    pub retained_summary_parent_ids: Vec<String>,
 }
 
 /// Per-state descendant roll-up (the `?summary=true` response body).
@@ -259,6 +273,20 @@ pub struct LineageSummaryReport {
     pub status: FanoutStatus,
     /// Shards that could not be read.
     pub unavailable_shards: Vec<UnavailableShard>,
+    /// Execution ids of nodes in the returned tree that have at least one child
+    /// **demoted into a retention summary** (issue #752) and therefore omitted
+    /// from the tree, along with anything beneath it.
+    ///
+    /// Empty on the default configuration: tiered summary retention is opt-in,
+    /// and with it off there are no summary rows to omit. When it is on, a
+    /// terminal child can be collected independently of its still-live parent,
+    /// so `truncated == false` and `status == complete` alone do NOT mean every
+    /// descendant is present — check this list too. The demoted rows remain
+    /// readable via `GET /workflows/summaries`.
+    ///
+    /// Only the *nearest live ancestor* of omitted lineage is named; a summary
+    /// child's own children are not enumerated.
+    pub retained_summary_parent_ids: Vec<String>,
 }
 
 /// Project a lineage row into the tree's **root** node: depth `0`, no children
@@ -333,6 +361,9 @@ pub struct LineageWalk {
     /// Parents whose children were observed and dropped for budget, plus any
     /// the probe confirmed. Sorted/deduped by the `BTreeSet`.
     dropped_parents: BTreeSet<uuid::Uuid>,
+    /// Nodes confirmed to have a retention-summarised child omitted from the
+    /// tree (issue #752). Sorted/deduped by the `BTreeSet`.
+    retained_summary_parents: BTreeSet<uuid::Uuid>,
     reason: Option<TruncationReason>,
     max_depth_reached: u8,
 }
@@ -348,6 +379,7 @@ impl LineageWalk {
             visited,
             nodes: Vec::new(),
             dropped_parents: BTreeSet::new(),
+            retained_summary_parents: BTreeSet::new(),
             reason: None,
             max_depth_reached: 0,
         }
@@ -462,6 +494,27 @@ impl LineageWalk {
             .extend(parents_with_children.iter().copied());
     }
 
+    /// Record nodes whose children were demoted into retention summaries
+    /// (issue #752) and are therefore absent from the tree.
+    ///
+    /// Deliberately **not** a truncation: no bound was hit and re-rooting the
+    /// walk at one of these ids would not surface the omitted rows (they are
+    /// not in `harvest_workflow_executions` at all). It is a separate, additive
+    /// incompleteness signal so the response cannot imply a completeness it
+    /// does not have.
+    pub fn record_retained_summary_parents(&mut self, parents: &[uuid::Uuid]) {
+        self.retained_summary_parents
+            .extend(parents.iter().copied());
+    }
+
+    /// Ids admitted so far (root included) — the probe input for retained
+    /// summary children, which can hang off *any* node in the tree, not just an
+    /// unexpanded leaf.
+    #[must_use]
+    pub fn admitted_ids(&self) -> Vec<uuid::Uuid> {
+        self.visited.iter().copied().collect()
+    }
+
     /// Note that a shard's fetch window came back full.
     ///
     /// `fetch_limit` is `remaining_budget + 1` precisely so an overflow row is
@@ -512,6 +565,12 @@ impl LineageWalk {
             });
         }
 
+        let retained_summary_parent_ids: Vec<String> = self
+            .retained_summary_parents
+            .iter()
+            .map(|u| ExecutionId::from_uuid(*u).to_string())
+            .collect();
+
         let mut root = root;
         attach_children(&mut root, &mut by_parent, 1);
 
@@ -526,6 +585,7 @@ impl LineageWalk {
             limits: self.limits,
             status: FanoutStatus::Complete,
             unavailable_shards: Vec::new(),
+            retained_summary_parent_ids,
         }
     }
 }
@@ -597,6 +657,7 @@ impl LineageTreeReport {
             limits: self.limits,
             status: self.status,
             unavailable_shards: self.unavailable_shards,
+            retained_summary_parent_ids: self.retained_summary_parent_ids,
         }
     }
 }

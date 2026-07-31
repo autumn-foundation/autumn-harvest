@@ -598,9 +598,10 @@
           "status",
           "unavailable_shards",
           "counts",
-          "total_descendants"
+          "total_descendants",
+          "retained_summary_parent_ids"
         ],
-        "notes": "The body is POLYMORPHIC. Default (tree) mode returns root (a nested node whose `children` array recurses), node_count, and max_depth_reached. `?summary=true` returns root as a compact {execution_id, workflow_name, workflow_id, state} ref plus counts (map of lowercased state -> descendant count) and total_descendants, and omits node_count/children. Both shapes carry truncated, truncation_reason (omitted when null), truncated_parent_ids, truncated_parents_capped, limits (the bounds actually applied), status, and unavailable_shards. The fields list above is the UNION of both shapes."
+        "notes": "The body is POLYMORPHIC. Default (tree) mode returns root (a nested node whose `children` array recurses), node_count, and max_depth_reached. `?summary=true` returns root as a compact {execution_id, workflow_name, workflow_id, state} ref plus counts (map of lowercased state -> descendant count) and total_descendants, and omits node_count/children. Both shapes carry truncated, truncation_reason (omitted when null), truncated_parent_ids, truncated_parents_capped, limits (the bounds actually applied), status, and unavailable_shards. The fields list above is the UNION of both shapes. retained_summary_parent_ids (issue #752) names nodes in the returned tree that have at least one child DEMOTED INTO A RETENTION SUMMARY and therefore omitted from the tree along with everything beneath it; it is empty unless tiered summary retention is enabled. It is a THIRD, independent incompleteness signal: truncated=false AND status=complete together still do not mean every descendant is present -- check this list too. The omitted rows remain readable via GET /workflows/summaries."
       },
       "error_responses": [
         {

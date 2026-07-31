@@ -170,6 +170,27 @@ The tree is assembled by reading each shard independently. Two consequences:
   undetermined. Retry once the pool is configured, or query a node that has it.
   A `404` is reserved for an id no shard in this deployment could host.
 
+- **Retention-collected descendants are absent — and one case is reported.**
+  A terminal child can be collected by retention while its parent is still
+  live. If tiered summary retention (#752) is enabled, that child is demoted
+  into `harvest_execution_summaries` rather than hard-deleted, and the tree
+  names its **live parent** in `retained_summary_parent_ids` so a zero
+  `counts.failed` is never mistaken for "nothing failed here":
+
+  ```json
+  { "truncated": false, "status": "complete",
+    "retained_summary_parent_ids": ["0000...bb2"] }
+  ```
+
+  Read the demoted rows with `GET /workflows/summaries` (filter by
+  `workflow_name`/`completed_after`). Only the nearest live ancestor is named;
+  anything below a demoted child is not enumerated. With summary retention
+  **off** (the default) a collected child is hard-deleted and leaves no trace
+  at all — the tree cannot report what no longer exists.
+
+  This is a third, independent incompleteness signal: `truncated == false` and
+  `status == "complete"` together still do not mean every descendant is here.
+
 - **The snapshot may be marginally time-skewed across shards.** There is no
   cross-shard transaction: a child on shard B is read a few milliseconds after
   its parent on shard A, so a child that terminated in that window can appear
