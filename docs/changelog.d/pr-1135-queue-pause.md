@@ -192,3 +192,35 @@ two round-23 tests, and the explicit `BEGIN`/`COMMIT` a hand-driven test needed
 only because `ON COMMIT DROP` forced both passes into one transaction. Round 23's
 *other* fix — the collision-resistant `queue_lock_keys` derivation — is unaffected
 and stays.
+
+**Round 25 (Codex review of `bea4e04`)** — one P2: the queue-pause migration was
+missing from the release upgrade guide's inventory.
+
+`docs/upgrading/0.5.0.md` states it lists the migrations `0.5.0` adds, and a
+non-`dev` profile **refuses to start** while any migration is pending. Every
+other migration in the release cycle had a row;
+`20260715000000_harvest_queue_pause` did not. An operator enumerating schema
+changes from that guide would therefore apply an incomplete set and have the
+deploy refused — or, bypassing the plugin check, hit the new claim and timeout
+queries against a missing `harvest_queue_pauses` relation.
+
+Fixed by adding the row. The migration is a plain additive `CREATE TABLE`, so
+the table header's "every one is additive — no history rewrite, no data backfill"
+claim stays true.
+
+The more useful half is the **guard**, because this was the one inventory in the
+repo with none. The CI manifest, the contract registries and the audit route
+lists all have drift guards, which is why omissions there were caught at PR
+time; the upgrade guide had only a convention, and the convention is what broke.
+`migration_hygiene.rs` gains `every_release_migration_is_in_the_upgrade_guide`
+(no-DB, runs on every OS in the existing cheap leg): it parses the inventory
+table and asserts every migration at or after the guide's own earliest listed
+entry has a row.
+
+Two properties make it self-maintaining rather than another thing to keep
+current: the release boundary is read from the guide itself (so prior releases
+stay out of scope and a *new* migration, which always sorts later, is always in
+scope), and an empty parse is a hard failure rather than a vacuous pass — if the
+table's shape ever changes, the guard says so instead of silently passing.
+RED-verified: with the row removed it fails naming
+`20260715000000_harvest_queue_pause`.
