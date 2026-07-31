@@ -230,6 +230,9 @@ fn format_shards(shards: &[ShardId]) -> String {
 /// Hashes use `seahash` rather than `std::hash` because `std::hash::BuildHasher`
 /// is seeded randomly per-process and would produce different placements on
 /// every boot, breaking idempotent outbox retries.
+///
+/// See [`ShardRouter::parts`] for the exhaustive-destructuring accessor the
+/// operator-facing config snapshot uses.
 #[derive(Debug, Clone)]
 pub struct ShardRouter {
     readable_shards: Vec<ShardId>,
@@ -239,6 +242,23 @@ pub struct ShardRouter {
     ///
     /// Empty by default. Populated via [`ShardRouter::with_residency_map`].
     residency_map: BTreeMap<String, ShardId>,
+}
+
+/// Every placement-affecting field of a [`ShardRouter`], borrowed together.
+///
+/// Returned by [`ShardRouter::parts`] so a projection that must not silently
+/// miss a field can destructure it exhaustively (no `..`) and get a compile
+/// error when a new placement input is added.
+#[derive(Debug, Clone)]
+pub struct ShardRouterParts<'a> {
+    /// The superset of shards the deployment can load from.
+    pub readable_shards: &'a [ShardId],
+    /// The subset that accepts new workflows.
+    pub writable_shards: &'a [ShardId],
+    /// The shard unencoded execution ids resolve to.
+    pub default_shard: ShardId,
+    /// The declared residency key → shard mapping (issue #697).
+    pub residency_map: &'a BTreeMap<String, ShardId>,
 }
 
 impl ShardRouter {
@@ -373,6 +393,41 @@ impl ShardRouter {
     #[must_use]
     pub const fn residency_map(&self) -> &BTreeMap<String, ShardId> {
         &self.residency_map
+    }
+
+    /// Borrow every placement-affecting field at once, for exhaustive
+    /// destructuring by a projection that must not silently miss one.
+    ///
+    /// [`crate::effective_config::ShardTopologyView::from_router`] destructures
+    /// the returned [`ShardRouterParts`] with **no** `..`, so adding a field
+    /// here is a compile error until the operator-facing config snapshot
+    /// surfaces it. That guard exists because `residency_map` — which decides
+    /// which *jurisdiction* a pinned workflow lands in — was added to this
+    /// router (issue #697) and silently missing from the snapshot until a
+    /// review caught it.
+    ///
+    /// Add a field here whenever a new `ShardRouter` field influences
+    /// placement; a purely internal cache or memo does not belong.
+    // Not `const`: `Vec<ShardId> -> &[ShardId]` deref coercion is not yet
+    // const-stable, and the MSRV is 1.88.
+    #[must_use]
+    pub fn parts(&self) -> ShardRouterParts<'_> {
+        // First hop of the coverage guard: destructure `Self` EXHAUSTIVELY so a
+        // new `ShardRouter` field is a compile error HERE, forcing an explicit
+        // surface-or-omit decision. `ShardTopologyView::from_router` then
+        // destructures the result with no `..` as the second hop. Do NOT add `..`.
+        let Self {
+            readable_shards,
+            writable_shards,
+            default_shard,
+            residency_map,
+        } = self;
+        ShardRouterParts {
+            readable_shards,
+            writable_shards,
+            default_shard: *default_shard,
+            residency_map,
+        }
     }
 
     /// Resolve a [`ShardPlacement`] to a concrete shard for a *new* workflow.

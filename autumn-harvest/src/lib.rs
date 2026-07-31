@@ -426,7 +426,7 @@ pub use scheduler::{
 };
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
-pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter};
+pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter, ShardRouterParts};
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 #[cfg(feature = "db")]

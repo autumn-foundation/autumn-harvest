@@ -105,9 +105,39 @@ Misconfiguring the map itself (a blank key, or a target outside `readable_shards
 
 The chosen shard is observable three ways after a start (AC5) — no new column was added:
 
-- The start response carries `shard_id` **when a placement was requested**. An unpinned start omits the field entirely, so its response is byte-for-byte the pre-#697 shape.
+- The start response carries `shard_id` **when a placement was requested**. An unpinned start omits the field entirely, so its response is byte-for-byte the pre-#697 shape. A **throttled** start's deferred `202` echoes it too, since there is no `execution_id` to decode yet.
 - The `ExecutionId` encodes the shard in its first two bytes (`exec_id.shard()`), which is how every later id-based lookup routes with no directory.
 - The execution row's existing `shard_id` column.
+
+### Verifying fleet consistency *before* accepting pinned starts
+
+The three surfaces above tell you where one run landed. They cannot tell you whether the **fleet agrees on the map**, and that is the failure mode with the worst blast radius: if two replicas are deployed with different `residency_map`s, the same `residency_key` places workflows in **different jurisdictions** depending on which replica happens to serve the request — silently, because both replicas report identical `readable_shards` / `writable_shards` / `default_shard`.
+
+`GET /api/harvest/admin/config` (issue #695) therefore surfaces the declared map under `shard_topology.residency_map`:
+
+```bash
+curl -s .../admin/config | jq -S '.shard_topology'
+```
+
+```json
+{
+  "default_shard": 0,
+  "readable_shards": [0, 1],
+  "residency_map": { "eu": 0, "us": 1 },
+  "writable_shards": [0, 1]
+}
+```
+
+The projection is `BTreeMap`-ordered, so it is byte-stable and a plain diff across replicas is meaningful:
+
+```bash
+diff <(curl -s "$REPLICA_A/admin/config" | jq -S .shard_topology) \
+     <(curl -s "$REPLICA_B/admin/config" | jq -S .shard_topology)
+```
+
+Run this after any deploy that touches the map, and before you start relying on pinned starts. Residency keys are operator-declared jurisdiction labels, not secrets or caller input, and the endpoint is admin-gated — but note the deliberate asymmetry with the *rejection* messages above, which never enumerate the declared key set to a lower-trust start caller.
+
+A coverage guard keeps this honest: `ShardRouter::parts()` and `ShardTopologyView::from_router` both destructure exhaustively (no `..`), so adding a placement-affecting field to the router is a **compile error** until it is surfaced here. `residency_map` itself was missing from the snapshot when it was first introduced, which is why the guard exists.
 
 ### Residency is transitive across the workflow tree
 
