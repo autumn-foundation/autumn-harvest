@@ -37,6 +37,7 @@ use std::time::Duration;
 use autumn_harvest::debounce::DebouncePolicy;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::throttle::ThrottlePolicy;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{WorkflowInfo, context::WorkflowContext};
@@ -184,6 +185,22 @@ fn debounced_info(name: &'static str) -> WorkflowInfo {
     info
 }
 
+/// A workflow carrying a start throttle (issue #607) with a **single** token,
+/// so the first start reserves it and proceeds while the second is DEFERRED
+/// (`202`). Unlike debounce/batch, a throttled start threads the resolved
+/// shard through to `reserve_or_defer`, so a pin IS honoured there.
+fn throttled_info(name: &'static str) -> WorkflowInfo {
+    let mut info = plain_info(name);
+    info.throttle = Some(ThrottlePolicy {
+        // One token per hour, capacity one: start #1 debits it, start #2 defers.
+        refill_per_sec: 1.0 / 3600.0,
+        burst: 1.0,
+        key_expr: None,
+        schedule_to_start: None,
+    });
+    info
+}
+
 /// A three-shard app whose router declares a residency map:
 /// `eu -> 0`, `us -> 1`. Shard 2 is readable but **not** writable (drained).
 fn build_app(url_eu: &str, url_us: &str, url_drained: &str) -> HarvestApiApp {
@@ -222,7 +239,11 @@ fn build_app_with_writable(
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
     let registry = HandlerRegistry::new(
-        vec![plain_info("order_flow"), debounced_info("debounced_flow")],
+        vec![
+            plain_info("order_flow"),
+            debounced_info("debounced_flow"),
+            throttled_info("throttled_flow"),
+        ],
         vec![],
     );
     api_state.install(HarvestApiRuntime::new(
@@ -745,7 +766,11 @@ fn build_app_with_unpooled_shard(url_eu: &str, url_us: &str, url_drained: &str) 
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
     let registry = HandlerRegistry::new(
-        vec![plain_info("order_flow"), debounced_info("debounced_flow")],
+        vec![
+            plain_info("order_flow"),
+            debounced_info("debounced_flow"),
+            throttled_info("throttled_flow"),
+        ],
         vec![],
     );
     api_state.install(HarvestApiRuntime::new(
@@ -798,6 +823,167 @@ async fn routable_but_unpooled_shard_fails_closed_503_and_writes_nothing() {
     );
     assert_eq!(workflow_id_count(&us, workflow_id).await, 0);
     assert_eq!(workflow_id_count(&drained, workflow_id).await, 0);
+}
+
+/// Codex P1 (issue #697 review): the #808 committed-replay probe must resolve
+/// a **pinned** request's connection with `exact_pool_for`, never `pool_for`.
+///
+/// `pool_for` falls back to the DEFAULT shard's pool for a shard with no pool
+/// entry, so a pinned-but-unpooled request would probe the **wrong database**
+/// for its idempotency claim. When a same-key claim already exists there (from
+/// an earlier unpinned start) that is a false HIT: the caller gets `200` plus
+/// an `execution_id` on the *default* shard while having explicitly asked for a
+/// different jurisdiction -- a silent cross-shard residency breach, and exactly
+/// the failure this feature exists to remove. Failing closed (`503`) is right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_committed_replay_probe_never_falls_back_to_the_default_shard() {
+    let ((eu, us, drained), _guard) = setup_three_shards().await;
+    let key = "delivery-probe-fallback-1";
+
+    // Commit a keyed start on the DEFAULT shard (EU) by making it the only
+    // writable shard, so the claim row deterministically lands there.
+    let eu_only = build_app_with_writable(&eu, &us, &drained, &[EU_SHARD]);
+    let (status, body) = post_start_keyed(
+        &eu_only,
+        json!({ "workflow_id": "order-probe", "input": {} }),
+        key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed start: {body}");
+    let seeded = exec_id_of(&body);
+    assert_eq!(
+        seeded.shard(),
+        ShardId::new(EU_SHARD),
+        "the seeded claim must live on the default shard for this test to bite"
+    );
+
+    // Now retry the SAME key, but pinned to a routable-yet-unpooled shard.
+    let unpooled_app = build_app_with_unpooled_shard(&eu, &us, &drained);
+    let (retry_status, retry_body) = post_start_keyed(
+        &unpooled_app,
+        json!({ "workflow_id": "order-probe", "input": {}, "shard_id": UNPOOLED_SHARD }),
+        key,
+    )
+    .await;
+
+    assert_eq!(
+        retry_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a pinned start at an unpooled shard must fail closed, never resolve a \
+         committed replay out of the DEFAULT shard's database: {retry_body}"
+    );
+    // The load-bearing half: the default shard's execution must not be handed
+    // back as though it satisfied the pinned request.
+    assert!(
+        retry_body.get("execution_id").is_none(),
+        "the pinned request must return no execution: {retry_body}"
+    );
+    assert!(
+        !retry_body.to_string().contains(&seeded.to_string()),
+        "the default shard's execution ({seeded}) must never be returned for a \
+         request pinned elsewhere: {retry_body}"
+    );
+    // And nothing new was written anywhere.
+    assert_eq!(workflow_id_count(&eu, "order-probe").await, 1);
+    assert_eq!(workflow_id_count(&us, "order-probe").await, 0);
+    assert_eq!(workflow_id_count(&drained, "order-probe").await, 0);
+}
+
+/// Codex P2 (issue #697 review): a THROTTLED start honours an explicit pin --
+/// the resolved shard is threaded into `reserve_or_defer` -- so its deferred
+/// `202` must echo `shard_id` too. There is no `execution_id` to decode yet, so
+/// without the echo a caller has no way at all to audit where a deferred pinned
+/// start will run. An unpinned throttled `202` must stay byte-identical to a
+/// pre-#697 build (no `shard_id` key at all).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn throttled_deferred_start_echoes_the_pinned_shard() {
+    let ((eu, us, drained), _guard) = setup_three_shards().await;
+    let app = build_app(&eu, &us, &drained);
+
+    // Start #1 debits the single token and runs immediately, pinned to US.
+    let (first_status, first_body) = post_start_to(
+        &app,
+        "throttled_flow",
+        json!({ "workflow_id": "thr-1", "input": {}, "shard_id": US_SHARD }),
+    )
+    .await;
+    assert_eq!(
+        first_status,
+        StatusCode::CREATED,
+        "first start: {first_body}"
+    );
+    assert_eq!(exec_id_of(&first_body).shard(), ShardId::new(US_SHARD));
+
+    // Start #2 finds an empty bucket and is DEFERRED -- the 202 must still
+    // report the shard the scanner will eventually fire it on.
+    let (second_status, second_body) = post_start_to(
+        &app,
+        "throttled_flow",
+        json!({ "workflow_id": "thr-2", "input": {}, "shard_id": US_SHARD }),
+    )
+    .await;
+    assert_eq!(
+        second_status,
+        StatusCode::ACCEPTED,
+        "second start must be throttled/deferred: {second_body}"
+    );
+    assert_eq!(
+        second_body.get("throttled").and_then(Value::as_bool),
+        Some(true),
+        "expected the deferred-start body: {second_body}"
+    );
+    assert_eq!(
+        second_body.get("shard_id").and_then(Value::as_i64),
+        Some(i64::from(US_SHARD)),
+        "a pinned throttled 202 must echo the resolved shard: {second_body}"
+    );
+}
+
+/// The AC1 half of the throttle echo: an UNPINNED throttled `202` must omit
+/// `shard_id` entirely, so a pre-#697 client sees a byte-identical body.
+///
+/// Uses an EU-only writable set so both starts deterministically land on the
+/// same shard -- throttle buckets are **shard-local** (`start-throttle:{wf}:{key}`
+/// lives in that shard's `harvest_rate_limit_buckets`), so an unpinned start
+/// rendezvous-hashed onto a different shard would find a full bucket and run
+/// immediately instead of deferring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpinned_throttled_deferred_start_omits_shard_id() {
+    let ((eu, us, drained), _guard) = setup_three_shards().await;
+    let app = build_app_with_writable(&eu, &us, &drained, &[EU_SHARD]);
+
+    let (first_status, first_body) = post_start_to(
+        &app,
+        "throttled_flow",
+        json!({ "workflow_id": "thr-open-1", "input": {} }),
+    )
+    .await;
+    assert_eq!(
+        first_status,
+        StatusCode::CREATED,
+        "first start: {first_body}"
+    );
+
+    let (second_status, second_body) = post_start_to(
+        &app,
+        "throttled_flow",
+        json!({ "workflow_id": "thr-open-2", "input": {} }),
+    )
+    .await;
+    assert_eq!(
+        second_status,
+        StatusCode::ACCEPTED,
+        "second unpinned start must be throttled/deferred: {second_body}"
+    );
+    assert_eq!(
+        second_body.get("throttled").and_then(Value::as_bool),
+        Some(true),
+        "expected the deferred-start body: {second_body}"
+    );
+    assert!(
+        second_body.get("shard_id").is_none(),
+        "an unpinned throttled 202 must omit shard_id entirely: {second_body}"
+    );
 }
 
 /// AC6 over HTTP: a negative `shard_id` and the reserved `UNENCODED` sentinel

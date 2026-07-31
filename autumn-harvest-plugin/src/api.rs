@@ -12283,7 +12283,20 @@ async fn probe_committed_start_replay(
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
-    let mut probe_conn = acquire_conn(pool.pool_for(shard)).await.ok()?;
+    // A PINNED probe must never fall back to the default shard's pool. `pool_for`
+    // does exactly that when the requested shard has no pool of its own (a real
+    // state mid a shard-add rollout / removal), so a same-name/key claim living
+    // on the DEFAULT database would be returned as a successful replay and
+    // echoed as belonging to the requested residency shard -- the same silent
+    // breach `db_conn_for_pinned_shard` closes on the fresh-start path. Returning
+    // `None` here is a probe MISS, so the caller falls through to that fresh
+    // pinned path and fails closed with a `503` rather than inventing a replay.
+    let probe_pool = if report_shard.is_some() {
+        pool.exact_pool_for(shard)?
+    } else {
+        pool.pool_for(shard)
+    };
+    let mut probe_conn = acquire_conn(probe_pool).await.ok()?;
     let window_secs = api_state.start_idempotency_window().as_secs_f64();
     let claim_exec_id = autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
         &mut probe_conn,
@@ -14734,17 +14747,28 @@ pub(crate) async fn start_workflow(
                     ))
                     .into_response();
                 }
-                return (
-                    axum::http::StatusCode::ACCEPTED,
-                    Json(serde_json::json!({
-                        "throttled": true,
-                        "workflow_name": workflow_name,
-                        "workflow_id": outcome.workflow_id,
-                        "throttle_key": outcome.throttle_key,
-                        "deferred_at": outcome.deferred_at,
-                    })),
-                )
-                    .into_response();
+                let mut body = serde_json::json!({
+                    "throttled": true,
+                    "workflow_name": workflow_name,
+                    "workflow_id": outcome.workflow_id,
+                    "throttle_key": outcome.throttle_key,
+                    "deferred_at": outcome.deferred_at,
+                });
+                // issue #697 (AC5): a throttled start HONOURS an explicit pin --
+                // the resolved shard is threaded into `reserve_or_defer` and the
+                // scanner fires there -- so the accepted placement must be
+                // echoed here too. Without it a caller has no way to audit a
+                // deferred pinned start (there is no `execution_id` to decode
+                // yet), contradicting the contract that every start response
+                // reports the resolved shard whenever placement was requested.
+                // Omitted for an unpinned start, keeping its body byte-identical
+                // to a pre-#697 build.
+                if let Some(pinned) = pinned_shard_id
+                    && let Some(obj) = body.as_object_mut()
+                {
+                    obj.insert("shard_id".to_string(), serde_json::json!(pinned));
+                }
+                return (axum::http::StatusCode::ACCEPTED, Json(body)).into_response();
             }
             Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
                 throttle_reserved = Some(bucket_key);
@@ -31266,6 +31290,17 @@ fn parse_shard_placement(
             if ShardId::new(raw).is_unencoded() {
                 return Err(AutumnError::bad_request_msg(format!(
                     "shard_id {raw} is the reserved routing sentinel, not a placeable shard"
+                )));
+            }
+            // Above `0xFFFE` the value cannot round-trip through an
+            // `ExecutionId` (the encoder masks to 16 bits), so the row would be
+            // written to one database while every id-based lookup routed to the
+            // truncated shard. The router rejects it too; catching it at the
+            // request boundary gives the caller the precise reason.
+            if !autumn_harvest::shard::is_encodable_shard(ShardId::new(raw)) {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id must be at most {}, got {raw}",
+                    autumn_harvest::shard::MAX_ENCODABLE_SHARD
                 )));
             }
             Ok(ShardPlacement::Shard(ShardId::new(raw)))

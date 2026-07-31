@@ -190,6 +190,26 @@ impl ShardPlacementError {
     }
 }
 
+/// Largest shard number an [`ExecutionId`] can carry.
+///
+/// `ExecutionId::new_for_shard` encodes the shard into the UUID's first two
+/// bytes as `shard & 0xFFFF`, and `0xFFFF` is reserved for
+/// [`ShardId::UNENCODED`], so `0xFFFE` is the highest usable value.
+pub const MAX_ENCODABLE_SHARD: i32 = 0xFFFE;
+
+/// Can this shard number survive a round trip through an [`ExecutionId`]?
+///
+/// [`ShardId::new`] is an unbounded `const fn`, so an out-of-range value is
+/// constructible even though its own docs call `0..=0xFFFE` the valid range.
+/// Anything outside that range is silently truncated by the encoder, which would
+/// route later id-based lookups to a different shard than the one the row was
+/// written to — so placement rejects it up front.
+#[must_use]
+pub const fn is_encodable_shard(shard: ShardId) -> bool {
+    let raw = shard.as_i32();
+    raw >= 0 && raw <= MAX_ENCODABLE_SHARD
+}
+
 fn format_shards(shards: &[ShardId]) -> String {
     let rendered: Vec<String> = shards.iter().map(ToString::to_string).collect();
     format!("[{}]", rendered.join(", "))
@@ -285,16 +305,39 @@ impl ShardRouter {
     ///
     /// # Panics
     ///
-    /// Panics if a key is blank or maps to a shard outside `readable_shards`.
-    /// This mirrors [`ShardRouter::new`]'s existing panic contract so a
-    /// misconfigured residency map fails at boot rather than at the first
-    /// residency-pinned start.
+    /// Panics if a key is blank, maps to a shard outside `readable_shards`, or
+    /// two keys normalize to the same trimmed key with *conflicting* shards
+    /// (e.g. `("eu", 1)` and `(" eu ", 2)`) — which target survived would depend
+    /// on the source's iteration order, and from an unordered source could
+    /// differ across restarts. A duplicate that maps to the *same* shard is
+    /// harmless and accepted. This mirrors [`ShardRouter::new`]'s existing panic
+    /// contract so a misconfigured residency map fails at boot rather than at
+    /// the first residency-pinned start.
     #[must_use]
-    pub fn with_residency_map(mut self, map: impl IntoIterator<Item = (String, ShardId)>) -> Self {
-        let map: BTreeMap<String, ShardId> = map
-            .into_iter()
-            .map(|(k, v)| (k.trim().to_string(), v))
-            .collect();
+    pub fn with_residency_map(
+        mut self,
+        entries: impl IntoIterator<Item = (String, ShardId)>,
+    ) -> Self {
+        // Insert one at a time rather than `.collect()`ing: two RAW keys that
+        // normalize to the same trimmed key (`"eu"` and `" eu "`) would silently
+        // overwrite one another, and from an UNORDERED source (a `HashMap`)
+        // *which* target survives can differ across process restarts — breaking
+        // the stable-mapping guarantee that is the entire point of a declared
+        // map, and potentially moving work between jurisdictions on a restart.
+        // Fail construction instead, consistent with the blank-key and
+        // shard-outside-the-readable-set panics below.
+        let mut map: BTreeMap<String, ShardId> = BTreeMap::new();
+        for (raw, shard) in entries {
+            let key = raw.trim().to_string();
+            if let Some(existing) = map.insert(key.clone(), shard) {
+                assert_eq!(
+                    existing, shard,
+                    "residency key '{key}' is declared more than once (after trimming) with \
+                     conflicting shards {existing} and {shard}; which one survives would depend \
+                     on iteration order"
+                );
+            }
+        }
         for (key, shard) in &map {
             assert!(
                 !key.is_empty(),
@@ -424,12 +467,22 @@ impl ShardRouter {
         shard: ShardId,
         require_writable: bool,
     ) -> Result<ShardId, ShardPlacementError> {
-        // The sentinel is a routing marker ("resolve to the deployment default"),
-        // never a shard number. Reject it explicitly rather than relying on it
-        // being absent from `readable_shards`: `ShardRouter::new` does not forbid
-        // configuring it, and accepting it here would silently place pinned work
-        // on the default shard — the exact failure this feature removes.
-        if shard.is_unencoded() {
+        // A shard number outside `0..=0xFFFE` is not representable in an
+        // `ExecutionId`: `ExecutionId::new_for_shard` writes `shard & 0xFFFF`
+        // into the UUID's first two bytes, so `65536` would encode as `0` and
+        // `-1` as the `0xFFFF` sentinel. `ShardId::new` is an unbounded
+        // `const fn`, so a router CAN be configured with such a value; accepting
+        // the pin would write the row to the requested pool while every later
+        // id-based lookup routed to the truncated shard, leaving a pinned
+        // workflow inaccessible or visible through the wrong database. Reject it
+        // before the set membership checks — the value is unusable regardless of
+        // how the deployment is configured.
+        //
+        // `is_unencoded` (`0xFFFF`) is inside this rejected range: the sentinel
+        // is a routing marker ("resolve to the deployment default"), never a
+        // shard number, and accepting it would silently place pinned work on the
+        // default shard — the exact failure this feature removes.
+        if !is_encodable_shard(shard) {
             return Err(ShardPlacementError::UnknownShard {
                 requested: shard,
                 readable: self.readable_shards.clone(),
@@ -1042,6 +1095,103 @@ mod tests {
             matches!(err, ShardPlacementError::UnknownShard { .. }),
             "expected UnknownShard, got {err:?}"
         );
+    }
+
+    /// Codex P1 (issue #697 review): `ShardId::new` is an unbounded `const fn`,
+    /// but `ExecutionId::new_for_shard` masks the value to 16 bits. A pin to a
+    /// shard outside `0..=0xFFFE` would write the row to the requested pool
+    /// while every id-based lookup routed to the TRUNCATED shard, leaving the
+    /// workflow inaccessible or visible through the wrong database. Rejected
+    /// even when the router is (mis)configured to consider it readable+writable.
+    #[test]
+    fn shard_outside_the_encodable_range_is_rejected_even_when_configured() {
+        for raw in [0x1_0000, 0x1_0001, i32::MAX, -1, i32::MIN] {
+            let out_of_range = ShardId::new(raw);
+            // Deliberately configure the router to accept it, so the rejection
+            // can only come from the encodability check.
+            let router = ShardRouter::new(
+                vec![ShardId::new(0), out_of_range],
+                vec![ShardId::new(0), out_of_range],
+                ShardId::new(0),
+            );
+            let err = router
+                .resolve_placement(&ShardPlacement::Shard(out_of_range), "wf", "id-1")
+                .expect_err("a non-encodable shard must never be a valid pin");
+            assert!(
+                matches!(err, ShardPlacementError::UnknownShard { .. }),
+                "expected UnknownShard for {raw}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encodable_shard_predicate_matches_the_uuid_round_trip() {
+        // Everything the predicate ACCEPTS must survive the `ExecutionId`
+        // encoding unchanged, and must not be the reserved sentinel.
+        for raw in [0, 1, 0xFFFE] {
+            let shard = ShardId::new(raw);
+            assert!(is_encodable_shard(shard), "{raw} should be encodable");
+            assert_eq!(ExecutionId::new_for_shard(shard).shard(), shard);
+            assert!(!shard.is_unencoded(), "{raw} must not be the sentinel");
+        }
+
+        // Everything it REJECTS is unsafe to pin, for one of two reasons.
+        //
+        // (a) The value does not fit in the two shard bytes, so
+        //     `ExecutionId::new_for_shard` silently truncates it (`& 0xFFFF`)
+        //     and the id reads back as a DIFFERENT shard -- the exact
+        //     cross-jurisdiction hazard the predicate exists to prevent.
+        for raw in [-1, 0x1_0000, 0x1_0001] {
+            let shard = ShardId::new(raw);
+            assert!(!is_encodable_shard(shard), "{raw} should not be encodable");
+            assert_ne!(
+                ExecutionId::new_for_shard(shard).shard(),
+                shard,
+                "{raw} silently truncates through the ExecutionId encoding"
+            );
+        }
+
+        // (b) `0xFFFE + 1 == 0xFFFF` DOES round-trip byte-for-byte -- it is not
+        //     truncated -- but it is `ShardId::UNENCODED`, the reserved "no
+        //     shard encoded, fall back to the default shard" sentinel. Pinning
+        //     to it would mint ids the router resolves to the DEFAULT shard,
+        //     so it is rejected for a different reason than (a).
+        let sentinel = ShardId::new(0xFFFF);
+        assert!(sentinel.is_unencoded());
+        assert!(
+            !is_encodable_shard(sentinel),
+            "the reserved sentinel is never a pinnable shard"
+        );
+        assert_eq!(
+            ExecutionId::new_for_shard(sentinel).shard(),
+            sentinel,
+            "the sentinel round-trips (it is reserved, not truncated)"
+        );
+    }
+
+    /// Codex P1 (issue #697 review): two RAW keys that normalize to the same
+    /// trimmed key with CONFLICTING shards would silently discard one mapping,
+    /// and from an unordered source which one survives could vary across
+    /// restarts — breaking the stable-mapping guarantee that is the whole point
+    /// of a declared map, and potentially moving work between jurisdictions.
+    #[test]
+    #[should_panic(expected = "declared more than once")]
+    fn conflicting_residency_keys_that_collide_after_trimming_panic() {
+        let _ = router_with(&[0, 1, 2]).with_residency_map([
+            ("eu".to_string(), ShardId::new(1)),
+            (" eu ".to_string(), ShardId::new(2)),
+        ]);
+    }
+
+    #[test]
+    fn duplicate_residency_keys_agreeing_on_the_shard_are_accepted() {
+        // Harmless: there is no ambiguity about which target survives.
+        let router = router_with(&[0, 1]).with_residency_map([
+            ("eu".to_string(), ShardId::new(1)),
+            (" eu ".to_string(), ShardId::new(1)),
+        ]);
+        assert_eq!(router.residency_map().get("eu"), Some(&ShardId::new(1)));
+        assert_eq!(router.residency_map().len(), 1);
     }
 
     #[test]
