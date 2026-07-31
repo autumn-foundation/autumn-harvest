@@ -62,6 +62,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          event_batch_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          integration_e2e
+linux        autumn-harvest         integration                      -                          lineage_store_tests
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
@@ -97,6 +98,7 @@ linux        autumn-harvest-plugin  fail_now_integration             -          
 linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -
 linux        autumn-harvest-plugin  interface_schema_integration     -                          -
 linux        autumn-harvest-plugin  legal_hold_integration           -                          -
+linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  progress_stream_integration      -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
 linux        autumn-harvest-plugin  queue_pause_integration          -                          -

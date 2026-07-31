@@ -279,6 +279,11 @@ fn workflow_awaitables_is_covered() {
 }
 
 #[test]
+fn workflow_tree_is_covered() {
+    assert_covered(&["workflow", "tree", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
 fn workflow_replay_diagnosis_is_covered() {
     assert_covered(&[
         "workflow",

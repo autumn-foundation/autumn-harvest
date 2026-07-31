@@ -315,6 +315,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /workflows", RouteClass::ReadOnly),
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
+    // Recursive cross-shard lineage tree (issue #621): a point-in-time read of
+    // `harvest_workflow_executions` rows over the existing `parent_id` edges.
+    // Appends no events, performs no writes.
+    ("GET /workflows/{id}/tree", RouteClass::ReadOnly),
     ("GET /workflows/{id}/stack", RouteClass::ReadOnly),
     ("GET /workflows/{id}/timeline", RouteClass::ReadOnly),
     // Open-awaitables diagnostic (issue #615): read-only replay projection of
@@ -752,6 +756,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /workflows",
     "GET /workflows/{id}",
     "GET /workflows/{id}/children",
+    "GET /workflows/{id}/tree",
     "GET /workflows/{id}/stack",
     "GET /workflows/{id}/timeline",
     "GET /workflows/{id}/awaitables",
@@ -878,6 +883,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows", None),
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
+    // Issue #621: read-only, no audit operation.
+    ("GET /workflows/{id}/tree", None),
     ("GET /workflows/{id}/stack", None),
     ("GET /workflows/{id}/timeline", None),
     // Issue #615: read-only, no audit operation.
@@ -1559,6 +1566,33 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn lineage_tree_route_is_classified_read_only() {
+        // The recursive cross-shard lineage tree (issue #621) is a
+        // point-in-time read over the existing `parent_id` edges: it appends no
+        // events, performs no writes, and adds no `WorkflowEvent` variant.
+        // Pinned here rather than relying on the general exhaustiveness guards,
+        // which only cross-check CLASSIFIED_ROUTES against ALL_MUTATION_ROUTES
+        // and therefore stay green if the route is dropped from BOTH lists.
+        let route = "GET /workflows/{id}/tree";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #621)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #621)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #621)"
         );
     }
 

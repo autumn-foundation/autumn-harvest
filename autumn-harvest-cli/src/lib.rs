@@ -1034,6 +1034,26 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Render the recursive descendant lineage tree for an execution across all
+    /// shards — the spawn topology of a saga or fan-out, annotated with each
+    /// descendant's state.
+    Tree {
+        /// Root workflow execution ID (may be any node in the tree; the
+        /// response is the subtree below it).
+        execution_id: String,
+        /// Print the per-state descendant roll-up instead of the tree.
+        #[arg(long)]
+        summary: bool,
+        /// Recursion depth cap below the root (1-50, default 20).
+        #[arg(long)]
+        max_depth: Option<u32>,
+        /// Total node cap including the root (1-10000, default 1000).
+        #[arg(long)]
+        max_nodes: Option<u32>,
+        /// Emit raw JSON instead of the default rendering.
+        #[arg(long)]
+        json: bool,
+    },
     /// Reconstruct the ordered continue-as-new run chain a workflow execution
     /// belongs to, resolvable from any member (origin, middle, or tail).
     RunChain {
@@ -3113,6 +3133,13 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_summaries_wants_table(cli) {
         return Ok(format_workflow_summaries_table(value));
     }
+    if lineage_tree_wants_render(cli) {
+        return Ok(if lineage_tree_wants_summary(cli) {
+            format_lineage_summary(value)
+        } else {
+            format_lineage_tree(value)
+        });
+    }
     if run_chain_wants_table(cli) {
         return Ok(format_run_chain_table(value));
     }
@@ -3150,6 +3177,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     let output = if workflow_children_wants_raw_json(cli)
         || workflow_summaries_wants_raw_json(cli)
         || run_chain_wants_raw_json(cli)
+        || lineage_tree_wants_raw_json(cli)
         || batch_preview_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
@@ -4297,6 +4325,34 @@ const fn workflow_summaries_wants_raw_json(cli: &Cli) -> bool {
     )
 }
 
+/// `workflow tree` renders an indented outline by default; `--json` opts out.
+fn lineage_tree_wants_render(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Tree { json: false, .. }
+        } if cli.output == OutputFormat::PrettyJson
+    )
+}
+
+const fn lineage_tree_wants_summary(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Tree { summary: true, .. }
+        }
+    )
+}
+
+const fn lineage_tree_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Workflow {
+            command: WorkflowCommand::Tree { json: true, .. }
+        }
+    )
+}
+
 fn run_chain_wants_table(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -4560,6 +4616,160 @@ fn format_workflow_summaries_table(value: &Value) -> String {
         rendered.push_str(cursor);
     }
     rendered
+}
+
+// ── Lineage tree rendering (issue #621) ──────────────────────────────────────
+
+/// Render the recursive lineage tree as an indented outline.
+///
+/// Indentation *is* the topology here — a flat table would lose the parent →
+/// child relationship that is the whole point of the endpoint — so each node is
+/// printed one level deeper than its parent with its state and identity inline.
+fn format_lineage_tree(value: &Value) -> String {
+    let Some(root) = value.get("root") else {
+        return "No lineage tree found.".to_string();
+    };
+
+    let mut out = String::new();
+    render_lineage_node(root, 0, &mut out);
+
+    let _ = write!(
+        out,
+        "\n{} node(s), max depth {}\n",
+        cell_number(value.get("node_count")),
+        cell_number(value.get("max_depth_reached"))
+    );
+    out.push_str(&format_lineage_footer(value));
+    out.trim_end().to_string()
+}
+
+/// One node line plus its subtree. Depth is bounded by the server's
+/// `max_depth` ceiling, so this recursion cannot blow the stack.
+fn render_lineage_node(node: &Value, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    let branch = if indent == 0 { "" } else { "└─ " };
+    let detached = if node.get("await_mode").and_then(Value::as_str) == Some("detached") {
+        let policy = node
+            .get("parent_close_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        format!(" [detached:{policy}]")
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        out,
+        "{pad}{branch}{state:<12} {exec}  {name} ({wf_id}){detached}",
+        state = cell_str(node.get("state")),
+        exec = cell_str(node.get("execution_id")),
+        name = cell_str(node.get("workflow_name")),
+        wf_id = cell_str(node.get("workflow_id")),
+    );
+
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            render_lineage_node(child, indent + 1, out);
+        }
+    }
+}
+
+/// Render the `?summary=true` per-state descendant roll-up.
+fn format_lineage_summary(value: &Value) -> String {
+    let mut out = String::new();
+    if let Some(root) = value.get("root") {
+        let _ = write!(
+            out,
+            "root {} {} ({}) state={}\n\n",
+            cell_str(root.get("execution_id")),
+            cell_str(root.get("workflow_name")),
+            cell_str(root.get("workflow_id")),
+            cell_str(root.get("state")),
+        );
+    }
+
+    match value.get("counts").and_then(Value::as_object) {
+        Some(counts) if !counts.is_empty() => {
+            let width = counts.keys().map(String::len).max().unwrap_or(0);
+            for (state, count) in counts {
+                let _ = writeln!(
+                    out,
+                    "{state:<width$}  {}",
+                    cell_number(Some(count)),
+                    width = width
+                );
+            }
+        }
+        _ => out.push_str("(no descendant counts)\n"),
+    }
+
+    let _ = write!(
+        out,
+        "\n{} descendant(s), max depth {}\n",
+        cell_number(value.get("total_descendants")),
+        cell_number(value.get("max_depth_reached"))
+    );
+    out.push_str(&format_lineage_footer(value));
+    out.trim_end().to_string()
+}
+
+/// Shared truncation / partial-shard footer.
+///
+/// A truncated or partial tree must never look complete on the terminal, so
+/// both conditions are called out explicitly rather than left to the operator
+/// to notice a missing subtree.
+fn format_lineage_footer(value: &Value) -> String {
+    let mut out = String::new();
+
+    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+        let reason = value
+            .get("truncation_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let _ = write!(out, "\nTRUNCATED ({reason}) — the tree is incomplete.");
+        if let Some(parents) = value
+            .get("truncated_parent_ids")
+            .and_then(Value::as_array)
+            .filter(|p| !p.is_empty())
+        {
+            out.push_str("\n  dropped subtrees under (re-root the call here to continue):");
+            for parent in parents {
+                let _ = write!(out, "\n    {}", cell_str(Some(parent)));
+            }
+            if value
+                .get("truncated_parents_capped")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                out.push_str("\n    ... (list capped)");
+            }
+        }
+        out.push('\n');
+    }
+
+    if value
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != "complete")
+    {
+        let _ = write!(
+            out,
+            "\nPARTIAL ({}) — some shards could not be read:",
+            cell_str(value.get("status"))
+        );
+        if let Some(shards) = value.get("unavailable_shards").and_then(Value::as_array) {
+            for shard in shards {
+                let _ = write!(
+                    out,
+                    "\n  shard {}: {}",
+                    cell_number(shard.get("shard_id")),
+                    cell_str(shard.get("reason"))
+                );
+            }
+        }
+        out.push('\n');
+    }
+
+    out
 }
 
 fn format_run_chain_table(value: &Value) -> String {
@@ -4966,6 +5176,30 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/awaitables",
             path_segment(execution_id)
         ))),
+        WorkflowCommand::Tree {
+            execution_id,
+            summary,
+            max_depth,
+            max_nodes,
+            json: _,
+        } => {
+            let mut path = format!("/workflows/{}/tree", path_segment(execution_id));
+            let mut params: Vec<String> = Vec::new();
+            if *summary {
+                params.push("summary=true".to_string());
+            }
+            if let Some(depth) = max_depth {
+                params.push(format!("max_depth={depth}"));
+            }
+            if let Some(nodes) = max_nodes {
+                params.push(format!("max_nodes={nodes}"));
+            }
+            if !params.is_empty() {
+                path.push('?');
+                path.push_str(&params.join("&"));
+            }
+            Ok(ApiRequest::get(path))
+        }
         WorkflowCommand::RunChain {
             execution_id,
             json: _,
@@ -8910,6 +9144,148 @@ mod completion_delivery_cli_tests {
         let value = json!({ "ok": true });
         let filtered = filter_completion_deliveries_by_state(&value, "failed");
         assert_eq!(filtered, value);
+    }
+
+    // ── Lineage tree rendering (issue #621) ──────────────────────────────
+
+    fn lineage_tree_fixture() -> Value {
+        serde_json::json!({
+            "root": {
+                "execution_id": "11111111-1111-1111-1111-111111111111",
+                "workflow_name": "checkout_saga",
+                "workflow_id": "order-42",
+                "state": "RUNNING",
+                "depth": 0,
+                "await_mode": "awaited",
+                "parent_close_policy": null,
+                "children": [{
+                    "execution_id": "22222222-2222-2222-2222-222222222222",
+                    "workflow_name": "charge_card",
+                    "workflow_id": "charge-42",
+                    "state": "FAILED",
+                    "depth": 1,
+                    "await_mode": "detached",
+                    "parent_close_policy": "request_cancel",
+                    "children": []
+                }]
+            },
+            "node_count": 2,
+            "max_depth_reached": 1,
+            "truncated": false,
+            "truncated_parent_ids": [],
+            "truncated_parents_capped": false,
+            "status": "complete",
+            "unavailable_shards": []
+        })
+    }
+
+    #[test]
+    fn lineage_tree_renders_children_indented_below_their_parent() {
+        // Indentation IS the topology for this endpoint — a child must not
+        // render at the same level as its parent.
+        let rendered = format_lineage_tree(&lineage_tree_fixture());
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines[0].starts_with("RUNNING"), "root is not indented");
+        assert!(
+            lines[1].starts_with("  "),
+            "the child must be indented below the root, got {:?}",
+            lines[1]
+        );
+        assert!(lines[1].contains("FAILED"));
+        assert!(lines[1].contains("22222222-2222-2222-2222-222222222222"));
+        assert!(
+            lines[1].contains("[detached:request_cancel]"),
+            "a detached child must surface its parent-close policy"
+        );
+        assert!(rendered.contains("2 node(s), max depth 1"));
+    }
+
+    #[test]
+    fn lineage_tree_render_calls_out_truncation_and_names_dropped_parents() {
+        // A truncated tree must never look complete on a terminal.
+        let mut value = lineage_tree_fixture();
+        value["truncated"] = Value::Bool(true);
+        value["truncation_reason"] = Value::String("max_nodes".to_string());
+        value["truncated_parent_ids"] = serde_json::json!(["22222222-2222-2222-2222-222222222222"]);
+        let rendered = format_lineage_tree(&value);
+        assert!(rendered.contains("TRUNCATED (max_nodes)"));
+        assert!(rendered.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(rendered.contains("re-root the call here"));
+    }
+
+    #[test]
+    fn lineage_tree_render_calls_out_an_unavailable_shard() {
+        let mut value = lineage_tree_fixture();
+        value["status"] = Value::String("partial".to_string());
+        value["unavailable_shards"] = serde_json::json!([
+            { "shard_id": 1, "reason": "connection refused" }
+        ]);
+        let rendered = format_lineage_tree(&value);
+        assert!(rendered.contains("PARTIAL (partial)"));
+        assert!(rendered.contains("shard 1"));
+        assert!(rendered.contains("connection refused"));
+    }
+
+    #[test]
+    fn lineage_summary_renders_per_state_counts() {
+        let value = serde_json::json!({
+            "root": {
+                "execution_id": "11111111-1111-1111-1111-111111111111",
+                "workflow_name": "checkout_saga",
+                "workflow_id": "order-42",
+                "state": "RUNNING"
+            },
+            "counts": { "running": 3, "failed": 1, "completed": 12 },
+            "total_descendants": 16,
+            "max_depth_reached": 3,
+            "truncated": false,
+            "truncated_parent_ids": [],
+            "truncated_parents_capped": false,
+            "status": "complete",
+            "unavailable_shards": []
+        });
+        let rendered = format_lineage_summary(&value);
+        assert!(rendered.contains("failed"));
+        assert!(rendered.contains("16 descendant(s)"));
+        assert!(rendered.contains("order-42"));
+    }
+
+    #[test]
+    fn lineage_tree_flag_dispatch_picks_the_right_renderer() {
+        let tree = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "tree",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .expect("parse");
+        assert!(lineage_tree_wants_render(&tree));
+        assert!(!lineage_tree_wants_summary(&tree));
+        assert!(!lineage_tree_wants_raw_json(&tree));
+
+        let summary = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "tree",
+            "00000000-0000-0000-0000-000000000001",
+            "--summary",
+        ])
+        .expect("parse");
+        assert!(lineage_tree_wants_summary(&summary));
+
+        let raw = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "tree",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ])
+        .expect("parse");
+        assert!(lineage_tree_wants_raw_json(&raw));
+        assert!(
+            !lineage_tree_wants_render(&raw),
+            "--json must bypass the outline renderer"
+        );
     }
 
     #[test]

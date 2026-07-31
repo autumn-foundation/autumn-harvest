@@ -143,6 +143,52 @@ fn workflow_start_maps_to_management_api_request() {
     );
 }
 
+/// Lineage tree (issue #621) maps onto `GET /workflows/{id}/tree`, with every
+/// bound carried as a query param so an omitted flag inherits the *server's*
+/// documented default rather than a second copy of it in the CLI.
+#[test]
+fn workflow_tree_maps_bounds_onto_query_params() {
+    // Bare form sends no query string at all, so the server's documented
+    // defaults (max_depth 20 / max_nodes 1000) apply.
+    let tree = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "tree",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow tree args should parse");
+    let tree_request = tree.api_request().expect("tree request should build");
+    assert_eq!(tree_request.method, ApiMethod::Get);
+    assert_eq!(
+        tree_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/tree"
+    );
+    assert_eq!(tree_request.body, None);
+
+    let tree_summary = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "tree",
+        "00000000-0000-0000-0000-000000000001",
+        "--summary",
+        "--max-depth",
+        "3",
+        "--max-nodes",
+        "50",
+    ])
+    .expect("workflow tree flags should parse");
+    let tree_summary_request = tree_summary
+        .api_request()
+        .expect("tree summary request should build");
+    assert_eq!(tree_summary_request.method, ApiMethod::Get);
+    assert_eq!(
+        tree_summary_request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/tree\
+         ?summary=true&max_depth=3&max_nodes=50"
+    );
+    assert_eq!(tree_summary_request.body, None);
+}
+
 #[test]
 fn workflow_list_and_query_use_get_requests() {
     let list = Cli::try_parse_from(["harvest", "workflow", "list", "--limit", "25"])

@@ -59,6 +59,7 @@ mod havoc_tests;
 mod idempotency_tests;
 mod integration_e2e;
 mod legal_hold_tests;
+mod lineage_store_tests;
 mod macros_activity;
 mod macros_collect;
 #[cfg(feature = "testing")]
