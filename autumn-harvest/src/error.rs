@@ -893,6 +893,19 @@ impl From<diesel::result::Error> for HarvestError {
     }
 }
 
+/// An explicit shard placement that could not be honoured is a caller
+/// configuration error (issue #697).
+///
+/// Mapping onto [`HarvestError::Config`] means SDK callers get the same
+/// `400`-class treatment the HTTP layer gives, and the actionable message —
+/// which names the offending shard/key and the valid set — is preserved
+/// verbatim.
+impl From<crate::shard::ShardPlacementError> for HarvestError {
+    fn from(value: crate::shard::ShardPlacementError) -> Self {
+        Self::Config(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

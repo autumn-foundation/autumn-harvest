@@ -6152,7 +6152,12 @@ impl WorkflowContext {
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
-                    child_id: ExecutionId::new(),
+                    // Inherit the parent's shard so data residency is transitive
+                    // across the workflow tree (issue #697 AC4). The worker
+                    // already writes the child's row on the parent's shard; the
+                    // encoded shard is what makes every later id-based lookup
+                    // route there too, instead of the default shard.
+                    child_id: ExecutionId::new_for_shard(self.exec_id.shard()),
                     workflow_name: workflow_name.to_string(),
                     input,
                     result_tx: tx,
@@ -9251,7 +9256,9 @@ impl WorkflowContext {
                             to_dispatch.push(RaceDispatch {
                                 index,
                                 activity_id: None,
-                                child_id: Some(ExecutionId::new()),
+                                // Inherit the parent's shard (issue #697 AC4) --
+                                // same rationale as the plain awaited-child path.
+                                child_id: Some(ExecutionId::new_for_shard(self.exec_id.shard())),
                                 is_new: true,
                             });
                         }
@@ -12342,7 +12349,7 @@ impl ActivityContext {
 mod tests {
     use super::*;
     use crate::error::TimeoutType;
-    use crate::types::ActivityExecId;
+    use crate::types::{ActivityExecId, ShardId};
     use chrono::Utc;
     use std::time::Duration;
 
@@ -16685,6 +16692,148 @@ mod tests {
             result.unwrap_err(),
             HarvestError::NonDeterministic { .. }
         ));
+    }
+
+    /// AC4 (issue #697): a child spawned by a pinned parent must inherit the
+    /// parent's shard, so data residency is transitive across the whole
+    /// workflow tree. The `ExecutionId` carries the shard in its first two
+    /// bytes, so an `ExecutionId::new()` (UNENCODED sentinel) child would be
+    /// routed to the deployment's *default* shard by every id-based lookup
+    /// even though its row lands on the parent's shard.
+    #[tokio::test]
+    async fn awaited_child_workflow_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(7);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let fut = ctx.spawn_child_workflow_raw("process_order", serde_json::json!({"sku": "book"}));
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh awaited child must suspend on its result channel"
+        );
+
+        let cmds = ctx.drain_commands();
+        let WorkflowCommand::StartChildWorkflow { child_id, .. } = &cmds[0] else {
+            panic!("expected StartChildWorkflow, got {cmds:?}");
+        };
+        assert_eq!(
+            child_id.shard(),
+            parent_shard,
+            "an awaited child must inherit the parent's shard (issue #697 AC4)"
+        );
+    }
+
+    /// AC4 (issue #697): the `ctx.race()` child-workflow branch mints its own
+    /// `ExecutionId` and must inherit the parent's shard for the same reason
+    /// the plain awaited path does.
+    #[tokio::test]
+    async fn race_child_workflow_branch_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(11);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let fut = ctx
+            .race()
+            .child_workflow_raw("leg_a", serde_json::json!({}))
+            .child_workflow_raw("leg_b", serde_json::json!({}))
+            .run();
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh child race must suspend awaiting its branches"
+        );
+
+        let started: Vec<ExecutionId> = ctx
+            .drain_commands()
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2, "both race branches must be dispatched");
+        for child_id in started {
+            assert_eq!(
+                child_id.shard(),
+                parent_shard,
+                "a raced child must inherit the parent's shard (issue #697 AC4)"
+            );
+        }
+    }
+
+    /// AC4 (issue #697): the child-or-deadline race (`#779`) mints its own
+    /// child `ExecutionId` on a fresh dispatch and must inherit the parent's
+    /// shard. Already correct pre-#697 -- locked in so a future refactor of the
+    /// mixed `StartChildWorkflow + StartTimer` suspension cannot silently
+    /// regress residency for a deadline-bounded sub-orchestration.
+    #[tokio::test]
+    async fn child_timeout_race_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(9);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let fut = ctx.spawn_child_workflow_timeout(
+            "bounded_child",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(60),
+        );
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "a fresh child-timeout race must suspend awaiting the child or the deadline"
+        );
+
+        let commands = ctx.drain_commands();
+        let child_id = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::StartChildWorkflow { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .expect("the race must dispatch exactly one child");
+        assert_eq!(
+            child_id.shard(),
+            parent_shard,
+            "a deadline-bounded child must inherit the parent's shard (issue #697 AC4)"
+        );
+    }
+
+    /// AC4 (issue #697): the detached path already inherits -- lock it in so a
+    /// future refactor cannot silently regress residency for detached children.
+    #[tokio::test]
+    async fn detached_child_workflow_inherits_the_parents_shard() {
+        let parent_shard = ShardId::new(3);
+        let ctx = WorkflowContext::for_replay(
+            ExecutionId::new_for_shard(parent_shard),
+            started_history(),
+        );
+
+        let child_id = ctx
+            .spawn_child_workflow_detached_raw(
+                "audit_trail",
+                serde_json::json!({}),
+                crate::ParentClosePolicy::Abandon,
+            )
+            .expect("detached spawn should succeed");
+
+        assert_eq!(
+            child_id.shard(),
+            parent_shard,
+            "a detached child must inherit the parent's shard (issue #697 AC4)"
+        );
     }
 
     #[tokio::test]

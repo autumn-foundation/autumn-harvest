@@ -409,24 +409,47 @@ pub struct ShardTopologyView {
     pub writable_shards: Vec<i32>,
     /// The default shard used to resolve unencoded execution IDs.
     pub default_shard: i32,
+    /// The declared residency key → shard mapping (issue #697).
+    ///
+    /// Empty unless the deployment declared one. This is **placement-affecting
+    /// configuration**, not a secret: the keys are operator-declared
+    /// jurisdiction labels (`"eu"`, `"us"`), never caller input or credentials,
+    /// and this endpoint is admin-gated.
+    ///
+    /// Surfacing it is what lets an operator detect the failure mode a
+    /// topology-only snapshot hides: two replicas deployed with **different**
+    /// key → shard maps report identical `readable`/`writable`/`default` sets
+    /// while placing the same `residency_key` in **different jurisdictions**
+    /// depending on which replica serves the request. Diff this field across
+    /// replicas before accepting pinned starts. `BTreeMap` ordering makes the
+    /// projection stable, so a byte comparison of two snapshots is meaningful.
+    pub residency_map: BTreeMap<String, i32>,
 }
 
 impl ShardTopologyView {
     /// Project a [`ShardRouter`](crate::shard::ShardRouter) into its view.
     #[must_use]
     pub fn from_router(router: &crate::shard::ShardRouter) -> Self {
+        // Coverage guard (issue #695 pattern, extended to the router by the
+        // issue #697 review): destructure EXHAUSTIVELY so adding a
+        // placement-affecting accessor to `ShardRouter` without surfacing it
+        // here is a compile error rather than a silent snapshot gap -- which is
+        // exactly how `residency_map` slipped through when it was introduced.
+        // Do NOT add `..`.
+        let crate::shard::ShardRouterParts {
+            readable_shards,
+            writable_shards,
+            default_shard,
+            residency_map,
+        } = router.parts();
         Self {
-            readable_shards: router
-                .readable_shards()
+            readable_shards: readable_shards.iter().map(|s| s.as_i32()).collect(),
+            writable_shards: writable_shards.iter().map(|s| s.as_i32()).collect(),
+            default_shard: default_shard.as_i32(),
+            residency_map: residency_map
                 .iter()
-                .map(|s| s.as_i32())
+                .map(|(key, shard)| (key.clone(), shard.as_i32()))
                 .collect(),
-            writable_shards: router
-                .writable_shards()
-                .iter()
-                .map(|s| s.as_i32())
-                .collect(),
-            default_shard: router.default_shard().as_i32(),
         }
     }
 }
@@ -727,6 +750,60 @@ mod tests {
         let view = ShardTopologyView::from_router(&multi);
         assert_eq!(view.readable_shards, vec![0, 1, 2]);
         assert_eq!(view.writable_shards, vec![0, 1]);
+        assert!(
+            view.residency_map.is_empty(),
+            "a router with no declared map must report an empty projection"
+        );
+    }
+
+    /// Issue #697 review (Codex P2): two replicas deployed with DIFFERENT
+    /// residency maps place the same key in different jurisdictions while
+    /// reporting identical readable/writable/default sets. The snapshot must
+    /// surface the map so an operator can diff it across the fleet.
+    #[test]
+    fn shard_topology_surfaces_the_residency_map_so_replica_drift_is_visible() {
+        let shards = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        let replica_a = crate::shard::ShardRouter::new(
+            shards.clone(),
+            shards.clone(),
+            crate::types::ShardId::new(0),
+        )
+        .with_residency_map([
+            ("eu".to_string(), crate::types::ShardId::new(0)),
+            ("us".to_string(), crate::types::ShardId::new(1)),
+        ]);
+        // Same topology, MIRRORED map -- the misconfiguration this exists to catch.
+        let replica_b =
+            crate::shard::ShardRouter::new(shards.clone(), shards, crate::types::ShardId::new(0))
+                .with_residency_map([
+                    ("eu".to_string(), crate::types::ShardId::new(1)),
+                    ("us".to_string(), crate::types::ShardId::new(0)),
+                ]);
+
+        let view_a = ShardTopologyView::from_router(&replica_a);
+        let view_b = ShardTopologyView::from_router(&replica_b);
+
+        assert_eq!(view_a.residency_map.get("eu"), Some(&0));
+        assert_eq!(view_a.residency_map.get("us"), Some(&1));
+
+        // Topology alone is identical -- exactly why the map is load-bearing.
+        assert_eq!(view_a.readable_shards, view_b.readable_shards);
+        assert_eq!(view_a.writable_shards, view_b.writable_shards);
+        assert_eq!(view_a.default_shard, view_b.default_shard);
+        assert_ne!(
+            view_a.residency_map, view_b.residency_map,
+            "a mirrored residency map MUST be visible in the snapshot; without \
+             this field two conflicting replicas serialize identically"
+        );
+
+        // Stable ordering, so a byte comparison across replicas is meaningful.
+        let json_a = serde_json::to_string(&view_a).expect("serialize");
+        assert_eq!(
+            json_a,
+            serde_json::to_string(&ShardTopologyView::from_router(&replica_a)).expect("serialize"),
+            "the projection must be byte-stable across calls"
+        );
+        assert!(json_a.contains("residency_map"), "{json_a}");
     }
 
     #[test]

@@ -156,7 +156,12 @@ async fn seed_execution(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
 ) -> (ExecutionId, Vec<WorkflowEvent>) {
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    // Deliberately a NON-default shard (issue #697 AC4): the reset fork must
+    // inherit the *source's* shard, so seeding on shard 0 -- which is this
+    // fixture's default shard -- would let a "always use default_shard"
+    // regression pass. Only the encoded shard changes; the row is still written
+    // through the single test pool, which every shard id resolves to here.
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(4));
     start_or_load_workflow_execution(
         conn,
         StartWorkflowParams {
@@ -352,7 +357,13 @@ async fn reset_forks_200_event_execution_and_tears_down_source() {
         .unwrap();
     assert_eq!(fork.state, "RUNNING");
     assert_eq!(fork.workflow_id, "wf-reset-success");
-    assert_eq!(new_exec_id.shard(), exec_id.shard());
+    assert_eq!(
+        new_exec_id.shard(),
+        exec_id.shard(),
+        "a reset fork must inherit the source's shard (issue #697 AC4); the \
+         source is seeded on a non-default shard so this also falsifies a \
+         `default_shard` regression, not just an `ExecutionId::new()` one"
+    );
 
     let fork_events: Vec<(i32, String)> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))

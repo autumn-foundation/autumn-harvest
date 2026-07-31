@@ -1142,6 +1142,16 @@ enum WorkflowCommand {
         /// Delay duration before starting the workflow (e.g. "10s", "5m").
         #[arg(long)]
         delay: Option<String>,
+        /// Pin this workflow to a concrete shard (issue #697). Mutually
+        /// exclusive with `--residency-key`. An unknown or drained shard is
+        /// rejected with `400`, never silently re-hashed.
+        #[arg(long, value_name = "SHARD", conflicts_with = "residency_key")]
+        shard_id: Option<i32>,
+        /// Pin this workflow via an operator-declared residency key (issue
+        /// #697), e.g. `eu`. Mutually exclusive with `--shard-id`. An
+        /// undeclared key is rejected with `400`.
+        #[arg(long, value_name = "KEY")]
+        residency_key: Option<String>,
     },
     /// Cancel a workflow execution.
     Cancel {
@@ -5268,6 +5278,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             conflict_policy,
             start_at,
             delay,
+            shard_id,
+            residency_key,
         } => {
             let mut body = Map::new();
             insert_string(&mut body, "workflow_id", workflow_id.as_deref());
@@ -5302,6 +5314,13 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             insert_string(&mut body, "conflict_policy", conflict_policy.as_deref());
             insert_string(&mut body, "start_at", start_at.as_deref());
             insert_string(&mut body, "delay", delay.as_deref());
+            // issue #697: explicit shard placement. Omitting a flag omits the
+            // key entirely, so an unpinned start's body is byte-identical to a
+            // pre-#697 CLI. Clap enforces the mutual exclusion.
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), json!(shard));
+            }
+            insert_string(&mut body, "residency_key", residency_key.as_deref());
 
             Ok(ApiRequest::post(
                 format!("/workflows/{}/start", path_segment(workflow_name)),
@@ -10210,5 +10229,94 @@ mod scaffold_new_tests {
         assert_eq!(derive_crate_ident("trail-"), "trail");
         assert_eq!(derive_crate_ident("my--app"), "my_app");
         assert_eq!(derive_crate_ident("A_B-c"), "a_b_c");
+    }
+}
+
+#[cfg(test)]
+mod shard_placement_tests {
+    //! CLI mapping tests for `--shard-id` / `--residency-key` on
+    //! `workflow start` (issue #697). Mirror `mod conflict_policy_tests`:
+    //! omitting a flag must omit the key entirely so an unpinned start's body
+    //! stays byte-identical to a pre-#697 CLI.
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn start_request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn start_omitting_placement_sends_neither_field() {
+        let req = start_request(&["workflow", "start", "my_wf"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert!(
+            body.get("shard_id").is_none(),
+            "omitting --shard-id must not send the field"
+        );
+        assert!(
+            body.get("residency_key").is_none(),
+            "omitting --residency-key must not send the field"
+        );
+    }
+
+    #[test]
+    fn start_with_shard_id_sends_a_numeric_field() {
+        let req = start_request(&["workflow", "start", "my_wf", "--shard-id", "2"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert_eq!(body.get("shard_id"), Some(&serde_json::json!(2)));
+        assert!(body.get("residency_key").is_none());
+    }
+
+    #[test]
+    fn start_with_residency_key_sends_a_string_field() {
+        let req = start_request(&["workflow", "start", "my_wf", "--residency-key", "eu"]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert_eq!(body.get("residency_key"), Some(&serde_json::json!("eu")));
+        assert!(body.get("shard_id").is_none());
+    }
+
+    #[test]
+    fn start_rejects_both_placement_flags_at_parse_time() {
+        // Two placement sources are ambiguous; clap must reject them before a
+        // request is ever built.
+        let parsed = Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "start",
+            "my_wf",
+            "--shard-id",
+            "1",
+            "--residency-key",
+            "eu",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--shard-id and --residency-key must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn placement_preserves_other_start_fields() {
+        let req = start_request(&[
+            "workflow",
+            "start",
+            "my_wf",
+            "--workflow-id",
+            "order-42",
+            "--residency-key",
+            "eu",
+        ]);
+        let body = req.body.as_ref().expect("start should have a body");
+        assert_eq!(
+            body.get("workflow_id"),
+            Some(&serde_json::json!("order-42"))
+        );
+        assert_eq!(body.get("residency_key"), Some(&serde_json::json!("eu")));
     }
 }

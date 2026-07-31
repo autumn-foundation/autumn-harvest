@@ -105,7 +105,7 @@ use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
     harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardPlacement, ShardRouter};
 use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID, ATTR_WORKFLOW_ID};
@@ -1964,6 +1964,16 @@ pub(crate) struct StartWorkflowResponse {
     /// via a matching `idempotency_key` (issue #808). Omitted on the no-key path.
     #[serde(skip_serializing_if = "Option::is_none")]
     deduplicated: Option<bool>,
+    /// The shard this execution was placed on (issue #697).
+    ///
+    /// Populated only when the request supplied an explicit `shard_id` or
+    /// `residency_key`, so an operator can audit that a residency-pinned start
+    /// actually landed where it was pinned without decoding the `execution_id`
+    /// UUID by hand. Omitted for unpinned starts, keeping their response
+    /// byte-identical to a pre-#697 build. The same value is durably visible on
+    /// the execution row's `shard_id` column and via `GET /workflows/{id}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2290,6 +2300,24 @@ pub(crate) struct StartWorkflowRequest {
     /// Mutually exclusive with a throttle / debounce / batch policy.
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Pin this workflow to a concrete shard (issue #697).
+    ///
+    /// Mutually exclusive with [`Self::residency_key`]. Omitting both keeps
+    /// today's rendezvous routing byte-for-byte. A shard outside the
+    /// deployment's `readable_shards`, one drained out of `writable_shards`,
+    /// a negative value, or the reserved routing sentinel all return `400` —
+    /// never a silent fallback to the default shard.
+    #[serde(default)]
+    shard_id: Option<i32>,
+    /// Pin this workflow via an operator-declared residency key (issue #697),
+    /// e.g. `"eu"`.
+    ///
+    /// Mutually exclusive with [`Self::shard_id`]. Resolved through the
+    /// router's declared residency map; an undeclared key returns `400` rather
+    /// than falling back to the hash. The key→shard mapping is stable across
+    /// process restarts and across any widening of the shard set.
+    #[serde(default)]
+    residency_key: Option<String>,
     /// Internal workflow-start provenance override (issue #740). Set by
     /// [`Self::from_webhook`] so a webhook-delegated start records `webhook`
     /// provenance instead of the default `api`. `#[serde(skip)]` so it is
@@ -2331,6 +2359,8 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            shard_id: None,
+            residency_key: None,
             start_source_override: None,
             start_source_ref_override: None,
         }
@@ -2373,6 +2403,8 @@ impl StartWorkflowRequest {
             context_headers: None,
             priority: None,
             idempotency_key: None,
+            shard_id: None,
+            residency_key: None,
             // Webhook-delegated starts record `webhook` provenance (#740/#344).
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
             start_source_ref_override: None,
@@ -5563,6 +5595,8 @@ pub const fn management_api_request_fields()
                 "batch_max_wait",
                 "completion_callbacks",
                 "idempotency_key",
+                "shard_id",
+                "residency_key",
             ]),
         ),
         (
@@ -6136,6 +6170,7 @@ pub const fn management_api_response_fields()
                 "max_size",
                 "started_fresh",
                 "deduplicated",
+                "shard_id",
             ]),
         ),
         (
@@ -12241,10 +12276,27 @@ async fn probe_committed_start_replay(
     source: &str,
     request_id: Option<&str>,
     route: &'static str,
+    // `report_shard`: shard to echo on the replay response (issue #697). `Some`
+    // only when the *retry* carried an explicit placement, so an unpinned keyed
+    // replay keeps its pre-#697 response shape byte-for-byte.
+    report_shard: Option<i32>,
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
-    let mut probe_conn = acquire_conn(pool.pool_for(shard)).await.ok()?;
+    // A PINNED probe must never fall back to the default shard's pool. `pool_for`
+    // does exactly that when the requested shard has no pool of its own (a real
+    // state mid a shard-add rollout / removal), so a same-name/key claim living
+    // on the DEFAULT database would be returned as a successful replay and
+    // echoed as belonging to the requested residency shard -- the same silent
+    // breach `db_conn_for_pinned_shard` closes on the fresh-start path. Returning
+    // `None` here is a probe MISS, so the caller falls through to that fresh
+    // pinned path and fails closed with a `503` rather than inventing a replay.
+    let probe_pool = if report_shard.is_some() {
+        pool.exact_pool_for(shard)?
+    } else {
+        pool.pool_for(shard)
+    };
+    let mut probe_conn = acquire_conn(probe_pool).await.ok()?;
     let window_secs = api_state.start_idempotency_window().as_secs_f64();
     let claim_exec_id = autumn_harvest::start_idempotency::lookup_live_start_idempotency_claim(
         &mut probe_conn,
@@ -12297,6 +12349,7 @@ async fn probe_committed_start_replay(
                 state: dup_state,
                 started_fresh: Some(false),
                 deduplicated: Some(true),
+                shard_id: report_shard,
             }),
         )
             .into_response(),
@@ -12575,6 +12628,8 @@ async fn handle_malformed_start_body(
         &source,
         request_id.as_deref(),
         route,
+        // The body did not parse, so no placement can be read from it.
+        None,
     )
     .await
     {
@@ -12807,15 +12862,101 @@ pub(crate) async fn start_workflow(
     // — a retry that changes its explicit `workflow_id` is not a retry of the
     // same delivery and can route to a different shard. The no-key path is
     // byte-for-byte unchanged.
-    let shard = if let Some(ref key) = idempotency_key
-        && !explicit_workflow_id
+    // issue #697: an explicit placement (`shard_id` or `residency_key`) OVERRIDES
+    // both hash routes below. Residency is a hard placement contract — a
+    // tenant's state must land on its designated database — so it outranks the
+    // keyed-dedup co-location heuristic, which is only an optimisation for
+    // finding the claim row. `Auto` (the default, and the only possibility when
+    // neither field is sent) leaves the two branches byte-for-byte unchanged.
+    //
+    // Resolution happens BEFORE the #808 committed-replay probe because the
+    // probe cannot run without knowing which shard to probe. Consequence,
+    // documented in `docs/sharding.md` and the api-contract: a retry must carry
+    // the SAME placement as the original delivery — exactly the existing #808
+    // consistency caveat for `workflow_id`, for the same reason (both determine
+    // where the claim row lives).
+    let placement = match parse_shard_placement(request.shard_id, request.residency_key.as_deref())
     {
-        runtime.router.pick_for_idempotency_key(&workflow_name, key)
-    } else {
-        runtime
-            .router
-            .pick_for_new_workflow(&workflow_name, &workflow_id)
+        Ok(placement) => placement,
+        Err(e) => {
+            audit_start_failure(
+                &api_state,
+                &StartFailureAudit {
+                    actor: &actor,
+                    workflow_name: &workflow_name,
+                    route,
+                    request_id: request_id.as_deref(),
+                    source: &source,
+                    requested_shard_id: request.shard_id,
+                },
+                "invalid shard placement",
+            )
+            .await;
+            return e.into_response();
+        }
     };
+
+    let shard = if placement.is_auto() {
+        if let Some(ref key) = idempotency_key
+            && !explicit_workflow_id
+        {
+            runtime.router.pick_for_idempotency_key(&workflow_name, key)
+        } else {
+            runtime
+                .router
+                .pick_for_new_workflow(&workflow_name, &workflow_id)
+        }
+    } else {
+        // Resolve WITHOUT the writable check here: this shard is also what the
+        // #808 committed-replay probe below reads, and writability is a
+        // fresh-start-only concern. Enforcing it now would make a retry of an
+        // already-committed keyed start return `400` instead of its mandated
+        // `200` no-op merely because the operator started draining the pinned
+        // shard in between — rejecting work that creates nothing. The writable
+        // check is enforced further down, after the probe, on the genuine
+        // fresh-start path. Every other validation (unknown shard, undeclared
+        // residency key, blank key) still rejects here, so an unresolvable
+        // placement can never fall through to a silent re-hash.
+        match runtime
+            .router
+            .resolve_placement_for_lookup(&placement, &workflow_name, &workflow_id)
+        {
+            Ok(shard) => shard,
+            Err(e) => {
+                audit_start_failure(
+                    &api_state,
+                    &StartFailureAudit {
+                        actor: &actor,
+                        workflow_name: &workflow_name,
+                        route,
+                        request_id: request_id.as_deref(),
+                        source: &source,
+                        requested_shard_id: request.shard_id,
+                    },
+                    "unresolvable shard placement",
+                )
+                .await;
+                // An unknown shard or an undeclared residency key is a caller
+                // error, never a silent re-hash onto the default shard.
+                //
+                // The client gets the terse `client_message` -- naming what THEY
+                // got wrong -- while the enumerating form (shard topology, live
+                // drain state, every declared residency key) stays server-side.
+                // Residency keys are frequently tenant-identifying, so echoing
+                // the declared set would let one probe enumerate other tenants.
+                tracing::warn!(
+                    workflow_name = %workflow_name,
+                    error = %e,
+                    "rejected explicit shard placement"
+                );
+                return AutumnError::bad_request_msg(e.client_message()).into_response();
+            }
+        }
+    };
+
+    // Is the resolved pin actually placeable? Computed here (cheap, in-memory)
+    // but ENFORCED after the #808 probe -- see the two uses below.
+    let pin_is_writable = placement.is_auto() || runtime.router.is_writable(shard);
 
     // issue #808 (Codex P2): when a keyed start OMITS `workflow_id`, the server
     // auto-generates it AND (per the routing rule above) routes the start by the
@@ -12837,7 +12978,33 @@ pub(crate) async fn start_workflow(
     // the cap is a safety backstop only. Explicit client-chosen `workflow_id`s
     // (routed by `workflow_id`, subject to the documented consistency caveat) and
     // the no-key path are UNCHANGED.
-    if idempotency_key.is_some() && !explicit_workflow_id {
+    //
+    // issue #697 extends the SAME rejection sampling to an explicitly PINNED
+    // start whose `workflow_id` was auto-generated, for the identical reason:
+    // a pin moves the run off its hash-derived shard, so a later request that
+    // reuses the RETURNED `workflow_id` without repeating the pin would route by
+    // hash to a different shard, miss the execution, and create a second active
+    // run under the same `workflow_id`. Minting the id onto the pinned shard
+    // closes that hole for every auto-generated id. The pinned shard is always
+    // in `writable_shards` (`resolve_placement` rejects a drained shard), so
+    // `pick_for_new_workflow` can return it and the loop converges.
+    //
+    // The hole CANNOT be closed for an EXPLICIT caller-chosen `workflow_id`,
+    // because the id is the caller's business identity and cannot be re-minted.
+    // For that case the caller must pin consistently across every start for a
+    // given `workflow_id` — the same consistency contract #808 already documents
+    // for keyed dedup. See `docs/sharding.md`.
+    //
+    // `pin_is_writable` gates the loop because `pick_for_new_workflow` applies
+    // the writable-subset redirect and therefore can NEVER return a drained
+    // shard: without this guard a pin at a drained shard would spin the full
+    // `MINT_CAP` and warn, only for the start to be rejected moments later on
+    // the fresh-start path anyway. A dedup hit never uses the minted id (it
+    // returns the original execution), so skipping the mint costs nothing.
+    if (idempotency_key.is_some() || !placement.is_auto())
+        && !explicit_workflow_id
+        && pin_is_writable
+    {
         const MINT_CAP: u32 = 10_000;
         let mut attempts = 0u32;
         while runtime
@@ -12850,13 +13017,19 @@ pub(crate) async fn start_workflow(
                 tracing::warn!(
                     workflow_name = %workflow_name,
                     shard = ?shard,
-                    "could not mint a workflow_id on the idempotency-key shard after {attempts} attempts; using last candidate"
+                    "could not mint a workflow_id on the target shard after {attempts} attempts; using last candidate"
                 );
                 break;
             }
             workflow_id = uuid::Uuid::new_v4().to_string();
         }
     }
+
+    // issue #697 (AC5): echo the resolved shard so an operator can audit that a
+    // residency-pinned start landed where it was pinned, without decoding the
+    // `execution_id` UUID by hand. Populated ONLY for a pinned request, so an
+    // unpinned start's response stays byte-identical to a pre-#697 build.
+    let pinned_shard_id: Option<i32> = (!placement.is_auto()).then(|| shard.as_i32());
 
     // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
     // precede ALL fresh-start-only rejections (reuse-policy parse,
@@ -12903,10 +13076,50 @@ pub(crate) async fn start_workflow(
             &source,
             request_id.as_deref(),
             route,
+            pinned_shard_id,
         )
         .await
     {
         return resp;
+    }
+
+    // issue #697: enforce writability HERE, not at resolution time. Placing new
+    // work on a shard the operator is draining contradicts the drain, so a
+    // fresh pinned start at a drained shard is a `400` — but this is a
+    // fresh-start-only concern, so it must sit after the #808 committed-replay
+    // probe above. Otherwise an at-least-once retry of a keyed start that
+    // already committed would flip from its mandated `200` no-op to a `400`
+    // the moment the operator began draining the pinned shard, rejecting a
+    // delivery that creates no new work.
+    //
+    // The check itself is delegated back to `resolve_placement` (the FULL
+    // readable+writable resolution) rather than hand-built here, so the router
+    // stays the single source of truth for what "placeable" means and the two
+    // call sites can never drift.
+    if !pin_is_writable
+        && let Err(err) = runtime
+            .router
+            .resolve_placement(&placement, &workflow_name, &workflow_id)
+    {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "shard placement at a non-writable shard",
+        )
+        .await;
+        tracing::warn!(
+            workflow_name = %workflow_name,
+            error = %err,
+            "rejected explicit shard placement at a drained shard"
+        );
+        return AutumnError::bad_request_msg(err.client_message()).into_response();
     }
 
     // Fresh-start-only validation: parse the reuse policy. Runs AFTER the
@@ -13142,6 +13355,44 @@ pub(crate) async fn start_workflow(
                 "error": "conflict_policy is not supported for a throttled, debounced, or batched \
                           workflow; the start is deferred and has no active prior to resolve at \
                           request time"
+            })),
+        )
+            .into_response();
+    }
+
+    // issue #697: an explicit shard placement pins where the execution's data
+    // lands. Debounce (#499) and batch (#518) DEFER the start and derive their
+    // own shard from the debounce/batch KEY -- that co-location is load-bearing
+    // (the `UNIQUE (workflow_name, debounce_key)` upsert collapse only works if
+    // every admission for a key lands on the same shard), so honouring a
+    // per-request pin would break the collapse whenever two admissions for one
+    // key pinned different shards. Rejecting is therefore the correct outcome,
+    // and it is mandatory rather than cosmetic: silently accepting the request
+    // and re-hashing would place residency-bound data in the wrong database
+    // while returning `202` with no `shard_id` for the caller to check -- the
+    // exact silent-fallback failure mode this feature exists to remove.
+    // Throttle (#607) is NOT included: it threads the resolved `shard` through
+    // to `reserve_or_defer`, so a pinned throttled start is honoured.
+    if !placement.is_auto() && (is_debounced_start || has_batch_policy) {
+        audit_start_failure(
+            &api_state,
+            &StartFailureAudit {
+                actor: &actor,
+                workflow_name: &workflow_name,
+                route,
+                request_id: request_id.as_deref(),
+                source: &source,
+                requested_shard_id: request.shard_id,
+            },
+            "shard placement on a deferred start",
+        )
+        .await;
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "shard_id/residency_key is not supported for a debounced or batched \
+                          workflow; the start is deferred and its shard is derived from the \
+                          debounce/batch key so all admissions for that key collapse together"
             })),
         )
             .into_response();
@@ -14133,7 +14384,16 @@ pub(crate) async fn start_workflow(
 
     // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);
-    let mut conn = match db_conn_for_shard(&api_state, shard).await {
+    // An explicitly PINNED start must never fall back to the default shard's
+    // pool (issue #697) -- that would write residency-bound data to the wrong
+    // database while reporting the pinned shard. An unpinned start keeps the
+    // pre-#697 fallback behaviour byte-for-byte.
+    let conn_result = if placement.is_auto() {
+        db_conn_for_shard(&api_state, shard).await
+    } else {
+        db_conn_for_pinned_shard(&api_state, shard).await
+    };
+    let mut conn = match conn_result {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
@@ -14487,17 +14747,28 @@ pub(crate) async fn start_workflow(
                     ))
                     .into_response();
                 }
-                return (
-                    axum::http::StatusCode::ACCEPTED,
-                    Json(serde_json::json!({
-                        "throttled": true,
-                        "workflow_name": workflow_name,
-                        "workflow_id": outcome.workflow_id,
-                        "throttle_key": outcome.throttle_key,
-                        "deferred_at": outcome.deferred_at,
-                    })),
-                )
-                    .into_response();
+                let mut body = serde_json::json!({
+                    "throttled": true,
+                    "workflow_name": workflow_name,
+                    "workflow_id": outcome.workflow_id,
+                    "throttle_key": outcome.throttle_key,
+                    "deferred_at": outcome.deferred_at,
+                });
+                // issue #697 (AC5): a throttled start HONOURS an explicit pin --
+                // the resolved shard is threaded into `reserve_or_defer` and the
+                // scanner fires there -- so the accepted placement must be
+                // echoed here too. Without it a caller has no way to audit a
+                // deferred pinned start (there is no `execution_id` to decode
+                // yet), contradicting the contract that every start response
+                // reports the resolved shard whenever placement was requested.
+                // Omitted for an unpinned start, keeping its body byte-identical
+                // to a pre-#697 build.
+                if let Some(pinned) = pinned_shard_id
+                    && let Some(obj) = body.as_object_mut()
+                {
+                    obj.insert("shard_id".to_string(), serde_json::json!(pinned));
+                }
+                return (axum::http::StatusCode::ACCEPTED, Json(body)).into_response();
             }
             Ok(autumn_harvest::throttle::ThrottleAdmission::Reserved { bucket_key }) => {
                 throttle_reserved = Some(bucket_key);
@@ -14658,6 +14929,7 @@ pub(crate) async fn start_workflow(
                         state: start.state,
                         started_fresh: Some(start.created),
                         deduplicated: Some(false),
+                        shard_id: pinned_shard_id,
                     }),
                 )
                     .into_response()
@@ -14697,6 +14969,7 @@ pub(crate) async fn start_workflow(
                         state: dup_state,
                         started_fresh: Some(false),
                         deduplicated: Some(true),
+                        shard_id: pinned_shard_id,
                     }),
                 )
                     .into_response()
@@ -14994,6 +15267,7 @@ pub(crate) async fn start_workflow(
                     },
                     // No-key path never sets `deduplicated` (idempotency-key only).
                     deduplicated: None,
+                    shard_id: pinned_shard_id,
                 }),
             )
                 .into_response()
@@ -20376,6 +20650,9 @@ pub(crate) async fn trigger_dag_run_inner(
                     state: started.state,
                     started_fresh: None,
                     deduplicated: None,
+                    // Placement pinning is a workflow-start concern (issue
+                    // #697); DAG triggers route via `pick_for_dag`.
+                    shard_id: None,
                 }),
             ))
         }
@@ -29534,6 +29811,31 @@ pub(crate) async fn db_conn_for_shard(
     acquire_conn(pool.pool_for(shard)).await
 }
 
+/// Acquire a connection for `shard` with **no** default-shard fallback
+/// (issue #697).
+///
+/// [`db_conn_for_shard`] resolves through `pool_for`, which silently returns
+/// the default shard's pool when `shard` has no pool of its own. For an
+/// explicitly *pinned* start that fallback is a correctness failure, not a
+/// convenience: the execution id, the response, and the row's `shard_id`
+/// column would all report the pinned shard while the data physically landed
+/// in the default shard's database — a silent residency breach that only
+/// surfaces later, when the pinned shard's pool is finally wired up and those
+/// executions become invisible. Fail loudly instead.
+async fn db_conn_for_pinned_shard(
+    api_state: &HarvestApiState,
+    shard: ShardId,
+) -> Result<PoolConn, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let shard_pool = pool.exact_pool_for(shard).ok_or_else(|| {
+        AutumnError::service_unavailable_msg(format!(
+            "shard {shard} has no configured connection pool; it is known to the router but not \
+             yet serviceable, so a workflow cannot be pinned to it"
+        ))
+    })?;
+    acquire_conn(shard_pool).await
+}
+
 async fn db_conn_for_dag(
     api_state: &HarvestApiState,
     dag_name: &str,
@@ -30898,6 +31200,125 @@ fn parse_conflict_policy(raw: Option<&str>) -> Result<WorkflowIdConflictPolicy, 
             "unknown conflict_policy '{other}'; expected one of: unspecified, fail, use_existing, \
              terminate_existing"
         ))),
+    }
+}
+
+/// Write a best-effort `FAILED` audit row for a rejected workflow start.
+///
+/// Mirrors the inline audit blocks the reuse-policy / conflict-policy `400`
+/// paths already use; extracted so the issue-#697 placement rejections record
+/// the same trail without a third copy of the boilerplate.
+/// Request-scoped identity for a failed workflow-start audit row.
+///
+/// Bundled rather than passed positionally because every call site supplies the
+/// same six values verbatim and only `error_summary` varies.
+struct StartFailureAudit<'a> {
+    actor: &'a str,
+    workflow_name: &'a str,
+    route: &'static str,
+    request_id: Option<&'a str>,
+    source: &'a str,
+    /// The shard the caller *requested*, when they requested one (issue #697).
+    ///
+    /// Recorded so an operator can answer "who repeatedly tried to pin
+    /// EU-tagged work at the US shard and was refused?" from the audit log
+    /// alone — the success path already records the resolved shard, so a
+    /// hardcoded `None` here would make rejections forensically silent.
+    requested_shard_id: Option<i32>,
+}
+
+async fn audit_start_failure(
+    api_state: &HarvestApiState,
+    ctx: &StartFailureAudit<'_>,
+    error_summary: &str,
+) {
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+    {
+        let ar = NewAuditRecord {
+            actor: ctx.actor,
+            operation: OP_WORKFLOW_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(ctx.workflow_name),
+            route_or_command: ctx.route,
+            request_id: ctx.request_id,
+            idempotency_key: None,
+            status: STATUS_FAILED,
+            error_summary: Some(error_summary),
+            shard_id: ctx.requested_shard_id,
+            source: ctx.source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+}
+
+/// Parse the optional explicit shard placement (issue #697).
+///
+/// Cap on a caller-supplied `residency_key`.
+///
+/// A residency key names a declared jurisdiction/tenant bucket, so a legitimate
+/// one is short. Capping it keeps an unbounded caller-supplied string from being
+/// reflected back in the `400` body — `input` has a payload cap, this field
+/// otherwise had none.
+const MAX_RESIDENCY_KEY_LEN: usize = 128;
+
+/// `shard_id` and `residency_key` are mutually exclusive placement sources;
+/// supplying both is ambiguous and rejected rather than silently preferring
+/// one. Omitting both yields [`ShardPlacement::Auto`] — today's rendezvous
+/// routing, byte-for-byte.
+///
+/// This validates only the *shape* of the request. Whether the requested shard
+/// actually exists (and is writable), or the residency key is declared, is the
+/// router's call — see [`ShardPlacement`] and
+/// `ShardRouter::resolve_placement`. Both layers return `400`-class errors, so
+/// an out-of-range or unparseable value can never fall through to a silent
+/// re-hash onto the default shard.
+fn parse_shard_placement(
+    shard_id: Option<i32>,
+    residency_key: Option<&str>,
+) -> Result<ShardPlacement, AutumnError> {
+    match (shard_id, residency_key) {
+        (Some(_), Some(_)) => Err(AutumnError::bad_request_msg(
+            "shard_id and residency_key are mutually exclusive; supply at most one placement",
+        )),
+        (Some(raw), None) => {
+            if raw < 0 {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id must be a non-negative shard number, got {raw}"
+                )));
+            }
+            if ShardId::new(raw).is_unencoded() {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id {raw} is the reserved routing sentinel, not a placeable shard"
+                )));
+            }
+            // Above `0xFFFE` the value cannot round-trip through an
+            // `ExecutionId` (the encoder masks to 16 bits), so the row would be
+            // written to one database while every id-based lookup routed to the
+            // truncated shard. The router rejects it too; catching it at the
+            // request boundary gives the caller the precise reason.
+            if !autumn_harvest::shard::is_encodable_shard(ShardId::new(raw)) {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "shard_id must be at most {}, got {raw}",
+                    autumn_harvest::shard::MAX_ENCODABLE_SHARD
+                )));
+            }
+            Ok(ShardPlacement::Shard(ShardId::new(raw)))
+        }
+        (None, Some(key)) => {
+            if key.trim().is_empty() {
+                return Err(AutumnError::bad_request_msg(
+                    "residency_key must not be blank",
+                ));
+            }
+            if key.trim().len() > MAX_RESIDENCY_KEY_LEN {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "residency_key must be at most {MAX_RESIDENCY_KEY_LEN} characters"
+                )));
+            }
+            Ok(ShardPlacement::residency_key(key.trim()))
+        }
+        (None, None) => Ok(ShardPlacement::Auto),
     }
 }
 
@@ -41639,5 +42060,75 @@ mod tests {
         assert_eq!(page.status, FanoutStatus::Partial);
         assert_eq!(page.unavailable_shards.len(), 1);
         assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    // ── issue #697: explicit shard placement parsing (pure, no DB) ──────────
+
+    #[test]
+    fn placement_defaults_to_auto_when_neither_field_is_supplied() {
+        // AC1: omitting both fields must be byte-for-byte today's behaviour.
+        let placement = parse_shard_placement(None, None).expect("no placement is valid");
+        assert_eq!(placement, ShardPlacement::Auto);
+        assert!(placement.is_auto());
+    }
+
+    #[test]
+    fn placement_parses_an_explicit_shard_id() {
+        assert_eq!(
+            parse_shard_placement(Some(3), None).expect("shard 3 parses"),
+            ShardPlacement::Shard(ShardId::new(3))
+        );
+    }
+
+    #[test]
+    fn placement_parses_a_residency_key() {
+        assert_eq!(
+            parse_shard_placement(None, Some("eu")).expect("eu parses"),
+            ShardPlacement::residency_key("eu")
+        );
+    }
+
+    #[test]
+    fn placement_rejects_supplying_both_fields() {
+        // Two placement sources are ambiguous; never silently prefer one.
+        let err = parse_shard_placement(Some(1), Some("eu")).expect_err("both is ambiguous");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("shard_id") && msg.contains("residency_key"),
+            "message must name both fields: {msg}"
+        );
+    }
+
+    #[test]
+    fn placement_rejects_a_negative_shard_id() {
+        // Shard numbers are non-negative; a negative value is unparseable
+        // rather than a silent re-hash.
+        let err = parse_shard_placement(Some(-1), None).expect_err("negative is invalid");
+        assert!(
+            format!("{err:?}").contains("shard_id"),
+            "message must name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn placement_rejects_the_unencoded_sentinel_shard_id() {
+        // 0xFFFF is the routing sentinel, never a placeable shard.
+        let err = parse_shard_placement(Some(0xFFFF), None).expect_err("sentinel is invalid");
+        assert!(
+            format!("{err:?}").contains("shard_id"),
+            "message must name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn placement_rejects_a_blank_residency_key() {
+        for blank in ["", "   "] {
+            let err =
+                parse_shard_placement(None, Some(blank)).expect_err("blank keys are unparseable");
+            assert!(
+                format!("{err:?}").contains("residency_key"),
+                "message must name the field: {err:?}"
+            );
+        }
     }
 }

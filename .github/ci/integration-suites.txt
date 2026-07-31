@@ -107,6 +107,7 @@ linux        autumn-harvest-plugin  read_path_decode_integration     -          
 linux        autumn-harvest-plugin  replay_diagnosis_integration     -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  schedule_runs_integration        -                          -
+linux        autumn-harvest-plugin  shard_placement_integration      -                          -
 linux        autumn-harvest-plugin  start_idempotency_integration    -                          -
 linux        autumn-harvest-plugin  start_source_integration         -                          -
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -

@@ -143,6 +143,50 @@ fn workflow_start_maps_to_management_api_request() {
     );
 }
 
+/// issue #697: `--residency-key` maps to the `residency_key` body field, and an
+/// unpinned start's body stays byte-identical to a pre-#697 CLI.
+#[test]
+fn workflow_start_residency_key_maps_to_the_body_field() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "start",
+        "approval_workflow",
+        "--workflow-id",
+        "approval-42",
+        "--residency-key",
+        "eu",
+    ])
+    .expect("workflow start args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.path, "/workflows/approval_workflow/start");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "workflow_id": "approval-42",
+            "residency_key": "eu",
+        }))
+    );
+}
+
+/// issue #697: `--shard-id` maps to a numeric `shard_id` body field.
+#[test]
+fn workflow_start_shard_id_maps_to_a_numeric_body_field() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "start",
+        "approval_workflow",
+        "--shard-id",
+        "2",
+    ])
+    .expect("workflow start args should parse");
+
+    let request = cli.api_request().expect("request should build");
+    assert_eq!(request.body, Some(json!({ "shard_id": 2 })));
+}
+
 /// Lineage tree (issue #621) maps onto `GET /workflows/{id}/tree`, with every
 /// bound carried as a query param so an omitted flag inherits the *server's*
 /// documented default rather than a second copy of it in the CLI.

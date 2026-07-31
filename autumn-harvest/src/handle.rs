@@ -25,7 +25,7 @@ use crate::execution::{
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
 use crate::schema::harvest_workflow_executions;
-use crate::shard::{ShardRouter, ShardedDbPool};
+use crate::shard::{ShardPlacement, ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, ShardId};
 use crate::worker::DbPool;
 
@@ -478,6 +478,39 @@ impl WorkflowHandleClient {
         self.inner
             .router
             .pick_for_new_workflow(workflow_name, workflow_id)
+    }
+
+    /// Resolve an explicit [`ShardPlacement`] for a new workflow (issue #697).
+    ///
+    /// [`ShardPlacement::Auto`] is exactly [`Self::pick_shard_for_new_workflow`];
+    /// the explicit variants pin the workflow (and, by shard inheritance, its
+    /// whole descendant tree) to a residency-controlled database.
+    ///
+    /// # Scope
+    ///
+    /// This **resolves** a placement against this client's router; it does not
+    /// by itself place anything. The in-process start APIs
+    /// ([`StartWorkflowParams`] and the typed client stubs) carry no placement
+    /// field, so they always route by hash — placement is exposed on the HTTP
+    /// start route and the CLI. Use this to compute or validate a shard
+    /// (e.g. to pre-flight an operator tool), not on the assumption that a
+    /// subsequent in-process start will honour it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ShardPlacementError`] as [`HarvestError::Config`] when the
+    /// requested shard is unknown or drained, or the residency key is blank or
+    /// undeclared.
+    pub fn resolve_shard_placement(
+        &self,
+        placement: &ShardPlacement,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> HarvestResult<ShardId> {
+        self.inner
+            .router
+            .resolve_placement(placement, workflow_name, workflow_id)
+            .map_err(HarvestError::from)
     }
 
     /// Create a handle for an existing workflow execution.
@@ -1303,5 +1336,117 @@ mod tests {
             WorkflowResultState::from_execution_state("RUNNING"),
             WorkflowResultState::Running
         );
+    }
+
+    // ── issue #697: explicit shard pinning ───────────────────────────────────
+
+    #[test]
+    fn shard_placement_error_converts_to_a_config_harvest_error() {
+        use crate::shard::ShardPlacementError;
+        // SDK callers surface placement failures through the ordinary error
+        // channel, which the plugin already maps to a 400-class response.
+        let err = HarvestError::from(ShardPlacementError::UnknownResidencyKey {
+            key: "apac".to_string(),
+            known: vec!["eu".to_string()],
+        });
+        match err {
+            HarvestError::Config(msg) => {
+                assert!(msg.contains("apac"), "message must name the key: {msg}");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    /// Build a client whose router declares a residency map. The pools are
+    /// never dialled (deadpool connects lazily), so this needs no database.
+    fn residency_client() -> WorkflowHandleClient {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+            "postgres://unused@127.0.0.1:1/unused",
+        );
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool");
+
+        let router = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        )
+        .with_residency_map([
+            ("eu".to_string(), ShardId::new(1)),
+            ("us".to_string(), ShardId::new(0)),
+        ]);
+
+        WorkflowHandleClient::new(
+            ShardedDbPool::single(pool),
+            router,
+            [(ShardId::new(0), "postgres://unused@127.0.0.1:1/unused")],
+        )
+    }
+
+    /// AC1b/AC5 on the **handle** surface: the SDK's placement resolver reads
+    /// the client's declared residency map, not a hash. Shard 1 is deliberately
+    /// NOT the default shard, so a "always resolves to default" regression is
+    /// caught rather than passing by coincidence.
+    #[test]
+    fn resolve_shard_placement_reads_the_declared_residency_map() {
+        let client = residency_client();
+        assert_eq!(
+            client
+                .resolve_shard_placement(&ShardPlacement::residency_key("eu"), "order_flow", "o-1")
+                .expect("declared key must resolve"),
+            ShardId::new(1),
+            "the `eu` key must resolve through the map to shard 1 (not the default shard 0)"
+        );
+        assert_eq!(
+            client
+                .resolve_shard_placement(&ShardPlacement::residency_key("us"), "order_flow", "o-1")
+                .expect("declared key must resolve"),
+            ShardId::new(0)
+        );
+    }
+
+    /// AC1 (no placement) on the handle surface: `Auto` is byte-for-byte
+    /// today's rendezvous routing.
+    #[test]
+    fn resolve_shard_placement_auto_matches_rendezvous_routing() {
+        let client = residency_client();
+        for i in 0..25 {
+            let workflow_id = format!("order-{i}");
+            assert_eq!(
+                client
+                    .resolve_shard_placement(&ShardPlacement::Auto, "order_flow", &workflow_id)
+                    .expect("auto never fails"),
+                client.pick_shard_for_new_workflow("order_flow", &workflow_id),
+                "Auto must be exactly the pre-#697 hash for {workflow_id}"
+            );
+        }
+    }
+
+    /// AC2 on the handle surface: an undeclared key and an unknown/drained
+    /// shard surface as a typed error the caller can act on — never a silent
+    /// fall back to the default shard.
+    #[test]
+    fn resolve_shard_placement_rejects_undeclared_and_unplaceable_targets() {
+        let client = residency_client();
+
+        for placement in [
+            ShardPlacement::residency_key("apac"),
+            ShardPlacement::residency_key("   "),
+            ShardPlacement::Shard(ShardId::new(99)),
+            // Readable but drained.
+            ShardPlacement::Shard(ShardId::new(2)),
+        ] {
+            let err = client
+                .resolve_shard_placement(&placement, "order_flow", "o-1")
+                .expect_err("unplaceable target must be rejected, never defaulted");
+            assert!(
+                matches!(err, HarvestError::Config(_)),
+                "expected Config for {placement:?}, got {err:?}"
+            );
+        }
     }
 }

@@ -25,13 +25,183 @@ This means:
 
 If your use-case requires a hard global cap across all shards (e.g., "at most 10 concurrent workflows for any tenant, regardless of which shard they land on"), route all executions for the same concurrency key to a single shard.
 
-`ShardRouter::new` builds a rendezvous router keyed on `(workflow_name, workflow_id)`. To achieve tenant-pinned routing you would need a workflow ID naming convention that incorporates the tenant identifier — for example, always prefixing workflow IDs with the tenant: `"acme::order-42"`. Because rendezvous hashing is deterministic, all workflow IDs with the same prefix will not necessarily land on the same shard (the hash also mixes in `workflow_name`), so this approach only works reliably if you pin both `workflow_name` and the tenant-identifying part of `workflow_id`.
+Use **explicit shard placement** (below) — supply a `residency_key` derived from the same field you cap on. Every execution carrying that key lands on the same shard, so the local `limit` is also the global limit:
 
-A fully custom shard-selection strategy is not yet exposed via `ShardRouter`; it is planned as a future API extension.
-
-With tenant-consistent placement, every execution for `tenant_id = "acme"` lands on the same shard, so the local `limit` is also the global limit.
+```bash
+curl -X POST /api/harvest/workflows/order_flow/start \
+  -H 'Content-Type: application/json' \
+  -d '{"workflow_id": "order-42", "input": {"tenant_id": "acme"}, "residency_key": "acme"}'
+```
 
 **Trade-off**: routing all of one tenant's workflows to the same shard concentrates load. Size shards to handle the worst-case tenant burst, or use rate limiting above Harvest to bound how fast new workflows can be started per tenant.
+
+---
+
+## Explicit shard placement and data residency (issue #697)
+
+By default a new workflow's shard is chosen by rendezvous hashing over `(workflow_name, workflow_id)`. That is the right default — it spreads load evenly and needs no configuration — but a hash cannot know which physical database sits in which jurisdiction, so it cannot satisfy a data-residency obligation. For that, the start path accepts an **explicit placement**.
+
+### Two ways to place a workflow
+
+| Placement | Field | Use when |
+|---|---|---|
+| **Concrete shard** | `shard_id: 1` | You already know the shard number (ops tooling, migrations, tests). |
+| **Residency key** | `residency_key: "eu"` | You know the *jurisdiction / tenant*, not the shard number. The router maps the key to a shard. |
+| **Auto** (default) | *omit both* | Anything with no residency obligation. Byte-for-byte the pre-#697 routing. |
+
+The two fields are **mutually exclusive** — supplying both is a `400`.
+
+### Resolution rule and stability guarantee
+
+A residency key is resolved through an **operator-declared map** on the router, not through a hash:
+
+```rust
+let router = ShardRouter::new(
+    vec![ShardId::new(0), ShardId::new(1)],   // readable
+    vec![ShardId::new(0), ShardId::new(1)],   // writable
+    ShardId::new(0),                          // default
+)
+.with_residency_map([
+    ("eu".to_string(), ShardId::new(0)),
+    ("us".to_string(), ShardId::new(1)),
+]);
+```
+
+This is a declared map rather than a hash for two reasons:
+
+1. **A hash cannot express jurisdiction.** Only the operator knows that shard 0's database is the one physically hosted in the EU. A hash would assign keys to shards arbitrarily.
+2. **A hash is not stable when the shard set widens.** Rendezvous hashing deliberately re-balances: adding a shard moves roughly `1/N` of keys to it. That is correct for load distribution and *fatal* for residency — a key that resolved to the EU shard could silently start resolving to the US shard the moment a third shard is added.
+
+The declared map gives the guarantee residency needs:
+
+> **A residency key resolves to the same shard across process restarts and across any widening of `writable_shards`.** The mapping changes only when an operator edits the map.
+
+A key that is **not in the map** is rejected with a typed error — it is never hashed as a fallback, because a silent hash is exactly the failure mode that produces a compliance breach.
+
+### Rejections (never a silent fallback)
+
+`POST /workflows/{name}/start` returns `400` with a JSON body — never a `500`, never a silent re-hash, never a quiet fall back to the default shard — for:
+
+| Condition | Error |
+|---|---|
+| `shard_id` not in `readable_shards` | *shard N is not a placeable shard for this deployment* |
+| `shard_id` readable but not in `writable_shards` (a draining shard) | *shard N is not currently accepting new workflows; it is being drained* |
+| `residency_key` not in the declared map | *residency key 'K' is not declared for this deployment* |
+| `residency_key` blank / whitespace-only | `residency key must not be blank` |
+| `residency_key` longer than 128 characters | rejected at the request boundary |
+| Both `shard_id` and `residency_key` supplied | mutually exclusive |
+| `shard_id` negative, or the reserved `65535` sentinel | rejected at the request boundary (not a placeable shard) |
+| `shard_id` / `residency_key` on a debounced or batched workflow | mutually exclusive (see *Caveats*) |
+
+Pinning to a **readable but non-writable** shard is rejected rather than accepted because placing new work on a shard the operator is draining contradicts the drain.
+
+The messages above are deliberately terse: they name what the caller asked for and why it was refused, but never enumerate the deployment's shard set, drain state, or declared residency keys — a start endpoint is often reachable by a lower-trust caller than the operator surfaces. The full detail (including the known set) is written to the server log via `tracing::warn!` for the operator.
+
+A pin to a shard the router accepts but that has **no pool of its own** — a real state mid a shard-add rollout, since the router's shard set and the pool map are configured independently — fails closed with a `503`, not a `201`. Falling back to the default shard's database here would write residency-bound data to the wrong country while still reporting the pinned shard to the caller.
+
+Misconfiguring the map itself (a blank key, or a target outside `readable_shards`) panics at `ShardRouter` construction, so it fails at boot rather than at the first request. A declared target that is readable but *not* writable is accepted (it is a legitimate mid-drain state) but logged as a warning: starts under that key will be rejected until the shard is writable again.
+
+### Observing the chosen shard
+
+The chosen shard is observable three ways after a start (AC5) — no new column was added:
+
+- The start response carries `shard_id` **when a placement was requested**. An unpinned start omits the field entirely, so its response is byte-for-byte the pre-#697 shape. A **throttled** start's deferred `202` echoes it too, since there is no `execution_id` to decode yet.
+- The `ExecutionId` encodes the shard in its first two bytes (`exec_id.shard()`), which is how every later id-based lookup routes with no directory.
+- The execution row's existing `shard_id` column.
+
+### Verifying fleet consistency *before* accepting pinned starts
+
+The three surfaces above tell you where one run landed. They cannot tell you whether the **fleet agrees on the map**, and that is the failure mode with the worst blast radius: if two replicas are deployed with different `residency_map`s, the same `residency_key` places workflows in **different jurisdictions** depending on which replica happens to serve the request — silently, because both replicas report identical `readable_shards` / `writable_shards` / `default_shard`.
+
+`GET /api/harvest/admin/config` (issue #695) therefore surfaces the declared map under `shard_topology.residency_map`:
+
+```bash
+curl -s .../admin/config | jq -S '.shard_topology'
+```
+
+```json
+{
+  "default_shard": 0,
+  "readable_shards": [0, 1],
+  "residency_map": { "eu": 0, "us": 1 },
+  "writable_shards": [0, 1]
+}
+```
+
+The projection is `BTreeMap`-ordered, so it is byte-stable and a plain diff across replicas is meaningful:
+
+```bash
+diff <(curl -s "$REPLICA_A/admin/config" | jq -S .shard_topology) \
+     <(curl -s "$REPLICA_B/admin/config" | jq -S .shard_topology)
+```
+
+Run this after any deploy that touches the map, and before you start relying on pinned starts. Residency keys are operator-declared jurisdiction labels, not secrets or caller input, and the endpoint is admin-gated — but note the deliberate asymmetry with the *rejection* messages above, which never enumerate the declared key set to a lower-trust start caller.
+
+A coverage guard keeps this honest: `ShardRouter::parts()` and `ShardTopologyView::from_router` both destructure exhaustively (no `..`), so adding a placement-affecting field to the router is a **compile error** until it is surfaced here. `residency_map` itself was missing from the snapshot when it was first introduced, which is why the guard exists.
+
+### Residency is transitive across the workflow tree
+
+Everything spawned under a pinned parent stays on the parent's shard — this is asserted by tests, not left implicit:
+
+| Descendant | Inherits |
+|---|---|
+| Awaited child workflow | ✅ |
+| Detached child workflow | ✅ |
+| `ctx.race()` child branch | ✅ |
+| Child-or-deadline race (`execute_child_workflow_timeout`) | ✅ |
+| `continue_as_new` successor | ✅ |
+| Workflow-level retry run (#523) | ✅ |
+| Reset fork (#148) | ✅ |
+
+So pinning the **root** of a workflow tree confines the whole tree.
+
+### Worked example — a two-region EU/US deployment
+
+1. **Provision two databases**, one per region, and run `diesel migration run` against each.
+
+2. **Declare the shards and the residency map** when building the router:
+
+   ```rust
+   let router = ShardRouter::new(
+       vec![ShardId::new(0), ShardId::new(1)],
+       vec![ShardId::new(0), ShardId::new(1)],
+       ShardId::new(0),
+   )
+   .with_residency_map([
+       ("eu".to_string(), ShardId::new(0)),   // database hosted in the EU
+       ("us".to_string(), ShardId::new(1)),   // database hosted in the US
+   ]);
+   ```
+
+3. **Start each workflow with the caller's region as the residency key.** Derive the key from whatever your app already knows about the customer — do *not* try to infer it from the workflow payload, which Harvest deliberately never inspects:
+
+   ```bash
+   # An EU customer's order — confined to the EU database.
+   curl -X POST /api/harvest/workflows/order_flow/start \
+     -H 'Content-Type: application/json' \
+     -d '{"workflow_id": "order-1001", "input": {...}, "residency_key": "eu"}'
+   # → 201 {"execution_id": "...", "shard_id": 0, ...}
+   ```
+
+   or from the CLI:
+
+   ```bash
+   harvest workflow start order_flow --workflow-id order-1001 --residency-key eu
+   ```
+
+4. **Prove confinement.** The response's `shard_id` is `0`; the returned `execution_id` encodes shard `0`; and the row exists in the EU database only. Every child, retry, and continue-as-new of that run stays in the EU database.
+
+5. **Adding a third region later does not move existing keys.** Add shard 2 to `readable_shards`, wait for readiness, add it to `writable_shards`, then add `("apac", ShardId::new(2))` to the map. `eu` and `us` keep resolving exactly where they did.
+
+### Caveats
+
+- **`(workflow_name, workflow_id)` uniqueness is per-shard.** A pin moves a run off its hash-derived shard, so a *later, unpinned* start of the same `workflow_id` would route elsewhere and could create a duplicate. When the caller omits `workflow_id`, Harvest mints one that hashes to the pinned shard, closing the hole automatically. When the caller supplies an **explicit** `workflow_id`, be consistent: either always pin it or never pin it. (This is the same consistency requirement idempotency-key routing already documents.)
+- **Placement is resolved before idempotency-key replay.** A retry of a keyed start must carry the same placement as the original delivery. A *committed* keyed replay still returns its original `200` even if the pinned shard has since been drained — the replay creates no new work, so it is validated against `readable_shards` only.
+- **Only the HTTP start route and the CLI carry placement.** `POST /workflows/{name}/signal-with-start` and `/update-with-start` have no `shard_id` / `residency_key` field, and the in-process SDK start APIs (`StartWorkflowParams`, the typed client stubs) carry none either — all of them route by hash. An entity workflow created through the documented signal-with-start pattern therefore **cannot** be pinned today. If a residency-bound workflow must be reachable that way, start it explicitly first (pinned) and let signal-with-start attach to the existing run. `WorkflowHandleClient::resolve_shard_placement` resolves and validates a placement for pre-flight tooling, but does not itself place anything.
+- **Deferred starts cannot be pinned.** Debounce (#499) and batch (#518) admit a start without creating an execution, so there is nothing to place at request time; combining either with `shard_id` / `residency_key` is a `400` rather than a silently discarded pin. A throttled start (#607) *is* pinned — it defers the same concrete placement to its scanner.
+- **Rollout ordering.** Placement is enforced by the node handling the start. During a rolling deploy, a pinned request that lands on a pre-#697 node is accepted and hashed, silently ignoring the pin. Upgrade the whole fleet before you begin sending pinned starts, and treat the first pinned start as the cutover point.
+- **Residency keys are an operator-declared, low-cardinality set.** The map is held in memory on every node and validated at boot; it is sized for regions/jurisdictions (single digits to dozens), not per-tenant keys. For per-tenant placement, map the tenant to a region in your own application layer and pass the region as the key.
+- **Out of scope**: migrating a *running* workflow between shards, per-shard worker assignment, geo-replication / cross-region failover, and inferring residency from payload contents. Harvest never reads your payload to decide placement — the caller states it explicitly.
 
 ### Cross-shard global limits — explicit out of scope
 
@@ -145,7 +315,7 @@ Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts w
 
 ## Debounce coordination is shard-local (issue #499)
 
-Debounce pending-start records (`harvest_debounce`) are routed to the same shard as the debounce key (via `ShardRouter`), matching the per-key concurrency scope above. All burst admissions for the same `(workflow_name, debounce_key)` pair must land on the same shard for the `UNIQUE (workflow_name, debounce_key)` upsert collapse to work. Cross-shard global debounce coordination is **out of scope**: embedders requiring a global cap should ensure all executions for a given debounce key route to a single shard (see the concurrency routing guidance above).
+Debounce pending-start records (`harvest_debounce`) are routed to the same shard as the debounce key (via `ShardRouter`), matching the per-key concurrency scope above. All burst admissions for the same `(workflow_name, debounce_key)` pair must land on the same shard for the `UNIQUE (workflow_name, debounce_key)` upsert collapse to work. Cross-shard global debounce coordination is **out of scope**: embedders requiring a global cap should ensure all executions for a given debounce key route to a single shard (see [Explicit shard placement and data residency](#explicit-shard-placement-and-data-residency-issue-697) above).
 
 ---
 
@@ -153,7 +323,7 @@ Debounce pending-start records (`harvest_debounce`) are routed to the same shard
 
 Per-key **activity** rate-limit buckets (`dyn-rate:{key_expr}:{resolved}` in `harvest_rate_limit_buckets`, declared via `#[activity(rate_limit(key = "input.tenant_id", rps = …))]`) are enforced **within a shard**, exactly like the per-key concurrency limits and the workflow-start throttle above. An activity dispatched from a workflow runs on that workflow's own shard, so the token bucket for a given `(key_expr, resolved_value)` is consulted on that shard only. Buckets are never coordinated across shards.
 
-**Consequence**: the effective per-tenant RPS across a multi-shard cluster is `per-shard-rate × number-of-shards-the-tenant's-workflows-land-on`. If a tenant's workflows spread across N shards via rendezvous hashing, that tenant's activities can run at up to N × the declared `rps`. Cross-shard global rate coordination is **out of scope** (it would require a coordination service or bounded-inaccuracy gossip, both of which conflict with the Postgres-native design). Embedders needing a true global per-tenant activity cap should route all of a tenant's executions to a single shard (see the concurrency routing guidance above), so every one of that tenant's activities consults the same bucket.
+**Consequence**: the effective per-tenant RPS across a multi-shard cluster is `per-shard-rate × number-of-shards-the-tenant's-workflows-land-on`. If a tenant's workflows spread across N shards via rendezvous hashing, that tenant's activities can run at up to N × the declared `rps`. Cross-shard global rate coordination is **out of scope** (it would require a coordination service or bounded-inaccuracy gossip, both of which conflict with the Postgres-native design). Embedders needing a true global per-tenant activity cap should route all of a tenant's executions to a single shard (see [Explicit shard placement and data residency](#explicit-shard-placement-and-data-residency-issue-697) above), so every one of that tenant's activities consults the same bucket.
 
 ---
 
@@ -161,7 +331,7 @@ Per-key **activity** rate-limit buckets (`dyn-rate:{key_expr}:{resolved}` in `ha
 
 The durable named mutex `ctx.mutex(key).acquire()` (the `harvest_mutex_locks` / `harvest_mutex_waiters` tables) is enforced **within a shard**, exactly the same scope as the per-key concurrency limits above. The lock table, the FIFO waiter queue, and the `pg_advisory_xact_lock` that serializes each acquire/release/reclaim all live on the workflow's own shard, so "at most one holder per key" holds only among executions that resolve to that shard.
 
-**Consequence**: two workflows that must serialize on a shared resource must land on the **same** shard for the mutex to actually serialize them. Route all contending executions for a given lock key to a single shard (see the concurrency routing guidance above) — e.g. derive the mutex key from the same field you shard on. Cross-shard global mutual exclusion is **out of scope** for the same Postgres-native reasons as cross-shard concurrency and rate limits.
+**Consequence**: two workflows that must serialize on a shared resource must land on the **same** shard for the mutex to actually serialize them. Route all contending executions for a given lock key to a single shard (see [Explicit shard placement and data residency](#explicit-shard-placement-and-data-residency-issue-697) above) — e.g. derive the mutex key from the same field you shard on. Cross-shard global mutual exclusion is **out of scope** for the same Postgres-native reasons as cross-shard concurrency and rate limits.
 
 ---
 
