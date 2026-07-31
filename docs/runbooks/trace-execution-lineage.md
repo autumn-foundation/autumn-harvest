@@ -76,7 +76,7 @@ Or, straight to the id with `jq`:
 
 ```bash
 curl -s "$HARVEST/api/harvest/workflows/$EXEC_ID/tree" \
-  | jq -r '[.root] | [recurse(.children[]?)] | .[] | select(.state=="FAILED") | .execution_id'
+  | jq -r '.root | recurse(.children[]?) | select(.state=="FAILED") | .execution_id'
 ```
 
 Then drill into that id with the single-execution surfaces:

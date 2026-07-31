@@ -609,7 +609,11 @@
         },
         {
           "status": 404,
-          "description": "Root execution not found (including a classic DAG run, which is not on the execution path)."
+          "description": "Root execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it), and for a classic DAG run, which is not on the execution path."
+        },
+        {
+          "status": 503,
+          "description": "The root's own shard could not be queried, so existence is undetermined (retriable): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node — the normal state mid a shard-add rollout — or that shard's pool connection could not be acquired. Deliberately not a 404: answering 'not found' would be a false negative for a run that may exist on its own shard. Note this applies only to the ROOT lookup; an unreachable shard encountered during the DESCENDANT walk degrades to 200 with status=partial and the shard named in unavailable_shards."
         },
         {
           "status": 500,
