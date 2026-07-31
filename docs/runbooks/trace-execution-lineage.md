@@ -161,6 +161,15 @@ The tree is assembled by reading each shard independently. Two consequences:
 
   The CLI prints a `PARTIAL (...)` block naming each unavailable shard.
 
+- **A `503` means "cannot tell", not "not found".** If the *root's* own shard
+  is one this node knows about but has no configured pool for — the normal
+  state mid a shard-add rollout, where `readable_shards` is widened before the
+  pool is provisioned — the call returns `503` naming that shard rather than a
+  `404`. The execution may well exist on its own shard, and answering `404`
+  would read as authoritative ("no such run") when existence is genuinely
+  undetermined. Retry once the pool is configured, or query a node that has it.
+  A `404` is reserved for an id no shard in this deployment could host.
+
 - **The snapshot may be marginally time-skewed across shards.** There is no
   cross-shard transaction: a child on shard B is read a few milliseconds after
   its parent on shard A, so a child that terminated in that window can appear

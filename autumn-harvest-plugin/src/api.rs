@@ -9831,11 +9831,20 @@ async fn get_workflow_tree(
     let exec_id = parse_execution_id(&id)?;
     let params = parse_lineage_query(&pairs)?;
 
-    // Root lookup is O(1) shard-routed off the id's embedded shard — the same
-    // routing every other single-execution route uses. Only the *descendant*
-    // walk needs a fan-out.
+    // Root lookup is O(1) shard-routed off the id's embedded shard — only the
+    // *descendant* walk needs a fan-out. Deliberately the **exact** variant:
+    // the lenient `db_conn_for_execution` would fall back to the default shard
+    // when the owning shard has no pool on this node, turning "I cannot see
+    // that shard" into a confident `404`. That would contradict this very
+    // response, whose `unavailable_shards` reports exactly such a shard as
+    // unreachable for the descendant walk.
     let root_execution = {
-        let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+        let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        };
         match load_execution(&mut conn, exec_id).await {
             Ok(execution) => execution,
             Err(HarvestError::NotFound(_)) => {
@@ -29416,6 +29425,50 @@ pub(crate) async fn db_conn_for_execution(
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     acquire_conn(pool.pool_for_execution(exec_id)).await
+}
+
+/// Resolve a connection to the shard that *owns* `exec_id`, with **no default
+/// fallback** — for reads whose answer is "does this execution exist?".
+///
+/// [`db_conn_for_execution`] routes through `ShardedDbPool::pool_for_execution`,
+/// which falls back to the **default** shard when the id's encoded shard has no
+/// configured pool. For an existence question that fallback is a correctness
+/// hazard: mid a shard-add rollout (step 2 of the documented procedure widens
+/// `readable_shards` *before* this process has the new pool) the lookup
+/// silently queries the wrong database, finds nothing, and answers a confident
+/// `404` for a run that may exist on its own shard.
+///
+/// This variant fails closed instead, mirroring the business-id resolver
+/// (#805): `Err` → `503` when the owning shard is one this deployment claims
+/// but cannot query, so existence is genuinely undetermined; `Ok(None)` when
+/// the id encodes a shard neither the pools nor the router know about — nothing
+/// here could ever host it, so the caller's `404` is honest. Membership is
+/// decided by [`shard_fanout::expected_shards`], the same helper the lineage
+/// fan-out uses, so a single request can never call one shard `unavailable` for
+/// descendants while implying "does not exist" for the root.
+///
+/// Only `GET /workflows/{id}/tree` uses this today. The lenient
+/// [`db_conn_for_execution`] is left in place for the ~40 other
+/// single-execution routes: switching them all is a behaviour change across the
+/// whole management API and belongs in its own slice.
+pub(crate) async fn db_conn_for_execution_exact(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<Option<PoolConn>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
+        return acquire_conn(shard_pool).await.map(Some);
+    }
+    let shard = exec_id.shard().as_i32();
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    if crate::shard_fanout::expected_shards(api_state, &pools).contains(&shard) {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "shard {shard} owns execution {exec_id} but has no configured storage \
+             pool on this node; cannot determine whether it exists without \
+             risking a false 404"
+        )));
+    }
+    Ok(None)
 }
 
 pub(crate) async fn db_conn_for_shard(

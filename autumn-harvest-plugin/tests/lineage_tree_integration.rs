@@ -840,6 +840,68 @@ async fn a_shard_that_was_never_queried_is_not_reported_as_inspected() {
     );
 }
 
+// ── Root resolution vs. the default-shard fallback ────────────────────────
+
+/// The root lookup must not silently fall back to the default shard.
+///
+/// `ShardedDbPool::pool_for` falls back to the default shard when the requested
+/// shard has no entry, so routing the root off its encoded shard through the
+/// lenient `pool_for_execution` would query the **wrong database**, find
+/// nothing, and answer a confident `404` — for an execution that may well exist
+/// on its own shard. That is the exact false-negative the sibling business-id
+/// resolver (#805) fails closed against, and it would contradict this very
+/// endpoint's own fan-out, which reports a router-known-but-poolless shard as
+/// `unavailable` rather than pretending it is empty.
+#[tokio::test]
+async fn a_root_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404() {
+    let (admin, _guard) = setup_server().await;
+    let shard0 = create_shard_db(&admin, &unique("lineage_s0")).await;
+
+    // The router knows shards 0 and 1, but this process only has a pool for 0
+    // — the documented mid-shard-add-rollout state (readable_shards widened
+    // before the pool is configured).
+    let pools = BTreeMap::from([(ShardId::new(0), build_pool(&shard0))]);
+    let app = build_app(
+        HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0))),
+        router_for(&[0, 1]),
+    );
+
+    // An id whose embedded shard is 1 — the shard we cannot query.
+    let root = ExecutionId::new_for_shard(ShardId::new(1));
+
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the owning shard could not be queried, so existence is unknown — \
+         answering 404 would be a false negative; body: {body}"
+    );
+    let message = body.to_string();
+    assert!(
+        message.contains('1'),
+        "the response must name the shard that could not be queried: {message}"
+    );
+}
+
+/// ...but the fix must not over-reach into a confusing `503` for an id no shard
+/// in this deployment could ever host (an operator pasting a wrong UUID decodes
+/// to an arbitrary shard number). Unknown-to-the-router stays a clean `404`.
+#[tokio::test]
+async fn a_root_on_a_shard_this_deployment_does_not_know_is_still_404() {
+    let (admin, _guard) = setup_server().await;
+    let (app, _conn) = single_shard_app(&admin).await;
+
+    // Shard 7 is neither a configured pool nor known to the router.
+    let root = ExecutionId::new_for_shard(ShardId::new(7));
+
+    let (status, _body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no shard in this deployment could host that id, so 404 is honest"
+    );
+}
+
 // ── Cycle safety ─────────────────────────────────────────────────────────
 
 #[tokio::test]
