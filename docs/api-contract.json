@@ -553,6 +553,78 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/{id}/tree",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Recursive cross-shard execution lineage tree (issue #621): the full descendant tree rooted at {id}, so an operator triaging a DLQ/stuck alert can locate the failed descendant of a multi-level saga in ONE call instead of hand-walking parent_id links level by level and shard by shard. Rooting at a mid-tree node returns just the subtree below it; the chosen root is always depth 0 and still reports its own parent_id. Each node carries execution_id, workflow_name, workflow_id, state, started_at, closed_at, parent_id, depth, shard_id, and the spawn relationship (await_mode `awaited`/`detached` plus parent_close_policy when detached); children is always an array, empty for a leaf (never an error). The walk fans out across every readable shard (the iter_shards() aggregation pattern), so a child placed on a different shard than its parent by rendezvous hashing still appears. Recursion is bounded by max_depth (default 20, ceiling 50) and max_nodes (default 1000, ceiling 10000, counted INCLUDING the root); hitting either sets truncated=true with a machine-readable truncation_reason (`max_depth` | `max_nodes`) and names the dropped subtrees' parents in truncated_parent_ids (bounded, with truncated_parents_capped when it overflowed) — never a silent cap. Only parents that PROVABLY have children are named (via a bounded existence probe), so an operator is never sent chasing a subtree that does not exist. A visited-set guarantees each execution_id appears exactly once and a malformed parent_id loop terminates instead of recursing. `?summary=true` returns the per-state DESCENDANT roll-up (counts keyed by lowercased state, every known state always present even at 0; the root's own state is echoed on `root` and excluded from counts) plus total_descendants, for an at-a-glance health check without transferring the tree. Cross-shard degradation (issue #756): an unreachable shard is named in unavailable_shards with status `partial`/`unavailable` rather than failing the whole call — a triage read must not 500 during the incident it exists to diagnose. NOT admin-gated, matching GET /workflows/{id}/children (which already traverses depth cross-shard over the same rows). SNAPSHOT CONSISTENCY: shards are read independently, so a tree may be marginally time-skewed across shards; acceptable for triage. Adds no WorkflowEvent variant, no migration, appends no events, performs no writes.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Root execution UUID (may be any node in the tree)."
+        },
+        {
+          "name": "max_depth",
+          "in": "query",
+          "required": false,
+          "description": "Recursion depth cap below the root. Default 20, must be 1–50. Out of range is rejected with 400 rather than silently clamped."
+        },
+        {
+          "name": "max_nodes",
+          "in": "query",
+          "required": false,
+          "description": "Total node cap INCLUDING the root. Default 1000, must be 1–10000. Out of range is rejected with 400."
+        },
+        {
+          "name": "summary",
+          "in": "query",
+          "required": false,
+          "description": "`true`/`1` returns the per-state descendant roll-up instead of the nested tree."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "root",
+          "node_count",
+          "max_depth_reached",
+          "truncated",
+          "truncation_reason",
+          "truncated_parent_ids",
+          "truncated_parents_capped",
+          "limits",
+          "status",
+          "unavailable_shards",
+          "counts",
+          "total_descendants",
+          "retained_summary_parent_ids"
+        ],
+        "notes": "The body is POLYMORPHIC. Default (tree) mode returns root (a nested node whose `children` array recurses), node_count, and max_depth_reached. `?summary=true` returns root as a compact {execution_id, workflow_name, workflow_id, state} ref plus counts (map of lowercased state -> descendant count) and total_descendants, and omits node_count/children. Both shapes carry truncated, truncation_reason (omitted when null), truncated_parent_ids, truncated_parents_capped, limits (the bounds actually applied), status, and unavailable_shards. The fields list above is the UNION of both shapes. retained_summary_parent_ids (issue #752) names nodes in the returned tree that have at least one child DEMOTED INTO A RETENTION SUMMARY and therefore omitted from the tree along with everything beneath it; it is empty unless tiered summary retention is enabled. It is a THIRD, independent incompleteness signal: truncated=false AND status=complete together still do not mean every descendant is present -- check this list too. The omitted rows remain readable via GET /workflows/summaries."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution ID, or an out-of-range/non-numeric max_depth or max_nodes (the message names the offending bound)."
+        },
+        {
+          "status": 404,
+          "description": "Root execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it), and for a classic DAG run, which is not on the execution path."
+        },
+        {
+          "status": 503,
+          "description": "The root's own shard could not be queried, so existence is undetermined (retriable): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node — the normal state mid a shard-add rollout — or that shard's pool connection could not be acquired. Deliberately not a 404: answering 'not found' would be a false negative for a run that may exist on its own shard. Note this applies only to the ROOT lookup; an unreachable shard encountered during the DESCENDANT walk degrades to 200 with status=partial and the shard named in unavailable_shards."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only. A point-in-time snapshot assembled per-shard."
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}/stack",
       "category": "workflow",
       "read_only": true,

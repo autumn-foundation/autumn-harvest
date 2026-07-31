@@ -1024,10 +1024,15 @@ workflow failures become visible.
 3. Inspect recent failures directly: `harvest workflow list --state FAILED
    --workflow-name <name> | head -20` (or `GET /api/harvest/workflows?state=FAILED`)
    and read the `error` field for the original step error.
-4. Check whether `harvest_saga_compensation_failed` is ALSO firing — a spike
+4. If the saga spawns child workflows, the failing step may be several levels
+   down: `harvest workflow tree <exec_id> --summary` gives a per-state
+   descendant roll-up in one call, and `harvest workflow tree <exec_id>`
+   renders the whole family so you can find *which* descendant failed. See
+   [trace-execution-lineage.md](trace-execution-lineage.md).
+5. Check whether `harvest_saga_compensation_failed` is ALSO firing — a spike
    plus failed compensations means dangling state is accumulating; treat as
    the page, not the ticket.
-5. Check the downstream dependency the failing step calls (status page,
+6. Check the downstream dependency the failing step calls (status page,
    circuit breaker state via `GET /api/harvest/admin/circuits`).
 
 ### Likely causes

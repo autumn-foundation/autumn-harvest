@@ -16,7 +16,7 @@ use diesel_async::RunQueryDsl;
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
-use crate::schema::{harvest_events, harvest_workflow_executions};
+use crate::schema::{harvest_events, harvest_execution_summaries, harvest_workflow_executions};
 use crate::types::ExecutionId;
 
 /// Loaded event history for a single workflow execution.
@@ -1289,6 +1289,235 @@ fn workflow_child_row_from_parts(
         await_mode,
         parent_close_policy,
     }
+}
+
+// ── Cross-shard lineage tree loaders (issue #621) ────────────────────────────
+//
+// The recursive lineage walk expands a whole *frontier* of parents per level,
+// so these helpers take a batch of parent ids (`parent_id = ANY($1)`) rather
+// than a single parent. That turns a depth-`D` tree over `S` shards from
+// `O(nodes × S)` round trips (one query per parent per shard — what a naive
+// recursion over `load_workflow_children` costs) into `O(D × S)`, which is what
+// keeps a ~200-node/8-shard tree inside the issue's p95 < 500 ms budget.
+//
+// Both helpers are shard-local reads; the cross-shard fan-out and the bounded
+// walk itself live in the plugin (`autumn-harvest-plugin::lineage`).
+
+/// One execution row in a cross-shard lineage tree (issue #621).
+///
+/// Distinct from [`WorkflowChildRow`] (the `GET /workflows/{id}/children` read
+/// model): a lineage node additionally carries its own `parent_id` — needed to
+/// nest a flat, cross-shard row set back into a tree — and `workflow_id`, the
+/// business key an operator recognises. It deliberately does **not** carry an
+/// error summary: the tree is a topology/state map, and a node's failure detail
+/// is one `GET /workflows/{id}` away.
+#[derive(Debug, Clone)]
+pub struct LineageChildRow {
+    /// This execution's id.
+    pub exec_id: ExecutionId,
+    /// The parent this row was discovered through. `None` only for a row whose
+    /// `parent_id` column is NULL (a root), which the batch loader never
+    /// returns — it is populated for every discovered descendant.
+    pub parent_id: Option<ExecutionId>,
+    /// Registered workflow type name.
+    pub workflow_name: String,
+    /// Caller-supplied business workflow id.
+    pub workflow_id: String,
+    /// Raw persisted state (`RUNNING`, `FAILED`, …), matching the `state=`
+    /// filter vocabulary of `GET /workflows`.
+    pub state: String,
+    /// When this execution started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When this execution reached a terminal state, if it has.
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Shard this row was read from.
+    pub shard_id: i32,
+    /// How this child was spawned (awaited vs detached).
+    pub await_mode: AwaitMode,
+    /// For detached children, the policy applied when the parent closes.
+    pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
+}
+
+type LineageChildProjection = (
+    uuid::Uuid,
+    Option<uuid::Uuid>,
+    String,
+    String,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    i32,
+    Option<String>,
+);
+
+/// Load the direct children of **every** parent in `parent_ids` from one shard,
+/// in a single query (issue #621).
+///
+/// Rows are ordered `started_at ASC, id ASC` and capped at `limit`. The
+/// ordering is load-bearing, not cosmetic: when the walk's `max_nodes` budget
+/// truncates a level it keeps the first `N` rows of this order, so the tree an
+/// operator sees is stable across retries instead of varying with Postgres'
+/// physical row order.
+///
+/// Returns an empty vector without touching the database when `parent_ids` is
+/// empty or `limit <= 0` — the walk calls this once per shard per level and
+/// both cases occur naturally (an exhausted node budget, an empty frontier).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_workflow_children_batch(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+    limit: i64,
+) -> HarvestResult<Vec<LineageChildRow>> {
+    if parent_ids.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq_any(parents))
+        .order((
+            harvest_workflow_executions::started_at.asc(),
+            harvest_workflow_executions::id.asc(),
+        ))
+        .limit(limit)
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::parent_id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+            harvest_workflow_executions::completed_at,
+            harvest_workflow_executions::shard_id,
+            harvest_workflow_executions::parent_close_policy,
+        ))
+        .load::<LineageChildProjection>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().map(lineage_child_row_from_parts).collect())
+}
+
+fn lineage_child_row_from_parts(parts: LineageChildProjection) -> LineageChildRow {
+    let (
+        id,
+        parent_id,
+        workflow_name,
+        workflow_id,
+        state,
+        started_at,
+        completed_at,
+        shard_id,
+        parent_close_policy_str,
+    ) = parts;
+    let parent_close_policy = parent_close_policy_str
+        .as_deref()
+        .and_then(|s| s.parse::<crate::types::ParentClosePolicy>().ok());
+    // A detached child is exactly one that carries a parent-close policy; an
+    // awaited child's column is NULL. Same derivation as
+    // `workflow_child_row_from_parts`, kept in lockstep with it.
+    let await_mode = if parent_close_policy.is_some() {
+        AwaitMode::Detached
+    } else {
+        AwaitMode::Awaited
+    };
+    LineageChildRow {
+        exec_id: ExecutionId::from_uuid(id),
+        parent_id: parent_id.map(ExecutionId::from_uuid),
+        workflow_name,
+        workflow_id,
+        state,
+        started_at,
+        completed_at,
+        shard_id,
+        await_mode,
+        parent_close_policy,
+    }
+}
+
+/// Bounded existence probe: of the given `parent_ids`, which ones have at least
+/// one child on this shard? (issue #621)
+///
+/// This is what lets a truncated lineage walk name **precisely** the nodes whose
+/// subtrees were dropped, instead of conservatively naming every unexpanded
+/// leaf. A false positive there would send an operator chasing a subtree that
+/// does not exist, so the walk pays one extra `SELECT DISTINCT` per shard to
+/// stay honest.
+///
+/// The result is `DISTINCT`, so a parent with 500 children contributes one id —
+/// the response's dropped-subtree list is bounded by frontier size, not by
+/// child count.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_parents_with_children(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::parent_id.eq_any(parents))
+        .select(harvest_workflow_executions::parent_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
+/// Bounded existence probe against **retained summaries**: which of the given
+/// `parent_ids` have a demoted child on this shard? (issues #621, #752)
+///
+/// "Demoted" means the child now lives only in `harvest_execution_summaries`.
+/// Tiered summary retention is opt-in, but when it is on, a *terminal* child is
+/// independently retention-eligible: it can be demoted into a summary and have
+/// its `harvest_workflow_executions` row deleted while its long-running parent
+/// is still live. [`load_workflow_children_batch`] reads only the executions
+/// table, so such a child — and everything beneath it — is invisible to a
+/// lineage walk. Without this probe a `FAILED` demoted child would produce a
+/// tree that reports itself complete, which is precisely the silent omission
+/// the walk's bounds machinery exists to prevent.
+///
+/// Retention deliberately preserves `harvest_execution_summaries.parent_id` for
+/// exactly this case (it skips the terminal-child `parent_id` null-out when
+/// summary retention is enabled), and [`crate::erase`]'s cascade already unions
+/// both tables on it; this is the read-side counterpart.
+///
+/// Returns only the *nearest live ancestors* of omitted lineage. A summary
+/// child's own children are not enumerated — naming the live node an operator
+/// can actually act from is the useful signal, and it keeps the probe a single
+/// `DISTINCT` per shard.
+///
+/// When summary retention is disabled (the default) the table is empty and this
+/// returns nothing, so the walk is unaffected.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn load_parents_with_summary_children(
+    conn: &mut AsyncPgConnection,
+    parent_ids: &[uuid::Uuid],
+) -> HarvestResult<Vec<uuid::Uuid>> {
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parents: Vec<uuid::Uuid> = parent_ids.to_vec();
+    harvest_execution_summaries::table
+        .filter(harvest_execution_summaries::parent_id.eq_any(parents))
+        .select(harvest_execution_summaries::parent_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(crate::error::database_error)
+        .map(|rows| rows.into_iter().flatten().collect())
 }
 
 /// Merge-patch the `search_attrs` JSONB column for a workflow execution.

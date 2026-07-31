@@ -1,7 +1,7 @@
 //! Axum management routes for Harvest workflows and DAGs.
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -129,6 +129,9 @@ use autumn_harvest::{
     update_with_start_workflow_execution_with_metrics,
 };
 
+use crate::lineage::{
+    LineageLimits, LineageTreeReport, LineageWalk, lineage_root_node, root_row_from_execution,
+};
 use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::schedule_runs;
 use crate::shard_fanout::{
@@ -4309,6 +4312,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
+        // Recursive cross-shard lineage tree (issue #621). Deliberately NOT
+        // admin-gated: it returns the same class of execution-row data as
+        // `/children` (which already traverses depth across shards), so gating
+        // it would be an inconsistency rather than a hardening.
+        .route("/workflows/{id}/tree", get(get_workflow_tree))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
         // Open-awaitables diagnostic (issue #615): admin-gated (the eligibility
@@ -5316,6 +5324,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
         ("GET", "/workflows/{id}/children"),
+        ("GET", "/workflows/{id}/tree"),
         ("GET", "/workflows/{id}/stack"),
         ("GET", "/workflows/{id}/timeline"),
         ("GET", "/workflows/{id}/awaitables"),
@@ -6029,6 +6038,32 @@ pub const fn management_api_response_fields()
                 "state",
                 "steps",
                 "rollup",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/tree",
+            // Issue #621. The body is polymorphic: the default is the nested
+            // tree (`root` carries `children`), `?summary=true` is the
+            // per-state descendant roll-up (`root` is a compact ref, plus
+            // `counts`/`total_descendants`). Both shapes' top-level fields are
+            // enumerated here so the registry ↔ contract cross-check covers
+            // the union. `truncation_reason` is omitted when absent
+            // (skip_serializing_if) but declared for the same reason.
+            Some(&[
+                "root",
+                "node_count",
+                "max_depth_reached",
+                "truncated",
+                "truncation_reason",
+                "truncated_parent_ids",
+                "truncated_parents_capped",
+                "limits",
+                "status",
+                "unavailable_shards",
+                "counts",
+                "total_descendants",
+                "retained_summary_parent_ids",
             ]),
         ),
         (
@@ -9771,6 +9806,367 @@ async fn load_workflow_children_tree_from_shards(
     }
 
     Ok(rows)
+}
+
+// ── Recursive cross-shard lineage tree (issue #621) ───────────────────────────
+
+/// `GET /workflows/{id}/tree` — the full recursive descendant tree rooted at
+/// `id`, across all readable shards.
+///
+/// The bounded, cycle-safe walk itself is
+/// [`crate::lineage::LineageWalk`] (pure, unit-tested); this handler owns the
+/// HTTP contract: root resolution (`404`/`400`), bound validation (`400`), and
+/// the tree-vs-summary response selection.
+///
+/// **Not admin-gated**, matching its closest siblings `GET
+/// /workflows/{id}/children` (which already performs a cross-shard depth
+/// traversal over the same rows) and `GET /workflows/{id}/run-chain`. This
+/// route exposes strictly the same class of data — execution rows' identity,
+/// state, and topology — with no payloads, so gating it while `/children`
+/// stays open would be an inconsistency, not a hardening.
+async fn get_workflow_tree(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<axum::response::Response, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let params = parse_lineage_query(&pairs)?;
+
+    // Root lookup is O(1) shard-routed off the id's embedded shard — only the
+    // *descendant* walk needs a fan-out. Deliberately the **exact** variant:
+    // the lenient `db_conn_for_execution` would fall back to the default shard
+    // when the owning shard has no pool on this node, turning "I cannot see
+    // that shard" into a confident `404`. That would contradict this very
+    // response, whose `unavailable_shards` reports exactly such a shard as
+    // unreachable for the descendant walk.
+    let root_execution = {
+        let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+            return Err(AutumnError::not_found_msg(format!(
+                "workflow execution {exec_id} not found \
+                 (classic DAG runs are not on the execution path)"
+            )));
+        };
+        match load_execution(&mut conn, exec_id).await {
+            Ok(execution) => execution,
+            Err(HarvestError::NotFound(_)) => {
+                return Err(AutumnError::not_found_msg(format!(
+                    "workflow execution {exec_id} not found \
+                     (classic DAG runs are not on the execution path)"
+                )));
+            }
+            Err(err) => return Err(map_error(err)),
+        }
+    };
+
+    let report = build_lineage_report(
+        &api_state,
+        &root_row_from_execution(&root_execution),
+        params.limits,
+    )
+    .await;
+
+    Ok(if params.summary {
+        Json(report.into_summary()).into_response()
+    } else {
+        Json(report).into_response()
+    })
+}
+
+/// Parsed `GET /workflows/{id}/tree` query string.
+struct LineageQueryParams {
+    limits: LineageLimits,
+    summary: bool,
+}
+
+/// Parse and validate `?max_depth=`, `?max_nodes=`, `?summary=`.
+///
+/// An out-of-range or non-numeric bound is a `400` naming the offending
+/// parameter rather than a silent clamp — the response echoes the `limits` it
+/// applied, so clamping would make that echo lie.
+fn parse_lineage_query(pairs: &[(String, String)]) -> Result<LineageQueryParams, AutumnError> {
+    let mut max_depth = None;
+    let mut max_nodes = None;
+    let mut summary = false;
+
+    for (key, value) in pairs {
+        match key.as_str() {
+            "max_depth" => {
+                max_depth = Some(value.trim().parse::<u32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid max_depth '{value}'"))
+                })?);
+            }
+            "max_nodes" => {
+                max_nodes = Some(value.trim().parse::<u32>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!("invalid max_nodes '{value}'"))
+                })?);
+            }
+            "summary" => {
+                // Rejected rather than defaulted to `false`: a caller who
+                // typos the value and silently receives a full tree with a
+                // 200 has no way to notice, and every other bound on this
+                // route is a hard 400 on an invalid value.
+                let v = value.trim();
+                summary = match v {
+                    _ if v.eq_ignore_ascii_case("true") || v == "1" => true,
+                    _ if v.eq_ignore_ascii_case("false") || v == "0" => false,
+                    _ => {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid summary '{value}' (expected true or false)"
+                        )));
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let limits =
+        LineageLimits::parse(max_depth, max_nodes).map_err(AutumnError::bad_request_msg)?;
+    Ok(LineageQueryParams { limits, summary })
+}
+
+/// Drive the bounded lineage walk level by level across every expected shard.
+///
+/// Two batched queries per level (children of the whole frontier, then — once —
+/// an existence probe over the unexpanded leaves) rather than one query per
+/// parent per shard: that is what keeps a ~200-node/8-shard tree inside the
+/// issue's p95 < 500 ms budget.
+///
+/// Never fails wholesale on an unreachable shard (issue #756): the reachable
+/// shards' rows still flow, the shard is named in `unavailable_shards`, and
+/// `status` degrades to `partial`/`unavailable` — a cross-shard triage read
+/// must not 500 during exactly the incident it exists to diagnose.
+///
+/// **Consistency:** shards are read independently, so a deep tree may be
+/// marginally time-skewed across shards. That is acceptable for triage and is
+/// documented on the endpoint.
+async fn build_lineage_report(
+    api_state: &HarvestApiState,
+    root_row: &store::LineageChildRow,
+    limits: LineageLimits,
+) -> LineageTreeReport {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected = crate::shard_fanout::expected_shards(api_state, &pools);
+
+    let mut walk = LineageWalk::new(root_row.exec_id, limits);
+    let mut frontier = vec![root_row.exec_id.as_uuid()];
+    let mut shard_errors: BTreeMap<i32, String> = BTreeMap::new();
+    // Evidence, not arithmetic: a shard is only "inspected" once it has
+    // actually answered. Deriving this as `expected - errors` would claim a
+    // complete read on a path where zero shards were queried (a budget that
+    // only fits the root breaks the loop before the first round).
+    let mut observed: BTreeSet<i32> = BTreeSet::new();
+
+    for depth in 1..=limits.max_depth {
+        if frontier.is_empty() || walk.is_exhausted() {
+            break;
+        }
+        // Fetch one past the remaining budget so an overflow is *observed*
+        // (and its parent named) instead of silently fitting.
+        let fetch_limit =
+            i64::try_from(walk.remaining_budget().saturating_add(1)).unwrap_or(i64::MAX);
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_children_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                frontier.clone(),
+                fetch_limit,
+            )
+        }))
+        .await;
+
+        // A shard whose window came back full may have had rows cut by the
+        // SQL LIMIT that the budget sentinel never got to observe.
+        let saturated = observations
+            .iter()
+            .any(|o| i64::try_from(o.rows.len()).unwrap_or(i64::MAX) >= fetch_limit);
+        let rows = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        frontier = walk.admit_level(depth, rows);
+        if saturated {
+            walk.note_saturated_fetch_window();
+        }
+    }
+
+    // Existence probe: name ONLY the unexpanded leaves that provably have
+    // children, so a childless leaf is never reported as a dropped subtree.
+    //
+    // The live `frontier` is the authoritative unexpanded set on every exit
+    // path — empty when the tree completed naturally, the deepest admitted
+    // level on a depth exit, and `[root]` when the budget was spent before a
+    // single round ran.
+    let probe_targets = frontier;
+    if !probe_targets.is_empty() {
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_probe_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                probe_targets.clone(),
+            )
+        }))
+        .await;
+
+        let parents = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        walk.record_probe_result(&parents);
+    }
+
+    // Retained-summary probe (issue #752). A terminal child can be demoted into
+    // `harvest_execution_summaries` and have its execution row collected while
+    // its parent is still live, so it is invisible to the walk above. Probing
+    // EVERY admitted id (not just the unexpanded frontier) is required: such a
+    // child can hang off any node in the tree, not only a leaf.
+    let summary_targets = walk.admitted_ids();
+    if !summary_targets.is_empty() {
+        let observations = futures::future::join_all(expected.iter().map(|shard_id| {
+            lineage_summary_probe_on_shard(
+                *shard_id,
+                pools.get(shard_id).cloned(),
+                summary_targets.clone(),
+            )
+        }))
+        .await;
+
+        let parents = absorb_lineage_observations(observations, &mut shard_errors, &mut observed);
+        walk.record_retained_summary_parents(&parents);
+    }
+
+    let mut report = walk.finish(lineage_root_node(root_row));
+    let inspected = observed.len();
+    report.status = FanoutStatus::from_counts(inspected, shard_errors.len());
+    report.unavailable_shards = shard_errors
+        .into_iter()
+        .map(|(shard_id, reason)| UnavailableShard { shard_id, reason })
+        .collect();
+    report
+}
+
+/// Why a shard could not contribute to the lineage walk.
+///
+/// Folding every failure mode (no pool for a router-known shard, connection
+/// acquire, query) into a `ShardObservation` error rather than propagating is
+/// what lets an unreachable shard degrade the report to `partial` instead of
+/// failing the whole call (#756).
+const fn lineage_shard_unavailable<R>(shard_id: i32, reason: String) -> ShardObservation<R> {
+    ShardObservation {
+        shard_id,
+        rows: Vec::new(),
+        error: Some(reason),
+    }
+}
+
+/// One shard's contribution to a lineage level: the children of every frontier
+/// parent that lives on this shard.
+async fn lineage_children_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    frontier: Vec<uuid::Uuid>,
+    limit: i64,
+) -> ShardObservation<store::LineageChildRow> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_workflow_children_batch(&mut conn, &frontier, limit).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// One shard's contribution to the existence probe: which of the unexpanded
+/// leaves have at least one child here?
+async fn lineage_probe_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    parents: Vec<uuid::Uuid>,
+) -> ShardObservation<uuid::Uuid> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_parents_with_children(&mut conn, &parents).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// One shard's contribution to the **retained-summary** probe (issue #752):
+/// which of the given nodes have a child that was demoted into
+/// `harvest_execution_summaries` and so is absent from the tree.
+///
+/// Structurally identical to [`lineage_probe_on_shard`] — same degrade-to-
+/// `partial` failure handling — but against the summaries table, so a shard
+/// that predates the summaries migration degrades rather than 500s.
+async fn lineage_summary_probe_on_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    parents: Vec<uuid::Uuid>,
+) -> ShardObservation<uuid::Uuid> {
+    let Some(pool) = pool else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("shard {shard_id} has no configured storage pool"),
+        );
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return lineage_shard_unavailable(
+            shard_id,
+            format!("database connection for shard {shard_id} could not be acquired"),
+        );
+    };
+    match store::load_parents_with_summary_children(&mut conn, &parents).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => lineage_shard_unavailable(shard_id, error.to_string()),
+    }
+}
+
+/// Fold one level's (or the probe's) per-shard observations into a flat row set,
+/// recording the first error seen per shard and which shards actually answered.
+///
+/// First-error-per-shard is deliberate: a shard that is down stays down for
+/// every level, so this collapses to one `unavailable_shards` entry rather than
+/// one per level.
+fn absorb_lineage_observations<R>(
+    observations: Vec<ShardObservation<R>>,
+    shard_errors: &mut BTreeMap<i32, String>,
+    observed: &mut BTreeSet<i32>,
+) -> Vec<R> {
+    let mut rows = Vec::new();
+    for observation in observations {
+        if let Some(error) = observation.error {
+            shard_errors.entry(observation.shard_id).or_insert(error);
+        } else {
+            observed.insert(observation.shard_id);
+        }
+        rows.extend(observation.rows);
+    }
+    rows
 }
 
 fn workflow_children_store_filters(
@@ -29084,6 +29480,50 @@ pub(crate) async fn db_conn_for_execution(
 ) -> Result<PoolConn, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     acquire_conn(pool.pool_for_execution(exec_id)).await
+}
+
+/// Resolve a connection to the shard that *owns* `exec_id`, with **no default
+/// fallback** — for reads whose answer is "does this execution exist?".
+///
+/// [`db_conn_for_execution`] routes through `ShardedDbPool::pool_for_execution`,
+/// which falls back to the **default** shard when the id's encoded shard has no
+/// configured pool. For an existence question that fallback is a correctness
+/// hazard: mid a shard-add rollout (step 2 of the documented procedure widens
+/// `readable_shards` *before* this process has the new pool) the lookup
+/// silently queries the wrong database, finds nothing, and answers a confident
+/// `404` for a run that may exist on its own shard.
+///
+/// This variant fails closed instead, mirroring the business-id resolver
+/// (#805): `Err` → `503` when the owning shard is one this deployment claims
+/// but cannot query, so existence is genuinely undetermined; `Ok(None)` when
+/// the id encodes a shard neither the pools nor the router know about — nothing
+/// here could ever host it, so the caller's `404` is honest. Membership is
+/// decided by [`shard_fanout::expected_shards`], the same helper the lineage
+/// fan-out uses, so a single request can never call one shard `unavailable` for
+/// descendants while implying "does not exist" for the root.
+///
+/// Only `GET /workflows/{id}/tree` uses this today. The lenient
+/// [`db_conn_for_execution`] is left in place for the ~40 other
+/// single-execution routes: switching them all is a behaviour change across the
+/// whole management API and belongs in its own slice.
+pub(crate) async fn db_conn_for_execution_exact(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<Option<PoolConn>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
+        return acquire_conn(shard_pool).await.map(Some);
+    }
+    let shard = exec_id.shard().as_i32();
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    if crate::shard_fanout::expected_shards(api_state, &pools).contains(&shard) {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "shard {shard} owns execution {exec_id} but has no configured storage \
+             pool on this node; cannot determine whether it exists without \
+             risking a false 404"
+        )));
+    }
+    Ok(None)
 }
 
 pub(crate) async fn db_conn_for_shard(
