@@ -1484,6 +1484,230 @@ async fn test_concurrency_capped_reports_concurrency_saturated_only() {
     );
 }
 
+// Issue #619 review: `queue_paused` must lead the FINAL `reason_codes` array,
+// not just the producer's intermediate list.
+//
+// `task_intrinsic_impediment_reasons` pushes it first, but the reasons are then
+// collapsed through a `HashSet` (destroying insertion order) and re-sorted — and
+// `concurrency_saturated` sorts *before* `queue_paused` alphabetically. So the
+// documented priority ("the one impediment a triaging operator should see before
+// anything else") only holds if it survives that merge. This test drives the real
+// endpoint with BOTH impediments present, which is the only way to observe it.
+#[tokio::test]
+async fn test_queue_paused_leads_the_final_reason_codes_over_another_impediment() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    // Saturate the single concurrency slot for "tenant-x" so the held task has a
+    // second, alphabetically-earlier impediment alongside the pause.
+    {
+        let mut conn = pool.get().await.expect("running task connection");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue (
+                id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
+                concurrency_key, concurrency_cap, worker_id
+             ) VALUES (
+                gen_random_uuid(), 'test-queue-paused-prio', 'workflow', '{}'::jsonb, 'RUNNING', 0, 1, NOW(),
+                'tenant-x', 1, 'worker-holding'
+             )",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert running task to saturate concurrency");
+
+        // The operator's deliberate hold on the same queue.
+        diesel::sql_query(
+            // `queue_name` is the PK, so stay re-run safe: every sibling test in
+            // this file seeds with generated ids and CI gives each test a fresh
+            // container, but a fixed PK would otherwise break a second run
+            // against a shared database.
+            "INSERT INTO harvest_queue_pauses (queue_name, reason, paused_by, paused_at) \
+             VALUES ('test-queue-paused-prio', 'provider outage', 'alice', NOW()) \
+             ON CONFLICT (queue_name) DO NOTHING",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("failed to pause the queue");
+    }
+
+    seed_task_detailed(
+        &pool,
+        "test-queue-paused-prio",
+        None,
+        None,
+        None,
+        Some("tenant-x"),
+        Some(1),
+    )
+    .await;
+
+    register_active_worker_with_build(
+        &pool,
+        "worker-paused-prio",
+        &["test-queue-paused-prio"],
+        &[0],
+        "v1",
+        10,
+        0,
+    )
+    .await;
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-paused-prio"], ShardRouter::single()),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let (status, body) = get_json_with_auth(
+        &app,
+        "/admin/queues/test-queue-paused-prio/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ineligible = body["ineligible_workers"].as_array().unwrap();
+    let w = ineligible
+        .iter()
+        .find(|w| w["worker_id"] == "worker-paused-prio")
+        .expect("the worker must be ineligible while the queue is held");
+    let reasons: Vec<&str> = w["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    // NB: `reasons[0]` rather than `.first()` — this file imports Diesel's
+    // prelude, whose DSL traits shadow `first` on `Vec` and blow up trait
+    // resolution.
+    assert!(
+        !reasons.is_empty(),
+        "a held, saturated task must report impediments"
+    );
+    assert_eq!(
+        reasons[0], "queue_paused",
+        "the operator's own deliberate hold must lead the array an operator \
+         actually reads -- a plain alphabetical sort buries it behind \
+         concurrency_saturated; got {reasons:?}"
+    );
+    // Both impediments are still reported: the priority reorders, it never drops.
+    assert!(
+        reasons.contains(&"concurrency_saturated"),
+        "the other impediment must survive the reorder, got {reasons:?}"
+    );
+}
+
+// Issue #619 review: a queue pause must survive the worker-reason short-circuit.
+//
+// A worker that is unsubscribed, assigned to another shard, draining, or stopped
+// is pushed straight into `ineligible_workers` carrying only its worker-specific
+// reasons and then `continue`s -- bypassing BOTH the shared pause impediment and
+// `sort_reason_codes`. The sibling test above only reaches the pause check
+// because its worker is healthy.
+//
+// So when *every* online worker has one of those conditions -- e.g. a fleet
+// drained for the very outage the operator paused the queue for -- the response
+// never mentions `queue_paused` at all, and the deliberate hold is invisible on
+// the one surface built to answer "why is nothing dispatching?".
+#[tokio::test]
+async fn test_queue_paused_survives_the_worker_reason_short_circuit() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    {
+        let mut conn = pool.get().await.expect("connection");
+        diesel::sql_query(
+            "INSERT INTO harvest_queue_pauses (queue_name, reason, paused_by, paused_at) \
+             VALUES ('test-queue-paused-drain', 'provider outage', 'alice', NOW()) \
+             ON CONFLICT (queue_name) DO NOTHING",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("failed to pause the queue");
+    }
+
+    seed_task_detailed(
+        &pool,
+        "test-queue-paused-drain",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // The ONLY online worker is draining, so it takes the worker-reason
+    // short-circuit and never reaches the per-task pause check.
+    register_active_worker_with_build(
+        &pool,
+        "worker-paused-drain",
+        &["test-queue-paused-drain"],
+        &[0],
+        "v1",
+        10,
+        0,
+    )
+    .await;
+    mark_worker_draining(&pool, "worker-paused-drain").await;
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-paused-drain"], ShardRouter::single()),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let (status, body) = get_json_with_auth(
+        &app,
+        "/admin/queues/test-queue-paused-drain/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ineligible = body["ineligible_workers"].as_array().unwrap();
+    let w = ineligible
+        .iter()
+        .find(|w| w["worker_id"] == "worker-paused-drain")
+        .expect("a draining worker must be reported ineligible");
+    let reasons: Vec<&str> = w["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    assert!(
+        reasons.contains(&"queue_paused"),
+        "the operator's deliberate hold must be reported even when every worker \
+         is short-circuited on a worker-specific reason -- otherwise the only \
+         surface that answers \"why is nothing dispatching?\" omits the actual \
+         answer; got {reasons:?}"
+    );
+    // NB: `reasons[0]` rather than `.first()` -- Diesel's prelude DSL traits
+    // shadow `first` on `Vec` in this file.
+    assert_eq!(
+        reasons[0], "queue_paused",
+        "the pause must still LEAD the array through this branch, which \
+         previously skipped sort_reason_codes entirely; got {reasons:?}"
+    );
+    // The worker-specific reason is reordered, never dropped.
+    assert!(
+        reasons.contains(&"worker_draining"),
+        "the worker condition must survive alongside the pause, got {reasons:?}"
+    );
+    // `all_draining` is a statement about the WORKER fleet; the queue pause is a
+    // statement about the QUEUE. Both are true here, and adding the pause
+    // impediment must not silently downgrade the fleet diagnosis.
+    assert_eq!(
+        body["summary"]["diagnosis"], "all_draining",
+        "surfacing queue_paused must not change the worker-fleet diagnosis"
+    );
+}
+
 #[tokio::test]
 async fn test_worker_queue_filtering_for_capable_of() {
     let (database_url, _container) = setup_database_url_with_migrations().await;

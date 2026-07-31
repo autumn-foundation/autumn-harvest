@@ -2261,6 +2261,194 @@ fn legal_hold_release_maps_to_post_with_no_body() {
     assert_eq!(request.body, None);
 }
 
+// ── Task-queue pause/resume (issue #619) ──────────────────────────────────────
+
+#[test]
+fn queue_pause_maps_to_post_with_reason() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "SMTP provider outage",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/queues/email-workers/pause");
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "SMTP provider outage" })),
+        "omitting --shard-id must send NO shard_id field: the default is a \
+         fleet-wide hold, not shard 0"
+    );
+}
+
+#[test]
+fn queue_pause_with_shard_id_scopes_the_hold() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email-workers",
+        "--reason",
+        "one shard only",
+        "--shard-id",
+        "2",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "one shard only", "shard_id": 2 }))
+    );
+}
+
+#[test]
+fn queue_resume_maps_to_post_with_empty_body() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "resume", "email-workers"])
+        .expect("queue resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/queues/email-workers/resume");
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn queue_list_paused_maps_to_the_read_route() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "list-paused"])
+        .expect("queue list-paused args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queues/paused");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_pause_percent_encodes_the_queue_name() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        "email workers/eu",
+        "--reason",
+        "x",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/email%20workers%2Feu/pause",
+        "a queue name with a space or slash must not break out of the path segment"
+    );
+}
+
+#[test]
+fn queue_pause_rejects_url_dot_segment_queue_names() {
+    // A literal `.` or `..` queue name is NOT percent-encodable out of the
+    // problem: the WHATWG URL parser that reqwest uses collapses dot-segments
+    // *after* `ApiRequest.path` is built, so a `.` name silently rewrites the
+    // request to `/admin/queues/pause` -- a DIFFERENT route. Rejection at
+    // request-construction time is the only correct handling.
+    //
+    // The `%2e` spellings are additionally rejected as defense in depth: they
+    // are already neutralized today by `PATH_SEGMENT_ENCODE_SET` encoding `%`
+    // (they reach the URL as `%252e`), and the guard should not silently depend
+    // on that staying true.
+    for bad in [".", "..", "%2e", "%2E", "%2e%2e", "%2E%2E"] {
+        let cli = Cli::try_parse_from(["harvest", "queue", "pause", bad, "--reason", "x"])
+            .expect("queue pause args should parse");
+
+        assert!(
+            cli.api_request().is_err(),
+            "queue name {bad:?} normalizes away in the URL path and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn queue_resume_rejects_url_dot_segment_queue_names() {
+    // Same hazard on the destructive direction: a `..` resume must never be
+    // allowed to silently target `/admin/pause`.
+    for bad in [".", "..", "%2e", "%2E"] {
+        let cli = Cli::try_parse_from(["harvest", "queue", "resume", bad])
+            .expect("queue resume args should parse");
+
+        assert!(
+            cli.api_request().is_err(),
+            "queue name {bad:?} normalizes away in the URL path and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn queue_pause_percent_encodes_a_backslash_in_the_queue_name() {
+    // The URL parser treats `\` as a path separator for http/https, so an
+    // unencoded backslash splits the segment and the request silently lands on
+    // a different route -- and it re-enables `..` traversal inside what should
+    // be one opaque segment, past the whole-segment dot-segment guard.
+    // Encoding IS the right fix here (unlike the literal `.`/`..` forms):
+    // `%5C` is not collapsed, so a queue whose name genuinely carries a
+    // backslash stays pausable.
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "pause",
+        r"payments\..\admin",
+        "--reason",
+        "x",
+    ])
+    .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path, "/admin/queues/payments%5C..%5Cadmin/pause",
+        "a backslash must not split the path segment or enable traversal"
+    );
+}
+
+#[test]
+fn queue_resume_percent_encodes_a_backslash_in_the_queue_name() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "resume", r"payments\eu"])
+        .expect("queue resume args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.path, "/admin/queues/payments%5Ceu/resume");
+}
+
+#[test]
+fn queue_pause_still_accepts_names_that_merely_contain_dots() {
+    // Only a WHOLE-segment `.`/`..` is a dot-segment -- `a.b` is a perfectly
+    // ordinary queue name and must not be swept up by the rejection.
+    let cli = Cli::try_parse_from(["harvest", "queue", "pause", "orders.eu", "--reason", "x"])
+        .expect("queue pause args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.path, "/admin/queues/orders.eu/pause");
+}
+
+#[test]
+fn queue_pause_requires_a_reason() {
+    // A hold with no stated cause is unauditable -- clap must reject it.
+    assert!(
+        Cli::try_parse_from(["harvest", "queue", "pause", "email-workers"]).is_err(),
+        "queue pause must require --reason"
+    );
+}
+
 // ── Scoped API tokens (issue #942) ────────────────────────────────────────────
 
 #[test]

@@ -1288,6 +1288,72 @@ async fn ui_workers_partial_shard_failure_degraded() {
     );
 }
 
+/// Issue #619 review — a shard whose pause state cannot be read must not leave
+/// the Workers page silently claiming dispatch is flowing.
+///
+/// Nothing is paused on the reachable shard, so before this fix the paused-queue
+/// banner rendered *nothing at all* on a page where one shard's pause state was
+/// simply unknown — indistinguishable from a genuinely clean fleet, on exactly
+/// the page an operator lands on when investigating idle workers. A hold that
+/// exists only on the unread shard is likewise absent from the banner, which is
+/// why "we do not know" has to be said out loud.
+#[tokio::test]
+async fn ui_workers_warns_when_a_shards_pause_state_is_unreadable() {
+    let (good_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&good_url).await.unwrap();
+    insert_test_worker(&mut conn, "good-worker", "Active", 0).await;
+
+    // Shard 0 is live and holds no pause; shard 1 is unreachable, so its pause
+    // state is UNKNOWN rather than "not paused".
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&good_url));
+    pools.insert(
+        ShardId::new(1),
+        build_test_pool("postgres://invalid:5432/nonexistent"),
+    );
+    let harvest_pool = HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(harvest_pool);
+    api_state.install(HarvestApiRuntime::new(
+        echo_registry(),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        None,
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, html) = fetch_html(&app, "/workers").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unreadable shard must degrade the page, never fail it: {html}"
+    );
+    assert!(
+        html.contains("Queue pause state incomplete"),
+        "the page must say the pause state is unknown, not render a silent clean \
+         banner: {html}"
+    );
+    assert!(
+        html.contains("/admin/queues/paused"),
+        "it must point at the authoritative per-shard read: {html}"
+    );
+    // Nothing is actually held on the reachable shard, so there must be no hold
+    // banner claiming otherwise.
+    assert!(
+        !html.contains("Queue dispatch paused"),
+        "no queue is held on the readable shard, so no hold may be claimed: {html}"
+    );
+}
+
 /// Performance: 1 k workers across 4 shards must render in ≤ 500 ms p95.
 ///
 /// Seeds 250 workers per shard, makes a single page request, and asserts:

@@ -13,6 +13,17 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:3000/api/harvest";
+/// Characters percent-encoded when a caller-supplied value becomes one URL path
+/// segment.
+///
+/// `/` and `\` are both here because the URL parser reqwest uses treats **both**
+/// as path separators for special (http/https) URLs, so either one would split a
+/// single value into extra segments and silently retarget the request at a
+/// different route — and `\` additionally re-enables `..` traversal inside what
+/// should be one opaque segment (`payments\..\admin` resolved to
+/// `/admin/queues/admin/pause`). `%` is here so a caller-supplied `%2e` cannot
+/// become a dot-segment; the LITERAL `.`/`..` forms cannot be encoded away at
+/// all and are rejected instead — see `is_url_dot_segment`.
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -24,7 +35,8 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'`')
     .add(b'{')
     .add(b'}')
-    .add(b'/');
+    .add(b'/')
+    .add(b'\\');
 
 /// Top-level CLI arguments for the `harvest` binary.
 #[derive(Debug, Parser)]
@@ -290,6 +302,24 @@ pub enum CliError {
         verdict: String,
     },
 
+    /// A queue pause/resume was only partially applied across the fleet.
+    #[error("queue mutation was only partially applied: {detail}")]
+    QueuePartialMutation {
+        /// Per-shard failure summary reported by the API.
+        detail: String,
+    },
+
+    /// A queue name would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid queue name '{value}': '.' and '..' are removed as dot-segments \
+         when the request URL is parsed, which would silently retarget the \
+         request at a different route"
+    )]
+    QueueNameDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
     /// Version-gate guard found active usage or incomplete shard inspection.
     #[error("version usage guard failed")]
     VersionUsageGate,
@@ -422,6 +452,12 @@ enum Commands {
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
+    },
+    /// Hold or release dispatch on a named task queue (issue #619).
+    #[command(alias = "queues")]
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
     },
     /// Inspect cluster-wide per-activity concurrency caps.
     Concurrency {
@@ -1604,6 +1640,41 @@ enum ConcurrencyCommand {
     Status,
 }
 
+/// Task-queue pause/resume (issue #619): hold dispatch on a whole queue while a
+/// downstream dependency is down, then thaw it.
+///
+/// A pause never fails, retries, or dead-letters work — held tasks stay
+/// `PENDING` and become claimable again the instant the queue is resumed, with
+/// the time they spent held credited back so the thaw does not retroactively
+/// schedule-to-start-time-out the backlog.
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Hold dispatch on a task queue.
+    Pause {
+        /// Task queue name.
+        queue_name: String,
+        /// Why the queue is being held (recorded on the pause row, surfaced by
+        /// `harvest queue list-paused` and the Vantage Workers page).
+        #[arg(long)]
+        reason: String,
+        /// Restrict the hold to one shard. Omit for a fleet-wide pause (the
+        /// default).
+        #[arg(long)]
+        shard_id: Option<i32>,
+    },
+    /// Release a held task queue; held tasks become immediately claimable.
+    Resume {
+        /// Task queue name.
+        queue_name: String,
+        /// Restrict the release to one shard. Omit for fleet-wide (the default).
+        #[arg(long)]
+        shard_id: Option<i32>,
+    },
+    /// List every currently-paused queue with its reason and held-task count.
+    #[command(alias = "list", alias = "status")]
+    ListPaused,
+}
+
 /// Per-execution legal hold (issue #747): exempt an execution's history from
 /// retention deletion and PII erasure until released or auto-expired.
 #[derive(Debug, Subcommand)]
@@ -2002,6 +2073,7 @@ impl Cli {
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::CompletionDelivery { command } => Ok(completion_delivery_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
+            Commands::Queue { command } => queue_request(command),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
             Commands::Batch { command } => batch_request(command),
@@ -2260,6 +2332,14 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             context: "orphaned verdict, in_use with type filter, or incomplete shard report"
                 .to_string(),
         });
+    }
+    if queue_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
+        let detail = response
+            .get("partial_failures")
+            .and_then(Value::as_str)
+            .unwrap_or("see response body")
+            .to_string();
+        return Err(CliError::QueuePartialMutation { detail });
     }
     if canary_should_gate(&cli) && canary_exit_code(&response) != 0 {
         let verdict = response
@@ -5699,6 +5779,109 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
     }
 }
 
+/// True when the command is a queue pause/resume, whose response carries a
+/// partial-application contract worth gating the exit code on.
+///
+/// `list-paused` is a read with no such contract, so it is deliberately excluded.
+const fn queue_mutation_should_gate(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Pause { .. } | QueueCommand::Resume { .. }
+        }
+    )
+}
+
+/// Exit code for a queue pause/resume response.
+///
+/// A `207` partial fleet-wide hold is NOT in effect on the shards it missed --
+/// those keep dispatching into exactly the outage the operator is riding out --
+/// so it must never look like success to a script or a runbook step. `execute`
+/// only rejects non-2xx statuses, and `207` IS 2xx, hence this body-level gate
+/// (the same shape as `preflight_exit_code` and friends).
+///
+/// Fails closed: a body carrying neither signal is not a queue-mutation response
+/// we can vouch for, so it is reported as a failure rather than as a hold that
+/// may not hold.
+fn queue_mutation_exit_code(value: &Value) -> i32 {
+    let ok = value.get("ok").and_then(Value::as_bool);
+    let complete = value.get("status").and_then(Value::as_str) == Some("complete");
+    i32::from(!(ok == Some(true) && complete))
+}
+
+/// True when `raw` names a WHATWG URL dot-segment.
+///
+/// The URL parser reqwest uses strips single-dot (`.`, `%2e`) and double-dot
+/// (`..`, `.%2e`, `%2e.`, `%2e%2e`) segments, all ASCII-case-insensitively,
+/// when the request URL is parsed -- which happens *after* `ApiRequest.path` is
+/// assembled, so `path_segment` cannot encode its way out of the LITERAL forms:
+/// `.` on `/admin/queues/{q}/pause` silently resolves to `/admin/queues/pause`
+/// and `..` to `/admin/pause`, retargeting the request at a different route.
+/// They are therefore rejected up front.
+///
+/// The percent-encoded forms are, today, already neutralized a layer down --
+/// `PATH_SEGMENT_ENCODE_SET` encodes `%`, so a queue literally named `%2e`
+/// reaches the URL as `%252e` and survives intact. They are matched here anyway
+/// so this guard stays correct on its own terms rather than silently depending
+/// on that encode set keeping `%`.
+fn is_url_dot_segment(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "." | "%2e" | ".." | ".%2e" | "%2e." | "%2e%2e"
+    )
+}
+
+/// Reject a queue name that cannot survive URL path parsing intact.
+fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
+    if is_url_dot_segment(queue_name) {
+        return Err(CliError::QueueNameDotSegment {
+            value: queue_name.to_string(),
+        });
+    }
+    Ok(path_segment(queue_name))
+}
+
+/// Map `harvest queue …` onto the three management routes (issue #619).
+///
+/// `--shard-id` is omitted from the body entirely when unset, so the default is
+/// a fleet-wide hold rather than a shard-scoped one.
+fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        QueueCommand::Pause {
+            queue_name,
+            reason,
+            shard_id,
+        } => {
+            let segment = checked_queue_segment(queue_name)?;
+            let mut body = Map::new();
+            body.insert("reason".to_string(), Value::String(reason.clone()));
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), Value::from(*shard));
+            }
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{segment}/pause"),
+                Some(Value::Object(body)),
+            ))
+        }
+        QueueCommand::Resume {
+            queue_name,
+            shard_id,
+        } => {
+            let segment = checked_queue_segment(queue_name)?;
+            let mut body = Map::new();
+            if let Some(shard) = shard_id {
+                body.insert("shard_id".to_string(), Value::from(*shard));
+            }
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{segment}/resume"),
+                Some(Value::Object(body)),
+            ))
+        }
+        QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+    }
+}
+
 fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
     match command {
         RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
@@ -7543,6 +7726,157 @@ mod reuse_policy_tests {
         assert_eq!(workflow_reachability_exit_code(&value), 2);
         let unavailable = json!({ "status": "unavailable", "items": [] });
         assert_eq!(workflow_reachability_exit_code(&unavailable), 2);
+    }
+
+    #[test]
+    fn path_segment_encodes_both_path_separators() {
+        // The URL parser treats `\` as a path separator for http/https, so an
+        // unencoded backslash splits one value into extra segments and the
+        // request silently lands on a different route. Route-wide: every caller
+        // of `path_segment` (queue names, workflow ids, keys, ...) depends on
+        // this, not just queue pause/resume.
+        assert_eq!(path_segment(r"payments\eu"), "payments%5Ceu");
+        assert_eq!(path_segment(r"a\b\c"), "a%5Cb%5Cc");
+        assert_eq!(path_segment("payments/eu"), "payments%2Feu");
+        // Worse than a missed route: a backslash re-enables `..` traversal
+        // inside what should be one opaque segment, past the whole-segment
+        // dot-segment guard.
+        assert_eq!(path_segment(r"payments\..\admin"), "payments%5C..%5Cadmin");
+        // An ordinary name is untouched.
+        assert_eq!(path_segment("orders-eu"), "orders-eu");
+    }
+
+    /// Exhaustive guard for the whole path-separator / normalization class.
+    ///
+    /// Every printable ASCII byte, embedded in a value that becomes one path
+    /// segment, must survive `path_segment` + URL parsing as **exactly one**
+    /// segment that decodes back to the original. This is the test that would
+    /// have caught the missing `\` (the URL parser treats it as a path
+    /// separator for http/https), and it fails if any separator-class character
+    /// is ever dropped from `PATH_SEGMENT_ENCODE_SET`.
+    ///
+    /// Scope: *embedded* bytes. A whole-segment `.`/`..` cannot be encoded away
+    /// at all and is rejected instead (`is_url_dot_segment`); control
+    /// characters are covered by `CONTROLS`.
+    #[test]
+    fn every_printable_ascii_byte_survives_as_exactly_one_path_segment() {
+        let mut offenders = Vec::new();
+        for byte in 0x20u8..=0x7e {
+            let raw = format!("q{}z", byte as char);
+            let encoded = path_segment(&raw);
+            let url = format!("http://host/admin/queues/{encoded}/pause");
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("byte {byte:#04x} produced an unparseable URL: {e}"));
+            let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+            let intact = segments.len() == 4 && percent_decode(segments[2]) == raw;
+            if !intact {
+                offenders.push(format!(
+                    "byte {byte:#04x} ({:?}) encoded to {encoded:?} but parsed as {:?}",
+                    byte as char,
+                    parsed.path()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these bytes did not survive as one intact path segment:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn non_ascii_queue_names_survive_as_exactly_one_path_segment() {
+        // The exhaustive sweep above can only walk printable ASCII, because a
+        // lone byte >= 0x80 is not valid UTF-8 and so is not expressible as a
+        // `&str` queue name at all. The reachable non-ASCII case is a real
+        // multi-byte character, and it is worth pinning rather than assuming:
+        // `utf8_percent_encode` percent-encodes every non-ASCII byte regardless
+        // of the `AsciiSet`, so such a name has no separator hazard -- but that
+        // is a property of the encoding crate, and this asserts we actually get
+        // it instead of trusting it.
+        for raw in [
+            "paiements-europe-é",
+            "支払い",
+            "очередь",
+            "emoji-🚀-queue",
+            // A combining sequence, so normalization differences would show up.
+            "e\u{0301}-queue",
+        ] {
+            let encoded = path_segment(raw);
+            let url = format!("http://host/admin/queues/{encoded}/pause");
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("{raw:?} produced an unparseable URL: {e}"));
+            let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+            assert_eq!(
+                segments.len(),
+                4,
+                "{raw:?} encoded to {encoded:?} but split into {:?}",
+                parsed.path()
+            );
+            assert_eq!(
+                percent_decode(segments[2]),
+                raw,
+                "{raw:?} encoded to {encoded:?} but did not decode back intact"
+            );
+        }
+    }
+
+    fn percent_decode(value: &str) -> String {
+        percent_encoding::percent_decode_str(value)
+            .decode_utf8_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn queue_mutation_exit_code_fails_on_a_partial_hold() {
+        // Issue #619: a 207 partial fleet-wide hold is NOT in effect on the
+        // shards it missed -- those keep dispatching into the outage. It must
+        // never look like success to a script or a runbook step.
+        assert_eq!(
+            queue_mutation_exit_code(&json!({ "ok": false, "status": "partial" })),
+            1
+        );
+        assert_eq!(
+            queue_mutation_exit_code(&json!({ "ok": true, "status": "complete" })),
+            0
+        );
+    }
+
+    #[test]
+    fn queue_mutation_exit_code_gates_on_either_signal_independently() {
+        // `ok` and `status` are belt-and-braces: either one reporting a
+        // non-complete application is enough to fail the command.
+        assert_eq!(queue_mutation_exit_code(&json!({ "ok": false })), 1);
+        assert_eq!(queue_mutation_exit_code(&json!({ "status": "partial" })), 1);
+        // A body missing both signals is not a queue-mutation response we can
+        // vouch for -- fail closed rather than reporting a hold that may not hold.
+        assert_eq!(queue_mutation_exit_code(&json!({})), 1);
+    }
+
+    #[test]
+    fn queue_mutation_gate_applies_only_to_the_mutating_subcommands() {
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "pause", "q", "--reason", "x"
+        ])));
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "resume", "q"
+        ])));
+        assert!(
+            !queue_mutation_should_gate(&parse(&["queue", "list-paused"])),
+            "the read route has no partial-application contract to gate on"
+        );
+        assert!(!queue_mutation_should_gate(&parse(&["health"])));
+    }
+
+    #[test]
+    fn queue_partial_mutation_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::QueuePartialMutation {
+                detail: "shard 1 unreachable".to_string()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]

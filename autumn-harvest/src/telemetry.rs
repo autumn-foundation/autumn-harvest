@@ -238,6 +238,21 @@ pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions"
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
+/// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
+/// (issue #619).
+///
+/// Emitted by the queue-pause sampler in `worker.rs` on the worker's poll
+/// cadence, labelled `{queue}`. Cardinality is bounded by the number of
+/// distinct queue names the fleet has ever paused within a process lifetime;
+/// a resumed queue is explicitly zero-filled for one cycle so the series drops
+/// to `0` rather than going stale at `1`. Per ADR-0001 §7, `execution.id` is
+/// never a label.
+///
+/// `max by (queue) (harvest_queue_paused) > 0` is the "a hold is in effect"
+/// signal; pairing it with Prometheus' own `for:` duration is how an operator
+/// alerts on a pause that was left on too long.
+pub const METRIC_QUEUE_PAUSED: &str = "harvest.queue.paused";
+
 /// Counter: incremented once per dead-letter entry processed by an operator
 /// redrive (issue #510). Labelled `{queue, outcome}` where `outcome` is one of
 /// `redriven` / `skipped` / `failed`.
@@ -1863,6 +1878,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_dlq_entries{shard}`.
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         let _ = (shard, depth);
+    }
+
+    /// Whether a task queue is currently held by an operator queue pause
+    /// (issue #619): `paused = true` while the hold is in effect, `false` for
+    /// one cycle after it is released so the series drops rather than going
+    /// stale.
+    ///
+    /// Emitted by a periodic background sampler on the worker's poll cadence.
+    /// Maps to the gauge `harvest_queue_paused{queue}`.
+    fn record_queue_paused(&self, queue: &str, paused: bool) {
+        let _ = (queue, paused);
     }
 
     /// Periodic snapshot of a worker's dispatch-slot occupancy for one slot

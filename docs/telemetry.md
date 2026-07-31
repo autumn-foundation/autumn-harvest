@@ -50,7 +50,8 @@ a second, Harvest-specific toggle.
 **Coverage:** this endpoint aggregates the nine ADR-0001 §7 catalogue
 metrics named in issue #355 (`harvest.workflow.started`,
 `harvest.workflow.duration`, `harvest.activity.duration`,
-`harvest.timer.started`, `harvest.queue.depth`, `harvest.dlq.entries`,
+`harvest.timer.started`, `harvest.queue.depth`, `harvest.queue.paused`,
+`harvest.dlq.entries`,
 `harvest.schedule.runs`, `harvest.schedule.skipped`,
 `harvest.retention.deleted`), plus `harvest.queue.oldest_pending_age`,
 `harvest.worker.slots_in_use`/`slots_available`/`slot_target`, and
@@ -320,6 +321,7 @@ metric is emitted in the source code.
 | `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
 | `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
+| `harvest.queue.paused` | Gauge | `worker.rs` — `spawn_queue_pause_sampler`, periodic (`poll_interval`, 5 s default). `1` while an operator hold is in effect on a queue, `0` otherwise. Read across all shards of the worker's `ShardedDbPool`. A hold observed on a readable shard is **always** emitted, even when another shard's read failed — pause is boolean per queue, so suppressing it would leave this gauge (and the `harvest_queue_paused_too_long` alert) silent for the duration of an unrelated shard outage. A read failure suppresses only the **zero-fill**, so an outage never false-clears the gauge; a queue absent from an incomplete scan is retained and zero-filled exactly once on a later complete scan rather than going stale at `1` (issue #619) |
 | `harvest.worker.slots_in_use` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, periodic (5 s default). Pure in-memory read of the workflow/activity dispatch `Semaphore`s against their configured maxima — no DB access (issue #531) |
 | `harvest.worker.slots_available` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, alongside `slots_in_use`. Invariant: `slots_in_use + slots_available == configured_max` per `slot_type` within one sampler interval (issue #531) |
 | `harvest.workflow.active` | Gauge | `worker.rs` — `spawn_workflow_active_sampler`, periodic (`poll_interval`, 5 s default). Shard-local `COUNT(*) … GROUP BY (workflow_name, state) WHERE state IN ('RUNNING','PAUSED')`, aggregated **across all shards** of the worker's `ShardedDbPool` (summed per `(workflow, state)`) so the population is fleet-wide, not default-shard-only. A read failure skips the whole tick so an outage never false-clears the gauge; drained `(workflow, state)` pairs are zero-filled (issue #770) |
@@ -368,6 +370,7 @@ metric is emitted in the source code.
 | `harvest.queue.schedule_to_start` | `queue` |
 | `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.dlq.entries` | `shard` |
+| `harvest.queue.paused` | `queue` |
 | `harvest.worker.slots_in_use` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slots_available` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slot_target` | `slot_type` (`workflow\|activity`) |

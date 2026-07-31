@@ -422,3 +422,105 @@ fn no_new_handrolled_migration_bundles_outside_allowlist() {
         stale.join("\n  ")
     );
 }
+
+/// The release-upgrade guide whose migration inventory this guard keeps honest.
+///
+/// Root-relative so the failure message names the file an author must edit.
+const UPGRADE_GUIDE: &str = "docs/upgrading/0.5.0.md";
+
+/// Extract the migration directory names listed in the upgrade guide's
+/// inventory table, i.e. the leading `` `<dir>` `` cell of every row shaped
+/// `` | `<dir>` | … | ``.
+///
+/// Pure — takes the guide's text so it can be unit-tested with synthetic input.
+fn migrations_listed_in_guide(markdown: &str) -> BTreeSet<String> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let cell = line.trim().strip_prefix("| `")?;
+            let (name, _) = cell.split_once('`')?;
+            // Inventory rows only: a migration dir is `<timestamp>_<slug>`, so
+            // require a leading all-digit timestamp. This skips every other
+            // backtick-leading table in the guide (config keys, metric names).
+            let prefix = name.split('_').next()?;
+            (prefix.len() >= 8 && prefix.chars().all(|c| c.is_ascii_digit()))
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn guide_row_extractor_reads_migration_rows_and_ignores_others() {
+    let synthetic = "\
+| Migration dir | Adds |\n\
+|---------------|------|\n\
+| `20260618000001_harvest_debounce` | `harvest_debounce` table (#499) |\n\
+| `20260715000000_harvest_queue_pause` | `harvest_queue_pauses` (#619) |\n\
+| `harvest.queue.paused` | a metric, not a migration |\n\
+plain prose mentioning `20260101000000_not_a_row`\n";
+    let found = migrations_listed_in_guide(synthetic);
+    assert_eq!(
+        found,
+        [
+            "20260618000001_harvest_debounce",
+            "20260715000000_harvest_queue_pause"
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<BTreeSet<String>>(),
+        "only timestamped migration rows must be extracted"
+    );
+}
+
+/// Every migration in this release must appear in the upgrade guide's inventory.
+///
+/// The guide states it lists the migrations `0.5.0` adds, and non-`dev` profiles
+/// **refuse to start** with a pending migration — so an omitted row means an
+/// operator following the guide applies an incomplete set and the deploy fails
+/// (or, if they bypass the plugin check, the new queries fail against a missing
+/// relation). Issue #619 shipped `20260715000000_harvest_queue_pause` without
+/// its row; nothing caught it, because this is the one inventory in the repo
+/// with no drift guard. This is that guard.
+///
+/// **Scope** is every migration at or after the guide's own earliest listed
+/// entry, so migrations from prior releases are correctly out of scope and a
+/// NEW migration — which always sorts later — is always in scope. That makes
+/// the boundary self-maintaining rather than a hardcoded date this guard would
+/// itself have to keep current.
+#[test]
+fn every_release_migration_is_in_the_upgrade_guide() {
+    let path = workspace_root().join(UPGRADE_GUIDE);
+    let markdown = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("upgrade guide '{}' must be readable: {e}", path.display()));
+
+    let listed = migrations_listed_in_guide(&markdown);
+    assert!(
+        !listed.is_empty(),
+        "no migration rows parsed from {UPGRADE_GUIDE} — the inventory table's shape changed, \
+         so this guard is silently vacuous. Fix the parser, do not delete the test."
+    );
+
+    // The guide's earliest listed migration is the release boundary.
+    let first = listed
+        .iter()
+        .next()
+        .expect("non-empty, checked above")
+        .clone();
+
+    let mut missing: Vec<&str> = MIGRATIONS_LIST
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name >= first.as_str())
+        .filter(|name| !listed.contains(*name))
+        .collect();
+    missing.sort_unstable();
+
+    assert!(
+        missing.is_empty(),
+        "these migrations are missing from the inventory table in {UPGRADE_GUIDE}:\n  {}\n\
+         An operator following that guide would apply an incomplete migration set, and a \
+         non-`dev` profile refuses to start with a migration pending. Add a row per migration \
+         (release boundary: the guide's earliest listed entry, `{first}`).",
+        missing.join("\n  ")
+    );
+}

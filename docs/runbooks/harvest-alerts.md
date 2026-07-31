@@ -1350,3 +1350,170 @@ Ticket the workflow owner with the type name and the current active count.
 Escalate to page if the population growth is unbounded and accelerating, the
 worker fleet is already at capacity, and business-critical runs are visibly
 stalled (their `stack` shows no forward progress across successive checks).
+
+## harvest_queue_paused_too_long
+
+**What to do when a task queue has been held by an operator for too long:** the
+`harvest.queue.paused` gauge (issue #619) reports `1` for every queue whose
+dispatch is currently held and `0` otherwise. A pause is *safe* — nothing fails,
+retries, or dead-letters, and already-`RUNNING` tasks finish naturally — but it
+is also *silent*: work accumulates as `PENDING`, no other alert fires, and a
+forgotten pause is indistinguishable from a healthy idle queue until the backlog
+breaches an SLA. This alert exists to make a forgotten freeze loud.
+
+> **"Nothing fails" has one exception: `schedule_to_close`.** A pause suspends
+> only the *relative* `schedule_to_start` timer. An activity carrying an
+> **absolute** `schedule_to_close` deadline (issue #378) is still timed out
+> while the queue is held — a pause is not an SLA extension. The longer the
+> hold, the more of the held backlog can cross its own absolute deadline, so
+> treat this alert's `for` window as a real budget, not a formality. Crediting
+> held time back to `schedule_to_close` is explicitly out of scope for issue
+> #619.
+
+Because the gauge is binary, the **`for` duration is the threshold**, not the
+value. Alert on `max by (queue) (harvest_queue_paused) > 0` with `for: 1h`
+(ticket) or `for: 4h` (page).
+
+### Triage steps
+
+1. **See what is held and why.** The read endpoint returns the reason, the
+   operator who placed the hold, when it was placed, and how much work is
+   waiting behind it:
+
+   ```bash
+   harvest queue list-paused
+   # or: curl -s .../api/harvest/admin/queues/paused | jq
+   ```
+
+   The Vantage **Workers** page shows the same thing as a banner — the fleet
+   page an operator lands on when investigating idle workers.
+
+   Check `effective_scope` on each entry (the banner's **Scope** column shows
+   the same thing). It reports what the hold *actually* covers, derived from the
+   shards that hold the queue versus the expected shard set — not the
+   `scope_shard_id` intent recorded when the row was written:
+
+   - `fleet` — every expected shard holds it.
+   - `partial_fleet` — **some shards are still dispatching.** A fleet-wide pause
+     that only reached part of the fleet writes `scope_shard_id: null` on the
+     shards it reached and *no row* on the ones it missed, so intent alone cannot
+     tell this apart from a complete hold. Re-issue the pause (it is idempotent);
+     the original reason and operator are preserved. An unreachable shard also
+     reports `partial_fleet` — it may still be dispatching, so that is the safe
+     reading.
+   - `shard` — a deliberately shard-scoped hold.
+
+2. **Confirm the downstream is actually back.** The reason field records why the
+   hold was placed (`"SMTP provider outage"`). Verify that dependency is healthy
+   before thawing, or the backlog will simply fail on release.
+
+3. **Check how much is held.** `held_task_count` on the read endpoint is the
+   number of `PENDING` tasks on the queue. A large number means the thaw will
+   produce a burst — see *False positives* below for why that burst is safe.
+
+4. **Resume.**
+
+   ```bash
+   harvest queue resume email-workers
+   ```
+
+   Held tasks become immediately claimable. The response echoes the
+   `released_reason` and `released_paused_by` of the hold you just released —
+   the pause row is deleted on resume, so this is the last moment the *why* is
+   recoverable *from that row*.
+
+   For a **post-incident** review after the row is gone, read the audit log
+   instead — who/why/when survives the resume permanently there:
+
+   ```bash
+   harvest audit list --operation queue.pause --target-id email-workers
+   harvest audit list --operation queue.resume --target-id email-workers
+   ```
+
+   The reason is carried in the record's **`error_summary`** field, which is the
+   only free-text column on `harvest_audit_log` (there is no metadata column) —
+   so it is populated on `succeeded` rows too, not just failures. It reads:
+
+   - `reason: <why>` on a `queue.pause` row;
+   - `reason: released hold by <actor>: <why>` on the matching `queue.resume`
+     row;
+   - when independently-paused shards carried **different** holds, the resume row
+     instead lists every one of them, longest first, so no shard's *why* is lost
+     once its pause row is deleted:
+     `reason: released 2 holds (longest first); shards 0,2 by alice: stripe
+     outage (held 900s); shard 1 by bob: pg failover (held 60s)`. Shards sharing
+     one incident collapse into a single entry, so this grows with the number of
+     distinct holds, not the shard count;
+   - `... | failures: <detail>` appended on either when the operation only
+     partially applied, naming the shards it did not reach.
+
+5. **Confirm the thaw.** `harvest queue list-paused` should now be empty and the
+   `harvest_queue_depth` / `harvest_queue_oldest_pending_age` panels should
+   start falling.
+
+### Likely causes
+
+- **A genuine, still-ongoing downstream outage.** The hold is doing its job; the
+  alert is telling you the outage has outlasted its expected window.
+- **A forgotten hold.** The incident was resolved but nobody resumed the queue.
+  This is the failure mode the alert exists for.
+- **A pause placed on the wrong queue name.** Check `list-paused` against the
+  queue you meant to freeze; a typo produces a hold on a queue nobody is
+  watching. (A name with *surrounding whitespace* is rejected with a `400`
+  rather than accepted: queue names are matched exactly, so a stray space would
+  hold a different queue than the one intended.)
+- **A shard-scoped pause left behind** after a fleet-wide one was released
+  (`shard_id` is surfaced on the read endpoint).
+- **A fleet-wide pause that only partially applied** — `effective_scope:
+  "partial_fleet"`. The shards it missed never stopped dispatching; re-issue it.
+
+### False positives
+
+- **A short, deliberate freeze during a planned dependency migration.** Expected —
+  this is why the rule uses a `for` duration rather than firing immediately.
+  Tune `for` to the longest freeze your team plans for.
+- **A pause on a genuinely idle queue.** The hold is harmless because there is
+  nothing to hold. Use the sharper alert variant in the pack
+  (`harvest_queue_paused > 0 and harvest_queue_depth > 1000`) to only fire when
+  the hold is actually accumulating a backlog.
+- **A rising `harvest_queue_depth` while this gauge is `1` is NOT a capacity
+  incident.** It is the deliberate hold working as designed. This pairing is the
+  single most common false page during an outage freeze — check this gauge
+  before escalating a backlog alert.
+- **`harvest_queue_schedule_to_start` does not spike on a thaw.** Resume credits
+  the held time back to each task's `scheduled_at`, so a queue held for six
+  hours does not report six hours of schedule-to-start latency on release. The
+  credit is measured against the live clock at release, so the time the resume
+  itself takes — waiting on its queue lock and shifting a large backlog — is
+  credited too, and does not count against any task's `schedule_to_start`. A
+  task *enqueued while the resume is running* is credited as well: the hold is in
+  force until the resume commits, so a second pass picks up those late arrivals.
+  The one residual is sub-millisecond (a row committed during that final pass's
+  own execution), far below any usable `schedule_to_start`.
+
+### Safe actions
+
+- `harvest queue list-paused` — read-only.
+- `harvest queue resume <queue>` — releases the hold. Idempotent: resuming a
+  queue that is not paused is a success no-op, so a retry after a lost response
+  is safe.
+- `harvest queue pause <queue> --reason "<why>"` — re-freezing is idempotent and
+  **preserves the original reason and operator**, so a re-pause never overwrites
+  the provenance of an existing hold.
+- Both mutating commands **exit non-zero when a fleet-wide hold only partially
+  applied** (HTTP `207`): the shards the request missed keep dispatching into the
+  outage, so a scripted `harvest queue pause` step fails loudly rather than
+  reporting success. Re-issue it — both operations are idempotent — and confirm
+  with `harvest queue list-paused` that `effective_scope` reads `fleet` rather
+  than `partial_fleet`.
+- Inspecting a held task with `harvest workflow stack <id>` or the eligibility
+  explainer (`GET /admin/queues/{queue}/eligibility`), which reports
+  `queue_paused` as the first impediment.
+
+### Escalation criteria
+
+Escalate to the team that owns the downstream dependency named in the pause
+reason. Page if the held backlog is breaching a business SLA and the dependency
+has no ETA — at that point the decision is a business one (keep holding and
+accumulate, or resume and let the work fail into the DLQ where it can be
+redriven later).

@@ -179,6 +179,7 @@ pub mod prelude;
 pub mod query;
 #[doc(hidden)] // internal implementation detail; no stability guarantee
 pub mod queue_fairness;
+pub mod queue_pause;
 pub mod replay;
 #[cfg(feature = "db")]
 pub mod reset;

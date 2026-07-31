@@ -130,12 +130,25 @@ pub const fn start_to_close_timeout_query() -> &'static str {
 /// ([`crate::execution::shift_schedule_to_close_on_resume_query`]) so the
 /// row does not get instantly killed post-resume with a schedule-to-start
 /// budget the pause consumed.
+///
+/// Queue-pause carve-out (issue #619): a task held by a **queue** pause is
+/// likewise not a genuine worker-capacity signal — it is unclaimable because an
+/// operator deliberately froze its queue, not because the fleet is short of
+/// capacity. Enforcing schedule-to-start against it would fail exactly the work
+/// the hold exists to protect (AC3/AC4). Unlike the frozen-row carve-out above,
+/// this exclusion is unconditional for the queue: every PENDING row on a paused
+/// queue is unclaimable by construction, whatever its `schedule_to_close_at`.
+/// The absolute `schedule_to_close` deadline keeps ticking during a queue pause
+/// (an explicit out-of-scope decision in #619), so that scanner is deliberately
+/// *not* given a matching carve-out.
 #[must_use]
 pub const fn schedule_to_start_timeout_query() -> &'static str {
     "SELECT t.* FROM harvest_task_queue t \
      WHERE t.state = 'PENDING' \
      AND t.schedule_to_start IS NOT NULL \
      AND t.scheduled_at + t.schedule_to_start < NOW() \
+     AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
+         WHERE qp.queue_name = t.queue_name) \
      AND NOT (\
          t.schedule_to_close_at IS NOT NULL \
          AND t.schedule_to_close_at <= NOW() \
@@ -554,6 +567,135 @@ async fn task_state_and_deadline_for_update(
         .map_err(crate::error::database_error)
 }
 
+/// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
+///
+/// `FOR UPDATE` so the read serializes against `resume_queue`'s `scheduled_at`
+/// shift, and `clock_timestamp()` rather than `NOW()` because `NOW()` is frozen
+/// at transaction start — i.e. before this transaction waited on the queue
+/// advisory lock — which would judge the deadline against a stale instant.
+///
+/// **Lock ordering (issue #619 round-22 review):** this locks a `harvest_task_queue`
+/// row, so it may only run *after* the execution row is locked — see
+/// [`schedule_to_start_still_expired_unlocked_query`] for the fast path that
+/// runs before it and why the split exists.
+#[cfg(feature = "db")]
+#[must_use]
+const fn schedule_to_start_still_expired_query() -> &'static str {
+    "SELECT COALESCE(scheduled_at + schedule_to_start < clock_timestamp(), false) AS expired \
+     FROM harvest_task_queue \
+     WHERE id = $1 AND schedule_to_start IS NOT NULL \
+     FOR UPDATE"
+}
+
+/// SQL for [`schedule_to_start_still_expired_unlocked`], exposed for shape tests.
+///
+/// Byte-identical to [`schedule_to_start_still_expired_query`] minus the
+/// `FOR UPDATE`, so the two can never disagree about the deadline predicate.
+///
+/// # Why the split exists (issue #619 round-22 review)
+///
+/// The documented `harvest_task_queue` lock order is **execution row → task
+/// row**, and `resume_workflow_execution` follows it: it holds the execution
+/// row `FOR UPDATE` and then shifts this execution's task rows with a plain,
+/// *waiting* `UPDATE` (unlike its external-task sibling, that shift has no
+/// `SKIP LOCKED` escape). Round 18 placed the locked re-read *before* the
+/// execution lock, inverting the order for `ScheduleToStart` — enforcement
+/// holding a task row and waiting on the execution row while a resume holds the
+/// execution row and waits on that task row. Postgres would abort one of them,
+/// failing either the timeout sweep or the operator's resume.
+///
+/// So the authoritative locked re-read moved *after* the execution lock, and
+/// this unlocked variant took its place as a **fast path**: it bails out of the
+/// common held-task case before the execution-row lock and history load,
+/// without taking any lock of its own. It is advisory only — a concurrent
+/// resume can still commit between it and the authoritative check — which is
+/// exactly the fast-path/authoritative split `worker::process_workflow_task`
+/// already uses for its PAUSED re-check.
+#[cfg(feature = "db")]
+#[must_use]
+const fn schedule_to_start_still_expired_unlocked_query() -> &'static str {
+    "SELECT COALESCE(scheduled_at + schedule_to_start < clock_timestamp(), false) AS expired \
+     FROM harvest_task_queue \
+     WHERE id = $1 AND schedule_to_start IS NOT NULL"
+}
+
+/// Locked re-read of a task's *row-current* schedule-to-start deadline (issue
+/// #619 round-18 review).
+///
+/// [`find_timed_out_tasks`] produces a snapshot, and a whole pause/resume cycle
+/// can complete before a given row in a large batch is reached. Resume credits
+/// the held time back by shifting `scheduled_at` forward and then **deletes**
+/// the pause row, so by the time enforcement runs the pause re-check finds
+/// nothing to suppress on — and, without this, enforcement proceeds on the
+/// scan-time deadline and times the task out immediately after its deadline was
+/// credited. On the workflow path that seals the entire execution `TIMED_OUT`,
+/// which is exactly what AC3/AC4 forbid.
+///
+/// Returns `false` — meaning *do not enforce* — when the row is gone, when it
+/// carries no `schedule_to_start` at all, or when the row-current deadline is no
+/// longer in the past. Safe in the conservative direction: a task that is
+/// genuinely still expired is caught on this or any later scan.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+async fn schedule_to_start_still_expired(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ExpiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        expired: bool,
+    }
+
+    let row: Option<ExpiredRow> = diesel::sql_query(schedule_to_start_still_expired_query())
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.is_some_and(|r| r.expired))
+}
+
+/// Non-locking fast-path twin of [`schedule_to_start_still_expired`].
+///
+/// Takes **no** row lock, so it is safe to run before the execution row is
+/// locked. Advisory only: a resume can commit between this and the
+/// authoritative locked check, so a `true` here must always be re-confirmed
+/// under the execution lock. A `false` is safe to act on immediately — the
+/// deadline can only move *forward* (a resume credits held time), so a task
+/// this reports as un-expired cannot become expired by a concurrent resume.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+async fn schedule_to_start_still_expired_unlocked(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+) -> HarvestResult<bool> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ExpiredRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        expired: bool,
+    }
+
+    let row: Option<ExpiredRow> =
+        diesel::sql_query(schedule_to_start_still_expired_unlocked_query())
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .get_result(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+    Ok(row.is_some_and(|r| r.expired))
+}
+
 /// Returns the set of task states that are valid for a given timeout reason.
 ///
 /// `enforce_activity_timeout` skips rows whose current state is not in this
@@ -641,22 +783,6 @@ fn external_task_timeout_still_due(
     now: chrono::DateTime<Utc>,
 ) -> bool {
     state == "PENDING" && schedule_to_close_at < now
-}
-
-async fn load_workflow_execution(
-    conn: &mut AsyncPgConnection,
-    exec_id: crate::types::ExecutionId,
-) -> HarvestResult<WorkflowExecution> {
-    use crate::schema::harvest_workflow_executions::dsl;
-
-    dsl::harvest_workflow_executions
-        .find(exec_id.as_uuid())
-        .select(WorkflowExecution::as_select())
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?
-        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
 async fn update_workflow_execution_timed_out(
@@ -835,8 +961,84 @@ async fn enforce_activity_timeout(
 
     // Did we actually append a timeout (vs. a no-op because the task already
     // moved on)? Only a real enforcement should count toward the breaker.
-    let enforced = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+    //
+    // Pinned `READ COMMITTED`, not the session default (issue #619 round-24
+    // review). The queue advisory lock taken below is a `SELECT`, so it fixes
+    // this transaction's snapshot and *then* blocks waiting for an in-flight
+    // pause. Under `REPEATABLE READ` that snapshot is the transaction's only
+    // one, so after the pause commits and releases the lock, `is_queue_paused`
+    // still reads pre-pause state, returns false, and this enforcer fails the
+    // task *after the hold was acknowledged* — defeating the guarantee the
+    // whole queue-pause feature exists to provide. `queue::claim_task` pins the
+    // same level for the same reason; inheriting it would let a
+    // `default_transaction_isolation = repeatable read` on the database or the
+    // role disable the guarantee from outside this code.
+    let mut tx = conn.build_transaction().read_committed();
+    let enforced = Box::pin(tx.run::<bool, HarvestError, _>(async |conn| {
         let error = error.clone();
+
+        // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
+        // is a non-locking snapshot, so a queue pause committing after the scan
+        // would otherwise let this transaction schedule-to-start-fail the very
+        // task the hold was meant to protect.
+        //
+        // Unlike the execution-pause re-check further down — which is
+        // authoritative because both sides lock the *execution row* —
+        // `pause_queue` shares no row with this transaction, so a bare re-read
+        // would not serialize: a pause could commit in the window between the
+        // read and this transaction's own commit. Both sides therefore take the
+        // same queue-scoped advisory lock, so a pause is either fully visible
+        // here or blocked until this enforcement commits.
+        //
+        // LOCK ORDERING (load-bearing): this runs FIRST, before the execution
+        // and task row locks below, because `resume_queue` takes the very same
+        // advisory lock and *then* row-locks every PENDING task on the queue via
+        // its `scheduled_at` shift. Taking the rows first here and the advisory
+        // lock after would invert that order — enforcement holding a task row
+        // and waiting on the advisory lock while resume holds the advisory lock
+        // and waits on that task row — and Postgres would abort one of them,
+        // failing either the timeout pass or the operator's resume. Both paths
+        // now take advisory-then-rows. (Same convention as the
+        // `harvest_external_tasks` task-row -> execution-row ordering documented
+        // in `enforce_external_task_timeouts`.)
+        //
+        // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
+        // — the absolute `schedule_to_close` deadline keeps ticking during a
+        // queue pause, and heartbeat/start-to-close apply to RUNNING rows that a
+        // pause never touches — so the lock is taken only for that reason and
+        // never on the far more common in-flight timeout paths. Bailing here
+        // also skips the row locks and history load entirely for a held task.
+        //
+        // SHARED mode (round-21 review): exclusive would block every claim's
+        // `try_lock_queue_for_claim` for this whole transaction, stalling
+        // dispatch on a queue that is not paused at all. Shared still mutually
+        // excludes the exclusive pause/resume, which is the only ordering this
+        // re-check needs. See `lock_queue_for_timeout_recheck`.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
+                return Ok(false);
+            }
+            // A *completed* pause/resume cycle leaves nothing for the check
+            // above to suppress on, but resume has already credited the held
+            // time back into `scheduled_at`. Re-read the row-current deadline
+            // before trusting the scan snapshot, or a task is timed out the
+            // instant its deadline was extended.
+            //
+            // Unlocked here (round-22 review): locking the task row before the
+            // execution row below would invert the documented
+            // execution-row -> task-row order and deadlock against
+            // `resume_workflow_execution`. This is a fast path that skips the
+            // execution lock and history load for the common held-task case;
+            // the authoritative locked re-read runs after the row locks below.
+            if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+                return Ok(false);
+            }
+        }
+
         let (execution, history) =
             lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
         let Some((state, row_schedule_to_close_at)) =
@@ -845,6 +1047,19 @@ async fn enforce_activity_timeout(
             return Ok(false);
         };
         if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
+            return Ok(false);
+        }
+        // Authoritative `schedule_to_start` deadline re-read (round-18 review),
+        // now placed here — after the execution row lock above and while this
+        // transaction already holds the task row from
+        // `task_state_and_deadline_for_update` — so it preserves the
+        // execution-row -> task-row order (round-22 review). The unlocked
+        // fast-path check near the top of this transaction is advisory; this is
+        // the one that must be trusted, because only a lock held across the
+        // resume's own `scheduled_at` shift can serialize against it.
+        if matches!(reason, TimeoutReason::ScheduleToStart)
+            && !schedule_to_start_still_expired(conn, task.id).await?
+        {
             return Ok(false);
         }
         // Authoritative PAUSED re-check under the execution row lock
@@ -864,6 +1079,8 @@ async fn enforce_activity_timeout(
         ) {
             return Ok(false);
         }
+        // (The queue-pause re-check runs at the TOP of this transaction, before
+        // the row locks above — see the lock-ordering note there.)
         let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
             Ok(Some(activity_id)) => activity_id,
             Ok(None) => return Ok(false),
@@ -1249,40 +1466,113 @@ async fn enforce_workflow_timeout(
     reason: &TimeoutReason,
     metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
-    let execution = load_workflow_execution(conn, exec_id).await?;
-    let error = timeout_error(&execution.workflow_name, reason);
-    let history = store::load_history(conn, exec_id).await?;
-    let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+    // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
+    // `enforce_activity_timeout` — see the note there (issue #619 round-24
+    // review). Without it, a `repeatable read` session default lets this
+    // enforcer time out the whole execution after a pause was acknowledged.
+    let mut tx = conn.build_transaction().read_committed();
+    let enforced = Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
+        // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
+        // the one in `enforce_activity_timeout` — see that function for the full
+        // rationale on why an advisory lock (not a bare re-read) is required and
+        // why the lock must be taken BEFORE any row is touched.
+        //
+        // This path needs it for the same reason: `find_timed_out_tasks` does
+        // not filter on `task_type`, so a PENDING **workflow** task carrying
+        // `schedule_to_start` reaches here exactly as an activity task does, and
+        // the scan's queue-pause carve-out is only a non-locking snapshot. A
+        // pause committing after that snapshot would otherwise let this
+        // transaction append `WorkflowFailed` and seal the whole execution
+        // `TIMED_OUT` — strictly worse than the activity case, which fails one
+        // task, and precisely the outcome AC3/AC4 forbid.
+        //
+        // Bailing here also skips the execution/history loads below, so the
+        // advisory-lock wait cannot widen the window between reading
+        // `history.next_event_id` and appending at it (those loads used to sit
+        // outside this transaction; they are inside it now for that reason).
+        //
+        // Returning `None` — rather than proceeding with no writes — is
+        // load-bearing beyond the appends: it also skips
+        // `maybe_increment_schedule_failure_counter` below, so a deliberately
+        // held task can never count toward the schedule auto-pause threshold
+        // (issue #360). A hold is not a schedule failure.
+        if matches!(reason, TimeoutReason::ScheduleToStart) {
+            // Shared mode, exactly as in `enforce_activity_timeout` — and it
+            // matters more here, because this transaction holds the lock across
+            // `append_events`, the parent-close cascade and trigger evaluation,
+            // so an exclusive lock would stall dispatch on an unpaused queue for
+            // that entire span. See `lock_queue_for_timeout_recheck`.
+            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
+            if crate::queue_pause::queue_pause_suppresses_timeout(
+                reason,
+                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+            ) {
+                return Ok(None);
+            }
+            // Same stale-scan guard as the activity path, and it matters more
+            // here: this path seals the whole execution `TIMED_OUT` rather than
+            // failing one task, so acting on a deadline a completed resume has
+            // already credited forward destroys the run the hold was protecting.
+            //
+            // Unlocked fast path, for the same lock-ordering reason as the
+            // activity path (round-22 review); the authoritative locked re-read
+            // runs below, once the execution row is held.
+            if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+                return Ok(None);
+            }
+        }
 
-    let (deferred_starts, closed_children) =
-        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            let error = error.clone();
-            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
-            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-            queue::fail_task(conn, task.id, &error).await?;
-            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
-            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+        // Lock the execution row BEFORE any task row (round-22 review). This
+        // path used to read the execution unlocked and only take the row lock
+        // implicitly, inside `store::append_events` below — which left the
+        // locked `schedule_to_start` re-read above it, inverting the documented
+        // execution-row -> task-row order. Locking here also loads the history
+        // in the same call, replacing a separate `store::load_history`.
+        let (execution, history) =
+            lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
+        // Authoritative deadline re-read, now correctly ordered after the
+        // execution lock. See the activity path for why the unlocked check
+        // above cannot be trusted on its own.
+        if matches!(reason, TimeoutReason::ScheduleToStart)
+            && !schedule_to_start_still_expired(conn, task.id).await?
+        {
+            return Ok(None);
+        }
+        let error = timeout_error(&execution.workflow_name, reason);
+        let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+
+        store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
+        update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+        queue::fail_task(conn, task.id, &error).await?;
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::TimedOut,
+            Some(metrics),
+        )
+        .await?;
+        deferred.extend(triggers);
+        if execution.parent_close_policy.is_none()
+            && let Some(parent_uuid) = execution.parent_id
+        {
+            wake_parent_for_child_timeout(
                 conn,
+                execution_id_from_uuid(parent_uuid),
                 exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                Some(metrics),
+                &error,
             )
             .await?;
-            deferred.extend(triggers);
-            if execution.parent_close_policy.is_none()
-                && let Some(parent_uuid) = execution.parent_id
-            {
-                wake_parent_for_child_timeout(
-                    conn,
-                    execution_id_from_uuid(parent_uuid),
-                    exec_id,
-                    &error,
-                )
-                .await?;
-            }
-            Ok((deferred, closed_children))
-        }))
-        .await?;
+        }
+        Ok(Some((execution, deferred, closed_children)))
+    }))
+    .await?;
+
+    // Suppressed by a queue pause: nothing was written, so there is nothing to
+    // cascade, no handler check to run, and no schedule failure to count.
+    let Some((execution, deferred_starts, closed_children)) = enforced else {
+        return Ok(());
+    };
 
     for start in deferred_starts {
         start.spawn();
@@ -3224,6 +3514,119 @@ mod tests {
         assert!(
             sql.contains("started_at"),
             "should reference started_at column"
+        );
+    }
+
+    /// Round-18 P2: the stale-scan guard must re-read the row under a lock and
+    /// judge it against *real* current time.
+    ///
+    /// `FOR UPDATE` is what serializes this read against `resume_queue`'s
+    /// `scheduled_at` shift; `clock_timestamp()` rather than `NOW()` is what
+    /// keeps it honest, since `NOW()` is frozen at transaction start — before
+    /// this transaction waited on the queue advisory lock — and would judge the
+    /// deadline against a stale instant.
+    #[cfg(feature = "db")]
+    #[test]
+    fn stale_scan_guard_relocks_the_row_and_uses_real_time() {
+        let sql = schedule_to_start_still_expired_query();
+        assert!(
+            sql.contains("FOR UPDATE"),
+            "the re-read must lock the row so it serializes against the resume \
+             shift; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("clock_timestamp()"),
+            "must compare against real current time, not the transaction's frozen \
+             NOW(); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("NOW()"),
+            "NOW() is frozen at transaction start, i.e. before the advisory-lock \
+             wait, so it would judge a credited-forward deadline as still expired; \
+             got:\n{sql}"
+        );
+        assert!(
+            sql.contains("scheduled_at + schedule_to_start"),
+            "must recompute the deadline from the row's current columns; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("schedule_to_start IS NOT NULL"),
+            "a row with no schedule-to-start has no such deadline to enforce; got:\n{sql}"
+        );
+    }
+
+    /// Round-22 P2: the locked deadline re-read must never precede the
+    /// execution-row lock.
+    ///
+    /// The documented `harvest_task_queue` order is execution row -> task row,
+    /// and `resume_workflow_execution` follows it (execution `FOR UPDATE`, then
+    /// a plain *waiting* `UPDATE` of this execution's task rows — that shift has
+    /// no `SKIP LOCKED` escape, unlike its external-task sibling). Round 18 put
+    /// the locked re-read before the execution lock and inverted it, so a resume
+    /// racing a `schedule_to_start` sweep could deadlock and Postgres would abort
+    /// one of them.
+    ///
+    /// Source-level because the hazard is *statement order*, which no SQL-shape
+    /// assertion can see. Checked per enforcement function so a later edit that
+    /// reintroduces the locked call early in either one fails here.
+    #[test]
+    fn locked_deadline_reread_never_precedes_the_execution_lock() {
+        let src = include_str!("timeout.rs");
+        for func in [
+            "async fn enforce_activity_timeout(",
+            "async fn enforce_workflow_timeout(",
+        ] {
+            let Some(start) = src.find(func) else {
+                continue;
+            };
+            let body = &src[start..];
+            // Bound the search to this function: the next `\nasync fn ` at column 0.
+            let end = body[1..].find("\nasync fn ").map_or(body.len(), |o| o + 1);
+            let body = &body[..end];
+
+            let locked = body
+                .find("schedule_to_start_still_expired(conn")
+                .expect("each schedule_to_start path must keep the authoritative locked re-read");
+            let exec_lock = body
+                .find("lock_workflow_execution_row_and_load_history(conn")
+                .expect("each schedule_to_start path must lock the execution row explicitly");
+            assert!(
+                exec_lock < locked,
+                "{func}: the locked schedule_to_start re-read must come AFTER the \
+                 execution-row lock, or it takes a task row first and deadlocks \
+                 against resume_workflow_execution (execution row -> task rows)"
+            );
+
+            let unlocked = body
+                .find("schedule_to_start_still_expired_unlocked(conn")
+                .expect("the pre-execution-lock fast path must stay unlocked");
+            assert!(
+                unlocked < exec_lock,
+                "{func}: the unlocked fast path exists to bail before the \
+                 execution lock and history load; after it, it is pointless"
+            );
+        }
+    }
+
+    /// The two deadline queries must differ only by `FOR UPDATE`, so the fast
+    /// path can never disagree with the authoritative check about expiry.
+    #[test]
+    fn the_two_deadline_queries_differ_only_by_for_update() {
+        let locked = schedule_to_start_still_expired_query();
+        let unlocked = schedule_to_start_still_expired_unlocked_query();
+        assert!(
+            locked.ends_with(" FOR UPDATE"),
+            "the authoritative re-read must lock the row; got:\n{locked}"
+        );
+        assert!(
+            !unlocked.contains("FOR UPDATE"),
+            "the fast path must take no lock, or it reintroduces the inverted \
+             lock order it exists to avoid; got:\n{unlocked}"
+        );
+        assert_eq!(
+            locked.trim_end_matches(" FOR UPDATE"),
+            unlocked,
+            "the two deadline queries must be identical apart from FOR UPDATE"
         );
     }
 

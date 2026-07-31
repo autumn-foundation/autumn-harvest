@@ -21,6 +21,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_update_rejected_rate",
     "harvest_signal_unhandled_rate",
     "harvest_workflow_population_leak",
+    "harvest_queue_paused_too_long",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -54,6 +55,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_queue_schedule_to_start_bucket",
     "harvest_queue_oldest_pending_age",
     "harvest_dlq_entries",
+    "harvest_queue_paused",
     "harvest_schedule_runs_total",
     "harvest_schedule_skipped_total",
     "harvest_schedule_overdue",
@@ -200,6 +202,41 @@ fn saga_spike_alert_absolute_floor_fires_without_a_baseline() {
         expr.contains("or sum by (workflow) (rate(harvest_saga_compensated_total[5m])) * 0"),
         "spike alert baseline must default to a zero-valued, label-matched series so the \
          absolute floor fires with no baseline samples: {expr}"
+    );
+}
+
+/// Round-10 hardening (issue #619, Codex review): the queue-pause alert's
+/// description originally said a pause is safe because "nothing fails, retries,
+/// or dead-letters". That is true of the *relative* `schedule_to_start` timer,
+/// which a pause suspends and credits back on resume, but **not** of the
+/// *absolute* `schedule_to_close` deadline (issue #378), which keeps running for
+/// the whole hold. This is the one alert an operator consults after the 1h/4h
+/// threshold, so an unqualified "nothing fails" there invites leaving a hold in
+/// place under the false assumption that all held work is protected. Pin the
+/// exception textually — the API contract and the runbook both carry it, and a
+/// future "tighten the wording" pass must not quietly drop it.
+#[test]
+fn queue_pause_alert_states_the_schedule_to_close_exception() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_queue_paused_too_long"))
+        .expect("queue-pause alert must exist");
+    let description = rule["description"]
+        .as_str()
+        .expect("description must be a string");
+    assert!(
+        description.contains("schedule_to_close"),
+        "the pause-safety claim must name the absolute-deadline exception: {description}"
+    );
+    // The runbook says the same thing; the two must not drift apart.
+    let runbook = read_doc("docs/runbooks/harvest-alerts.md");
+    let section = markdown_section(&runbook, "harvest_queue_paused_too_long")
+        .expect("queue-pause runbook section must exist");
+    assert!(
+        section.contains("schedule_to_close"),
+        "the runbook section must carry the same exception as the alert description"
     );
 }
 

@@ -344,6 +344,31 @@ async fn eris_unauthenticated_fail_activity_now_is_blocked() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Issue #619 AC1/AC6: pausing or resuming a task queue is an operator action
+/// that must be admin-gated and audited — never reachable unauthenticated.
+#[tokio::test]
+async fn eris_unauthenticated_queue_pause_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/admin/queues/email-workers/pause",
+            r#"{"reason": "SMTP outage"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_queue_resume_is_blocked() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json("/admin/queues/email-workers/resume", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn eris_unauthenticated_awaitables_is_blocked() {
     // Open-awaitables diagnostic (issue #615): admin-only read (the

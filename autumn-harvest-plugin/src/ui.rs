@@ -2405,6 +2405,10 @@ async fn list_workers_ui(
     // state regardless of the active UI filter.
     let shard_results = load_workers_from_shards(&pool, None, stale_threshold).await;
 
+    // Issue #619: paused queues are the most likely explanation for idle
+    // workers alongside a full queue, so surface them on the fleet page.
+    let paused_queues = load_paused_queues_from_shards(&api_state).await;
+
     let stats = compute_fleet_stats(&shard_results);
     let banner_state = determine_banner_state(&stats);
     let is_multi_shard = shard_results.len() > 1;
@@ -2473,6 +2477,7 @@ async fn list_workers_ui(
     Ok(render_workers_page(
         &stats,
         banner_state,
+        &paused_queues,
         &grouped,
         &shard_errors,
         is_multi_shard,
@@ -2513,6 +2518,324 @@ fn parse_worker_ui_filters(
         }
     };
     Ok((status_filter, stale_only))
+}
+
+/// A paused queue as rendered on the Workers page, merged across shards.
+///
+/// Issue #619: an operator queue pause is the single most likely explanation
+/// for "workers are idle but the queue is full", so it is surfaced on the
+/// fleet page an operator lands on during exactly that incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PausedQueueBannerRow {
+    pub queue_name: String,
+    pub reason: String,
+    pub paused_by: String,
+    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub scope_shard_id: Option<i32>,
+    pub held_task_count: i64,
+    /// False when the shards holding this queue disagree on
+    /// `(reason, paused_by, scope_shard_id)` — the displayed provenance then
+    /// describes only part of the fleet and the banner says so.
+    pub provenance_uniform: bool,
+    /// What the hold **actually** covers, derived from the shards that hold it
+    /// versus the expected shard set — not from the stored `scope_shard_id`,
+    /// which records only the intent of the request that wrote each row.
+    pub coverage: autumn_harvest::queue_pause::PauseCoverage,
+}
+
+/// Outcome of the Workers-page paused-queue scan: the merged banner rows plus
+/// the shards whose pause state could not be read at all.
+///
+/// Issue #619 review: a shard whose connection or pause read fails contributes
+/// **no rows**, which is indistinguishable from "that shard is not holding
+/// anything". For *coverage classification* that is the safe reading (a
+/// not-holding shard makes the hold `partial_fleet`, i.e. possibly still
+/// dispatching). For *presence* it is not safe at all: a hold that exists
+/// **only** on an unread shard vanishes from the banner entirely, so an
+/// operator investigating idle workers sees a clean page and looks elsewhere
+/// while dispatch is in fact held. The failed shard ids are therefore carried
+/// alongside the rows and rendered as a warning even when `rows` is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PausedQueueScan {
+    pub rows: Vec<PausedQueueBannerRow>,
+    /// Shards whose pause state is **unknown**, not "not paused". Sorted.
+    pub unreadable_shards: Vec<i32>,
+}
+
+/// Merge per-shard paused-queue rows into one banner row per queue name.
+///
+/// Held counts are summed across shards. The top-level provenance is the
+/// **earliest** hold (the one an operator reasons about — "how long has this
+/// been held?"), tie-broken by shard id so the choice never depends on
+/// fan-out order. Rows are sorted by queue name so the banner is stable
+/// across refreshes.
+///
+/// The shards' rows are **not** guaranteed to agree: `pause_queue` is
+/// idempotent and preserves the *original* reason and operator on a re-pause,
+/// and the `shard_id` parameter explicitly supports holding the same queue on
+/// two shards separately. Summing every shard's held tasks under a single
+/// shard's reason would then tell the operator a story that is simply not true
+/// for part of the fleet, so `provenance_uniform` records the disagreement and
+/// `render_paused_queues_banner` marks it visibly.
+///
+/// The uniformity rule is identical to the one `GET /admin/queues/paused` uses
+/// (`api::merge_paused_queue_rows`) — including comparing
+/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`,
+/// since each shard stamps its own `NOW()` — so the two surfaces can never
+/// disagree about whether a hold is uniform.
+///
+/// The rendered **scope** is likewise derived from real coverage rather than the
+/// stored `scope_shard_id`, via the shared
+/// [`autumn_harvest::queue_pause::classify_pause_coverage`]: a fleet-wide pause
+/// that only reached some shards persists `scope_shard_id = NULL` on the shards
+/// it reached and no row on the ones it missed, so labelling it "fleet-wide"
+/// would tell an operator the fleet is held while part of it keeps dispatching
+/// (issue #619 review).
+pub(crate) fn merge_paused_queue_banner_rows(
+    per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
+    expected_shards: &[i32],
+) -> Vec<PausedQueueBannerRow> {
+    let mut by_queue: std::collections::BTreeMap<
+        String,
+        Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
+    > = std::collections::BTreeMap::new();
+    for (shard_id, row) in per_shard {
+        by_queue
+            .entry(row.queue_name.clone())
+            .or_default()
+            .push((shard_id, row));
+    }
+
+    by_queue
+        .into_values()
+        .map(|shard_rows| {
+            let earliest = shard_rows
+                .iter()
+                .min_by_key(|(shard_id, row)| (row.paused_at, *shard_id))
+                .map(|(_, row)| row)
+                .expect("group is non-empty by construction");
+            let provenance_uniform = shard_rows.iter().all(|(_, row)| {
+                row.reason == earliest.reason
+                    && row.paused_by == earliest.paused_by
+                    && row.scope_shard_id == earliest.scope_shard_id
+            });
+            let holding: Vec<i32> = shard_rows.iter().map(|(shard_id, _)| *shard_id).collect();
+            let scopes: Vec<Option<i32>> = shard_rows
+                .iter()
+                .map(|(_, row)| row.scope_shard_id)
+                .collect();
+            PausedQueueBannerRow {
+                queue_name: earliest.queue_name.clone(),
+                reason: earliest.reason.clone(),
+                paused_by: earliest.paused_by.clone(),
+                paused_at: earliest.paused_at,
+                scope_shard_id: earliest.scope_shard_id,
+                held_task_count: shard_rows.iter().map(|(_, row)| row.held_task_count).sum(),
+                provenance_uniform,
+                coverage: autumn_harvest::queue_pause::classify_pause_coverage(
+                    &holding,
+                    &scopes,
+                    expected_shards,
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Render the paused-queues banner (issue #619). Empty when nothing is paused
+/// **and** every shard's pause state was readable, so a healthy fleet page is
+/// byte-identical to before.
+///
+/// A row whose shards disagree on provenance is marked "mixed across shards"
+/// rather than silently attributing the fleet-wide held total to one shard's
+/// reason and operator — see [`merge_paused_queue_banner_rows`].
+///
+/// `unreadable_shards` renders its own warning **even when `rows` is empty**:
+/// an unread shard's pause state is unknown, so an absent banner would otherwise
+/// read as "nothing is held" on exactly the page an operator lands on when
+/// investigating idle workers — see [`PausedQueueScan`].
+pub(crate) fn render_paused_queues_banner(
+    rows: &[PausedQueueBannerRow],
+    unreadable_shards: &[i32],
+) -> Markup {
+    if rows.is_empty() && unreadable_shards.is_empty() {
+        return html! {};
+    }
+    let unreadable_list = unreadable_shards
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let held_total: i64 = rows.iter().map(|r| r.held_task_count).sum();
+    let mixed = rows.iter().filter(|r| !r.provenance_uniform).count();
+    // A fleet-wide hold that did not reach every shard leaves part of the fleet
+    // dispatching into the outage the operator is trying to hold back -- the
+    // single most important thing to say on this banner (issue #619 review).
+    let incomplete = rows
+        .iter()
+        .filter(|r| r.coverage.is_incomplete_fleet())
+        .count();
+    html! {
+        // Rendered FIRST and unconditionally on a read failure: if this is the
+        // only thing on the banner, the honest answer is "we do not know whether
+        // dispatch is held", not the silent clean page an absent banner implies.
+        @if !unreadable_shards.is_empty() {
+            div.banner.Degraded {
+                strong { "Queue pause state incomplete" }
+                " — could not read shard(s) " (unreadable_list) ". "
+                "A hold that exists only on an unread shard is MISSING from this \
+                 banner, and a hold shown below may cover more shards than its \
+                 Scope column says. Check GET /admin/queues/paused before \
+                 concluding dispatch is flowing."
+            }
+        }
+        @if !rows.is_empty() {
+            div.banner.Degraded {
+                strong { "Queue dispatch paused" }
+                " — "
+                (rows.len()) " queue(s) held | " (held_total) " task(s) waiting"
+                @if incomplete > 0 {
+                    " | " (incomplete) " only PARTIALLY applied — some shards are \
+                           still dispatching; re-issue the pause"
+                }
+                @if mixed > 0 {
+                    " | " (mixed) " with mixed provenance across shards \
+                           (see GET /admin/queues/paused for the per-shard holds)"
+                }
+            }
+            table {
+                thead {
+                    tr {
+                        th { "Queue" }
+                        th { "Scope" }
+                        th { "Held tasks" }
+                        th { "Paused at" }
+                        th { "By" }
+                        th { "Reason" }
+                    }
+                }
+                tbody {
+                    @for row in rows {
+                        tr {
+                            td { code { (row.queue_name) } }
+                            td {
+                                // Real coverage, not the stored intent: a
+                                // fleet-wide request that missed a shard must not
+                                // read "fleet-wide".
+                                (row.coverage.label())
+                                @if let Some(shard) = row.scope_shard_id {
+                                    " (shard " (shard) ")"
+                                }
+                            }
+                            td { (row.held_task_count) }
+                            td { (row.paused_at.to_rfc3339()) }
+                            td {
+                                (row.paused_by)
+                                @if !row.provenance_uniform { " (mixed across shards)" }
+                            }
+                            td {
+                                (row.reason)
+                                @if !row.provenance_uniform { " (mixed across shards)" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load paused queues across every shard for the Workers-page banner.
+///
+/// Best-effort: an unreachable shard never fails the page — the banner is a
+/// diagnostic aid, never a gate on rendering the fleet. It is **not** silent
+/// about it either: the failed shard ids come back in
+/// [`PausedQueueScan::unreadable_shards`] and are rendered as their own warning,
+/// because a hold that exists only on an unread shard is otherwise invisible
+/// here (issue #619 review).
+///
+/// The **expected** shard set (pools plus every shard the router knows about) is
+/// resolved from `api_state`, identical to `GET /admin/queues/paused`, so a
+/// partially-applied fleet-wide hold is labelled the same way on both surfaces.
+/// An unread shard counts as not-holding for *coverage*, which is the safe
+/// direction (it may still be dispatching) — the warning is what tells the
+/// operator the shown `Scope` could understate the real coverage.
+async fn load_paused_queues_from_shards(api_state: &HarvestApiState) -> PausedQueueScan {
+    let pools = crate::shard_fanout::pools_by_shard(api_state);
+    let expected_set = crate::shard_fanout::expected_shards(api_state, &pools);
+
+    // Fan out over the EXPECTED shard set, not just `pool.iter_shards()`.
+    //
+    // `expected_shards` deliberately includes a shard the router advertises but
+    // this process has no pool for yet (mid a shard-add rollout). Iterating only
+    // the pools would give such a shard no future at all, so it could never
+    // enter `unreadable_shards` — and if it is the ONLY shard holding a queue,
+    // the Workers page would again render no pause warning whatsoever. That is
+    // the same presence-vs-coverage gap the unreadable-shard warning exists to
+    // close, reached through a missing pool instead of a failing read.
+    //
+    // Resolution goes through the API's own `resolve_expected_shard_pools` (one
+    // shared function, not a second copy of the rule) so a poolless shard maps
+    // to `None` and is reported, never silently resolved through
+    // `ShardedDbPool::pool_for`'s default-shard fallback — which would query the
+    // DEFAULT shard's database in its place and let coverage read `fleet`.
+    let expected: Vec<i32> = expected_set.iter().copied().collect();
+    let resolved = crate::api::resolve_expected_shard_pools(&expected_set, &pools);
+    scan_paused_queues(resolved, &expected).await
+}
+
+/// Read the pause table on each resolved shard and fold the outcomes into a
+/// [`PausedQueueScan`].
+///
+/// Split out from [`load_paused_queues_from_shards`] so the reporting half is
+/// directly testable: reaching a poolless-but-expected shard through
+/// `api_state` requires an installed runtime with a widened router, but the
+/// rule under test — *a `None` pool is reported, never dropped* — needs
+/// neither. Its counterpart, that a router-known poolless shard resolves to
+/// `None` rather than a default-fallback pool, is guarded on the API side by
+/// `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+///
+/// `expected` is the same shard set `resolved` was built from, threaded through
+/// for the coverage calculation in [`merge_paused_queue_banner_rows`].
+async fn scan_paused_queues(
+    resolved: Vec<(i32, Option<&autumn_harvest::worker::DbPool>)>,
+    expected: &[i32],
+) -> PausedQueueScan {
+    let futs: Vec<_> = resolved
+        .into_iter()
+        .map(|(shard, maybe_pool)| async move {
+            // No pool for a shard the router advertises: unread, not "holding
+            // nothing". Dropping it here is exactly the invisible-hold bug.
+            let Some(shard_pool) = maybe_pool else {
+                return Err(shard);
+            };
+            let read = async {
+                let mut conn = acquire_conn(shard_pool).await.ok()?;
+                autumn_harvest::queue_pause::list_paused_queues(&mut conn)
+                    .await
+                    .ok()
+            }
+            .await;
+            // Err(shard) carries WHICH shard failed, so the banner can say so
+            // instead of silently reporting it as holding nothing.
+            read.map_or(Err(shard), |rows| {
+                Ok(rows.into_iter().map(|row| (shard, row)).collect::<Vec<_>>())
+            })
+        })
+        .collect();
+    let mut per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)> = Vec::new();
+    let mut unreadable_shards: Vec<i32> = Vec::new();
+    for outcome in futures::future::join_all(futs).await {
+        match outcome {
+            Ok(rows) => per_shard.extend(rows),
+            Err(shard) => unreadable_shards.push(shard),
+        }
+    }
+    unreadable_shards.sort_unstable();
+    PausedQueueScan {
+        rows: merge_paused_queue_banner_rows(per_shard, expected),
+        unreadable_shards,
+    }
 }
 
 async fn load_workers_from_shards(
@@ -3387,6 +3710,7 @@ fn layout_dead_letters(title: &str, body: &Markup, refresh: Option<u64>) -> Mark
 fn render_workers_page(
     stats: &WorkerFleetStats,
     banner_state: Option<BannerState>,
+    paused_queues: &PausedQueueScan,
     grouped: &[(ShardId, Vec<WorkerRow>)],
     shard_errors: &[(ShardId, &str)],
     is_multi_shard: bool,
@@ -3406,6 +3730,9 @@ fn render_workers_page(
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
+
+        // Paused-queue banner (issue #619) -- empty when nothing is held.
+        (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
         (render_worker_filters(status_filter, shard_filter, stale_only, build_id_filter, limit))
@@ -8521,6 +8848,394 @@ fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #619: with nothing paused **and** every shard readable, the banner
+    /// must render nothing at all, so a healthy Workers page is byte-identical to
+    /// before the feature.
+    #[test]
+    fn paused_queues_banner_is_empty_when_nothing_is_paused() {
+        assert_eq!(render_paused_queues_banner(&[], &[]).into_string(), "");
+    }
+
+    /// A pool that is never connected to; `.build()` is lazy, so constructing it
+    /// performs no I/O and `acquire_conn` on it fails fast.
+    fn never_connecting_pool() -> autumn_harvest::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://harvest:harvest@127.0.0.1:1/never");
+        deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool builds without connecting")
+    }
+
+    /// Issue #619 review (round 11): mid a shard-add rollout the router
+    /// advertises a shard this process has no pool for. Fanning out over the
+    /// pools alone would give that shard no future at all, so it could never
+    /// reach `unreadable_shards` — and if it is the only shard holding a queue,
+    /// the Workers page renders no pause warning whatsoever, the exact
+    /// invisible-hold bug the warning exists to prevent.
+    ///
+    /// This guards the *reporting* half (a `None` pool is reported, never
+    /// dropped). Its counterpart — that a router-known poolless shard resolves
+    /// to `None` rather than a default-fallback pool — is guarded on the API
+    /// side by `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+    #[tokio::test]
+    async fn scan_reports_an_expected_shard_that_has_no_local_pool() {
+        let live = never_connecting_pool();
+        // Shard 0 has a pool (whose read will fail); shard 1 is the poolless,
+        // router-known shard. Both must be reported.
+        let scan = scan_paused_queues(vec![(0, Some(&live)), (1, None)], &[0, 1]).await;
+        assert!(
+            scan.unreadable_shards.contains(&1),
+            "a poolless expected shard must be reported unreadable, not dropped: {:?}",
+            scan.unreadable_shards
+        );
+        assert_eq!(
+            scan.unreadable_shards,
+            vec![0, 1],
+            "both an unreadable pool and a missing pool are reported, sorted"
+        );
+        assert!(
+            scan.rows.is_empty(),
+            "no shard was read, so there are no rows to show"
+        );
+        // And the banner is therefore non-empty: silence here is the lie.
+        assert!(
+            !render_paused_queues_banner(&scan.rows, &scan.unreadable_shards)
+                .into_string()
+                .is_empty(),
+            "an unread/poolless shard must never render as a clean page"
+        );
+    }
+
+    /// The poolless shard is reported even when it is the ONLY expected shard —
+    /// i.e. the fold does not depend on some other shard producing a future.
+    #[tokio::test]
+    async fn scan_reports_a_lone_poolless_shard() {
+        let scan = scan_paused_queues(vec![(7, None)], &[7]).await;
+        assert_eq!(scan.unreadable_shards, vec![7]);
+    }
+
+    /// Issue #619 review: a shard whose pause state could not be read makes the
+    /// banner's silence a lie — a hold that exists ONLY on that shard is absent
+    /// from `rows` entirely. The warning must therefore render even with zero
+    /// rows, because that is exactly the case an operator misreads as "dispatch
+    /// is flowing, look elsewhere".
+    #[test]
+    fn unreadable_shard_warns_even_with_no_visible_holds() {
+        let html = render_paused_queues_banner(&[], &[1, 3]).into_string();
+        assert!(
+            !html.is_empty(),
+            "an unread shard must never render as a clean page"
+        );
+        assert!(
+            html.contains("Queue pause state incomplete"),
+            "must name the condition: {html}"
+        );
+        assert!(html.contains("1, 3"), "must name the failed shards: {html}");
+        assert!(
+            html.contains("MISSING"),
+            "must say a hold could be missing entirely: {html}"
+        );
+        assert!(
+            html.contains("/admin/queues/paused"),
+            "must point at the authoritative per-shard read: {html}"
+        );
+        // No hold is visible, so there is nothing to tabulate.
+        assert!(
+            !html.contains("Queue dispatch paused") && !html.contains("<table"),
+            "with zero rows there must be no hold banner or table: {html}"
+        );
+    }
+
+    /// The two warnings are independent: a visible hold PLUS an unread shard must
+    /// show both, because the shown `Scope` can understate the real coverage.
+    #[test]
+    fn unreadable_shard_warning_composes_with_a_visible_hold() {
+        let rows = vec![PausedQueueBannerRow {
+            queue_name: "email-workers".to_string(),
+            reason: "SMTP provider outage".to_string(),
+            paused_by: "alice".to_string(),
+            paused_at: chrono::Utc::now(),
+            scope_shard_id: None,
+            held_task_count: 7,
+            provenance_uniform: true,
+            coverage: autumn_harvest::queue_pause::PauseCoverage::PartialFleet,
+        }];
+        let html = render_paused_queues_banner(&rows, &[2]).into_string();
+        assert!(
+            html.contains("Queue pause state incomplete"),
+            "read-failure warning: {html}"
+        );
+        assert!(
+            html.contains("Queue dispatch paused"),
+            "hold banner still rendered: {html}"
+        );
+        assert!(
+            html.contains("email-workers"),
+            "table still rendered: {html}"
+        );
+        // The incomplete-read warning must come FIRST: "we do not know" outranks
+        // the partial-coverage detail it may itself explain.
+        let read_at = html.find("Queue pause state incomplete").unwrap();
+        let hold_at = html.find("Queue dispatch paused").unwrap();
+        assert!(
+            read_at < hold_at,
+            "the unknown-state warning must precede the hold banner: {html}"
+        );
+    }
+
+    /// AC6: the banner surfaces the queue name, held count, actor and reason so
+    /// an operator can see WHO paused WHAT and WHY without leaving the page.
+    #[test]
+    fn paused_queues_banner_surfaces_reason_actor_and_held_count() {
+        let rows = vec![PausedQueueBannerRow {
+            queue_name: "email-workers".to_string(),
+            reason: "SMTP provider outage".to_string(),
+            paused_by: "alice".to_string(),
+            paused_at: chrono::Utc::now(),
+            scope_shard_id: None,
+            held_task_count: 42,
+            provenance_uniform: true,
+            coverage: autumn_harvest::queue_pause::PauseCoverage::Fleet,
+        }];
+        let html = render_paused_queues_banner(&rows, &[]).into_string();
+        assert!(html.contains("email-workers"), "queue name: {html}");
+        assert!(html.contains("SMTP provider outage"), "reason: {html}");
+        assert!(html.contains("alice"), "actor: {html}");
+        assert!(html.contains("42"), "held count: {html}");
+        assert!(html.contains("fleet-wide"), "scope: {html}");
+        assert!(
+            !html.contains("mixed across shards"),
+            "a uniform hold must NOT be marked mixed: {html}"
+        );
+    }
+
+    /// AC7: pause is fleet-wide by default, so the same queue paused on two
+    /// shards is ONE banner row whose held count is the fleet-wide sum.
+    #[test]
+    fn paused_queue_rows_merge_across_shards_summing_held_counts() {
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let later = chrono::Utc::now();
+        let merged = merge_paused_queue_banner_rows(
+            vec![
+                (
+                    1,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "email-workers".to_string(),
+                        reason: "later shard".to_string(),
+                        paused_by: "bob".to_string(),
+                        paused_at: later,
+                        scope_shard_id: Some(1),
+                        held_task_count: 3,
+                    },
+                ),
+                (
+                    0,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "email-workers".to_string(),
+                        reason: "earliest pause wins".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: earlier,
+                        scope_shard_id: Some(0),
+                        held_task_count: 4,
+                    },
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(merged.len(), 1, "one row per queue name");
+        assert_eq!(
+            merged[0].held_task_count, 7,
+            "held counts sum across shards"
+        );
+        assert_eq!(
+            merged[0].paused_at, earlier,
+            "the earliest pause instant is the one an operator reasons about"
+        );
+        assert_eq!(
+            merged[0].reason, "earliest pause wins",
+            "provenance travels with the earliest pause, not a mix"
+        );
+        assert_eq!(merged[0].paused_by, "alice");
+    }
+
+    /// Issue #619 review: two shards holding the same queue with *different*
+    /// reasons/actors is a supported case (`shard_id` scoping, plus the
+    /// idempotent re-pause that preserves the original provenance). The banner
+    /// sums both shards' held tasks, so labelling that fleet-wide total with
+    /// only one shard's story would tell the operator something untrue about
+    /// the rest of the fleet. It must be flagged instead.
+    #[test]
+    fn divergent_shard_provenance_is_flagged_and_visibly_marked() {
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let later = chrono::Utc::now();
+        let merged = merge_paused_queue_banner_rows(
+            vec![
+                (
+                    0,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "shard-0 provider degraded".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: earlier,
+                        scope_shard_id: Some(0),
+                        held_task_count: 4,
+                    },
+                ),
+                (
+                    1,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "shard-1 unrelated incident".to_string(),
+                        paused_by: "bob".to_string(),
+                        paused_at: later,
+                        scope_shard_id: Some(1),
+                        held_task_count: 9,
+                    },
+                ),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].held_task_count, 13, "the total is fleet-wide");
+        assert!(
+            !merged[0].provenance_uniform,
+            "the shards disagree on reason, actor AND scope"
+        );
+
+        let html = render_paused_queues_banner(&merged, &[]).into_string();
+        assert!(
+            html.contains("mixed across shards"),
+            "divergent provenance must be visible, not silently attributed to \
+             one shard: {html}"
+        );
+        assert!(
+            html.contains("mixed provenance across shards"),
+            "the banner summary must count the divergent queue(s): {html}"
+        );
+    }
+
+    /// The uniformity rule must match `api::merge_paused_queue_rows` exactly,
+    /// including comparing `(reason, paused_by, scope_shard_id)` and NOT
+    /// `paused_at` — each shard stamps its own `NOW()`, so a fleet-wide hold
+    /// whose shards agree on the story must never be flagged as mixed.
+    #[test]
+    fn differing_paused_at_alone_does_not_flag_divergence() {
+        let merged = merge_paused_queue_banner_rows(
+            vec![
+                (
+                    0,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "provider outage".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: chrono::Utc::now() - chrono::Duration::seconds(3),
+                        scope_shard_id: None,
+                        held_task_count: 2,
+                    },
+                ),
+                (
+                    1,
+                    autumn_harvest::queue_pause::PausedQueue {
+                        queue_name: "payments".to_string(),
+                        reason: "provider outage".to_string(),
+                        paused_by: "alice".to_string(),
+                        paused_at: chrono::Utc::now(),
+                        scope_shard_id: None,
+                        held_task_count: 5,
+                    },
+                ),
+            ],
+            &[0, 1],
+        );
+        assert!(
+            merged[0].provenance_uniform,
+            "a fleet-wide hold's per-shard NOW() skew is not a divergence"
+        );
+        let html = render_paused_queues_banner(&merged, &[]).into_string();
+        assert!(!html.contains("mixed across shards"), "{html}");
+    }
+
+    /// Issue #619 review: a fleet-wide pause that only reached SOME shards must
+    /// not read as "fleet-wide".
+    ///
+    /// The shards it reached persist `scope_shard_id = NULL` and the ones it
+    /// missed persist **no row at all**, so the stored intent is indistinguishable
+    /// from a complete hold — while the missed shards keep dispatching into the
+    /// very outage the operator is trying to hold back. Scope is therefore derived
+    /// from real coverage against the expected shard set.
+    #[test]
+    fn a_partially_applied_fleet_pause_is_not_rendered_as_fleet_wide() {
+        let row = |shard: i32| {
+            (
+                shard,
+                autumn_harvest::queue_pause::PausedQueue {
+                    queue_name: "payments".to_string(),
+                    reason: "stripe outage".to_string(),
+                    paused_by: "alice".to_string(),
+                    paused_at: chrono::Utc::now(),
+                    // Fleet-wide INTENT -- what a fleet-wide request writes.
+                    scope_shard_id: None,
+                    held_task_count: 3,
+                },
+            )
+        };
+
+        // Shard 1 was missed: it has no row and is still dispatching.
+        let partial = merge_paused_queue_banner_rows(vec![row(0)], &[0, 1]);
+        assert_eq!(
+            partial[0].coverage,
+            autumn_harvest::queue_pause::PauseCoverage::PartialFleet,
+            "one of two expected shards holds the queue -- intent says \
+             fleet-wide, reality does not"
+        );
+        let html = render_paused_queues_banner(&partial, &[]).into_string();
+        assert!(
+            html.contains("partially applied"),
+            "the Scope cell must not claim fleet-wide coverage: {html}"
+        );
+        assert!(
+            html.contains("still dispatching"),
+            "the banner summary must tell the operator to re-issue the pause: \
+             {html}"
+        );
+
+        // Both shards held: the same stored intent now really is fleet-wide.
+        let complete = merge_paused_queue_banner_rows(vec![row(0), row(1)], &[0, 1]);
+        assert_eq!(
+            complete[0].coverage,
+            autumn_harvest::queue_pause::PauseCoverage::Fleet
+        );
+        let html = render_paused_queues_banner(&complete, &[]).into_string();
+        assert!(html.contains("fleet-wide"), "{html}");
+        assert!(
+            !html.contains("partially applied") && !html.contains("still dispatching"),
+            "a complete hold must not be marked partial: {html}"
+        );
+    }
+
+    /// Merged rows are sorted by queue name so the banner is stable across
+    /// refreshes (shard iteration order must not shuffle it).
+    #[test]
+    fn paused_queue_rows_are_sorted_by_queue_name() {
+        let now = chrono::Utc::now();
+        let mk = |name: &str| autumn_harvest::queue_pause::PausedQueue {
+            queue_name: name.to_string(),
+            reason: "r".to_string(),
+            paused_by: "a".to_string(),
+            paused_at: now,
+            scope_shard_id: None,
+            held_task_count: 1,
+        };
+        let merged = merge_paused_queue_banner_rows(
+            vec![(0, mk("zeta")), (0, mk("alpha")), (0, mk("mid"))],
+            &[0],
+        );
+        let names: Vec<&str> = merged.iter().map(|r| r.queue_name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
 
     #[test]
     fn url_encode_preserves_unreserved_and_encodes_space() {
