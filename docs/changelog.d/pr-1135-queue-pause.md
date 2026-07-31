@@ -132,3 +132,63 @@ and showing `pg_try_advisory_xact_lock_shared(619, hashtext(b))` fails — befor
 asserting the shipped key does not, while still excluding claims on the queue
 actually being paused. The scratch table's own test drives three resumes
 back-to-back on one pooled connection, which fails without `ON COMMIT DROP`.
+
+### Round 24 — Codex automated review (5857ae5)
+
+One P1 and two P2s. The P1 and one P2 are the same bug in two places; the other
+P2 is a regression round 23 introduced and is **reverted** rather than patched.
+
+- **P1 — a `repeatable read` session default silently defeats the whole
+  feature.** The queue advisory lock is taken with a `SELECT`, so it establishes
+  the enclosing transaction's snapshot and *then* blocks waiting for an
+  in-flight pause. Every one of these transactions was opened with a bare
+  `conn.transaction(...)`, which **inherits** `default_transaction_isolation`.
+  Under `REPEATABLE READ` that first snapshot is the transaction's only one, so
+  once the pause commits and releases the lock the transaction still reads
+  pre-pause state. Two consequences, both of them the failure this feature
+  exists to prevent: the timeout enforcers see "not paused" and **fail the task
+  after the hold was acknowledged**, and `resume_queue`'s `DELETE` cannot see
+  the pause row it waited for, so it reports a cheerful `newly_resumed: false`
+  no-op **while the queue stays frozen** — the operator believes they thawed and
+  nothing dispatches.
+
+  This is not speculative: `queue::claim_task` already pins `READ COMMITTED`
+  for exactly this reason, with a round-17 comment naming
+  `default_transaction_isolation = repeatable read` on the database or the role
+  as the hazard. Round 17 recognised the requirement on the claim path and the
+  sibling paths never got it — a consistency gap inside one feature, not a new
+  discovery. Fixed by pinning `READ COMMITTED` via
+  `build_transaction().read_committed()` (which emits the level on the `BEGIN`,
+  so the guarantee travels with the query) on all four transactions that take
+  the queue lock: both timeout enforcers, `pause_queue`, and `resume_queue`.
+  Pinning `pause_queue` too is not strictly required by the reported failure but
+  keeps every queue-lock transaction on one rule rather than leaving a reader to
+  work out which ones need it.
+
+- **P2 (reverted, not fixed) — round 23's scratch table required an unchecked
+  database privilege.** `CREATE TEMP TABLE` requires the database-level
+  `TEMPORARY` privilege. Nothing in the migration grants it and nothing in the
+  storage-role preflight validates it, so a deployment that has revoked
+  `TEMPORARY` — a recognised hardening step — passes every current permission
+  check and then fails **every** resume, rolling back the pause-row deletion and
+  leaving the queue frozen at precisely the moment an operator is trying to thaw
+  it.
+
+  Round 23 introduced this while fixing an O(backlog) memory cost. That was a
+  bad trade: the memory cost is a *scale* problem that bites at multi-million-row
+  backlogs, while this is a *deterministic, silent, config-dependent* break of
+  the feature's core operation. So the scratch table is reverted and the two-pass
+  shift goes back to the array bind (`RETURNING id` → `unnest($3::uuid[])`),
+  which is covered by the DML grants the migration already issues.
+
+  The memory cost is real and is tracked as a follow-up. Fixing it properly needs
+  a handoff covered by existing grants — a real table keyed by a per-resume token
+  — not a privilege the deployment may not have. Bounded batching remains
+  rejected for the round-19/20 reason: it would hold the exclusive queue lock
+  across many statements and make the two-pass partition non-atomic.
+
+Also removed with the revert: the `resume_shifted_scratch_query` SQL helper, its
+two round-23 tests, and the explicit `BEGIN`/`COMMIT` a hand-driven test needed
+only because `ON COMMIT DROP` forced both passes into one transaction. Round 23's
+*other* fix — the collision-resistant `queue_lock_keys` derivation — is unaffected
+and stays.

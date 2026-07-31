@@ -55,6 +55,17 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
+/// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
+/// can exclude exactly the rows the first pass shifted rather than re-deriving
+/// that set from a `created_at` predicate that cannot see commit order
+/// (issue #619 round-19 review).
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ShiftedTaskId {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+}
+
 /// Domain separator for [`queue_lock_keys`] (issue #619 round-23 review).
 ///
 /// Mirrors `crate::build_routing`'s `RAMP_HASH_DOMAIN_SEP`: the digest is this
@@ -809,62 +820,39 @@ pub const fn queue_pause_suppresses_timeout(
 /// claim keeps the wait it had already accrued; it is now credited correctly by
 /// pass 2 rather than relying on being unreachable in this window.
 ///
-/// # Why the ids never leave Postgres (issue #619 round-23 review)
+/// # Why the ids round-trip through this process (issue #619 round-24 review)
 ///
-/// The shifted ids are captured straight into a transaction-scoped scratch
-/// table ([`resume_shifted_scratch_query`]) by a data-modifying CTE, rather
-/// than loaded into the API process and sent back as an array bind for pass 2.
+/// The shifted ids are loaded here and sent back to pass 2 as an array bind,
+/// which is linear in the released backlog: one `Uuid` per shifted task in
+/// application memory, then that array re-serialised onto the wire and
+/// re-materialised server-side by `unnest`, all while this transaction holds
+/// the queue's exclusive advisory lock.
 ///
-/// Loading them was linear in the released backlog *twice over* — one `Uuid`
-/// per shifted task in application memory, then that whole array re-serialised
-/// onto the wire and re-materialised server-side by `unnest` — all while this
-/// transaction holds the queue's exclusive advisory lock. A multi-million-row
-/// outage backlog is exactly the case an operator reaches for this feature in,
-/// and is the case where that allocation could exhaust the API process or
-/// blow the bind size, failing the resume and rolling back the thaw the
-/// operator is waiting on. Round 11 already refused `RETURNING id` on the
-/// notify path for the same reason (see [`resumed_queue_notify_task_query`]).
+/// Round 23 removed that cost by capturing the ids straight into a
+/// transaction-scoped `CREATE TEMP TABLE ... ON COMMIT DROP` scratch table via
+/// a data-modifying CTE. Round 24 reverted it: `CREATE TEMP TABLE` requires the
+/// database-level `TEMPORARY` privilege. Nothing in the migration grants it and
+/// nothing in preflight validates it, so a deployment that has revoked
+/// `TEMPORARY` — a recognised hardening step — passes every current permission
+/// check and then fails EVERY resume, rolling back the pause deletion and
+/// leaving the queue frozen at precisely the moment an operator is trying to
+/// thaw it. A rare scale problem is a better failure than a deterministic,
+/// silent, config-dependent break of the feature's core operation.
 ///
-/// Keeping the set server-side makes the resume's application-side memory O(1)
-/// in the backlog, and shortens the lock hold by the round trip it removes.
+/// The memory cost is real and is tracked as a follow-up. Fixing it properly
+/// needs a handoff covered by the grants the migration already issues (a real
+/// table keyed by a per-resume token), not a privilege the deployment may not
+/// have.
 ///
-/// Binds: `$1` = queue name, `$2` = `paused_at`. The statement's row count is
-/// the number of tasks shifted; the ids land in the scratch table for
-/// [`resume_shift_late_arrivals_query`] to exclude.
 #[must_use]
 pub const fn resume_shift_scheduled_at_query() -> &'static str {
-    "WITH shifted AS ( \
-       UPDATE harvest_task_queue \
-       SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
-       WHERE queue_name = $1 \
-         AND state = 'PENDING' \
-         AND scheduled_at <= clock_timestamp() \
-         AND (created_at IS NULL OR created_at < $2) \
-       RETURNING id \
-     ) \
-     INSERT INTO harvest_resume_shifted (id) SELECT id FROM shifted"
-}
-
-/// Transaction-scoped scratch table for the resume's shifted-id set.
-///
-/// [`resume_shift_scheduled_at_query`] writes into it and
-/// [`resume_shift_late_arrivals_query`] anti-joins it, so the ids never enter
-/// application memory (issue #619 round-23 review).
-///
-/// `ON COMMIT DROP` ties its lifetime to `resume_queue`'s own transaction, so
-/// it is gone on either commit or rollback and cannot leak onto a pooled
-/// connection. Temp tables are session-scoped, so concurrent resumes on
-/// different connections never collide, and the deliberate absence of
-/// `IF NOT EXISTS` means a second `resume_queue` inside one transaction would
-/// fail loudly rather than silently credit against a stale id set.
-///
-/// The `PRIMARY KEY` is not for uniqueness — the ids are unique by construction
-/// — but to bound the plan: a freshly created temp table carries no statistics,
-/// and the index keeps even a nested-loop anti-join at O(rows × log ids)
-/// instead of the O(rows × ids) scan the round-19 note rejected `<> ALL` for.
-#[must_use]
-pub const fn resume_shifted_scratch_query() -> &'static str {
-    "CREATE TEMP TABLE harvest_resume_shifted (id uuid PRIMARY KEY) ON COMMIT DROP"
+    "UPDATE harvest_task_queue \
+     SET scheduled_at = scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
+     WHERE queue_name = $1 \
+       AND state = 'PENDING' \
+       AND scheduled_at <= clock_timestamp() \
+       AND (created_at IS NULL OR created_at < $2) \
+     RETURNING id"
 }
 
 /// Second pass of the resume shift: credit rows **enqueued during the thaw
@@ -905,14 +893,12 @@ pub const fn resume_shifted_scratch_query() -> &'static str {
 /// credited here, whichever side it belongs to. An empty `$3` — the primary
 /// pass shifted nothing — correctly leaves every row to this pass.
 ///
-/// The exclusion is written as `NOT EXISTS (… scratch table …)` rather than
+/// The exclusion is written as `NOT EXISTS (… unnest …)` rather than
 /// `id <> ALL(<array>)` deliberately: the latter is a per-row linear scan of
 /// the array, while the former lets the planner build a hash anti-join, so the
 /// cost is O(rows + ids) rather than O(rows × ids). (Round 11 rejected this
 /// exclusion on the strength of the `<> ALL` cost; the objection was to that
-/// spelling, not to the approach.) Round 23 moved the id set from an array bind
-/// into [`resume_shifted_scratch_query`], so it is O(1) in application memory —
-/// see the note on [`resume_shift_scheduled_at_query`].
+/// spelling, not to the approach.)
 ///
 /// # Irreducible residual
 ///
@@ -930,8 +916,8 @@ pub const fn resume_shifted_scratch_query() -> &'static str {
 /// paying to recover a sub-millisecond credit — so the residual is documented
 /// rather than eliminated.
 ///
-/// Binds: `$1` = queue name, `$2` = the hold's `paused_at`. The ids the primary
-/// pass shifted are read from [`resume_shifted_scratch_query`]'s table.
+/// Binds: `$1` = queue name, `$2` = the hold's `paused_at`, `$3` = the ids the
+/// primary pass reported shifting.
 #[must_use]
 pub const fn resume_shift_late_arrivals_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -944,7 +930,7 @@ pub const fn resume_shift_late_arrivals_query() -> &'static str {
        AND state = 'PENDING' \
        AND scheduled_at <= clock_timestamp() \
        AND NOT EXISTS ( \
-             SELECT 1 FROM harvest_resume_shifted already \
+             SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
              WHERE already.id = harvest_task_queue.id \
            )"
 }
@@ -1303,7 +1289,7 @@ pub async fn pause_queue(
     actor: &str,
     scope_shard_id: Option<i32>,
 ) -> HarvestResult<PauseOutcome> {
-    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use diesel_async::RunQueryDsl;
 
     let queue_owned = validate_queue_name(queue_name)?;
     if reason.trim().is_empty() {
@@ -1315,53 +1301,57 @@ pub async fn pause_queue(
     let reason_owned = reason.to_string();
     let actor_owned = actor.to_string();
 
-    Box::pin(
-        conn.transaction::<PauseOutcome, HarvestError, _>(async |conn| {
-            // Serialize against the schedule_to_start enforcer so it cannot
-            // fail a task on the queue we are pausing (see
-            // `lock_queue_for_pause`).
-            lock_queue_for_pause(conn, &queue_owned).await?;
+    // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
+    // `resume_queue` — see the note there (issue #619 round-24 review). The
+    // advisory lock establishes this transaction's snapshot before it waits, so
+    // under `REPEATABLE READ` a pause that lands behind a concurrent
+    // pause/resume would read pre-lock state for the rest of the transaction.
+    let mut tx = conn.build_transaction().read_committed();
+    Box::pin(tx.run::<PauseOutcome, HarvestError, _>(async |conn| {
+        // Serialize against the schedule_to_start enforcer so it cannot
+        // fail a task on the queue we are pausing (see
+        // `lock_queue_for_pause`).
+        lock_queue_for_pause(conn, &queue_owned).await?;
 
-            // The hold takes effect HERE, not at COMMIT: `try_lock_queue_for_claim`
-            // takes the shared mode of the key just locked exclusively, so every
-            // claim on this queue now fails its `try` and gives the task back.
-            // Read the clock in its own statement, immediately after the lock, so
-            // the whole rest of this transaction — the unbounded backlog scan
-            // below included — is credited back on resume. See
-            // `pause_upsert_query` for why a later stamp under-credits and can
-            // spuriously time a task out after the thaw.
-            let clock: ClockRow = diesel::sql_query(pause_clock_query())
-                .get_result(conn)
-                .await?;
+        // The hold takes effect HERE, not at COMMIT: `try_lock_queue_for_claim`
+        // takes the shared mode of the key just locked exclusively, so every
+        // claim on this queue now fails its `try` and gives the task back.
+        // Read the clock in its own statement, immediately after the lock, so
+        // the whole rest of this transaction — the unbounded backlog scan
+        // below included — is credited back on resume. See
+        // `pause_upsert_query` for why a later stamp under-credits and can
+        // spuriously time a task out after the thaw.
+        let clock: ClockRow = diesel::sql_query(pause_clock_query())
+            .get_result(conn)
+            .await?;
 
-            let held: CountRow = diesel::sql_query(held_task_count_query())
-                .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .get_result(conn)
-                .await?;
+        let held: CountRow = diesel::sql_query(held_task_count_query())
+            .bind::<diesel::sql_types::Text, _>(&queue_owned)
+            .get_result(conn)
+            .await?;
 
-            // `paused_at` is bound from the lock-acquisition instant above, not
-            // evaluated inline here — see `pause_upsert_query`.
-            let row: UpsertedPauseRow = diesel::sql_query(pause_upsert_query())
-                .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .bind::<diesel::sql_types::Text, _>(&reason_owned)
-                .bind::<diesel::sql_types::Text, _>(&actor_owned)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
-                .bind::<diesel::sql_types::Timestamptz, _>(clock.now)
-                .get_result(conn)
-                .await?;
-            let newly_paused = row.newly_paused;
+        // `paused_at` is bound from the lock-acquisition instant above, not
+        // evaluated inline here — see `pause_upsert_query`.
+        let row: UpsertedPauseRow = diesel::sql_query(pause_upsert_query())
+            .bind::<diesel::sql_types::Text, _>(&queue_owned)
+            .bind::<diesel::sql_types::Text, _>(&reason_owned)
+            .bind::<diesel::sql_types::Text, _>(&actor_owned)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
+            .bind::<diesel::sql_types::Timestamptz, _>(clock.now)
+            .get_result(conn)
+            .await?;
+        let newly_paused = row.newly_paused;
 
-            Ok(PauseOutcome {
-                queue_name: row.queue_name,
-                newly_paused,
-                reason: row.reason,
-                paused_by: row.paused_by,
-                paused_at: row.paused_at,
-                scope_shard_id: row.scope_shard_id,
-                held_task_count: held.count,
-            })
-        }),
-    )
+        Ok(PauseOutcome {
+            queue_name: row.queue_name,
+            newly_paused,
+            reason: row.reason,
+            paused_by: row.paused_by,
+            paused_at: row.paused_at,
+            scope_shard_id: row.scope_shard_id,
+            held_task_count: held.count,
+        })
+    }))
     .await
 }
 
@@ -1382,118 +1372,146 @@ pub async fn resume_queue(
     queue_name: &str,
     actor: &str,
 ) -> HarvestResult<ResumeOutcome> {
-    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use diesel_async::RunQueryDsl;
 
     let queue_owned = validate_queue_name(queue_name)?;
     let _ = actor; // recorded by the caller's audit row; the table keeps no resume trail
 
-    Box::pin(
-        conn.transaction::<ResumeOutcome, HarvestError, _>(async |conn| {
-            // Same lock the pause path and the timeout enforcer take, so a
-            // resume cannot interleave with either.
-            //
-            // LOCK ORDERING (load-bearing): advisory lock FIRST, then the
-            // PENDING task rows the `scheduled_at` shift below updates. The
-            // `schedule_to_start` enforcer takes the same two in the same order
-            // (see the lock-ordering note in `timeout::enforce_activity_timeout`).
-            // Inverting either side would let enforcement hold a task row while
-            // waiting on this advisory lock and this transaction hold the
-            // advisory lock while waiting on that task row — an ABBA deadlock
-            // Postgres would break by aborting one, failing either the timeout
-            // pass or the operator's resume.
-            lock_queue_for_pause(conn, &queue_owned).await?;
+    // Pinned `READ COMMITTED`, not the session default (issue #619 round-24 review).
+    //
+    // The advisory lock below is a `SELECT`, so it establishes this
+    // transaction's snapshot and *then* blocks waiting for any in-flight pause.
+    // Under `REPEATABLE READ` that snapshot is the transaction's only one, so
+    // once the pause commits and releases the lock, the `DELETE` below still
+    // cannot see the pause row it was waiting for: the resume reports a
+    // successful `newly_resumed: false` no-op while the queue stays held —
+    // the operator believes they thawed and nothing dispatches.
+    //
+    // Under `READ COMMITTED` each statement takes a fresh snapshot, so the
+    // post-lock `DELETE` observes the pause that committed while we waited.
+    // Inheriting the level would let a `default_transaction_isolation =
+    // repeatable read` on the database or the role silently disable the
+    // guarantee from outside this code; `build_transaction().read_committed()`
+    // emits the level on the `BEGIN`, so it travels with the query. This
+    // mirrors `queue::claim_task`, which pins the same level for the same
+    // fresh-snapshot reason.
+    let mut tx = conn.build_transaction().read_committed();
+    Box::pin(tx.run::<ResumeOutcome, HarvestError, _>(async |conn| {
+        // Same lock the pause path and the timeout enforcer take, so a
+        // resume cannot interleave with either.
+        //
+        // LOCK ORDERING (load-bearing): advisory lock FIRST, then the
+        // PENDING task rows the `scheduled_at` shift below updates. The
+        // `schedule_to_start` enforcer takes the same two in the same order
+        // (see the lock-ordering note in `timeout::enforce_activity_timeout`).
+        // Inverting either side would let enforcement hold a task row while
+        // waiting on this advisory lock and this transaction hold the
+        // advisory lock while waiting on that task row — an ABBA deadlock
+        // Postgres would break by aborting one, failing either the timeout
+        // pass or the operator's resume.
+        lock_queue_for_pause(conn, &queue_owned).await?;
 
-            // Delete-and-return: a single statement that is both the
-            // "was it paused?" test and the release, so two concurrent
-            // resumes cannot both claim to have released the same hold.
-            let deleted: Vec<PauseRow> = diesel::sql_query(
-                "DELETE FROM harvest_queue_pauses WHERE queue_name = $1 \
+        // Delete-and-return: a single statement that is both the
+        // "was it paused?" test and the release, so two concurrent
+        // resumes cannot both claim to have released the same hold.
+        let deleted: Vec<PauseRow> = diesel::sql_query(
+            "DELETE FROM harvest_queue_pauses WHERE queue_name = $1 \
                      RETURNING reason, paused_by, paused_at",
-            )
+        )
+        .bind::<diesel::sql_types::Text, _>(&queue_owned)
+        .load(conn)
+        .await?;
+
+        let Some(row) = deleted.into_iter().next() else {
+            return Ok(ResumeOutcome {
+                queue_name: queue_owned,
+                newly_resumed: false,
+                released_task_count: 0,
+                paused_duration_secs: 0,
+                released_reason: None,
+                released_paused_by: None,
+            });
+        };
+
+        // The ids this pass shifts are what pass 2 excludes -- see the
+        // round-19 notes on both queries for why a `created_at` predicate
+        // cannot do that job.
+        //
+        // Round 23 briefly handed this set over server-side in a
+        // `CREATE TEMP TABLE ... ON COMMIT DROP` scratch table, to keep
+        // application memory O(1) in the released backlog. That was
+        // reverted in round 24: `CREATE TEMP TABLE` requires the
+        // database-level `TEMPORARY` privilege, which nothing in the
+        // migration grants and nothing in preflight validates, so a
+        // deployment that has revoked it (a recognised hardening step)
+        // would pass every current permission check and then fail EVERY
+        // resume -- rolling back the pause deletion and leaving the queue
+        // frozen at exactly the moment an operator is trying to thaw it.
+        // Trading a rare scale problem for a deterministic, silent,
+        // config-dependent break of the feature's core operation is the
+        // wrong trade. The memory cost is tracked as a follow-up.
+        let shifted: Vec<ShiftedTaskId> = diesel::sql_query(resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&queue_owned)
+            .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
             .load(conn)
             .await?;
+        let released = shifted.len();
+        let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
 
-            let Some(row) = deleted.into_iter().next() else {
-                return Ok(ResumeOutcome {
-                    queue_name: queue_owned,
-                    newly_resumed: false,
-                    released_task_count: 0,
-                    paused_duration_secs: 0,
-                    released_reason: None,
-                    released_paused_by: None,
-                });
-            };
+        // Second pass, LAST so it sees the freshest snapshot: a task still
+        // held (our DELETE has not committed, so concurrent claimers still
+        // see the pause row) may be invisible to the primary shift above --
+        // whether it was created during the hold, or created *before* it by
+        // an enqueue that only committed just now. This pass covers BOTH
+        // sides of the partition and excludes exactly the rows the primary
+        // pass reported shifting, so the two are disjoint by construction
+        // (the counts sum exactly, no row is shifted twice) for any commit
+        // order rather than only for the ones a `created_at` test happens
+        // to separate.
+        let late = diesel::sql_query(resume_shift_late_arrivals_query())
+            .bind::<diesel::sql_types::Text, _>(&queue_owned)
+            .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+            .execute(conn)
+            .await?;
 
-            // The ids this pass shifts are what pass 2 excludes -- see the
-            // round-19 notes on both queries for why a `created_at` predicate
-            // cannot do that job, and the round-23 note on why they are handed
-            // over in a transaction-scoped scratch table rather than an array
-            // bind through this process.
-            diesel::sql_query(resume_shifted_scratch_query())
-                .execute(conn)
-                .await?;
-            let released = diesel::sql_query(resume_shift_scheduled_at_query())
-                .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-                .execute(conn)
-                .await?;
+        // Wake sleeping listeners (issue #619 round-17 review).
+        //
+        // AC5 promises held tasks are claimable *immediately* on resume,
+        // but a worker with `notification_database_url` set parks in
+        // `wait_for_notification(poll_interval)` and only re-polls when a
+        // `NOTIFY` arrives on the queue channel. Every held row was
+        // enqueued *before* the pause, so its enqueue notification fired
+        // long ago and was consumed (or missed) while the queue was held —
+        // and nothing about a resume enqueues anything new. Without a
+        // notification here the queue therefore stays idle for up to a full
+        // `poll_interval` after the thaw. That is invisible at the 500 ms
+        // default, but `poll_interval` is configurable and raising it is
+        // precisely why an operator configures LISTEN/NOTIFY in the first
+        // place, so the deployments most likely to be tuned this way are
+        // the ones that would sit idle longest.
+        //
+        // Emitted INSIDE this transaction on purpose: Postgres queues
+        // `NOTIFY` and delivers it at COMMIT, so listeners are woken
+        // exactly when the hold actually lifts — never before (a worker
+        // woken early would still see the uncommitted pause row and skip
+        // the queue) and never lost to a rollback.
+        //
+        // Skipped when nothing was released: there is no held backlog to
+        // wake for, and a spurious wake would just burn a poll cycle.
+        if released.saturating_add(late) > 0 {
+            notify_resumed_queue(conn, &queue_owned).await?;
+        }
 
-            // Second pass, LAST so it sees the freshest snapshot: a task still
-            // held (our DELETE has not committed, so concurrent claimers still
-            // see the pause row) may be invisible to the primary shift above --
-            // whether it was created during the hold, or created *before* it by
-            // an enqueue that only committed just now. This pass covers BOTH
-            // sides of the partition and excludes exactly the rows the primary
-            // pass reported shifting, so the two are disjoint by construction
-            // (the counts sum exactly, no row is shifted twice) for any commit
-            // order rather than only for the ones a `created_at` test happens
-            // to separate.
-            let late = diesel::sql_query(resume_shift_late_arrivals_query())
-                .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-                .execute(conn)
-                .await?;
-
-            // Wake sleeping listeners (issue #619 round-17 review).
-            //
-            // AC5 promises held tasks are claimable *immediately* on resume,
-            // but a worker with `notification_database_url` set parks in
-            // `wait_for_notification(poll_interval)` and only re-polls when a
-            // `NOTIFY` arrives on the queue channel. Every held row was
-            // enqueued *before* the pause, so its enqueue notification fired
-            // long ago and was consumed (or missed) while the queue was held —
-            // and nothing about a resume enqueues anything new. Without a
-            // notification here the queue therefore stays idle for up to a full
-            // `poll_interval` after the thaw. That is invisible at the 500 ms
-            // default, but `poll_interval` is configurable and raising it is
-            // precisely why an operator configures LISTEN/NOTIFY in the first
-            // place, so the deployments most likely to be tuned this way are
-            // the ones that would sit idle longest.
-            //
-            // Emitted INSIDE this transaction on purpose: Postgres queues
-            // `NOTIFY` and delivers it at COMMIT, so listeners are woken
-            // exactly when the hold actually lifts — never before (a worker
-            // woken early would still see the uncommitted pause row and skip
-            // the queue) and never lost to a rollback.
-            //
-            // Skipped when nothing was released: there is no held backlog to
-            // wake for, and a spurious wake would just burn a poll cycle.
-            if released.saturating_add(late) > 0 {
-                notify_resumed_queue(conn, &queue_owned).await?;
-            }
-
-            Ok(ResumeOutcome {
-                queue_name: queue_owned,
-                newly_resumed: true,
-                released_task_count: i64::try_from(released.saturating_add(late))
-                    .unwrap_or(i64::MAX),
-                paused_duration_secs: (Utc::now() - row.paused_at).num_seconds().max(0),
-                released_reason: Some(row.reason),
-                released_paused_by: Some(row.paused_by),
-            })
-        }),
-    )
+        Ok(ResumeOutcome {
+            queue_name: queue_owned,
+            newly_resumed: true,
+            released_task_count: i64::try_from(released.saturating_add(late)).unwrap_or(i64::MAX),
+            paused_duration_secs: (Utc::now() - row.paused_at).num_seconds().max(0),
+            released_reason: Some(row.reason),
+            released_paused_by: Some(row.paused_by),
+        })
+    }))
     .await
 }
 
@@ -1972,7 +1990,7 @@ mod tests {
              to cover (round-19 P2); got:\n{late}"
         );
         assert!(
-            late.contains("harvest_resume_shifted") && late.contains("NOT EXISTS"),
+            late.contains("unnest($3::uuid[])") && late.contains("NOT EXISTS"),
             "pass 2 must exclude by the shifted-id set; got:\n{late}"
         );
         assert!(
@@ -1980,14 +1998,6 @@ mod tests {
             "`<> ALL` is a per-row linear scan; the NOT EXISTS spelling lets the \
              planner hash the id set; got:\n{late}"
         );
-        // Round-23 P2: the id set must stay server-side. An array bind would
-        // put one UUID per shifted task through this process, twice over.
-        assert!(
-            !late.contains("unnest(") && !late.contains("uuid[]"),
-            "pass 2 must read the shifted ids from the scratch table, not from \
-             an array bind proportional to the released backlog; got:\n{late}"
-        );
-
         // Same queue, same PENDING/due gate on both sides, or a row could leak
         // out of one pass without the other picking it up.
         for sql in [primary, late] {
@@ -2427,34 +2437,6 @@ mod tests {
             calls_two_arg_advisory_lock("pg_try_advisory_xact_lock(hashtext($1)::bigint)")
                 .is_none(),
             "the detector must not flag the single-argument form"
-        );
-    }
-
-    /// Round-23 P2: the resume's shifted-id set stays inside Postgres.
-    #[test]
-    fn resume_shift_hands_the_id_set_over_server_side() {
-        let scratch = resume_shifted_scratch_query();
-        let primary = resume_shift_scheduled_at_query();
-
-        assert!(
-            scratch.contains("CREATE TEMP TABLE") && scratch.contains("ON COMMIT DROP"),
-            "the scratch table must be transaction-scoped so it cannot leak onto \
-             a pooled connection; got:\n{scratch}"
-        );
-        assert!(
-            !scratch.contains("IF NOT EXISTS"),
-            "a second resume inside one transaction must fail loudly rather than \
-             credit against a stale id set; got:\n{scratch}"
-        );
-        assert!(
-            primary.contains("INSERT INTO harvest_resume_shifted"),
-            "pass 1 must capture its ids straight into the scratch table rather \
-             than returning them to the client; got:\n{primary}"
-        );
-        assert!(
-            primary.trim_start().starts_with("WITH shifted AS ("),
-            "the capture must be a data-modifying CTE, so the UPDATE and the \
-             capture share one statement and one snapshot; got:\n{primary}"
         );
     }
 

@@ -961,7 +961,20 @@ async fn enforce_activity_timeout(
 
     // Did we actually append a timeout (vs. a no-op because the task already
     // moved on)? Only a real enforcement should count toward the breaker.
-    let enforced = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+    //
+    // Pinned `READ COMMITTED`, not the session default (issue #619 round-24
+    // review). The queue advisory lock taken below is a `SELECT`, so it fixes
+    // this transaction's snapshot and *then* blocks waiting for an in-flight
+    // pause. Under `REPEATABLE READ` that snapshot is the transaction's only
+    // one, so after the pause commits and releases the lock, `is_queue_paused`
+    // still reads pre-pause state, returns false, and this enforcer fails the
+    // task *after the hold was acknowledged* — defeating the guarantee the
+    // whole queue-pause feature exists to provide. `queue::claim_task` pins the
+    // same level for the same reason; inheriting it would let a
+    // `default_transaction_isolation = repeatable read` on the database or the
+    // role disable the guarantee from outside this code.
+    let mut tx = conn.build_transaction().read_committed();
+    let enforced = Box::pin(tx.run::<bool, HarvestError, _>(async |conn| {
         let error = error.clone();
 
         // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
@@ -1453,7 +1466,12 @@ async fn enforce_workflow_timeout(
     reason: &TimeoutReason,
     metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
-    let enforced = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+    // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
+    // `enforce_activity_timeout` — see the note there (issue #619 round-24
+    // review). Without it, a `repeatable read` session default lets this
+    // enforcer time out the whole execution after a pause was acknowledged.
+    let mut tx = conn.build_transaction().read_committed();
+    let enforced = Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
         // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
         // the one in `enforce_activity_timeout` — see that function for the full
         // rationale on why an advisory lock (not a bare re-read) is required and

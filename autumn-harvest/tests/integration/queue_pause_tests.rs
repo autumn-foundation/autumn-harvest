@@ -646,19 +646,16 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
         .await
         .expect("begin, lock, release the hold");
 
-    // Pass 1 — the primary shift. Its ids land in the transaction-scoped
-    // scratch table pass 2 reads, exactly as `resume_queue` drives them
-    // (issue #619 round-23: they never enter this process).
-    diesel::sql_query(queue_pause::resume_shifted_scratch_query())
-        .execute(&mut resumer)
-        .await
-        .expect("create the shifted-id scratch table");
-    let primary = diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-        .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .execute(&mut resumer)
-        .await
-        .expect("primary shift");
+    // Pass 1 — the primary shift.
+    let primary_ids: Vec<ShiftedTaskIdRow> =
+        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .load(&mut resumer)
+            .await
+            .expect("primary shift");
+    let primary = primary_ids.len();
+    let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
 
     // ── THE WINDOW ──────────────────────────────────────────────────────────
     let late = enqueue_activity(&mut conn, &q, None).await;
@@ -684,6 +681,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -789,23 +787,13 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
         .await
         .expect("begin, lock, release the hold");
 
-    diesel::sql_query(queue_pause::resume_shifted_scratch_query())
-        .execute(&mut resumer)
-        .await
-        .expect("create the shifted-id scratch table");
-    diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-        .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .execute(&mut resumer)
-        .await
-        .expect("primary shift");
-    // Read the captured set back out of Postgres -- that is where pass 2 will
-    // read it from too (issue #619 round-23).
     let primary_ids: Vec<ShiftedTaskIdRow> =
-        diesel::sql_query("SELECT id FROM harvest_resume_shifted ORDER BY id")
+        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
             .load(&mut resumer)
             .await
-            .expect("read the shifted-id scratch table");
+            .expect("primary shift");
     let shifted_ids: Vec<Uuid> = primary_ids.into_iter().map(|r| r.id).collect();
     assert_eq!(
         shifted_ids,
@@ -823,6 +811,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
         .expect("late-arrivals shift");
@@ -2459,66 +2448,6 @@ async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
     }
 }
 
-/// Round-23 P2: the resume's shifted-id scratch table is transaction-scoped.
-///
-/// The ids pass 1 shifts are handed to pass 2 inside Postgres rather than
-/// through this process, which means `resume_queue` now creates a temp table on
-/// a **pooled** connection. `ON COMMIT DROP` is what keeps that from leaking:
-/// without it the table survives the resume's transaction and the next resume
-/// to land on the same connection fails with "already exists", so an operator's
-/// second thaw of the day would error out.
-///
-/// Two resumes driven back-to-back on one connection is the falsifiable form of
-/// that — it fails if the scratch table is not transaction-scoped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_resume_scratch_table_does_not_leak_across_transactions() {
-    let (url, _c) = setup_db_url().await;
-    let mut conn = connect(&url).await;
-
-    for round in 0..3 {
-        let q = unique_queue(&format!("scratch-{round}"));
-        let task = enqueue_activity(&mut conn, &q, None).await;
-        backdate_scheduled_at(&mut conn, task, 100).await;
-
-        queue_pause::pause_queue(&mut conn, &q, "outage", "alice", None)
-            .await
-            .expect("pause");
-        let outcome = queue_pause::resume_queue(&mut conn, &q, "alice")
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "resume {round} on the same pooled connection failed ({e}); the \
-                     shifted-id scratch table must be ON COMMIT DROP or it survives \
-                     the transaction and the next resume cannot create it"
-                )
-            });
-        assert!(outcome.newly_resumed, "round {round} released the hold");
-        assert_eq!(
-            outcome.released_task_count, 1,
-            "round {round} credited its held task"
-        );
-    }
-
-    // And it is genuinely gone afterwards, not merely re-creatable.
-    #[derive(diesel::QueryableByName)]
-    struct RegRow {
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        reg: Option<String>,
-    }
-    use diesel_async::RunQueryDsl;
-    let reg: Vec<RegRow> =
-        diesel::sql_query("SELECT to_regclass('harvest_resume_shifted')::text AS reg")
-            .load(&mut conn)
-            .await
-            .expect("probe for the scratch table");
-    assert!(
-        reg[0].reg.is_none(),
-        "the scratch table must not outlive the resume transaction on a pooled \
-         connection; found {:?}",
-        reg[0].reg
-    );
-}
-
 /// re-check both legitimately see an unpaused queue. Before the barrier the
 /// task is claimed; after it, the claim is given back untouched — same state,
 /// same attempt, immediately re-claimable once the pause transaction settles.
@@ -2772,29 +2701,14 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
             .expect("the hold exists")
             .paused_at;
 
-    // Open `resume_queue`'s transaction by hand. Both passes must run inside
-    // ONE transaction, exactly as `resume_queue` drives them: the scratch table
-    // is `ON COMMIT DROP`, so in autocommit it would be gone the instant the
-    // CREATE's implicit transaction ended. READ COMMITTED still gives pass 2 a
-    // fresh snapshot -- which is the whole point of this test.
-    driver.batch_execute("BEGIN").await.expect("begin resume");
-
     // Pass 1. The slow enqueue is still uncommitted, so this cannot see it.
-    diesel::sql_query(queue_pause::resume_shifted_scratch_query())
-        .execute(&mut driver)
-        .await
-        .expect("create the shifted-id scratch table");
-    diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
-        .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
-        .execute(&mut driver)
-        .await
-        .expect("primary shift");
     let shifted: Vec<ShiftedTaskIdRow> =
-        diesel::sql_query("SELECT id FROM harvest_resume_shifted ORDER BY id")
+        diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
+            .bind::<diesel::sql_types::Text, _>(&q)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
             .load(&mut driver)
             .await
-            .expect("read the shifted-id scratch table");
+            .expect("primary shift");
     let shifted_ids: Vec<Uuid> = shifted.into_iter().map(|r| r.id).collect();
     assert_eq!(
         shifted_ids,
@@ -2812,6 +2726,7 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
         .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut driver)
         .await
         .expect("second pass");
