@@ -424,9 +424,9 @@ pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
     register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
-pub use shard::ShardRouter;
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
+pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter};
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 #[cfg(feature = "db")]

@@ -259,6 +259,36 @@ convenience) and the offline `harvest token bootstrap`.
 
 ---
 
+## Data residency and shard placement (issue #697)
+
+`POST /workflows/{name}/start` accepts an optional `shard_id` or `residency_key`
+that pins the new workflow (and, by shard inheritance, its whole descendant
+tree) to a specific database. See [`sharding.md`](./sharding.md#explicit-shard-placement-and-data-residency-issue-697)
+for the mechanism. Security-relevant properties:
+
+- **`shard_id` is not a capability.** Any caller authorised to start a workflow
+  can pin it to any *placeable* shard. Placement selects a database within the
+  deployment; it does not grant access to data already there, and there is no
+  per-shard authorisation tier. If a caller must be confined to one region,
+  enforce that in your own auth layer before delegating to the start route —
+  Harvest validates that a requested shard exists and accepts writes, not that
+  *this* caller is entitled to it.
+- **Rejections do not enumerate the deployment.** A refused placement names only
+  what the caller asked for (`shard N is not a placeable shard for this
+  deployment`, `residency key 'K' is not declared for this deployment`). The
+  shard set, drain state, and declared key list are never returned to the
+  caller — they go to the server log via `tracing::warn!`. This keeps the start
+  route from being a topology-discovery oracle for a lower-trust caller.
+- **Residency keys are opaque labels, not secrets.** They are operator-declared
+  at boot and appear in caller requests, CLI invocations, and audit rows. Do not
+  encode tenant identifiers or anything sensitive in them; use region /
+  jurisdiction names.
+- **A pin failing closed is a `503`, not a silent redirect.** A shard the router
+  accepts but has no pool for is refused rather than written to the default
+  database, so a residency obligation cannot be violated by a configuration gap.
+
+---
+
 ## CLI token semantics
 
 The Harvest CLI supports `--token <value>` and the `HARVEST_TOKEN` environment

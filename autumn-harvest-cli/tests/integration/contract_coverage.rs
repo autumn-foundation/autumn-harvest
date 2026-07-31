@@ -704,7 +704,16 @@ fn workflow_start_body_fields_are_documented() {
         "reject_duplicate",
         "--conflict-policy",
         "use_existing",
+        "--residency-key",
+        "eu",
     ]);
+}
+
+/// issue #697: the `shard_id` placement field must be documented too. It is
+/// mutually exclusive with `--residency-key`, so it needs its own invocation.
+#[test]
+fn workflow_start_shard_id_body_field_is_documented() {
+    assert_body_fields_documented(&["workflow", "start", "my_workflow", "--shard-id", "1"]);
 }
 
 #[test]

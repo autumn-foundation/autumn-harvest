@@ -710,6 +710,65 @@ pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> E
     exec_id
 }
 
+/// Insert a RUNNING execution pinned to `shard` -- both in the encoded
+/// `ExecutionId` and in the row's `shard_id` column, exactly as the shard-pinned
+/// start path (issue #697) writes it. Used to prove residency is transitive
+/// across the workflow tree.
+pub(crate) async fn insert_workflow_execution_on_shard(
+    conn: &mut AsyncPgConnection,
+    shard: autumn_harvest::types::ShardId,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(shard);
+    // Unique per call so repeated runs against the same (non-throwaway)
+    // database never collide on the partial `UNIQUE(workflow_name, workflow_id)`
+    // active index.
+    let workflow_id = format!("e2e-wf-pinned-{}", Uuid::new_v4().simple());
+    let row = NewWorkflowExecution {
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "e2e_test_workflow",
+        workflow_id: &workflow_id,
+        run_id: Uuid::new_v4(),
+        shard_id: shard.as_i32(),
+        input: serde_json::json!({"test": true}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("failed to insert shard-pinned workflow execution");
+
+    exec_id
+}
+
 /// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
 /// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
 /// inserts more than one live execution: they would otherwise collide on the
@@ -1391,6 +1450,88 @@ fn parent_workflow_with_child<'a>(
             .await
             .map_err(|e| e.to_string())
     })
+}
+
+/// Issue #697 (AC4 + success metric): spawns a child and THEN continues-as-new,
+/// so a single run produces both descendant kinds and one test can assert the
+/// metric's "remain on across children/CAN" clause end to end. Branches on
+/// `phase`: `"init"` spawns the child then forks; the continuation returns.
+fn child_then_continue_as_new_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let phase = input
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if phase == "init" {
+            let child_output = ctx
+                .spawn_child_workflow_raw(
+                    "child_echo_workflow",
+                    serde_json::json!({"value": "pinned"}),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = ctx
+                .continue_as_new(serde_json::json!({"phase": "next", "child": child_output}))
+                .await;
+            unreachable!("continue_as_new must not resolve");
+        }
+        Ok(input)
+    })
+}
+
+fn child_then_continue_as_new_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                mcp: false,
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: child_then_continue_as_new_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                mcp: false,
+                name: "child_echo_workflow",
+                module: "integration_e2e",
+                handler: child_echo_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
 }
 
 fn child_echo_workflow<'a>(
@@ -3276,6 +3417,169 @@ async fn worker_completes_workflow_with_timer_round_trip() {
     let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
     assert_eq!(timers.len(), 1, "a durable timer row should be created");
     assert!(timers[0].fired, "timer should be marked fired once resumed");
+}
+
+/// Issue #697 AC4 (DB, real worker loop): a child spawned by a shard-pinned
+/// parent stays on the parent's shard -- **both** in the encoded `ExecutionId`
+/// (what every id-based lookup routes on) and in the row's `shard_id` column.
+/// The context-level unit tests prove the id is minted correctly; this proves
+/// the whole worker persistence path preserves it end to end, so residency is
+/// transitive across the workflow tree rather than implicitly assumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_child_of_a_shard_pinned_parent_inherits_the_parents_shard() {
+    use autumn_harvest::types::ShardId;
+
+    let pinned = ShardId::new(5);
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution_on_shard(&mut conn, pinned).await;
+    assert_eq!(
+        parent_exec_id.shard(),
+        pinned,
+        "precondition: the parent must actually be pinned"
+    );
+    enqueue_started_workflow_task(
+        &mut conn,
+        parent_exec_id,
+        serde_json::json!({"value": "from-pinned-parent"}),
+    )
+    .await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-child-shard-inheritance",
+        2,
+        1,
+        child_round_trip_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(child_execs.len(), 1, "exactly one child should be created");
+    let child = &child_execs[0];
+
+    // The encoded shard is the load-bearing half: an `ExecutionId::new()` child
+    // would carry the UNENCODED sentinel and every id-based lookup would route
+    // it to the deployment's *default* shard, breaking residency even though
+    // the row itself landed on the parent's shard.
+    let child_exec_id: ExecutionId = child
+        .id
+        .to_string()
+        .parse()
+        .expect("child execution id should parse");
+    assert_eq!(
+        child_exec_id.shard(),
+        pinned,
+        "the child's ExecutionId must encode the parent's shard (issue #697 AC4)"
+    );
+    assert_eq!(
+        child.shard_id,
+        pinned.as_i32(),
+        "the child's row must live on the parent's shard (issue #697 AC4)"
+    );
+}
+
+/// Issue #697 AC4 + the issue's **success metric** (DB, real worker loop):
+/// a shard-pinned run, the child it spawns, AND the continue-as-new successor
+/// it forks all stay on the pinned shard -- the metric's literal
+/// "land on (and remain on across children/CAN) the intended shard" clause,
+/// measured in one run rather than assumed from reading the mint sites.
+///
+/// Deliberately pinned to a **non-default** shard (5) so a regression that
+/// hardcodes `ShardId::new(0)` / `default_shard` is caught, not just one that
+/// mints the `UNENCODED` sentinel. Each assertion checks BOTH halves: the
+/// encoded `ExecutionId` (what every later id-based lookup routes on) and the
+/// row's `shard_id` column (where the data physically lives).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_pinned_child_and_continue_as_new_successor_stay_on_the_pinned_shard() {
+    use autumn_harvest::types::ShardId;
+
+    let pinned = ShardId::new(5);
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution_on_shard(&mut conn, pinned).await;
+    assert_eq!(
+        parent_exec_id.shard(),
+        pinned,
+        "precondition: the parent must actually be pinned"
+    );
+    enqueue_started_workflow_task(
+        &mut conn,
+        parent_exec_id,
+        serde_json::json!({"phase": "init"}),
+    )
+    .await;
+
+    let worker = build_runtime_worker(
+        "worker-e2e-pinned-descendants",
+        2,
+        1,
+        child_then_continue_as_new_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // The pinned run seals CONTINUED_AS_NEW once it has spawned its child and
+    // forked its successor.
+    let _sealed = wait_for_execution_state(&database_url, parent_exec_id, "CONTINUED_AS_NEW").await;
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    let successor_exec_id = parent_history
+        .events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("pinned history should contain a WorkflowContinuedAsNew event");
+    let successor = wait_for_execution_state(&database_url, successor_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // --- descendant 1: the spawned child ---
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(child_execs.len(), 1, "exactly one child should be created");
+    let child_exec_id: ExecutionId = child_execs[0]
+        .id
+        .to_string()
+        .parse()
+        .expect("child execution id should parse");
+    assert_eq!(
+        child_exec_id.shard(),
+        pinned,
+        "the child's ExecutionId must encode the pinned shard (issue #697 AC4)"
+    );
+    assert_eq!(
+        child_execs[0].shard_id,
+        pinned.as_i32(),
+        "the child's row must live on the pinned shard (issue #697 AC4)"
+    );
+
+    // --- descendant 2: the continue-as-new successor ---
+    assert_eq!(
+        successor_exec_id.shard(),
+        pinned,
+        "the continue-as-new successor's ExecutionId must encode the pinned \
+         shard -- an `ExecutionId::new()` or default-shard successor would \
+         silently move a residency-bound chain off its shard (issue #697 AC4)"
+    );
+    assert_eq!(
+        successor.shard_id,
+        pinned.as_i32(),
+        "the continue-as-new successor's row must live on the pinned shard \
+         (issue #697 AC4)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

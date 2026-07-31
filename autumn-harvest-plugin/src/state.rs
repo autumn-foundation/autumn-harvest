@@ -99,9 +99,27 @@ impl HarvestDbPool {
     }
 
     /// Return the pool for an explicit shard.
+    ///
+    /// Falls back to the default shard's pool when `shard` has no pool of its
+    /// own. Use [`HarvestDbPool::exact_pool_for`] when that fallback would be
+    /// incorrect.
     #[must_use]
     pub fn pool_for(&self, shard: ShardId) -> &DbPool {
         self.sharded.pool_for(shard)
+    }
+
+    /// Return the pool for an explicit shard, with **no** default fallback.
+    ///
+    /// Required wherever silently using the default shard's database would be
+    /// wrong rather than merely suboptimal — notably an explicitly pinned
+    /// workflow start (issue #697), where falling back would write
+    /// residency-bound data to the wrong database while still reporting the
+    /// pinned shard to the caller. The router's shard set and the pool map are
+    /// configured independently, so a shard known to the router but not yet
+    /// pooled (mid a shard-add rollout) is a real state.
+    #[must_use]
+    pub fn exact_pool_for(&self, shard: ShardId) -> Option<&DbPool> {
+        self.sharded.exact_pool_for(shard)
     }
 
     /// Iterate `(shard, pool)` pairs.

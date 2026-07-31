@@ -24,13 +24,176 @@
 //! [`ShardId::UNENCODED`]; the pool falls back to a configured default shard
 //! for those cases.
 
-#[cfg(feature = "db")]
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 
 use crate::types::{ExecutionId, ShardId};
 #[cfg(feature = "db")]
 use crate::worker::DbPool;
+
+/// Where a brand-new workflow should be placed (issue #697).
+///
+/// The default, [`ShardPlacement::Auto`], is today's rendezvous routing and is
+/// byte-for-byte unchanged. The other two variants are *explicit placement
+/// policy* for deployments with a data-residency or tenant-isolation
+/// obligation, where "whichever shard the hash picked" is not an acceptable
+/// answer.
+///
+/// Placement is decided **before** the execution id is minted, so the chosen
+/// shard is baked into the `ExecutionId` bytes and every later lookup — plus
+/// every child workflow, continue-as-new successor, retry, and reset fork,
+/// which all inherit `exec_id.shard()` — stays on the pinned shard. No event
+/// is written and no migration is involved.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::shard::{ShardPlacement, ShardRouter};
+/// use autumn_harvest::types::ShardId;
+///
+/// let router = ShardRouter::new(
+///     vec![ShardId::new(0), ShardId::new(1)],
+///     vec![ShardId::new(0), ShardId::new(1)],
+///     ShardId::new(0),
+/// )
+/// .with_residency_map([("eu".to_string(), ShardId::new(1))]);
+///
+/// // Unpinned: today's hash.
+/// let auto = router.resolve_placement(&ShardPlacement::Auto, "wf", "order-42")?;
+/// assert_eq!(auto, router.pick_for_new_workflow("wf", "order-42"));
+///
+/// // Pinned by residency key: always the EU database.
+/// let eu = router.resolve_placement(&ShardPlacement::residency_key("eu"), "wf", "order-42")?;
+/// assert_eq!(eu, ShardId::new(1));
+/// # Ok::<(), autumn_harvest::shard::ShardPlacementError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ShardPlacement {
+    /// Route by rendezvous hash over `(workflow_name, workflow_id)`.
+    ///
+    /// This is the pre-#697 behaviour and the default for every caller that
+    /// does not opt in.
+    #[default]
+    Auto,
+    /// Pin to a concrete shard.
+    ///
+    /// Rejected unless the shard is in the router's `readable_shards` *and*
+    /// `writable_shards` sets.
+    Shard(ShardId),
+    /// Pin via a stable, operator-declared residency key (e.g. `"eu"`).
+    ///
+    /// Resolved through [`ShardRouter::with_residency_map`]. An unmapped key is
+    /// an error, never a hash fallback.
+    ResidencyKey(String),
+}
+
+impl ShardPlacement {
+    /// Convenience constructor for [`ShardPlacement::ResidencyKey`].
+    #[must_use]
+    pub fn residency_key(key: impl Into<String>) -> Self {
+        Self::ResidencyKey(key.into())
+    }
+
+    /// Is this the default (unpinned) placement?
+    #[must_use]
+    pub const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Why an explicit [`ShardPlacement`] could not be honoured.
+///
+/// Every variant is a caller error that must surface as a `400`-class failure.
+/// Placement never falls back to the default shard: a silent fallback is
+/// exactly the failure mode explicit pinning exists to remove.
+///
+/// # Disclosure
+///
+/// [`Display`](std::fmt::Display) renders the **operator** view and enumerates
+/// the valid shard set / declared residency keys, which is what you want in a
+/// log line or a Rust-API caller's error. Do **not** return it verbatim to an
+/// untrusted HTTP caller — residency keys are frequently tenant- or
+/// region-identifying, so echoing the declared set lets one probe enumerate
+/// your shard topology, live drain state, and other tenants' keys. Use
+/// [`ShardPlacementError::client_message`] on any caller-facing boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ShardPlacementError {
+    /// The requested shard is not in the deployment's `readable_shards` set.
+    #[error(
+        "shard {requested} is not a configured shard; readable shards are {}",
+        format_shards(readable)
+    )]
+    #[non_exhaustive]
+    UnknownShard {
+        /// The shard the caller asked for.
+        requested: ShardId,
+        /// The shards this deployment can read from.
+        readable: Vec<ShardId>,
+    },
+    /// The requested shard exists but has been drained out of
+    /// `writable_shards`, so it is deliberately not accepting new workflows.
+    #[error(
+        "shard {requested} is readable but not writable (drained); writable shards are {}",
+        format_shards(writable)
+    )]
+    #[non_exhaustive]
+    ShardNotWritable {
+        /// The shard the caller asked for.
+        requested: ShardId,
+        /// The shards that currently accept new workflows.
+        writable: Vec<ShardId>,
+    },
+    /// The residency key has no entry in the router's residency map.
+    #[error(
+        "residency key '{key}' is not mapped to a shard; declared keys are [{}]",
+        known.join(", ")
+    )]
+    #[non_exhaustive]
+    UnknownResidencyKey {
+        /// The key the caller asked for.
+        key: String,
+        /// The residency keys this deployment declares.
+        known: Vec<String>,
+    },
+    /// The residency key was empty or whitespace-only.
+    #[error("residency key must not be blank")]
+    EmptyResidencyKey,
+}
+
+impl ShardPlacementError {
+    /// The **caller-facing** rendering, safe to return over HTTP.
+    ///
+    /// Names the value the caller got wrong and what to do about it, but never
+    /// enumerates the deployment's shard set, live drain state, or the declared
+    /// residency keys — see the type-level "Disclosure" note. A caller does not
+    /// need the valid set to correct their own request; an operator reads the
+    /// full [`Display`](std::fmt::Display) form from the log and the audit row.
+    #[must_use]
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::UnknownShard { requested, .. } => {
+                format!("shard {requested} is not a placeable shard for this deployment")
+            }
+            Self::ShardNotWritable { requested, .. } => {
+                format!(
+                    "shard {requested} is not currently accepting new workflows; \
+                     it is being drained"
+                )
+            }
+            Self::UnknownResidencyKey { key, .. } => {
+                format!("residency key '{key}' is not declared for this deployment")
+            }
+            Self::EmptyResidencyKey => "residency key must not be blank".to_string(),
+        }
+    }
+}
+
+fn format_shards(shards: &[ShardId]) -> String {
+    let rendered: Vec<String> = shards.iter().map(ToString::to_string).collect();
+    format!("[{}]", rendered.join(", "))
+}
 
 /// Decides which shard a newly started workflow should live on.
 ///
@@ -52,6 +215,10 @@ pub struct ShardRouter {
     readable_shards: Vec<ShardId>,
     writable_shards: Vec<ShardId>,
     default_shard: ShardId,
+    /// Operator-declared residency key → shard mapping (issue #697).
+    ///
+    /// Empty by default. Populated via [`ShardRouter::with_residency_map`].
+    residency_map: BTreeMap<String, ShardId>,
 }
 
 impl ShardRouter {
@@ -84,7 +251,203 @@ impl ShardRouter {
             readable_shards,
             writable_shards,
             default_shard,
+            residency_map: BTreeMap::new(),
         }
+    }
+
+    /// Attach an operator-declared residency key → shard mapping (issue #697).
+    ///
+    /// This is the *placement policy* for data-residency and tenant-isolation
+    /// deployments: the operator — who alone knows which physical database sits
+    /// in which jurisdiction — declares `"eu" -> ShardId(1)`, and application
+    /// code then starts workflows with the semantic key rather than a shard
+    /// number. Renumbering shards is a config change, not a redeploy.
+    ///
+    /// The mapping is deliberately **declared, not derived**. A hash (rendezvous
+    /// or otherwise) cannot know which database is physically in the EU, and
+    /// moves roughly `1/N` of its keys whenever a shard is added — so a hashed
+    /// residency key could silently migrate a tenant's placement mid-contract.
+    /// A declared map is stable by construction across process restarts and
+    /// across any widening of the readable/writable sets.
+    ///
+    /// Keys are trimmed on insert, matching how a request's `residency_key` is
+    /// trimmed before lookup — so a declared `" eu "` is reachable as `"eu"`
+    /// rather than becoming a permanently dead entry.
+    ///
+    /// Calling this twice replaces the previous map.
+    ///
+    /// A declared target that is readable but currently drained out of
+    /// `writable_shards` is **not** a panic — draining a residency shard is a
+    /// legitimate transient state and crash-looping the fleet over it would be
+    /// worse than the outage it signals. It logs a warning instead, because
+    /// every start under that key will be refused until the shard is restored
+    /// or the key remapped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key is blank or maps to a shard outside `readable_shards`.
+    /// This mirrors [`ShardRouter::new`]'s existing panic contract so a
+    /// misconfigured residency map fails at boot rather than at the first
+    /// residency-pinned start.
+    #[must_use]
+    pub fn with_residency_map(mut self, map: impl IntoIterator<Item = (String, ShardId)>) -> Self {
+        let map: BTreeMap<String, ShardId> = map
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_string(), v))
+            .collect();
+        for (key, shard) in &map {
+            assert!(
+                !key.is_empty(),
+                "residency key must not be blank (mapped to shard {shard})"
+            );
+            assert!(
+                self.readable_shards.contains(shard),
+                "residency key '{key}' maps to shard {shard}, which is not in the readable set"
+            );
+            // Readable but drained: the router boots, yet EVERY start under this
+            // key will be refused with `ShardNotWritable` until the shard is
+            // restored to `writable_shards` or the key is remapped. That is the
+            // likelier operational mistake (draining a shard is routine;
+            // removing one from `readable_shards` is rare), so surface it at
+            // boot rather than leaving it to be discovered from production 400s.
+            if !self.writable_shards.contains(shard) {
+                tracing::warn!(
+                    residency_key = %key,
+                    shard = %shard,
+                    "residency key targets a shard that is readable but not writable (drained); \
+                     new workflows pinned to this key will be rejected until the shard is \
+                     restored to the writable set or the key is remapped"
+                );
+            }
+        }
+        self.residency_map = map;
+        self
+    }
+
+    /// The declared residency key → shard mapping.
+    ///
+    /// Empty unless [`ShardRouter::with_residency_map`] was used.
+    #[must_use]
+    pub const fn residency_map(&self) -> &BTreeMap<String, ShardId> {
+        &self.residency_map
+    }
+
+    /// Resolve a [`ShardPlacement`] to a concrete shard for a *new* workflow.
+    ///
+    /// [`ShardPlacement::Auto`] delegates to [`Self::pick_for_new_workflow`] and
+    /// is byte-for-byte identical to the pre-#697 code path. The explicit
+    /// variants validate first and never fall back to the default shard.
+    ///
+    /// Because the resolved shard is encoded into the `ExecutionId` the caller
+    /// then mints, residency is transitive: children, continue-as-new
+    /// successors, workflow-level retries, and reset forks all inherit
+    /// `exec_id.shard()` and therefore stay on the pinned database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardPlacementError`] when an explicit shard is unknown or
+    /// drained, or a residency key is blank or undeclared.
+    pub fn resolve_placement(
+        &self,
+        placement: &ShardPlacement,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Result<ShardId, ShardPlacementError> {
+        self.resolve_placement_inner(placement, workflow_name, workflow_id, true)
+    }
+
+    /// Resolve a [`ShardPlacement`] to the shard an execution for it *would*
+    /// live on, **without** enforcing writability.
+    ///
+    /// Use this when the resolved shard is only being used to *look something
+    /// up* — an idempotency-key dedup probe, an operator read — rather than to
+    /// place new work. Writability is a fresh-start-only concern: refusing to
+    /// even *read* from a shard the operator happens to be draining would, for
+    /// example, turn an at-least-once retry of an already-committed keyed start
+    /// into a spurious `400` instead of the `200` no-op it must return.
+    ///
+    /// Every other validation still applies — an unknown shard or an undeclared
+    /// residency key is still an error, never a silent fall back to the default
+    /// shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardPlacementError`] when an explicit shard is unknown, or a
+    /// residency key is blank or undeclared. Never returns
+    /// [`ShardPlacementError::ShardNotWritable`].
+    pub fn resolve_placement_for_lookup(
+        &self,
+        placement: &ShardPlacement,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Result<ShardId, ShardPlacementError> {
+        self.resolve_placement_inner(placement, workflow_name, workflow_id, false)
+    }
+
+    fn resolve_placement_inner(
+        &self,
+        placement: &ShardPlacement,
+        workflow_name: &str,
+        workflow_id: &str,
+        require_writable: bool,
+    ) -> Result<ShardId, ShardPlacementError> {
+        match placement {
+            ShardPlacement::Auto => Ok(self.pick_for_new_workflow(workflow_name, workflow_id)),
+            ShardPlacement::Shard(shard) => self.validate_pinned_shard(*shard, require_writable),
+            ShardPlacement::ResidencyKey(key) => {
+                let trimmed = key.trim();
+                if trimmed.is_empty() {
+                    return Err(ShardPlacementError::EmptyResidencyKey);
+                }
+                let shard = self.residency_map.get(trimmed).copied().ok_or_else(|| {
+                    ShardPlacementError::UnknownResidencyKey {
+                        key: trimmed.to_string(),
+                        known: self.residency_map.keys().cloned().collect(),
+                    }
+                })?;
+                // Defence in depth: `with_residency_map` already rejects targets
+                // outside the readable set, but a router mutated by other means
+                // (or a shard drained after the map was declared) must still
+                // fail loud rather than place residency-bound work incorrectly.
+                self.validate_pinned_shard(shard, require_writable)
+            }
+        }
+    }
+
+    /// Shared validation for an explicitly pinned shard.
+    ///
+    /// `require_writable` distinguishes placing new work (`true`) from resolving
+    /// where existing work lives (`false`) — see
+    /// [`Self::resolve_placement_for_lookup`].
+    fn validate_pinned_shard(
+        &self,
+        shard: ShardId,
+        require_writable: bool,
+    ) -> Result<ShardId, ShardPlacementError> {
+        // The sentinel is a routing marker ("resolve to the deployment default"),
+        // never a shard number. Reject it explicitly rather than relying on it
+        // being absent from `readable_shards`: `ShardRouter::new` does not forbid
+        // configuring it, and accepting it here would silently place pinned work
+        // on the default shard — the exact failure this feature removes.
+        if shard.is_unencoded() {
+            return Err(ShardPlacementError::UnknownShard {
+                requested: shard,
+                readable: self.readable_shards.clone(),
+            });
+        }
+        if !self.readable_shards.contains(&shard) {
+            return Err(ShardPlacementError::UnknownShard {
+                requested: shard,
+                readable: self.readable_shards.clone(),
+            });
+        }
+        if require_writable && !self.writable_shards.contains(&shard) {
+            return Err(ShardPlacementError::ShardNotWritable {
+                requested: shard,
+                writable: self.writable_shards.clone(),
+            });
+        }
+        Ok(shard)
     }
 
     /// Build a router for a single-shard deployment.
@@ -107,6 +470,15 @@ impl ShardRouter {
     #[must_use]
     pub fn writable_shards(&self) -> &[ShardId] {
         &self.writable_shards
+    }
+
+    /// Does this router currently accept *new* workflows on `shard`?
+    ///
+    /// A shard that is readable but not writable is being drained: existing
+    /// work there is still served, but new work must not be placed on it.
+    #[must_use]
+    pub fn is_writable(&self, shard: ShardId) -> bool {
+        self.writable_shards.contains(&shard)
     }
 
     /// The shard returned when an `ExecutionId` carries the unencoded sentinel.
@@ -552,5 +924,278 @@ mod tests {
                 ShardId::new(1)
             );
         }
+    }
+
+    // ── issue #697: explicit shard pinning for data residency ────────────────
+
+    /// Build a three-shard router with an `eu`/`us` residency map.
+    fn residency_router() -> ShardRouter {
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            ShardId::new(0),
+        )
+        .with_residency_map([
+            ("eu".to_string(), ShardId::new(1)),
+            ("us".to_string(), ShardId::new(2)),
+        ])
+    }
+
+    #[test]
+    fn auto_placement_is_byte_for_byte_todays_rendezvous_routing() {
+        // AC1: when no placement is supplied, behaviour must be identical to
+        // `pick_for_new_workflow` for every input — zero regression.
+        let router = residency_router();
+        for i in 0..200 {
+            let wid = format!("user-{i}");
+            assert_eq!(
+                router
+                    .resolve_placement(&ShardPlacement::Auto, "onboarding", &wid)
+                    .expect("Auto never fails"),
+                router.pick_for_new_workflow("onboarding", &wid),
+            );
+        }
+    }
+
+    #[test]
+    fn default_placement_is_auto() {
+        assert_eq!(ShardPlacement::default(), ShardPlacement::Auto);
+    }
+
+    #[test]
+    fn explicit_shard_placement_wins_over_the_hash() {
+        let router = residency_router();
+        // Find a workflow id whose hash does NOT land on shard 2 so the pin is
+        // observably doing the work.
+        let wid = (0..500)
+            .map(|i| format!("id-{i}"))
+            .find(|wid| router.pick_for_new_workflow("wf", wid) != ShardId::new(2))
+            .expect("some id must hash off shard 2");
+        assert_eq!(
+            router
+                .resolve_placement(&ShardPlacement::Shard(ShardId::new(2)), "wf", &wid)
+                .expect("shard 2 is readable and writable"),
+            ShardId::new(2)
+        );
+    }
+
+    #[test]
+    fn explicit_shard_outside_readable_set_is_rejected_not_defaulted() {
+        // AC2: typed, actionable error — never a panic and never a silent
+        // fallback to the default shard.
+        let router = residency_router();
+        let err = router
+            .resolve_placement(&ShardPlacement::Shard(ShardId::new(9)), "wf", "id-1")
+            .expect_err("shard 9 is not configured");
+        match err {
+            ShardPlacementError::UnknownShard {
+                requested,
+                readable,
+            } => {
+                assert_eq!(requested, ShardId::new(9));
+                assert_eq!(
+                    readable,
+                    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)]
+                );
+            }
+            other => panic!("expected UnknownShard, got {other:?}"),
+        }
+        // The message must name the offending shard and the valid set.
+        let msg = router
+            .resolve_placement(&ShardPlacement::Shard(ShardId::new(9)), "wf", "id-1")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains('9'), "message must name the shard: {msg}");
+        assert!(
+            msg.contains("readable"),
+            "message must name the valid set: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_shard_that_is_readable_but_drained_is_rejected() {
+        // A shard drained out of `writable_shards` is deliberately not
+        // accepting new work; pinning new work onto it must fail loud rather
+        // than contradict the operator's drain.
+        let router = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0)],
+            ShardId::new(0),
+        );
+        let err = router
+            .resolve_placement(&ShardPlacement::Shard(ShardId::new(1)), "wf", "id-1")
+            .expect_err("shard 1 is readable but drained");
+        assert!(
+            matches!(err, ShardPlacementError::ShardNotWritable { requested, .. } if requested == ShardId::new(1)),
+            "expected ShardNotWritable, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unencoded_sentinel_is_never_a_valid_pin() {
+        // `ShardId::UNENCODED` is a routing sentinel, not a shard number.
+        let router = residency_router();
+        let err = router
+            .resolve_placement(&ShardPlacement::Shard(ShardId::UNENCODED), "wf", "id-1")
+            .expect_err("the sentinel is not a placeable shard");
+        assert!(
+            matches!(err, ShardPlacementError::UnknownShard { .. }),
+            "expected UnknownShard, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn residency_key_resolves_through_the_declared_map() {
+        let router = residency_router();
+        assert_eq!(
+            router
+                .resolve_placement(&ShardPlacement::residency_key("eu"), "wf", "id-1")
+                .expect("eu is mapped"),
+            ShardId::new(1)
+        );
+        assert_eq!(
+            router
+                .resolve_placement(&ShardPlacement::residency_key("us"), "wf", "id-1")
+                .expect("us is mapped"),
+            ShardId::new(2)
+        );
+    }
+
+    #[test]
+    fn unmapped_residency_key_is_rejected_never_hashed() {
+        // A silent hash fallback is exactly the "hope the hash cooperates"
+        // failure mode this feature exists to remove.
+        let router = residency_router();
+        let err = router
+            .resolve_placement(&ShardPlacement::residency_key("apac"), "wf", "id-1")
+            .expect_err("apac is not mapped");
+        match err {
+            ShardPlacementError::UnknownResidencyKey { ref key, ref known } => {
+                assert_eq!(key, "apac");
+                assert_eq!(known, &vec!["eu".to_string(), "us".to_string()]);
+            }
+            other => panic!("expected UnknownResidencyKey, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("apac"),
+            "message must name the key: {err}"
+        );
+    }
+
+    #[test]
+    fn residency_key_on_a_router_with_no_map_is_rejected() {
+        let router = router_with(&[0, 1, 2]);
+        let err = router
+            .resolve_placement(&ShardPlacement::residency_key("eu"), "wf", "id-1")
+            .expect_err("no residency map is configured");
+        assert!(
+            matches!(err, ShardPlacementError::UnknownResidencyKey { .. }),
+            "expected UnknownResidencyKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn blank_residency_key_is_rejected() {
+        let router = residency_router();
+        for blank in ["", "   ", "\t"] {
+            let err = router
+                .resolve_placement(&ShardPlacement::residency_key(blank), "wf", "id-1")
+                .expect_err("blank keys are not resolvable");
+            assert!(
+                matches!(err, ShardPlacementError::EmptyResidencyKey),
+                "expected EmptyResidencyKey for {blank:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn residency_key_resolution_is_stable_across_a_widening_of_the_shard_set() {
+        // AC3 (the money test): a key that resolves to shard N must KEEP
+        // resolving to N when shards are added. Rendezvous hashing cannot
+        // promise this — a declared map can, by construction.
+        let map = [
+            ("eu".to_string(), ShardId::new(1)),
+            ("us".to_string(), ShardId::new(2)),
+        ];
+        let before = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+            ShardId::new(0),
+        )
+        .with_residency_map(map.clone());
+
+        // Widen both the readable and writable sets by three new shards.
+        let after = ShardRouter::new(
+            (0..6).map(ShardId::new).collect(),
+            (0..6).map(ShardId::new).collect(),
+            ShardId::new(0),
+        )
+        .with_residency_map(map);
+
+        for key in ["eu", "us"] {
+            let placement = ShardPlacement::residency_key(key);
+            assert_eq!(
+                before.resolve_placement(&placement, "wf", "id-1").unwrap(),
+                after.resolve_placement(&placement, "wf", "id-1").unwrap(),
+                "residency key {key} moved when shards were added"
+            );
+        }
+
+        // Contrast: the rendezvous hash genuinely does move keys on widening,
+        // which is precisely why residency cannot be built on it.
+        let moved = (0..200)
+            .map(|i| format!("id-{i}"))
+            .filter(|wid| {
+                before.pick_for_new_workflow("wf", wid) != after.pick_for_new_workflow("wf", wid)
+            })
+            .count();
+        assert!(
+            moved > 0,
+            "the hash is expected to move some keys on widening; if it does not, \
+             this test no longer proves the map buys anything"
+        );
+    }
+
+    #[test]
+    fn residency_conformance_n_workflows_across_k_keys() {
+        // Success metric: 100% of starts under a residency key land on that
+        // key's shard, independent of workflow name/id.
+        let router = residency_router();
+        let keys = [("eu", ShardId::new(1)), ("us", ShardId::new(2))];
+        for (key, expected) in keys {
+            for i in 0..100 {
+                let resolved = router
+                    .resolve_placement(
+                        &ShardPlacement::residency_key(key),
+                        &format!("wf-{}", i % 7),
+                        &format!("id-{i}"),
+                    )
+                    .expect("mapped key resolves");
+                assert_eq!(resolved, expected, "key {key} escaped its shard on run {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn residency_map_accessor_exposes_the_declared_mapping() {
+        let router = residency_router();
+        let map = router.residency_map();
+        assert_eq!(map.get("eu"), Some(&ShardId::new(1)));
+        assert_eq!(map.get("us"), Some(&ShardId::new(2)));
+        assert_eq!(map.len(), 2);
+        assert!(router_with(&[0]).residency_map().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "residency key")]
+    fn residency_map_targeting_an_unconfigured_shard_panics_at_construction() {
+        // Misconfiguration must fail at boot, not at the first EU start.
+        let _ = router_with(&[0, 1]).with_residency_map([("eu".to_string(), ShardId::new(7))]);
+    }
+
+    #[test]
+    #[should_panic(expected = "residency key")]
+    fn residency_map_with_a_blank_key_panics_at_construction() {
+        let _ = router_with(&[0, 1]).with_residency_map([(String::new(), ShardId::new(1))]);
     }
 }
