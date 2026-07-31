@@ -4769,6 +4769,32 @@ fn format_lineage_footer(value: &Value) -> String {
         out.push('\n');
     }
 
+    // The third incompleteness signal (issue #752). Unlike the other two it
+    // can fire on a tree that is otherwise entirely clean — `truncated:
+    // false`, `status: complete`, `failed: 0` — because a terminal descendant
+    // was collected by retention rather than dropped by a bound or an
+    // unreachable shard. Printing it is what keeps the documented
+    // `harvest workflow tree [--summary]` triage flow from showing an
+    // apparently-healthy family that is missing a failed child.
+    //
+    // It is deliberately NOT phrased as a truncation: re-rooting here would
+    // not surface the omitted rows, because they are no longer in
+    // `harvest_workflow_executions` at all.
+    if let Some(parents) = value
+        .get("retained_summary_parent_ids")
+        .and_then(Value::as_array)
+        .filter(|p| !p.is_empty())
+    {
+        out.push_str(
+            "\nRETENTION — descendants were collected by retention and are absent from this tree.",
+        );
+        out.push_str("\n  omitted under (read them with `harvest workflow summaries`):");
+        for parent in parents {
+            let _ = write!(out, "\n    {}", cell_str(Some(parent)));
+        }
+        out.push('\n');
+    }
+
     out
 }
 
@@ -9272,6 +9298,65 @@ mod completion_delivery_cli_tests {
         assert!(rendered.contains("PARTIAL (partial)"));
         assert!(rendered.contains("shard 1"));
         assert!(rendered.contains("connection refused"));
+    }
+
+    #[test]
+    fn lineage_tree_render_calls_out_retention_collected_descendants() {
+        // The third incompleteness signal. Unlike the other two it can fire on
+        // a tree that is otherwise clean — `truncated: false`, `status:
+        // complete` — so if the terminal does not print it, the documented
+        // triage flow shows an apparently-healthy family that is missing a
+        // descendant.
+        let mut value = lineage_tree_fixture();
+        value["retained_summary_parent_ids"] =
+            serde_json::json!(["22222222-2222-2222-2222-222222222222"]);
+        let rendered = format_lineage_tree(&value);
+        assert!(
+            rendered.contains("RETENTION"),
+            "an otherwise-clean tree must still be called out as incomplete:\n{rendered}"
+        );
+        assert!(rendered.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(
+            rendered.contains("workflow summaries"),
+            "name the command that reads the omitted rows"
+        );
+    }
+
+    #[test]
+    fn lineage_render_stays_quiet_when_nothing_was_retention_collected() {
+        // The complement: the signal must not cry wolf on a genuinely
+        // complete tree, or operators will learn to ignore it.
+        let value = lineage_tree_fixture();
+        let rendered = format_lineage_tree(&value);
+        assert!(!rendered.contains("RETENTION"), "{rendered}");
+    }
+
+    #[test]
+    fn lineage_summary_render_calls_out_retention_collected_descendants() {
+        // `--summary` is the *first* command in the runbook's triage flow, and
+        // the one that reports `failed: 0`. It shares the footer, so this pins
+        // that the sharing is real.
+        let value = serde_json::json!({
+            "root": {
+                "execution_id": "11111111-1111-1111-1111-111111111111",
+                "workflow_name": "checkout_saga",
+                "workflow_id": "order-42",
+                "state": "RUNNING"
+            },
+            // The trap this guards: a clean-looking roll-up.
+            "counts": { "running": 1, "failed": 0, "completed": 2 },
+            "total_descendants": 3,
+            "max_depth_reached": 1,
+            "truncated": false,
+            "truncated_parent_ids": [],
+            "truncated_parents_capped": false,
+            "status": "complete",
+            "unavailable_shards": [],
+            "retained_summary_parent_ids": ["33333333-3333-3333-3333-333333333333"]
+        });
+        let rendered = format_lineage_summary(&value);
+        assert!(rendered.contains("RETENTION"), "{rendered}");
+        assert!(rendered.contains("33333333-3333-3333-3333-333333333333"));
     }
 
     #[test]

@@ -899,6 +899,47 @@ async fn a_child_demoted_into_a_retention_summary_is_reported_not_silently_dropp
     );
 }
 
+/// `retained_summary_parent_ids` must only ever name nodes the caller can
+/// actually find in the tree it was handed — the contract's literal wording.
+///
+/// The trap: the walk's `visited` set is the cycle/duplicate guard, and it
+/// deliberately retains an id that was rejected for budget. Probing that
+/// superset would name a node that `max_nodes` dropped, handing the operator
+/// an id they cannot locate in the response.
+#[tokio::test]
+async fn a_budget_dropped_node_is_never_named_as_a_retention_summary_parent() {
+    let (admin, _guard) = setup_server().await;
+    let (app, mut conn) = single_shard_app(&admin).await;
+
+    let root = insert(&mut conn, Spec::root("saga")).await;
+    // Two children, oldest first so admission order is deterministic.
+    let kept = insert(&mut conn, Spec::child(root, "kept", 0)).await;
+    let dropped = insert(&mut conn, Spec::child(root, "dropped", 1)).await;
+
+    // The node that will NOT survive the budget is the one with a demoted
+    // child, so a `visited`-sourced probe would name it.
+    let demoted = ExecutionId::new_for_shard(ShardId::new(0));
+    demote_child_to_summary(&mut conn, demoted, dropped, "FAILED").await;
+
+    // Budget for root + exactly one child.
+    let (status, body) = get_json(&app, &format!("/workflows/{root}/tree?max_nodes=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["truncated"], json!(true), "the budget was hit: {body}");
+
+    let kids = body["root"]["children"].as_array().expect("children array");
+    assert_eq!(kids.len(), 1, "only one child fits the budget: {body}");
+    assert_eq!(kids[0]["execution_id"], kept.to_string());
+
+    let named = body["retained_summary_parent_ids"]
+        .as_array()
+        .expect("retained_summary_parent_ids must be present");
+    assert!(
+        !named.iter().any(|v| v == &json!(dropped.to_string())),
+        "the budget-dropped node is absent from the tree, so naming it would \
+         hand the operator an id they cannot find: {body}"
+    );
+}
+
 /// The signal must not fire on the default configuration — with summary
 /// retention off there are no summary rows, so an ordinary tree stays clean.
 #[tokio::test]

@@ -182,11 +182,18 @@ The tree is assembled by reading each shard independently. Two consequences:
     "retained_summary_parent_ids": ["0000...bb2"] }
   ```
 
-  Read the demoted rows with `GET /workflows/summaries` (filter by
-  `workflow_name`/`completed_after`). Only the nearest live ancestor is named;
-  anything below a demoted child is not enumerated. With summary retention
-  **off** (the default) a collected child is hard-deleted and leaves no trace
-  at all — the tree cannot report what no longer exists.
+  The CLI prints a `RETENTION` block naming each such parent.
+
+  Read the demoted rows with `harvest workflow summaries` /
+  `GET /workflows/summaries` (filter by `workflow_name`/`completed_after`).
+  Only the nearest live ancestor is named; anything below a demoted child is
+  not enumerated. With summary retention **off** (the default) a collected
+  child is hard-deleted and leaves no trace at all — the tree cannot report
+  what no longer exists.
+
+  Every id in this list is a node **in the returned tree**, so you can always
+  locate it in the output you were handed (a subtree dropped by `max_nodes` is
+  reported through `truncated_parent_ids`, not here).
 
   This is a third, independent incompleteness signal: `truncated == false` and
   `status == "complete"` together still do not mean every descendant is here.

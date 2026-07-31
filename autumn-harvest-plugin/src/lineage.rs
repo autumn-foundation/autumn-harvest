@@ -350,9 +350,15 @@ pub fn root_row_from_execution(execution: &WorkflowExecution) -> LineageChildRow
 #[derive(Debug)]
 pub struct LineageWalk {
     limits: LineageLimits,
-    /// Every id ever admitted (root included). This is the cycle/duplicate
-    /// guard: an id is admitted at most once, so a malformed `parent_id` loop
-    /// terminates instead of recursing forever.
+    /// The chosen root. Held so [`admitted_ids`](Self::admitted_ids) can
+    /// reconstruct exactly the id set the response carries without consulting
+    /// `visited`, which also holds budget-rejected ids.
+    root_id: uuid::Uuid,
+    /// Every id ever *seen* (root included). This is the cycle/duplicate
+    /// guard: an id is considered at most once, so a malformed `parent_id`
+    /// loop terminates instead of recursing forever. Note this is a superset
+    /// of the returned tree — a budget-rejected row stays marked here — so it
+    /// must not be used to enumerate the response's nodes.
     visited: HashSet<uuid::Uuid>,
     /// Admitted descendant rows, in admission order.
     nodes: Vec<LineageChildRow>,
@@ -376,6 +382,7 @@ impl LineageWalk {
         visited.insert(root_id.as_uuid());
         Self {
             limits,
+            root_id: root_id.as_uuid(),
             visited,
             nodes: Vec::new(),
             dropped_parents: BTreeSet::new(),
@@ -507,12 +514,23 @@ impl LineageWalk {
             .extend(parents.iter().copied());
     }
 
-    /// Ids admitted so far (root included) — the probe input for retained
-    /// summary children, which can hang off *any* node in the tree, not just an
-    /// unexpanded leaf.
+    /// Ids present in the returned tree (root included) — the probe input for
+    /// retained summary children, which can hang off *any* node in the tree,
+    /// not just an unexpanded leaf.
+    ///
+    /// Derived from `root_id` + [`nodes`](Self::nodes), i.e. exactly what
+    /// [`finish`](Self::finish) assembles into the response, and deliberately
+    /// **not** from `visited`. `visited` is the cycle/duplicate guard and is a
+    /// strict superset: `admit_level` inserts an id there *before* the budget
+    /// check and leaves a budget-rejected id in place on purpose. Probing that
+    /// superset would let `retained_summary_parent_ids` name a node the caller
+    /// cannot find in the tree it was handed, breaking the field's contract.
     #[must_use]
     pub fn admitted_ids(&self) -> Vec<uuid::Uuid> {
-        self.visited.iter().copied().collect()
+        let mut ids = Vec::with_capacity(self.nodes.len() + 1);
+        ids.push(self.root_id);
+        ids.extend(self.nodes.iter().map(|n| n.exec_id.as_uuid()));
+        ids
     }
 
     /// Note that a shard's fetch window came back full.
@@ -922,6 +940,45 @@ mod tests {
     }
 
     // ── Cycle / duplicate safety (AC) ────────────────────────────────────
+
+    #[test]
+    fn admitted_ids_excludes_budget_rejected_rows() {
+        // `visited` is the cycle/duplicate guard, and `admit_level`
+        // deliberately LEAVES a budget-rejected id in it (so a duplicate of a
+        // rejected row can never be admitted later). It is therefore a
+        // superset of the returned tree. `admitted_ids` feeds the retained
+        // summary probe, whose output names nodes an operator is told to look
+        // up *in the tree* — so sourcing it from `visited` would emit an id
+        // that cannot be found there.
+        let root = id(1);
+        let mut walk = LineageWalk::new(
+            root,
+            LineageLimits {
+                max_depth: 10,
+                max_nodes: 2, // root + exactly one child
+            },
+        );
+        let _ = walk.admit_level(
+            1,
+            vec![
+                row(id(2), root, "RUNNING", 1),
+                row(id(3), root, "RUNNING", 2), // budget-rejected
+            ],
+        );
+
+        let admitted = walk.admitted_ids();
+        assert!(admitted.contains(&root.as_uuid()), "the root is admitted");
+        assert!(
+            admitted.contains(&id(2).as_uuid()),
+            "the admitted child is probed"
+        );
+        assert!(
+            !admitted.contains(&id(3).as_uuid()),
+            "a budget-rejected row is absent from the returned tree, so naming \
+             it would hand the operator an id they cannot find in it"
+        );
+        assert_eq!(admitted.len(), 2, "exactly root + the one admitted child");
+    }
 
     #[test]
     fn a_self_parent_row_is_rejected_by_the_visited_set() {
