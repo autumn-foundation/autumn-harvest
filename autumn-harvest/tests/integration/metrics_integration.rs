@@ -728,6 +728,34 @@ fn history_bloat_double_suspension_probe<'a>(
     })
 }
 
+/// PR #1139 review (second round, Codex worker.rs:11017): proposes a WIDE
+/// batch of pending bookkeeping commands (8 `ctx.side_effect(...)` calls,
+/// none of them durably appended before the hard cap rejects the whole
+/// decision) followed by a single fresh timer arm, so this decision's
+/// PROSPECTIVE event count (predicted by `suspended_command_event_count`
+/// for the pending, not-yet-persisted batch) is far larger than the DURABLE
+/// event count that will actually land in `harvest_events` once the
+/// terminal `WorkflowFailed` event is appended instead. See the sibling
+/// test using this probe for the exact arithmetic and the bug this proves
+/// is fixed.
+fn history_bloat_prospective_overcount_probe<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        for i in 0..8 {
+            let name = format!("padding-{i}");
+            let _: serde_json::Value = ctx
+                .side_effect(&name, || serde_json::json!({}))
+                .map_err(|error| error.to_string())?;
+        }
+        ctx.timer("history-bloat-prospective-overcount-wait", 3_600)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
 fn local_activity_retry_reaches_history_cap<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -2227,6 +2255,234 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
         dlq_row.error.contains("HistoryCapExceeded"),
         "DLQ reason should identify the hard cap, got: {}",
         dlq_row.error
+    );
+}
+
+/// PR #1139 review (second round, Codex `worker.rs:11017`): the hard-cap
+/// preflight's soft-threshold crossing decision must be based on the
+/// DURABLE post-failure event count, never the PROSPECTIVE count of a
+/// pending, not-yet-persisted suspension batch.
+///
+/// Setup: only `WorkflowStarted` is pre-seeded (1 durable event, so
+/// `next_event_id == 1` when the decision runs). The probe proposes 8
+/// pending `RecordSideEffect` bookkeeping commands plus a fresh `StartTimer`
+/// in ONE live decision -- none of which are ever durably appended, because
+/// `event_hard_cap = 8` makes this decision's PROSPECTIVE event count
+/// (1 loaded + 8 side effects + 1 new timer = 10) satisfy `>= cap` and
+/// route straight to the terminal `fail_workflow_for_history_cap` DLQ path
+/// instead of a normal `Suspended` persist. `fraction = 0.75` against
+/// `cap = 8` computes a soft threshold of `(8.0 * 0.75) as u64 = 6`.
+///
+/// Before the fix, `should_warn_history_bloat` was computed off the
+/// PROSPECTIVE count (10) -- `10 >= 6` is `true`, so the counter fired and
+/// `history_bloat_warned_at` was permanently stamped for an execution whose
+/// actual recorded history never grew past 2 events (`WorkflowStarted` +
+/// the terminal `WorkflowFailed`), well below the threshold of 6. Worse,
+/// once stamped, that execution is *terminal* -- the live (non-terminal)
+/// discovery query (AC1/AC2) can never surface it, so the operator-facing
+/// counter and the discovery filter would permanently disagree about
+/// whether this execution ever crossed the soft threshold.
+///
+/// After the fix, the decision is based on the DURABLE count instead: 1
+/// event loaded plus 1 for the about-to-be-appended `WorkflowFailed` event
+/// = 2, and `2 >= 6` is `false` -- the counter must NOT fire and
+/// `history_bloat_warned_at` must stay unset, even though the hard cap DID
+/// terminally fail the execution.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("history-bloat-prospective-overcount-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: "history_bloat_prospective_overcount_probe",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Only `WorkflowStarted` is pre-seeded -- next_event_id == 1 when the
+    // decision runs, so the DURABLE count never approaches the threshold.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    // cap=8, fraction=0.75 -> threshold=(8.0*0.75) as u64=6. This decision's
+    // PROSPECTIVE event count (1 loaded + 8 pending side effects + 1 new
+    // timer = 10) satisfies `event_count >= cap` (10 >= 8, hard-cap path),
+    // but the DURABLE post-failure count (1 loaded + 1 WorkflowFailed = 2)
+    // never reaches the threshold (2 >= 6 is false).
+    let policy = WorkflowHistoryPolicy::default()
+        .with_event_hard_cap(8)
+        .with_history_bloat_warn_fraction(0.75);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "history_bloat_prospective_overcount_probe",
+            module: "metrics_integration",
+            handler: history_bloat_prospective_overcount_probe,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker(
+        "metrics-worker-history-bloat-prospective-overcount",
+        registry,
+    );
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let error = execution
+        .error
+        .clone()
+        .expect("hard cap should fail execution");
+    assert!(
+        error.contains("HistoryCapExceeded"),
+        "execution error should identify the hard-cap reason, got: {error}"
+    );
+
+    // The regression proof: a purely PROSPECTIVE pending-command count must
+    // never stamp the guard column or fire the counter.
+    assert!(
+        execution.history_bloat_warned_at.is_none(),
+        "history_bloat_warned_at must stay unset -- the DURABLE post-failure \
+         event count (2) never reaches the soft threshold (6), even though \
+         the PROSPECTIVE pending-command count (10) satisfied the hard cap"
+    );
+
+    let emissions = recording.drain();
+    assert!(
+        emissions
+            .iter()
+            .all(|e| e.name != METRIC_WORKFLOW_HISTORY_BLOAT),
+        "the soft-threshold counter must NOT fire off a prospective, \
+         not-yet-persisted pending-command count; got: {emissions:?}"
+    );
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
+        .await
+        .expect("failed to list DLQ rows");
+    let dlq_row = dead_letters
+        .iter()
+        .find(|row| row.workflow_exec_id == Some(exec_id.as_uuid()))
+        .expect("hard-cap offender must be moved to DLQ");
+    assert!(
+        dlq_row.error.contains("HistoryCapExceeded"),
+        "DLQ reason should identify the hard cap, got: {}",
+        dlq_row.error
+    );
+
+    // Confirm the DURABLE count matches the arithmetic the doc comment
+    // above claims: exactly 2 events (`WorkflowStarted` + `WorkflowFailed`),
+    // proving the 8 proposed side effects and the proposed timer arm were
+    // genuinely never persisted.
+    let final_history = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("failed to load final history");
+    assert_eq!(
+        final_history.events.len(),
+        2,
+        "the 8 proposed side effects and the proposed timer arm must never \
+         have been durably appended; final history: {:?}",
+        final_history.events
     );
 }
 

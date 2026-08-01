@@ -10900,10 +10900,13 @@ async fn move_workflow_to_dlq_for_history_cap(
 /// `process_workflow_task`, gated there by callers combining this with
 /// `matches!(&outcome, WorkflowOutcome::Suspended { .. })` and `!is_canary`;
 /// and (2) `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
-/// (PR #1139 review), where a single decision can grow history from below
-/// the soft threshold straight past the hard cap in one inline append batch,
-/// bypassing (1) entirely -- the crossing still happened in the same
-/// decision, so it is evaluated there too rather than silently dropped.
+/// (PR #1139 review), evaluated there against the DURABLE post-failure
+/// event count -- never a prospective, not-yet-persisted one (PR #1139
+/// review, second round) -- since a single decision can grow durably
+/// recorded history from below the soft threshold straight past the hard
+/// cap in one inline append batch, bypassing (1) entirely; the crossing
+/// still happened in the same decision, so it is evaluated there too
+/// rather than silently dropped.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -11000,21 +11003,35 @@ async fn fail_workflow_for_history_cap(
         WorkflowStatus::Failed,
     );
 
-    // Issue #704 (PR #1139 review): every caller here has already confirmed
-    // `event_count >= cap`, and the public configuration surface clamps
-    // `history_bloat_warn_fraction` strictly below `1.0`
-    // (`MAX_HISTORY_BLOAT_WARN_FRACTION`), so the soft threshold was
-    // provably ALSO just crossed in this very decision whenever the
-    // feature is enabled -- mark and emit it here, BEFORE the terminal DLQ
-    // transition below, so a crash between the two leaves the mark
-    // retryable (a future retry of this same task re-enters this function,
-    // observes `already_warned`, and skips re-emitting) rather than lost
-    // forever once the execution seals terminal. Never fires for the
-    // synthetic liveness canary (issue #796), matching the sibling
-    // `WorkflowOutcome::Suspended` path.
+    // Issue #704 (PR #1139 review, second round): decide the crossing from
+    // `terminal_count` -- the DURABLE post-failure event count, computed
+    // above from `next_event_id` (the running count of events actually
+    // appended so far this cycle) -- never from the `event_count` parameter.
+    // `event_count` is whatever value tripped the HARD cap at the call
+    // site, and for the `WorkflowOutcome::Suspended` preflight branch that
+    // value can be purely PROSPECTIVE: `suspended_command_event_count`
+    // predicts how many events a batch of still-pending commands (e.g. a
+    // large activity fan-out) WOULD produce if persisted, and this function
+    // never persists them -- the whole point of the hard-cap preflight is
+    // to reject the batch and fail terminally instead. A run sitting at 10
+    // durably recorded events that merely PROPOSED 90 more (against a cap
+    // of 100) would otherwise stamp a permanent crossing off a count that
+    // never lands in `harvest_events`, leaving a terminal execution the
+    // live (non-terminal) discovery query can never find. `terminal_count`
+    // is exactly what WILL be durably recorded once the `WorkflowFailed`
+    // event below is appended, so it is the only value this decision can
+    // correctly be based on -- at every other call site (a genuinely
+    // already-appended batch) `terminal_count` and `event_count` coincide,
+    // so this is a strict correctness fix with no behavior change there.
+    // Mark and emit it here, BEFORE the terminal DLQ transition below, so a
+    // crash between the two leaves the mark retryable (a future retry of
+    // this same task re-enters this function, observes `already_warned`,
+    // and skips re-emitting) rather than lost forever once the execution
+    // seals terminal. Never fires for the synthetic liveness canary (issue
+    // #796), matching the sibling `WorkflowOutcome::Suspended` path.
     let should_warn_history_bloat = !crate::canary::is_canary_workflow(&execution.workflow_name)
         && history_bloat_threshold_crossed(
-            event_count,
+            terminal_count,
             cap,
             registry.history_policy().history_bloat_warn_fraction(),
             execution.history_bloat_warned_at.is_some(),

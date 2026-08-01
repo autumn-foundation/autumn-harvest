@@ -35,7 +35,7 @@
 //!   than letting one silently win;
 //! - finding B (second review round): `min_history_events` (issue #493) must
 //!   still compose with `history_bloat_min_events` when both are supplied at
-//!   once -- ANDing the two `>=` thresholds together (equivalent to the
+//!   once -- `AND`ing the two `>=` thresholds together (equivalent to the
 //!   stricter/maximum of the two), not silently dropping one;
 //! - finding C (second review round): the per-shard candidate query is
 //!   bounded to `filters.limit`, ordered by history size descending, *before*
@@ -774,7 +774,7 @@ async fn history_bloat_min_events_composes_with_failure_cause() {
 
 /// `min_history_events` (issue #493, the pre-existing general-purpose count
 /// filter) must compose with `history_bloat_min_events` when the caller
-/// supplies both at once, ANDing the two `>=` thresholds together -- before
+/// supplies both at once, `AND`ing the two `>=` thresholds together -- before
 /// the fix, `load_history_bloat_workflows` silently dropped
 /// `min_history_events` entirely whenever `history_bloat_min_events` was also
 /// present, so the *lower* of the two thresholds always won regardless of
