@@ -10931,7 +10931,23 @@ fn history_bloat_threshold_crossed(
     if already_warned || fraction <= 0.0 {
         return false;
     }
-    let threshold = (cap as f64 * fraction).ceil() as u64;
+    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
+    // Issue #704 (PR #1139 review, Nth round): clamp the threshold below
+    // `cap` here, unconditionally of `fraction` -- `context.rs`'s public
+    // clamp of `fraction` to `MAX_HISTORY_BLOAT_WARN_FRACTION` (0.999) is
+    // fraction-only and cannot see `cap`, so it cannot guarantee
+    // `ceil(cap * fraction) < cap` for every cap value: for cap=100,
+    // `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`, meaning the soft
+    // warning would fire on the EXACT SAME decision cycle as the hard cap
+    // itself (zero intervention window) for any cap below 1000 -- the
+    // opposite of the "warn before the hard cap" contract this signal
+    // exists to provide. Clamping the threshold to `cap.saturating_sub(1)`
+    // here, where BOTH `cap` and `fraction` are known together, guarantees
+    // at least one full event of warning room below the hard cap for
+    // every (cap, fraction) combination the caller can construct --
+    // independent of, and strictly stronger than, whatever ceiling
+    // `context.rs` clamps `fraction` to.
+    let threshold = raw_threshold.min(cap.saturating_sub(1));
     current_history_event_count >= threshold
 }
 
@@ -11033,12 +11049,6 @@ async fn fail_workflow_for_history_cap(
     // correctly be based on -- at every other call site (a genuinely
     // already-appended batch) `terminal_count` and `event_count` coincide,
     // so this is a strict correctness fix with no behavior change there.
-    // Mark and emit it here, BEFORE the terminal DLQ transition below, so a
-    // crash between the two leaves the mark retryable (a future retry of
-    // this same task re-enters this function, observes `already_warned`,
-    // and skips re-emitting) rather than lost forever once the execution
-    // seals terminal. Never fires for the synthetic liveness canary (issue
-    // #796), matching the sibling `WorkflowOutcome::Suspended` path.
     let should_warn_history_bloat = !crate::canary::is_canary_workflow(&execution.workflow_name)
         && history_bloat_threshold_crossed(
             terminal_count,
@@ -11046,14 +11056,6 @@ async fn fail_workflow_for_history_cap(
             registry.history_policy().history_bloat_warn_fraction(),
             execution.history_bloat_warned_at.is_some(),
         );
-    emit_history_bloat_warning_if_crossed(
-        conn,
-        telemetry,
-        exec_id,
-        &execution.workflow_name,
-        should_warn_history_bloat,
-    )
-    .await;
 
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
@@ -11071,6 +11073,41 @@ async fn fail_workflow_for_history_cap(
         Some(telemetry.metrics.as_ref()),
     )
     .await?;
+
+    // Issue #704 (PR #1139 review, Nth round): emit/stamp the crossing only
+    // AFTER `move_workflow_to_dlq_for_history_cap` above has returned `Ok`
+    // -- never before it. Until that call's transaction commits,
+    // `terminal_count` is only a PREDICTION of what next_event_id will
+    // become once `WorkflowFailed` lands, not a durable fact. Emitting and
+    // stamping the guard ahead of that commit (the previous ordering) left
+    // a crash/transaction-failure window between the two steps that would
+    // permanently mark `history_bloat_warned_at` off a crossing that never
+    // actually became durable: the `?` above would propagate the error,
+    // the execution would stay RUNNING at its true (uncrossed) count, but
+    // `execution.history_bloat_warned_at` was already committed as set --
+    // so a future retry of this same decision cycle (or any later cycle
+    // that reaches the hard-cap path again) would see `already_warned` and
+    // could never correct the false crossing, permanently silencing a
+    // signal that never fired for real. Emitting only once the terminal
+    // transition has committed guarantees `terminal_count` IS exactly what
+    // is now durably recorded, so the "at-least-once, biased toward a rare
+    // duplicate over a possible permanent loss" delivery semantics
+    // documented on `emit_history_bloat_warning_if_crossed` hold as
+    // written: the only residual crash window is between this commit and
+    // the guard stamp immediately below, and losing that narrow window
+    // means (at worst) one already-terminal execution's warning is never
+    // marked/counted -- a single missed sample on a run that has already
+    // sealed, not a permanently wrong guard on a run that could still
+    // self-correct. Never fires for the synthetic liveness canary (issue
+    // #796), matching the sibling `WorkflowOutcome::Suspended` path.
+    emit_history_bloat_warning_if_crossed(
+        conn,
+        telemetry,
+        exec_id,
+        &execution.workflow_name,
+        should_warn_history_bloat,
+    )
+    .await;
 
     check_and_report_unfinished_handlers_for_worker(
         conn,
@@ -16862,9 +16899,38 @@ mod tests {
     }
 
     #[test]
-    fn history_bloat_threshold_crossed_fraction_one_requires_reaching_the_full_cap() {
-        assert!(!history_bloat_threshold_crossed(99, 100, 1.0, false));
+    fn history_bloat_threshold_crossed_fraction_one_still_leaves_one_event_of_room_below_the_cap() {
+        // PR #1139 review (Nth round): a raw `ceil(cap * fraction)` of
+        // `1.0` used to require reaching the FULL cap (threshold == cap
+        // exactly, zero warning room). The threshold is now always clamped
+        // to `cap - 1`, so even a fraction of `1.0` still leaves the
+        // promised one-event window before the hard cap fires.
+        assert!(!history_bloat_threshold_crossed(98, 100, 1.0, false));
+        assert!(history_bloat_threshold_crossed(99, 100, 1.0, false));
         assert!(history_bloat_threshold_crossed(100, 100, 1.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_small_cap_at_the_builder_ceiling_still_leaves_room() {
+        // The concrete regression this clamp fixes: at the PUBLIC builder
+        // ceiling (`MAX_HISTORY_BLOAT_WARN_FRACTION` = 0.999), a cap below
+        // 1000 previously collapsed the threshold onto the cap itself --
+        // e.g. cap=100: `ceil(100 * 0.999) = ceil(99.9) = 100 == cap` --
+        // so the soft warning fired on the EXACT SAME decision cycle as
+        // the hard cap, giving zero intervention window. The threshold
+        // must now be strictly below `cap` regardless of how small `cap`
+        // is.
+        let fraction = crate::context::MAX_HISTORY_BLOAT_WARN_FRACTION;
+        assert!(!history_bloat_threshold_crossed(98, 100, fraction, false));
+        assert!(history_bloat_threshold_crossed(99, 100, fraction, false));
+        assert!(history_bloat_threshold_crossed(100, 100, fraction, false));
+
+        // A pathologically small cap (10) at the same ceiling: `ceil(10 *
+        // 0.999) = ceil(9.99) = 10 == cap` before the fix; must still stay
+        // below `cap` after it.
+        assert!(!history_bloat_threshold_crossed(8, 10, fraction, false));
+        assert!(history_bloat_threshold_crossed(9, 10, fraction, false));
+        assert!(history_bloat_threshold_crossed(10, 10, fraction, false));
     }
 
     #[test]

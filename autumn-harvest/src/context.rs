@@ -75,12 +75,26 @@ pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
 /// *before* the warn-fraction crossing calculation on the same decision
 /// cycle, and returns early the instant `current_history_event_count >= cap`
 /// -- the exact condition a fraction of `1.0` would itself require to fire.
-/// A configured `1.0` therefore always loses that race and the counter can
-/// never fire, silently and permanently disabling it exactly like `0.0`
-/// does, but with none of `0.0`'s documented "this disables it" contract.
-/// Clamping the ceiling below `1.0` guarantees the warn threshold is reached
-/// on a decision cycle strictly before the hard cap can be, so the signal
-/// stays functional for every value the public builder API accepts.
+/// A configured `1.0` would therefore always lose that race and the counter
+/// could never fire, silently and permanently disabling it exactly like
+/// `0.0` does, but with none of `0.0`'s documented "this disables it"
+/// contract.
+///
+/// This ceiling alone is **not** what guarantees the warn threshold stays
+/// below the hard cap, though: `ceil(cap * fraction)` can still equal `cap`
+/// itself at this exact ceiling for any `cap` below 1000 (e.g. cap=100:
+/// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
+/// fix -- would collapse the promised "warn before the hard cap" window into
+/// "warn on the same decision cycle as the hard cap" for small caps (PR
+/// #1139 review, a later round). The actual below-`cap` guarantee is
+/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
+/// its computed threshold to `cap - 1` unconditionally of what `fraction`
+/// resolves to -- that clamp is what keeps the signal functional for every
+/// `(cap, fraction)` combination the public builder API can produce. This
+/// constant's `< 1.0` ceiling remains as an independent, secondary safety
+/// margin (and a reasonable API choice on its own: a fraction of exactly
+/// `1.0` is a confusing "wait until literally the entire cap" configuration
+/// regardless of the below-cap clamp).
 pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
 
 /// Default maximum byte length for the `current_details` string (issue #473).
