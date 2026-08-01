@@ -25,14 +25,22 @@
 //!   response shape, not the `400` `history_bloat_min_events` produces for
 //!   the same params).
 //!
-//! Two further PR #1139 review findings, each with a dedicated regression
-//! test at the end of this file:
+//! Further PR #1139 review findings, each with a dedicated regression test at
+//! the end of this file:
 //! - finding #3: `failure_cause` (issue #506) must narrow the
 //!   `history_bloat_min_events` results, not be silently ignored;
 //! - finding #4: `no_progress_minutes` (issue #486, stalled-workflow
 //!   discovery) and `history_bloat_min_events` are mutually-exclusive
 //!   discovery paths and must be rejected with `400` when combined, rather
-//!   than letting one silently win.
+//!   than letting one silently win;
+//! - finding B (second review round): `min_history_events` (issue #493) must
+//!   still compose with `history_bloat_min_events` when both are supplied at
+//!   once -- ANDing the two `>=` thresholds together (equivalent to the
+//!   stricter/maximum of the two), not silently dropping one;
+//! - finding C (second review round): the per-shard candidate query is
+//!   bounded to `filters.limit`, ordered by history size descending, *before*
+//!   any full execution row is loaded -- proven correct even when a single
+//!   shard alone has more matching candidates than the global limit.
 
 use std::collections::BTreeMap;
 
@@ -762,6 +770,71 @@ async fn history_bloat_min_events_composes_with_failure_cause() {
     );
 }
 
+// ─── PR #1139 review (finding B, second round): min_history_events compose ─
+
+/// `min_history_events` (issue #493, the pre-existing general-purpose count
+/// filter) must compose with `history_bloat_min_events` when the caller
+/// supplies both at once, ANDing the two `>=` thresholds together -- before
+/// the fix, `load_history_bloat_workflows` silently dropped
+/// `min_history_events` entirely whenever `history_bloat_min_events` was also
+/// present, so the *lower* of the two thresholds always won regardless of
+/// which one the caller actually wanted enforced.
+#[tokio::test]
+async fn history_bloat_min_events_composes_with_min_history_events() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // Below BOTH thresholds -- must never appear.
+    let _too_small =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-mhe-too-small", 2)
+            .await; // total 3
+
+    // At/above the lower (`history_bloat_min_events=4`) but below the higher
+    // (`min_history_events=6`) threshold -- before the fix this row was
+    // wrongly returned, since only the lower threshold was ever enforced.
+    let _between =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-mhe-between", 4).await; // total 5
+
+    // At/above BOTH thresholds -- must always appear.
+    let _above_both =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-mhe-above-both", 6)
+            .await; // total 7
+
+    let (status, body) = get_json(
+        &app,
+        "/workflows?history_bloat_min_events=4&min_history_events=6",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert_eq!(
+        ids,
+        vec!["hb-mhe-above-both".to_string()],
+        "the stricter of the two composed count thresholds (min_history_events=6 \
+         here, above history_bloat_min_events=4) must win -- a row satisfying \
+         only the lower threshold must be excluded, not silently returned \
+         because min_history_events was dropped; got {ids:?}"
+    );
+
+    // Reverse the roles -- `history_bloat_min_events` supplies the stricter
+    // bound this time -- to prove composition is symmetric (an AND of both
+    // predicates, not "whichever param happens to be checked first wins").
+    let (status, body) = get_json(
+        &app,
+        "/workflows?history_bloat_min_events=6&min_history_events=4",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert_eq!(
+        ids,
+        vec!["hb-mhe-above-both".to_string()],
+        "with the roles of the two params reversed, the same stricter bound \
+         (6) must still apply; got {ids:?}"
+    );
+}
+
 // ─── PR #1139 review (finding #4): mutually-exclusive discovery paths ─────
 
 /// `no_progress_minutes` (stalled-workflow discovery, issue #486) and
@@ -784,4 +857,104 @@ async fn history_bloat_min_events_combined_with_no_progress_minutes_returns_400(
         body.is_object(),
         "a 400 must carry a JSON error object; got {body}"
     );
+}
+
+// ─── PR #1139 review (finding C, second round): bounded per-shard load ────
+//
+// Before this fix, `load_history_bloat_workflows`'s per-shard candidate query
+// had no `LIMIT` at all -- it loaded every matching live row (full
+// `WorkflowExecution` structs, JSON payload columns included) and truncated
+// only *after* the cross-shard merge. These tests prove the fix -- ordering
+// by the current event count descending and applying `.limit(filters.limit)`
+// per shard, before any full row is loaded -- still produces the exact same,
+// correct top-K result: both within a single shard (proving the `ORDER BY`
+// direction is right, not just "whatever LIMIT happens to return") and across
+// shards where a single shard alone has *more* matching candidates than the
+// global limit (proving the per-shard bound uses the full `filters.limit`,
+// not some smaller divided value that would wrongly truncate a row the
+// global top-K still needs).
+
+/// A single shard with more above-threshold candidates than `limit`, seeded
+/// in an order that does NOT match the count-descending result order -- so
+/// only a genuinely-correct `ORDER BY (count) DESC LIMIT N` (not insertion
+/// order, primary-key order, or the reverse direction) can produce the
+/// expected top-2.
+#[tokio::test]
+async fn history_bloat_min_events_limit_orders_by_history_size_not_insertion_order() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // Seeded smallest-first, then largest, then middle -- deliberately NOT in
+    // count-descending order.
+    let _smallest =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-limit-c", 5).await; // total 6
+    let _largest =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-limit-a", 9).await; // total 10
+    let _middle =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-limit-b", 7).await; // total 8
+
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=5&limit=2").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert_eq!(
+        ids,
+        vec!["hb-limit-a".to_string(), "hb-limit-b".to_string()],
+        "the per-shard query must return the top-2 by current history size \
+         descending (10, then 8), excluding the smallest (6) row entirely -- \
+         a wrong ORDER BY direction, or one falling back to insertion/PK \
+         order, would return a different pair or a different order; got {ids:?}"
+    );
+}
+
+/// Two shards, each with *more* above-threshold candidates than the global
+/// `limit`. The globally-second-largest row lives on the SAME shard as the
+/// globally-largest row (shard 0's local rank-2), so it must survive shard
+/// 0's own per-shard truncation to reach the final cross-shard merge -- proof
+/// that the per-shard bound is the full `filters.limit`, not some smaller
+/// value (e.g. `limit` divided across shards) that would wrongly drop it.
+#[tokio::test]
+async fn history_bloat_min_events_limit_survives_per_shard_truncation_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool = build_two_shard_pool(&shard0_url, &shard1_url);
+    let app = build_app_with_pool(pool);
+
+    // Shard 0: four candidates, counts [14, 20, 16, 18], seeded out of order.
+    // Global top-3 needs BOTH x0-a (20, rank 1 globally) and x0-b (18, rank 3
+    // globally / rank 2 *on this shard*) -- x0-c/x0-d must be excluded.
+    let _x0_d = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-d", 13).await; // total 14
+    let _x0_a = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-a", 19).await; // total 20
+    let _x0_c = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-c", 15).await; // total 16
+    let _x0_b = seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-x0-b", 17).await; // total 18
+
+    // Shard 1: four candidates, counts [13, 19, 15, 17], seeded out of order.
+    // Global top-3 needs ONLY x1-a (19, rank 2 globally) -- x1-b (17, rank 2
+    // *on this shard*) is globally rank 4 and must be excluded by the final
+    // cross-shard merge, even though it also survives its own shard's
+    // per-shard truncation (limit=3 keeps 3 of shard 1's 4 rows locally).
+    let _x1_d = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-d", 12).await; // total 13
+    let _x1_a = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-a", 18).await; // total 19
+    let _x1_c = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-c", 14).await; // total 15
+    let _x1_b = seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-x1-b", 16).await; // total 17
+
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=5&limit=3").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert_eq!(
+        ids,
+        vec![
+            "hb-x0-a".to_string(), // 20 -- global rank 1
+            "hb-x1-a".to_string(), // 19 -- global rank 2
+            "hb-x0-b".to_string(), // 18 -- global rank 3, shard 0's own local rank 2
+        ],
+        "the global top-3 must survive both the per-shard bound AND the final \
+         cross-shard merge, in count-descending order; got {ids:?}"
+    );
+    for excluded in ["hb-x0-c", "hb-x0-d", "hb-x1-b", "hb-x1-c", "hb-x1-d"] {
+        assert!(
+            !ids.contains(&excluded.to_string()),
+            "{excluded} must be excluded from the global top-3; got {ids:?}"
+        );
+    }
 }

@@ -30815,10 +30815,12 @@ pub(crate) async fn load_stalled_workflows(
 /// Per-shard history-bloat discovery query (issue #704, AC1/AC2).
 ///
 /// Returns non-terminal (live) executions whose current recorded
-/// `harvest_events` count is `>= filters.history_bloat_min_events`, each
-/// carrying its `history_event_count` so the caller can rank/triage without a
-/// second round-trip. Returns `Ok(vec![])` immediately when
-/// `history_bloat_min_events` is unset.
+/// `harvest_events` count is `>= filters.history_bloat_min_events` (and, when
+/// also supplied, `>= filters.min_history_events` -- PR #1139 review finding
+/// B: the two count thresholds compose rather than one silently overriding
+/// the other), each carrying its `history_event_count` so the caller can
+/// rank/triage without a second round-trip. Returns `Ok(vec![])` immediately
+/// when `history_bloat_min_events` is unset.
 ///
 /// Non-terminal is enforced unconditionally (`state NOT IN` the six terminal
 /// states) in addition to — not instead of — any caller-supplied `state=`
@@ -30826,6 +30828,14 @@ pub(crate) async fn load_stalled_workflows(
 /// further as expected, while a `state=COMPLETED` request yields zero rows
 /// (an incompatible combination) rather than silently overriding the
 /// caller's explicit choice.
+///
+/// Bounded per-shard (PR #1139 review finding C): ordered by the current
+/// event count descending (with an `id` ascending tie-break matching
+/// [`build_history_bloat_fanout`]'s cross-shard merge order) and limited to
+/// `filters.limit` rows *before* any full [`WorkflowExecution`] row is
+/// loaded, so a shard with a large live population cannot force this query
+/// to materialize (and transfer, and JSON-decode) more candidate rows than
+/// the caller could ever see in the final, truncated response.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn load_history_bloat_workflows(
     conn: &mut AsyncPgConnection,
@@ -30833,15 +30843,33 @@ pub(crate) async fn load_history_bloat_workflows(
 ) -> HarvestResult<Vec<StalledWorkflowRow>> {
     use diesel::dsl::sql;
     use diesel::sql_types::{BigInt, Bool, Jsonb, Text};
-    use std::collections::HashMap;
+
+    // Correlated subquery computing each candidate's current recorded event
+    // count. Reused for the count-threshold filter(s), the `ORDER BY`, and
+    // the `SELECT` below, so all three read the identical single source of
+    // truth for "how big is this execution's history right now" and can
+    // never drift apart from one another.
+    const HISTORY_EVENT_COUNT_SUBQUERY: &str = "(SELECT COUNT(*) FROM harvest_events \
+         WHERE workflow_exec_id = harvest_workflow_executions.id)";
 
     let Some(min_events) = filters.history_bloat_min_events else {
         return Ok(vec![]);
     };
 
-    // ── Step 1: find candidate executions ───────────────────────────────────
-    // No per-shard limit here; the global limit is applied after cross-shard
-    // sorting by computed history size in `load_history_bloat_workflows_from_shards`.
+    // ── Step 1: find candidate executions, bounded per-shard (AC1/AC2) ──────
+    // PR #1139 review (finding C): this used to `.load()` every matching live
+    // row on a shard with no `LIMIT`, truncating only after the cross-shard
+    // merge -- a shard with a large live population could materialize
+    // thousands of full `WorkflowExecution` rows (JSON payload columns
+    // included) just to discard all but `filters.limit` of them. Ordering by
+    // the same count expression the final merge sorts by
+    // (`build_history_bloat_fanout`), with the identical `id` ASC tie-break,
+    // and applying `.limit(filters.limit)` per shard is a correct
+    // top-K-per-partition-then-merge: any row excluded from a shard's own
+    // local top-`filters.limit` under this exact order has `filters.limit`
+    // other rows on that same shard ranked at or above it, so it can never be
+    // part of the global top-K after merging every shard's contribution --
+    // excluding it here changes nothing about the final, truncated result.
     let mut query = harvest_workflow_executions::table
         .into_boxed()
         // AC1: "live (non-terminal)" — unconditional, ANDed with any explicit
@@ -30852,12 +30880,21 @@ pub(crate) async fn load_history_bloat_workflows(
         // (issue #805) recognize as terminal.
         .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES))
         .filter(
-            sql::<Bool>(
-                "(SELECT COUNT(*) FROM harvest_events \
-                 WHERE workflow_exec_id = harvest_workflow_executions.id) >= ",
-            )
-            .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
+            sql::<Bool>(&format!("{HISTORY_EVENT_COUNT_SUBQUERY} >= "))
+                .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
         );
+    // PR #1139 review (finding B): compose (never silently drop) the
+    // pre-existing general-purpose `min_history_events` filter (issue #493)
+    // when the caller supplies BOTH count thresholds at once. ANDing the two
+    // `>=` predicates together is equivalent to filtering on their maximum,
+    // so the stricter of the two bounds always wins rather than one being
+    // silently ignored.
+    if let Some(min_history) = filters.min_history_events {
+        query = query.filter(
+            sql::<Bool>(&format!("{HISTORY_EVENT_COUNT_SUBQUERY} >= "))
+                .bind::<BigInt, _>(i64::try_from(min_history).unwrap_or(i64::MAX)),
+        );
+    }
 
     if !filters.states.is_empty() {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
@@ -30927,40 +30964,29 @@ pub(crate) async fn load_history_bloat_workflows(
         query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
 
-    let candidates: Vec<WorkflowExecution> = query
-        .select(WorkflowExecution::as_select())
+    // ── Step 2: order by history size, bound, and fetch the count alongside
+    // each row in the SAME query (AC2) -- no separate batch-count round trip,
+    // and no full row materialized beyond the per-shard `LIMIT`.
+    let rows: Vec<(WorkflowExecution, i64)> = query
+        .order(sql::<BigInt>(HISTORY_EVENT_COUNT_SUBQUERY).desc())
+        .then_order_by(harvest_workflow_executions::id.asc())
+        .limit(filters.limit)
+        .select((
+            WorkflowExecution::as_select(),
+            sql::<BigInt>(HISTORY_EVENT_COUNT_SUBQUERY),
+        ))
         .load(conn)
         .await
         .map_err(database_error)?;
 
-    if candidates.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let exec_ids: Vec<uuid::Uuid> = candidates.iter().map(|e| e.id).collect();
-
-    // ── Step 2: batch-fetch history_event_count per execution (AC2) ────────
-    let counts: HashMap<uuid::Uuid, i64> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
-        .group_by(harvest_events::workflow_exec_id)
-        .select((harvest_events::workflow_exec_id, diesel::dsl::count_star()))
-        .load::<(uuid::Uuid, i64)>(conn)
-        .await
-        .map_err(database_error)?
+    Ok(rows
         .into_iter()
-        .collect();
-
-    Ok(candidates
-        .into_iter()
-        .map(|execution| {
-            let history_event_count = counts.get(&execution.id).copied();
-            StalledWorkflowRow {
-                execution,
-                last_event_at: None,
-                last_event_age_seconds: None,
-                stall_reason: None,
-                history_event_count,
-            }
+        .map(|(execution, history_event_count)| StalledWorkflowRow {
+            execution,
+            last_event_at: None,
+            last_event_age_seconds: None,
+            stall_reason: None,
+            history_event_count: Some(history_event_count),
         })
         .collect())
 }
