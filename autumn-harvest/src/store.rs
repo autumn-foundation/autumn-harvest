@@ -1601,6 +1601,39 @@ pub async fn update_current_details(
     Ok(())
 }
 
+/// Guarded exactly-once stamp for the operator early-warning soft threshold
+/// on workflow history bloat (issue #704).
+///
+/// Called by the worker, post-commit (in autocommit), when a still-RUNNING
+/// execution's recorded history event count has just crossed
+/// `history_bloat_warn_fraction * event_hard_cap` for the first time.
+///
+/// The `WHERE history_bloat_warned_at IS NULL` guard makes this exactly-once
+/// and race-safe: concurrent workers racing to persist the same execution's
+/// next cycle (or repeated re-dispatch of an already-warned execution) can
+/// never double-stamp the row. Returns `Ok(true)` iff THIS call performed the
+/// transition (the row was NULL and is now stamped) so the caller emits the
+/// counter exactly once; `Ok(false)` means it was already stamped (by an
+/// earlier cycle or a racing worker) and the caller must not emit again.
+pub async fn mark_history_bloat_warned(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> crate::error::HarvestResult<bool> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let rows = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::history_bloat_warned_at.is_null()),
+    )
+    .set(dsl::history_bloat_warned_at.eq(diesel::dsl::now))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows > 0)
+}
+
 fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 

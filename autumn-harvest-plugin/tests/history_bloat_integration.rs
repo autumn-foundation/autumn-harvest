@@ -1,0 +1,354 @@
+//! Integration tests for the `min_history_events` operator early-warning
+//! discovery filter on `GET /workflows` (issue #704, AC1/AC2/AC7).
+//!
+//! Verifies, against a real Postgres-backed HTTP router, that the filter:
+//! - returns only live (non-terminal) executions whose current recorded
+//!   history event count is `>= N`, sorted by history size descending (AC1);
+//! - includes each row's current `history_event_count` so callers can
+//!   rank/triage without a second call (AC2);
+//! - rejects an invalid (non-numeric / negative) value with a `400` JSON
+//!   error body, never a `500` or a silent empty match (AC7);
+//! - rejects composition with `cursor`/`page_size`/`order` pagination with a `400`
+//!   (the computed sort has no keyset cursor, so silently mis-ordering a
+//!   paginated response would be worse than a clear rejection).
+
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
+use autumn_harvest::worker::DbPool;
+use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest_plugin::HarvestDbPool;
+use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
+use autumn_web::AppState;
+use autumn_web::reexports::axum;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use serde_json::{Value, json};
+use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use tower::ServiceExt;
+
+fn init_sql() -> Vec<u8> {
+    autumn_harvest::full_migrations_sql().as_bytes().to_vec()
+}
+
+type HarvestApiApp = axum::Router;
+
+fn test_app_state() -> AppState {
+    AppState::for_test().with_profile("test")
+}
+
+async fn setup_database() -> (String, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_init_sql(init_sql())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    (database_url, container)
+}
+
+fn build_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
+}
+
+fn build_app(database_url: &str) -> HarvestApiApp {
+    let pool = build_pool(database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    harvest_api_router(api_state).with_state(test_app_state())
+}
+
+async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, Value) {
+    let uri = uri.into();
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .expect("GET request failed");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("failed to read body");
+    let json: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("response must be JSON")
+    };
+    (status, json)
+}
+
+/// Seed a RUNNING workflow execution (a single `WorkflowStarted` event) and
+/// then pad its recorded history with `extra_events` additional raw rows so
+/// its total `history_event_count` is `1 + extra_events`. The padding rows'
+/// content is never deserialized/replayed by these HTTP-only tests -- only
+/// counted -- so a minimal, structurally-arbitrary `MarkerRecorded` payload
+/// is sufficient.
+async fn seed_workflow_with_history_size(
+    database_url: &str,
+    workflow_id: &str,
+    extra_events: i32,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect");
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "history_bloat_filter_test",
+            workflow_id,
+            exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: autumn_harvest::StartSource::Api,
+            start_source_ref: None,
+            started_by: None,
+        },
+        None,
+    )
+    .await
+    .expect("seed workflow");
+
+    // `start_or_load_workflow_execution` appends exactly one `WorkflowStarted`
+    // event at `event_id = 0`; pad with `extra_events` more, sequentially.
+    for i in 0..extra_events {
+        diesel::sql_query(
+            "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+             VALUES ($1, $2, 'MarkerRecorded', \
+             '{\"type\":\"MarkerRecorded\",\"data\":{\"name\":\"padding\",\"details\":{}}}'::jsonb, NOW())",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Integer, _>(1 + i)
+        .execute(&mut conn)
+        .await
+        .expect("insert padding event");
+    }
+
+    exec_id
+}
+
+/// Force an execution's persisted state directly (bypassing a real worker) --
+/// used to prove a terminal execution is excluded from the discovery filter
+/// (AC1: "live (non-terminal)") regardless of how large its history is.
+async fn force_execution_state(database_url: &str, exec_id: ExecutionId, state: &str) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect");
+    diesel::sql_query("UPDATE harvest_workflow_executions SET state = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Text, _>(state)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("force execution state");
+}
+
+fn workflow_ids_of(arr: &Value) -> Vec<String> {
+    arr.as_array()
+        .expect("response must be an array")
+        .iter()
+        .map(|r| r["workflow_id"].as_str().expect("workflow_id").to_string())
+        .collect()
+}
+
+fn history_event_count_of(row: &Value) -> i64 {
+    row["history_event_count"]
+        .as_i64()
+        .expect("history_event_count must be present and an integer (AC2)")
+}
+
+// ─── AC1 / AC2 ──────────────────────────────────────────────────────────────
+
+/// AC1: only live (non-terminal) executions at or above the threshold are
+/// returned, sorted by current history size descending. AC2: each row
+/// carries its `history_event_count`.
+#[tokio::test]
+async fn min_history_events_returns_live_executions_sorted_by_size_descending() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // 1 (WorkflowStarted) + extra_events.
+    let _small = seed_workflow_with_history_size(&database_url, "hb-small", 1).await; // total 2
+    let _medium = seed_workflow_with_history_size(&database_url, "hb-medium", 4).await; // total 5
+    let _large = seed_workflow_with_history_size(&database_url, "hb-large", 7).await; // total 8
+
+    // A terminal execution whose history is larger than every live one above
+    // must still be excluded -- AC1's "live (non-terminal)" restriction.
+    let terminal = seed_workflow_with_history_size(&database_url, "hb-terminal-huge", 20).await; // total 21
+    force_execution_state(&database_url, terminal, "COMPLETED").await;
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=5").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"hb-medium".to_string()),
+        "hb-medium (5 events) must be returned at the threshold; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"hb-large".to_string()),
+        "hb-large (8 events) must be returned above the threshold; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"hb-small".to_string()),
+        "hb-small (2 events) must be excluded below the threshold; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"hb-terminal-huge".to_string()),
+        "a terminal execution must never appear, regardless of history size; got {ids:?}"
+    );
+
+    // Sorted descending: hb-large (8) before hb-medium (5).
+    let large_pos = ids.iter().position(|id| id == "hb-large").unwrap();
+    let medium_pos = ids.iter().position(|id| id == "hb-medium").unwrap();
+    assert!(
+        large_pos < medium_pos,
+        "results must be sorted by history size descending; got order {ids:?}"
+    );
+
+    // AC2: each returned row carries the exact current history_event_count.
+    let rows = body.as_array().unwrap();
+    let large_row = rows
+        .iter()
+        .find(|r| r["workflow_id"] == "hb-large")
+        .expect("hb-large row");
+    assert_eq!(history_event_count_of(large_row), 8);
+    let medium_row = rows
+        .iter()
+        .find(|r| r["workflow_id"] == "hb-medium")
+        .expect("hb-medium row");
+    assert_eq!(history_event_count_of(medium_row), 5);
+}
+
+/// The general-purpose `min_history_events` filter (issue #493) is
+/// unaffected: without triggering the dedicated discovery path (this route
+/// only activates it, so a state filter or the absence of the param at all
+/// still behaves as before) a terminal execution IS reachable through the
+/// ordinary `state=` filter composed with `min_history_events` on the
+/// stalled loader's sibling path is out of scope for this file -- this test
+/// only pins that `min_history_events` alone always excludes terminals.
+#[tokio::test]
+async fn min_history_events_excludes_every_terminal_state() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    for (label, state) in [
+        ("hb-completed", "COMPLETED"),
+        ("hb-failed", "FAILED"),
+        ("hb-cancelled", "CANCELLED"),
+        ("hb-timed-out", "TIMED_OUT"),
+        ("hb-terminated", "TERMINATED"),
+    ] {
+        let exec_id = seed_workflow_with_history_size(&database_url, label, 9).await;
+        force_execution_state(&database_url, exec_id, state).await;
+    }
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=1").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.is_empty(),
+        "every seeded execution is terminal; none should be returned, got {ids:?}"
+    );
+}
+
+// ─── AC7 ────────────────────────────────────────────────────────────────────
+
+/// AC7: a non-numeric `min_history_events` value returns `400` with a JSON
+/// error body, never a `500` or a silent empty array.
+#[tokio::test]
+async fn min_history_events_non_numeric_value_returns_400() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=not_a_number").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
+    assert!(
+        body.is_object(),
+        "a 400 must carry a JSON error object, not an array or empty body; got {body}"
+    );
+}
+
+/// AC7: a negative `min_history_events` value returns `400`, not a silently
+/// accepted (and meaningless, since counts can't be negative) filter.
+#[tokio::test]
+async fn min_history_events_negative_value_returns_400() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=-5").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
+    assert!(
+        body.is_object(),
+        "a 400 must carry a JSON error object; got {body}"
+    );
+}
+
+// ─── AC1: pagination-combo rejection ───────────────────────────────────────
+
+/// `min_history_events` sorts by a computed value with no keyset cursor, so
+/// combining it with `cursor`/`page_size`/`order` pagination is rejected with a
+/// clear `400` rather than silently mis-ordering (or ignoring) the request.
+#[tokio::test]
+async fn min_history_events_combined_with_page_size_returns_400() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=1&page_size=10").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
+    assert!(
+        body.is_object(),
+        "a 400 must carry a JSON error object; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn min_history_events_combined_with_order_returns_400() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=1&order=asc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
+}

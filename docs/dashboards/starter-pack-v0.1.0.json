@@ -1369,6 +1369,55 @@
             }
           ],
           "description": "How long paused executions stay paused before resume (operator or auto-resume ceiling)."
+        },
+        {
+          "id": 915,
+          "type": "timeseries",
+          "title": "Workflow history bloat (early warning)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 68
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (workflow) (increase(harvest_workflow_history_bloat_total{workflow=~\"$workflow\"}[1h]))",
+              "legendFormat": "{{workflow}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) Still-running executions whose recorded harvest_events count first crossed history_bloat_warn_fraction * event_hard_cap (issue #704, default 75%). Observation-only — the run keeps executing normally; emitted exactly once per crossing per run. Requires event_hard_cap to be configured for the workflow type via WorkflowHistoryPolicy; otherwise this stays flat at zero (disabled), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?min_history_events=<N> or harvest workflow list --min-history-events <N>."
         }
       ]
     },

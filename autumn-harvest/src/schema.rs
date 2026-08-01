@@ -137,6 +137,12 @@ diesel::table! {
         /// Optional human/operator attribution for the start (issue #740).
         /// NULL when absent.
         started_by -> Nullable<Text>,
+        /// Wall-clock the operator early-warning soft threshold was first
+        /// crossed for this execution's recorded history size (issue #704).
+        /// NULL = not yet warned. Guarded exactly-once via
+        /// `UPDATE ... WHERE history_bloat_warned_at IS NULL`. Never read on
+        /// replay; never set at insert time (always starts NULL).
+        history_bloat_warned_at -> Nullable<Timestamptz>,
     }
 }
 

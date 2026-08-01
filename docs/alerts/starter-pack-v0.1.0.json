@@ -851,6 +851,43 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_population_leak"
     },
     {
+      "id": "harvest_workflow_history_bloat",
+      "status": "enforceable",
+      "signal_source": "harvest.workflow.history_bloat counter (issue #704), incremented exactly once per still-running (non-terminal) workflow execution when its recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (WorkflowHistoryPolicy, default fraction 0.75).",
+      "default_threshold": "Ticket on any increase over a 15 minute window: sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m])) > 0. This is a per-run early-warning crossing, not a sustained rate -- a single occurrence is worth triaging before the run reaches the hard cap and is terminally force-failed to the DLQ. The signal only fires for workflow types where the operator has configured event_hard_cap; it is a no-op (a permanently flat series) otherwise, which is expected, not a health issue.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A still-running (non-terminal) workflow execution's recorded event history has crossed a configurable fraction (default 75%) of the engine's optional hard history-event-count cap. This is an operator early-warning, not a lifecycle change: the run keeps executing exactly as before, and the counter fires exactly once per crossing per run. Left unaddressed, continued growth risks the execution eventually reaching the hard cap and being terminally force-failed to the dead-letter queue. Typical causes are a workflow that polls or loops without ever calling continue_as_new, or an unexpectedly wide fan-out.",
+      "first_action": "harvest workflow list --min-history-events <threshold>, which returns only live executions at or above that recorded event count, sorted by history size descending with each row's current history_event_count -- rank and triage the largest offenders first.",
+      "dependencies": [
+        {
+          "ref": "#704",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_HISTORY_BLOAT / harvest.workflow.history_bloat, GET /api/harvest/workflows?min_history_events=<N>, harvest workflow list --min-history-events <N>"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric label: workflow; execution.id is never a label"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "The counter fires once per run at the moment it crosses the soft threshold, so alert on ANY increase within the window rather than a sustained rate. workflow is the only label; execution.id is never a label. An unconfigured deployment (no event_hard_cap set on any workflow) will show a permanently flat, never-incrementing series -- this is the disabled/no-op state (AC4), not an outage.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest workflow list --min-history-events <threshold>",
+        "GET /api/harvest/workflows?min_history_events=<threshold>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat"
+    },
+    {
       "id": "harvest_queue_paused_too_long",
       "status": "enforceable",
       "signal_source": "ADR-0001/#619 gauge harvest.queue.paused sampled per worker on the poll interval. Label: queue (bounded to distinct queue names). 1 while an operator hold is in effect, 0 otherwise.",

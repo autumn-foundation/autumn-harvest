@@ -1484,6 +1484,12 @@ pub struct StalledWorkflowRow {
     pub last_event_age_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stall_reason: Option<StallReason>,
+    /// The execution's current recorded `harvest_events` count, computed on
+    /// read (issue #704, AC2). Populated only when the request set
+    /// `min_history_events` — omitted (never `null`) on every other list
+    /// response so this stays additive and byte-for-byte backward compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_event_count: Option<i64>,
 }
 
 impl From<WorkflowExecution> for StalledWorkflowRow {
@@ -1493,6 +1499,7 @@ impl From<WorkflowExecution> for StalledWorkflowRow {
             last_event_at: None,
             last_event_age_seconds: None,
             stall_reason: None,
+            history_event_count: None,
         }
     }
 }
@@ -8034,6 +8041,29 @@ async fn list_workflows(
         // unreachable (issue #756) it degrades to the `{ workflows, status,
         // unavailable_shards }` envelope instead of a `500`.
         let page = load_stalled_workflows_from_shards(&api_state, &filters).await?;
+        return Ok(fanout_list_json(
+            "workflows",
+            page.rows,
+            page.status,
+            &page.unavailable_shards,
+        )?
+        .into_response());
+    }
+    if filters.min_history_events.is_some() {
+        // Operator early-warning discovery for workflow history bloat (issue
+        // #704, AC1). A dedicated non-terminal-only, sorted-by-size path — see
+        // the `load_history_bloat_workflows` doc comment. Sorting is by a
+        // *computed* value (no stored keyset column), so combining with cursor
+        // pagination is rejected up front (AC7: never a silent, wrongly-ordered
+        // page — always a clear `400`).
+        if filters.paginated {
+            return Err(AutumnError::bad_request_msg(
+                "min_history_events is not supported together with cursor/page_size/order \
+                 pagination; results are sorted by current history size, which has no keyset \
+                 cursor",
+            ));
+        }
+        let page = load_history_bloat_workflows_from_shards(&api_state, &filters).await?;
         return Ok(fanout_list_json(
             "workflows",
             page.rows,
@@ -30601,6 +30631,24 @@ pub(crate) async fn load_stalled_workflows(
         .filter_map(|(id, ts)| ts.map(|t| (id, t)))
         .collect();
 
+    // ── Step 2.5: batch-fetch history_event_count when requested (issue #704,
+    // AC2) ───────────────────────────────────────────────────────────────────
+    // Only queried when the caller actually asked (`min_history_events` set) so
+    // a plain `?no_progress_minutes=N` request pays no extra query cost.
+    let history_event_counts: HashMap<uuid::Uuid, i64> = if filters.min_history_events.is_some() {
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
+            .group_by(harvest_events::workflow_exec_id)
+            .select((harvest_events::workflow_exec_id, diesel::dsl::count_star()))
+            .load::<(uuid::Uuid, i64)>(conn)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     // ── Step 3: any runnable task queue row (activity or workflow type) ────────
     // Checking all task_type values mirrors the sleeping-filter predicate so that
     // an execution with a stuck workflow task is not mislabelled no_pending_work.
@@ -30692,14 +30740,233 @@ pub(crate) async fn load_stalled_workflows(
             } else {
                 StallReason::NoPendingWork
             });
+            let history_event_count = history_event_counts.get(&id).copied();
             StalledWorkflowRow {
                 execution,
                 last_event_at,
                 last_event_age_seconds,
                 stall_reason,
+                history_event_count,
             }
         })
         .collect())
+}
+
+// ── Issue #704: operator early-warning discovery for workflow history bloat
+// ─────────────────────────────────────────────────────────────────────────
+//
+// A dedicated `min_history_events` discovery path, distinct from the
+// general-purpose `min_history_events` filter already composable on
+// `load_workflows`/`load_stalled_workflows` (issue #493): AC1 specifically
+// requires the response be (a) restricted to live (non-terminal) executions
+// and (b) sorted by history size descending — neither of which the general
+// filter does (it composes with the caller's own `state=`/`order=` choice).
+// Mirrors `load_stalled_workflows`'s multi-step-query shape rather than
+// retrofitting those two behaviors into the general-purpose loader, so the
+// existing `min_history_events` composition on the default/stalled paths is
+// left byte-for-byte unchanged.
+
+/// Per-shard history-bloat discovery query (issue #704, AC1/AC2).
+///
+/// Returns non-terminal (live) executions whose current recorded
+/// `harvest_events` count is `>= filters.min_history_events`, each carrying
+/// its `history_event_count` so the caller can rank/triage without a second
+/// round-trip. Returns `Ok(vec![])` immediately when `min_history_events` is
+/// unset.
+///
+/// Non-terminal is enforced unconditionally (`state NOT IN` the six terminal
+/// states) in addition to — not instead of — any caller-supplied `state=`
+/// filter: the two AND together, so a `state=RUNNING` request narrows
+/// further as expected, while a `state=COMPLETED` request yields zero rows
+/// (an incompatible combination) rather than silently overriding the
+/// caller's explicit choice.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn load_history_bloat_workflows(
+    conn: &mut AsyncPgConnection,
+    filters: &WorkflowFilters,
+) -> HarvestResult<Vec<StalledWorkflowRow>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{BigInt, Bool, Text};
+    use std::collections::HashMap;
+
+    let Some(min_events) = filters.min_history_events else {
+        return Ok(vec![]);
+    };
+
+    // ── Step 1: find candidate executions ───────────────────────────────────
+    // No per-shard limit here; the global limit is applied after cross-shard
+    // sorting by computed history size in `load_history_bloat_workflows_from_shards`.
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        // AC1: "live (non-terminal)" — unconditional, ANDed with any explicit
+        // `state=` filter below.
+        .filter(harvest_workflow_executions::state.ne_all([
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ]))
+        .filter(
+            sql::<Bool>(
+                "(SELECT COUNT(*) FROM harvest_events \
+                 WHERE workflow_exec_id = harvest_workflow_executions.id) >= ",
+            )
+            .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
+        );
+
+    if !filters.states.is_empty() {
+        query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
+    }
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.as_str()));
+    }
+    // Issue #796 (AC8): hide synthetic liveness canary runs unless the caller
+    // explicitly filters to a canary workflow name.
+    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    if let Some(owner) = &filters.owner {
+        query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
+    }
+    if let Some(severity) = &filters.severity {
+        query = query.filter(harvest_workflow_executions::severity.eq(severity.as_str()));
+    }
+    query = apply_search_attr_filters(
+        query,
+        &filters.search_attrs,
+        &filters.search_attr_predicates,
+    );
+    if filters.sla_breached {
+        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    if filters.nd_blocked {
+        query = query
+            .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
+            .filter(harvest_workflow_executions::state.eq("RUNNING"));
+    }
+    if filters.legal_hold {
+        let now = chrono::Utc::now();
+        query = query
+            .filter(harvest_workflow_executions::legal_hold_set_at.is_not_null())
+            .filter(
+                harvest_workflow_executions::legal_hold_until
+                    .is_null()
+                    .or(harvest_workflow_executions::legal_hold_until.gt(now)),
+            );
+    }
+    if let Some(src) = &filters.start_source {
+        if src == "unknown" {
+            query = query.filter(
+                harvest_workflow_executions::start_source
+                    .is_null()
+                    .or(harvest_workflow_executions::start_source.eq("unknown")),
+            );
+        } else {
+            query = query.filter(harvest_workflow_executions::start_source.eq(src.clone()));
+        }
+    }
+    if let Some(after) = filters.started_after {
+        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+    }
+    if let Some(before) = filters.started_before {
+        query = query.filter(harvest_workflow_executions::started_at.le(before));
+    }
+    if let Some(prefix) = &filters.exec_id_prefix {
+        let pattern = format!("{}%", prefix.to_lowercase());
+        query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
+    }
+
+    let candidates: Vec<WorkflowExecution> = query
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    if candidates.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let exec_ids: Vec<uuid::Uuid> = candidates.iter().map(|e| e.id).collect();
+
+    // ── Step 2: batch-fetch history_event_count per execution (AC2) ────────
+    let counts: HashMap<uuid::Uuid, i64> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
+        .group_by(harvest_events::workflow_exec_id)
+        .select((harvest_events::workflow_exec_id, diesel::dsl::count_star()))
+        .load::<(uuid::Uuid, i64)>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .collect();
+
+    Ok(candidates
+        .into_iter()
+        .map(|execution| {
+            let history_event_count = counts.get(&execution.id).copied();
+            StalledWorkflowRow {
+                execution,
+                last_event_at: None,
+                last_event_age_seconds: None,
+                stall_reason: None,
+                history_event_count,
+            }
+        })
+        .collect())
+}
+
+/// Fan-out `load_history_bloat_workflows` across all configured shards and
+/// merge results sorted by `history_event_count` descending, truncated to
+/// `filters.limit` (issue #704, AC1).
+///
+/// Partial availability (issue #756): an unreachable shard is folded into the
+/// returned [`FanoutRows`] rather than failing the whole request; reachable
+/// shards' rows still merge, sort, and truncate normally.
+pub(crate) async fn load_history_bloat_workflows_from_shards(
+    api_state: &HarvestApiState,
+    filters: &WorkflowFilters,
+) -> Result<FanoutRows<StalledWorkflowRow>, AutumnError> {
+    let observations = observe_shards(api_state, |_shard_id, mut conn| {
+        let filters = filters.clone();
+        async move {
+            load_history_bloat_workflows(&mut conn, &filters)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+
+    Ok(build_history_bloat_fanout(observations, filters.limit))
+}
+
+/// Merge, sort by `history_event_count` descending, and truncate per-shard
+/// history-bloat observations (pure, no DB) — issue #704.
+///
+/// Ties break on `execution.id` for a total, deterministic order across
+/// repeated calls. A row with no computed count (unreachable in practice —
+/// every candidate is fetched alongside its count in the same loader pass)
+/// sorts as `0`, never panics.
+pub(crate) fn build_history_bloat_fanout(
+    observations: Vec<ShardObservation<StalledWorkflowRow>>,
+    limit_raw: i64,
+) -> FanoutRows<StalledWorkflowRow> {
+    let FanoutRows {
+        mut rows,
+        status,
+        unavailable_shards,
+    } = collect_fanout_rows(observations);
+
+    rows.sort_by(|a, b| {
+        b.history_event_count
+            .unwrap_or(0)
+            .cmp(&a.history_event_count.unwrap_or(0))
+            .then_with(|| a.execution.id.cmp(&b.execution.id))
+    });
+    rows.truncate(usize::try_from(limit_raw).unwrap_or(usize::MAX));
+    FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    }
 }
 
 /// Fan-out `load_stalled_workflows` across all configured shards and merge
@@ -41224,6 +41491,7 @@ mod tests {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            history_bloat_warned_at: None,
         }
     }
 
@@ -41992,6 +42260,58 @@ mod tests {
         assert_eq!(page.status, FanoutStatus::Partial);
         assert_eq!(page.unavailable_shards.len(), 1);
         assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_history_bloat_fanout_sorts_by_count_descending_and_names_down_shard() {
+        let t = chrono::Utc::now();
+        let mut r_small = StalledWorkflowRow::from(exec_at(1, t));
+        r_small.history_event_count = Some(50);
+        let mut r_huge = StalledWorkflowRow::from(exec_at(2, t));
+        r_huge.history_event_count = Some(9_000);
+        let mut r_mid = StalledWorkflowRow::from(exec_at(3, t));
+        r_mid.history_event_count = Some(500);
+        let obs = vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![r_small, r_huge, r_mid],
+                error: None,
+            },
+            ShardObservation::<StalledWorkflowRow> {
+                shard_id: 1,
+                rows: Vec::new(),
+                error: Some("down".to_string()),
+            },
+        ];
+        let page = build_history_bloat_fanout(obs, 2);
+        // (a) largest-history-first, (b) truncated to limit=2.
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].history_event_count, Some(9_000));
+        assert_eq!(page.rows[1].history_event_count, Some(500));
+        // (d) partial + shard 1 named (issue #756).
+        assert_eq!(page.status, FanoutStatus::Partial);
+        assert_eq!(page.unavailable_shards.len(), 1);
+        assert_eq!(page.unavailable_shards[0].shard_id, 1);
+    }
+
+    #[test]
+    fn build_history_bloat_fanout_ties_break_on_execution_id() {
+        let t = chrono::Utc::now();
+        // Two rows with the identical count but different ids — the merge must
+        // be deterministic across repeated calls, not left to sort stability.
+        let mut r_a = StalledWorkflowRow::from(exec_at(9, t));
+        r_a.history_event_count = Some(100);
+        let mut r_b = StalledWorkflowRow::from(exec_at(1, t));
+        r_b.history_event_count = Some(100);
+        let obs = vec![ShardObservation {
+            shard_id: 0,
+            rows: vec![r_a, r_b],
+            error: None,
+        }];
+        let page = build_history_bloat_fanout(obs, 10);
+        assert_eq!(page.rows.len(), 2);
+        // Tied on count -> lower execution id sorts first.
+        assert!(page.rows[0].execution.id < page.rows[1].execution.id);
     }
 
     #[test]

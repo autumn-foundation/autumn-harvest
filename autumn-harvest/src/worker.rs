@@ -10882,6 +10882,40 @@ async fn move_workflow_to_dlq_for_history_cap(
     Ok((deferred, closed_children))
 }
 
+/// Pure decision for the operator early-warning soft threshold on workflow
+/// history bloat (issue #704, AC3/AC4).
+///
+/// Returns `true` iff a still-RUNNING execution's history event count has
+/// JUST crossed `fraction * cap` for the first time -- i.e. `already_warned`
+/// is `false`, `fraction` is a strictly-positive (non-disabled) configured
+/// value, and `current_history_event_count` has reached the computed
+/// threshold. Never `true` when `already_warned` (the caller must not
+/// re-stamp an execution that already crossed the threshold on an earlier
+/// cycle) or when `fraction <= 0.0` (the `0.0`/disabled sentinel, AC4).
+///
+/// This is a PURE function of its four inputs -- it performs no I/O and has
+/// no knowledge of the execution's identity, the outcome shape, or whether
+/// the caller is a synthetic canary probe (issue #796). Callers are
+/// responsible for combining this with `matches!(&outcome,
+/// WorkflowOutcome::Suspended { .. })` and `!is_canary` before acting on it.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn history_bloat_threshold_crossed(
+    current_history_event_count: u64,
+    cap: u64,
+    fraction: f64,
+    already_warned: bool,
+) -> bool {
+    if already_warned || fraction <= 0.0 {
+        return false;
+    }
+    let threshold = (cap as f64 * fraction) as u64;
+    current_history_event_count >= threshold
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
@@ -12345,6 +12379,31 @@ async fn process_workflow_task(
     // via the #603 gate returning early above, never reaches here on an
     // ND-carrying Failed), so this is a no-op on every non-terminal path.
     let unhandled_signal_metrics = outcome_unhandled_signals(&outcome);
+    // Issue #704: decide (pure, no I/O) whether this cycle should mark the
+    // operator early-warning soft threshold for workflow history bloat.
+    // Computed here -- before the persist transaction moves `outcome` --
+    // and acted on post-commit in the `Persisted` arm below (same
+    // discipline as harvest.update.completed/failed and
+    // harvest.signal.unhandled, issue #684): a ParkedPaused discard or a
+    // persist failure must never mark an execution as "warned" for a
+    // decision cycle that never became durable. Never fires for the
+    // synthetic liveness canary (issue #796) -- it contributes to no
+    // `harvest.workflow.*` business signal, matching the sibling
+    // `record_workflow_completed`/`history_size`/`continue_as_new` gates
+    // right above.
+    let should_warn_history_bloat = !is_canary
+        && matches!(&outcome, WorkflowOutcome::Suspended { .. })
+        && registry
+            .history_policy()
+            .event_hard_cap()
+            .is_some_and(|cap| {
+                history_bloat_threshold_crossed(
+                    current_history_event_count,
+                    cap,
+                    registry.history_policy().history_bloat_warn_fraction(),
+                    prepared.execution.history_bloat_warned_at.is_some(),
+                )
+            });
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -12468,6 +12527,33 @@ async fn process_workflow_task(
                 &update_metric_queue,
                 &unhandled_signal_metrics,
             );
+            // Issue #704: mark + emit the operator early-warning soft
+            // threshold, post-commit, in autocommit -- mirroring
+            // `run_deferred_schedule_counter`'s documented discipline: a
+            // best-effort write that must never roll back or fail the
+            // durably-persisted workflow decision. The guarded UPDATE
+            // (`WHERE history_bloat_warned_at IS NULL`) makes this
+            // race-safe against a concurrent worker on the same
+            // execution, so only the winner of the race emits the
+            // counter.
+            if should_warn_history_bloat {
+                match store::mark_history_bloat_warned(conn, prepared.exec_id).await {
+                    Ok(true) => {
+                        telemetry
+                            .metrics
+                            .record_workflow_history_bloat(&prepared.execution.workflow_name);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            exec_id = %prepared.exec_id,
+                            %error,
+                            "failed to mark history-bloat early-warning threshold \
+                             (best-effort, not fatal)"
+                        );
+                    }
+                }
+            }
         }
         Err(error) => {
             // Preserve per-path error handling: a terminal-with-commands persist
@@ -16596,6 +16682,62 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── Operator early-warning for workflow history bloat (issue #704) ───────
+
+    #[test]
+    fn history_bloat_threshold_crossed_fires_at_and_above_the_computed_threshold() {
+        // cap = 100, fraction = 0.75 -> threshold = 75.
+        assert!(!history_bloat_threshold_crossed(74, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(75, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(76, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(100, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(u64::MAX, 100, 0.75, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_never_fires_once_already_warned() {
+        // Even a wildly-over-threshold count must not re-fire once
+        // `already_warned` is true -- the caller's exactly-once contract.
+        assert!(!history_bloat_threshold_crossed(1_000_000, 100, 0.75, true));
+        assert!(!history_bloat_threshold_crossed(75, 100, 0.75, true));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_disabled_at_zero_fraction() {
+        // fraction = 0.0 is the documented AC4 "disabled" sentinel: never
+        // fires regardless of how far over any notional threshold the count
+        // is.
+        assert!(!history_bloat_threshold_crossed(1_000_000, 100, 0.0, false));
+        assert!(!history_bloat_threshold_crossed(0, 0, 0.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_negative_fraction_is_also_disabled() {
+        // Defensive: `WorkflowHistoryPolicy::with_history_bloat_warn_fraction`
+        // already clamps into [0.0, 1.0] at configuration time, but this pure
+        // function must not misbehave (e.g. compute a negative/garbage
+        // threshold) if it is ever called with an unclamped value directly.
+        assert!(!history_bloat_threshold_crossed(
+            1_000_000, 100, -0.5, false
+        ));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_fraction_one_requires_reaching_the_full_cap() {
+        assert!(!history_bloat_threshold_crossed(99, 100, 1.0, false));
+        assert!(history_bloat_threshold_crossed(100, 100, 1.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_zero_cap_fires_immediately_when_enabled() {
+        // A pathological but well-defined edge: cap = 0 means the threshold
+        // math (`0 * fraction`) is also 0, so any non-negative count "crosses"
+        // it immediately. This function does not decide whether a `cap` of 0
+        // is a sane configuration -- it only computes the threshold predicate.
+        assert!(history_bloat_threshold_crossed(0, 0, 0.75, false));
+        assert!(history_bloat_threshold_crossed(1, 0, 0.75, false));
+    }
 
     // ── Active-workflow population gauge (issue #770) ────────────────────────
 

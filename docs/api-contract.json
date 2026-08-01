@@ -125,18 +125,24 @@
           "in": "query",
           "required": false,
           "description": "Filter by workflow-start provenance (issue #740). One of the bounded StartSource set: api, schedule, backfill, signal_with_start, update_with_start, completion_trigger, webhook, child, batch, continue_as_new, reset, outbox, or 'unknown' (matches NULL / pre-upgrade rows). Any other value returns 400."
+        },
+        {
+          "name": "min_history_events",
+          "in": "query",
+          "required": false,
+          "description": "Operator early-warning discovery for workflow history bloat (issue #704). A non-negative integer N. Restricts the response to live (non-terminal) executions whose current recorded harvest_events count is >= N, sorted by history size descending (largest first), each row carrying its history_event_count so callers can rank/triage without a second call. Not supported together with cursor/page_size/order pagination (results are sorted by a computed value, which has no keyset cursor) -- combining them returns 400. A non-numeric or negative value returns 400."
         }
       ],
       "request_body": null,
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged."
+        "description": "Without pagination params: bare JSON array of execution objects on the happy path (backward compatible); on shard degradation the { workflows, status, unavailable_shards } envelope (see below). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>, \"status\": \"complete\"|\"partial\"|\"unavailable\", \"unavailable_shards\": [{ \"shard_id\", \"reason\" }]} — for the paginated object shape, status and unavailable_shards are ALWAYS present (additive fields; status is \"complete\" and unavailable_shards is [] on the happy path). Partial availability (issue #756): when a shard is unreachable this endpoint returns 200 with the union of reachable-shard results (the non-paginated bare array degrades to the same { workflows, status, unavailable_shards } object) instead of failing the whole request with a 500; an unreachable shard is named in unavailable_shards rather than being silently dropped. On the happy path (all shards reachable) the non-paginated response shape is byte-for-byte unchanged. With min_history_events set (issue #704): each returned row additionally carries history_event_count (an integer, omitted on every other request); rows are always non-terminal and sorted by history_event_count descending regardless of any order= param (which is rejected when combined -- see the min_history_events param description)."
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid filter value, bad RFC 3339 timestamp, or unknown order direction."
+          "description": "Invalid filter value, bad RFC 3339 timestamp, unknown order direction, or min_history_events combined with cursor/page_size/order pagination."
         },
         {
           "status": 500,

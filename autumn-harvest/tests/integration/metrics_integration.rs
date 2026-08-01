@@ -31,9 +31,9 @@ use autumn_harvest::telemetry::{
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START, METRIC_SIGNAL_RECEIVED,
     METRIC_SIGNAL_UNHANDLED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED,
     METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_NON_DETERMINISM,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, TelemetryConfig,
-    WorkflowStatus,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, TelemetryConfig, WorkflowStatus,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -138,6 +138,14 @@ impl MetricsRecorder for RecordingMetrics {
     fn record_workflow_continue_as_new(&self, workflow_name: &str) {
         self.push(
             METRIC_WORKFLOW_CONTINUE_AS_NEW,
+            vec![("workflow.type", workflow_name.to_owned())],
+        );
+    }
+
+    // Issue #704: operator early-warning soft-threshold crossing.
+    fn record_workflow_history_bloat(&self, workflow_name: &str) {
+        self.push(
+            METRIC_WORKFLOW_HISTORY_BLOAT,
             vec![("workflow.type", workflow_name.to_owned())],
         );
     }
@@ -616,6 +624,32 @@ fn history_cap_never_finishing_child<'a>(
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
         ctx.timer("child-history-cap-long-timer", 3_600)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
+/// Issue #704: consumes two pre-seeded `side_effect` markers (mirroring
+/// `suspended_command_reaches_history_cap`'s proven "near-cap" pattern -- a
+/// legacy `MarkerRecorded { name: "side_effect:{name}" }` event genuinely
+/// matches/consumes a `ctx.side_effect(name, ...)` call, unlike an orphan
+/// marker the code never touches), then parks on a fresh, unpolled long
+/// timer so the worker observes a genuine `WorkflowOutcome::Suspended` --
+/// the soft-threshold early-warning counter's only gate (it never fires on
+/// Completed/Failed/ContinueAsNew).
+fn history_bloat_soft_threshold_probe<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: serde_json::Value = ctx
+            .side_effect("padding-1", || serde_json::json!({}))
+            .map_err(|error| error.to_string())?;
+        let _: serde_json::Value = ctx
+            .side_effect("padding-2", || serde_json::json!({}))
+            .map_err(|error| error.to_string())?;
+        ctx.timer("history-bloat-soft-threshold-wait", 3_600)
             .await
             .map_err(|error| error.to_string())?;
         Ok(serde_json::json!({"unreachable": true}))
@@ -1676,6 +1710,417 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// harvest.workflow.history_bloat operator early-warning (issue #704)
+// ---------------------------------------------------------------------------
+
+/// AC3 + AC5 (soft-threshold crossing): a still-RUNNING (non-terminal,
+/// suspended) execution's history crossing `history_bloat_warn_fraction *
+/// event_hard_cap` durably stamps `history_bloat_warned_at` and emits
+/// `harvest.workflow.history_bloat` exactly once, end-to-end through a real
+/// worker and a real Postgres transaction. Also exercises the guarded
+/// `UPDATE ... WHERE history_bloat_warned_at IS NULL`'s exactly-once
+/// semantics directly against the real row -- something the pure
+/// `history_bloat_threshold_crossed` unit tests in `worker.rs` cannot reach
+/// on their own, since they never touch SQL.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_crosses_the_soft_threshold()
+ {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("history-bloat-soft-warn-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: "history_bloat_soft_threshold_probe",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Pre-seed 3 events (WorkflowStarted + 2 inert markers, never consumed by
+    // any call the handler makes). The handler's ONLY live call is a fresh,
+    // unpolled `ctx.timer(...)`, which contributes exactly one new event on
+    // this cycle -- confirmed against the engine's own
+    // `suspended_command_event_count` -> `extract_started_timer_for_suspension`
+    // path: a genuinely new (never-before-recorded) timer arm is
+    // `bookkeeping_events(0) + 1`. So this cycle's
+    // `current_history_event_count = 3 (loaded) + 1 (this cycle) = 4`.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-1".into(),
+                details: serde_json::json!({}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-2".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    // cap=8, fraction=0.5 -> threshold=(8.0*0.5) as u64=4 (both exact in
+    // binary floating point -- no truncation ambiguity). The crossing lands
+    // exactly AT the threshold (4 >= 4), exercising the inclusive `>=` bound.
+    let policy = WorkflowHistoryPolicy::default()
+        .with_event_hard_cap(8)
+        .with_history_bloat_warn_fraction(0.5);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "history_bloat_soft_threshold_probe",
+            module: "metrics_integration",
+            handler: history_bloat_soft_threshold_probe,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-history-bloat-warn", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // The execution parks on a long, unpolled timer -- it never reaches a
+    // terminal state, so poll the guard column directly (mirrors
+    // `wait_for_nd_block`'s pattern for a non-terminal signal).
+    let execution = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let ex = load_execution(&database_url, exec_id).await;
+            if ex.history_bloat_warned_at.is_some() {
+                break ex;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("history-bloat soft threshold was never stamped within timeout");
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a soft-threshold crossing must never terminalize the execution -- \
+         AC3 says 'still-running', and the hard cap (8) was not reached"
+    );
+    assert!(
+        execution.history_bloat_warned_at.is_some(),
+        "history_bloat_warned_at must be stamped once the soft threshold is crossed"
+    );
+
+    let emissions = recording.drain();
+    let history_bloat_hits: Vec<_> = emissions
+        .iter()
+        .filter(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT)
+        .collect();
+    assert_eq!(
+        history_bloat_hits.len(),
+        1,
+        "the soft-threshold counter must fire exactly once per crossing; got: {emissions:?}"
+    );
+    assert!(
+        history_bloat_hits[0]
+            .labels_debug
+            .contains("history_bloat_soft_threshold_probe"),
+        "the emission must be labeled by the workflow type; got: {:?}",
+        history_bloat_hits[0]
+    );
+
+    // Exercise the guarded UPDATE's exactly-once semantics directly against
+    // the real row: a second call for the same already-stamped execution
+    // must be a no-op (`Ok(false)`), proving the
+    // `WHERE history_bloat_warned_at IS NULL` guard is race-safe.
+    let second_mark = store::mark_history_bloat_warned(&mut conn, exec_id)
+        .await
+        .expect("guarded mark must not error on an already-stamped row");
+    assert!(
+        !second_mark,
+        "a second guarded mark on an already-warned execution must return false"
+    );
+}
+
+/// AC4: `history_bloat_warn_fraction = 0.0` (disabled) must never emit,
+/// end-to-end, even though the exact same event counts would otherwise cross
+/// a nonzero threshold. This proves the disabled-fraction wiring through the
+/// real registry/worker path, not just the pure decision function.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("history-bloat-disabled-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: "history_bloat_soft_threshold_probe",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Identical event math to the positive test above -- 3 pre-seeded events
+    // + 1 fresh timer arm = 4, which crosses what would be a 0.5*8=4
+    // threshold. Only `history_bloat_warn_fraction = 0.0` differs.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-1".into(),
+                details: serde_json::json!({}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-2".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default()
+        .with_event_hard_cap(8)
+        .with_history_bloat_warn_fraction(0.0);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "history_bloat_soft_threshold_probe",
+            module: "metrics_integration",
+            handler: history_bloat_soft_threshold_probe,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-history-bloat-disabled", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // There is no "stamped" signal to poll for here (that is the point of
+    // this test), so instead poll until the timer the workflow arms on its
+    // first live cycle is actually recorded -- proof the decision cycle ran
+    // to completion (suspended on the timer) -- then assert the guard column
+    // was never touched.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let history = load_history(&database_url, exec_id).await;
+        let timer_recorded = history
+            .events
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::TimerStarted { .. }));
+        if timer_recorded {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "workflow never reached its suspension point within timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Give the (silent, by design) decision cycle's post-commit block a beat
+    // to have run, since there is no positive signal to await on.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let execution = load_execution(&database_url, exec_id).await;
+    assert_eq!(execution.state, "RUNNING");
+    assert!(
+        execution.history_bloat_warned_at.is_none(),
+        "a disabled (fraction=0.0) soft threshold must never stamp \
+         history_bloat_warned_at, even though the same event count would \
+         otherwise cross a nonzero threshold"
+    );
+
+    let emissions = recording.drain();
+    assert!(
+        !emissions
+            .iter()
+            .any(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT),
+        "a disabled soft threshold must never emit the counter; got: {emissions:?}"
+    );
 }
 
 #[allow(clippy::too_many_lines)]
