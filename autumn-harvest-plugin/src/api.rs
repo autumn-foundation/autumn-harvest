@@ -30799,15 +30799,12 @@ pub(crate) async fn load_history_bloat_workflows(
     let mut query = harvest_workflow_executions::table
         .into_boxed()
         // AC1: "live (non-terminal)" — unconditional, ANDed with any explicit
-        // `state=` filter below.
-        .filter(harvest_workflow_executions::state.ne_all([
-            "COMPLETED",
-            "FAILED",
-            "CANCELLED",
-            "TIMED_OUT",
-            "CONTINUED_AS_NEW",
-            "TERMINATED",
-        ]))
+        // `state=` filter below. Derives from `erase::TERMINAL_STATES`, the
+        // engine's single source of truth for terminal-state classification
+        // (see its doc comment), so this filter can never silently drift from
+        // the states `is_terminal_state`/`resolve_execution_id_by_workflow_id`
+        // (issue #805) recognize as terminal.
+        .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES))
         .filter(
             sql::<Bool>(
                 "(SELECT COUNT(*) FROM harvest_events \

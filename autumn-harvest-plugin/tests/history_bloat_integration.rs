@@ -12,6 +12,9 @@
 //!   (the computed sort has no keyset cursor, so silently mis-ordering a
 //!   paginated response would be worse than a clear rejection).
 
+use std::collections::BTreeMap;
+
+use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -24,6 +27,7 @@ use axum::http::{Request, StatusCode};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
@@ -55,6 +59,52 @@ async fn setup_database() -> (String, ContainerAsync<Postgres>) {
     (database_url, container)
 }
 
+/// Two genuinely separate Postgres databases (mirroring
+/// `workflow_filter_integration.rs::setup_sharded_databases`), so the
+/// cross-shard `min_history_events` fan-out (`build_history_bloat_fanout`) is
+/// exercised end-to-end -- not just its pure in-memory merge/sort/truncate
+/// unit tests.
+async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let shard0_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
+    let shard1_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
+
+    let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+        .await
+        .expect("failed to connect to admin database");
+    diesel::sql_query(format!("CREATE DATABASE {shard0_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("failed to create shard 0 database");
+    diesel::sql_query(format!("CREATE DATABASE {shard1_db}"))
+        .execute(&mut admin_conn)
+        .await
+        .expect("failed to create shard 1 database");
+
+    let base_url = format!("postgres://postgres:postgres@{host}:{port}");
+    let shard0_url = format!("{base_url}/{shard0_db}");
+    let shard1_url = format!("{base_url}/{shard1_db}");
+
+    for shard_url in [&shard0_url, &shard1_url] {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
+            .await
+            .expect("failed to connect to shard database");
+        conn.batch_execute(autumn_harvest::full_migrations_sql())
+            .await
+            .expect("failed to apply harvest migrations to shard database");
+    }
+
+    ((shard0_url, shard1_url), container)
+}
+
 fn build_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
@@ -63,10 +113,21 @@ fn build_pool(database_url: &str) -> DbPool {
         .expect("failed to build test pool")
 }
 
+fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(shard0_url));
+    pools.insert(ShardId::new(1), build_pool(shard1_url));
+    HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
+}
+
 fn build_app(database_url: &str) -> HarvestApiApp {
     let pool = build_pool(database_url);
+    build_app_with_pool(HarvestDbPool::from(pool))
+}
+
+fn build_app_with_pool(pool: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
-    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    api_state.install_storage_pool(pool);
     harvest_api_router(api_state).with_state(test_app_state())
 }
 
@@ -97,10 +158,11 @@ async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, V
 /// is sufficient.
 async fn seed_workflow_with_history_size(
     database_url: &str,
+    shard: ShardId,
     workflow_id: &str,
     extra_events: i32,
 ) -> ExecutionId {
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let exec_id = ExecutionId::new_for_shard(shard);
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect");
@@ -210,13 +272,18 @@ async fn min_history_events_returns_live_executions_sorted_by_size_descending() 
     let app = build_app(&database_url);
 
     // 1 (WorkflowStarted) + extra_events.
-    let _small = seed_workflow_with_history_size(&database_url, "hb-small", 1).await; // total 2
-    let _medium = seed_workflow_with_history_size(&database_url, "hb-medium", 4).await; // total 5
-    let _large = seed_workflow_with_history_size(&database_url, "hb-large", 7).await; // total 8
+    let _small =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-small", 1).await; // total 2
+    let _medium =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-medium", 4).await; // total 5
+    let _large =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-large", 7).await; // total 8
 
     // A terminal execution whose history is larger than every live one above
     // must still be excluded -- AC1's "live (non-terminal)" restriction.
-    let terminal = seed_workflow_with_history_size(&database_url, "hb-terminal-huge", 20).await; // total 21
+    let terminal =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-terminal-huge", 20)
+            .await; // total 21
     force_execution_state(&database_url, terminal, "COMPLETED").await;
 
     let (status, body) = get_json(&app, "/workflows?min_history_events=5").await;
@@ -262,6 +329,36 @@ async fn min_history_events_returns_live_executions_sorted_by_size_descending() 
     assert_eq!(history_event_count_of(medium_row), 5);
 }
 
+/// `min_history_events=0` is a well-defined boundary, not a "disabled"
+/// sentinel: it accepts every live execution regardless of history size
+/// (every recorded count is `>= 0`), and the value is `u64`-parseable so it
+/// is never confused with AC7's rejection path.
+#[tokio::test]
+async fn min_history_events_zero_returns_every_live_execution() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // Smallest possible live history: just the single `WorkflowStarted`
+    // event (0 extra padding rows), total `history_event_count == 1`.
+    let _tiny = seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-tiny", 0).await;
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=0").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"hb-tiny".to_string()),
+        "min_history_events=0 must match even a minimal 1-event history; got {ids:?}"
+    );
+
+    let rows = body.as_array().unwrap();
+    let tiny_row = rows
+        .iter()
+        .find(|r| r["workflow_id"] == "hb-tiny")
+        .expect("hb-tiny row");
+    assert_eq!(history_event_count_of(tiny_row), 1);
+}
+
 /// The general-purpose `min_history_events` filter (issue #493) is
 /// unaffected: without triggering the dedicated discovery path (this route
 /// only activates it, so a state filter or the absence of the param at all
@@ -279,9 +376,11 @@ async fn min_history_events_excludes_every_terminal_state() {
         ("hb-failed", "FAILED"),
         ("hb-cancelled", "CANCELLED"),
         ("hb-timed-out", "TIMED_OUT"),
+        ("hb-continued-as-new", "CONTINUED_AS_NEW"),
         ("hb-terminated", "TERMINATED"),
     ] {
-        let exec_id = seed_workflow_with_history_size(&database_url, label, 9).await;
+        let exec_id =
+            seed_workflow_with_history_size(&database_url, ShardId::new(0), label, 9).await;
         force_execution_state(&database_url, exec_id, state).await;
     }
 
@@ -351,4 +450,97 @@ async fn min_history_events_combined_with_order_returns_400() {
 
     let (status, body) = get_json(&app, "/workflows?min_history_events=1&order=asc").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
+}
+
+// ─── AC1: cross-shard fan-out ───────────────────────────────────────────────
+
+/// AC1 says "fanned out across shards, sorted by history size descending" --
+/// exercised here against two *genuinely separate* Postgres databases (not
+/// just `build_history_bloat_fanout`'s pure in-memory merge/sort/truncate
+/// unit tests), proving the real HTTP path performs a global sort across
+/// shards rather than concatenating each shard's already-sorted page (which
+/// would silently misorder a large shard-1 row after a small shard-0 one).
+#[tokio::test]
+async fn min_history_events_merges_and_sorts_globally_across_shards() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool = build_two_shard_pool(&shard0_url, &shard1_url);
+    let app = build_app_with_pool(pool);
+
+    // Shard 0: one above-threshold row (total 6), one below-threshold row.
+    let _shard0_large =
+        seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-shard0-large", 5).await; // total 6
+    let _shard0_small =
+        seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-shard0-small", 1).await; // total 2
+
+    // Shard 1: one above-threshold row that is *larger* than shard 0's, so a
+    // correct global sort must place it first -- proving the merge isn't
+    // just "shard 0's page, then shard 1's page".
+    let _shard1_larger = seed_workflow_with_history_size(
+        &shard1_url,
+        ShardId::new(1),
+        "hb-shard1-larger",
+        11, // total 12
+    )
+    .await;
+    let _shard1_small =
+        seed_workflow_with_history_size(&shard1_url, ShardId::new(1), "hb-shard1-small", 0).await; // total 1
+
+    // A terminal row on shard 1, larger than everything else, must still be
+    // excluded even though it is on the "other" shard from the live rows.
+    let shard1_terminal = seed_workflow_with_history_size(
+        &shard1_url,
+        ShardId::new(1),
+        "hb-shard1-terminal",
+        30, // total 31
+    )
+    .await;
+    force_execution_state(&shard1_url, shard1_terminal, "COMPLETED").await;
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=5").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"hb-shard0-large".to_string()),
+        "shard 0's above-threshold row must be present; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"hb-shard1-larger".to_string()),
+        "shard 1's above-threshold row must be present; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"hb-shard0-small".to_string()),
+        "shard 0's below-threshold row must be excluded; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"hb-shard1-small".to_string()),
+        "shard 1's below-threshold row must be excluded; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"hb-shard1-terminal".to_string()),
+        "a terminal row must never appear, regardless of shard or history size; got {ids:?}"
+    );
+
+    // Global descending sort: shard 1's larger row (12) must precede shard
+    // 0's row (6) -- a per-shard-then-concatenate merge would get this
+    // backwards (shard 0 first, since it's the default shard queried first).
+    let shard1_pos = ids.iter().position(|id| id == "hb-shard1-larger").unwrap();
+    let shard0_pos = ids.iter().position(|id| id == "hb-shard0-large").unwrap();
+    assert!(
+        shard1_pos < shard0_pos,
+        "results must be sorted by history size descending across shards, \
+         not concatenated per-shard; got order {ids:?}"
+    );
+
+    let rows = body.as_array().unwrap();
+    let shard1_row = rows
+        .iter()
+        .find(|r| r["workflow_id"] == "hb-shard1-larger")
+        .expect("hb-shard1-larger row");
+    assert_eq!(history_event_count_of(shard1_row), 12);
+    let shard0_row = rows
+        .iter()
+        .find(|r| r["workflow_id"] == "hb-shard0-large")
+        .expect("hb-shard0-large row");
+    assert_eq!(history_event_count_of(shard0_row), 6);
 }

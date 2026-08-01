@@ -436,6 +436,32 @@ async fn wait_for_nd_block(database_url: &str, exec_id: ExecutionId) -> Workflow
     .expect("execution did not non-terminally block on non-determinism within timeout")
 }
 
+/// Wait until a recorded `TimerStarted { timer_id, .. }` event with the given
+/// id appears in the execution's history -- the durable, unambiguous proof
+/// that a specific live decision cycle actually ran (rather than merely
+/// polling a coarser state signal that a *later* cycle could satisfy too).
+async fn wait_for_timer_started(database_url: &str, exec_id: ExecutionId, timer_id: &str) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let history = load_history(database_url, exec_id).await;
+            let found = history.events.iter().any(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::TimerStarted { timer_id: id, .. } if id.as_str() == timer_id
+                )
+            });
+            if found {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("TimerStarted({timer_id}) never appeared in history within timeout")
+    });
+}
+
 fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
@@ -650,6 +676,48 @@ fn history_bloat_soft_threshold_probe<'a>(
             .side_effect("padding-2", || serde_json::json!({}))
             .map_err(|error| error.to_string())?;
         ctx.timer("history-bloat-soft-threshold-wait", 3_600)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
+/// Issue #704 (AC3 exactly-once, double-suspension): parks on a SHORT
+/// (genuinely-firing) timer first, so the SAME execution is driven through a
+/// second, real, live `WorkflowOutcome::Suspended` decision cycle -- proving
+/// the counter's exactly-once guarantee end-to-end across two real cycles,
+/// not just via a second *direct* `store::mark_history_bloat_warned` call
+/// from test code (which the sibling
+/// `history_bloat_counter_fires_once_when_a_still_suspended_execution_crosses_the_soft_threshold`
+/// test already covers, but only proves the SQL guard is race-safe -- not
+/// that a genuine second live cycle actually respects it). After the short
+/// timer fires and the workflow replays past it, it parks again on a long,
+/// never-firing timer so the test can safely observe final state.
+fn history_bloat_double_suspension_probe<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: serde_json::Value = ctx
+            .side_effect("padding-1", || serde_json::json!({}))
+            .map_err(|error| error.to_string())?;
+        let _: serde_json::Value = ctx
+            .side_effect("padding-2", || serde_json::json!({}))
+            .map_err(|error| error.to_string())?;
+        // Cycle 1 suspends here. The soft threshold is crossed on this very
+        // cycle (see the test's cap/fraction setup), so the counter must
+        // fire exactly once as this timer's `TimerStarted` is persisted.
+        ctx.timer("history-bloat-first-suspension", 1)
+            .await
+            .map_err(|error| error.to_string())?;
+        // Cycle 2: the short timer above fired, waking this execution for a
+        // genuine SECOND live decision cycle. Replaying the two side effects
+        // and the now-fired first timer contributes no new events; only the
+        // fresh long timer below is new. The soft threshold was already
+        // crossed in cycle 1 (`history_bloat_warned_at` is already stamped),
+        // so this cycle's crossing check must be a no-op -- the counter must
+        // NOT fire a second time.
+        ctx.timer("history-bloat-second-suspension", 3_600)
             .await
             .map_err(|error| error.to_string())?;
         Ok(serde_json::json!({"unreachable": true}))
@@ -1930,6 +1998,223 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
     assert!(
         !second_mark,
         "a second guarded mark on an already-warned execution must return false"
+    );
+}
+
+/// AC3 exactly-once, proven across TWO genuine live decision cycles rather
+/// than a second *direct* `store::mark_history_bloat_warned` test call: the
+/// same execution crosses the soft threshold on cycle 1 (fires the counter
+/// once), then a real timer fire drives a second, independent, live
+/// `WorkflowOutcome::Suspended` cycle for the SAME execution -- and the
+/// counter must NOT fire again, because `history_bloat_warned_at` is already
+/// stamped by then.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspension_cycles() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("history-bloat-double-suspension-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: "history_bloat_double_suspension_probe",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Same shape as the single-suspension test: WorkflowStarted + 2 inert
+    // markers (3 events loaded), so cycle 1's fresh `ctx.timer(...)` (the
+    // handler's first live call) contributes exactly one new event, crossing
+    // cap=8, fraction=0.5 -> threshold=4 (3 loaded + 1 this cycle = 4 >= 4).
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-1".into(),
+                details: serde_json::json!({}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-2".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default()
+        .with_event_hard_cap(8)
+        .with_history_bloat_warn_fraction(0.5);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "history_bloat_double_suspension_probe",
+            module: "metrics_integration",
+            handler: history_bloat_double_suspension_probe,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-history-bloat-double-suspension", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Cycle 1: the soft threshold is crossed and the counter fires exactly
+    // once, mirroring the single-suspension test above.
+    let execution_after_cycle_one = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let ex = load_execution(&database_url, exec_id).await;
+            if ex.history_bloat_warned_at.is_some() {
+                break ex;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("history-bloat soft threshold was never stamped within timeout (cycle 1)");
+    assert_eq!(
+        execution_after_cycle_one.state, "RUNNING",
+        "a soft-threshold crossing must never terminalize the execution"
+    );
+
+    let emissions_after_cycle_one = recording.drain();
+    let hits_after_cycle_one = emissions_after_cycle_one
+        .iter()
+        .filter(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT)
+        .count();
+    assert_eq!(
+        hits_after_cycle_one,
+        1,
+        "the counter must fire exactly once on the crossing cycle; got: {emissions_after_cycle_one:?}"
+    );
+
+    // Cycle 2: the SHORT `history-bloat-first-suspension` timer (1s) fires
+    // for real, waking this SAME execution for a genuine second live
+    // decision cycle. The workflow replays past the two side effects and the
+    // now-fired first timer (no new events for those), then arms a fresh,
+    // long, never-firing timer -- proving cycle 2 actually ran end-to-end.
+    wait_for_timer_started(&database_url, exec_id, "history-bloat-second-suspension").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let execution_after_cycle_two = load_execution(&database_url, exec_id).await;
+    assert_eq!(
+        execution_after_cycle_two.state, "RUNNING",
+        "the execution must still be running after the second suspension cycle"
+    );
+    assert!(
+        execution_after_cycle_two.history_bloat_warned_at.is_some(),
+        "history_bloat_warned_at must remain stamped after the second cycle"
+    );
+    assert_eq!(
+        execution_after_cycle_two.history_bloat_warned_at,
+        execution_after_cycle_one.history_bloat_warned_at,
+        "the stamped timestamp must not change on a second (already-warned) crossing"
+    );
+
+    // The headline assertion: draining again after the genuine second live
+    // suspension cycle must show ZERO new `harvest.workflow.history_bloat`
+    // emissions -- the counter fired exactly once across both real cycles,
+    // not once per suspension.
+    let emissions_after_cycle_two = recording.drain();
+    let has_second_hit = emissions_after_cycle_two
+        .iter()
+        .any(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT);
+    assert!(
+        !has_second_hit,
+        "the counter must NOT fire again on a second live suspension cycle of an \
+         already-warned execution; got: {emissions_after_cycle_two:?}"
     );
 }
 
