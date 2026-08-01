@@ -661,9 +661,13 @@ fn history_cap_never_finishing_child<'a>(
 /// legacy `MarkerRecorded { name: "side_effect:{name}" }` event genuinely
 /// matches/consumes a `ctx.side_effect(name, ...)` call, unlike an orphan
 /// marker the code never touches), then parks on a fresh, unpolled long
-/// timer so the worker observes a genuine `WorkflowOutcome::Suspended` --
-/// the soft-threshold early-warning counter's only gate (it never fires on
-/// Completed/Failed/ContinueAsNew).
+/// timer so the worker observes a genuine `WorkflowOutcome::Suspended`.
+///
+/// Reused by two tests with different `event_hard_cap` values: a generous
+/// cap (8) drives the plain `Suspended`-persist soft-threshold path, while a
+/// tight cap (4) drives the SAME decision through the terminal
+/// `fail_workflow_for_history_cap` hard-cap path instead (PR #1139 review,
+/// finding #1) -- the soft-threshold counter must fire on both.
 fn history_bloat_soft_threshold_probe<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -1998,6 +2002,231 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
     assert!(
         !second_mark,
         "a second guarded mark on an already-warned execution must return false"
+    );
+}
+
+/// PR #1139 review (finding #1): the soft-threshold early-warning must still
+/// fire even when the SAME decision cycle that crosses it ALSO reaches (or
+/// exceeds) the event-count hard cap and takes the terminal
+/// `fail_workflow_for_history_cap` DLQ path instead of a normal
+/// `WorkflowOutcome::Suspended` persist. An earlier cut only checked the soft
+/// threshold inside the `Suspended` persist branch, so a workflow whose
+/// history bloat is severe enough to trip the hard cap in a single decision
+/// -- arguably the MOST important case for an early-warning signal -- never
+/// got a warning at all: it went straight from "healthy" to "DLQ'd" with the
+/// soft-threshold counter skipped entirely.
+///
+/// Reuses `history_bloat_soft_threshold_probe`'s exact handler and
+/// pre-seeding pattern (3 events pre-seeded: `WorkflowStarted` + two inert
+/// markers; the handler's only live call is a fresh `ctx.timer(...)`, adding
+/// exactly one new event -- see that test's own comment for the arithmetic),
+/// but with `event_hard_cap` lowered to 4 (from 8) so that this decision's
+/// `current_history_event_count` (3 loaded + 1 new = 4) satisfies
+/// `event_count >= cap` (4 >= 4) and routes through the hard-cap
+/// `fail_workflow_for_history_cap` path (the "main"/non-local-activity call
+/// site) rather than the soft-threshold-only `Suspended` persist branch the
+/// sibling test above exercises. `fraction` stays 0.5, so the soft threshold
+/// (`(4.0 * 0.5) as u64 = 2`) is also crossed in this same decision (4 >= 2).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_hard_cap() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("history-bloat-hard-cap-warn-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: "history_bloat_soft_threshold_probe",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Pre-seed the identical 3 events the sibling soft-threshold test uses --
+    // see that test's comment for the exact event-count arithmetic.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-1".into(),
+                details: serde_json::json!({}),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:padding-2".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    // cap=4, fraction=0.5 -> threshold=(4.0*0.5) as u64=2. This decision's
+    // event count (3 loaded + 1 new timer arm = 4) satisfies BOTH
+    // `event_count >= cap` (4 >= 4, hard-cap path) AND
+    // `event_count >= threshold` (4 >= 2, soft-threshold crossing) at once.
+    let policy = WorkflowHistoryPolicy::default()
+        .with_event_hard_cap(4)
+        .with_history_bloat_warn_fraction(0.5);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "history_bloat_soft_threshold_probe",
+            module: "metrics_integration",
+            handler: history_bloat_soft_threshold_probe,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-history-bloat-hard-cap-warn", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Unlike the sibling soft-threshold test, this execution DOES reach a
+    // terminal state -- the hard cap fails it. Poll for that terminal state
+    // rather than the (still-eventually-true) `history_bloat_warned_at`
+    // guard column, so a regression that skips the mark entirely times out
+    // clearly instead of racing a state check that would pass anyway.
+    let execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let error = execution
+        .error
+        .clone()
+        .expect("hard cap should fail execution");
+    assert!(
+        error.contains("HistoryCapExceeded"),
+        "execution error should identify the hard-cap reason, got: {error}"
+    );
+
+    // The finding-#1 regression proof: the hard-cap DLQ path must ALSO mark
+    // the soft-threshold guard column, not just terminally fail the run.
+    assert!(
+        execution.history_bloat_warned_at.is_some(),
+        "history_bloat_warned_at must be stamped even when the SAME decision \
+         reaches the hard cap and terminally fails the execution"
+    );
+
+    let emissions = recording.drain();
+    let history_bloat_hits: Vec<_> = emissions
+        .iter()
+        .filter(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT)
+        .collect();
+    assert_eq!(
+        history_bloat_hits.len(),
+        1,
+        "the soft-threshold counter must fire exactly once even on the \
+         hard-cap terminal-fail path; got: {emissions:?}"
+    );
+    assert!(
+        history_bloat_hits[0]
+            .labels_debug
+            .contains("history_bloat_soft_threshold_probe"),
+        "the emission must be labeled by the workflow type; got: {:?}",
+        history_bloat_hits[0]
+    );
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
+        .await
+        .expect("failed to list DLQ rows");
+    let dlq_row = dead_letters
+        .iter()
+        .find(|row| row.workflow_exec_id == Some(exec_id.as_uuid()))
+        .expect("hard-cap offender must be moved to DLQ");
+    assert!(
+        dlq_row.error.contains("HistoryCapExceeded"),
+        "DLQ reason should identify the hard cap, got: {}",
+        dlq_row.error
     );
 }
 

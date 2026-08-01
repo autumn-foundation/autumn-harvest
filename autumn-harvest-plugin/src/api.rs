@@ -8047,6 +8047,22 @@ async fn list_workflows(
 ) -> Result<axum::response::Response, AutumnError> {
     use axum::response::IntoResponse as _;
     let filters = parse_workflow_filters(&pairs)?;
+    // PR #1139 review: `no_progress_minutes` (stalled-workflow discovery,
+    // issue #486) and `history_bloat_min_events` (history-bloat discovery,
+    // issue #704) are two dedicated, mutually-exclusive discovery paths —
+    // each computes and sorts by a *different* value (staleness vs. current
+    // history size) that the other loader neither computes nor honors.
+    // Silently letting one win (whichever branch is checked first) would
+    // drop the other filter without telling the caller. Reject the
+    // combination up front with a clear `400`, matching the existing
+    // pagination-combo precedent below (AC7: never a silent, mis-filtered
+    // page).
+    if filters.no_progress_minutes.is_some() && filters.history_bloat_min_events.is_some() {
+        return Err(AutumnError::bad_request_msg(
+            "no_progress_minutes and history_bloat_min_events are two separate discovery paths \
+             (stalled-workflow vs. history-bloat) and cannot be combined in one request",
+        ));
+    }
     if filters.no_progress_minutes.is_some() {
         // Stalled-workflow discovery (issue #486). On the happy path this is a
         // bare array (cursor pagination is not supported here); when a shard is
@@ -30816,7 +30832,7 @@ pub(crate) async fn load_history_bloat_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<StalledWorkflowRow>> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{BigInt, Bool, Text};
+    use diesel::sql_types::{BigInt, Bool, Jsonb, Text};
     use std::collections::HashMap;
 
     let Some(min_events) = filters.history_bloat_min_events else {
@@ -30863,6 +30879,14 @@ pub(crate) async fn load_history_bloat_workflows(
         &filters.search_attrs,
         &filters.search_attr_predicates,
     );
+    // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling --
+    // omitting it here silently broadened the result to unrelated bloated
+    // executions instead of narrowing to the ones actually blocked by the
+    // named cause (e.g. non-determinism) when the two filters are combined.
+    if let Some(cause) = &filters.failure_cause {
+        let predicate = serde_json::json!({ "failure_cause": cause });
+        query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
+    }
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
     }

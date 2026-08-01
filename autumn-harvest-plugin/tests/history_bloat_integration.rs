@@ -24,6 +24,15 @@
 //! - composes with `page_size`/`order` pagination (the paginated object
 //!   response shape, not the `400` `history_bloat_min_events` produces for
 //!   the same params).
+//!
+//! Two further PR #1139 review findings, each with a dedicated regression
+//! test at the end of this file:
+//! - finding #3: `failure_cause` (issue #506) must narrow the
+//!   `history_bloat_min_events` results, not be silently ignored;
+//! - finding #4: `no_progress_minutes` (issue #486, stalled-workflow
+//!   discovery) and `history_bloat_min_events` are mutually-exclusive
+//!   discovery paths and must be rejected with `400` when combined, rather
+//!   than letting one silently win.
 
 use std::collections::BTreeMap;
 
@@ -258,6 +267,22 @@ async fn force_execution_state(database_url: &str, exec_id: ExecutionId, state: 
         .execute(&mut conn)
         .await
         .expect("force execution state");
+}
+
+/// Force an execution's `search_attrs` column directly (bypassing a real
+/// worker) -- mirrors `force_execution_state`'s pattern; used to seed the
+/// `failure_cause` composition regression test (PR #1139 review, finding #3)
+/// below.
+async fn force_search_attrs(database_url: &str, exec_id: ExecutionId, search_attrs: Value) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect");
+    diesel::sql_query("UPDATE harvest_workflow_executions SET search_attrs = $1 WHERE id = $2")
+        .bind::<diesel::sql_types::Jsonb, _>(search_attrs)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("force search_attrs");
 }
 
 fn workflow_ids_of(arr: &Value) -> Vec<String> {
@@ -680,5 +705,83 @@ async fn min_history_events_composes_with_order_pagination() {
         body.is_object() && body.get("workflows").is_some(),
         "an `order` param was supplied, so the response must use the \
          paginated object shape; got {body}"
+    );
+}
+
+// ─── PR #1139 review (finding #3): `failure_cause` composition ────────────
+
+/// `failure_cause` (issue #506 discovery filter) must compose with
+/// `history_bloat_min_events` and narrow its results -- before the fix,
+/// `load_history_bloat_workflows` silently ignored `failure_cause` entirely,
+/// so combining the two params returned every above-threshold row regardless
+/// of its recorded failure cause instead of narrowing to the ones the caller
+/// actually asked for.
+#[tokio::test]
+async fn history_bloat_min_events_composes_with_failure_cause() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let matching =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-cause-match", 9).await; // total 10
+    force_search_attrs(
+        &database_url,
+        matching,
+        json!({ "failure_cause": "non_determinism" }),
+    )
+    .await;
+
+    let other_cause =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-cause-other", 9).await; // total 10
+    force_search_attrs(
+        &database_url,
+        other_cause,
+        json!({ "failure_cause": "poison_pill" }),
+    )
+    .await;
+
+    // No `failure_cause` recorded at all -- also above threshold. Before the
+    // fix this was returned unconditionally alongside `hb-cause-match`.
+    let _no_cause =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-cause-none", 9).await; // total 10
+
+    let (status, body) = get_json(
+        &app,
+        "/workflows?history_bloat_min_events=5&failure_cause=non_determinism",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let ids = workflow_ids_of(&body);
+    assert_eq!(
+        ids,
+        vec!["hb-cause-match".to_string()],
+        "failure_cause must narrow the history-bloat discovery results to \
+         only the matching cause, excluding both a differently-caused row \
+         and an uncaused row that satisfy history_bloat_min_events alone; \
+         got {ids:?}"
+    );
+}
+
+// ─── PR #1139 review (finding #4): mutually-exclusive discovery paths ─────
+
+/// `no_progress_minutes` (stalled-workflow discovery, issue #486) and
+/// `history_bloat_min_events` (this feature) are two separate,
+/// mutually-exclusive discovery paths -- each sorts by a different computed
+/// value the other loader neither computes nor honors. Combining them must
+/// be rejected with a clear `400` rather than silently letting one win.
+#[tokio::test]
+async fn history_bloat_min_events_combined_with_no_progress_minutes_returns_400() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let (status, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&history_bloat_min_events=5",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
+    assert!(
+        body.is_object(),
+        "a 400 must carry a JSON error object; got {body}"
     );
 }

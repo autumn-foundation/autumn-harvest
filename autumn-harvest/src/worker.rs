@@ -10885,19 +10885,25 @@ async fn move_workflow_to_dlq_for_history_cap(
 /// Pure decision for the operator early-warning soft threshold on workflow
 /// history bloat (issue #704, AC3/AC4).
 ///
-/// Returns `true` iff a still-RUNNING execution's history event count has
-/// JUST crossed `fraction * cap` for the first time -- i.e. `already_warned`
-/// is `false`, `fraction` is a strictly-positive (non-disabled) configured
-/// value, and `current_history_event_count` has reached the computed
-/// threshold. Never `true` when `already_warned` (the caller must not
-/// re-stamp an execution that already crossed the threshold on an earlier
-/// cycle) or when `fraction <= 0.0` (the `0.0`/disabled sentinel, AC4).
+/// Returns `true` iff an execution's history event count has JUST crossed
+/// `fraction * cap` for the first time -- i.e. `already_warned` is `false`,
+/// `fraction` is a strictly-positive (non-disabled) configured value, and
+/// `current_history_event_count` has reached the computed threshold. Never
+/// `true` when `already_warned` (the caller must not re-stamp an execution
+/// that already crossed the threshold on an earlier cycle) or when
+/// `fraction <= 0.0` (the `0.0`/disabled sentinel, AC4).
 ///
 /// This is a PURE function of its four inputs -- it performs no I/O and has
 /// no knowledge of the execution's identity, the outcome shape, or whether
-/// the caller is a synthetic canary probe (issue #796). Callers are
-/// responsible for combining this with `matches!(&outcome,
-/// WorkflowOutcome::Suspended { .. })` and `!is_canary` before acting on it.
+/// the caller is a synthetic canary probe (issue #796). Used from two call
+/// shapes: (1) the still-RUNNING `WorkflowOutcome::Suspended` path in
+/// `process_workflow_task`, gated there by callers combining this with
+/// `matches!(&outcome, WorkflowOutcome::Suspended { .. })` and `!is_canary`;
+/// and (2) `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
+/// (PR #1139 review), where a single decision can grow history from below
+/// the soft threshold straight past the hard cap in one inline append batch,
+/// bypassing (1) entirely -- the crossing still happened in the same
+/// decision, so it is evaluated there too rather than silently dropped.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -10916,9 +10922,57 @@ fn history_bloat_threshold_crossed(
     current_history_event_count >= threshold
 }
 
+/// Emits and marks the operator early-warning soft-threshold counter for
+/// workflow history bloat (issue #704, AC3/AC4), if `should_warn` is `true`.
+///
+/// Delivery semantics (PR #1139 review): this is deliberately
+/// **at-least-once, biased toward a rare duplicate over a possible
+/// permanent loss** -- the counter is emitted FIRST, then the durable guard
+/// (`store::mark_history_bloat_warned`, `WHERE history_bloat_warned_at IS
+/// NULL`) is set. If the worker crashes in the narrow window between the
+/// two, `history_bloat_warned_at` stays `NULL`, so a future retry of the
+/// same decision cycle (this codebase's existing crash-recovery mechanism
+/// -- no new machinery introduced here) re-detects the crossing and
+/// re-emits, rather than the mark permanently silencing a signal that was
+/// never actually delivered. This trade-off is deliberate for THIS
+/// counter specifically: unlike a recurring per-cycle counter, the guard
+/// is a one-shot, non-recurring gate -- there is no "next crossing" for a
+/// given execution to fall back on, so a lost-forever failure mode is
+/// worse here than for this codebase's other best-effort telemetry
+/// emissions (`run_deferred_schedule_counter`, `emit_update_result_metrics`,
+/// `emit_unhandled_signal_metrics`), which this function otherwise mirrors:
+/// a failure to persist the mark is logged and swallowed, never fails or
+/// rolls back the caller's already-durable workflow decision. A rare
+/// crash-retry duplicate increment is an accepted cost for an early-WARNING
+/// signal, not a correctness-critical durable record.
+async fn emit_history_bloat_warning_if_crossed(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    should_warn: bool,
+) {
+    if !should_warn {
+        return;
+    }
+    telemetry
+        .metrics
+        .record_workflow_history_bloat(workflow_name);
+    if let Err(error) = store::mark_history_bloat_warned(conn, exec_id).await {
+        tracing::warn!(
+            exec_id = %exec_id,
+            %error,
+            "failed to mark history-bloat early-warning threshold after emitting \
+             the counter (best-effort, not fatal; a future retry of this decision \
+             cycle may re-emit rather than silently losing the signal)"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
     telemetry: &crate::telemetry::TelemetryConfig,
     task: &TaskQueueItem,
     execution: &WorkflowExecution,
@@ -10945,6 +10999,34 @@ async fn fail_workflow_for_history_cap(
         &task.queue_name,
         WorkflowStatus::Failed,
     );
+
+    // Issue #704 (PR #1139 review): every caller here has already confirmed
+    // `event_count >= cap`, and the public configuration surface clamps
+    // `history_bloat_warn_fraction` strictly below `1.0`
+    // (`MAX_HISTORY_BLOAT_WARN_FRACTION`), so the soft threshold was
+    // provably ALSO just crossed in this very decision whenever the
+    // feature is enabled -- mark and emit it here, BEFORE the terminal DLQ
+    // transition below, so a crash between the two leaves the mark
+    // retryable (a future retry of this same task re-enters this function,
+    // observes `already_warned`, and skips re-emitting) rather than lost
+    // forever once the execution seals terminal. Never fires for the
+    // synthetic liveness canary (issue #796), matching the sibling
+    // `WorkflowOutcome::Suspended` path.
+    let should_warn_history_bloat = !crate::canary::is_canary_workflow(&execution.workflow_name)
+        && history_bloat_threshold_crossed(
+            event_count,
+            cap,
+            registry.history_policy().history_bloat_warn_fraction(),
+            execution.history_bloat_warned_at.is_some(),
+        );
+    emit_history_bloat_warning_if_crossed(
+        conn,
+        telemetry,
+        exec_id,
+        &execution.workflow_name,
+        should_warn_history_bloat,
+    )
+    .await;
 
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
@@ -11368,6 +11450,7 @@ async fn process_workflow_task(
                         {
                             let deferred = fail_workflow_for_history_cap(
                                 conn,
+                                registry,
                                 &telemetry,
                                 task,
                                 &prepared.execution,
@@ -11431,6 +11514,7 @@ async fn process_workflow_task(
                         history_events.extend(events);
                         let deferred = fail_workflow_for_history_cap(
                             conn,
+                            registry,
                             &telemetry,
                             task,
                             &prepared.execution,
@@ -11459,6 +11543,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -11602,6 +11687,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -11863,6 +11949,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -12113,6 +12200,7 @@ async fn process_workflow_task(
     {
         let deferred = fail_workflow_for_history_cap(
             conn,
+            registry,
             &telemetry,
             task,
             &prepared.execution,
@@ -12531,29 +12619,18 @@ async fn process_workflow_task(
             // threshold, post-commit, in autocommit -- mirroring
             // `run_deferred_schedule_counter`'s documented discipline: a
             // best-effort write that must never roll back or fail the
-            // durably-persisted workflow decision. The guarded UPDATE
-            // (`WHERE history_bloat_warned_at IS NULL`) makes this
-            // race-safe against a concurrent worker on the same
-            // execution, so only the winner of the race emits the
-            // counter.
-            if should_warn_history_bloat {
-                match store::mark_history_bloat_warned(conn, prepared.exec_id).await {
-                    Ok(true) => {
-                        telemetry
-                            .metrics
-                            .record_workflow_history_bloat(&prepared.execution.workflow_name);
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            exec_id = %prepared.exec_id,
-                            %error,
-                            "failed to mark history-bloat early-warning threshold \
-                             (best-effort, not fatal)"
-                        );
-                    }
-                }
-            }
+            // durably-persisted workflow decision. Shared with
+            // `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
+            // via `emit_history_bloat_warning_if_crossed` so the two call
+            // shapes can never drift.
+            emit_history_bloat_warning_if_crossed(
+                conn,
+                &telemetry,
+                prepared.exec_id,
+                &prepared.execution.workflow_name,
+                should_warn_history_bloat,
+            )
+            .await;
         }
         Err(error) => {
             // Preserve per-path error handling: a terminal-with-commands persist

@@ -1371,9 +1371,15 @@ fleet-wide `HarvestBuilder::max_workflow_history_events` ceiling from issue
 the same still-`RUNNING` execution that would eventually hit it is instead
 warned once — the first time its recorded history crosses a configurable
 fraction of that cap (`history_bloat_warn_fraction`, default **75%**,
-`0` disables the signal entirely). The counter increments exactly once per
-crossing per execution; the run itself is completely unaffected and keeps
-executing normally. If nothing intervenes, continued growth will eventually
+`0` disables the signal entirely). The counter increments once per crossing
+per execution (delivery is at-least-once — see the last triage step below);
+the run itself is completely unaffected and keeps executing normally. A
+single decision cycle can also grow history from below the soft threshold
+straight past the hard cap in one shot (e.g. a batched local-activity or
+external-signal append); in that case the same crossing is caught and
+emitted right before the execution is terminally force-failed, so the
+warning still fires even for a run that never spends a cycle "just barely
+over the soft line." If nothing intervenes, continued growth will eventually
 reach the hard cap, at which point the execution is terminally force-failed
 and moved to the dead-letter queue — this alert exists to give an operator a
 window to act *before* that happens.
@@ -1401,9 +1407,15 @@ window to act *before* that happens.
    without ever checkpointing.
 4. Check whether the execution has already been warned before
    (`history_bloat_warned_at` on the execution row, surfaced by the describe
-   endpoint) — the counter and the field both fire exactly once, so a
-   repeat page for the *same* execution means it kept growing past the first
-   warning and is now closer to the hard cap.
+   endpoint) — the guard field is set once and only once per execution
+   (idempotent across replays/retries), so a repeat page naming the *same*
+   execution means it kept growing past the first warning and is now closer
+   to the hard cap. The counter itself is delivered at-least-once: it is
+   emitted just before the guard is durably persisted, so a worker crash in
+   that narrow window can rarely cause one extra increment on a retry —
+   treat a lone duplicate-looking page for an execution whose
+   `history_bloat_warned_at` is already set as this benign case, not a
+   second distinct crossing.
 
 ### Likely causes
 
