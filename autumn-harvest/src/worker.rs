@@ -10882,6 +10882,88 @@ async fn move_workflow_to_dlq_for_history_cap(
     Ok((deferred, closed_children))
 }
 
+/// Pure decision for a bounded retry sequence (issue #704, PR #1139
+/// review): given the outcome of each attempt IN ORDER, resolves to the
+/// first `Ok`, or -- if every attempt failed -- the *last* `Err` (the
+/// freshest failure, not the stale first one; an easy off-by-one to get
+/// backwards in a hand-rolled loop, and the one that actually matters for
+/// diagnosing a persistent failure). A fast, DB-free, directly
+/// unit-testable pin of that exact semantic.
+///
+/// `count_history_events_with_retries` below hand-rolls the equivalent
+/// *lazy* loop rather than calling this directly: each attempt there is a
+/// real, costly DB round-trip, so it must stop as soon as one succeeds
+/// instead of eagerly running every attempt regardless of an earlier
+/// success (which is what accepting an already-materialized `Vec` here
+/// would require of a caller). Consequently this function itself has no
+/// production caller -- it exists solely as a fast, DB-free pin of the
+/// decision shape the hand-rolled loop below must match, hence `#[cfg(test)]`.
+#[cfg(test)]
+fn resolve_retry_attempts<T, E>(attempts: Vec<Result<T, E>>) -> Result<T, E> {
+    let mut last_err = None;
+    for attempt in attempts {
+        match attempt {
+            Ok(value) => return Ok(value),
+            Err(error) => last_err = Some(error),
+        }
+    }
+    Err(last_err.expect("caller must supply at least one attempt"))
+}
+
+/// Bounded in-process retry around [`crate::store::count_history_events`]
+/// (issue #704, PR #1139 review).
+///
+/// The caller of this function runs strictly *after* the persist
+/// transaction has already committed (autocommit) -- the workflow's real,
+/// durable decision has already landed regardless of what this read does.
+/// Without a retry, a single transient failure here (a momentary statement
+/// timeout, connection blip, or replica hiccup) silently gives up on this
+/// cycle's chance to mark/emit the soft-threshold warning; the documented
+/// "at-least-once, re-checked on a later decision cycle" fallback only
+/// holds if a later decision cycle actually happens, which is not
+/// guaranteed for an execution that then suspends on a signal or timer that
+/// may never fire again. A few bounded, closely-spaced retries substantially
+/// narrow (without fully eliminating) that window for the concrete failure
+/// mode named by the review -- a transient error clearing within
+/// milliseconds -- at negligible cost.
+///
+/// Deliberately still best-effort: retries are exhausted quietly and the
+/// caller falls through to its existing "skip this cycle's warning"
+/// handling on a persistent failure. Moving this read *inside* the
+/// already-committed persist transaction (so a failure here would abort and
+/// retry the whole workflow decision cycle) was considered and rejected: it
+/// would let a best-effort telemetry read delay or fail the workflow's
+/// actual, durable progress, directly contradicting this code path's
+/// explicit contract -- see [`emit_history_bloat_warning_if_crossed`]'s doc
+/// comment, and the multiple earlier review rounds on this same PR that
+/// settled on "never fail the decision" for this exact metric.
+///
+/// Mirrors [`resolve_retry_attempts`]'s decision shape (short-circuit on
+/// the first success, else surface the last failure) as a lazy loop --
+/// see that function's doc comment for why this is hand-rolled rather than
+/// calling it directly.
+async fn count_history_events_with_retries(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    const ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match crate::store::count_history_events(conn, exec_id).await {
+            Ok(count) => return Ok(count),
+            Err(error) => {
+                last_err = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop body runs at least once, so this is always Some on exhaustion"))
+}
+
 /// Pure decision for the operator early-warning soft threshold on workflow
 /// history bloat (issue #704, AC3/AC4).
 ///
@@ -12692,13 +12774,17 @@ async fn process_workflow_task(
             // estimate -- closing a Codex-review finding where a decision
             // cycle that merely enqueued (never granted) a contended
             // `AcquireMutex` could over-count by one and cross the threshold
-            // a cycle early. A count-query failure degrades to "don't warn
-            // this cycle" rather than risking a false mark or panicking a
-            // best-effort telemetry path.
+            // a cycle early. A bounded retry (issue #704, PR #1139 review --
+            // see `count_history_events_with_retries`'s doc comment) narrows
+            // the window where a transient read failure silently and
+            // permanently drops this execution's one-shot warning chance; a
+            // still-persistent failure degrades to "don't warn this cycle"
+            // rather than risking a false mark or panicking a best-effort
+            // telemetry path.
             let should_warn_history_bloat = if may_warn_history_bloat {
                 match registry.history_policy().event_hard_cap() {
                     Some(cap) => {
-                        match crate::store::count_history_events(conn, prepared.exec_id).await {
+                        match count_history_events_with_retries(conn, prepared.exec_id).await {
                             Ok(durable_count) => history_bloat_threshold_crossed(
                                 durable_count,
                                 cap,
@@ -12710,7 +12796,7 @@ async fn process_workflow_task(
                                     exec_id = %prepared.exec_id,
                                     %error,
                                     "failed to count durable history events for the history-bloat \
-                                     soft-threshold check; skipping this cycle's warning"
+                                     soft-threshold check after retries; skipping this cycle's warning"
                                 );
                                 false
                             }
@@ -16970,6 +17056,40 @@ mod tests {
         // is a sane configuration -- it only computes the threshold predicate.
         assert!(history_bloat_threshold_crossed(0, 0, 0.75, false));
         assert!(history_bloat_threshold_crossed(1, 0, 0.75, false));
+    }
+
+    // ── Bounded retry decision (issue #704, PR #1139 review) ─────────────────
+    // `resolve_retry_attempts` is pure and DB-free, so these exercise the
+    // exact semantic `count_history_events_with_retries`'s hand-rolled lazy
+    // loop mirrors -- no Postgres connection, no async runtime needed.
+
+    #[test]
+    fn resolve_retry_attempts_returns_the_first_success() {
+        let attempts: Vec<Result<u32, &str>> = vec![Err("transient"), Err("transient"), Ok(7)];
+        assert_eq!(resolve_retry_attempts(attempts), Ok(7));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_a_success_at_the_front_wins_over_a_later_entry() {
+        // Proves the first `Ok` is what gets returned, not the last one --
+        // mirrors "a first-try success must not need a later attempt".
+        let attempts: Vec<Result<u32, &str>> = vec![Ok(1), Ok(99)];
+        assert_eq!(resolve_retry_attempts(attempts), Ok(1));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_returns_the_last_error_on_total_failure() {
+        // The freshest failure (attempt 3), not the stale first one -- an
+        // easy off-by-one to get backwards in a hand-rolled loop, and the
+        // one that actually matters for diagnosing a persistent failure.
+        let attempts: Vec<Result<u32, u32>> = vec![Err(1), Err(2), Err(3)];
+        assert_eq!(resolve_retry_attempts(attempts), Err(3));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_a_single_failure_surfaces_it() {
+        let attempts: Vec<Result<u32, &str>> = vec![Err("boom")];
+        assert_eq!(resolve_retry_attempts(attempts), Err("boom"));
     }
 
     // ── Active-workflow population gauge (issue #770) ────────────────────────
