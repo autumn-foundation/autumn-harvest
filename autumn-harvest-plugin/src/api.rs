@@ -1485,9 +1485,15 @@ pub struct StalledWorkflowRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stall_reason: Option<StallReason>,
     /// The execution's current recorded `harvest_events` count, computed on
-    /// read (issue #704, AC2). Populated only when the request set
-    /// `min_history_events` — omitted (never `null`) on every other list
-    /// response so this stays additive and byte-for-byte backward compatible.
+    /// read (issue #704, AC2). Populated only when the request set the
+    /// dedicated `history_bloat_min_events` discovery parameter (served by
+    /// `load_history_bloat_workflows`) — omitted (never `null`) on every
+    /// other list response, INCLUDING the general-purpose, pre-existing
+    /// `min_history_events` filter (issue #493, served by
+    /// `load_stalled_workflows`/`load_workflows`), so this stays additive
+    /// and byte-for-byte backward compatible. See `docs/api-contract.json`
+    /// and PR #1139's review for the two parameters' deliberately distinct
+    /// contracts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_event_count: Option<i64>,
 }
@@ -30673,23 +30679,22 @@ pub(crate) async fn load_stalled_workflows(
         .filter_map(|(id, ts)| ts.map(|t| (id, t)))
         .collect();
 
-    // ── Step 2.5: batch-fetch history_event_count when requested (issue #704,
-    // AC2) ───────────────────────────────────────────────────────────────────
-    // Only queried when the caller actually asked (`min_history_events` set) so
-    // a plain `?no_progress_minutes=N` request pays no extra query cost.
-    let history_event_counts: HashMap<uuid::Uuid, i64> = if filters.min_history_events.is_some() {
-        harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
-            .group_by(harvest_events::workflow_exec_id)
-            .select((harvest_events::workflow_exec_id, diesel::dsl::count_star()))
-            .load::<(uuid::Uuid, i64)>(conn)
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    // Issue #704 (PR #1139 review, Codex P2): `history_event_count` is
+    // documented (`docs/api-contract.json`) as populated ONLY when the
+    // request set `history_bloat_min_events` -- the dedicated AC2 discovery
+    // path served by `load_history_bloat_workflows`, a completely separate
+    // loader `list_workflows` routes to *instead of* this one (the two are
+    // mutually exclusive with `no_progress_minutes`, rejected 400 together).
+    // This function (`load_stalled_workflows`, the `no_progress_minutes`
+    // path) must therefore NEVER populate the field -- not even when the
+    // pre-existing, general-purpose `min_history_events` filter (issue #493)
+    // is also supplied, which composes as a pure row FILTER here (applied
+    // above) and was never meant to change the response shape. An earlier
+    // cut incorrectly ran an extra batch `COUNT(*)` query and populated
+    // `history_event_count` whenever `min_history_events` was set, silently
+    // changing the JSON shape for existing
+    // `?no_progress_minutes=N&min_history_events=M` callers and paying for a
+    // query the response never needed.
 
     // ── Step 3: any runnable task queue row (activity or workflow type) ────────
     // Checking all task_type values mirrors the sleeping-filter predicate so that
@@ -30782,13 +30787,14 @@ pub(crate) async fn load_stalled_workflows(
             } else {
                 StallReason::NoPendingWork
             });
-            let history_event_count = history_event_counts.get(&id).copied();
             StalledWorkflowRow {
                 execution,
                 last_event_at,
                 last_event_age_seconds,
                 stall_reason,
-                history_event_count,
+                // Never populated on this (`no_progress_minutes`) path --
+                // see the removed Step 2.5 block's doc comment above.
+                history_event_count: None,
             }
         })
         .collect())

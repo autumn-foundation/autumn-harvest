@@ -40,7 +40,11 @@
 //! - finding C (second review round): the per-shard candidate query is
 //!   bounded to `filters.limit`, ordered by history size descending, *before*
 //!   any full execution row is loaded -- proven correct even when a single
-//!   shard alone has more matching candidates than the global limit.
+//!   shard alone has more matching candidates than the global limit;
+//! - finding b (third review round): `history_event_count` must stay ABSENT
+//!   on the legacy `no_progress_minutes` (stalled-workflow) discovery path
+//!   even when the composed `min_history_events` filter is ALSO satisfied --
+//!   the field is exclusive to the dedicated `history_bloat_min_events` path.
 
 use std::collections::BTreeMap;
 
@@ -260,6 +264,28 @@ async fn seed_workflow_with_history_size(
     }
 
     exec_id
+}
+
+/// Backdate every recorded event for an execution by `hours_ago` hours --
+/// mirrors `stalled_workflow_tests.rs::seed_stalled_workflow`'s backdating
+/// step, factored out here so it composes with `seed_workflow_with_history_size`
+/// (which seeds a specific *event count*, not a specific *staleness*).  Used
+/// to prove a row can satisfy BOTH `no_progress_minutes` (staleness) and
+/// `min_history_events` (count) at once -- PR #1139 review, round 3, finding
+/// b.
+async fn backdate_all_events(database_url: &str, exec_id: ExecutionId, hours_ago: i64) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect");
+    diesel::sql_query(
+        "UPDATE harvest_events SET timestamp = NOW() - ($1 * INTERVAL '1 hour') \
+         WHERE workflow_exec_id = $2",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(hours_ago)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("backdate events");
 }
 
 /// Force an execution's persisted state directly (bypassing a real worker) --
@@ -856,6 +882,61 @@ async fn history_bloat_min_events_combined_with_no_progress_minutes_returns_400(
     assert!(
         body.is_object(),
         "a 400 must carry a JSON error object; got {body}"
+    );
+}
+
+// ─── PR #1139 review (round 3, finding b): no_progress_minutes must never ──
+// leak `history_event_count`, even when the pre-existing, general-purpose
+// `min_history_events` filter (issue #493) is ALSO supplied and satisfied.
+//
+// `history_event_count` is documented (`docs/api-contract.json`) and
+// specified (`StalledWorkflowRow::history_event_count`'s doc comment) as
+// populated ONLY on the dedicated `history_bloat_min_events` discovery path
+// (`load_history_bloat_workflows`) -- never on the legacy `no_progress_minutes`
+// path (`load_stalled_workflows`), regardless of which OTHER filters compose
+// with it. An earlier revision ran an extra batch `COUNT(*)` query and
+// populated the field whenever `min_history_events` was ALSO set on the
+// `no_progress_minutes` path, silently changing the response shape for
+// existing `?no_progress_minutes=N&min_history_events=M` callers.
+
+/// A row matching BOTH `no_progress_minutes` (stalled) AND the composed
+/// `min_history_events` count threshold must still omit `history_event_count`
+/// entirely from its JSON -- not `null`, ABSENT (the field is
+/// `#[serde(skip_serializing_if = "Option::is_none")]`).
+#[tokio::test]
+async fn no_progress_minutes_composed_with_min_history_events_never_leaks_history_event_count() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // 1 (WorkflowStarted) + 5 padding events = 6 total, satisfying
+    // `min_history_events=4` below.
+    let exec_id =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "no-progress-hb", 5).await;
+
+    // Backdate every recorded event so the execution is ALSO "stalled" --
+    // `no_progress_minutes` requires the MOST RECENT event to be older than
+    // the threshold.
+    backdate_all_events(&database_url, exec_id, 2).await;
+
+    let (status, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=60&min_history_events=4",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+
+    let rows = body.as_array().expect("response must be an array");
+    let row = rows
+        .iter()
+        .find(|r| r["workflow_id"] == "no-progress-hb")
+        .unwrap_or_else(|| panic!("expected the seeded row in the stalled results; body={body}"));
+    assert!(
+        row.get("history_event_count").is_none(),
+        "`history_event_count` must be ABSENT (never populated, not even \
+         `null`) on the `no_progress_minutes` (legacy stalled-workflow) \
+         discovery path -- it is documented (docs/api-contract.json) as \
+         exclusive to the dedicated `history_bloat_min_events` path; got \
+         row={row}"
     );
 }
 

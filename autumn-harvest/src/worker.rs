@@ -12494,31 +12494,29 @@ async fn process_workflow_task(
     // via the #603 gate returning early above, never reaches here on an
     // ND-carrying Failed), so this is a no-op on every non-terminal path.
     let unhandled_signal_metrics = outcome_unhandled_signals(&outcome);
-    // Issue #704: decide (pure, no I/O) whether this cycle should mark the
-    // operator early-warning soft threshold for workflow history bloat.
-    // Computed here -- before the persist transaction moves `outcome` --
-    // and acted on post-commit in the `Persisted` arm below (same
-    // discipline as harvest.update.completed/failed and
-    // harvest.signal.unhandled, issue #684): a ParkedPaused discard or a
-    // persist failure must never mark an execution as "warned" for a
-    // decision cycle that never became durable. Never fires for the
-    // synthetic liveness canary (issue #796) -- it contributes to no
-    // `harvest.workflow.*` business signal, matching the sibling
-    // `record_workflow_completed`/`history_size`/`continue_as_new` gates
-    // right above.
-    let should_warn_history_bloat = !is_canary
+    // Issue #704: capture (pure, no I/O) whether this cycle is even eligible
+    // to mark the operator early-warning soft threshold for workflow history
+    // bloat. Computed here -- before the persist transaction moves `outcome`
+    // -- but the actual *crossing decision* is deliberately deferred to
+    // post-commit (see the `Persisted` arm below), where it is computed
+    // against the true durably-persisted event count rather than this
+    // cycle's prospective `current_history_event_count`. That prospective
+    // count is a deliberately conservative *over-estimate* for several
+    // suspension shapes (e.g. `suspended_command_event_count`'s `AcquireMutex`
+    // branch counts +1 for a contended acquire that only enqueues and grants
+    // nothing) -- fine for the hard-cap preflight above, which only needs to
+    // fail fast on a true overflow, but wrong for a threshold-*crossing*
+    // decision that permanently marks `history_bloat_warned_at`: a decision
+    // cycle one event below threshold that merely enqueues a contended mutex
+    // acquire must not stamp "warned" for a mark that may never actually be
+    // reached. Never fires for the synthetic liveness canary (issue #796) --
+    // it contributes to no `harvest.workflow.*` business signal, matching the
+    // sibling `record_workflow_completed`/`history_size`/`continue_as_new`
+    // gates right above.
+    let may_warn_history_bloat = !is_canary
         && matches!(&outcome, WorkflowOutcome::Suspended { .. })
-        && registry
-            .history_policy()
-            .event_hard_cap()
-            .is_some_and(|cap| {
-                history_bloat_threshold_crossed(
-                    current_history_event_count,
-                    cap,
-                    registry.history_policy().history_bloat_warn_fraction(),
-                    prepared.execution.history_bloat_warned_at.is_some(),
-                )
-            });
+        && registry.history_policy().event_hard_cap().is_some();
+    let history_bloat_already_warned = prepared.execution.history_bloat_warned_at.is_some();
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -12650,6 +12648,42 @@ async fn process_workflow_task(
             // `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
             // via `emit_history_bloat_warning_if_crossed` so the two call
             // shapes can never drift.
+            //
+            // The crossing decision itself is computed here, against the
+            // *true* durably-persisted event count (a fresh, lock-free
+            // `COUNT(*)`), rather than the pre-transaction prospective
+            // estimate -- closing a Codex-review finding where a decision
+            // cycle that merely enqueued (never granted) a contended
+            // `AcquireMutex` could over-count by one and cross the threshold
+            // a cycle early. A count-query failure degrades to "don't warn
+            // this cycle" rather than risking a false mark or panicking a
+            // best-effort telemetry path.
+            let should_warn_history_bloat = if may_warn_history_bloat {
+                match registry.history_policy().event_hard_cap() {
+                    Some(cap) => {
+                        match crate::store::count_history_events(conn, prepared.exec_id).await {
+                            Ok(durable_count) => history_bloat_threshold_crossed(
+                                durable_count,
+                                cap,
+                                registry.history_policy().history_bloat_warn_fraction(),
+                                history_bloat_already_warned,
+                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    exec_id = %prepared.exec_id,
+                                    %error,
+                                    "failed to count durable history events for the history-bloat \
+                                     soft-threshold check; skipping this cycle's warning"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
             emit_history_bloat_warning_if_crossed(
                 conn,
                 &telemetry,

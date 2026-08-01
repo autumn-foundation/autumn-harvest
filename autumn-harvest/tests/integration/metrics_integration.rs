@@ -21,10 +21,14 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
+use autumn_harvest::models::{
+    HarvestMutexWaiter, NewHarvestMutexLock, NewWorkflowExecution, WorkflowExecution,
+};
 use autumn_harvest::queue::{self as queue_mod, EnqueueParams, TaskType};
 use autumn_harvest::schema::harvest_task_queue::dsl as queue_dsl;
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{
+    harvest_mutex_locks, harvest_mutex_waiters, harvest_workflow_executions,
+};
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
@@ -680,6 +684,30 @@ fn history_bloat_soft_threshold_probe<'a>(
             .side_effect("padding-2", || serde_json::json!({}))
             .map_err(|error| error.to_string())?;
         ctx.timer("history-bloat-soft-threshold-wait", 3_600)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({"unreachable": true}))
+    })
+}
+
+/// PR #1139 review (Codex P2): parks on a *contended* `ctx.mutex(key).acquire()`
+/// -- the lock is pre-seeded as held by a phantom holder, so this decision
+/// cycle merely enqueues into `harvest_mutex_waiters` and appends **no**
+/// `MutexGranted` event. `suspended_command_event_count`'s `AcquireMutex`
+/// branch is deliberately conservative and counts +1 regardless of whether the
+/// acquire is actually granted this cycle -- fine for the hard-cap preflight
+/// (which only needs to fail fast on a genuine overflow), but wrong for the
+/// soft-threshold *crossing* decision, which must be based on what was
+/// actually durably persisted.
+fn history_bloat_mutex_waiter_probe<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let key = input["key"].as_str().unwrap_or("k").to_string();
+        let _guard = ctx
+            .mutex(key)
+            .acquire()
             .await
             .map_err(|error| error.to_string())?;
         Ok(serde_json::json!({"unreachable": true}))
@@ -2030,6 +2058,250 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
     assert!(
         !second_mark,
         "a second guarded mark on an already-warned execution must return false"
+    );
+}
+
+/// PR #1139 review (Codex P2): a `Suspended` decision cycle whose only live
+/// call is a *contended* `ctx.mutex(key).acquire()` must NOT stamp
+/// `history_bloat_warned_at` on the strength of the pre-transaction
+/// prospective event-count estimate alone. `suspended_command_event_count`'s
+/// `AcquireMutex` branch deliberately over-counts by +1 (it cannot know,
+/// before the persist transaction runs, whether the acquire will be granted
+/// this cycle or merely enqueued) -- correct for the hard-cap preflight
+/// (fail fast on a genuine overflow), but wrong for the soft-threshold
+/// *crossing* decision, which must reflect what is actually durably
+/// persisted.
+///
+/// Setup: the mutex key is pre-seeded as held by a phantom holder (a
+/// `harvest_mutex_locks` row with a lease far in the future, no relation to
+/// any real execution), so the probe workflow's `AcquireMutex` command can
+/// only enqueue into `harvest_mutex_waiters` -- no `MutexGranted` event is
+/// appended. `event_hard_cap = 4`, `fraction = 0.5` (both exact in binary
+/// floating point: `4.0 * 0.5 = 2.0`, `threshold = 2`).
+///
+/// - Pre-transaction PROSPECTIVE count: 1 (`WorkflowStarted`, pre-seeded) + 1
+///   (the `AcquireMutex` over-count) = 2. `2 >= threshold(2)` -- crosses, so
+///   the pre-fix code stamped `history_bloat_warned_at` here (a false
+///   positive).
+/// - Post-commit DURABLE count: 1 (`WorkflowStarted` only -- the acquire
+///   only enqueued). `1 >= threshold(2)` is false -- must NOT cross.
+///
+/// Also confirms `2 (prospective) < cap(4)`, so the hard-cap preflight (which
+/// legitimately uses the prospective estimate) does not fire either --
+/// isolating this test to the soft-threshold decision alone.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_prospective_over_count()
+ {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mutex_key = format!("history-bloat-mutex-waiter-{}", Uuid::new_v4());
+    let workflow_input = serde_json::json!({"key": mutex_key});
+    let workflow_id = format!("history-bloat-mutex-waiter-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            continued_from_exec_id: None,
+            first_exec_id: None,
+            id: exec_id.as_uuid(),
+            workflow_name: "history_bloat_mutex_waiter_probe",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            chain_execution_timeout: None,
+            chain_deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: None,
+            start_source_ref: None,
+            started_by: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Pre-seed exactly WorkflowStarted (1 event). The handler's only live
+    // call is the contended `ctx.mutex(key).acquire()`, which contributes
+    // the conservative +1 to the PROSPECTIVE count but zero to the DURABLE
+    // count (enqueue-only, no grant this cycle).
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    // Pre-seed the mutex key as held by a phantom holder with a lease far in
+    // the future, so the probe workflow's acquire is genuinely contended: it
+    // can only enqueue, never grant, for the duration of this test.
+    diesel::insert_into(harvest_mutex_locks::table)
+        .values(NewHarvestMutexLock {
+            lock_key: mutex_key.clone(),
+            holder_exec_id: Uuid::new_v4(),
+            lock_seq: 1,
+            lease_expires_at: Utc::now() + chrono::Duration::minutes(5),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to pre-seed held mutex lock");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default()
+        .with_event_hard_cap(4)
+        .with_history_bloat_warn_fraction(0.5);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![WorkflowInfo {
+            mcp: false,
+            name: "history_bloat_mutex_waiter_probe",
+            module: "metrics_integration",
+            handler: history_bloat_mutex_waiter_probe,
+            execution_timeout: None,
+            chain_execution_timeout: None,
+            sla: None,
+            concurrency: None,
+
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-history-bloat-mutex-waiter", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Poll until the decision cycle has run and the acquire has enqueued
+    // (proving the workflow was actually driven through its one live cycle),
+    // then give the (deliberately absent, post-fix) warning a moment to land
+    // if it were ever going to.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let waiter_count: i64 = harvest_mutex_waiters::table
+                .filter(harvest_mutex_waiters::waiter_exec_id.eq(exec_id.as_uuid()))
+                .count()
+                .get_result(&mut conn)
+                .await
+                .expect("failed to count mutex waiter rows");
+            if waiter_count >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("mutex acquire was never enqueued within timeout");
+    // The enqueue above proves the decision cycle committed; give any
+    // (deliberately absent) post-commit warning emission a moment to land.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let waiter_rows: Vec<HarvestMutexWaiter> = harvest_mutex_waiters::table
+        .filter(harvest_mutex_waiters::waiter_exec_id.eq(exec_id.as_uuid()))
+        .load(&mut conn)
+        .await
+        .expect("failed to load mutex waiter rows");
+    assert_eq!(
+        waiter_rows.len(),
+        1,
+        "the acquire must have enqueued exactly one waiter row"
+    );
+
+    let history = load_history(&database_url, exec_id).await;
+    assert_eq!(
+        history.events.len(),
+        1,
+        "no MutexGranted should have been appended -- the lock stayed held \
+         by the phantom holder for the whole test; got: {:?}",
+        history.events
+    );
+
+    let execution = load_execution(&database_url, exec_id).await;
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a contended acquire must leave the execution RUNNING (parked)"
+    );
+    assert!(
+        execution.history_bloat_warned_at.is_none(),
+        "history_bloat_warned_at must stay unset -- the DURABLE event count \
+         (1) never actually reached the threshold (2); only the pre-transaction \
+         PROSPECTIVE estimate (2, from AcquireMutex's conservative +1) did"
+    );
+
+    let emissions = recording.drain();
+    assert!(
+        !emissions
+            .iter()
+            .any(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT),
+        "the soft-threshold counter must not fire for a merely-enqueued \
+         (never granted) contended mutex acquire; got: {emissions:?}"
     );
 }
 

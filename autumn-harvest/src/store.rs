@@ -496,6 +496,36 @@ pub(crate) async fn next_event_id_for(
     Ok(max_id.map_or(0, |id| id.saturating_add(1)))
 }
 
+/// Count an execution's durably-persisted `harvest_events` rows.
+///
+/// Lock-free (no `FOR UPDATE`, no execution-row existence check) and
+/// autocommit-safe -- unlike [`next_event_id_for`], which is meant for
+/// in-transaction use and raises [`crate::error::HarvestError::NotFound`] on
+/// a missing execution. This is a best-effort read intended for post-commit
+/// telemetry decisions (issue #704's history-bloat soft-threshold warning):
+/// the caller must already know the execution exists (it just persisted a
+/// decision cycle for it), so a `NotFound` distinction is unnecessary here
+/// -- an execution with zero rows (impossible in practice) simply counts 0.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub(crate) async fn count_history_events(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    use diesel::dsl::count_star;
+
+    let count: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(count_star())
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// Durably admit an update into a workflow's event history.
 ///
 /// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the

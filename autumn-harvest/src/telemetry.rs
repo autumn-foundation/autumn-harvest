@@ -390,19 +390,36 @@ pub const METRIC_WORKFLOW_SLA_BREACHED: &str = "harvest.workflow.sla_breached";
 
 /// Counter: workflow history bloat early-warning (issue #704).
 ///
-/// Incremented exactly once per run when a still-RUNNING (suspended, not
-/// terminal) workflow execution's recorded history event count first crosses
-/// `history_bloat_warn_fraction * event_hard_cap`.
+/// Fires the moment a workflow execution's recorded `harvest_events` count
+/// first crosses `history_bloat_warn_fraction * event_hard_cap`
+/// (`WorkflowHistoryPolicy`), from **two** emission sites: (1)
+/// `process_workflow_task`'s `Persisted` arm, post-commit, for an execution
+/// that is still RUNNING (non-terminal, `WorkflowOutcome::Suspended`) after
+/// the crossing decision cycle; and (2) `fail_workflow_for_history_cap`, when
+/// a single decision cycle grows history from below the soft threshold
+/// straight past `event_hard_cap` in one inline append batch (e.g.
+/// local-activity or external-signal persistence) -- the crossing still
+/// happened in that same decision, so it is emitted there too, immediately
+/// before the execution is terminally hard-cap-failed and moved to the DLQ.
 ///
-/// This is an **operator early-warning**, not a lifecycle change: the run is
-/// never terminated or otherwise altered by this crossing -- it is purely a
-/// signal that the run is approaching the point where the existing hard-cap
-/// terminal-fail (DLQ) behavior would trigger. A run whose history keeps
-/// growing after crossing the soft threshold does not re-fire this counter --
-/// the guard column (`history_bloat_warned_at`) makes the emission
-/// exactly-once for the life of the execution row (a continue-as-new
+/// **Delivery is at-least-once, not exactly-once**: the counter is emitted
+/// *before* the guard column (`history_bloat_warned_at`) is durably
+/// persisted, so a worker crash in the narrow window between the two leaves
+/// the guard unset and a later retry of the same decision cycle may re-emit
+/// -- a deliberate trade-off (documented on `emit_history_bloat_warning_if_crossed`)
+/// favoring "never silently lose the signal" over "never duplicate it" for a
+/// one-shot, non-recurring gate with no later crossing to fall back on for a
+/// given execution. Once the guard is durably set, the emission is
+/// idempotent for the life of that execution row (a continue-as-new
 /// successor or reset fork is a fresh row and is naturally eligible to warn
 /// again, since it tracks its own history size from zero).
+///
+/// This is an **operator early-warning**, not a lifecycle change on its own:
+/// path (1) never terminates or otherwise alters the run -- it is purely a
+/// signal that the run is approaching the point where the existing hard-cap
+/// terminal-fail (DLQ) behavior would trigger. Path (2) accompanies (not
+/// causes) a termination the hard cap was already going to enforce
+/// regardless of this counter.
 ///
 /// Labeled by `workflow` (workflow name) ONLY -- no `queue` label, unlike its
 /// sibling counters above. The soft-threshold crossing is a property of the
