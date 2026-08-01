@@ -858,12 +858,12 @@
       "severity": "ticket",
       "owner_persona": "workflow owner",
       "description": "A still-running (non-terminal) workflow execution's recorded event history has crossed a configurable fraction (default 75%) of the engine's optional hard history-event-count cap. This is an operator early-warning, not a lifecycle change: the run keeps executing exactly as before, and the counter fires exactly once per crossing per run. Left unaddressed, continued growth risks the execution eventually reaching the hard cap and being terminally force-failed to the dead-letter queue. Typical causes are a workflow that polls or loops without ever calling continue_as_new, or an unexpectedly wide fan-out.",
-      "first_action": "harvest workflow list --min-history-events <threshold>, which returns only live executions at or above that recorded event count, sorted by history size descending with each row's current history_event_count -- rank and triage the largest offenders first.",
+      "first_action": "harvest workflow list --history-bloat-min-events <threshold>, which returns only live executions at or above that recorded event count, sorted by history size descending with each row's current history_event_count -- rank and triage the largest offenders first.",
       "dependencies": [
         {
           "ref": "#704",
           "status": "shipped",
-          "surface": "METRIC_WORKFLOW_HISTORY_BLOAT / harvest.workflow.history_bloat, GET /api/harvest/workflows?min_history_events=<N>, harvest workflow list --min-history-events <N>"
+          "surface": "METRIC_WORKFLOW_HISTORY_BLOAT / harvest.workflow.history_bloat, GET /api/harvest/workflows?history_bloat_min_events=<N>, harvest workflow list --history-bloat-min-events <N>"
         },
         {
           "ref": "ADR-0001",
@@ -882,8 +882,8 @@
         ]
       },
       "management_checks": [
-        "harvest workflow list --min-history-events <threshold>",
-        "GET /api/harvest/workflows?min_history_events=<threshold>"
+        "harvest workflow list --history-bloat-min-events <threshold>",
+        "GET /api/harvest/workflows?history_bloat_min_events=<threshold>"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat"
     },

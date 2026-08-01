@@ -1,7 +1,13 @@
-//! Integration tests for the `min_history_events` operator early-warning
-//! discovery filter on `GET /workflows` (issue #704, AC1/AC2/AC7).
+//! Integration tests for the `history_bloat_min_events` operator early-warning
+//! discovery filter on `GET /workflows` (issue #704, AC1/AC2/AC7), plus a
+//! regression proof (issue #704 / PR #1139 review, P1) that the pre-existing,
+//! general-purpose `min_history_events` filter (issue #493) still composes
+//! freely with `state=`/pagination — the exact composition an earlier
+//! revision of this feature broke by reusing that query-parameter name for
+//! the (functionally incompatible) dedicated discovery path below.
 //!
-//! Verifies, against a real Postgres-backed HTTP router, that the filter:
+//! Verifies, against a real Postgres-backed HTTP router, that
+//! `history_bloat_min_events`:
 //! - returns only live (non-terminal) executions whose current recorded
 //!   history event count is `>= N`, sorted by history size descending (AC1);
 //! - includes each row's current `history_event_count` so callers can
@@ -10,7 +16,14 @@
 //!   error body, never a `500` or a silent empty match (AC7);
 //! - rejects composition with `cursor`/`page_size`/`order` pagination with a `400`
 //!   (the computed sort has no keyset cursor, so silently mis-ordering a
-//!   paginated response would be worse than a clear rejection).
+//!   paginated response would be worse than a clear rejection);
+//!
+//! and that `min_history_events` (issue #493, unchanged) is unaffected:
+//! - composes with `state=` (including terminal states, which
+//!   `history_bloat_min_events` always excludes);
+//! - composes with `page_size`/`order` pagination (the paginated object
+//!   response shape, not the `400` `history_bloat_min_events` produces for
+//!   the same params).
 
 use std::collections::BTreeMap;
 
@@ -61,7 +74,7 @@ async fn setup_database() -> (String, ContainerAsync<Postgres>) {
 
 /// Two genuinely separate Postgres databases (mirroring
 /// `workflow_filter_integration.rs::setup_sharded_databases`), so the
-/// cross-shard `min_history_events` fan-out (`build_history_bloat_fanout`) is
+/// cross-shard `history_bloat_min_events` fan-out (`build_history_bloat_fanout`) is
 /// exercised end-to-end -- not just its pure in-memory merge/sort/truncate
 /// unit tests.
 async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres>) {
@@ -267,7 +280,7 @@ fn history_event_count_of(row: &Value) -> i64 {
 /// returned, sorted by current history size descending. AC2: each row
 /// carries its `history_event_count`.
 #[tokio::test]
-async fn min_history_events_returns_live_executions_sorted_by_size_descending() {
+async fn history_bloat_min_events_returns_live_executions_sorted_by_size_descending() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
@@ -286,7 +299,7 @@ async fn min_history_events_returns_live_executions_sorted_by_size_descending() 
             .await; // total 21
     force_execution_state(&database_url, terminal, "COMPLETED").await;
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=5").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=5").await;
     assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
 
     let ids = workflow_ids_of(&body);
@@ -329,12 +342,12 @@ async fn min_history_events_returns_live_executions_sorted_by_size_descending() 
     assert_eq!(history_event_count_of(medium_row), 5);
 }
 
-/// `min_history_events=0` is a well-defined boundary, not a "disabled"
+/// `history_bloat_min_events=0` is a well-defined boundary, not a "disabled"
 /// sentinel: it accepts every live execution regardless of history size
 /// (every recorded count is `>= 0`), and the value is `u64`-parseable so it
 /// is never confused with AC7's rejection path.
 #[tokio::test]
-async fn min_history_events_zero_returns_every_live_execution() {
+async fn history_bloat_min_events_zero_returns_every_live_execution() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
@@ -342,13 +355,13 @@ async fn min_history_events_zero_returns_every_live_execution() {
     // event (0 extra padding rows), total `history_event_count == 1`.
     let _tiny = seed_workflow_with_history_size(&database_url, ShardId::new(0), "hb-tiny", 0).await;
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=0").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=0").await;
     assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
 
     let ids = workflow_ids_of(&body);
     assert!(
         ids.contains(&"hb-tiny".to_string()),
-        "min_history_events=0 must match even a minimal 1-event history; got {ids:?}"
+        "history_bloat_min_events=0 must match even a minimal 1-event history; got {ids:?}"
     );
 
     let rows = body.as_array().unwrap();
@@ -359,15 +372,14 @@ async fn min_history_events_zero_returns_every_live_execution() {
     assert_eq!(history_event_count_of(tiny_row), 1);
 }
 
-/// The general-purpose `min_history_events` filter (issue #493) is
-/// unaffected: without triggering the dedicated discovery path (this route
-/// only activates it, so a state filter or the absence of the param at all
-/// still behaves as before) a terminal execution IS reachable through the
-/// ordinary `state=` filter composed with `min_history_events` on the
-/// stalled loader's sibling path is out of scope for this file -- this test
-/// only pins that `min_history_events` alone always excludes terminals.
+/// AC1's "live (non-terminal)" restriction applies regardless of state:
+/// `history_bloat_min_events` excludes every terminal state unconditionally
+/// -- unlike the general-purpose `min_history_events` filter (issue #493,
+/// see the `min_history_events_composes_with_state_including_terminal` test
+/// below), which has no such restriction and composes freely with an
+/// explicit `state=` filter, including a terminal one.
 #[tokio::test]
-async fn min_history_events_excludes_every_terminal_state() {
+async fn history_bloat_min_events_excludes_every_terminal_state() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
@@ -384,7 +396,7 @@ async fn min_history_events_excludes_every_terminal_state() {
         force_execution_state(&database_url, exec_id, state).await;
     }
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=1").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=1").await;
     assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
     let ids = workflow_ids_of(&body);
     assert!(
@@ -395,14 +407,14 @@ async fn min_history_events_excludes_every_terminal_state() {
 
 // ─── AC7 ────────────────────────────────────────────────────────────────────
 
-/// AC7: a non-numeric `min_history_events` value returns `400` with a JSON
-/// error body, never a `500` or a silent empty array.
+/// AC7: a non-numeric `history_bloat_min_events` value returns `400` with a
+/// JSON error body, never a `500` or a silent empty array.
 #[tokio::test]
-async fn min_history_events_non_numeric_value_returns_400() {
+async fn history_bloat_min_events_non_numeric_value_returns_400() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=not_a_number").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=not_a_number").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
     assert!(
         body.is_object(),
@@ -410,14 +422,15 @@ async fn min_history_events_non_numeric_value_returns_400() {
     );
 }
 
-/// AC7: a negative `min_history_events` value returns `400`, not a silently
-/// accepted (and meaningless, since counts can't be negative) filter.
+/// AC7: a negative `history_bloat_min_events` value returns `400`, not a
+/// silently accepted (and meaningless, since counts can't be negative)
+/// filter.
 #[tokio::test]
-async fn min_history_events_negative_value_returns_400() {
+async fn history_bloat_min_events_negative_value_returns_400() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=-5").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=-5").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
     assert!(
         body.is_object(),
@@ -427,15 +440,16 @@ async fn min_history_events_negative_value_returns_400() {
 
 // ─── AC1: pagination-combo rejection ───────────────────────────────────────
 
-/// `min_history_events` sorts by a computed value with no keyset cursor, so
-/// combining it with `cursor`/`page_size`/`order` pagination is rejected with a
-/// clear `400` rather than silently mis-ordering (or ignoring) the request.
+/// `history_bloat_min_events` sorts by a computed value with no keyset
+/// cursor, so combining it with `cursor`/`page_size`/`order` pagination is
+/// rejected with a clear `400` rather than silently mis-ordering (or
+/// ignoring) the request.
 #[tokio::test]
-async fn min_history_events_combined_with_page_size_returns_400() {
+async fn history_bloat_min_events_combined_with_page_size_returns_400() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=1&page_size=10").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=1&page_size=10").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
     assert!(
         body.is_object(),
@@ -444,11 +458,11 @@ async fn min_history_events_combined_with_page_size_returns_400() {
 }
 
 #[tokio::test]
-async fn min_history_events_combined_with_order_returns_400() {
+async fn history_bloat_min_events_combined_with_order_returns_400() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=1&order=asc").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=1&order=asc").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400; body={body}");
 }
 
@@ -461,7 +475,7 @@ async fn min_history_events_combined_with_order_returns_400() {
 /// shards rather than concatenating each shard's already-sorted page (which
 /// would silently misorder a large shard-1 row after a small shard-0 one).
 #[tokio::test]
-async fn min_history_events_merges_and_sorts_globally_across_shards() {
+async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let app = build_app_with_pool(pool);
@@ -496,7 +510,7 @@ async fn min_history_events_merges_and_sorts_globally_across_shards() {
     .await;
     force_execution_state(&shard1_url, shard1_terminal, "COMPLETED").await;
 
-    let (status, body) = get_json(&app, "/workflows?min_history_events=5").await;
+    let (status, body) = get_json(&app, "/workflows?history_bloat_min_events=5").await;
     assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
 
     let ids = workflow_ids_of(&body);
@@ -543,4 +557,128 @@ async fn min_history_events_merges_and_sorts_globally_across_shards() {
         .find(|r| r["workflow_id"] == "hb-shard0-large")
         .expect("hb-shard0-large row");
     assert_eq!(history_event_count_of(shard0_row), 6);
+}
+
+// ─── issue #493: `min_history_events` composition (PR #1139 review, P1) ────
+//
+// A prior revision of the `history_bloat_min_events` feature above (issue
+// #704) reused the pre-existing `min_history_events` query-parameter name
+// (issue #493) for its own, functionally incompatible dedicated-discovery
+// trigger — silently breaking every caller who combined `min_history_events`
+// with `state=` or pagination (a semantic merge conflict caught in PR #1139
+// review, since git's line-level merge has no way to detect two independent
+// features colliding on the same identifier). These tests pin the restored,
+// composable behavior directly, so a future regression of this exact kind
+// fails CI rather than shipping silently again.
+
+/// `min_history_events` (issue #493) has no "live-only" restriction and
+/// composes with an explicit `state=` filter -- including a *terminal*
+/// state, which `history_bloat_min_events` above always excludes. Before the
+/// P1 fix, `min_history_events` itself triggered the dedicated (terminal-
+/// excluding) discovery path, so this exact query would have silently
+/// returned an empty array instead of the completed row below.
+#[tokio::test]
+async fn min_history_events_composes_with_state_including_terminal() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    // Terminal, above the threshold: must be returned when explicitly
+    // filtered to `state=COMPLETED`.
+    let completed =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-completed-large", 9)
+            .await; // total 10
+    force_execution_state(&database_url, completed, "COMPLETED").await;
+
+    // Live, but below the threshold: must be excluded by the count filter
+    // regardless of state.
+    let _running_small =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-running-small", 1)
+            .await; // total 2
+
+    // Live and above the threshold, but the wrong state: must be excluded by
+    // the `state=` filter even though it satisfies `min_history_events`.
+    let _running_large =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-running-large", 9)
+            .await; // total 10
+
+    let (status, body) = get_json(&app, "/workflows?state=COMPLETED&min_history_events=5").await;
+    assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
+    assert!(
+        body.is_array(),
+        "no pagination param was supplied, so this must stay the legacy \
+         bare-array shape (never the {{workflows,...}} object); got {body}"
+    );
+
+    let ids = workflow_ids_of(&body);
+    assert!(
+        ids.contains(&"mhe-completed-large".to_string()),
+        "a COMPLETED execution at/above the threshold must be returned when \
+         explicitly requested via state=COMPLETED -- this is the exact \
+         composition the P1 param-collision regression broke; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"mhe-running-small".to_string()),
+        "a RUNNING (non-matching state) execution must be excluded by \
+         state=COMPLETED regardless of history size; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"mhe-running-large".to_string()),
+        "a RUNNING execution above the threshold must still be excluded by \
+         state=COMPLETED; got {ids:?}"
+    );
+}
+
+/// `min_history_events` composes with `page_size` pagination -- unlike
+/// `history_bloat_min_events` above, which rejects that combination with a
+/// `400` because its sort is by a computed, cursor-less value.
+/// `min_history_events` is a plain filter with no such restriction, so
+/// pagination proceeds normally and returns the paginated object shape.
+#[tokio::test]
+async fn min_history_events_composes_with_page_size_pagination() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let _large =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-paginated-large", 9)
+            .await; // total 10
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=5&page_size=10").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "min_history_events + page_size must NOT be rejected (unlike \
+         history_bloat_min_events + pagination); body={body}"
+    );
+    assert!(
+        body.is_object() && body.get("workflows").is_some(),
+        "a pagination param was supplied, so the response must use the \
+         paginated {{workflows, next_cursor, ...}} object shape; got {body}"
+    );
+    let ids = workflow_ids_of(&body["workflows"]);
+    assert!(
+        ids.contains(&"mhe-paginated-large".to_string()),
+        "the above-threshold row must still be present under pagination; got {ids:?}"
+    );
+}
+
+/// Same composition proof as above, for the `order` pagination param.
+#[tokio::test]
+async fn min_history_events_composes_with_order_pagination() {
+    let (database_url, _container) = setup_database().await;
+    let app = build_app(&database_url);
+
+    let _large =
+        seed_workflow_with_history_size(&database_url, ShardId::new(0), "mhe-order-large", 9).await; // total 10
+
+    let (status, body) = get_json(&app, "/workflows?min_history_events=5&order=asc").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "min_history_events + order must NOT be rejected; body={body}"
+    );
+    assert!(
+        body.is_object() && body.get("workflows").is_some(),
+        "an `order` param was supplied, so the response must use the \
+         paginated object shape; got {body}"
+    );
 }

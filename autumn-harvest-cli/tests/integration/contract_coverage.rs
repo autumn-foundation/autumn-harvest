@@ -238,9 +238,11 @@ fn workflow_list_is_covered() {
 }
 
 #[test]
-fn workflow_list_min_history_events_is_covered() {
+fn workflow_list_history_bloat_min_events_is_covered() {
     // Issue #704: operator early-warning discovery for workflow history bloat.
-    assert_covered(&["workflow", "list", "--min-history-events", "5000"]);
+    // Distinct query param from the server's general-purpose
+    // `min_history_events` filter (issue #493) -- see PR #1139 review.
+    assert_covered(&["workflow", "list", "--history-bloat-min-events", "5000"]);
 }
 
 #[test]

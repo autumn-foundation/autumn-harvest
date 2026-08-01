@@ -2173,8 +2173,7 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
         .filter(|e| e.name == METRIC_WORKFLOW_HISTORY_BLOAT)
         .count();
     assert_eq!(
-        hits_after_cycle_one,
-        1,
+        hits_after_cycle_one, 1,
         "the counter must fire exactly once on the crossing cycle; got: {emissions_after_cycle_one:?}"
     );
 

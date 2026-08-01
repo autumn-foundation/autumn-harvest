@@ -1417,7 +1417,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) Still-running executions whose recorded harvest_events count first crossed history_bloat_warn_fraction * event_hard_cap (issue #704, default 75%). Observation-only — the run keeps executing normally; emitted exactly once per crossing per run. Requires event_hard_cap to be configured for the workflow type via WorkflowHistoryPolicy; otherwise this stays flat at zero (disabled), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?min_history_events=<N> or harvest workflow list --min-history-events <N>."
+          "description": "Alert: harvest_workflow_history_bloat (docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat) Still-running executions whose recorded harvest_events count first crossed history_bloat_warn_fraction * event_hard_cap (issue #704, default 75%). Observation-only — the run keeps executing normally; emitted exactly once per crossing per run. Requires event_hard_cap to be configured for the workflow type via WorkflowHistoryPolicy; otherwise this stays flat at zero (disabled), not an outage. Discover and rank offending executions with GET /api/harvest/workflows?history_bloat_min_events=<N> or harvest workflow list --history-bloat-min-events <N>."
         }
       ]
     },

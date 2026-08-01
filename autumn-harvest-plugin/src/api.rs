@@ -3067,7 +3067,19 @@ pub(crate) struct WorkflowFilters {
     /// the literal `"unknown"`, which matches NULL / pre-upgrade rows via `IS NULL`).
     pub(crate) start_source: Option<String>,
     /// Only return executions with at least this many recorded events (issue #493).
+    /// General-purpose: composes freely with `state=`/`order=`/pagination and
+    /// sorts in the caller's chosen order. Distinct from `history_bloat_min_events`
+    /// below (issue #704) — the two must never share a query-parameter name, or a
+    /// caller combining `state=COMPLETED&min_history_events=N` (or pagination)
+    /// would silently get the wrong results instead of the documented ones.
     pub(crate) min_history_events: Option<u64>,
+    /// Operator early-warning discovery for workflow history bloat (issue
+    /// #704, AC1): a dedicated, non-composable path returning only live
+    /// (non-terminal) executions with at least this many recorded events,
+    /// sorted by current history size descending. Deliberately a SEPARATE
+    /// field/query-param from `min_history_events` above — see its doc
+    /// comment for why reusing that name would be a regression.
+    pub(crate) history_bloat_min_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
     pub(crate) order: WorkflowSortOrder,
     /// Keyset cursor decoded from the `cursor` query param (issue #498).
@@ -8049,16 +8061,19 @@ async fn list_workflows(
         )?
         .into_response());
     }
-    if filters.min_history_events.is_some() {
+    if filters.history_bloat_min_events.is_some() {
         // Operator early-warning discovery for workflow history bloat (issue
         // #704, AC1). A dedicated non-terminal-only, sorted-by-size path — see
-        // the `load_history_bloat_workflows` doc comment. Sorting is by a
-        // *computed* value (no stored keyset column), so combining with cursor
-        // pagination is rejected up front (AC7: never a silent, wrongly-ordered
-        // page — always a clear `400`).
+        // the `load_history_bloat_workflows` doc comment. This is a SEPARATE
+        // query param from the general-purpose `min_history_events` (issue
+        // #493) precisely so that filter keeps composing with `state=`/
+        // pagination unchanged — see `WorkflowFilters::min_history_events`.
+        // Sorting is by a *computed* value (no stored keyset column), so
+        // combining with cursor pagination is rejected up front (AC7: never a
+        // silent, wrongly-ordered page — always a clear `400`).
         if filters.paginated {
             return Err(AutumnError::bad_request_msg(
-                "min_history_events is not supported together with cursor/page_size/order \
+                "history_bloat_min_events is not supported together with cursor/page_size/order \
                  pagination; results are sorted by current history size, which has no keyset \
                  cursor",
             ));
@@ -8828,6 +8843,17 @@ pub(crate) fn parse_workflow_filters(
                     ))
                 })?;
                 filters.min_history_events = Some(parsed);
+            }
+            "history_bloat_min_events" => {
+                // Issue #704, AC1/AC7: deliberately a distinct query param from
+                // `min_history_events` above (issue #493) — see the field doc
+                // comment on `WorkflowFilters::history_bloat_min_events`.
+                let parsed = value.trim().parse::<u64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid history_bloat_min_events '{value}'; expected a non-negative integer"
+                    ))
+                })?;
+                filters.history_bloat_min_events = Some(parsed);
             }
             // ── Issue #498: time-range, prefix, and pagination params ────────
             "started_after" => {
@@ -30755,24 +30781,28 @@ pub(crate) async fn load_stalled_workflows(
 // ── Issue #704: operator early-warning discovery for workflow history bloat
 // ─────────────────────────────────────────────────────────────────────────
 //
-// A dedicated `min_history_events` discovery path, distinct from the
-// general-purpose `min_history_events` filter already composable on
-// `load_workflows`/`load_stalled_workflows` (issue #493): AC1 specifically
-// requires the response be (a) restricted to live (non-terminal) executions
-// and (b) sorted by history size descending — neither of which the general
-// filter does (it composes with the caller's own `state=`/`order=` choice).
+// A dedicated `history_bloat_min_events` discovery path, using a query
+// parameter DISTINCT from the pre-existing general-purpose `min_history_events`
+// filter already composable on `load_workflows`/`load_stalled_workflows`
+// (issue #493): AC1 specifically requires the response be (a) restricted to
+// live (non-terminal) executions and (b) sorted by history size descending —
+// neither of which the general filter does (it composes with the caller's
+// own `state=`/`order=`/pagination choice, and must keep doing so). Using a
+// separate param — rather than repurposing `min_history_events` for this
+// incompatible behavior — is deliberate: hijacking the existing param broke
+// callers combining it with `state=`/pagination (see the PR #1139 review).
 // Mirrors `load_stalled_workflows`'s multi-step-query shape rather than
-// retrofitting those two behaviors into the general-purpose loader, so the
+// retrofitting these two behaviors into the general-purpose loader, so the
 // existing `min_history_events` composition on the default/stalled paths is
 // left byte-for-byte unchanged.
 
 /// Per-shard history-bloat discovery query (issue #704, AC1/AC2).
 ///
 /// Returns non-terminal (live) executions whose current recorded
-/// `harvest_events` count is `>= filters.min_history_events`, each carrying
-/// its `history_event_count` so the caller can rank/triage without a second
-/// round-trip. Returns `Ok(vec![])` immediately when `min_history_events` is
-/// unset.
+/// `harvest_events` count is `>= filters.history_bloat_min_events`, each
+/// carrying its `history_event_count` so the caller can rank/triage without a
+/// second round-trip. Returns `Ok(vec![])` immediately when
+/// `history_bloat_min_events` is unset.
 ///
 /// Non-terminal is enforced unconditionally (`state NOT IN` the six terminal
 /// states) in addition to — not instead of — any caller-supplied `state=`
@@ -30789,7 +30819,7 @@ pub(crate) async fn load_history_bloat_workflows(
     use diesel::sql_types::{BigInt, Bool, Text};
     use std::collections::HashMap;
 
-    let Some(min_events) = filters.min_history_events else {
+    let Some(min_events) = filters.history_bloat_min_events else {
         return Ok(vec![]);
     };
 

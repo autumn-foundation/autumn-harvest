@@ -66,6 +66,23 @@ pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 /// runaway loop) before the hard cap terminally fails the workflow.
 pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
 
+/// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
+/// (issue #704, PR #1139 review, P2).
+///
+/// Deliberately **strictly below `1.0`**, unlike the structurally-similar
+/// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`] knob (which clamps to a full
+/// `[0.0, 1.0]`): `worker.rs`'s hard-cap force-fail check runs unconditionally
+/// *before* the warn-fraction crossing calculation on the same decision
+/// cycle, and returns early the instant `current_history_event_count >= cap`
+/// -- the exact condition a fraction of `1.0` would itself require to fire.
+/// A configured `1.0` therefore always loses that race and the counter can
+/// never fire, silently and permanently disabling it exactly like `0.0`
+/// does, but with none of `0.0`'s documented "this disables it" contract.
+/// Clamping the ceiling below `1.0` guarantees the warn threshold is reached
+/// on a decision cycle strictly before the hard cap can be, so the signal
+/// stays functional for every value the public builder API accepts.
+pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
+
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
 pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
@@ -214,12 +231,14 @@ impl WorkflowHistoryPolicy {
     }
 
     /// Override the history-bloat soft-warning fraction (issue #704). The
-    /// value is **clamped** into `[0.0, 1.0]`. `0.0` disables the signal
-    /// entirely (AC4) -- a naive threshold of `cap * 0.0 == 0` would instead
-    /// fire on the very first recorded event, which is never the intent.
+    /// value is **clamped** into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]`
+    /// (strictly below `1.0` -- see that constant's doc comment for why).
+    /// `0.0` disables the signal entirely (AC4) -- a naive threshold of
+    /// `cap * 0.0 == 0` would instead fire on the very first recorded event,
+    /// which is never the intent.
     #[must_use]
     pub const fn with_history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
-        self.history_bloat_warn_fraction = fraction.clamp(0.0, 1.0);
+        self.history_bloat_warn_fraction = fraction.clamp(0.0, MAX_HISTORY_BLOAT_WARN_FRACTION);
         self
     }
 }
@@ -13689,9 +13708,20 @@ mod tests {
                 < f64::EPSILON
         );
 
-        // Clamped to [0.0, 1.0], mirroring `continue_as_new_deadline_fraction`.
+        // Clamped to [0.0, MAX_HISTORY_BLOAT_WARN_FRACTION] -- deliberately
+        // NOT the full [0.0, 1.0] `continue_as_new_deadline_fraction` uses;
+        // see MAX_HISTORY_BLOAT_WARN_FRACTION's doc comment (PR #1139 P2).
         let over = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(1.5);
-        assert!((over.history_bloat_warn_fraction() - 1.0).abs() < f64::EPSILON);
+        assert!(
+            (over.history_bloat_warn_fraction() - MAX_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON
+        );
+        assert!(over.history_bloat_warn_fraction() < 1.0);
+        // Exactly 1.0 must ALSO clamp down -- it is the specific value that
+        // silently disables the signal if let through (see the constant's
+        // doc comment).
+        let exactly_one = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(1.0);
+        assert!(exactly_one.history_bloat_warn_fraction() < 1.0);
         let under = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(-0.5);
         assert!(under.history_bloat_warn_fraction().abs() < f64::EPSILON);
         let mid = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(0.5);

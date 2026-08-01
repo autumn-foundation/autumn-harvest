@@ -1385,11 +1385,15 @@ window to act *before* that happens.
 2. Discover and rank the specific offending execution(s) with the dedicated
    discovery filter, sorted largest-first with each row's current
    `history_event_count`:
-   `harvest workflow list --min-history-events <threshold>` (or
-   `GET /api/harvest/workflows?min_history_events=<threshold>`). Start with a
-   threshold near the configured hard cap's 75% soft mark and lower it if you
-   need to see the full ranked population; every returned row is guaranteed
-   non-terminal (`RUNNING`/`PAUSED`), sorted by history size descending.
+   `harvest workflow list --history-bloat-min-events <threshold>` (or
+   `GET /api/harvest/workflows?history_bloat_min_events=<threshold>`). Start
+   with a threshold near the configured hard cap's 75% soft mark and lower it
+   if you need to see the full ranked population; every returned row is
+   guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
+   descending. This is a DIFFERENT query parameter from the unrelated,
+   pre-existing general-purpose `min_history_events` filter (issue #493,
+   `docs/runbooks/history-ceiling.md`), which composes with `state=`/
+   pagination and does not restrict to live executions or sort by size.
 3. For the largest offender(s), inspect `GET /api/harvest/workflows/{execution_id}/stack`
    and `GET /api/harvest/workflows/{execution_id}/history` to understand what
    is driving the growth — a tight retry/poll loop, an unbounded fan-out, or a
@@ -1451,7 +1455,7 @@ signal to chase.
 ### Escalation criteria
 
 Ticket the workflow owner with the type name and the ranked list from
-`min_history_events`. Escalate if a specific execution keeps re-crossing
+`history_bloat_min_events`. Escalate if a specific execution keeps re-crossing
 (growth continuing well past the first warning) and is on a clear trajectory
 to reach the hard cap within the next alerting window, or if the growth is
 concentrated across many concurrent executions of the same type rather than

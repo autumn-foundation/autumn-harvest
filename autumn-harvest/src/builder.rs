@@ -3763,8 +3763,11 @@ mod tests {
     #[test]
     fn harvest_builder_accepts_history_bloat_warn_fraction_override() {
         // Issue #704: the operator early-warning soft-threshold fraction is
-        // configurable and clamped into [0.0, 1.0], mirroring the deadline
-        // fraction override above.
+        // configurable and clamped into [0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]
+        // -- strictly below 1.0, unlike the sibling deadline-fraction override
+        // above (PR #1139 review, P2: worker.rs's hard-cap force-fail check
+        // always wins the race against a warn threshold of exactly the cap,
+        // so a fraction of 1.0 must never be reachable through this API).
         let built = HarvestBuilder::new()
             .history_bloat_warn_fraction(0.5)
             .build();
@@ -3774,9 +3777,20 @@ mod tests {
         let clamped = HarvestBuilder::new()
             .history_bloat_warn_fraction(2.0)
             .build();
+        assert!(clamped.history_policy().history_bloat_warn_fraction() < 1.0);
         assert!(
-            (clamped.history_policy().history_bloat_warn_fraction() - 1.0).abs() < f64::EPSILON
+            (clamped.history_policy().history_bloat_warn_fraction()
+                - crate::context::MAX_HISTORY_BLOAT_WARN_FRACTION)
+                .abs()
+                < f64::EPSILON
         );
+
+        // Exactly 1.0 must ALSO clamp strictly below 1.0 -- it is the one
+        // value that would otherwise silently disable the signal.
+        let exactly_one = HarvestBuilder::new()
+            .history_bloat_warn_fraction(1.0)
+            .build();
+        assert!(exactly_one.history_policy().history_bloat_warn_fraction() < 1.0);
 
         // 0.0 explicitly disables the signal (AC4).
         let disabled = HarvestBuilder::new()
