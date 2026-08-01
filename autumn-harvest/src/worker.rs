@@ -10893,6 +10893,16 @@ async fn move_workflow_to_dlq_for_history_cap(
 /// that already crossed the threshold on an earlier cycle) or when
 /// `fraction <= 0.0` (the `0.0`/disabled sentinel, AC4).
 ///
+/// The threshold is the smallest integer event count satisfying
+/// `count >= cap * fraction` -- i.e. `(cap as f64 * fraction).ceil()`, NOT a
+/// truncating cast (PR #1139 review, third round). `cap * fraction` is
+/// non-integral whenever `cap` isn't evenly divisible by the fraction's
+/// denominator (e.g. cap=10, fraction=0.75 -> 7.5), and a truncating cast
+/// would round DOWN to 7, firing at the 7th event (70% of the cap) instead
+/// of the first integer count that actually reaches 75% (the 8th event,
+/// 80%) -- the fraction's whole point is to warn at-or-past the configured
+/// percentage, never noticeably before it.
+///
 /// This is a PURE function of its four inputs -- it performs no I/O and has
 /// no knowledge of the execution's identity, the outcome shape, or whether
 /// the caller is a synthetic canary probe (issue #796). Used from two call
@@ -10921,7 +10931,7 @@ fn history_bloat_threshold_crossed(
     if already_warned || fraction <= 0.0 {
         return false;
     }
-    let threshold = (cap as f64 * fraction) as u64;
+    let threshold = (cap as f64 * fraction).ceil() as u64;
     current_history_event_count >= threshold
 }
 
@@ -16821,6 +16831,35 @@ mod tests {
     fn history_bloat_threshold_crossed_fraction_one_requires_reaching_the_full_cap() {
         assert!(!history_bloat_threshold_crossed(99, 100, 1.0, false));
         assert!(history_bloat_threshold_crossed(100, 100, 1.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_rounds_a_non_integral_product_up_not_down() {
+        // PR #1139 review (third round): cap=10, fraction=0.75 -> the exact
+        // product is 7.5, non-integral. A truncating cast would floor to 7,
+        // firing at 70% of the cap; the correct threshold is the smallest
+        // integer >= 7.5, i.e. 8 (80%) -- the first count that actually
+        // meets or exceeds the configured 75% fraction.
+        assert!(!history_bloat_threshold_crossed(6, 10, 0.75, false));
+        assert!(!history_bloat_threshold_crossed(7, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(8, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(9, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(10, 10, 0.75, false));
+
+        // A second non-exact pair with a different fraction/cap combination,
+        // to guard against a fix that happens to work only for this one
+        // numerator/denominator: cap=7, fraction=0.5 -> exact product 3.5 ->
+        // threshold 4, not 3.
+        assert!(!history_bloat_threshold_crossed(3, 7, 0.5, false));
+        assert!(history_bloat_threshold_crossed(4, 7, 0.5, false));
+
+        // An EXACT product (cap=8, fraction=0.75 -> 6.0) must stay unaffected
+        // by switching from truncation to ceiling -- ceil(6.0) == 6.0, same
+        // as before, so the pre-existing exact-division tests elsewhere in
+        // this suite (and the DB-backed counter-emission tests) are
+        // unaffected by this fix.
+        assert!(!history_bloat_threshold_crossed(5, 8, 0.75, false));
+        assert!(history_bloat_threshold_crossed(6, 8, 0.75, false));
     }
 
     #[test]

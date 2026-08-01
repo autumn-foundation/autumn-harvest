@@ -30845,16 +30845,38 @@ pub(crate) async fn load_history_bloat_workflows(
     use diesel::sql_types::{BigInt, Bool, Jsonb, Text};
 
     // Correlated subquery computing each candidate's current recorded event
-    // count. Reused for the count-threshold filter(s), the `ORDER BY`, and
-    // the `SELECT` below, so all three read the identical single source of
-    // truth for "how big is this execution's history right now" and can
-    // never drift apart from one another.
+    // count. Reused for the WHERE threshold filter and the `SELECT` below --
+    // never for `ORDER BY`, which instead references the `SELECT`'s output
+    // alias (`HISTORY_EVENT_COUNT_ALIAS`, below) so the two share exactly one
+    // evaluation rather than each re-stating the subquery text. WHERE
+    // necessarily evaluates it separately from that shared pair -- Postgres
+    // evaluates WHERE before the SELECT list/ORDER BY in logical processing
+    // order, so a bare subquery text cannot be shared across that boundary
+    // without restructuring this query as a `LATERAL`/CTE join, which was
+    // judged too invasive a rewrite for this fix (PR #1139 review, third
+    // round) -- but the two count-threshold filters below (this parameter
+    // and the composed `min_history_events`) are collapsed into ONE combined
+    // WHERE evaluation, so the subquery is now evaluated at most twice total
+    // per candidate row (down from up to four: two WHERE instances, one
+    // ORDER BY instance, and one SELECT instance previously).
     const HISTORY_EVENT_COUNT_SUBQUERY: &str = "(SELECT COUNT(*) FROM harvest_events \
          WHERE workflow_exec_id = harvest_workflow_executions.id)";
+    const HISTORY_EVENT_COUNT_ALIAS: &str = "history_event_count";
 
     let Some(min_events) = filters.history_bloat_min_events else {
         return Ok(vec![]);
     };
+    // PR #1139 review (finding B, prior round): `count >= a AND count >= b`
+    // is exactly `count >= max(a, b)`, so the stricter of the two
+    // count-threshold filters always wins regardless of which parameter
+    // supplies it. Computed here (in Rust, before the query is built) rather
+    // than as two separate ANDed SQL predicates (PR #1139 review, third
+    // round) -- collapsing to one predicate halves the WHERE-clause
+    // evaluation count for the common "both filters supplied" case, on top
+    // of the semantics being identical either way.
+    let effective_min_events = filters
+        .min_history_events
+        .map_or(min_events, |min_history| min_history.max(min_events));
 
     // ── Step 1: find candidate executions, bounded per-shard (AC1/AC2) ──────
     // PR #1139 review (finding C): this used to `.load()` every matching live
@@ -30881,20 +30903,8 @@ pub(crate) async fn load_history_bloat_workflows(
         .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES))
         .filter(
             sql::<Bool>(&format!("{HISTORY_EVENT_COUNT_SUBQUERY} >= "))
-                .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
+                .bind::<BigInt, _>(i64::try_from(effective_min_events).unwrap_or(i64::MAX)),
         );
-    // PR #1139 review (finding B): compose (never silently drop) the
-    // pre-existing general-purpose `min_history_events` filter (issue #493)
-    // when the caller supplies BOTH count thresholds at once. ANDing the two
-    // `>=` predicates together is equivalent to filtering on their maximum,
-    // so the stricter of the two bounds always wins rather than one being
-    // silently ignored.
-    if let Some(min_history) = filters.min_history_events {
-        query = query.filter(
-            sql::<Bool>(&format!("{HISTORY_EVENT_COUNT_SUBQUERY} >= "))
-                .bind::<BigInt, _>(i64::try_from(min_history).unwrap_or(i64::MAX)),
-        );
-    }
 
     if !filters.states.is_empty() {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
@@ -30966,14 +30976,23 @@ pub(crate) async fn load_history_bloat_workflows(
 
     // ── Step 2: order by history size, bound, and fetch the count alongside
     // each row in the SAME query (AC2) -- no separate batch-count round trip,
-    // and no full row materialized beyond the per-shard `LIMIT`.
+    // and no full row materialized beyond the per-shard `LIMIT`. `ORDER BY`
+    // references the `SELECT`'s output alias by name (PR #1139 review, third
+    // round) rather than re-stating the correlated subquery: Postgres
+    // documents that a bare, simple-name `ORDER BY` expression matching an
+    // output column resolves to that output column (falling back to a
+    // same-named input column only when no output alias matches), so the two
+    // clauses share exactly one evaluation of the subquery per candidate row
+    // instead of each independently re-evaluating it.
     let rows: Vec<(WorkflowExecution, i64)> = query
-        .order(sql::<BigInt>(HISTORY_EVENT_COUNT_SUBQUERY).desc())
+        .order(sql::<BigInt>(HISTORY_EVENT_COUNT_ALIAS).desc())
         .then_order_by(harvest_workflow_executions::id.asc())
         .limit(filters.limit)
         .select((
             WorkflowExecution::as_select(),
-            sql::<BigInt>(HISTORY_EVENT_COUNT_SUBQUERY),
+            sql::<BigInt>(&format!(
+                "{HISTORY_EVENT_COUNT_SUBQUERY} AS {HISTORY_EVENT_COUNT_ALIAS}"
+            )),
         ))
         .load(conn)
         .await

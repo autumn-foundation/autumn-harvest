@@ -1361,13 +1361,18 @@ stalled (their `stack` shows no forward progress across successive checks).
 **What to do when a still-running workflow's history is approaching the hard
 cap:** the `harvest.workflow.history_bloat` counter (issue #704) is an operator
 **early-warning**, distinct from the terminal outcome it precedes. Harvest can
-optionally enforce a per-workflow-type hard cap on the number of recorded
-`harvest_events` an in-flight execution may accumulate
-(`WorkflowHistoryPolicy::event_hard_cap`, set via
-`WorkflowContext`/the workflow's history policy — not the unrelated
-fleet-wide `HarvestBuilder::max_workflow_history_events` ceiling from issue
-#493, which is sampled by a separate periodic scanner and reported via the
-`harvest.workflow.history_oversized` gauge). When a hard cap is configured,
+optionally enforce a hard cap on the number of recorded `harvest_events` an
+in-flight execution may accumulate (`WorkflowHistoryPolicy::event_hard_cap`,
+set once via `HarvestBuilder::history_event_hard_cap` at worker-registry
+construction time — **registry-wide, not per-workflow-type**: `HandlerRegistry`
+stores a single `WorkflowHistoryPolicy`, consulted with no workflow-name
+parameter, so every workflow type registered on that worker shares the
+identical cap and warn fraction; there is no per-type override, and raising or
+lowering either value affects every workflow type that worker serves. Distinct
+from the unrelated fleet-wide `HarvestBuilder::max_workflow_history_events`
+ceiling from issue #493, which is sampled by a separate periodic scanner and
+reported via the `harvest.workflow.history_oversized` gauge). When a hard cap
+is configured,
 the same still-`RUNNING` execution that would eventually hit it is instead
 warned once — the first time its recorded history crosses a configurable
 fraction of that cap (`history_bloat_warn_fraction`, default **75%**,
@@ -1430,9 +1435,12 @@ window to act *before* that happens.
   behaving correctly but was never given a deadline-aware checkpoint
   strategy (issue #772).
 - The configured `event_hard_cap` (or its `history_bloat_warn_fraction`) is
-  simply too tight for a workflow type's normal, healthy history footprint —
-  tune the fraction or the cap per workflow type rather than treating every
-  crossing as an incident.
+  simply too tight for the crossing workflow type's normal, healthy history
+  footprint — since the cap/fraction is registry-wide (not per-type), raising
+  either affects every other workflow type sharing the same worker process;
+  confirm the new value is still appropriate for them before tuning, or run
+  the outlier workflow type on a separate worker/`HandlerRegistry` with its
+  own cap if their footprints genuinely diverge.
 
 ### False positives
 
@@ -1440,10 +1448,9 @@ A single crossing for a workflow type known to run long and record many
 events by design (e.g. a long-lived entity workflow deliberately operating
 close to its configured cap) is expected, not an incident — the alert fires
 once per execution and does not repeat unless the execution keeps growing
-past the point already investigated. An unconfigured deployment (no workflow
-type has `event_hard_cap` set) will show a permanently flat,
-never-incrementing series; that is the disabled/no-op state, not a health
-signal to chase.
+past the point already investigated. A worker whose `HandlerRegistry` has no
+`event_hard_cap` configured will show a permanently flat, never-incrementing
+series; that is the disabled/no-op state, not a health signal to chase.
 
 ### Safe actions
 
@@ -1456,9 +1463,11 @@ signal to chase.
    and let the fix apply on the next deploy (existing in-flight executions
    are unaffected by the code change until they reach a fresh decision
    cycle).
-3. If the cap/fraction is simply mistuned for the workflow type's expected
-   footprint, raise `event_hard_cap` or `history_bloat_warn_fraction` for that
-   type — this never requires touching in-flight executions.
+3. If the cap/fraction is simply mistuned for the crossing workflow type's
+   expected footprint, raise `event_hard_cap` or `history_bloat_warn_fraction`
+   via `HarvestBuilder` on the next deploy — this is registry-wide (every
+   workflow type sharing that worker gets the new value; there is no
+   per-type override) and never requires touching in-flight executions.
 4. If the execution is at real risk of hitting the hard cap before any of the
    above can land, and it is safe to interrupt, cancel or terminate it
    (`POST /api/harvest/workflows/{execution_id}/cancel` or `/terminate`)
