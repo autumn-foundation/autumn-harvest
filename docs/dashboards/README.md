@@ -136,6 +136,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_update_rejected_rate` | Signal & update lifecycle | Update validator rejections | [runbook](../runbooks/harvest-alerts.md#harvest_update_rejected_rate) |
 | `harvest_signal_unhandled_rate` | Signal & update lifecycle | Unhandled signals | [runbook](../runbooks/harvest-alerts.md#harvest_signal_unhandled_rate) |
 | `harvest_workflow_population_leak` | Workflow lifecycle | Active workflows by type & state | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_population_leak) |
+| `harvest_workflow_history_bloat` | Workflow health | Workflow history bloat (early warning) | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_history_bloat) |
 | `harvest_queue_paused_too_long` | Queues & workers | Paused queues (dispatch held) | [runbook](../runbooks/harvest-alerts.md#harvest_queue_paused_too_long) |
 
 ### Readiness-style alerts (no native metric)

@@ -414,6 +414,39 @@ fn workflow_list_supports_repeated_and_comma_states() {
 }
 
 #[test]
+fn workflow_list_history_bloat_min_events_maps_to_query_string() {
+    // Issue #704: operator early-warning discovery for workflow history bloat.
+    // Distinct query param from the server's pre-existing, general-purpose
+    // `min_history_events` filter (issue #493) -- reusing that name broke
+    // callers combining it with state=/pagination (PR #1139 review). The CLI
+    // forwards the raw value verbatim -- the server owns validation
+    // (non-numeric/negative -> 400) and the non-terminal + sorted-by-size
+    // discovery behavior.
+    let list = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "list",
+        "--history-bloat-min-events",
+        "5000",
+    ])
+    .expect("history-bloat-min-events list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/workflows?history_bloat_min_events=5000");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn workflow_list_omits_history_bloat_min_events_by_default() {
+    let list = Cli::try_parse_from(["harvest", "workflow", "list"])
+        .expect("default list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.path, "/workflows");
+}
+
+#[test]
 fn workflow_list_start_source_filter_maps_to_query_string() {
     // Issue #740: `--start-source` forwards a single bounded provenance value
     // verbatim to the `start_source` query param. The CLI does not validate it

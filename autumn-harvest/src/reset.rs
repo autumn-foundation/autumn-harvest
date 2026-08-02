@@ -1632,6 +1632,7 @@ mod tests {
             start_source: None,
             start_source_ref: None,
             started_by: None,
+            history_bloat_warned_at: None,
         }
     }
 

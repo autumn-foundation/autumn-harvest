@@ -963,6 +963,15 @@ enum WorkflowCommand {
         /// stalled-workflow results. Only meaningful with --no-progress-minutes.
         #[arg(long)]
         include_sleeping: bool,
+        /// Operator early-warning discovery for workflow history bloat (issue
+        /// #704): return only live (non-terminal) executions whose current
+        /// recorded event count is at least this many, sorted by history size
+        /// descending. Distinct from the server's general-purpose
+        /// `min_history_events` filter (issue #493, not currently CLI-exposed),
+        /// which composes with `--state`/pagination and does not restrict to
+        /// live executions or force this sort order.
+        #[arg(long = "history-bloat-min-events")]
+        history_bloat_min_events: Option<u64>,
         /// Filter by workflow-start provenance (issue #740): one of api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
         /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
@@ -5162,6 +5171,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             owner,
             no_progress_minutes,
             include_sleeping,
+            history_bloat_min_events,
             start_source,
         } => Ok(ApiRequest::get(build_workflow_list_path(
             *limit,
@@ -5172,6 +5182,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             owner.as_deref(),
             *no_progress_minutes,
             *include_sleeping,
+            *history_bloat_min_events,
             start_source.as_deref(),
         )?)),
         WorkflowCommand::Summaries {
@@ -7047,6 +7058,7 @@ fn build_workflow_list_path(
     owner: Option<&str>,
     no_progress_minutes: Option<i64>,
     include_sleeping: bool,
+    history_bloat_min_events: Option<u64>,
     start_source: Option<&str>,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -7081,6 +7093,17 @@ fn build_workflow_list_path(
     }
     if include_sleeping {
         params.push(("include_sleeping", "true".to_string()));
+    }
+    // Issue #704: operator early-warning discovery for workflow history bloat.
+    // A query param DISTINCT from the server's general-purpose
+    // `min_history_events` filter (issue #493, not exposed via this CLI
+    // command) — see `WorkflowFilters::history_bloat_min_events` in the
+    // plugin for why the two must never share a name. The server owns
+    // validation (non-numeric/negative → 400) and the restricted-to-non-
+    // terminal + sorted-by-size-descending behavior — the CLI is a thin
+    // passthrough.
+    if let Some(value) = history_bloat_min_events {
+        params.push(("history_bloat_min_events", value.to_string()));
     }
     // Issue #740: bounded provenance filter. The server owns validation (a value
     // outside the known `StartSource` set / "unknown" returns a 400), so the CLI

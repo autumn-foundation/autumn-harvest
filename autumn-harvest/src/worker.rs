@@ -10882,9 +10882,208 @@ async fn move_workflow_to_dlq_for_history_cap(
     Ok((deferred, closed_children))
 }
 
+/// Pure decision for a bounded retry sequence (issue #704, PR #1139
+/// review): given the outcome of each attempt IN ORDER, resolves to the
+/// first `Ok`, or -- if every attempt failed -- the *last* `Err` (the
+/// freshest failure, not the stale first one; an easy off-by-one to get
+/// backwards in a hand-rolled loop, and the one that actually matters for
+/// diagnosing a persistent failure). A fast, DB-free, directly
+/// unit-testable pin of that exact semantic.
+///
+/// `count_history_events_with_retries` below hand-rolls the equivalent
+/// *lazy* loop rather than calling this directly: each attempt there is a
+/// real, costly DB round-trip, so it must stop as soon as one succeeds
+/// instead of eagerly running every attempt regardless of an earlier
+/// success (which is what accepting an already-materialized `Vec` here
+/// would require of a caller). Consequently this function itself has no
+/// production caller -- it exists solely as a fast, DB-free pin of the
+/// decision shape the hand-rolled loop below must match, hence `#[cfg(test)]`.
+#[cfg(test)]
+fn resolve_retry_attempts<T, E>(attempts: Vec<Result<T, E>>) -> Result<T, E> {
+    let mut last_err = None;
+    for attempt in attempts {
+        match attempt {
+            Ok(value) => return Ok(value),
+            Err(error) => last_err = Some(error),
+        }
+    }
+    Err(last_err.expect("caller must supply at least one attempt"))
+}
+
+/// Bounded in-process retry around [`crate::store::count_history_events`]
+/// (issue #704, PR #1139 review).
+///
+/// The caller of this function runs strictly *after* the persist
+/// transaction has already committed (autocommit) -- the workflow's real,
+/// durable decision has already landed regardless of what this read does.
+/// Without a retry, a single transient failure here (a momentary statement
+/// timeout, connection blip, or replica hiccup) silently gives up on this
+/// cycle's chance to mark/emit the soft-threshold warning; the documented
+/// "at-least-once, re-checked on a later decision cycle" fallback only
+/// holds if a later decision cycle actually happens, which is not
+/// guaranteed for an execution that then suspends on a signal or timer that
+/// may never fire again. A few bounded, closely-spaced retries substantially
+/// narrow (without fully eliminating) that window for the concrete failure
+/// mode named by the review -- a transient error clearing within
+/// milliseconds -- at negligible cost.
+///
+/// Deliberately still best-effort: retries are exhausted quietly and the
+/// caller falls through to its existing "skip this cycle's warning"
+/// handling on a persistent failure. Moving this read *inside* the
+/// already-committed persist transaction (so a failure here would abort and
+/// retry the whole workflow decision cycle) was considered and rejected: it
+/// would let a best-effort telemetry read delay or fail the workflow's
+/// actual, durable progress, directly contradicting this code path's
+/// explicit contract -- see [`emit_history_bloat_warning_if_crossed`]'s doc
+/// comment, and the multiple earlier review rounds on this same PR that
+/// settled on "never fail the decision" for this exact metric.
+///
+/// Mirrors [`resolve_retry_attempts`]'s decision shape (short-circuit on
+/// the first success, else surface the last failure) as a lazy loop --
+/// see that function's doc comment for why this is hand-rolled rather than
+/// calling it directly.
+async fn count_history_events_with_retries(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    const ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match crate::store::count_history_events(conn, exec_id).await {
+            Ok(count) => return Ok(count),
+            Err(error) => {
+                last_err = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop body runs at least once, so this is always Some on exhaustion"))
+}
+
+/// Pure decision for the operator early-warning soft threshold on workflow
+/// history bloat (issue #704, AC3/AC4).
+///
+/// Returns `true` iff an execution's history event count has JUST crossed
+/// `fraction * cap` for the first time -- i.e. `already_warned` is `false`,
+/// `fraction` is a strictly-positive (non-disabled) configured value, and
+/// `current_history_event_count` has reached the computed threshold. Never
+/// `true` when `already_warned` (the caller must not re-stamp an execution
+/// that already crossed the threshold on an earlier cycle) or when
+/// `fraction <= 0.0` (the `0.0`/disabled sentinel, AC4).
+///
+/// The threshold is the smallest integer event count satisfying
+/// `count >= cap * fraction` -- i.e. `(cap as f64 * fraction).ceil()`, NOT a
+/// truncating cast (PR #1139 review, third round). `cap * fraction` is
+/// non-integral whenever `cap` isn't evenly divisible by the fraction's
+/// denominator (e.g. cap=10, fraction=0.75 -> 7.5), and a truncating cast
+/// would round DOWN to 7, firing at the 7th event (70% of the cap) instead
+/// of the first integer count that actually reaches 75% (the 8th event,
+/// 80%) -- the fraction's whole point is to warn at-or-past the configured
+/// percentage, never noticeably before it.
+///
+/// This is a PURE function of its four inputs -- it performs no I/O and has
+/// no knowledge of the execution's identity, the outcome shape, or whether
+/// the caller is a synthetic canary probe (issue #796). Used from two call
+/// shapes: (1) the still-RUNNING `WorkflowOutcome::Suspended` path in
+/// `process_workflow_task`, gated there by callers combining this with
+/// `matches!(&outcome, WorkflowOutcome::Suspended { .. })` and `!is_canary`;
+/// and (2) `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
+/// (PR #1139 review), evaluated there against the DURABLE post-failure
+/// event count -- never a prospective, not-yet-persisted one (PR #1139
+/// review, second round) -- since a single decision can grow durably
+/// recorded history from below the soft threshold straight past the hard
+/// cap in one inline append batch, bypassing (1) entirely; the crossing
+/// still happened in the same decision, so it is evaluated there too
+/// rather than silently dropped.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn history_bloat_threshold_crossed(
+    current_history_event_count: u64,
+    cap: u64,
+    fraction: f64,
+    already_warned: bool,
+) -> bool {
+    if already_warned || fraction <= 0.0 {
+        return false;
+    }
+    let raw_threshold = (cap as f64 * fraction).ceil() as u64;
+    // Issue #704 (PR #1139 review, Nth round): clamp the threshold below
+    // `cap` here, unconditionally of `fraction` -- `context.rs`'s public
+    // clamp of `fraction` to `MAX_HISTORY_BLOAT_WARN_FRACTION` (0.999) is
+    // fraction-only and cannot see `cap`, so it cannot guarantee
+    // `ceil(cap * fraction) < cap` for every cap value: for cap=100,
+    // `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`, meaning the soft
+    // warning would fire on the EXACT SAME decision cycle as the hard cap
+    // itself (zero intervention window) for any cap below 1000 -- the
+    // opposite of the "warn before the hard cap" contract this signal
+    // exists to provide. Clamping the threshold to `cap.saturating_sub(1)`
+    // here, where BOTH `cap` and `fraction` are known together, guarantees
+    // at least one full event of warning room below the hard cap for
+    // every (cap, fraction) combination the caller can construct --
+    // independent of, and strictly stronger than, whatever ceiling
+    // `context.rs` clamps `fraction` to.
+    let threshold = raw_threshold.min(cap.saturating_sub(1));
+    current_history_event_count >= threshold
+}
+
+/// Emits and marks the operator early-warning soft-threshold counter for
+/// workflow history bloat (issue #704, AC3/AC4), if `should_warn` is `true`.
+///
+/// Delivery semantics (PR #1139 review): this is deliberately
+/// **at-least-once, biased toward a rare duplicate over a possible
+/// permanent loss** -- the counter is emitted FIRST, then the durable guard
+/// (`store::mark_history_bloat_warned`, `WHERE history_bloat_warned_at IS
+/// NULL`) is set. If the worker crashes in the narrow window between the
+/// two, `history_bloat_warned_at` stays `NULL`, so a future retry of the
+/// same decision cycle (this codebase's existing crash-recovery mechanism
+/// -- no new machinery introduced here) re-detects the crossing and
+/// re-emits, rather than the mark permanently silencing a signal that was
+/// never actually delivered. This trade-off is deliberate for THIS
+/// counter specifically: unlike a recurring per-cycle counter, the guard
+/// is a one-shot, non-recurring gate -- there is no "next crossing" for a
+/// given execution to fall back on, so a lost-forever failure mode is
+/// worse here than for this codebase's other best-effort telemetry
+/// emissions (`run_deferred_schedule_counter`, `emit_update_result_metrics`,
+/// `emit_unhandled_signal_metrics`), which this function otherwise mirrors:
+/// a failure to persist the mark is logged and swallowed, never fails or
+/// rolls back the caller's already-durable workflow decision. A rare
+/// crash-retry duplicate increment is an accepted cost for an early-WARNING
+/// signal, not a correctness-critical durable record.
+async fn emit_history_bloat_warning_if_crossed(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    should_warn: bool,
+) {
+    if !should_warn {
+        return;
+    }
+    telemetry
+        .metrics
+        .record_workflow_history_bloat(workflow_name);
+    if let Err(error) = store::mark_history_bloat_warned(conn, exec_id).await {
+        tracing::warn!(
+            exec_id = %exec_id,
+            %error,
+            "failed to mark history-bloat early-warning threshold after emitting \
+             the counter (best-effort, not fatal; a future retry of this decision \
+             cycle may re-emit rather than silently losing the signal)"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
     telemetry: &crate::telemetry::TelemetryConfig,
     task: &TaskQueueItem,
     execution: &WorkflowExecution,
@@ -10912,6 +11111,34 @@ async fn fail_workflow_for_history_cap(
         WorkflowStatus::Failed,
     );
 
+    // Issue #704 (PR #1139 review, second round): decide the crossing from
+    // `terminal_count` -- the DURABLE post-failure event count, computed
+    // above from `next_event_id` (the running count of events actually
+    // appended so far this cycle) -- never from the `event_count` parameter.
+    // `event_count` is whatever value tripped the HARD cap at the call
+    // site, and for the `WorkflowOutcome::Suspended` preflight branch that
+    // value can be purely PROSPECTIVE: `suspended_command_event_count`
+    // predicts how many events a batch of still-pending commands (e.g. a
+    // large activity fan-out) WOULD produce if persisted, and this function
+    // never persists them -- the whole point of the hard-cap preflight is
+    // to reject the batch and fail terminally instead. A run sitting at 10
+    // durably recorded events that merely PROPOSED 90 more (against a cap
+    // of 100) would otherwise stamp a permanent crossing off a count that
+    // never lands in `harvest_events`, leaving a terminal execution the
+    // live (non-terminal) discovery query can never find. `terminal_count`
+    // is exactly what WILL be durably recorded once the `WorkflowFailed`
+    // event below is appended, so it is the only value this decision can
+    // correctly be based on -- at every other call site (a genuinely
+    // already-appended batch) `terminal_count` and `event_count` coincide,
+    // so this is a strict correctness fix with no behavior change there.
+    let should_warn_history_bloat = !crate::canary::is_canary_workflow(&execution.workflow_name)
+        && history_bloat_threshold_crossed(
+            terminal_count,
+            cap,
+            registry.history_policy().history_bloat_warn_fraction(),
+            execution.history_bloat_warned_at.is_some(),
+        );
+
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
         cap,
@@ -10928,6 +11155,41 @@ async fn fail_workflow_for_history_cap(
         Some(telemetry.metrics.as_ref()),
     )
     .await?;
+
+    // Issue #704 (PR #1139 review, Nth round): emit/stamp the crossing only
+    // AFTER `move_workflow_to_dlq_for_history_cap` above has returned `Ok`
+    // -- never before it. Until that call's transaction commits,
+    // `terminal_count` is only a PREDICTION of what next_event_id will
+    // become once `WorkflowFailed` lands, not a durable fact. Emitting and
+    // stamping the guard ahead of that commit (the previous ordering) left
+    // a crash/transaction-failure window between the two steps that would
+    // permanently mark `history_bloat_warned_at` off a crossing that never
+    // actually became durable: the `?` above would propagate the error,
+    // the execution would stay RUNNING at its true (uncrossed) count, but
+    // `execution.history_bloat_warned_at` was already committed as set --
+    // so a future retry of this same decision cycle (or any later cycle
+    // that reaches the hard-cap path again) would see `already_warned` and
+    // could never correct the false crossing, permanently silencing a
+    // signal that never fired for real. Emitting only once the terminal
+    // transition has committed guarantees `terminal_count` IS exactly what
+    // is now durably recorded, so the "at-least-once, biased toward a rare
+    // duplicate over a possible permanent loss" delivery semantics
+    // documented on `emit_history_bloat_warning_if_crossed` hold as
+    // written: the only residual crash window is between this commit and
+    // the guard stamp immediately below, and losing that narrow window
+    // means (at worst) one already-terminal execution's warning is never
+    // marked/counted -- a single missed sample on a run that has already
+    // sealed, not a permanently wrong guard on a run that could still
+    // self-correct. Never fires for the synthetic liveness canary (issue
+    // #796), matching the sibling `WorkflowOutcome::Suspended` path.
+    emit_history_bloat_warning_if_crossed(
+        conn,
+        telemetry,
+        exec_id,
+        &execution.workflow_name,
+        should_warn_history_bloat,
+    )
+    .await;
 
     check_and_report_unfinished_handlers_for_worker(
         conn,
@@ -11334,6 +11596,7 @@ async fn process_workflow_task(
                         {
                             let deferred = fail_workflow_for_history_cap(
                                 conn,
+                                registry,
                                 &telemetry,
                                 task,
                                 &prepared.execution,
@@ -11397,6 +11660,7 @@ async fn process_workflow_task(
                         history_events.extend(events);
                         let deferred = fail_workflow_for_history_cap(
                             conn,
+                            registry,
                             &telemetry,
                             task,
                             &prepared.execution,
@@ -11425,6 +11689,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -11568,6 +11833,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -11829,6 +12095,7 @@ async fn process_workflow_task(
                 {
                     let deferred = fail_workflow_for_history_cap(
                         conn,
+                        registry,
                         &telemetry,
                         task,
                         &prepared.execution,
@@ -12079,6 +12346,7 @@ async fn process_workflow_task(
     {
         let deferred = fail_workflow_for_history_cap(
             conn,
+            registry,
             &telemetry,
             task,
             &prepared.execution,
@@ -12345,6 +12613,29 @@ async fn process_workflow_task(
     // via the #603 gate returning early above, never reaches here on an
     // ND-carrying Failed), so this is a no-op on every non-terminal path.
     let unhandled_signal_metrics = outcome_unhandled_signals(&outcome);
+    // Issue #704: capture (pure, no I/O) whether this cycle is even eligible
+    // to mark the operator early-warning soft threshold for workflow history
+    // bloat. Computed here -- before the persist transaction moves `outcome`
+    // -- but the actual *crossing decision* is deliberately deferred to
+    // post-commit (see the `Persisted` arm below), where it is computed
+    // against the true durably-persisted event count rather than this
+    // cycle's prospective `current_history_event_count`. That prospective
+    // count is a deliberately conservative *over-estimate* for several
+    // suspension shapes (e.g. `suspended_command_event_count`'s `AcquireMutex`
+    // branch counts +1 for a contended acquire that only enqueues and grants
+    // nothing) -- fine for the hard-cap preflight above, which only needs to
+    // fail fast on a true overflow, but wrong for a threshold-*crossing*
+    // decision that permanently marks `history_bloat_warned_at`: a decision
+    // cycle one event below threshold that merely enqueues a contended mutex
+    // acquire must not stamp "warned" for a mark that may never actually be
+    // reached. Never fires for the synthetic liveness canary (issue #796) --
+    // it contributes to no `harvest.workflow.*` business signal, matching the
+    // sibling `record_workflow_completed`/`history_size`/`continue_as_new`
+    // gates right above.
+    let may_warn_history_bloat = !is_canary
+        && matches!(&outcome, WorkflowOutcome::Suspended { .. })
+        && registry.history_policy().event_hard_cap().is_some();
+    let history_bloat_already_warned = prepared.execution.history_bloat_warned_at.is_some();
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -12468,6 +12759,62 @@ async fn process_workflow_task(
                 &update_metric_queue,
                 &unhandled_signal_metrics,
             );
+            // Issue #704: mark + emit the operator early-warning soft
+            // threshold, post-commit, in autocommit -- mirroring
+            // `run_deferred_schedule_counter`'s documented discipline: a
+            // best-effort write that must never roll back or fail the
+            // durably-persisted workflow decision. Shared with
+            // `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
+            // via `emit_history_bloat_warning_if_crossed` so the two call
+            // shapes can never drift.
+            //
+            // The crossing decision itself is computed here, against the
+            // *true* durably-persisted event count (a fresh, lock-free
+            // `COUNT(*)`), rather than the pre-transaction prospective
+            // estimate -- closing a Codex-review finding where a decision
+            // cycle that merely enqueued (never granted) a contended
+            // `AcquireMutex` could over-count by one and cross the threshold
+            // a cycle early. A bounded retry (issue #704, PR #1139 review --
+            // see `count_history_events_with_retries`'s doc comment) narrows
+            // the window where a transient read failure silently and
+            // permanently drops this execution's one-shot warning chance; a
+            // still-persistent failure degrades to "don't warn this cycle"
+            // rather than risking a false mark or panicking a best-effort
+            // telemetry path.
+            let should_warn_history_bloat = if may_warn_history_bloat {
+                match registry.history_policy().event_hard_cap() {
+                    Some(cap) => {
+                        match count_history_events_with_retries(conn, prepared.exec_id).await {
+                            Ok(durable_count) => history_bloat_threshold_crossed(
+                                durable_count,
+                                cap,
+                                registry.history_policy().history_bloat_warn_fraction(),
+                                history_bloat_already_warned,
+                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    exec_id = %prepared.exec_id,
+                                    %error,
+                                    "failed to count durable history events for the history-bloat \
+                                     soft-threshold check after retries; skipping this cycle's warning"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            emit_history_bloat_warning_if_crossed(
+                conn,
+                &telemetry,
+                prepared.exec_id,
+                &prepared.execution.workflow_name,
+                should_warn_history_bloat,
+            )
+            .await;
         }
         Err(error) => {
             // Preserve per-path error handling: a terminal-with-commands persist
@@ -16596,6 +16943,154 @@ mod tests {
     // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
     // now live in slot_tuner.rs's test module alongside the tuner logic that
     // consumes it.
+
+    // ── Operator early-warning for workflow history bloat (issue #704) ───────
+
+    #[test]
+    fn history_bloat_threshold_crossed_fires_at_and_above_the_computed_threshold() {
+        // cap = 100, fraction = 0.75 -> threshold = 75.
+        assert!(!history_bloat_threshold_crossed(74, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(75, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(76, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(100, 100, 0.75, false));
+        assert!(history_bloat_threshold_crossed(u64::MAX, 100, 0.75, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_never_fires_once_already_warned() {
+        // Even a wildly-over-threshold count must not re-fire once
+        // `already_warned` is true -- the caller's exactly-once contract.
+        assert!(!history_bloat_threshold_crossed(1_000_000, 100, 0.75, true));
+        assert!(!history_bloat_threshold_crossed(75, 100, 0.75, true));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_disabled_at_zero_fraction() {
+        // fraction = 0.0 is the documented AC4 "disabled" sentinel: never
+        // fires regardless of how far over any notional threshold the count
+        // is.
+        assert!(!history_bloat_threshold_crossed(1_000_000, 100, 0.0, false));
+        assert!(!history_bloat_threshold_crossed(0, 0, 0.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_negative_fraction_is_also_disabled() {
+        // Defensive: `WorkflowHistoryPolicy::with_history_bloat_warn_fraction`
+        // already clamps into [0.0, 1.0] at configuration time, but this pure
+        // function must not misbehave (e.g. compute a negative/garbage
+        // threshold) if it is ever called with an unclamped value directly.
+        assert!(!history_bloat_threshold_crossed(
+            1_000_000, 100, -0.5, false
+        ));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_fraction_one_still_leaves_one_event_of_room_below_the_cap() {
+        // PR #1139 review (Nth round): a raw `ceil(cap * fraction)` of
+        // `1.0` used to require reaching the FULL cap (threshold == cap
+        // exactly, zero warning room). The threshold is now always clamped
+        // to `cap - 1`, so even a fraction of `1.0` still leaves the
+        // promised one-event window before the hard cap fires.
+        assert!(!history_bloat_threshold_crossed(98, 100, 1.0, false));
+        assert!(history_bloat_threshold_crossed(99, 100, 1.0, false));
+        assert!(history_bloat_threshold_crossed(100, 100, 1.0, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_small_cap_at_the_builder_ceiling_still_leaves_room() {
+        // The concrete regression this clamp fixes: at the PUBLIC builder
+        // ceiling (`MAX_HISTORY_BLOAT_WARN_FRACTION` = 0.999), a cap below
+        // 1000 previously collapsed the threshold onto the cap itself --
+        // e.g. cap=100: `ceil(100 * 0.999) = ceil(99.9) = 100 == cap` --
+        // so the soft warning fired on the EXACT SAME decision cycle as
+        // the hard cap, giving zero intervention window. The threshold
+        // must now be strictly below `cap` regardless of how small `cap`
+        // is.
+        let fraction = crate::context::MAX_HISTORY_BLOAT_WARN_FRACTION;
+        assert!(!history_bloat_threshold_crossed(98, 100, fraction, false));
+        assert!(history_bloat_threshold_crossed(99, 100, fraction, false));
+        assert!(history_bloat_threshold_crossed(100, 100, fraction, false));
+
+        // A pathologically small cap (10) at the same ceiling: `ceil(10 *
+        // 0.999) = ceil(9.99) = 10 == cap` before the fix; must still stay
+        // below `cap` after it.
+        assert!(!history_bloat_threshold_crossed(8, 10, fraction, false));
+        assert!(history_bloat_threshold_crossed(9, 10, fraction, false));
+        assert!(history_bloat_threshold_crossed(10, 10, fraction, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_rounds_a_non_integral_product_up_not_down() {
+        // PR #1139 review (third round): cap=10, fraction=0.75 -> the exact
+        // product is 7.5, non-integral. A truncating cast would floor to 7,
+        // firing at 70% of the cap; the correct threshold is the smallest
+        // integer >= 7.5, i.e. 8 (80%) -- the first count that actually
+        // meets or exceeds the configured 75% fraction.
+        assert!(!history_bloat_threshold_crossed(6, 10, 0.75, false));
+        assert!(!history_bloat_threshold_crossed(7, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(8, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(9, 10, 0.75, false));
+        assert!(history_bloat_threshold_crossed(10, 10, 0.75, false));
+
+        // A second non-exact pair with a different fraction/cap combination,
+        // to guard against a fix that happens to work only for this one
+        // numerator/denominator: cap=7, fraction=0.5 -> exact product 3.5 ->
+        // threshold 4, not 3.
+        assert!(!history_bloat_threshold_crossed(3, 7, 0.5, false));
+        assert!(history_bloat_threshold_crossed(4, 7, 0.5, false));
+
+        // An EXACT product (cap=8, fraction=0.75 -> 6.0) must stay unaffected
+        // by switching from truncation to ceiling -- ceil(6.0) == 6.0, same
+        // as before, so the pre-existing exact-division tests elsewhere in
+        // this suite (and the DB-backed counter-emission tests) are
+        // unaffected by this fix.
+        assert!(!history_bloat_threshold_crossed(5, 8, 0.75, false));
+        assert!(history_bloat_threshold_crossed(6, 8, 0.75, false));
+    }
+
+    #[test]
+    fn history_bloat_threshold_crossed_zero_cap_fires_immediately_when_enabled() {
+        // A pathological but well-defined edge: cap = 0 means the threshold
+        // math (`0 * fraction`) is also 0, so any non-negative count "crosses"
+        // it immediately. This function does not decide whether a `cap` of 0
+        // is a sane configuration -- it only computes the threshold predicate.
+        assert!(history_bloat_threshold_crossed(0, 0, 0.75, false));
+        assert!(history_bloat_threshold_crossed(1, 0, 0.75, false));
+    }
+
+    // ── Bounded retry decision (issue #704, PR #1139 review) ─────────────────
+    // `resolve_retry_attempts` is pure and DB-free, so these exercise the
+    // exact semantic `count_history_events_with_retries`'s hand-rolled lazy
+    // loop mirrors -- no Postgres connection, no async runtime needed.
+
+    #[test]
+    fn resolve_retry_attempts_returns_the_first_success() {
+        let attempts: Vec<Result<u32, &str>> = vec![Err("transient"), Err("transient"), Ok(7)];
+        assert_eq!(resolve_retry_attempts(attempts), Ok(7));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_a_success_at_the_front_wins_over_a_later_entry() {
+        // Proves the first `Ok` is what gets returned, not the last one --
+        // mirrors "a first-try success must not need a later attempt".
+        let attempts: Vec<Result<u32, &str>> = vec![Ok(1), Ok(99)];
+        assert_eq!(resolve_retry_attempts(attempts), Ok(1));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_returns_the_last_error_on_total_failure() {
+        // The freshest failure (attempt 3), not the stale first one -- an
+        // easy off-by-one to get backwards in a hand-rolled loop, and the
+        // one that actually matters for diagnosing a persistent failure.
+        let attempts: Vec<Result<u32, u32>> = vec![Err(1), Err(2), Err(3)];
+        assert_eq!(resolve_retry_attempts(attempts), Err(3));
+    }
+
+    #[test]
+    fn resolve_retry_attempts_a_single_failure_surfaces_it() {
+        let attempts: Vec<Result<u32, &str>> = vec![Err("boom")];
+        assert_eq!(resolve_retry_attempts(attempts), Err("boom"));
+    }
 
     // ── Active-workflow population gauge (issue #770) ────────────────────────
 

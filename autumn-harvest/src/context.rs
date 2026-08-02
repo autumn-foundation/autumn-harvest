@@ -57,6 +57,46 @@ pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 /// deadline.
 pub const DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION: f64 = 0.8;
 
+/// Default fraction of [`WorkflowHistoryPolicy::event_hard_cap`] at which the
+/// operator early-warning soft threshold fires (issue #704).
+///
+/// `0.75` means a still-running execution is warned once it has accumulated
+/// 75% of the configured hard-cap event count -- giving an operator a window
+/// to intervene (e.g. trigger a manual `continue_as_new`, or investigate a
+/// runaway loop) before the hard cap terminally fails the workflow.
+pub const DEFAULT_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.75;
+
+/// Upper clamp for [`WorkflowContext::with_history_bloat_warn_fraction`]
+/// (issue #704, PR #1139 review, P2).
+///
+/// Deliberately **strictly below `1.0`**, unlike the structurally-similar
+/// [`DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION`] knob (which clamps to a full
+/// `[0.0, 1.0]`): `worker.rs`'s hard-cap force-fail check runs unconditionally
+/// *before* the warn-fraction crossing calculation on the same decision
+/// cycle, and returns early the instant `current_history_event_count >= cap`
+/// -- the exact condition a fraction of `1.0` would itself require to fire.
+/// A configured `1.0` would therefore always lose that race and the counter
+/// could never fire, silently and permanently disabling it exactly like
+/// `0.0` does, but with none of `0.0`'s documented "this disables it"
+/// contract.
+///
+/// This ceiling alone is **not** what guarantees the warn threshold stays
+/// below the hard cap, though: `ceil(cap * fraction)` can still equal `cap`
+/// itself at this exact ceiling for any `cap` below 1000 (e.g. cap=100:
+/// `ceil(100 * 0.999) = ceil(99.9) = 100 == cap`), which -- absent a further
+/// fix -- would collapse the promised "warn before the hard cap" window into
+/// "warn on the same decision cycle as the hard cap" for small caps (PR
+/// #1139 review, a later round). The actual below-`cap` guarantee is
+/// enforced in `worker.rs`'s `history_bloat_threshold_crossed`, which clamps
+/// its computed threshold to `cap - 1` unconditionally of what `fraction`
+/// resolves to -- that clamp is what keeps the signal functional for every
+/// `(cap, fraction)` combination the public builder API can produce. This
+/// constant's `< 1.0` ceiling remains as an independent, secondary safety
+/// margin (and a reasonable API choice on its own: a fraction of exactly
+/// `1.0` is a confusing "wait until literally the entire cap" configuration
+/// regardless of the below-cap clamp).
+pub const MAX_HISTORY_BLOAT_WARN_FRACTION: f64 = 0.999;
+
 /// Default maximum byte length for the `current_details` string (issue #473).
 /// Values longer than this cap are truncated to this length on the byte boundary.
 pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
@@ -133,6 +173,14 @@ pub struct WorkflowHistoryPolicy {
     /// [`WorkflowContext::should_continue_as_new`] additionally recommends a
     /// checkpoint (issue #772). Clamped into `[0.0, 1.0]`.
     continue_as_new_deadline_fraction: f64,
+    /// Fraction of [`event_hard_cap`](Self::event_hard_cap) at which the
+    /// operator early-warning soft threshold fires (issue #704). Clamped
+    /// into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]` (see that constant's
+    /// doc comment); `0.0` disables the signal entirely (AC4); `NAN` is
+    /// normalized to [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`] -- all set only
+    /// via [`Self::with_history_bloat_warn_fraction`], the sole (guarded)
+    /// entry point, since this field is private.
+    history_bloat_warn_fraction: f64,
 }
 
 impl Default for WorkflowHistoryPolicy {
@@ -141,6 +189,7 @@ impl Default for WorkflowHistoryPolicy {
             continue_as_new_threshold: DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
             event_hard_cap: None,
             continue_as_new_deadline_fraction: DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
+            history_bloat_warn_fraction: DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
         }
     }
 }
@@ -188,6 +237,41 @@ impl WorkflowHistoryPolicy {
     #[must_use]
     pub const fn with_continue_as_new_deadline_fraction(mut self, fraction: f64) -> Self {
         self.continue_as_new_deadline_fraction = fraction.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Fraction of [`event_hard_cap`](Self::event_hard_cap) at which the
+    /// operator early-warning soft threshold fires (issue #704). Defaults to
+    /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`].
+    #[must_use]
+    pub const fn history_bloat_warn_fraction(self) -> f64 {
+        self.history_bloat_warn_fraction
+    }
+
+    /// Override the history-bloat soft-warning fraction (issue #704). The
+    /// value is **clamped** into `[0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]`
+    /// (strictly below `1.0` -- see that constant's doc comment for why).
+    /// `0.0` disables the signal entirely (AC4) -- a naive threshold of
+    /// `cap * 0.0 == 0` would instead fire on the very first recorded event,
+    /// which is never the intent.
+    ///
+    /// `f64::NAN` is normalized to [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`]
+    /// rather than silently passed through (PR #1139 review, P2): `f64::clamp`
+    /// leaves `NAN` untouched (both of its internal comparisons against `NAN`
+    /// are `false`, so neither bound is ever applied), and a stored `NAN`
+    /// would make every later `cap as f64 * NAN` compute `NAN`, which casts to
+    /// `0` -- tripping the soft threshold on the very first suspended cycle of
+    /// *every* execution regardless of its actual history size. Normalizing
+    /// to the documented default (rather than to `0.0`/disabled) is the safer
+    /// failure mode for a garbage/corrupted config value: it keeps the signal
+    /// behaving as if unconfigured instead of silently going dark forever.
+    #[must_use]
+    pub const fn with_history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
+        self.history_bloat_warn_fraction = if fraction.is_nan() {
+            DEFAULT_HISTORY_BLOAT_WARN_FRACTION
+        } else {
+            fraction.clamp(0.0, MAX_HISTORY_BLOAT_WARN_FRACTION)
+        };
         self
     }
 }
@@ -13645,6 +13729,77 @@ mod tests {
         assert!(under.continue_as_new_deadline_fraction().abs() < f64::EPSILON);
         let mid = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.6);
         assert!((mid.continue_as_new_deadline_fraction() - 0.6).abs() < f64::EPSILON);
+    }
+
+    // ── Operator early-warning for history bloat (issue #704) ────────────────
+
+    #[test]
+    fn workflow_history_policy_bloat_warn_fraction_default_and_clamp() {
+        let default = WorkflowHistoryPolicy::default();
+        assert!(
+            (default.history_bloat_warn_fraction() - DEFAULT_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON
+        );
+
+        // Clamped to [0.0, MAX_HISTORY_BLOAT_WARN_FRACTION] -- deliberately
+        // NOT the full [0.0, 1.0] `continue_as_new_deadline_fraction` uses;
+        // see MAX_HISTORY_BLOAT_WARN_FRACTION's doc comment (PR #1139 P2).
+        let over = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(1.5);
+        assert!(
+            (over.history_bloat_warn_fraction() - MAX_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON
+        );
+        assert!(over.history_bloat_warn_fraction() < 1.0);
+        // Exactly 1.0 must ALSO clamp down -- it is the specific value that
+        // silently disables the signal if let through (see the constant's
+        // doc comment).
+        let exactly_one = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(1.0);
+        assert!(exactly_one.history_bloat_warn_fraction() < 1.0);
+        let under = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(-0.5);
+        assert!(under.history_bloat_warn_fraction().abs() < f64::EPSILON);
+        let mid = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(0.5);
+        assert!((mid.history_bloat_warn_fraction() - 0.5).abs() < f64::EPSILON);
+
+        // 0.0 is a valid, intentional value meaning "disabled" (AC4) — the
+        // crossing-detection logic (tested separately) must treat it as a
+        // no-op rather than a threshold of zero events.
+        let disabled = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(0.0);
+        assert!(disabled.history_bloat_warn_fraction().abs() < f64::EPSILON);
+    }
+
+    /// PR #1139 review, second pass, finding A: `f64::clamp` leaves `NAN`
+    /// untouched (both of its internal comparisons against `NAN` are
+    /// `false`), so a `NAN` input must be explicitly normalized rather than
+    /// relying on the clamp -- otherwise a stored `NAN` fraction makes
+    /// `history_bloat_threshold_crossed`'s `(cap as f64 * NAN) as u64` cast
+    /// to `0`, tripping the soft threshold on the very first suspended cycle
+    /// of every execution regardless of its actual history size.
+    #[test]
+    fn workflow_history_policy_bloat_warn_fraction_normalizes_nan() {
+        let nan_input = WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(f64::NAN);
+        assert!(
+            !nan_input.history_bloat_warn_fraction().is_nan(),
+            "a NAN input must never be stored as NAN"
+        );
+        assert!(
+            (nan_input.history_bloat_warn_fraction() - DEFAULT_HISTORY_BLOAT_WARN_FRACTION).abs()
+                < f64::EPSILON,
+            "a NAN input must normalize to the documented default, not to 0.0 \
+             (which would silently and indistinguishably behave like the \
+             intentional \"disabled\" value)"
+        );
+
+        // The negative-NaN bit pattern must be treated identically -- IEEE
+        // 754 has multiple NaN bit patterns, and `is_nan()` must catch all of
+        // them, not just the canonical one.
+        let neg_nan_input =
+            WorkflowHistoryPolicy::default().with_history_bloat_warn_fraction(-f64::NAN);
+        assert!(!neg_nan_input.history_bloat_warn_fraction().is_nan());
+        assert!(
+            (neg_nan_input.history_bloat_warn_fraction() - DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     // ── Cross-version replay tolerance (issue #772 / #603, Finding 1) ────────

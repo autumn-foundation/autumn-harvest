@@ -72,13 +72,13 @@ use crate::telemetry::{
     METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS,
     METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
     METRIC_WORKFLOW_CHAIN_TIMEOUT, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES,
-    METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
-    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, SessionAcquisitionOutcome, SlotType,
-    TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -641,6 +641,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_workflow_history_bloat(&self, workflow_name: &str) {
+        counter!(
+            METRIC_WORKFLOW_HISTORY_BLOAT,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_workflow_retry(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_RETRIES,
@@ -1060,6 +1068,7 @@ mod tests {
         rec.record_workflow_started("wf", "q");
         rec.record_workflow_completed("wf", "q", 1.0, WorkflowStatus::Completed);
         rec.record_workflow_history_size("wf", 2);
+        rec.record_workflow_history_bloat("wf");
         rec.record_workflow_continue_as_new("wf");
         rec.record_activity_completed("act", "q", 0.5, ActivityStatus::Completed);
         rec.record_timer_started(30.0);
@@ -1263,6 +1272,93 @@ mod tests {
             ],
             "the bridge must register both saga counters with exactly the \
              workflow + queue label constants, values un-swapped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator early-warning for workflow history bloat bridge (issue #704)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridges_workflow_history_bloat_with_workflow_label_only() {
+        // Real label-content assertion: a local `metrics::Recorder` captures
+        // the registered counter key, so a swapped label, a dropped label, or
+        // an accidentally-added `queue` label (unlike its sibling
+        // `sla_breached`/`nd_blocked` counters, this one is deliberately
+        // `workflow`-only, per the constant's doc comment) is caught here.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_workflow_history_bloat("onboarding");
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[(
+                METRIC_WORKFLOW_HISTORY_BLOAT.to_owned(),
+                vec![(METRIC_LABEL_WORKFLOW.to_owned(), "onboarding".to_owned())],
+            )],
+            "the bridge must register exactly the workflow label constant, \
+             with no queue label and no value swap"
         );
     }
 

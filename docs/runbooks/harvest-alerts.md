@@ -1356,6 +1356,133 @@ Escalate to page if the population growth is unbounded and accelerating, the
 worker fleet is already at capacity, and business-critical runs are visibly
 stalled (their `stack` shows no forward progress across successive checks).
 
+## harvest_workflow_history_bloat
+
+**What to do when a still-running workflow's history is approaching the hard
+cap:** the `harvest.workflow.history_bloat` counter (issue #704) is an operator
+**early-warning**, distinct from the terminal outcome it precedes. Harvest can
+optionally enforce a hard cap on the number of recorded `harvest_events` an
+in-flight execution may accumulate (`WorkflowHistoryPolicy::event_hard_cap`,
+set once via `HarvestBuilder::history_event_hard_cap` at worker-registry
+construction time — **registry-wide, not per-workflow-type**: `HandlerRegistry`
+stores a single `WorkflowHistoryPolicy`, consulted with no workflow-name
+parameter, so every workflow type registered on that worker shares the
+identical cap and warn fraction; there is no per-type override, and raising or
+lowering either value affects every workflow type that worker serves. Distinct
+from the unrelated fleet-wide `HarvestBuilder::max_workflow_history_events`
+ceiling from issue #493, which is sampled by a separate periodic scanner and
+reported via the `harvest.workflow.history_oversized` gauge). When a hard cap
+is configured,
+the same still-`RUNNING` execution that would eventually hit it is instead
+warned once — the first time its recorded history crosses a configurable
+fraction of that cap (`history_bloat_warn_fraction`, default **75%**,
+`0` disables the signal entirely). The counter increments once per crossing
+per execution (delivery is at-least-once — see the last triage step below);
+the run itself is completely unaffected and keeps executing normally. A
+single decision cycle can also grow history from below the soft threshold
+straight past the hard cap in one shot (e.g. a batched local-activity or
+external-signal append); in that case the same crossing is caught and
+emitted right before the execution is terminally force-failed, so the
+warning still fires even for a run that never spends a cycle "just barely
+over the soft line." If nothing intervenes, continued growth will eventually
+reach the hard cap, at which point the execution is terminally force-failed
+and moved to the dead-letter queue — this alert exists to give an operator a
+window to act *before* that happens.
+
+### Triage steps
+
+1. Read the `workflow` label to identify which workflow type crossed the soft
+   threshold.
+2. Discover and rank the specific offending execution(s) with the dedicated
+   discovery filter, sorted largest-first with each row's current
+   `history_event_count`:
+   `harvest workflow list --history-bloat-min-events <threshold>` (or
+   `GET /api/harvest/workflows?history_bloat_min_events=<threshold>`). Start
+   with a threshold near the configured hard cap's 75% soft mark and lower it
+   if you need to see the full ranked population; every returned row is
+   guaranteed non-terminal (`RUNNING`/`PAUSED`), sorted by history size
+   descending. This is a DIFFERENT query parameter from the unrelated,
+   pre-existing general-purpose `min_history_events` filter (issue #493,
+   `docs/runbooks/history-ceiling.md`), which composes with `state=`/
+   pagination and does not restrict to live executions or sort by size.
+3. For the largest offender(s), inspect `GET /api/harvest/workflows/{execution_id}/stack`
+   and `GET /api/harvest/workflows/{execution_id}/history` to understand what
+   is driving the growth — a tight retry/poll loop, an unbounded fan-out, or a
+   long-lived entity workflow that has simply been running for a long time
+   without ever checkpointing.
+4. Check whether the execution has already been warned before
+   (`history_bloat_warned_at` on the execution row, surfaced by the describe
+   endpoint) — the guard field is set once and only once per execution
+   (idempotent across replays/retries), so a repeat page naming the *same*
+   execution means it kept growing past the first warning and is now closer
+   to the hard cap. The counter itself is delivered at-least-once: it is
+   emitted just before the guard is durably persisted, so a worker crash in
+   that narrow window can rarely cause one extra increment on a retry —
+   treat a lone duplicate-looking page for an execution whose
+   `history_bloat_warned_at` is already set as this benign case, not a
+   second distinct crossing.
+
+### Likely causes
+
+- A workflow that polls or loops without ever calling `continue_as_new` (issue
+  #772's `should_continue_as_new()` exists precisely to recommend this
+  checkpoint; a workflow that ignores the recommendation, or has no such
+  check at all, keeps accumulating history indefinitely).
+- An unexpectedly wide activity or child-workflow fan-out (issues #359/#601)
+  recording far more events per decision cycle than the workflow author
+  anticipated.
+- A long-lived entity workflow (a subscription, a cart, a device) that is
+  behaving correctly but was never given a deadline-aware checkpoint
+  strategy (issue #772).
+- The configured `event_hard_cap` (or its `history_bloat_warn_fraction`) is
+  simply too tight for the crossing workflow type's normal, healthy history
+  footprint — since the cap/fraction is registry-wide (not per-type), raising
+  either affects every other workflow type sharing the same worker process;
+  confirm the new value is still appropriate for them before tuning, or run
+  the outlier workflow type on a separate worker/`HandlerRegistry` with its
+  own cap if their footprints genuinely diverge.
+
+### False positives
+
+A single crossing for a workflow type known to run long and record many
+events by design (e.g. a long-lived entity workflow deliberately operating
+close to its configured cap) is expected, not an incident — the alert fires
+once per execution and does not repeat unless the execution keeps growing
+past the point already investigated. A worker whose `HandlerRegistry` has no
+`event_hard_cap` configured will show a permanently flat, never-incrementing
+series; that is the disabled/no-op state, not a health signal to chase.
+
+### Safe actions
+
+1. If the workflow is a candidate for `continue_as_new`, trigger it (either by
+   waiting for the workflow's own `should_continue_as_new()` check to fire on
+   its next decision cycle, or — for a workflow with no such check — by
+   deploying a code change that adds one; in-flight executions replay
+   deterministically against the recorded history).
+2. If the growth is an unbounded fan-out, inspect and fix the workflow code
+   and let the fix apply on the next deploy (existing in-flight executions
+   are unaffected by the code change until they reach a fresh decision
+   cycle).
+3. If the cap/fraction is simply mistuned for the crossing workflow type's
+   expected footprint, raise `event_hard_cap` or `history_bloat_warn_fraction`
+   via `HarvestBuilder` on the next deploy — this is registry-wide (every
+   workflow type sharing that worker gets the new value; there is no
+   per-type override) and never requires touching in-flight executions.
+4. If the execution is at real risk of hitting the hard cap before any of the
+   above can land, and it is safe to interrupt, cancel or terminate it
+   (`POST /api/harvest/workflows/{execution_id}/cancel` or `/terminate`)
+   rather than let it dead-letter on the hard cap.
+
+### Escalation criteria
+
+Ticket the workflow owner with the type name and the ranked list from
+`history_bloat_min_events`. Escalate if a specific execution keeps re-crossing
+(growth continuing well past the first warning) and is on a clear trajectory
+to reach the hard cap within the next alerting window, or if the growth is
+concentrated across many concurrent executions of the same type rather than
+one outlier — the latter usually means the workflow's checkpoint strategy
+itself needs to change, not just the one instance.
+
 ## harvest_queue_paused_too_long
 
 **What to do when a task queue has been held by an operator for too long:** the

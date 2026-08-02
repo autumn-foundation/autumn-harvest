@@ -200,6 +200,11 @@ pub struct WorkflowExecution {
     /// when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_by: Option<String>,
+    /// Wall-clock the operator early-warning soft threshold was first crossed
+    /// for this execution's recorded history size (issue #704). `None` = not
+    /// yet warned. Never read on replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_bloat_warned_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /

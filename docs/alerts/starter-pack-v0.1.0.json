@@ -851,6 +851,43 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_population_leak"
     },
     {
+      "id": "harvest_workflow_history_bloat",
+      "status": "enforceable",
+      "signal_source": "harvest.workflow.history_bloat counter (issue #704), incremented once (at-least-once delivery; a rare crash-window duplicate is possible) per workflow execution when its recorded harvest_events count first crosses history_bloat_warn_fraction * event_hard_cap (WorkflowHistoryPolicy, default fraction 0.75) -- either while still-running, or in the same decision that terminally force-fails the run for exceeding the hard cap in one shot.",
+      "default_threshold": "Ticket on any increase over a 15 minute window: sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m])) > 0. This is a per-run early-warning crossing, not a sustained rate -- a single occurrence is worth triaging before the run reaches the hard cap and is terminally force-failed to the DLQ. The signal only fires for workflow types where the operator has configured event_hard_cap; it is a no-op (a permanently flat series) otherwise, which is expected, not a health issue. Prometheus caveat: this counter's series for a given workflow label is created only at that label's first-ever crossing (no prior zero sample exists to diff against), so increase() computed over that genesis crossing can read as zero/no-data until a second sample of the same series is scraped -- a true first-ever crossing for a workflow type that has never crossed before may not reliably page/ticket from this expression alone (it typically becomes observable on a second crossing, or once a later scrape re-samples the still-flat series). This is a general Prometheus counter-genesis property shared by every ANY-occurrence rule in this pack (harvest_workflow_non_determinism, harvest_workflow_nondeterministic_block, harvest_saga_compensation_failed), not specific to this signal. For guaranteed single-occurrence detection independent of Prometheus sampling, poll the discovery endpoint directly: GET /api/harvest/workflows?history_bloat_min_events=<threshold> (or harvest workflow list --history-bloat-min-events <threshold>), which has no such genesis-sample gap.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A workflow execution's recorded event history has crossed a configurable fraction (default 75%) of the engine's optional hard history-event-count cap. This is an operator early-warning: for a still-running execution the run keeps executing exactly as before, and the counter fires once per crossing per run (at-least-once delivery). A single decision can also grow history past the cap in one shot, in which case the crossing is caught and the counter fires right before that same decision terminally force-fails the run. Left unaddressed, continued growth risks the execution eventually reaching the hard cap and being terminally force-failed to the dead-letter queue. Typical causes are a workflow that polls or loops without ever calling continue_as_new, or an unexpectedly wide fan-out.",
+      "first_action": "harvest workflow list --history-bloat-min-events <threshold>, which returns only live executions at or above that recorded event count, sorted by history size descending with each row's current history_event_count -- rank and triage the largest offenders first.",
+      "dependencies": [
+        {
+          "ref": "#704",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_HISTORY_BLOAT / harvest.workflow.history_bloat, GET /api/harvest/workflows?history_bloat_min_events=<N>, harvest workflow list --history-bloat-min-events <N>"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric label: workflow; execution.id is never a label"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "The counter fires once per run at the moment it crosses the soft threshold, so alert on ANY increase within the window rather than a sustained rate. workflow is the only label; execution.id is never a label. An unconfigured deployment (no event_hard_cap set on any workflow) will show a permanently flat, never-incrementing series -- this is the disabled/no-op state (AC4), not an outage. A workflow label crossing for the very first time creates its series with no prior zero sample, so increase() may not observe that genesis crossing until a second sample of the series exists (see default_threshold's Prometheus caveat); the discovery endpoint has no such gap and is the reliable fallback for guaranteed single-occurrence detection.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest workflow list --history-bloat-min-events <threshold>",
+        "GET /api/harvest/workflows?history_bloat_min_events=<threshold>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_history_bloat"
+    },
+    {
       "id": "harvest_queue_paused_too_long",
       "status": "enforceable",
       "signal_source": "ADR-0001/#619 gauge harvest.queue.paused sampled per worker on the poll interval. Label: queue (bounded to distinct queue names). 1 while an operator hold is in effect, 0 otherwise.",

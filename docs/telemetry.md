@@ -311,6 +311,7 @@ metric is emitted in the source code.
 | `harvest.workflow.duration` | Histogram | `worker.rs` — `process_workflow_task`, on executor cycle completion |
 | `harvest.workflow.timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's per-run `deadline_at` (issue #243) elapses. Labels: `workflow`, `queue` |
 | `harvest.workflow.chain_timeout` | Counter | `timeout.rs` — `enforce_workflow_execution_timeouts`, when a run's chain-scoped `chain_deadline_at` (issue #617) elapses. The chain cap is anchored at the first run's start and carried verbatim across every continue-as-new, so this counter — distinct from `harvest.workflow.timeout` — fires when a whole continue-as-new chain (not a single run) outlives its lifetime cap. Labels: `workflow`, `queue`. Both a chain and a run timeout still emit `harvest.workflow.terminal{outcome="timed_out"}`; the chain-vs-run distinction lives only in these two counters |
+| `harvest.workflow.history_bloat` | Counter | `worker.rs` — via the shared `emit_history_bloat_warning_if_crossed` helper, called from two places: (1) `process_workflow_task`'s `Persisted` arm, post-commit, for a still-**RUNNING** (non-terminal, `WorkflowOutcome::Suspended`) execution (same "compute pre-transaction, act only after commit" discipline as `harvest.signal.unhandled`/`harvest.update.completed`/`harvest.update.failed`, issue #684, so an ND-blocked / paused-parked / persist-failed cycle can never emit); and (2) `fail_workflow_for_history_cap`, when a single decision cycle grows history from below the soft threshold straight past `event_hard_cap` in one inline append batch (e.g. local-activity or external-signal persistence), bypassing (1) entirely — the crossing still happened in the same decision, so it is emitted there too, before the execution is terminally DLQ'd. Fires once per still-**RUNNING** or newly-hard-cap-terminal-failed execution the moment its recorded `harvest_events` count first crosses `history_bloat_warn_fraction * event_hard_cap` (`WorkflowHistoryPolicy`, default fraction `0.75`, clamped below `1.0`); a guarded `history_bloat_warned_at` column on the execution row makes the crossing idempotent across replays/retries once the mark is durably set. **Delivery is at-least-once, not exactly-once**: the counter is emitted BEFORE the guard is persisted, so a worker crash in the narrow window between the two leaves the guard unset and a future retry of the same decision cycle may re-emit rather than silently losing the signal forever — deliberate, since the guard is a one-shot, non-recurring gate with no later crossing to fall back on for a given execution (PR #1139 review). Observation-only — the run keeps executing normally; a permanently flat, never-incrementing series for any workflow type with no `event_hard_cap` configured, which is the disabled/no-op state, not a health issue. Pair with `GET /api/harvest/workflows?history_bloat_min_events=<N>` (or `harvest workflow list --history-bloat-min-events <N>`) to discover and rank the specific offending, still-live execution(s) by current history size (issue #704) |
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
@@ -382,6 +383,7 @@ metric is emitted in the source code.
 | `harvest.retention.deleted` | `workflow` |
 | `harvest.retention.summary_deleted` | `workflow` |
 | `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
+| `harvest.workflow.history_bloat` | `workflow` (= `METRIC_LABEL_WORKFLOW`) — no `execution.id` label (ADR-0001 §7); see `GET /api/harvest/workflows?history_bloat_min_events=<N>` to find the specific execution(s) driving a crossing (issue #704) |
 | `harvest.workflow.start_throttled` | `workflow` (the resolved throttle key is deliberately **not** a label — unbounded cardinality; see `GET /admin/start-throttle` for per-key backlog, issue #607) |
 | `harvest.webhook.received` | `path` (registered `#[webhook(path = ...)]` bindings only, closed set), `outcome` (`accepted\|idempotent_replay\|verify_failed\|parse_failed\|missing_idempotency\|internal_error`) |
 | `harvest.webhook.rejected` | `path`, `outcome` (never `accepted`/`idempotent_replay`) |
@@ -465,6 +467,12 @@ harvest_queue_oldest_pending_age{queue="default"}
 
 # DLQ depth per shard
 harvest_dlq_entries{shard="0"}
+
+# Workflow history-bloat early warnings per type, per 15m window (issue #704).
+# One increase per still-running execution the moment it first crosses the
+# configured soft threshold (default 75% of event_hard_cap) -- pair a
+# crossing with `GET /workflows?history_bloat_min_events=<N>` to rank offenders.
+sum by (workflow) (increase(harvest_workflow_history_bloat_total[15m]))
 
 # Worker dispatch-slot utilization per slot type (issue #531):
 # "are my workers saturated?" — pairs with queue.depth to tell a worker

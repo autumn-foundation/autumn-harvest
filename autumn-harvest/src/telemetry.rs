@@ -388,6 +388,46 @@ pub const METRIC_WORKFLOW_TASK_TIMEOUT: &str = "harvest.workflow.task_timeout";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_SLA_BREACHED: &str = "harvest.workflow.sla_breached";
 
+/// Counter: workflow history bloat early-warning (issue #704).
+///
+/// Fires the moment a workflow execution's recorded `harvest_events` count
+/// first crosses `history_bloat_warn_fraction * event_hard_cap`
+/// (`WorkflowHistoryPolicy`), from **two** emission sites: (1)
+/// `process_workflow_task`'s `Persisted` arm, post-commit, for an execution
+/// that is still RUNNING (non-terminal, `WorkflowOutcome::Suspended`) after
+/// the crossing decision cycle; and (2) `fail_workflow_for_history_cap`, when
+/// a single decision cycle grows history from below the soft threshold
+/// straight past `event_hard_cap` in one inline append batch (e.g.
+/// local-activity or external-signal persistence) -- the crossing still
+/// happened in that same decision, so it is emitted there too, immediately
+/// before the execution is terminally hard-cap-failed and moved to the DLQ.
+///
+/// **Delivery is at-least-once, not exactly-once**: the counter is emitted
+/// *before* the guard column (`history_bloat_warned_at`) is durably
+/// persisted, so a worker crash in the narrow window between the two leaves
+/// the guard unset and a later retry of the same decision cycle may re-emit
+/// -- a deliberate trade-off (documented on `emit_history_bloat_warning_if_crossed`)
+/// favoring "never silently lose the signal" over "never duplicate it" for a
+/// one-shot, non-recurring gate with no later crossing to fall back on for a
+/// given execution. Once the guard is durably set, the emission is
+/// idempotent for the life of that execution row (a continue-as-new
+/// successor or reset fork is a fresh row and is naturally eligible to warn
+/// again, since it tracks its own history size from zero).
+///
+/// This is an **operator early-warning**, not a lifecycle change on its own:
+/// path (1) never terminates or otherwise alters the run -- it is purely a
+/// signal that the run is approaching the point where the existing hard-cap
+/// terminal-fail (DLQ) behavior would trigger. Path (2) accompanies (not
+/// causes) a termination the hard cap was already going to enforce
+/// regardless of this counter.
+///
+/// Labeled by `workflow` (workflow name) ONLY -- no `queue` label, unlike its
+/// sibling counters above. The soft-threshold crossing is a property of the
+/// execution's own accumulated history size against a globally-configured
+/// fraction/cap, not a per-queue phenomenon, and `execution.id` stays
+/// span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_HISTORY_BLOAT: &str = "harvest.workflow.history_bloat";
+
 /// Counter: incremented each time a failed workflow execution is automatically
 /// rescheduled for a retry run (issue #523).
 ///
@@ -2113,6 +2153,24 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A still-RUNNING (suspended, not terminal) workflow execution's
+    /// recorded history event count has just crossed the configured
+    /// early-warning fraction of the hard cap for the first time (issue
+    /// #704).
+    ///
+    /// Emitted **exactly once per execution**, worker-side, guarded by an
+    /// atomic `UPDATE ... WHERE history_bloat_warned_at IS NULL`. This is a
+    /// pure operator early-warning -- it never terminates, cancels, or
+    /// otherwise alters the run's lifecycle.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_HISTORY_BLOAT`] with label
+    /// `workflow` ONLY (no `queue`, unlike most sibling workflow counters --
+    /// see the constant's doc comment). Per ADR-0001 §7, `execution.id` must
+    /// never be a label here.
+    fn record_workflow_history_bloat(&self, workflow_name: &str) {
+        let _ = workflow_name;
+    }
+
     /// A failed workflow execution was automatically rescheduled for a retry run (issue #523).
     ///
     /// Maps to the counter `harvest.workflow.retries{workflow, queue}`.
@@ -3447,6 +3505,7 @@ mod tests {
         rec.record_summary_deleted("onboarding", 50);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
+        rec.record_workflow_history_bloat("onboarding");
         rec.record_schedule_to_start("default", 1.5);
         rec.record_queue_oldest_pending_age("default", 30.0);
         rec.record_worker_slots(SlotType::Workflow, 3, 5);
@@ -3514,6 +3573,23 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_admission_bypassed("outbox");
         rec.record_admission_bypassed("api");
+    }
+
+    #[test]
+    fn metric_workflow_history_bloat_name_is_stable() {
+        assert_eq!(
+            METRIC_WORKFLOW_HISTORY_BLOAT,
+            "harvest.workflow.history_bloat"
+        );
+    }
+
+    #[test]
+    fn noop_metrics_implements_history_bloat_without_panicking() {
+        // issue #704: the new early-warning counter has a no-op default
+        // (additive) so a `MetricsRecorder` implementor that predates this
+        // issue keeps compiling unchanged.
+        let rec = NoOpMetrics;
+        rec.record_workflow_history_bloat("onboarding");
     }
 
     #[test]

@@ -1699,6 +1699,24 @@ impl HarvestBuilder {
         self
     }
 
+    /// Override the fraction of [`history_event_hard_cap`](Self::history_event_hard_cap)
+    /// at which the operator early-warning soft threshold fires (issue #704).
+    /// Clamped into `[0.0, 1.0]`; `0.0` disables the signal entirely (AC4).
+    ///
+    /// Has no effect unless a hard cap is also configured -- with no hard
+    /// cap there is nothing to warn about approaching.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_HISTORY_BLOAT_WARN_FRACTION`](crate::context::DEFAULT_HISTORY_BLOAT_WARN_FRACTION)
+    /// (`0.75`).
+    #[must_use]
+    pub const fn history_bloat_warn_fraction(mut self, fraction: f64) -> Self {
+        self.history_policy = self
+            .history_policy
+            .with_history_bloat_warn_fraction(fraction);
+        self
+    }
+
     /// Set a server-side hard ceiling on the number of durable events a RUNNING
     /// workflow execution may accumulate (issue #493).
     ///
@@ -3738,6 +3756,51 @@ mod tests {
             .build();
         assert!(
             (clamped.history_policy().continue_as_new_deadline_fraction() - 1.0).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn harvest_builder_accepts_history_bloat_warn_fraction_override() {
+        // Issue #704: the operator early-warning soft-threshold fraction is
+        // configurable and clamped into [0.0, MAX_HISTORY_BLOAT_WARN_FRACTION]
+        // -- strictly below 1.0, unlike the sibling deadline-fraction override
+        // above (PR #1139 review, P2: worker.rs's hard-cap force-fail check
+        // always wins the race against a warn threshold of exactly the cap,
+        // so a fraction of 1.0 must never be reachable through this API).
+        let built = HarvestBuilder::new()
+            .history_bloat_warn_fraction(0.5)
+            .build();
+        let policy = built.history_policy();
+        assert!((policy.history_bloat_warn_fraction() - 0.5).abs() < f64::EPSILON);
+
+        let clamped = HarvestBuilder::new()
+            .history_bloat_warn_fraction(2.0)
+            .build();
+        assert!(clamped.history_policy().history_bloat_warn_fraction() < 1.0);
+        assert!(
+            (clamped.history_policy().history_bloat_warn_fraction()
+                - crate::context::MAX_HISTORY_BLOAT_WARN_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Exactly 1.0 must ALSO clamp strictly below 1.0 -- it is the one
+        // value that would otherwise silently disable the signal.
+        let exactly_one = HarvestBuilder::new()
+            .history_bloat_warn_fraction(1.0)
+            .build();
+        assert!(exactly_one.history_policy().history_bloat_warn_fraction() < 1.0);
+
+        // 0.0 explicitly disables the signal (AC4).
+        let disabled = HarvestBuilder::new()
+            .history_bloat_warn_fraction(0.0)
+            .build();
+        assert!(
+            disabled
+                .history_policy()
+                .history_bloat_warn_fraction()
+                .abs()
                 < f64::EPSILON
         );
     }

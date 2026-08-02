@@ -496,6 +496,36 @@ pub(crate) async fn next_event_id_for(
     Ok(max_id.map_or(0, |id| id.saturating_add(1)))
 }
 
+/// Count an execution's durably-persisted `harvest_events` rows.
+///
+/// Lock-free (no `FOR UPDATE`, no execution-row existence check) and
+/// autocommit-safe -- unlike [`next_event_id_for`], which is meant for
+/// in-transaction use and raises [`crate::error::HarvestError::NotFound`] on
+/// a missing execution. This is a best-effort read intended for post-commit
+/// telemetry decisions (issue #704's history-bloat soft-threshold warning):
+/// the caller must already know the execution exists (it just persisted a
+/// decision cycle for it), so a `NotFound` distinction is unnecessary here
+/// -- an execution with zero rows (impossible in practice) simply counts 0.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] if the query fails.
+pub(crate) async fn count_history_events(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<u64> {
+    use diesel::dsl::count_star;
+
+    let count: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(count_star())
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// Durably admit an update into a workflow's event history.
 ///
 /// Opens a transaction, acquires a row-level `FOR UPDATE` lock on the
@@ -1599,6 +1629,39 @@ pub async fn update_current_details(
         .map_err(crate::error::database_error)?;
 
     Ok(())
+}
+
+/// Guarded exactly-once stamp for the operator early-warning soft threshold
+/// on workflow history bloat (issue #704).
+///
+/// Called by the worker, post-commit (in autocommit), when a still-RUNNING
+/// execution's recorded history event count has just crossed
+/// `history_bloat_warn_fraction * event_hard_cap` for the first time.
+///
+/// The `WHERE history_bloat_warned_at IS NULL` guard makes this exactly-once
+/// and race-safe: concurrent workers racing to persist the same execution's
+/// next cycle (or repeated re-dispatch of an already-warned execution) can
+/// never double-stamp the row. Returns `Ok(true)` iff THIS call performed the
+/// transition (the row was NULL and is now stamped) so the caller emits the
+/// counter exactly once; `Ok(false)` means it was already stamped (by an
+/// earlier cycle or a racing worker) and the caller must not emit again.
+pub async fn mark_history_bloat_warned(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> crate::error::HarvestResult<bool> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let rows = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::history_bloat_warned_at.is_null()),
+    )
+    .set(dsl::history_bloat_warned_at.eq(diesel::dsl::now))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows > 0)
 }
 
 fn summarize_error(error: Option<String>) -> Option<String> {
