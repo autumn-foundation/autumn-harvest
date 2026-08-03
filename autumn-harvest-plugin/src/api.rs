@@ -20682,6 +20682,7 @@ pub(crate) async fn trigger_dag_run_inner(
         dag.owner.as_deref(),
         dag.runbook_url.as_deref(),
         dag.severity.as_deref(),
+        &runtime.registry,
         // Manual DAG trigger is attributed to the schedule (issue #740),
         // mirroring trigger_schedule_now; carry the operator actor.
         autumn_harvest::StartSource::Schedule,
@@ -21871,6 +21872,14 @@ fn reanchor_schedule_timezone(existing: &Schedule, tz: &str) -> Schedule {
 /// value can never disagree with what a real fire would set on
 /// `deadline_at`/`sla_deadline_at`.
 ///
+/// The fleet-wide `HandlerRegistry::max_workflow_execution_timeout` ceiling
+/// (issue #743 review, PR #1141 Finding #3) is applied BEFORE the sla clamp,
+/// exactly mirroring `start_or_load_workflow_execution`'s own
+/// `(Some(t), Some(ceiling)) => Some(t.min(ceiling))` rule -- so an
+/// operator-configured ceiling narrower than the declared `execution_timeout`
+/// is reflected in both the advertised `execution_timeout_secs` AND the
+/// `sla_secs` clamp, never the raw declared value.
+///
 /// `(None, None)` when the registry is unavailable (e.g. a scheduler-only
 /// process with no live runtime installed) or the workflow/DAG declares
 /// neither -- never a panic, never a stale/guessed value.
@@ -21881,11 +21890,15 @@ fn resolve_schedule_deadline_secs(
     let Some(info) = registry.and_then(|r| r.workflows.get(name)) else {
         return (None, None);
     };
-    let execution_timeout_secs = info
-        .execution_timeout
-        .and_then(|d| i64::try_from(d.as_secs()).ok());
+    let ceiling = registry.and_then(|r| r.max_workflow_execution_timeout);
+    let effective_execution_timeout = match (info.execution_timeout, ceiling) {
+        (Some(t), Some(ceiling)) => Some(t.min(ceiling)),
+        (other, _) => other,
+    };
+    let execution_timeout_secs =
+        effective_execution_timeout.and_then(|d| i64::try_from(d.as_secs()).ok());
     let sla_secs =
-        clamp_info_default_sla(info.sla, info.execution_timeout).map(|d| d.num_seconds());
+        clamp_info_default_sla(info.sla, effective_execution_timeout).map(|d| d.num_seconds());
     (execution_timeout_secs, sla_secs)
 }
 
@@ -42736,6 +42749,52 @@ mod tests {
         assert_eq!(
             resolve_schedule_deadline_secs(Some(&registry), "plain_wf"),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_applies_fleet_wide_ceiling() {
+        // Codex review on issue #743 (PR #1141): the resolver previously
+        // reported the RAW declared execution_timeout/sla, disagreeing with
+        // what a real fire would actually set on deadline_at/sla_deadline_at
+        // once a fleet-wide `max_workflow_execution_timeout` ceiling is
+        // configured. Both the advertised timeout AND the sla (clamped
+        // against the CEILED timeout, not the raw one) must reflect the 1h
+        // ceiling, never the raw 10h/8h declarations.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "ceiling_wf",
+                Some(std::time::Duration::from_secs(10 * 3600)),
+                Some(std::time::Duration::from_secs(8 * 3600)),
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "ceiling_wf"),
+            (Some(3_600), Some(3_600)),
+            "the ceiling must cap the advertised execution_timeout AND the sla \
+             clamp must be computed against the CEILED value, not the raw 10h/8h"
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_ceiling_never_widens_a_smaller_declared_value() {
+        // The ceiling only CAPS -- it must never widen a value the workflow
+        // declared smaller than the fleet-wide ceiling.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "small_wf",
+                Some(std::time::Duration::from_secs(1800)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "small_wf"),
+            (Some(1_800), None),
+            "a 30m declared timeout under a 1h ceiling must read back as 30m, not widened to 1h"
         );
     }
 
