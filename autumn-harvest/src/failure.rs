@@ -168,7 +168,20 @@ pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
 /// `From<String>` produces a retryable `ActivityFailure` with
 /// `error_type = "Error"`, so every activity that today returns
 /// `Err(String)` continues to compile and behave identically.
+///
+/// `#[non_exhaustive]` (added alongside the `retry_after` field, issue #744,
+/// Codex review on PR #1140): every field is `pub` for read access (the
+/// worker and downstream consumers pattern-read `error_type`/`message`/
+/// `details`/`non_retryable`/`retry_after` freely from within this crate),
+/// but external construction must go through [`Self::retryable`] /
+/// [`Self::non_retryable`] plus the builder methods
+/// (e.g. [`Self::with_retry_after`]) rather than a bare struct literal.
+/// Without this, adding `retry_after` would have been source-breaking for
+/// any downstream crate constructing the previous four-field struct via a
+/// literal; `#[non_exhaustive]` makes this addition -- and every future
+/// field addition -- genuinely additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ActivityFailure {
     /// A stable, low-cardinality error-type name used for metrics and policy
     /// matching (e.g. `"InvalidInput"`, `"RateLimitExceeded"`).
