@@ -25,8 +25,8 @@
 //! ```rust,ignore
 //! #[dag(schedule = "0 6 * * *", execution_timeout = "4h", sla = "3h")]
 //! fn nightly_reconciliation(dag: &mut DagBuilder) {
-//!     dag.activity(extract_ledger);
-//!     dag.activity(reconcile_accounts).upstream(&extract_ledger);
+//!     let extract = dag.activity(extract_ledger);
+//!     let _reconcile = dag.activity(reconcile_accounts).upstream(&extract);
 //! }
 //! ```
 //!
