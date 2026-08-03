@@ -1307,6 +1307,20 @@ pub struct DagInfo {
     /// `unified-dag-execution` feature is on, since MCP exposure lowers the
     /// DAG onto its shadow `WorkflowInfo`.
     pub mcp: bool,
+    /// A hard wall-clock deadline for the whole scheduled DAG run
+    /// (`#[dag(execution_timeout = "4h")]`, issue #743). Propagated verbatim
+    /// to the shadow [`WorkflowInfo::execution_timeout`] by
+    /// [`DagInfo::as_workflow_info`] and enforced by the EXISTING #243
+    /// `timeout::enforce_workflow_execution_timeouts` scanner -- no new
+    /// scanner, no new event variant.
+    pub execution_timeout: Option<Duration>,
+    /// A soft SLA for the whole scheduled DAG run (`#[dag(sla = "3h")]`,
+    /// issue #743). Propagated verbatim to the shadow
+    /// [`WorkflowInfo::sla`] and observed by the EXISTING #487
+    /// `timeout::enforce_workflow_sla_breaches` scanner, without altering the
+    /// run's lifecycle. Clamped down to `execution_timeout` at start when
+    /// declared larger than it.
+    pub sla: Option<Duration>,
 }
 
 impl DagInfo {
@@ -1394,10 +1408,15 @@ impl DagInfo {
             name: self.name,
             module: self.module,
             handler,
-            execution_timeout: None,
+            // issue #743: propagate the DAG's declared execution_timeout/sla
+            // onto the shadow WorkflowInfo so the SAME `deadline_at`/
+            // `sla_deadline_at` resolution the #243/#487 scanners already
+            // enforce for a `#[workflow]` applies identically to a unified
+            // DAG run -- no new scanner, no new event variant (AC1/AC2/AC3/AC4).
+            execution_timeout: self.execution_timeout,
             // DAGs carry no chain-scoped lifetime cap (issue #617).
             chain_execution_timeout: None,
-            sla: None,
+            sla: self.sla,
             concurrency: None,
 
             debounce: None,
@@ -1495,6 +1514,8 @@ impl std::fmt::Debug for DagInfo {
             .field("runbook_url", &self.runbook_url)
             .field("severity", &self.severity)
             .field("mcp", &self.mcp)
+            .field("execution_timeout", &self.execution_timeout)
+            .field("sla", &self.sla)
             .finish()
     }
 }
@@ -2151,6 +2172,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
 
         let definition = info.build_definition().expect("dag should compile");
@@ -2235,6 +2258,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));
@@ -2328,6 +2353,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp,
+            execution_timeout: None,
+            sla: None,
         }
     }
 
@@ -2356,6 +2383,74 @@ mod tests {
     #[test]
     fn dag_with_mcp_sets_the_flag() {
         assert!(mcp_dag(false).with_mcp().mcp);
+    }
+
+    // ── issue #743: DAG-level execution_timeout / sla ─────────────────────────
+
+    fn deadline_dag(
+        execution_timeout: Option<::std::time::Duration>,
+        sla: Option<::std::time::Duration>,
+    ) -> DagInfo {
+        DagInfo {
+            name: "deadline_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout,
+            sla,
+        }
+    }
+
+    #[test]
+    fn dag_as_workflow_info_propagates_execution_timeout() {
+        let et = ::std::time::Duration::from_secs(4 * 3600);
+        let info = deadline_dag(Some(et), None)
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        assert_eq!(
+            info.execution_timeout,
+            Some(et),
+            "the shadow WorkflowInfo must carry the DAG's declared execution_timeout (issue #743)"
+        );
+    }
+
+    #[test]
+    fn dag_as_workflow_info_propagates_sla() {
+        let sla = ::std::time::Duration::from_secs(3 * 3600);
+        let info = deadline_dag(None, Some(sla))
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        assert_eq!(
+            info.sla,
+            Some(sla),
+            "the shadow WorkflowInfo must carry the DAG's declared sla (issue #743)"
+        );
+    }
+
+    #[test]
+    fn dag_as_workflow_info_defaults_execution_timeout_and_sla_to_none() {
+        let info = deadline_dag(None, None)
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        assert_eq!(
+            info.execution_timeout, None,
+            "issue #743 AC7: zero regression for DAGs without the new attrs"
+        );
+        assert_eq!(
+            info.sla, None,
+            "issue #743 AC7: zero regression for DAGs without the new attrs"
+        );
     }
 
     // ── issue #610: signal/query/update interface schema ──────────────────────

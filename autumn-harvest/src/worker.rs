@@ -461,6 +461,19 @@ pub struct HandlerRegistry {
     /// DEFAULT (must reach every start, AC4), whereas the per-run ceiling only
     /// caps a specified value.
     pub max_workflow_chain_timeout: Option<std::time::Duration>,
+    /// Server-side ceiling on the per-run `execution_timeout` (issue #243),
+    /// threaded here (rather than resolved per-request from `api_state` like
+    /// the HTTP start paths) so the scheduler tick, buffered-drain, and manual
+    /// DAG trigger paths -- core-crate components with no `api_state` -- apply
+    /// the SAME fleet-wide ceiling to scheduler-initiated starts that manual
+    /// HTTP starts already apply (issue #743 review). `None` = no ceiling
+    /// applied fleet-wide.
+    ///
+    /// Unlike [`Self::max_workflow_chain_timeout`], this only CAPS a specified
+    /// value -- it is not itself a fleet-wide default when the workflow/DAG
+    /// declares no `execution_timeout` at all (mirrors the HTTP start paths'
+    /// `(other, _) => other` clamp rule in `execution.rs`).
+    pub max_workflow_execution_timeout: Option<std::time::Duration>,
     /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
     /// registered; all event writes/reads use the plain inline path unchanged.
     payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
@@ -630,6 +643,7 @@ impl HandlerRegistry {
             )),
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
+            max_workflow_execution_timeout: None,
             payload_offloader: None,
             activity_interceptors: Vec::new(),
             #[cfg(feature = "wasm-activities")]
@@ -727,6 +741,20 @@ impl HandlerRegistry {
         ceiling: Option<std::time::Duration>,
     ) -> Self {
         self.max_workflow_chain_timeout = ceiling;
+        self
+    }
+
+    /// Set the server-side ceiling on the per-run `execution_timeout`
+    /// (issue #743 review). Applied to scheduler-tick, buffered-drain, and
+    /// manual DAG trigger starts so a fleet-wide cap configured via
+    /// `HarvestBuilder::max_workflow_execution_timeout` reaches
+    /// scheduler-initiated starts identically to manual/HTTP starts.
+    #[must_use]
+    pub const fn with_max_workflow_execution_timeout(
+        mut self,
+        ceiling: Option<std::time::Duration>,
+    ) -> Self {
+        self.max_workflow_execution_timeout = ceiling;
         self
     }
 
@@ -941,6 +969,10 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "max_workflow_chain_timeout",
                 &self.max_workflow_chain_timeout,
+            )
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
             )
             .field("payload_offloader", &self.payload_offloader.is_some())
             .field(

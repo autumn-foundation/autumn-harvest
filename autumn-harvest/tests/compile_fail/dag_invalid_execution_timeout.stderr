@@ -1,0 +1,5 @@
+error: invalid execution_timeout duration; expected e.g. "30s", "5m", "4h", "2d"
+ --> tests/compile_fail/dag_invalid_execution_timeout.rs:7:27
+  |
+7 | #[dag(execution_timeout = "4 hours")]
+  |                           ^^^^^^^^^

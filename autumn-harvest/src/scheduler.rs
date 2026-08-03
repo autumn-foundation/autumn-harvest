@@ -752,6 +752,13 @@ pub async fn trigger_unified_dag(
     owner: Option<&str>,
     runbook_url: Option<&str>,
     severity: Option<&str>,
+    // Issue #743 review (PR #1141, Finding #1): a manual/MCP trigger must
+    // thread the DAG's declared `execution_timeout`/`sla`, and the fleet-wide
+    // `max_workflow_execution_timeout` ceiling (Finding #3), the SAME way the
+    // scheduler tick's main dispatch path already does -- resolved from the
+    // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
+    // `registry.workflows` by `DagInfo::as_workflow_info()`.
+    registry: &crate::worker::HandlerRegistry,
     // Workflow-start provenance for this DAG run (issue #740). The caller
     // decides: a manual HTTP/UI trigger passes `Schedule`, a scheduler tick
     // `Schedule`, a backfill `Backfill`. `started_by` carries the operator
@@ -826,6 +833,22 @@ pub async fn trigger_unified_dag(
     // schedule-associated (issue #740).
     let schedule_ref = schedule.as_ref().map(|s| s.id.to_string());
 
+    // Issue #743 review (PR #1141, Findings #1/#3): resolve the DAG's declared
+    // execution_timeout/sla from its shadow WorkflowInfo -- the SAME lookup
+    // `tick_one_workflow_schedule`'s main dispatch path performs -- and apply
+    // the fleet-wide ceiling, so a manual/MCP trigger gets the same deadline
+    // enforcement as a scheduled tick or a manual HTTP `/workflows/{name}/start`.
+    let wf_info = registry.workflows.get(dag_name);
+    let execution_timeout = wf_info
+        .and_then(|info| info.execution_timeout)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = wf_info
+        .and_then(|info| info.sla)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let max_execution_timeout_ceiling = registry
+        .max_workflow_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+
     start_or_load_workflow_execution(
         &mut db,
         StartWorkflowParams {
@@ -835,13 +858,13 @@ pub async fn trigger_unified_dag(
             input,
             parent_id: None,
             queue_name: &queue_name,
-            execution_timeout: None,
+            execution_timeout,
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
-            max_execution_timeout_ceiling: None,
+            max_execution_timeout_ceiling,
             chain_execution_timeout: None,
             max_workflow_chain_timeout_ceiling: None,
             inherited_chain_deadline_at: None,
@@ -857,7 +880,7 @@ pub async fn trigger_unified_dag(
             severity,
             context_headers: None,
 
-            sla: None,
+            sla,
             // Attribute the manual API trigger to the schedule so it appears in
             // GET /admin/schedules/{id}/runs with origin='manual_trigger'.
             // scheduled_for stays None so resolve_carryover (issue #488) still
@@ -3306,7 +3329,9 @@ async fn tick_one_workflow_schedule(
                 (None, None) => (None, None, None),
             }
         };
-        // Only workflows carry an SLA default; DAGs have no SLA concept.
+        // Issue #743: a DAG's own shadow `WorkflowInfo` (registered under its
+        // name by `DagInfo::as_workflow_info()`) carries `sla` identically to
+        // a `#[workflow]`, so this ONE lookup covers both kinds.
         let sla = wf_info
             .and_then(|info| info.sla)
             .and_then(|d| chrono::Duration::from_std(d).ok());
@@ -3386,7 +3411,14 @@ async fn tick_one_workflow_schedule(
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
-                    max_execution_timeout_ceiling_secs: None,
+                    // Fleet-wide execution_timeout ceiling (issue #743 review, PR
+                    // #1141 Finding #3): a throttled scheduled fire must be capped
+                    // by the same operator-configured ceiling a manual/HTTP start
+                    // applies -- parity with the chain-cap ceiling right below.
+                    max_execution_timeout_ceiling_secs: registry
+                        .max_workflow_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map(|d| d.num_seconds()),
                     // Chain-scoped lifetime cap (issue #617): workflow-type default
                     // + fleet-wide ceiling (via registry, since the core scheduler
                     // has no api_state) captured so a throttled scheduled fire keeps
@@ -3469,7 +3501,12 @@ async fn tick_one_workflow_schedule(
                 reuse_policy: scheduled_workflow_reuse_policy(),
                 conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                 trace_context: None,
-                max_execution_timeout_ceiling: None,
+                // Fleet-wide execution_timeout ceiling (issue #743 review, PR
+                // #1141 Finding #3): parity with the throttled branch above and
+                // with the chain-cap ceiling right below.
+                max_execution_timeout_ceiling: registry
+                    .max_workflow_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
                 // Chain-scoped lifetime cap (issue #617): carry the workflow-type
                 // default AND the fleet-wide chain ceiling-as-default, so a whole
                 // scheduled continue-as-new chain is capped even when the workflow
@@ -4899,9 +4936,20 @@ async fn drain_buffered_schedule_runs(
                     (None, None) => (None, None, None),
                 }
             };
-            // Only workflows carry an SLA default; DAGs have no SLA concept.
+            // Issue #743: a DAG's own shadow `WorkflowInfo` (registered under
+            // its name by `DagInfo::as_workflow_info()`) carries `sla`
+            // identically to a `#[workflow]`, so this ONE lookup covers both
+            // kinds.
             let sla = wf_info
                 .and_then(|info| info.sla)
+                .and_then(|d| chrono::Duration::from_std(d).ok());
+
+            // Issue #743 review (PR #1141, Finding #2): the same shadow
+            // `WorkflowInfo` lookup also carries the DAG's declared
+            // `execution_timeout`, which must reach a buffered/overlap-drained
+            // fire identically to a normal tick dispatch or a manual trigger.
+            let execution_timeout = wf_info
+                .and_then(|info| info.execution_timeout)
                 .and_then(|d| chrono::Duration::from_std(d).ok());
 
             tracing::info!(
@@ -4973,7 +5021,11 @@ async fn drain_buffered_schedule_runs(
                         .and_then(|p| serde_json::to_value(&p).ok());
                     let start_options = crate::debounce::DebounceStartOptions {
                         reuse_policy: Some("reject_duplicate".to_string()),
-                        execution_timeout_secs: None,
+                        // Issue #743 review (PR #1141, Finding #2): thread the
+                        // DAG/workflow's declared execution_timeout into a
+                        // throttled buffered-drain fire, mirroring the normal
+                        // dispatch path just below.
+                        execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
                         memo: None,
                         search_attrs: None,
                         sla_secs: sla.map(|d| d.num_seconds()),
@@ -4984,7 +5036,13 @@ async fn drain_buffered_schedule_runs(
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
-                        max_execution_timeout_ceiling_secs: None,
+                        // Fleet-wide execution_timeout ceiling (issue #743
+                        // review, PR #1141 Finding #3): parity with the
+                        // chain-cap ceiling right below.
+                        max_execution_timeout_ceiling_secs: registry
+                            .max_workflow_execution_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .map(|d| d.num_seconds()),
                         // Chain-scoped lifetime cap (issue #617): workflow-type
                         // default + fleet-wide ceiling (via registry) so a throttled
                         // buffered-drain fire keeps the cap.
@@ -5058,13 +5116,22 @@ async fn drain_buffered_schedule_runs(
                     input,
                     parent_id: None,
                     queue_name: dispatch_queue,
-                    execution_timeout: None,
+                    // Issue #743 review (PR #1141, Finding #2): thread the
+                    // DAG/workflow's declared execution_timeout into a
+                    // buffered-drain fire, mirroring the normal tick-direct
+                    // dispatch path above and this site's throttled sibling.
+                    execution_timeout,
                     memo: None,
                     search_attrs: None,
                     reuse_policy: scheduled_workflow_reuse_policy(),
                     conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                     trace_context: None,
-                    max_execution_timeout_ceiling: None,
+                    // Fleet-wide execution_timeout ceiling (issue #743
+                    // review, PR #1141 Finding #3): parity with the throttled
+                    // branch above and with the chain-cap ceiling right below.
+                    max_execution_timeout_ceiling: registry
+                        .max_workflow_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
                     // Chain-scoped lifetime cap (issue #617): carry the
                     // workflow-type default AND the fleet-wide chain ceiling (via
                     // the registry, since the core scheduler has no api_state) so a
@@ -5751,6 +5818,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 

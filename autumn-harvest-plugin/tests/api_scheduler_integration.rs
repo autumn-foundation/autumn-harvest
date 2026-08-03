@@ -666,6 +666,8 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }
 }
 
@@ -1864,6 +1866,8 @@ fn manual_pipeline_info() -> DagInfo {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }
 }
 
@@ -1884,6 +1888,8 @@ fn interval_pipeline_info() -> DagInfo {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }
 }
 
@@ -1904,6 +1910,8 @@ fn classic_interval_pipeline_info() -> DagInfo {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }
 }
 
@@ -1950,6 +1958,8 @@ fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }
 }
 
@@ -1970,6 +1980,8 @@ fn manual_interval_pipeline_info() -> DagInfo {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }
 }
 
@@ -4262,6 +4274,8 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("manual unified DAG should compile"),
     );
@@ -4568,6 +4582,8 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
     let workflow_schedule = dag_info
         .as_workflow_schedule()
@@ -4660,6 +4676,8 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4750,6 +4768,8 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -5510,6 +5530,8 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("unified DAG should compile"),
     );
@@ -5591,6 +5613,276 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
     assert_eq!(
         count_workflow_executions_by_name_from_url(&database_url, dag_name).await,
         2,
+    );
+}
+
+/// Issue #743 review (PR #1141, Finding #5): `POST /admin/schedules/{id}/backfill`
+/// for a DAG-kind schedule row must thread the DAG's declared
+/// `execution_timeout`/`sla`, and the fleet-wide
+/// `HandlerRegistry::max_workflow_execution_timeout` ceiling, into every
+/// backfilled execution -- exactly like the scheduler tick's dispatch path, a
+/// manual/MCP trigger (`trigger_unified_dag`), and a WORKFLOW-kind backfill.
+/// Declares a 10h `execution_timeout` + 5h sla against a 1h fleet-wide
+/// ceiling, so both the ceiling clamp on `execution_timeout` AND the
+/// clamp-sla-to-effective-timeout rule fire in one assertion (mirrors
+/// `resolve_schedule_deadline_secs_clamps_sla_to_execution_timeout`).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "backfill_dag_deadline";
+    let dag_catalog = Arc::new(
+        compile_dag_catalog(vec![DagInfo {
+            name: dag_name,
+            module: "tests",
+            schedule: Some(Schedule::Cron("0 * * * *".to_string())),
+            catchup: false,
+            max_active_runs: 1000,
+            default_queue: Some("dag-workers"),
+            builder: build_interval_pipeline_dag,
+            workflow_handler: Some(approval_workflow),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100u32,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        }])
+        .expect("unified DAG should compile"),
+    );
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
+        catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for DAG schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("DAG schedule should register");
+    }
+    let schedule = load_schedule_from_url(&database_url, dag_name).await;
+
+    // The DAG's shadow `WorkflowInfo` (the same lookup key `DagInfo::as_workflow_info()`
+    // registers the DAG under in `registry.workflows`) declares a 10h hard
+    // deadline and a 5h soft SLA. The 1h fleet-wide ceiling below must win.
+    let deadline_info = WorkflowInfo {
+        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+        ..workflow_info_named(dag_name)
+    };
+    let registry = Arc::new(
+        HandlerRegistry::new(vec![deadline_info], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600))),
+    );
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::clone(&dag_catalog),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["dag-workers".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    // Window boundaries are inclusive on both ends, so keep `to` just past
+    // `from` to land exactly the single 10:00 slot (a wider window would also
+    // dispatch 11:00, which is irrelevant to what this test asserts).
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:01Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["dispatched"], serde_json::json!(1), "body: {body}");
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("backfilled DAG execution row must exist");
+
+    // Ceiling wins over the 10h declared value.
+    assert_eq!(
+        execution.execution_timeout,
+        Some(chrono::Duration::seconds(3600)),
+        "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h",
+    );
+    // `deadline_at`/`sla_deadline_at` are computed server-side from
+    // `target_start_time`, a distinct `Utc::now()` capture from the row's own
+    // `started_at` column -- comparing against `execution.started_at + 3600s`
+    // exactly is flaky by a few hundred microseconds of clock skew between the
+    // two captures, so assert the derived deadline lands within a generous
+    // tolerance of one hour after `started_at` instead of bit-for-bit equal.
+    let deadline_at = execution
+        .deadline_at
+        .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
+    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        deadline_delta.num_milliseconds().abs() < 2000,
+        "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}",
+    );
+    // sla (5h) also clamps down to the 1h effective (ceiling-clamped) timeout.
+    assert_eq!(
+        execution.sla,
+        Some(chrono::Duration::seconds(3600)),
+        "sla must clamp to the ceiling-clamped effective execution_timeout, not the raw 10h ceiling-unaware ceiling",
+    );
+    let sla_deadline_at = execution
+        .sla_deadline_at
+        .expect("sla_deadline_at must be set from the clamped sla");
+    let sla_deadline_delta =
+        (sla_deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        sla_deadline_delta.num_milliseconds().abs() < 2000,
+        "sla_deadline_at must be ~1h after started_at (clamped); delta={sla_deadline_delta}",
+    );
+}
+
+/// Issue #743 review (PR #1141, Finding #5 -- workflow-kind companion): the
+/// SAME `execution_timeout`/`max_execution_timeout_ceiling` gap existed in the
+/// WORKFLOW (non-DAG) branch of `schedule_backfill`'s direct (non-throttled)
+/// start path -- `info_execution_timeout` was already resolved (it fed the
+/// `sla` clamp) but never applied to `StartWorkflowParams.execution_timeout`.
+/// Fixed alongside the DAG branch for full consistency across both kinds.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceiling() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let wf_name = "backfill_workflow_deadline";
+
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: wf_name.to_string(),
+        dag_name: None,
+        schedule: Schedule::Cron("0 * * * *".to_string()),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1000,
+        paused: false,
+        queue_name: "default".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
+        catchup_policy: None,
+        retry_policy: None,
+        all_writable_shards: false,
+    };
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for workflow schedule registration");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("workflow schedule should register");
+    }
+    let schedule = load_workflow_only_schedule_from_url_optional(&database_url, wf_name)
+        .await
+        .expect("workflow-only schedule row should exist");
+
+    // Same 10h declared / 5h sla / 1h fleet-wide ceiling values as the DAG
+    // companion test above, exercising the identical clamp math.
+    let deadline_info = WorkflowInfo {
+        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+        ..workflow_info_named(wf_name)
+    };
+    let registry = Arc::new(
+        HandlerRegistry::new(vec![deadline_info], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600))),
+    );
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![workflow_schedule]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:01Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let (status, body) = post_json(
+        &app,
+        format!("/admin/schedules/{}/backfill", schedule.id),
+        json!({ "from": from, "to": to }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["dispatched"], serde_json::json!(1), "body: {body}");
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, wf_name)
+        .await
+        .expect("backfilled workflow execution row must exist");
+
+    assert_eq!(
+        execution.execution_timeout,
+        Some(chrono::Duration::seconds(3600)),
+        "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h",
+    );
+    let deadline_at = execution
+        .deadline_at
+        .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
+    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        deadline_delta.num_milliseconds().abs() < 2000,
+        "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}",
+    );
+    assert_eq!(
+        execution.sla,
+        Some(chrono::Duration::seconds(3600)),
+        "sla must clamp to the ceiling-clamped effective execution_timeout",
     );
 }
 
@@ -6133,6 +6425,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("unified DAG should compile"),
     );
@@ -6200,6 +6494,8 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -6284,6 +6580,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -6399,6 +6697,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         runbook_url: None,
         severity: None,
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -6515,6 +6815,8 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -6635,6 +6937,8 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -6742,6 +7046,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -6870,6 +7176,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -6922,6 +7230,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }])
         .expect("classic DAG schedule should compile");
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
@@ -7484,6 +7794,8 @@ async fn scheduler_tick_preserves_dag_metadata() {
         runbook_url: Some("http://ops-runbook"),
         severity: Some("sev2"),
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
     let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
 
@@ -7548,6 +7860,8 @@ async fn api_trigger_preserves_dag_metadata() {
         runbook_url: Some("http://dev-runbook"),
         severity: Some("sev1"),
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
     let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
     let registry = Arc::new(HandlerRegistry::new(
@@ -8017,5 +8331,138 @@ async fn schedule_read_honors_calendar_deferred_fire() {
     assert_eq!(
         control["overdue"], true,
         "the same past slot WITHOUT a calendar must still report overdue=true (control): {control}"
+    );
+}
+
+// ── issue #743: DAG-level execution_timeout/sla -- schedule API surfacing (AC9) ──
+
+/// A `WorkflowInfo` fixture with the same defaults as `workflow_info_named`,
+/// but with `execution_timeout`/`sla` overridden.
+fn deadline_workflow_info(
+    name: &'static str,
+    execution_timeout: Option<Duration>,
+    sla: Option<Duration>,
+) -> WorkflowInfo {
+    WorkflowInfo {
+        execution_timeout,
+        sla,
+        ..workflow_info_named(name)
+    }
+}
+
+fn find_schedule_by_name<'a>(list: &'a Value, name: &str) -> &'a Value {
+    list.as_array()
+        .expect("schedule list must be a JSON array")
+        .iter()
+        .find(|s| s["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("schedule '{name}' must appear in the list: {list}"))
+}
+
+/// AC9: `GET /admin/schedules` (list) and `GET /admin/schedules/{id}` (single)
+/// surface the schedule's *effective* `execution_timeout_secs`/`sla_secs`,
+/// resolved from the registered `WorkflowInfo` -- including AC5's clamp (a
+/// declared `sla` larger than `execution_timeout` reads back already clamped
+/// down to it) and AC7's zero-regression case (neither attribute declared ->
+/// both fields are `null`).
+#[tokio::test]
+async fn schedule_api_surfaces_effective_execution_timeout_and_sla() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+
+    let plain_wf = "deadline_api_plain_wf";
+    let deadline_wf = "deadline_api_deadline_wf";
+    let clamp_wf = "deadline_api_clamp_wf";
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect for seeding");
+        for name in [plain_wf, deadline_wf, clamp_wf] {
+            let ws = WorkflowSchedule::new(name, Schedule::Interval(Duration::from_secs(3600)));
+            register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+                .await
+                .expect("register schedule");
+        }
+    }
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![
+            workflow_info_named(plain_wf),
+            deadline_workflow_info(
+                deadline_wf,
+                Some(Duration::from_secs(4 * 3600)),
+                Some(Duration::from_secs(3 * 3600)),
+            ),
+            // sla (10h) > execution_timeout (1h): must read back CLAMPED to 1h.
+            deadline_workflow_info(
+                clamp_wf,
+                Some(Duration::from_secs(3600)),
+                Some(Duration::from_secs(10 * 3600)),
+            ),
+        ],
+        vec![],
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        registry,
+        Arc::new(compile_dag_catalog(vec![]).expect("empty DAG catalog should compile")),
+        Arc::new(vec![]),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let (status, list) = get_json(&app, "/admin/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let plain_entry = find_schedule_by_name(&list, plain_wf);
+    assert!(
+        plain_entry["execution_timeout_secs"].is_null(),
+        "AC7: a workflow declaring no execution_timeout must read back null: {plain_entry}"
+    );
+    assert!(
+        plain_entry["sla_secs"].is_null(),
+        "AC7: a workflow declaring no sla must read back null: {plain_entry}"
+    );
+
+    let deadline_entry = find_schedule_by_name(&list, deadline_wf);
+    assert_eq!(
+        deadline_entry["execution_timeout_secs"], 14_400,
+        "a declared 4h execution_timeout must read back as 14400 seconds: {deadline_entry}"
+    );
+    assert_eq!(
+        deadline_entry["sla_secs"], 10_800,
+        "a declared 3h sla (below the 4h timeout) must read back unclamped: {deadline_entry}"
+    );
+
+    let clamp_entry = find_schedule_by_name(&list, clamp_wf);
+    assert_eq!(
+        clamp_entry["execution_timeout_secs"], 3_600,
+        "a declared 1h execution_timeout must read back as 3600 seconds: {clamp_entry}"
+    );
+    assert_eq!(
+        clamp_entry["sla_secs"], 3_600,
+        "AC5: a declared 10h sla, larger than the 1h execution_timeout, must read back \
+         CLAMPED to 3600 seconds, not the raw 36000: {clamp_entry}"
+    );
+
+    // GET /admin/schedules/{id} (single) must resolve identically.
+    let deadline_id = deadline_entry["id"]
+        .as_str()
+        .expect("deadline schedule must have an id");
+    let (single_status, single) = get_json(&app, format!("/admin/schedules/{deadline_id}")).await;
+    assert_eq!(single_status, StatusCode::OK);
+    assert_eq!(
+        single["execution_timeout_secs"], 14_400,
+        "GET /admin/schedules/{{id}} must resolve execution_timeout_secs identically \
+         to the list route: {single}"
+    );
+    assert_eq!(
+        single["sla_secs"], 10_800,
+        "GET /admin/schedules/{{id}} must resolve sla_secs identically to the list route: {single}"
     );
 }

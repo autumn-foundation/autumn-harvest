@@ -35,5 +35,8 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/rate_limit_missing_rps.rs");
     t.compile_fail("tests/compile_fail/rate_limit_flat_and_nested.rs");
     t.compile_fail("tests/compile_fail/rate_limit_key_reserved_prefix.rs");
+    t.compile_fail("tests/compile_fail/dag_invalid_execution_timeout.rs");
+    t.compile_fail("tests/compile_fail/dag_invalid_sla.rs");
+    t.compile_fail("tests/compile_fail/dag_unsupported_attribute.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

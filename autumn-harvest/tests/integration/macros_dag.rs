@@ -209,3 +209,85 @@ fn dag_macro_mcp_explicit_false() {
     let info = __autumn_dag_info_explicit_non_mcp_dag();
     assert!(!info.mcp);
 }
+
+// ── DAG-level execution_timeout / sla (issue #743) ───────────────────────────
+
+#[dag(schedule = "0 6 * * *", execution_timeout = "4h", sla = "3h")]
+fn nightly_deadline_etl(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_macro_execution_timeout_attribute_populates_field() {
+    let info = __autumn_dag_info_nightly_deadline_etl();
+    assert_eq!(
+        info.execution_timeout,
+        Some(Duration::from_secs(4 * 3600)),
+        "execution_timeout should be 4 hours"
+    );
+}
+
+#[test]
+fn dag_macro_sla_attribute_populates_field() {
+    let info = __autumn_dag_info_nightly_deadline_etl();
+    assert_eq!(
+        info.sla,
+        Some(Duration::from_secs(3 * 3600)),
+        "sla should be 3 hours"
+    );
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_execution_timeout_propagates_to_shadow_workflow_info() {
+    let workflow_info = __autumn_workflow_info_nightly_deadline_etl();
+    assert_eq!(
+        workflow_info.execution_timeout,
+        Some(Duration::from_secs(4 * 3600)),
+        "the shadow WorkflowInfo companion must carry the same execution_timeout as the DagInfo"
+    );
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_sla_propagates_to_shadow_workflow_info() {
+    let workflow_info = __autumn_workflow_info_nightly_deadline_etl();
+    assert_eq!(
+        workflow_info.sla,
+        Some(Duration::from_secs(3 * 3600)),
+        "the shadow WorkflowInfo companion must carry the same sla as the DagInfo"
+    );
+}
+
+#[test]
+fn dag_macro_default_execution_timeout_and_sla_are_none() {
+    let info = __autumn_dag_info_daily_etl();
+    assert_eq!(
+        info.execution_timeout, None,
+        "execution_timeout must default to None (AC7: zero regression)"
+    );
+    assert_eq!(
+        info.sla, None,
+        "sla must default to None (AC7: zero regression)"
+    );
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_default_execution_timeout_and_sla_are_none_on_shadow_workflow_info() {
+    let workflow_info = __autumn_workflow_info_daily_etl();
+    assert_eq!(workflow_info.execution_timeout, None);
+    assert_eq!(workflow_info.sla, None);
+}
+
+#[dag(schedule = "0 7 * * *", execution_timeout = "1h")]
+fn execution_timeout_only_dag(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_macro_execution_timeout_only_leaves_sla_none() {
+    let info = __autumn_dag_info_execution_timeout_only_dag();
+    assert_eq!(info.execution_timeout, Some(Duration::from_secs(3600)));
+    assert_eq!(info.sla, None);
+}

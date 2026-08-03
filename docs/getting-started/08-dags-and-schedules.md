@@ -166,6 +166,54 @@ you.
 | `catchup` | `false` | If `true`, the scheduler enqueues a run for every interval missed during downtime. If `false`, only the next-scheduled run runs after a gap. |
 | `max_active_runs` | `1` | Cap on concurrent runs of the same DAG. Set higher for fast-cadence DAGs whose runs can safely overlap. |
 | `default_queue` | `"default"` | Queue assigned to tasks that don't override it via `#[activity(queue = ...)]` or `.queue(...)`. |
+| `execution_timeout` | none | Hard wall-clock deadline for the whole DAG run — see below. |
+| `sla` | none | Soft SLA for the whole DAG run — see below. |
+
+### Deadlines for scheduled DAG runs (`execution_timeout` / `sla`)
+
+A unified DAG (the default execution mode — see "Under the hood" above) is
+just a `#[workflow]` under the hood, so it can declare the same hard
+`execution_timeout` and soft `sla` a plain workflow does:
+
+```rust
+#[dag(schedule = "0 6 * * *", execution_timeout = "4h", sla = "3h")]
+fn nightly_etl(dag: &mut DagBuilder) {
+    let extract = dag.activity(extract_users);
+    let _load = dag.activity(load_warehouse).upstream(&extract);
+}
+```
+
+`execution_timeout` and `sla` are propagated **verbatim** onto the DAG's
+shadow `WorkflowInfo` (`DagInfo::as_workflow_info`) and enforced by the
+**same** scanners a plain `#[workflow(execution_timeout = "…", sla = "…")]`
+already uses — the existing execution-timeout scanner
+(`timeout::enforce_workflow_execution_timeouts`) and the existing soft-SLA
+scanner (`timeout::enforce_workflow_sla_breaches`). There is no separate
+DAG-specific deadline mechanism, no new `WorkflowEvent` variant, and no new
+migration: a DAG run that overruns `execution_timeout` transitions to
+`TIMED_OUT` exactly like an overrun plain workflow, and a run that passes its
+`sla` emits `harvest.workflow.sla_breached{workflow, queue}` once and keeps
+running. See "Soft SLA" and "SLA vs `execution_timeout`" in
+[`07-reliability-knobs.md`](07-reliability-knobs.md) for the full semantics
+(clamping, pause interaction, the fleet-wide
+`HarvestBuilder::max_workflow_execution_timeout(…)` ceiling) — they apply to a
+DAG's declared values identically. In particular: if `sla` is declared larger
+than `execution_timeout`, it is **clamped down** to `execution_timeout` at
+start (the hard timeout would kill the run before the soft signal could ever
+fire), and the builder-wide ceiling caps a DAG's declared
+`execution_timeout` exactly as it caps a plain workflow's.
+
+A DAG declaring neither attribute behaves exactly as before — `null`
+`deadline_at`/`sla_deadline_at`, no scanner interaction, zero regression.
+`GET /admin/schedules` surfaces the schedule's *effective* deadlines
+(`execution_timeout_secs`/`sla_secs`, already clamped) resolved from the
+registered workflow or the DAG's shadow `WorkflowInfo`, so an operator can see
+what a scheduled DAG's next fire will get without cross-referencing source.
+
+(Classic, non-unified DAGs — `workflow_handler: None` — are already rejected
+at plugin startup and are being retired; `execution_timeout`/`sla` are a
+unified-DAG-only feature by construction, since the shadow `WorkflowInfo`
+that carries them only exists for unified DAGs.)
 
 ## Trigger rules
 
