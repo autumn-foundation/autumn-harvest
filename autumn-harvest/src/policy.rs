@@ -251,9 +251,11 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Resolve the effective next-retry delay for an author-supplied
+/// Resolve the effective next-retry delay for an author-supplied `retry_after` hint (issue #744).
+///
+/// The hint —
 /// [`ActivityFailure::retry_after`](crate::failure::ActivityFailure::retry_after)
-/// hint (issue #744), clamped to a builder-configured ceiling.
+/// — is clamped to a builder-configured ceiling:
 ///
 /// - `retry_after = None` -> `None` (no hint; the caller falls through to the
 ///   policy's own backoff curve for this attempt).

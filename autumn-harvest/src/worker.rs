@@ -2987,13 +2987,16 @@ fn next_retry_delay(
         return Ok(None);
     }
 
-    let policy_delay: Option<Duration> = if let Some(policy) = retry_policy {
-        policy.next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
-    } else if task.attempt < task.max_attempts {
-        Some(Duration::from_secs(1))
-    } else {
-        None
-    };
+    let policy_delay: Option<Duration> = retry_policy.map_or_else(
+        || {
+            if task.attempt < task.max_attempts {
+                Some(Duration::from_secs(1))
+            } else {
+                None
+            }
+        },
+        |policy| policy.next_delay_with_seed(task_attempt(task), retry_stream_seed(task)),
+    );
 
     // The attempt-cap gate is authoritative and must never be bypassed by a
     // retry_after hint (AC2): once the policy/attempt-cap says "no more

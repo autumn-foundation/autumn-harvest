@@ -59,11 +59,11 @@ pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
 /// [`PayloadStore`](crate::payload_store::PayloadStore). Only takes effect when
 /// a store is registered.
 pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
-/// Default ceiling on an author-supplied `Retry-After` delay hint (issue
-/// #744): 15 minutes. Bounds abuse from a misbehaving/malicious downstream
-/// without rejecting a legitimate hint outright — an over-ceiling value is
-/// clamped down, never an error. Configurable via
-/// [`WorkerConfig::with_retry_after_ceiling`].
+/// Default ceiling on an author-supplied `Retry-After` delay hint (issue #744): 15 minutes.
+///
+/// Bounds abuse from a misbehaving/malicious downstream without rejecting a
+/// legitimate hint outright — an over-ceiling value is clamped down, never
+/// an error. Configurable via [`WorkerConfig::with_retry_after_ceiling`].
 pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
 pub struct HarvestBuilder {
