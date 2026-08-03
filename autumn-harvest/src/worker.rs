@@ -20499,4 +20499,208 @@ mod tests {
         );
         assert!(sink.calls.lock().unwrap().is_empty());
     }
+
+    // ── Issue #744 — `next_retry_delay` pure unit tests ──────────────────────
+    //
+    // Before this section, `next_retry_delay` had ZERO direct unit tests --
+    // every AC2/AC3/AC4/AC5 behavior was exercised only indirectly through the
+    // slow, wall-clock-tolerant DB-backed tests in
+    // `tests/integration/retry_after_tests.rs` (whose windows are wide enough
+    // that e.g. a zero-hint fallthrough test still passes even if the whole
+    // `retry_after` feature were reverted -- see the PR #744 review). These
+    // tests pin the EXACT resolved delay at the point it is computed, with
+    // zero I/O, zero wall-clock tolerance, and zero database dependency.
+
+    use crate::failure::{ActivityFailure, IntoActivityErrorString as _};
+
+    fn retry_after_test_task(attempt: i32, max_attempts: i32) -> TaskQueueItem {
+        TaskQueueItem {
+            id: uuid::Uuid::nil(),
+            queue_name: "default".to_owned(),
+            task_type: "activity".to_owned(),
+            workflow_exec_id: None,
+            activity_name: Some("call_api".to_owned()),
+            activity_id: None,
+            input: Value::Null,
+            state: "RUNNING".to_owned(),
+            priority: 0,
+            worker_id: None,
+            attempt,
+            max_attempts,
+            scheduled_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            last_heartbeat_at: None,
+            heartbeat_details: None,
+            heartbeat_timeout: None,
+            start_to_close: None,
+            schedule_to_start: None,
+            retry_policy: None,
+            output: None,
+            error: None,
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+            trace_context: None,
+            concurrency_key: None,
+            concurrency_cap: None,
+            required_build_id: None,
+            rate_limit_key: None,
+            crash_strikes: 0,
+            schedule_to_close_at: None,
+            required_capabilities: None,
+            context_headers: None,
+            created_at: None,
+            wake_requested: false,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn next_retry_delay_non_retryable_wins_over_retry_after() {
+        // AC4: non_retryable must win over retry_after unconditionally, even
+        // when the hint is tiny and attempts remain.
+        let task = retry_after_test_task(1, 5);
+        let policy = RetryPolicy::fixed(5, Duration::from_secs(30));
+        let error = ActivityFailure::non_retryable("Fatal", "boom")
+            .with_retry_after(Duration::from_millis(1))
+            .into_error_payload();
+        let delay =
+            next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900)).unwrap();
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn next_retry_delay_attempt_cap_reached_with_policy_ignores_retry_after() {
+        // AC2: once the policy's attempt cap denies a retry, retry_after
+        // cannot resurrect it -- the cap gate runs strictly before the hint
+        // is ever consulted.
+        let task = retry_after_test_task(2, 2);
+        let policy = RetryPolicy::fixed(2, Duration::from_secs(30));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(1))
+            .into_error_payload();
+        let delay =
+            next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900)).unwrap();
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn next_retry_delay_attempt_cap_reached_without_policy_ignores_retry_after() {
+        // The `retry_policy: None` fallback branch gates on `task.attempt >=
+        // task.max_attempts` identically -- AC2 holds on both branches.
+        let task = retry_after_test_task(3, 3);
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(1))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, None, Duration::from_secs(900)).unwrap();
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn next_retry_delay_retry_after_overrides_policy_delay_with_exact_value() {
+        // AC2: the hint replaces the policy-computed backoff for this attempt
+        // only -- exact value, not merely "close to" it.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(999));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(2))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(2));
+    }
+
+    #[test]
+    fn next_retry_delay_retry_after_over_ceiling_is_clamped_to_exact_ceiling() {
+        // AC3: an over-ceiling hint clamps DOWN to the ceiling, never rejected.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(999));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(999))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(1))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn next_retry_delay_zero_retry_after_falls_through_to_exact_policy_delay() {
+        // AC3: a non-positive (here, exactly zero) hint falls through to the
+        // policy delay -- it must NOT resolve to an immediate retry.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(2));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::ZERO)
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(
+            delay,
+            chrono::Duration::seconds(2),
+            "a zero hint must fall through to the policy delay, not resolve to an immediate retry"
+        );
+    }
+
+    #[test]
+    fn next_retry_delay_no_retry_after_falls_through_to_exact_policy_delay() {
+        // A plain legacy `Err(String)` recovers no typed `ActivityFailure`, so
+        // `retry_after` is `None` and the policy delay is used verbatim.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
+        let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(5));
+    }
+
+    #[test]
+    fn next_retry_delay_ceiling_zero_clamps_a_positive_hint_to_an_immediate_retry() {
+        // Documents a real, confirmed edge case (issue #744 review): a
+        // ceiling of ZERO does NOT disable the retry_after mechanism. For any
+        // positive hint, `hint.min(ZERO) == ZERO`, so the retry is scheduled
+        // IMMEDIATELY (delay == 0) rather than falling back to the policy
+        // delay -- the opposite of what an operator setting "0 = off" would
+        // likely expect. There is no separate "disable retry_after honoring"
+        // switch today; see `resolve_retry_after_hint`'s doc comment.
+        let task = retry_after_test_task(1, 3);
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(30));
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_secs(1))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, Some(&policy), Duration::ZERO)
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(0));
+    }
+
+    #[test]
+    fn next_retry_delay_no_policy_no_retry_after_uses_one_second_fallback() {
+        // The `retry_policy: None` branch's own `Duration::from_secs(1)`
+        // fallback (when an attempt remains) is untouched when no hint is
+        // present.
+        let task = retry_after_test_task(1, 3);
+        let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn next_retry_delay_no_policy_retry_after_overrides_one_second_fallback() {
+        // AC7: retry_after is honored uniformly -- including the
+        // `retry_policy: None` fallback branch, not just an explicit
+        // `RetryPolicy`.
+        let task = retry_after_test_task(1, 3);
+        let error = ActivityFailure::retryable("Http429", "rate limited")
+            .with_retry_after(Duration::from_millis(250))
+            .into_error_payload();
+        let delay = next_retry_delay(&task, &error, None, Duration::from_secs(900))
+            .unwrap()
+            .expect("an attempt is still available");
+        assert_eq!(delay, chrono::Duration::milliseconds(250));
+    }
 }

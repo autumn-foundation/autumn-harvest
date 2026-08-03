@@ -267,6 +267,16 @@ impl Default for RetryPolicy {
 /// - `retry_after = Some(d)` where `0 < d <= ceiling` -> `Some(d)` (honored
 ///   verbatim).
 ///
+/// **`ceiling = Duration::ZERO` is *not* a "disable `retry_after` honoring"
+/// switch.** For any positive hint `d`, `d.min(Duration::ZERO) ==
+/// Duration::ZERO`, so this resolves to `Some(Duration::ZERO)` — an
+/// IMMEDIATE retry — not `None` (fall through to the policy delay). This is
+/// the opposite of what an operator setting the ceiling to zero might
+/// reasonably expect. There is no separate switch to turn `retry_after`
+/// honoring off entirely today; an author who never calls
+/// [`ActivityFailure::with_retry_after`](crate::failure::ActivityFailure::with_retry_after)
+/// is the only way to opt an activity out.
+///
 /// This function does **not** consult `non_retryable` or the retry policy's
 /// `max_attempts` cap — callers must check those first (a non-retryable
 /// failure, or an attempt count that has already exhausted the policy, must
@@ -1460,6 +1470,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_retry_after_hint_zero_ceiling_clamps_a_positive_hint_to_zero_not_none() {
+        // Confirmed edge case (issue #744 review): `ceiling = ZERO` is NOT a
+        // "disable the feature" switch. A positive hint clamps down to
+        // Duration::ZERO (an immediate retry), it does NOT fall through to
+        // `None` (the policy delay) the way a genuinely absent/zero HINT
+        // would. Contrast with `resolve_retry_after_hint_zero_falls_through`
+        // above, which tests the opposite axis (hint == ZERO).
+        assert_eq!(
+            resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::ZERO),
+            Some(Duration::ZERO),
+            "a zero ceiling clamps a positive hint down to zero, it does not disable honoring"
+        );
+    }
+
+    #[test]
     fn resolve_retry_after_hint_under_ceiling_is_honored_verbatim() {
         assert_eq!(
             resolve_retry_after_hint(Some(Duration::from_secs(30)), Duration::from_secs(900)),
@@ -1524,12 +1549,9 @@ mod tests {
                 assert_eq!(
                     resolved,
                     Some(expected),
-                    "hint={hint:?} ceiling={ceiling:?} must resolve to exactly min(hint, ceiling)"
-                );
-                assert!(
-                    resolved.unwrap() >= hint.min(ceiling),
-                    "resolved delay must never be less than the (clamped) hint -- \
-                     a retry must never fire before the hinted time"
+                    "hint={hint:?} ceiling={ceiling:?} must resolve to exactly min(hint, ceiling) \
+                     -- exact equality is a strictly stronger guarantee than \"resolved >= \
+                     min(hint, ceiling)\", which this exact-equality assertion already implies"
                 );
             }
         }

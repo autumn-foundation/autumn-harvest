@@ -59,14 +59,25 @@ mod replay_tests {
         })
     }
 
-    /// A history whose terminal `ActivityFailed.attempt == 2` is exactly what a
+    /// A history whose terminal `ActivityFailed.attempt == 2` is what a
     /// two-attempt run — one retry, delayed by a `retry_after` hint rather than
     /// the policy's own backoff — produces: the intermediate (non-terminal)
-    /// attempt-1 failure left no event at all, so only `WorkflowStarted`,
-    /// `ActivityScheduled`, and the final `ActivityFailed(attempt=2)` are
-    /// recorded — identical in shape to a plain policy-driven two-attempt
-    /// failure. Replay must succeed regardless of what wall-clock delay
-    /// produced this exact sequence.
+    /// attempt-1 failure leaves no event at all, only the transient task row's
+    /// `scheduled_at`/`error` columns change, so no `retry_after`-specific
+    /// event ever exists to replay differently.
+    ///
+    /// This snapshot is deliberately SIMPLIFIED relative to what a real worker
+    /// would record: a genuine run also appends an `ActivityStarted` event on
+    /// EVERY claim attempt (`worker::append_activity_started_if_pending`), so
+    /// a real two-attempt history would carry two `ActivityStarted` events
+    /// this snapshot omits entirely. That omission does not weaken the test —
+    /// `HistoryMatcher::scan_activity_terminal`'s forward scan explicitly
+    /// tolerates any number (including zero) of `ActivityStarted` events for a
+    /// matching `activity_id` before it reaches the terminal event, precisely
+    /// so a snapshot like this one — carrying only the events replay actually
+    /// depends on — still exercises the real matcher path. Replay must
+    /// succeed regardless of what wall-clock delay (or `ActivityStarted`
+    /// count) produced this sequence.
     #[tokio::test]
     async fn retry_after_delayed_retry_history_replays_unchanged() {
         let exec_id = ExecutionId::new();
@@ -798,17 +809,26 @@ mod db_tests {
         let exec_id =
             seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
 
-        // schedule_to_close = 2s (set at first schedule, i.e. ~now).
+        // schedule_to_close = 2s, set once at the FIRST schedule (~test
+        // start) and never refreshed on retry. `fail_retry_after_5s` returns
+        // retry_after = 5s on every attempt, including the very first one --
+        // so the deadline check fires on attempt 1's failure, not after any
+        // accumulated retries: `handle_activity_result` calls
+        // `schedule_to_close_deadline_exceeded(task, delay)` right after
+        // EVERY failed attempt (this file's own worker.rs read confirms
+        // there is no "wait until near-exhaustion" special case), and
+        // `now_at_attempt_1_failure + 5s` is *mathematically* guaranteed to
+        // exceed `enqueue_time + 2s` by a full 3-second margin, since
+        // `now_at_attempt_1_failure >= enqueue_time` always holds (time only
+        // moves forward) -- no wall-clock race, however slow the runner.
         //
-        // Policy delay alone (50ms/attempt, up to 5 attempts = ~250ms of
-        // cumulative *sleep*) plus ordinary worker/DB round-trip overhead
-        // cannot plausibly cross a full 2s deadline -- only the 5s
-        // retry_after hint does. A tighter deadline (e.g. 500ms) would let
-        // this test pass "by accident" on a slow/contended CI runner even
-        // without the retry_after fix in place (natural per-attempt latency
-        // alone could cross it), which would defeat the point of a RED-phase
-        // test that must fail specifically because retry_after is ignored.
-        // The 2s margin makes this test discriminate the fix's presence.
+        // Without the retry_after fix, `next_retry_delay` would use the
+        // 50ms/attempt policy delay instead (which never crosses 2s across
+        // all 5 attempts), so the run would instead exhaust its 5 retries
+        // and reach a plain retry-exhaustion `ActivityFailed` with NO
+        // `ActivityTimedOut { ScheduleToClose }` in history at all -- that is
+        // the actual RED/GREEN discriminator this test locks in, not a
+        // timing margin.
         let registry = build_registry(
             vec![wf_info("wf_one_activity", wf_one_activity)],
             vec![act_info(

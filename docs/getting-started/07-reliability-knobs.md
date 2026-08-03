@@ -103,7 +103,10 @@ waits too long:
 async fn call_rate_limited_api(ctx: &ActivityContext, req: ApiRequest)
     -> Result<ApiResponse, String>
 {
-    let resp = ctx.state::<HttpClient>().post(&req).await.map_err(|e| e.to_string())?;
+    let client = ctx
+        .state::<HttpClient>()
+        .ok_or_else(|| "HttpClient state must be registered".to_string())?;
+    let resp = client.post(&req).await.map_err(|e| e.to_string())?;
     if resp.status() == 429 || resp.status() == 503 {
         let retry_after = resp
             .headers()
@@ -139,6 +142,20 @@ would cross the cross-retry deadline, the deadline-exceeded path fires
 time. There is no new event variant and no replay impact — the hint only
 influences the transient `harvest_task_queue.scheduled_at` column, never
 `harvest_events`.
+
+**Interaction with a per-activity circuit breaker.** If the same activity also
+carries a `#[activity(circuit_breaker = ...)]` policy (issue #369), be aware
+that the breaker's rolling failure window only counts a failure toward
+tripping the circuit when it lands within `window` of the *prior* failure. A
+`retry_after` hint that regularly spaces consecutive attempts *wider* than the
+breaker's configured `window` can defeat trip detection entirely — the
+downstream may be persistently unhealthy, yet the breaker never opens because
+consecutive failures never land inside one rolling window. If you pair
+`retry_after` with a circuit breaker on the same activity, configure the
+breaker's `window` generously — wider than the largest `retry_after` hint (or
+the ceiling) you expect that downstream to ever send. See
+[the circuit-breaker runbook](../runbooks/activity-circuit-breaker.md) for the
+breaker's own configuration guidance.
 
 **Decision matrix — which timeout to use:**
 
