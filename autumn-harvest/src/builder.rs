@@ -59,6 +59,12 @@ pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
 /// [`PayloadStore`](crate::payload_store::PayloadStore). Only takes effect when
 /// a store is registered.
 pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
+/// Default ceiling on an author-supplied `Retry-After` delay hint (issue
+/// #744): 15 minutes. Bounds abuse from a misbehaving/malicious downstream
+/// without rejecting a legitimate hint outright — an over-ceiling value is
+/// clamped down, never an error. Configurable via
+/// [`WorkerConfig::with_retry_after_ceiling`].
+pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -1079,7 +1085,8 @@ impl BuiltHarvest {
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
-        );
+        )
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1145,7 +1152,8 @@ impl BuiltHarvest {
         .with_activity_defaults(
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
-        );
+        )
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -2862,6 +2870,18 @@ pub struct WorkerConfig {
     /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
     /// [`WorkerConfig::with_default_activity_start_to_close`].
     pub default_activity_start_to_close: Option<Duration>,
+    /// Ceiling on an author-supplied `Retry-After` delay hint (issue #744).
+    ///
+    /// `ActivityFailure::retry_after` lets an activity author override the
+    /// policy-computed backoff for a single attempt (e.g. to honor a
+    /// downstream's `Retry-After` response header). This ceiling bounds that
+    /// hint so a misbehaving/malicious downstream cannot park a task for an
+    /// unbounded duration — an over-ceiling hint is clamped down, never
+    /// rejected. Unlike the two builder-default floors above this is **not**
+    /// opt-in: it always applies, with the sane default
+    /// [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
+    /// [`WorkerConfig::with_retry_after_ceiling`].
+    pub retry_after_ceiling: Duration,
     /// How often the worker upserts its liveness row in `harvest_workers`.
     /// Defaults to **5 seconds**. The API classifies a worker as stale after
     /// `2 × worker_heartbeat_interval` without a heartbeat.
@@ -3031,6 +3051,7 @@ impl Default for WorkerConfig {
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            retry_after_ceiling: DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
@@ -3468,6 +3489,15 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
         self.default_activity_start_to_close = Some(timeout);
+        self
+    }
+
+    /// Set the ceiling on an author-supplied `Retry-After` delay hint (issue
+    /// #744). See [`WorkerConfig::retry_after_ceiling`] for the full
+    /// semantics. Default: [`DEFAULT_RETRY_AFTER_CEILING`] (15 minutes).
+    #[must_use]
+    pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
+        self.retry_after_ceiling = ceiling;
         self
     }
 }
@@ -3918,6 +3948,51 @@ mod tests {
             registry.default_activity_start_to_close(),
             Some(Duration::from_secs(17)),
         );
+    }
+
+    // Issue #744: the two `into_worker_parts*` hunks must also copy the
+    // builder-level `retry_after_ceiling` out of `WorkerConfig` into the
+    // `HandlerRegistry` so the worker's next-retry-delay computation sees the
+    // operator-configured ceiling, not a hardcoded default.
+    //
+    // RED PHASE: `HandlerRegistry::retry_after_ceiling` does not exist yet —
+    // this test fails to COMPILE against the missing method until the green
+    // phase adds it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_retry_after_ceiling_into_worker_registry() {
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(123)))
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) = built.into_worker_parts();
+
+        assert_eq!(
+            registry.retry_after_ceiling,
+            Duration::from_secs(123),
+            "the builder-configured retry_after ceiling must be wired into the registry"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_extra_state_wires_retry_after_ceiling_into_worker_registry() {
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(77)))
+            .build();
+
+        let (registry, _dags, _workflow_schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+
+        assert_eq!(registry.retry_after_ceiling, Duration::from_secs(77));
     }
 
     #[test]
@@ -4432,6 +4507,26 @@ mod tests {
             configured.default_activity_start_to_close,
             Some(Duration::from_secs(300)),
         );
+    }
+
+    // ── Retry-After ceiling (issue #744) ───────────────────────────────────
+    //
+    // RED PHASE: `WorkerConfig::retry_after_ceiling` / `with_retry_after_ceiling`
+    // do not exist yet -- this test fails to COMPILE against the missing
+    // symbols until the green phase adds them.
+
+    #[test]
+    fn worker_config_retry_after_ceiling_has_sane_default_and_is_configurable() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.retry_after_ceiling,
+            crate::builder::DEFAULT_RETRY_AFTER_CEILING,
+            "the ceiling must always be present with a sane default (AC3)"
+        );
+
+        let configured =
+            WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
+        assert_eq!(configured.retry_after_ceiling, Duration::from_secs(90));
     }
 
     // ── Local activity cap tests ──────────────────────────────────────────

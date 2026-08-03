@@ -492,6 +492,11 @@ pub struct HandlerRegistry {
     /// Builder-level default activity `start_to_close` (issue #620). `None` = no
     /// floor configured.
     default_activity_start_to_close: Option<Duration>,
+    /// Ceiling on an author-supplied `Retry-After` delay hint (issue #744).
+    /// Not opt-in — always applied. Mirrored from
+    /// [`crate::builder::WorkerConfig::retry_after_ceiling`]; default
+    /// [`crate::builder::DEFAULT_RETRY_AFTER_CEILING`] (15 minutes).
+    pub retry_after_ceiling: Duration,
 }
 
 impl HandlerRegistry {
@@ -640,6 +645,7 @@ impl HandlerRegistry {
             wasm_module_registrations: Vec::new(),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            retry_after_ceiling: crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         }
     }
 
@@ -842,6 +848,16 @@ impl HandlerRegistry {
         self.default_activity_start_to_close
     }
 
+    /// Set the ceiling on an author-supplied `Retry-After` delay hint (issue
+    /// #744). Mirrors [`crate::builder::WorkerConfig::with_retry_after_ceiling`];
+    /// installed here so the ceiling is reachable at the worker dispatch call
+    /// site without threading a separate parameter through every caller.
+    #[must_use]
+    pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
+        self.retry_after_ceiling = ceiling;
+        self
+    }
+
     /// Clone the shared state reference for runtime contexts.
     #[must_use]
     pub fn shared_state(&self) -> SharedState {
@@ -954,7 +970,8 @@ impl std::fmt::Debug for HandlerRegistry {
             .field(
                 "default_activity_start_to_close",
                 &self.default_activity_start_to_close,
-            );
+            )
+            .field("retry_after_ceiling", &self.retry_after_ceiling);
         #[cfg(feature = "wasm-activities")]
         d.field("wasm_activity_count", &self.wasm_activities.len())
             .field("wasm_store_configured", &self.wasm_store.is_some())
@@ -2956,26 +2973,43 @@ fn next_retry_delay(
     task: &TaskQueueItem,
     error: &str,
     retry_policy: Option<&RetryPolicy>,
+    retry_after_ceiling: Duration,
 ) -> HarvestResult<Option<chrono::Duration>> {
-    // Non-retryable (typed flag or policy `non_retryable_errors`, incl. legacy
-    // `Err(String)`) short-circuits all remaining attempts. See
-    // `failure_is_non_retryable` for the shared rule.
-    if failure_is_non_retryable(error, retry_policy) {
+    // Issue #744: parse the error ONCE via `classify_activity_error` so both
+    // the non-retryable decision AND the activity-supplied `retry_after` hint
+    // (if any) come from a single parse -- `failure_is_non_retryable` alone
+    // would discard the recovered `ActivityFailure` and its `retry_after`.
+    let (failure, non_retryable) = crate::failure::classify_activity_error(error, retry_policy);
+
+    // AC4: non_retryable wins over retry_after unconditionally -- routes to
+    // the terminal/DLQ path immediately regardless of any delay hint.
+    if non_retryable {
         return Ok(None);
     }
 
-    if let Some(policy) = retry_policy {
-        return policy
-            .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
-            .map(|delay| chrono_duration_from_std(delay, "retry delay"))
-            .transpose();
-    }
+    let policy_delay: Option<Duration> = if let Some(policy) = retry_policy {
+        policy.next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
+    } else if task.attempt < task.max_attempts {
+        Some(Duration::from_secs(1))
+    } else {
+        None
+    };
 
-    if task.attempt < task.max_attempts {
-        return Ok(Some(chrono::Duration::seconds(1)));
-    }
+    // The attempt-cap gate is authoritative and must never be bypassed by a
+    // retry_after hint (AC2): once the policy/attempt-cap says "no more
+    // retries", retry_after cannot resurrect the attempt.
+    let Some(policy_delay) = policy_delay else {
+        return Ok(None);
+    };
 
-    Ok(None)
+    // AC3: a present, positive retry_after hint overrides the policy-computed
+    // backoff for THIS attempt only, clamped to `[0, retry_after_ceiling]`. A
+    // non-positive (<=0) or absent hint falls through to the policy delay.
+    let delay =
+        crate::policy::resolve_retry_after_hint(failure.retry_after, retry_after_ceiling)
+            .unwrap_or(policy_delay);
+
+    chrono_duration_from_std(delay, "retry delay").map(Some)
 }
 
 fn find_pending_scheduled_activity(
@@ -7584,6 +7618,7 @@ async fn handle_activity_result(
     activity_name_for_cap: &str,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
+    retry_after_ceiling: Duration,
 ) -> HarvestResult<()> {
     match activity_result {
         Ok(output) => {
@@ -7615,7 +7650,7 @@ async fn handle_activity_result(
             {
                 metrics.record_activity_panic(activity_name_for_cap, &task.queue_name);
             }
-            let delay_result = next_retry_delay(task, &error, retry_policy);
+            let delay_result = next_retry_delay(task, &error, retry_policy, retry_after_ceiling);
             let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
 
             if let Some(delay) = delay {
@@ -8211,6 +8246,7 @@ async fn process_activity_task(
             activity_name,
             registry.payload_offloader(),
             telemetry.metrics.as_ref(),
+            registry.retry_after_ceiling,
         )
         .await;
     }
@@ -8673,6 +8709,7 @@ async fn process_activity_task(
         activity_name,
         registry.payload_offloader(),
         telemetry.metrics.as_ref(),
+        registry.retry_after_ceiling,
     )
     .await
 }
@@ -17976,6 +18013,7 @@ mod tests {
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            retry_after_ceiling: crate::builder::DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
