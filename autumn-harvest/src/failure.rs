@@ -176,10 +176,23 @@ pub const ERROR_TYPE_WASM_OUTPUT_TOO_LARGE: &str = "WasmOutputTooLarge";
 /// but external construction must go through [`Self::retryable`] /
 /// [`Self::non_retryable`] plus the builder methods
 /// (e.g. [`Self::with_retry_after`]) rather than a bare struct literal.
-/// Without this, adding `retry_after` would have been source-breaking for
-/// any downstream crate constructing the previous four-field struct via a
-/// literal; `#[non_exhaustive]` makes this addition -- and every future
-/// field addition -- genuinely additive.
+///
+/// **This is a deliberate, disclosed one-time breaking change, not a silent
+/// compatibility fix.** `#[non_exhaustive]` does not "grandfather" a struct
+/// literal written before the attribute existed -- Rust categorically
+/// forbids external struct-literal construction of a `#[non_exhaustive]`
+/// type, even when every current field is supplied. A downstream crate
+/// constructing the previous four-field struct via `ActivityFailure { .. }`
+/// would already have broken on `retry_after`'s addition (a missing-field
+/// error); adding `#[non_exhaustive]` does not restore that literal -- it
+/// still fails to compile, now for a different reason (E0639). No
+/// caller anywhere in this workspace uses struct-literal construction (every
+/// site goes through the constructors above), so nothing in-repo is
+/// affected, but an external 0.x consumer relying on the literal form would
+/// need to migrate to the constructors on this release. In exchange, this is
+/// a *one-time* cost: every field added from here on is genuinely additive
+/// for external callers, since literal construction is already disallowed
+/// and cannot regress further.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ActivityFailure {
