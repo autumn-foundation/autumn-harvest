@@ -11033,6 +11033,47 @@ fn history_bloat_threshold_crossed(
     current_history_event_count >= threshold
 }
 
+/// Pure pre-query eligibility gate for the operator early-warning soft
+/// threshold on workflow history bloat (issue #704, PR #1139 review).
+///
+/// Folds the `already_warned || fraction <= 0.0` short-circuit
+/// [`history_bloat_threshold_crossed`] already applies internally into this
+/// *earlier*, pre-query gate too. Without this, a long-lived, already-warned
+/// (or feature-disabled, `fraction == 0.0`) bloated workflow's suspended
+/// decision cycles would keep paying an O(history-size) durable-count
+/// `COUNT(*)` on every single cycle forever, purely to compute an answer
+/// that's already knowable for free -- both `already_warned` and `fraction`
+/// are known before that query ever runs.
+///
+/// `!(fraction <= 0.0)` (i.e. `fraction > 0.0`) is the exact negation of
+/// that function's own early-return condition; this is a safe negation only
+/// for a non-NaN `fraction`, which `WorkflowHistoryPolicy` already
+/// guarantees via its own NaN-normalizing builder (see the defensive note
+/// on `with_history_bloat_warn_fraction` in `context.rs`).
+///
+/// The interior check inside `history_bloat_threshold_crossed` is left in
+/// place as a defensive belt-and-braces should this gate's logic ever drift
+/// from the pure function's -- a caller that skips this gate (there is none
+/// today) still gets the correct answer, just without the query-skipping
+/// optimization.
+///
+/// `clippy::fn_params_excessive_bools`: a two-variant-enum-per-flag
+/// refactor would add ceremony without reducing the actual risk clippy is
+/// warning about here -- there is exactly one production call site (in
+/// `process_workflow_task`), the parameter names are self-documenting, and
+/// every branch is directly pinned by a dedicated unit test naming the
+/// exact flag it isolates.
+#[allow(clippy::fn_params_excessive_bools)]
+fn history_bloat_warning_eligible(
+    is_canary: bool,
+    is_suspended: bool,
+    hard_cap_configured: bool,
+    already_warned: bool,
+    warn_fraction: f64,
+) -> bool {
+    !is_canary && is_suspended && hard_cap_configured && !already_warned && warn_fraction > 0.0
+}
+
 /// Emits and marks the operator early-warning soft-threshold counter for
 /// workflow history bloat (issue #704, AC3/AC4), if `should_warn` is `true`.
 ///
@@ -12632,10 +12673,22 @@ async fn process_workflow_task(
     // it contributes to no `harvest.workflow.*` business signal, matching the
     // sibling `record_workflow_completed`/`history_size`/`continue_as_new`
     // gates right above.
-    let may_warn_history_bloat = !is_canary
-        && matches!(&outcome, WorkflowOutcome::Suspended { .. })
-        && registry.history_policy().event_hard_cap().is_some();
+    //
+    // `history_bloat_already_warned` and the disabled-fraction check are
+    // folded into this pre-query gate too (PR #1139 review) via
+    // `history_bloat_warning_eligible` -- see that function's doc comment
+    // for why: both are known *before* the post-commit `COUNT(*)` below
+    // ever runs, so a long-lived, already-warned (or feature-disabled)
+    // bloated workflow no longer pays that scan on every suspended decision
+    // cycle forever just to compute an already-knowable "don't warn".
     let history_bloat_already_warned = prepared.execution.history_bloat_warned_at.is_some();
+    let may_warn_history_bloat = history_bloat_warning_eligible(
+        is_canary,
+        matches!(&outcome, WorkflowOutcome::Suspended { .. }),
+        registry.history_policy().event_hard_cap().is_some(),
+        history_bloat_already_warned,
+        registry.history_policy().history_bloat_warn_fraction(),
+    );
     let update_metric_queue = task.queue_name.clone();
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
@@ -17090,6 +17143,66 @@ mod tests {
     fn resolve_retry_attempts_a_single_failure_surfaces_it() {
         let attempts: Vec<Result<u32, &str>> = vec![Err("boom")];
         assert_eq!(resolve_retry_attempts(attempts), Err("boom"));
+    }
+
+    // ── History-bloat warning pre-query eligibility gate (issue #704,
+    //    PR #1139 review) ────────────────────────────────────────────────────
+    // Proves the exact O(history-size)-scan-skipping property the review
+    // asked for: once `already_warned` is true, or the fraction is disabled
+    // (<= 0.0), the gate returns `false` regardless of every other input --
+    // in particular regardless of a wildly-eligible-looking combination of
+    // the remaining flags, so a caller never even reaches the durable
+    // `COUNT(*)` for either case.
+
+    #[test]
+    fn history_bloat_warning_eligible_true_when_every_condition_is_met() {
+        assert!(history_bloat_warning_eligible(
+            false, true, true, false, 0.75
+        ));
+    }
+
+    #[test]
+    fn history_bloat_warning_eligible_false_once_already_warned() {
+        // Every other flag is maximally "eligible" -- only `already_warned`
+        // differs from the true-case above.
+        assert!(!history_bloat_warning_eligible(
+            false, true, true, true, 0.75
+        ));
+    }
+
+    #[test]
+    fn history_bloat_warning_eligible_false_when_fraction_is_zero() {
+        assert!(!history_bloat_warning_eligible(
+            false, true, true, false, 0.0
+        ));
+    }
+
+    #[test]
+    fn history_bloat_warning_eligible_false_when_fraction_is_negative() {
+        assert!(!history_bloat_warning_eligible(
+            false, true, true, false, -0.1
+        ));
+    }
+
+    #[test]
+    fn history_bloat_warning_eligible_false_for_the_synthetic_canary() {
+        assert!(!history_bloat_warning_eligible(
+            true, true, true, false, 0.75
+        ));
+    }
+
+    #[test]
+    fn history_bloat_warning_eligible_false_when_not_suspended() {
+        assert!(!history_bloat_warning_eligible(
+            false, false, true, false, 0.75
+        ));
+    }
+
+    #[test]
+    fn history_bloat_warning_eligible_false_when_no_hard_cap_configured() {
+        assert!(!history_bloat_warning_eligible(
+            false, true, false, false, 0.75
+        ));
     }
 
     // ── Active-workflow population gauge (issue #770) ────────────────────────
