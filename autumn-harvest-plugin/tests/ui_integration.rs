@@ -62,6 +62,16 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (url, container)
 }
 
+/// Prefer `HARVEST_TEST_DATABASE_URL` (a real, already-running Postgres, for
+/// sandboxes with no Docker daemon) over spinning up a testcontainer.
+async fn overdue_read_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let (url, container) = setup_test_database_url().await;
+    (url, Some(container))
+}
+
 async fn setup_sharded_test_database_urls() -> ((String, String), ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_tag("16")
@@ -3080,6 +3090,140 @@ async fn ui_trigger_preserves_dag_metadata() {
     assert_eq!(execution.owner.as_deref(), Some("ui-team"));
     assert_eq!(execution.runbook_url.as_deref(), Some("http://ui-runbook"));
     assert_eq!(execution.severity.as_deref(), Some("sev3"));
+}
+
+/// Issue #743 review (PR #1141, Finding #6): `POST /schedules/{id}/trigger-now`
+/// (the Vantage UI manual-trigger route) is a DISTINCT DAG-start entry point
+/// from the scheduler tick, the buffered-drain, the direct HTTP/MCP trigger
+/// (`trigger_unified_dag`), and a backfill -- and its `execute_schedule_trigger_ui`
+/// handler hardcoded `execution_timeout`/`max_execution_timeout_ceiling` to
+/// `None`. Declares a 10h `execution_timeout` + 5h `sla` against a 1h
+/// fleet-wide ceiling, so both the ceiling clamp AND the clamp-sla-to-
+/// effective-timeout rule fire in one assertion (mirrors the sibling backfill
+/// test `backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling`
+/// in `api_scheduler_integration.rs`).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
+    let (database_url, _container) = overdue_read_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "ui_trigger_deadline_dag";
+
+    let dag_info = autumn_harvest::info::DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(autumn_harvest::policy::Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: |_dag| {},
+        workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        mcp: false,
+        execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+        sla: Some(std::time::Duration::from_secs(5 * 3600)),
+    };
+
+    let dag_catalog =
+        Arc::new(autumn_harvest::compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+
+    // The DAG's shadow WorkflowInfo, registered under `dag_name` -- exactly
+    // what `DagInfo::as_workflow_info()` would produce, hand-built here
+    // (matching the pre-existing sibling test's convention) since
+    // `execute_schedule_trigger_ui` reads execution_timeout/sla from THIS
+    // registry lookup, not from `DagInfo` directly.
+    let registry = Arc::new(
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                mcp: false,
+                name: dag_name,
+                module: "tests",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: Some(std::time::Duration::from_secs(10 * 3600)),
+                chain_execution_timeout: None,
+                sla: Some(std::time::Duration::from_secs(5 * 3600)),
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600))),
+    );
+
+    let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, _headers, _body) = post_form(
+        &app,
+        &format!("/schedules/{schedule_id}/trigger-now"),
+        String::new(),
+    )
+    .await;
+    assert!(
+        status.is_redirection(),
+        "UI trigger must redirect; got {status}"
+    );
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("triggered execution should exist");
+
+    assert_eq!(
+        execution.execution_timeout,
+        Some(chrono::Duration::seconds(3600)),
+        "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h"
+    );
+    let deadline_at = execution
+        .deadline_at
+        .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
+    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        deadline_delta.num_milliseconds().abs() < 2000,
+        "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}"
+    );
+    assert_eq!(
+        execution.sla,
+        Some(chrono::Duration::seconds(3600)),
+        "sla must clamp to the ceiling-clamped effective execution_timeout, not the raw 5h"
+    );
+    let sla_deadline_at = execution
+        .sla_deadline_at
+        .expect("sla_deadline_at must be set from the clamped sla");
+    let sla_deadline_delta =
+        (sla_deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    assert!(
+        sla_deadline_delta.num_milliseconds().abs() < 2000,
+        "sla_deadline_at must be ~1h after started_at (clamped); delta={sla_deadline_delta}"
+    );
 }
 
 async fn load_latest_workflow_execution_by_name_from_url(

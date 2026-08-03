@@ -178,8 +178,8 @@ just a `#[workflow]` under the hood, so it can declare the same hard
 ```rust
 #[dag(schedule = "0 6 * * *", execution_timeout = "4h", sla = "3h")]
 fn nightly_etl(dag: &mut DagBuilder) {
-    dag.activity(extract_users);
-    dag.activity(load_warehouse).upstream(&extract_users);
+    let extract = dag.activity(extract_users);
+    let _load = dag.activity(load_warehouse).upstream(&extract);
 }
 ```
 

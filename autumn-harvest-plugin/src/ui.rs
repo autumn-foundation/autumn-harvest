@@ -7876,18 +7876,32 @@ async fn execute_schedule_trigger_ui(
             (None, None) => (None, None, None),
         }
     };
-    // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let (sla, wf_default_retry_policy) =
-        runtime
-            .registry()
-            .workflows
-            .get(workflow_name)
-            .map_or((None, None), |info| {
-                (
-                    crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
-                    info.retry_policy.clone(),
-                )
-            });
+    // `workflow_name` here is either a registered workflow's own name, or --
+    // for a DAG-backed schedule, per `resolve_trigger_params` above -- the
+    // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
+    // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
+    // So this ONE lookup already resolves both a workflow's AND a DAG's
+    // declared `sla`/`execution_timeout` (issue #743 review, PR #1141
+    // finding #6) -- the previous "DAGs have no SLA concept" framing predates
+    // DAG-level `sla`/`execution_timeout` support and only ever described the
+    // caller's mental model, not an actual code gap; `execution_timeout`
+    // itself was genuinely never resolved here, unlike `sla`.
+    let (sla, wf_default_retry_policy, execution_timeout) = runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .map_or((None, None, None), |info| {
+            (
+                crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
+                info.retry_policy.clone(),
+                info.execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
+            )
+        });
+    let max_execution_timeout_ceiling = runtime
+        .registry()
+        .max_workflow_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row
@@ -7907,13 +7921,13 @@ async fn execute_schedule_trigger_ui(
             input,
             parent_id: None,
             queue_name: queue,
-            execution_timeout: None,
+            execution_timeout,
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
             trace_context: None,
-            max_execution_timeout_ceiling: None,
+            max_execution_timeout_ceiling,
             chain_execution_timeout: None,
             max_workflow_chain_timeout_ceiling: None,
             inherited_chain_deadline_at: None,
