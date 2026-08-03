@@ -6946,6 +6946,8 @@ pub const fn management_api_response_fields()
                 "last_catchup_at",
                 "overdue",
                 "overdue_by_secs",
+                "execution_timeout_secs",
+                "sla_secs",
             ]),
         ),
         (
@@ -6972,6 +6974,8 @@ pub const fn management_api_response_fields()
                 "last_catchup_at",
                 "overdue",
                 "overdue_by_secs",
+                "execution_timeout_secs",
+                "sla_secs",
             ]),
         ),
         (
@@ -6998,6 +7002,8 @@ pub const fn management_api_response_fields()
                 "last_catchup_at",
                 "overdue",
                 "overdue_by_secs",
+                "execution_timeout_secs",
+                "sla_secs",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["ok"])),
