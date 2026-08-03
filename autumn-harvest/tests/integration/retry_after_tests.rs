@@ -16,6 +16,14 @@
 //! - **AC2 / AC3 / AC4 / AC5 / the success metric** — proving the hint actually
 //!   reaches the real `harvest_task_queue.scheduled_at` column end-to-end
 //!   through a live worker (`db_tests`, requires the `db` feature + Postgres).
+//! - **Local activities** (`#[activity(local = true)]`) — a Codex review finding
+//!   on PR #1140 caught that `run_local_activity_inline`'s retry-sleep still read
+//!   only `run.retry_policy.next_delay(attempt)`, ignoring `retry_after` and the
+//!   ceiling entirely (local activities retry INLINE in the workflow task, never
+//!   through `harvest_task_queue`, so this is a genuinely separate code path from
+//!   the remote/task-queue retry loop `next_retry_delay` governs above). Covered
+//!   by `local_retry_after_end_to_end_test` (`db_tests`) plus a dedicated pure
+//!   unit-test suite on the extracted `worker::local_retry_delay` helper.
 //!
 //! RED PHASE (TDD): before `worker.rs`'s `next_retry_delay`/`handle_activity_result`
 //! consult `ActivityFailure::retry_after` / `resolve_retry_after_hint`, every test
@@ -139,9 +147,10 @@ mod replay_tests {
 // ---------------------------------------------------------------------------
 #[cfg(feature = "db")]
 mod db_tests {
+    use std::any::TypeId;
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use autumn_harvest::event::WorkflowEvent;
@@ -294,6 +303,50 @@ mod db_tests {
         })
     }
 
+    /// Workflow: schedule a LOCAL activity (retries run INLINE in the workflow
+    /// task, never through `harvest_task_queue`) with an explicit retry policy
+    /// passed at the call site.
+    fn wf_one_local_activity(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+        Box::pin(async move {
+            ctx.execute_local_activity_raw(
+                "local_echo",
+                input,
+                Some(RetryPolicy::fixed(2, Duration::from_secs(999))),
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Local activity: records `Instant::now()` on every attempt (via shared
+    /// state, since `ActivityHandlerFn` is a plain fn pointer with no closure
+    /// capture), fails attempt 1 with a fast (1.5s) `retry_after` hint against a
+    /// vastly slower (999s) registered policy delay, then succeeds on attempt 2.
+    /// If the hint is ignored (the bug this test exists to catch), the observed
+    /// gap between the two timestamps would be ~999s, not ~1.5s.
+    fn local_retry_after_2s(
+        ctx: &autumn_harvest::ActivityContext,
+        _input: serde_json::Value,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            let stamps = Arc::clone(
+                ctx.state::<Arc<std::sync::Mutex<Vec<std::time::Instant>>>>()
+                    .expect("attempt-timestamp state should be registered"),
+            );
+            stamps
+                .lock()
+                .expect("timestamp lock poisoned")
+                .push(std::time::Instant::now());
+            if ctx.attempt() == 1 {
+                return Err(ActivityFailure::retryable("Http429", "rate limited")
+                    .with_retry_after(Duration::from_millis(1500))
+                    .into_error_payload());
+            }
+            Ok(serde_json::json!("ok"))
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Registry / worker construction.
     // -----------------------------------------------------------------------
@@ -364,17 +417,63 @@ mod db_tests {
         activities: Vec<ActivityInfo>,
         retry_after_ceiling: Option<Duration>,
     ) -> Arc<HandlerRegistry> {
-        let telemetry = Arc::new(TelemetryConfig::default());
-        let mut registry = HandlerRegistry::with_state_and_telemetry(
+        build_registry_with_state(
             workflows,
             activities,
+            retry_after_ceiling,
             autumn_harvest::context::empty_shared_state(),
-            telemetry,
-        );
+        )
+    }
+
+    /// Same as [`build_registry`] but with caller-supplied typed shared state
+    /// (used by the local-activity test to inject an `Arc<Mutex<Vec<Instant>>>`
+    /// the handler records attempt timestamps into).
+    fn build_registry_with_state(
+        workflows: Vec<WorkflowInfo>,
+        activities: Vec<ActivityInfo>,
+        retry_after_ceiling: Option<Duration>,
+        state: autumn_harvest::context::SharedState,
+    ) -> Arc<HandlerRegistry> {
+        let telemetry = Arc::new(TelemetryConfig::default());
+        let mut registry =
+            HandlerRegistry::with_state_and_telemetry(workflows, activities, state, telemetry);
         if let Some(ceiling) = retry_after_ceiling {
             registry = registry.with_retry_after_ceiling(ceiling);
         }
         Arc::new(registry)
+    }
+
+    /// `ActivityInfo` for a local (`is_local: true`) activity. Local activities
+    /// have no `harvest_task_queue` row, so `default_queue` is irrelevant; the
+    /// retry policy is supplied at the call site
+    /// (`ctx.execute_local_activity_raw`), not read from this info, so it is
+    /// left `None` here.
+    fn local_act_info(
+        name: &'static str,
+        handler: autumn_harvest::info::ActivityHandlerFn,
+    ) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "retry_after_tests",
+            default_retry_policy: None,
+            default_start_to_close: Some(Duration::from_secs(20)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler,
+        }
     }
 
     fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
@@ -870,6 +969,71 @@ mod db_tests {
                 .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
             "no plain ActivityFailed should appear -- the deadline check must \
              short-circuit the requeue, not race it; history: {history:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Codex review (PR #1140) -- local activities (`local = true`) must
+    // honor `retry_after` too. Local-activity retries run INLINE in the
+    // workflow task via `run_local_activity_inline`, a code path entirely
+    // separate from the remote/task-queue `next_retry_delay` the tests
+    // above cover; before this fix it read only
+    // `run.retry_policy.next_delay(attempt)`, silently ignoring both the
+    // hint and the configured ceiling.
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_retry_after_end_to_end_test() {
+        let (url, _container) = setup_db().await;
+        let queue = "q744-local-retry-after";
+        let mut conn = connect(&url).await;
+        let exec_id = seed_workflow(
+            &mut conn,
+            "wf_one_local_activity",
+            serde_json::json!({}),
+            queue,
+        )
+        .await;
+
+        let stamps: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut state_map = HashMap::new();
+        state_map.insert(
+            TypeId::of::<Arc<Mutex<Vec<std::time::Instant>>>>(),
+            Box::new(Arc::clone(&stamps)) as Box<dyn std::any::Any + Send + Sync>,
+        );
+
+        let registry = build_registry_with_state(
+            vec![wf_info("wf_one_local_activity", wf_one_local_activity)],
+            vec![local_act_info("local_echo", local_retry_after_2s)],
+            None,
+            Arc::new(state_map),
+        );
+        let worker = build_worker("w744-local-retry-after", queue, Arc::clone(&registry));
+        let pool = build_pool(&url);
+
+        let execution = run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "COMPLETED",
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(execution.state, "COMPLETED");
+
+        let recorded = stamps.lock().expect("timestamp lock poisoned").clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected exactly two attempts (fail once, succeed on retry); recorded: {recorded:?}"
+        );
+        let observed_delay = recorded[1].duration_since(recorded[0]);
+        assert!(
+            observed_delay > Duration::from_millis(500) && observed_delay < Duration::from_secs(30),
+            "expected the retry_after hint (~1.5s) to govern the local-activity \
+             retry delay, not the registered policy's 999s backoff; observed \
+             delay = {observed_delay:?}"
         );
     }
 }

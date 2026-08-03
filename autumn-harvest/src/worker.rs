@@ -2857,10 +2857,17 @@ async fn run_local_activity_inline(
                     });
                 }
 
-                if let Some(delay) = run
+                // Issue #744 (Codex review, PR #1140): honor an
+                // ActivityFailure::retry_after hint for local activities too,
+                // clamped to the configured ceiling -- previously this only
+                // ever consulted the registered RetryPolicy's own backoff,
+                // silently ignoring a downstream-supplied delay hint.
+                let policy_delay = run
                     .retry_policy
                     .as_ref()
-                    .and_then(|p| p.next_delay(attempt))
+                    .and_then(|p| p.next_delay(attempt));
+                if let Some(delay) =
+                    local_retry_delay(policy_delay, typed.as_ref(), registry.retry_after_ceiling)
                 {
                     tokio::time::sleep(delay).await;
                 }
@@ -3012,6 +3019,34 @@ fn next_retry_delay(
         .unwrap_or(policy_delay);
 
     chrono_duration_from_std(delay, "retry delay").map(Some)
+}
+
+/// Local-activity counterpart to [`next_retry_delay`] (issue #744, Codex
+/// review on PR #1140): resolve the sleep duration for a non-terminal
+/// local-activity retry attempt, honoring `ActivityFailure::retry_after`
+/// (clamped to `[0, retry_after_ceiling]`) over the policy-computed backoff,
+/// for this attempt only.
+///
+/// Local activities retry INLINE in `run_local_activity_inline`, an entirely
+/// separate code path from the remote/task-queue retry loop `next_retry_delay`
+/// governs -- local activities never get a `harvest_task_queue` row, so there
+/// is no `schedule_to_close`/attempt-cap re-derivation to share here. The
+/// caller already parses the failure once (`parse_typed_payload`, for the
+/// existing `non_retryable` check) and only invokes this helper on a
+/// NON-terminal attempt, where `policy_delay`
+/// (`run.retry_policy.next_delay(attempt)`) is always `Some` in practice --
+/// `attempt < max_attempts` is guaranteed by the caller's `terminal_attempt`
+/// computation, and `RetryPolicy::next_delay` returns `None` only when
+/// `attempt >= max_attempts`. The attempt-cap gate is therefore already
+/// authoritative before this helper ever runs and is never bypassed by a
+/// `retry_after` hint (AC2).
+fn local_retry_delay(
+    policy_delay: Option<Duration>,
+    typed: Option<&crate::failure::ActivityFailure>,
+    retry_after_ceiling: Duration,
+) -> Option<Duration> {
+    let hint = typed.and_then(|f| f.retry_after);
+    crate::policy::resolve_retry_after_hint(hint, retry_after_ceiling).or(policy_delay)
 }
 
 fn find_pending_scheduled_activity(
@@ -20702,5 +20737,86 @@ mod tests {
             .unwrap()
             .expect("an attempt is still available");
         assert_eq!(delay, chrono::Duration::milliseconds(250));
+    }
+
+    // ── local activities must honor retry_after too (issue #744, Codex ──
+    // ── review on PR #1140) ────────────────────────────────────────────
+    //
+    // `run_local_activity_inline`'s non-terminal-retry sleep is a code path
+    // entirely separate from `next_retry_delay` above (local activities never
+    // get a `harvest_task_queue` row -- their retry loop runs inline in the
+    // workflow task). Before this fix it read only
+    // `run.retry_policy.next_delay(attempt)`, ignoring both
+    // `ActivityFailure::retry_after` and the configured ceiling. These tests
+    // exercise the extracted pure helper `local_retry_delay` directly, mirroring
+    // the `next_retry_delay_*` suite above exactly.
+
+    #[test]
+    fn local_retry_delay_hint_overrides_policy_delay_with_exact_value() {
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(2));
+        let delay = local_retry_delay(
+            Some(Duration::from_secs(999)),
+            Some(&failure),
+            Duration::from_secs(900),
+        );
+        assert_eq!(delay, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn local_retry_delay_no_hint_falls_through_to_exact_policy_delay() {
+        let delay = local_retry_delay(Some(Duration::from_secs(5)), None, Duration::from_secs(900));
+        assert_eq!(delay, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn local_retry_delay_zero_hint_falls_through_to_exact_policy_delay() {
+        let failure = ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::ZERO);
+        let delay = local_retry_delay(
+            Some(Duration::from_secs(5)),
+            Some(&failure),
+            Duration::from_secs(900),
+        );
+        assert_eq!(delay, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn local_retry_delay_over_ceiling_hint_is_clamped_to_exact_ceiling() {
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(999));
+        let delay = local_retry_delay(
+            Some(Duration::from_secs(5)),
+            Some(&failure),
+            Duration::from_secs(1),
+        );
+        assert_eq!(delay, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn local_retry_delay_no_policy_delay_and_no_hint_is_none() {
+        // Defensive: the real call site only reaches this helper on a
+        // non-terminal attempt, where `policy_delay` is always `Some` in
+        // practice (see `local_retry_delay`'s doc comment) -- but the helper
+        // itself must not panic or fabricate a delay when it is `None`.
+        let delay = local_retry_delay(None, None, Duration::from_secs(900));
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn local_retry_delay_hint_present_with_no_policy_delay_still_uses_hint() {
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(3));
+        let delay = local_retry_delay(None, Some(&failure), Duration::from_secs(900));
+        assert_eq!(delay, Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn local_retry_delay_ceiling_zero_clamps_a_positive_hint_to_an_immediate_retry() {
+        // Mirrors `next_retry_delay_ceiling_zero_clamps_a_positive_hint_to_an_immediate_retry`
+        // -- a ceiling of ZERO is not a "disable retry_after" switch here either.
+        let failure =
+            ActivityFailure::retryable("Http429", "x").with_retry_after(Duration::from_secs(5));
+        let delay = local_retry_delay(Some(Duration::from_secs(5)), Some(&failure), Duration::ZERO);
+        assert_eq!(delay, Some(Duration::ZERO));
     }
 }
