@@ -24973,6 +24973,20 @@ async fn schedule_backfill(
                     },
                 );
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
+                // Issue #743 review (PR #1141, Finding #5): a workflow backfill
+                // must ALSO thread the declared `execution_timeout` and the
+                // fleet-wide `max_workflow_execution_timeout` ceiling into the
+                // start below -- `info_execution_timeout` was already resolved
+                // above (it feeds the `sla` clamp) but was never applied to the
+                // execution row itself, leaving a backfilled run with no hard
+                // deadline even when the workflow type declares one. Mirrors the
+                // DAG branch's identical fix immediately below.
+                let workflow_execution_timeout =
+                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+                let workflow_max_execution_timeout_ceiling = runtime
+                    .registry
+                    .max_workflow_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
@@ -25119,7 +25133,13 @@ async fn schedule_backfill(
                         .and_then(|p| serde_json::to_value(&p).ok());
                     let start_options = autumn_harvest::debounce::DebounceStartOptions {
                         reuse_policy: Some("reject_duplicate".to_string()),
-                        execution_timeout_secs: None,
+                        // Issue #743 review (PR #1141, Finding #5): a throttled
+                        // (deferred) backfill fire must ALSO carry the declared
+                        // execution_timeout + fleet-wide ceiling -- parity with
+                        // the non-throttled backfill start path fixed above, and
+                        // with the `chain_execution_timeout_secs` field below,
+                        // which was already threaded correctly.
+                        execution_timeout_secs: workflow_execution_timeout.map(|d| d.num_seconds()),
                         memo: None,
                         search_attrs: None,
                         sla_secs: sla.map(|d| d.num_seconds()),
@@ -25130,7 +25150,8 @@ async fn schedule_backfill(
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
-                        max_execution_timeout_ceiling_secs: None,
+                        max_execution_timeout_ceiling_secs: workflow_max_execution_timeout_ceiling
+                            .map(|d| d.num_seconds()),
                         // Chain-scoped lifetime cap (issue #617): workflow-type
                         // default + fleet-wide ceiling captured so a throttled
                         // backfill fire keeps the cap (parity with the non-throttled
@@ -25257,14 +25278,14 @@ async fn schedule_backfill(
                         input: input.clone(),
                         parent_id: None,
                         queue_name: dispatch_queue,
-                        execution_timeout: None,
+                        execution_timeout: workflow_execution_timeout,
                         memo: None,
                         search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                         conflict_policy:
                             autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
-                        max_execution_timeout_ceiling: None,
+                        max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): backfilled runs
                         // inherit the workflow-type default + fleet-wide
                         // ceiling-as-default so a whole scheduled chain is capped
@@ -25507,6 +25528,33 @@ async fn schedule_backfill(
                             )
                         });
 
+                // Issue #743 review (PR #1141, Finding #5): a DAG backfill must
+                // thread the DAG's declared execution_timeout/sla, and the
+                // fleet-wide max_workflow_execution_timeout ceiling, the SAME
+                // way the scheduler tick's dispatch path and a manual/MCP
+                // trigger (`trigger_unified_dag`) already do -- resolved from the
+                // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
+                // `registry.workflows` by `DagInfo::as_workflow_info()`. Kept as a
+                // separate lookup from the `(owner, runbook_url, severity)` tuple
+                // above (sourced from `runtime.dags()`) so this fix stays scoped
+                // to the deadline fields and never touches classic-DAG behavior
+                // for those three unrelated fields. `chain_execution_timeout` is
+                // deliberately left `None` for a DAG start (issue #617: DAGs
+                // carry no chain-scoped lifetime cap), matching
+                // `DagInfo::as_workflow_info()`'s own `chain_execution_timeout:
+                // None`.
+                let dag_wf_info = runtime.registry.workflows.get(&dag_name);
+                let dag_execution_timeout = dag_wf_info
+                    .and_then(|info| info.execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                let dag_sla = dag_wf_info
+                    .and_then(|info| info.sla)
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
+                let dag_max_execution_timeout_ceiling = runtime
+                    .registry
+                    .max_workflow_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok());
+
                 // issue #377: enforce admission gates for DAG backfills, mirroring
                 // the workflow backfill branch gate check.
                 if let Some((gate_id, gate_reason, scope_kind)) =
@@ -25584,14 +25632,14 @@ async fn schedule_backfill(
                         input: serde_json::json!({"_harvest_run_source": "backfill"}),
                         parent_id: None,
                         queue_name: dag_queue,
-                        execution_timeout: None,
+                        execution_timeout: dag_execution_timeout,
                         memo: None,
                         search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
                         conflict_policy:
                             autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: None,
-                        max_execution_timeout_ceiling: None,
+                        max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
                         chain_execution_timeout: None,
                         max_workflow_chain_timeout_ceiling: None,
                         inherited_chain_deadline_at: None,
@@ -25607,7 +25655,7 @@ async fn schedule_backfill(
                         severity,
                         context_headers: None,
 
-                        sla: None,
+                        sla: dag_sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
