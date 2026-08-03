@@ -214,7 +214,10 @@ mod db_tests {
     /// `RetryPolicy` would compute a 999s delay -- proves the hint OVERRIDES the
     /// policy delay (AC2) without granting extra attempts (the policy's
     /// `max_attempts` cap is untouched).
-    fn fail_retry_after_2s(_ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
+    fn fail_retry_after_2s(
+        _ctx: &autumn_harvest::ActivityContext,
+        _input: serde_json::Value,
+    ) -> BoxFut<'_> {
         Box::pin(async move {
             Err(ActivityFailure::retryable("Http429", "rate limited")
                 .with_retry_after(Duration::from_secs(2))
@@ -284,7 +287,10 @@ mod db_tests {
     // Registry / worker construction.
     // -----------------------------------------------------------------------
 
-    fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
+    fn wf_info(
+        name: &'static str,
+        handler: autumn_harvest::info::WorkflowHandlerFn,
+    ) -> WorkflowInfo {
         WorkflowInfo {
             mcp: false,
             name,
@@ -496,7 +502,11 @@ mod db_tests {
     }
 
     /// Load the single enqueued *activity* task row for `activity_name`.
-    async fn load_activity_task(url: &str, exec_id: ExecutionId, activity_name: &str) -> TaskQueueItem {
+    async fn load_activity_task(
+        url: &str,
+        exec_id: ExecutionId,
+        activity_name: &str,
+    ) -> TaskQueueItem {
         let mut conn = connect(url).await;
         let rows: Vec<TaskQueueItem> = harvest_task_queue::table
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
@@ -560,7 +570,8 @@ mod db_tests {
         let (url, _container) = setup_db().await;
         let queue = "q744-override";
         let mut conn = connect(&url).await;
-        let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
+        let exec_id =
+            seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
         let t_before = Utc::now();
 
         // Policy delay would be 999s; max_attempts = 2, so exactly one retry
@@ -578,7 +589,15 @@ mod db_tests {
         let worker = build_worker("w744-override", queue, Arc::clone(&registry));
         let pool = build_pool(&url);
 
-        let execution = run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+        let execution = run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "FAILED",
+            Duration::from_secs(20),
+        )
+        .await;
         assert_eq!(
             execution.state, "FAILED",
             "the policy's max_attempts=2 cap must still terminate the run \
@@ -624,7 +643,8 @@ mod db_tests {
         let (url, _container) = setup_db().await;
         let queue = "q744-clamp";
         let mut conn = connect(&url).await;
-        let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
+        let exec_id =
+            seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
         let t_before = Utc::now();
 
         // A 1s ceiling; the hint (999s) must be clamped down to ~1s.
@@ -641,7 +661,15 @@ mod db_tests {
         let worker = build_worker("w744-clamp", queue, Arc::clone(&registry));
         let pool = build_pool(&url);
 
-        run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+        run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "FAILED",
+            Duration::from_secs(20),
+        )
+        .await;
 
         let task = load_activity_task(&url, exec_id, "echo").await;
         let observed_delay = task.scheduled_at - t_before;
@@ -662,7 +690,8 @@ mod db_tests {
         let (url, _container) = setup_db().await;
         let queue = "q744-zero-hint";
         let mut conn = connect(&url).await;
-        let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
+        let exec_id =
+            seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
         let t_before = Utc::now();
 
         // Policy delay is 2s; retry_after is ZERO, so the policy's 2s delay
@@ -680,7 +709,15 @@ mod db_tests {
         let worker = build_worker("w744-zero-hint", queue, Arc::clone(&registry));
         let pool = build_pool(&url);
 
-        run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+        run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "FAILED",
+            Duration::from_secs(20),
+        )
+        .await;
 
         let task = load_activity_task(&url, exec_id, "echo").await;
         let observed_delay = task.scheduled_at - t_before;
@@ -701,7 +738,8 @@ mod db_tests {
         let (url, _container) = setup_db().await;
         let queue = "q744-non-retryable";
         let mut conn = connect(&url).await;
-        let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
+        let exec_id =
+            seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
 
         // Plenty of attempts remain (5) and the hint is fast (1ms) -- if
         // non_retryable were ignored we would see several fast retries.
@@ -718,7 +756,15 @@ mod db_tests {
         let worker = build_worker("w744-non-retryable", queue, Arc::clone(&registry));
         let pool = build_pool(&url);
 
-        run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+        run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "FAILED",
+            Duration::from_secs(20),
+        )
+        .await;
 
         let task = load_activity_task(&url, exec_id, "echo").await;
         assert_eq!(
@@ -749,7 +795,8 @@ mod db_tests {
         let (url, _container) = setup_db().await;
         let queue = "q744-stc-interaction";
         let mut conn = connect(&url).await;
-        let exec_id = seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
+        let exec_id =
+            seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
 
         // schedule_to_close = 2s (set at first schedule, i.e. ~now).
         //
@@ -775,7 +822,15 @@ mod db_tests {
         let worker = build_worker("w744-stc-interaction", queue, Arc::clone(&registry));
         let pool = build_pool(&url);
 
-        run_to_state(&url, &pool, worker, exec_id, "FAILED", Duration::from_secs(20)).await;
+        run_to_state(
+            &url,
+            &pool,
+            worker,
+            exec_id,
+            "FAILED",
+            Duration::from_secs(20),
+        )
+        .await;
 
         let history = load_history(&url, exec_id).await;
         assert!(

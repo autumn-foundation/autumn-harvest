@@ -860,7 +860,10 @@ mod tests {
             .with_retry_after(std::time::Duration::from_secs(30))
             .with_details(serde_json::json!({"header": "Retry-After: 30"}));
         assert_eq!(f.retry_after, Some(std::time::Duration::from_secs(30)));
-        assert_eq!(f.details, Some(serde_json::json!({"header": "Retry-After: 30"})));
+        assert_eq!(
+            f.details,
+            Some(serde_json::json!({"header": "Retry-After: 30"}))
+        );
     }
 
     #[test]

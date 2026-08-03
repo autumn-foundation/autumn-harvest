@@ -4524,8 +4524,7 @@ mod tests {
             "the ceiling must always be present with a sane default (AC3)"
         );
 
-        let configured =
-            WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
+        let configured = WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
         assert_eq!(configured.retry_after_ceiling, Duration::from_secs(90));
     }
 

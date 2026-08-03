@@ -652,8 +652,10 @@ mod tests {
         // The ceiling is not opt-in (always present, unlike the sibling
         // default_activity_* floors) -- confirm the default AND a configured
         // override both surface through the introspection snapshot.
-        let default_view =
-            WorkerConfigView::from_worker_config(&WorkerConfig::default(), Duration::from_millis(500));
+        let default_view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
         assert_eq!(
             default_view.retry_after_ceiling_ms,
             u64::try_from(crate::builder::DEFAULT_RETRY_AFTER_CEILING.as_millis()).unwrap(),

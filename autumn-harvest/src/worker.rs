@@ -3005,9 +3005,8 @@ fn next_retry_delay(
     // AC3: a present, positive retry_after hint overrides the policy-computed
     // backoff for THIS attempt only, clamped to `[0, retry_after_ceiling]`. A
     // non-positive (<=0) or absent hint falls through to the policy delay.
-    let delay =
-        crate::policy::resolve_retry_after_hint(failure.retry_after, retry_after_ceiling)
-            .unwrap_or(policy_delay);
+    let delay = crate::policy::resolve_retry_after_hint(failure.retry_after, retry_after_ceiling)
+        .unwrap_or(policy_delay);
 
     chrono_duration_from_std(delay, "retry delay").map(Some)
 }
