@@ -17,43 +17,7 @@ use crate::parse_byte_size_macro;
 /// build error rather than panicking at registration via the emitted `.expect`.
 /// Kept intentionally permissive/identical to the runtime parser; the runtime
 /// `.expect` remains as a defensive backstop.
-fn is_valid_task_duration(s: &str) -> bool {
-    let mut total_secs = 0u64;
-    let mut current_num = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            if current_num == "0" {
-                current_num.clear();
-            }
-            if current_num.len() > 20 {
-                return false;
-            }
-            current_num.push(ch);
-        } else if ch.is_ascii_alphabetic() {
-            let Ok(num) = current_num.parse::<u64>() else {
-                return false;
-            };
-            current_num.clear();
-            let mult = match ch {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                'd' => 86400,
-                _ => return false,
-            };
-            match num
-                .checked_mul(mult)
-                .and_then(|v| total_secs.checked_add(v))
-            {
-                Some(v) => total_secs = v,
-                None => return false,
-            }
-        } else if ch != ' ' {
-            return false;
-        }
-    }
-    current_num.is_empty() && total_secs != 0
-}
+use crate::attr_util::is_valid_task_duration;
 
 // ---------------------------------------------------------------------------
 // Attribute parsing

@@ -3011,6 +3011,8 @@ async fn ui_trigger_preserves_dag_metadata() {
         runbook_url: Some("http://ui-runbook"),
         severity: Some("sev3"),
         mcp: false,
+        execution_timeout: None,
+        sla: None,
     };
 
     let dag_catalog =

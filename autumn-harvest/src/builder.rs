@@ -3524,6 +3524,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 
@@ -3547,6 +3549,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 
@@ -4846,6 +4850,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
@@ -4879,6 +4885,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(

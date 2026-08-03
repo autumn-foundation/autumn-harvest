@@ -5751,6 +5751,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 

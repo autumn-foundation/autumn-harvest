@@ -1,0 +1,5 @@
+error: unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, jitter, owner, runbook, severity, mcp, execution_timeout, or sla
+ --> tests/compile_fail/dag_unsupported_attribute.rs:5:7
+  |
+5 | #[dag(bogus_attr = "nope")]
+  |       ^^^^^^^^^^

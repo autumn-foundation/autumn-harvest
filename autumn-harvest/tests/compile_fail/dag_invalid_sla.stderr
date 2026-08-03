@@ -1,0 +1,5 @@
+error: invalid sla duration; expected e.g. "30s", "5m", "3h", "2d"
+ --> tests/compile_fail/dag_invalid_sla.rs:7:13
+  |
+7 | #[dag(sla = "three hours")]
+  |             ^^^^^^^^^^^^^

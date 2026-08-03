@@ -2771,6 +2771,18 @@ struct ScheduleEntry {
     /// How long past its scheduled fire this schedule is (`now − next_run_at`)
     /// in whole seconds, or `null` when it is not overdue (issue #696).
     overdue_by_secs: Option<i64>,
+    /// Effective hard execution-timeout deadline (issue #743) that a run this
+    /// schedule fires will get, resolved from the registered workflow (or the
+    /// DAG's shadow `WorkflowInfo`, for `kind: "dag"`) `execution_timeout`,
+    /// in whole seconds. `null` when the workflow/DAG declares none or the
+    /// registry is unavailable.
+    execution_timeout_secs: Option<i64>,
+    /// Effective soft SLA (issue #743) a run this schedule fires will get,
+    /// resolved from the registered workflow (or the DAG's shadow
+    /// `WorkflowInfo`) `sla`, clamped down to `execution_timeout_secs` when
+    /// declared larger than it (issue #743 AC5). In whole seconds; `null`
+    /// when the workflow/DAG declares none or the registry is unavailable.
+    sla_secs: Option<i64>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -20875,6 +20887,10 @@ async fn list_schedules(
     // issue #696 / Codex round 3), keyed by schedule id so the read agrees with
     // the gauge and the tick.
     let overdue_aux = load_schedule_overdue_aux_by_shard(&api_state).await;
+    // issue #743 AC9: resolved once (not per row) and threaded through so the
+    // list reflects the effective DAG/workflow execution_timeout/sla.
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|rt| rt.registry.as_ref());
 
     let entries: Vec<ScheduleEntry> = schedules
         .into_iter()
@@ -20884,7 +20900,13 @@ async fn list_schedules(
                 .cloned()
                 .map(BackfillSummary::from);
             let aux = overdue_aux.get(&s.id).copied().unwrap_or_default();
-            schedule_entry_from_row(s, last_backfill, aux.at_capacity, aux.effective_fire_at)
+            schedule_entry_from_row(
+                s,
+                last_backfill,
+                aux.at_capacity,
+                aux.effective_fire_at,
+                registry,
+            )
         })
         .collect();
     fanout_list_json("schedules", entries, status, &unavailable_shards)
@@ -20980,11 +21002,16 @@ async fn get_schedule(
         .remove(&s.id)
         .map(BackfillSummary::from);
 
+    // issue #743 AC9: surface the effective DAG/workflow execution_timeout/sla.
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|rt| rt.registry.as_ref());
+
     Ok(Json(schedule_entry_from_row(
         s,
         last_backfill,
         at_capacity,
         effective_fire_at,
+        registry,
     )))
 }
 
@@ -21499,6 +21526,7 @@ async fn reject_unknown_workflow_schedule_target(
 async fn upsert_workflow_schedule_and_read_back(
     conn: &mut diesel_async::AsyncPgConnection,
     ws: &WorkflowSchedule,
+    registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
@@ -21547,6 +21575,7 @@ async fn upsert_workflow_schedule_and_read_back(
         None,
         at_capacity,
         effective_fire_at,
+        registry,
     ))
 }
 
@@ -21723,7 +21752,16 @@ async fn create_workflow_schedule(
         // built-in synthetic liveness canary registration, not via this route.
         all_writable_shards: false,
     };
-    let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
+    // issue #743 AC9: surface the effective workflow execution_timeout/sla on
+    // the create response. `runtime` is already validated non-`Err` above
+    // (`reject_unknown_workflow_schedule_target` requires it).
+    let entry = match upsert_workflow_schedule_and_read_back(
+        &mut conn,
+        &ws,
+        Some(runtime.registry.as_ref()),
+    )
+    .await
+    {
         Ok(e) => e,
         Err(e) => {
             let err_str = e.to_string();
@@ -21818,11 +21856,45 @@ fn reanchor_schedule_timezone(existing: &Schedule, tz: &str) -> Schedule {
 }
 
 /// Build a [`ScheduleEntry`] from a raw `harvest_schedules` row.
+/// Resolve the effective hard `execution_timeout`/soft `sla` (issue #743,
+/// whole seconds) a run this schedule fires would get, from the registered
+/// `WorkflowInfo` for `name`. For `kind: Dag` this is the DAG's own shadow
+/// `WorkflowInfo` -- auto-registered under the DAG's name in
+/// `registry.workflows` when the `unified-dag-execution` feature is on, with
+/// `#[dag(execution_timeout = ...)]`/`#[dag(sla = ...)]` propagated onto it
+/// verbatim by `DagInfo::as_workflow_info()` -- so ONE lookup covers both
+/// schedule kinds identically (AC9); a classic (non-unified) DAG has no
+/// shadow entry and correctly resolves to `(None, None)`.
+///
+/// `sla` is clamped down to `execution_timeout` (AC5) via the SAME
+/// `clamp_info_default_sla` helper the start path applies, so the read-back
+/// value can never disagree with what a real fire would set on
+/// `deadline_at`/`sla_deadline_at`.
+///
+/// `(None, None)` when the registry is unavailable (e.g. a scheduler-only
+/// process with no live runtime installed) or the workflow/DAG declares
+/// neither -- never a panic, never a stale/guessed value.
+fn resolve_schedule_deadline_secs(
+    registry: Option<&HandlerRegistry>,
+    name: &str,
+) -> (Option<i64>, Option<i64>) {
+    let Some(info) = registry.and_then(|r| r.workflows.get(name)) else {
+        return (None, None);
+    };
+    let execution_timeout_secs = info
+        .execution_timeout
+        .and_then(|d| i64::try_from(d.as_secs()).ok());
+    let sla_secs =
+        clamp_info_default_sla(info.sla, info.execution_timeout).map(|d| d.num_seconds());
+    (execution_timeout_secs, sla_secs)
+}
+
 fn schedule_entry_from_row(
     s: HarvestSchedule,
     last_backfill: Option<BackfillSummary>,
     at_capacity: bool,
     effective_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    registry: Option<&HandlerRegistry>,
 ) -> ScheduleEntry {
     // Overdue detection (issue #696): computed from the schedule's own
     // `next_run_at` + cadence, never an externally-supplied interval. Rides the
@@ -21874,6 +21946,7 @@ fn schedule_entry_from_row(
     let remaining_runs = s
         .max_runs
         .map(|max| remaining_runs_budget(max, s.runs_started));
+    let (execution_timeout_secs, sla_secs) = resolve_schedule_deadline_secs(registry, &name);
     let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
         s.catchup_policy.as_deref(),
         s.catchup_window_secs,
@@ -21921,6 +21994,8 @@ fn schedule_entry_from_row(
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
         overdue: overdue_verdict.overdue,
         overdue_by_secs: overdue_verdict.overdue_by_secs,
+        execution_timeout_secs,
+        sla_secs,
     }
 }
 
@@ -22370,11 +22445,17 @@ async fn update_schedule_handler(
                 .get(&row.id)
                 .copied()
                 .unwrap_or_default();
+            // issue #743 AC9: surface the effective DAG/workflow
+            // execution_timeout/sla, reflecting any workflow-name-independent
+            // patch (e.g. `input`) immediately.
+            let patch_runtime = api_state.runtime().ok();
+            let patch_registry = patch_runtime.as_ref().map(|rt| rt.registry.as_ref());
             Ok(Json(schedule_entry_from_row(
                 *row,
                 last_backfill,
                 aux.at_capacity,
                 aux.effective_fire_at,
+                patch_registry,
             )))
         }
         Ok(ScheduleUpdateOutcome::NotFound) => {
@@ -39976,6 +40057,8 @@ mod tests {
             retry_policy: None,
             overdue: false,
             overdue_by_secs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
@@ -42552,5 +42635,146 @@ mod tests {
                 "message must name the field: {err:?}"
             );
         }
+    }
+
+    // ── issue #743: DAG-level execution_timeout/sla -- schedule API surfacing (AC9),
+    //    pure (no DB): resolve_schedule_deadline_secs directly. ──────────────────
+
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> autumn_harvest::WorkflowInfo {
+        autumn_harvest::WorkflowInfo {
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_returns_none_none_with_no_registry() {
+        // A schedule read while no runtime is installed (or the workflow is
+        // unknown to the registry) must resolve to (None, None), never panic
+        // or guess a stale value.
+        assert_eq!(
+            resolve_schedule_deadline_secs(None, "anything"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_returns_none_none_for_an_unregistered_name() {
+        let registry =
+            HandlerRegistry::new(vec![deadline_info_fixture("known_wf", None, None)], vec![]);
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "unknown_wf"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_propagates_declared_values_verbatim() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "deadline_wf",
+                Some(std::time::Duration::from_secs(4 * 3600)),
+                Some(std::time::Duration::from_secs(3 * 3600)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "deadline_wf"),
+            (Some(14_400), Some(10_800)),
+            "a declared 4h execution_timeout / 3h sla (sla < timeout) must read back unclamped"
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_clamps_sla_to_execution_timeout() {
+        // AC5's read-side manifestation: sla (10h) > execution_timeout (1h)
+        // must resolve CLAMPED to the 1h ceiling, mirroring the same clamp
+        // `clamp_info_default_sla` applies at start time.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "clamp_wf",
+                Some(std::time::Duration::from_secs(3600)),
+                Some(std::time::Duration::from_secs(10 * 3600)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "clamp_wf"),
+            (Some(3_600), Some(3_600)),
+            "sla must be clamped down to execution_timeout, never the raw declared 36000"
+        );
+    }
+
+    #[test]
+    fn resolve_schedule_deadline_secs_leaves_undeclared_fields_none() {
+        // AC7: zero regression -- a workflow declaring neither attribute
+        // resolves to (None, None), identical to a pre-#743 schedule read.
+        let registry =
+            HandlerRegistry::new(vec![deadline_info_fixture("plain_wf", None, None)], vec![]);
+        assert_eq!(
+            resolve_schedule_deadline_secs(Some(&registry), "plain_wf"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn schedule_entry_from_row_resolves_execution_timeout_and_sla_for_a_dag_schedule() {
+        // Closes the review gap left by the 5 tests above, which only exercise
+        // plain-workflow-named schedules. A `kind: "dag"` row's `name` resolves
+        // to `s.dag_name` (see the `(kind, name)` derivation in
+        // `schedule_entry_from_row`), and `HarvestBuilder::dags(...)`
+        // auto-registers a unified DAG's shadow `WorkflowInfo` under that SAME
+        // name in `registry.workflows` (`DagInfo::as_workflow_info()` ->
+        // `self.workflows.push(workflow_info)`), so `resolve_schedule_deadline_secs`
+        // must resolve identically for `kind: "dag"` schedules as it does for
+        // plain-workflow schedules -- the "ONE lookup covers both schedule
+        // kinds identically" claim documented on `resolve_schedule_deadline_secs`.
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "nightly_reconciliation",
+                Some(std::time::Duration::from_secs(4 * 3600)),
+                Some(std::time::Duration::from_secs(3 * 3600)),
+            )],
+            vec![],
+        );
+        let schedule = sched_named(1, Some("nightly_reconciliation"), None);
+
+        let entry = schedule_entry_from_row(schedule, None, false, None, Some(&registry));
+
+        assert_eq!(
+            entry.kind,
+            ScheduleKind::Dag,
+            "a dag_name-bearing row must resolve to ScheduleKind::Dag"
+        );
+        assert_eq!(entry.name, "nightly_reconciliation");
+        assert_eq!(
+            entry.execution_timeout_secs,
+            Some(14_400),
+            "a kind:dag schedule must resolve execution_timeout via the DAG's shadow \
+             WorkflowInfo, registered under the DAG's own name"
+        );
+        assert_eq!(entry.sla_secs, Some(10_800));
     }
 }

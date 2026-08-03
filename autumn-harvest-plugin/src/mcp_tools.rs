@@ -1462,6 +1462,8 @@ mod tests {
             runbook_url: None,
             severity: None,
             mcp: false,
+            execution_timeout: None,
+            sla: None,
         }
     }
 
@@ -1473,6 +1475,9 @@ mod tests {
             builder: |dag| {
                 let _ = dag.signal_gate("approval");
             },
+            // `execution_timeout`/`sla` (issue #743) are supplied by the
+            // `..dag_info(name, true)` base below -- `..base` must be the
+            // last item in a struct literal, so they are NOT re-listed here.
             ..dag_info(name, true)
         }
     }
