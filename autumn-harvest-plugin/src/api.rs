@@ -43,11 +43,11 @@ use autumn_harvest::audit::{
     OP_QUEUE_RESUME, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET,
-    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED,
-    STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
-    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
+    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
     TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RETENTION, TARGET_SCHEDULE,
     TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
 };
@@ -121,8 +121,9 @@ use autumn_harvest::workers::{
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
-    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
-    UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, TriageFieldChange,
+    TriageOutcome, TriagePatch, UpdateWithStartOutcome, UpdateWithStartParams,
+    WorkflowHandleClient, WorkflowResult, annotate_workflow_execution, cancel_workflow_execution,
     pause_workflow_execution, resume_workflow_execution,
     signal_with_start_workflow_execution_with_metrics,
     start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
@@ -4462,6 +4463,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/{id}/resume",
             post(resume_workflow).route_layer(require_admin.clone()),
         )
+        .route(
+            "/workflows/{id}/triage",
+            patch(annotate_workflow_handler).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/reset", post(reset_workflow))
         .route(
             "/workflows/{id}/signal/{signal_name}",
@@ -5411,6 +5416,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/terminate"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
+        ("PATCH", "/workflows/{id}/triage"),
         ("POST", "/workflows/{id}/erase-payloads"),
         ("POST", "/workflows/{id}/legal-hold"),
         ("POST", "/workflows/{id}/legal-hold/release"),
@@ -5689,6 +5695,11 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
+        (
+            "PATCH",
+            "/workflows/{id}/triage",
+            Some(&["owner", "severity", "note"]),
+        ),
         // Issue #614: bodyless POST (the execution id is the path param). Listed
         // with an empty field set, matching the resume/retry-now precedent.
         ("POST", "/workflows/{id}/replay-diagnosis", Some(&[])),
@@ -6282,6 +6293,17 @@ pub const fn management_api_response_fields()
                 "actor",
                 "pause_duration_secs",
                 "newly_resumed",
+            ]),
+        ),
+        (
+            "PATCH",
+            "/workflows/{id}/triage",
+            Some(&[
+                "execution_id",
+                "owner",
+                "severity",
+                "note",
+                "changed_fields",
             ]),
         ),
         (
@@ -18626,6 +18648,203 @@ async fn resume_workflow(
                 newly_resumed: resumed.newly_resumed,
             }),
         )),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+// ── Operator-mutable triage tags (issue #759) ─────────────────────────────────
+
+/// Request body for `PATCH /workflows/{id}/triage` (issue #759).
+///
+/// Each field is independently optional and tri-state, mirroring the
+/// `UpdateWorkflowScheduleRequest` (issue #771) PATCH contract: absent from
+/// the request = unchanged; explicit JSON `null` = clear; a value = set.
+///
+/// `deny_unknown_fields`: a typo'd field name (`"onwer"`) would otherwise
+/// silently deserialize to an all-`None` (no-op) body and 200-succeed with
+/// nothing changed — the rejection surfaces as a structured 400 instead (see
+/// [`annotate_workflow_handler`]).
+///
+/// A set (non-clear, non-absent) value is truncated to
+/// [`OPERATOR_REASON_MAX_CHARS`] at the `From<TriageWorkflowRequest> for
+/// TriagePatch` boundary before it reaches the core — these fields are now
+/// runtime, HTTP-caller-controlled strings (unlike the compile-time
+/// `&'static str` `owner`/`severity` defaults from issue #372) and are
+/// persisted durably and echoed into the audit log, so they get the same cap
+/// every other free-text operator field on this router already applies.
+#[allow(clippy::option_option)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriageWorkflowRequest {
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    owner: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    severity: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    note: Option<Option<String>>,
+}
+
+impl From<TriageWorkflowRequest> for TriagePatch {
+    fn from(request: TriageWorkflowRequest) -> Self {
+        // Bound each set value at the API boundary before it becomes a
+        // durable, unbounded-length Postgres TEXT column and an audit-log
+        // old->new summary -- the same `truncate_operator_reason` cap every
+        // other free-text operator field on this router applies (pause's
+        // `reason`, legal-hold's `reason`, the queue-pause `reason`). A tri-
+        // state "clear" (`Some(None)`) is unaffected by the inner `.map`.
+        Self {
+            owner: request
+                .owner
+                .map(|v| v.map(|s| truncate_operator_reason(&s))),
+            severity: request
+                .severity
+                .map(|v| v.map(|s| truncate_operator_reason(&s))),
+            note: request
+                .note
+                .map(|v| v.map(|s| truncate_operator_reason(&s))),
+        }
+    }
+}
+
+/// Response body for `PATCH /workflows/{id}/triage` (issue #759) — the
+/// execution's current triage view after applying the patch (AC4/AC7).
+#[derive(Debug, Serialize)]
+struct TriageWorkflowResponse {
+    execution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// Field names this call actually changed (empty on a true no-op /
+    /// idempotent repeat, e.g. re-setting an identical value or an empty
+    /// patch — issue #759 AC4).
+    changed_fields: Vec<&'static str>,
+}
+
+impl From<TriageOutcome> for TriageWorkflowResponse {
+    fn from(outcome: TriageOutcome) -> Self {
+        Self {
+            execution_id: outcome.execution_id,
+            owner: outcome.owner,
+            severity: outcome.severity,
+            note: outcome.triage_note,
+            changed_fields: outcome.changed_fields.iter().map(|c| c.field).collect(),
+        }
+    }
+}
+
+/// Build a compact `old -> new` diff summary for the triage audit row (issue
+/// #759, AC5). `None` when the call changed nothing (an idempotent repeat),
+/// matching the pause/resume "no `error_summary` on a no-op success" style.
+fn triage_diff_summary(changed: &[TriageFieldChange]) -> Option<String> {
+    if changed.is_empty() {
+        return None;
+    }
+    Some(
+        changed
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}: {} -> {}",
+                    c.field,
+                    c.old.as_deref().unwrap_or("(none)"),
+                    c.new.as_deref().unwrap_or("(none)")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// `PATCH /workflows/{id}/triage` — set, update, or clear an execution's
+/// operator-mutable triage tags: `owner`, `severity`, and a free-text `note`
+/// (issue #759).
+///
+/// A plain metadata update on `harvest_workflow_executions` — appends no
+/// `WorkflowEvent`, never read by the workflow function, zero
+/// replay-determinism impact (AC2). Works on any non-purged execution
+/// regardless of lifecycle state — RUNNING, PAUSED, FAILED, COMPLETED, … are
+/// all annotated identically (AC6). Admin-guarded, shard-routed via
+/// `exec_id.shard()`, idempotent (AC4). Returns 404 only for an unknown
+/// execution id (AC6); 400 for a malformed execution id or an unparseable /
+/// unknown-field request body.
+async fn annotate_workflow_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Result<Json<TriageWorkflowRequest>, JsonRejection>,
+) -> Result<Json<TriageWorkflowResponse>, AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "PATCH /workflows/{id}/triage";
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    // Body deserialization is unwrapped in-handler (rather than by a bare
+    // `Json` extractor) so a rejected body -- most importantly an unknown
+    // field, rejected via `deny_unknown_fields` since every real field is
+    // optional and a typo'd name would otherwise silently no-op -- surfaces
+    // as this route's structured 400 JSON error with a failed audit row,
+    // never as axum's default plain-text 422 (mirrors
+    // `update_schedule_handler`, issue #771).
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let err_summary = format!("invalid request body: {}", rejection.body_text());
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_ANNOTATE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(&err_summary),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return Err(AutumnError::bad_request_msg(err_summary));
+        }
+    };
+
+    let patch: TriagePatch = request.into();
+    let result = annotate_workflow_execution(&mut conn, exec_id, patch).await;
+
+    let (status, error_summary) = match &result {
+        Ok(outcome) => (
+            STATUS_SUCCEEDED,
+            triage_diff_summary(&outcome.changed_fields),
+        ),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_ANNOTATE,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok(Json(outcome.into())),
+        // `conflict_from` (not the bare `map_error`) matches every sibling
+        // audited-mutation handler (pause/resume/legal-hold/terminate/cancel/
+        // reset): `annotate_workflow_execution` today only ever returns
+        // `NotFound`/`Database`, both of which flow through unchanged, but a
+        // future `Config` ("execution is redacted/purged") would then map to
+        // 409 automatically rather than the misleading `map_error` default.
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -41744,6 +41963,7 @@ mod tests {
             start_source_ref: None,
             started_by: None,
             history_bloat_warned_at: None,
+            triage_note: None,
         }
     }
 

@@ -1493,6 +1493,72 @@
       ]
     },
     {
+      "method": "PATCH",
+      "path": "/workflows/{id}/triage",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Set, update, or clear an execution's operator-mutable triage tags: owner, severity, and a free-text note (issue #759). A plain metadata update on harvest_workflow_executions -- appends no WorkflowEvent, is never read by the workflow function, and has zero replay-determinism impact; distinct from author-controlled search_attrs. owner and severity set this way are immediately reflected in GET /workflows?owner=...&severity=... (issue #372's filters). Works on any non-purged execution regardless of lifecycle state (RUNNING, PAUSED, FAILED, COMPLETED, ...) -- triage annotation is orthogonal to lifecycle state.",
+      "idempotency": "Idempotent: applying the same patch twice yields the same final row (changed_fields is empty on the second call). An empty patch (every field omitted) performs no write and reports no changed fields.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "owner",
+            "required": false,
+            "description": "New owner (e.g. a team or on-call handle). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+            "name": "severity",
+            "required": false,
+            "description": "New severity/priority label (freeform, e.g. 'P1'). Tri-state: omit = unchanged, explicit null = clear."
+          },
+          {
+            "name": "note",
+            "required": false,
+            "description": "New free-text triage note. Tri-state: omit = unchanged, explicit null = clear."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "owner",
+          "severity",
+          "note",
+          "changed_fields"
+        ],
+        "description": "owner, severity, and note are omitted from the response when null (skip_serializing_if). changed_fields lists the field names this call actually changed (empty on a true no-op)."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id, or the request body contains an unknown field or fails to parse."
+        },
+        {
+          "status": 401,
+          "description": "Not authorized (admin-only route)."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/workflows/{id}/erase-payloads",
       "category": "workflow",

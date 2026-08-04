@@ -2098,6 +2098,113 @@ fn workflow_resume_maps_to_post_resume_route_with_no_body() {
     assert_eq!(request.body, None, "resume sends no body");
 }
 
+// ── annotate (operator-mutable triage tags, issue #759) ───────────────────────
+
+#[test]
+fn workflow_annotate_sets_owner_and_severity_maps_to_patch_triage_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--owner",
+        "team-payments",
+        "--severity",
+        "P1",
+    ])
+    .expect("workflow annotate args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/triage"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({ "owner": "team-payments", "severity": "P1" }))
+    );
+}
+
+#[test]
+fn workflow_annotate_note_only_maps_to_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--note",
+        "claimed, investigating stuck timer",
+    ])
+    .expect("workflow annotate note args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(
+        request.body,
+        Some(json!({ "note": "claimed, investigating stuck timer" }))
+    );
+}
+
+#[test]
+fn workflow_annotate_clear_flags_send_explicit_null() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--clear-owner",
+        "--clear-severity",
+        "--clear-note",
+    ])
+    .expect("workflow annotate clear args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    let body = request.body.expect("annotate request must have a body");
+    let obj = body.as_object().expect("body must be an object");
+    assert!(obj.contains_key("owner") && body["owner"].is_null());
+    assert!(obj.contains_key("severity") && body["severity"].is_null());
+    assert!(obj.contains_key("note") && body["note"].is_null());
+}
+
+#[test]
+fn workflow_annotate_no_flags_sends_empty_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow annotate args should parse");
+    let request = cli.api_request().expect("annotate request should build");
+
+    assert_eq!(request.method, ApiMethod::Patch);
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn workflow_annotate_set_and_clear_flags_conflict() {
+    for (set_flag, set_value, clear_flag) in [
+        ("--owner", "team-payments", "--clear-owner"),
+        ("--severity", "P1", "--clear-severity"),
+        ("--note", "investigating", "--clear-note"),
+    ] {
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "workflow",
+                "annotate",
+                "00000000-0000-0000-0000-000000000001",
+                set_flag,
+                set_value,
+                clear_flag,
+            ])
+            .is_err(),
+            "{set_flag} and {clear_flag} must conflict"
+        );
+    }
+}
+
 // ── batch-reset subcommand (issue #538) ───────────────────────────────────────
 
 #[test]
