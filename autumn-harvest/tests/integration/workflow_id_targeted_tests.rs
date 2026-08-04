@@ -421,6 +421,147 @@ async fn resolver_signal_terminal_current_run_is_not_running() {
 }
 
 #[tokio::test]
+async fn resolver_signal_keyed_retry_after_target_went_terminal_is_delivered_not_not_running() {
+    // Code review finding (PR #1145, issue #751): in the cross-shard outbox
+    // path, the TARGET-shard signal insert can commit while the CALLER-shard
+    // transaction fails before appending `ExternalSignalDelivered` -- so the
+    // outbox retries the same keyed request. If the target finishes
+    // (completes) before that retry runs, an early `is_terminal_state` check
+    // BEFORE ever attempting delivery would report `NotRunning` for a signal
+    // that was, in fact, already delivered -- denying
+    // `send_signal_idempotent`'s own "insert before validate" dedup (issue
+    // #521) the chance to ever observe the existing key collision. A keyed
+    // retry that already landed must dedupe to `Delivered`, not
+    // `NotRunning`, regardless of the target's current state.
+    let _guard = TEST_MUTEX.lock().await;
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_running_row(&mut conn, "resolver_wf", "res-keyed-1", exec_id).await;
+
+    // Attempt 1: delivers successfully while the target is still RUNNING.
+    let first = signal::resolve_and_signal_by_workflow_id(
+        &mut conn,
+        "resolver_wf",
+        "res-keyed-1",
+        "ping",
+        serde_json::json!({"n": 1}),
+        Some("retry-key-1"),
+    )
+    .await
+    .expect("first attempt should succeed");
+    assert_eq!(first, ByIdSignalOutcome::Delivered);
+
+    // The target processes the signal and completes before the caller-side
+    // outbox retry runs -- the exact race the review describes.
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("COMPLETED"))
+        .execute(&mut conn)
+        .await
+        .expect("seal completed");
+
+    // Attempt 2 (the retry): the SAME idempotency key, now against a
+    // terminal current run. Must report Delivered (already landed), never
+    // NotRunning.
+    let retry = signal::resolve_and_signal_by_workflow_id(
+        &mut conn,
+        "resolver_wf",
+        "res-keyed-1",
+        "ping",
+        serde_json::json!({"n": 1}),
+        Some("retry-key-1"),
+    )
+    .await
+    .expect("retry should succeed");
+    assert_eq!(
+        retry,
+        ByIdSignalOutcome::Delivered,
+        "a keyed retry that already landed must dedupe to Delivered even after \
+         the target has since gone terminal"
+    );
+
+    let pending = signal::load_pending_signals(&mut conn, exec_id)
+        .await
+        .expect("load pending signals");
+    assert_eq!(
+        pending.len(),
+        1,
+        "exactly one signal must ever be queued for this key -- no duplicate insert"
+    );
+}
+
+#[tokio::test]
+async fn resolver_signal_keyed_retry_after_continue_as_new_does_not_double_deliver() {
+    // Code review finding (PR #1145, issue #751): when a cross-shard delivery
+    // commits on run A but the caller-side outcome append rolls back, and A
+    // continues-as-new to B before the retry, a naive retry would resolve to
+    // B (the new current run) and attempt a FRESH insert there --
+    // `send_signal_idempotent`'s dedup is scoped to (workflow_exec_id,
+    // idempotency_key), so a key already used against A's exec_id does not
+    // collide against B's. That produces TWO SignalReceived events for one
+    // logical request, contrary to the `_with_idempotency` operation's
+    // exactly-once contract. The dedup identity must survive execution
+    // rotation: reusing `execution::lookup_idempotent_signal_dedupe` (the same
+    // (workflow_name, workflow_id, idempotency_key)-scoped lookup
+    // `signal_with_start` already uses, issue #244) before attempting fresh
+    // delivery closes this.
+    let _guard = TEST_MUTEX.lock().await;
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+
+    let pred = ExecutionId::new_for_shard(ShardId::new(0));
+    let succ = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_running_row(&mut conn, "resolver_wf", "res-keyed-2", pred).await;
+
+    // Attempt 1: delivers successfully to pred while it is still RUNNING.
+    let first = signal::resolve_and_signal_by_workflow_id(
+        &mut conn,
+        "resolver_wf",
+        "res-keyed-2",
+        "ping",
+        serde_json::json!({"n": 1}),
+        Some("retry-key-2"),
+    )
+    .await
+    .expect("first attempt should succeed");
+    assert_eq!(first, ByIdSignalOutcome::Delivered);
+
+    // pred rotates to succ before the caller-side outbox retry runs.
+    assert!(continue_as_new_atomically(&mut conn, "resolver_wf", "res-keyed-2", pred, succ).await);
+
+    // Attempt 2 (the retry): the SAME idempotency key. Must recognise the
+    // key as already delivered (to pred) and report Delivered WITHOUT
+    // inserting a second, duplicate signal against succ.
+    let retry = signal::resolve_and_signal_by_workflow_id(
+        &mut conn,
+        "resolver_wf",
+        "res-keyed-2",
+        "ping",
+        serde_json::json!({"n": 1}),
+        Some("retry-key-2"),
+    )
+    .await
+    .expect("retry should succeed");
+    assert_eq!(
+        retry,
+        ByIdSignalOutcome::Delivered,
+        "a keyed retry must recognise a delivery already recorded against a \
+         predecessor execution in the same (workflow_name, workflow_id) chain"
+    );
+
+    let pending_succ = signal::load_pending_signals(&mut conn, succ)
+        .await
+        .expect("load pending signals for succ");
+    assert!(
+        pending_succ.is_empty(),
+        "the retry must NOT insert a second, duplicate signal against the \
+         continue-as-new successor -- the request was already fulfilled \
+         against the predecessor"
+    );
+}
+
+#[tokio::test]
 async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     // No run in this file's other tests has more than one terminal row under
     // a given (workflow_name, workflow_id); this proves the live SQL

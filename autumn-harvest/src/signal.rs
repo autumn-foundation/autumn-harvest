@@ -193,6 +193,30 @@ pub enum ByIdSignalOutcome {
 /// and cannot be, delivered — matching the existing `ExecutionId`-targeted
 /// signal contract's "no signal silently dropped" invariant (issue #244).
 ///
+/// # Keyed retries (issue #751 code review, PR #1145)
+///
+/// This function deliberately does **not** early-return `NotRunning` for a
+/// terminal resolved run before attempting delivery. A keyed retry (the
+/// caller-side outbox retrying a request whose target-shard insert already
+/// committed, but whose caller-shard transaction rolled back before it could
+/// record the delivery outcome) must dedupe to `Delivered` even after the
+/// target has since gone terminal — an early terminal check would deny
+/// [`send_signal_idempotent`]'s own "insert before validate" dedup (issue
+/// #521) the chance to ever observe the existing key collision, misreporting
+/// a request that was, in fact, already fulfilled.
+///
+/// A second, distinct race compounds this across a continue-as-new rotation:
+/// [`send_signal_idempotent`]'s dedup is scoped to
+/// `(workflow_exec_id, idempotency_key)`, so a key already used against a
+/// predecessor's `exec_id` does not collide against a successor's — a naive
+/// retry that re-resolves to the (now different) current run would insert a
+/// *second*, duplicate signal for one logical request. This function closes
+/// that gap with a `(workflow_name, workflow_id, idempotency_key)`-scoped
+/// pre-check (reusing [`crate::execution::lookup_idempotent_signal_dedupe`],
+/// the same lookup `signal_with_start` already uses for exactly this
+/// purpose, issue #244) before ever attempting a fresh insert against the
+/// freshly-resolved run.
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] for persistence failures. Every other
@@ -213,11 +237,21 @@ pub async fn resolve_and_signal_by_workflow_id(
     else {
         return Ok(ByIdSignalOutcome::NoRunFound);
     };
-    if crate::erase::is_terminal_state(&run.state) {
-        return Ok(ByIdSignalOutcome::NotRunning);
+
+    // Cross-execution dedup: a keyed request already delivered to ANY
+    // execution in this (workflow_name, workflow_id) chain — including a
+    // predecessor sealed by a continue-as-new that raced ahead of this
+    // retry — is reported as already-delivered without a fresh insert.
+    if let Some(key) = idempotency_key.filter(|k| !k.is_empty())
+        && crate::execution::lookup_idempotent_signal_dedupe(conn, workflow_name, workflow_id, key)
+            .await?
+            .is_some()
+    {
+        return Ok(ByIdSignalOutcome::Delivered);
     }
+
     match send_signal_idempotent(conn, run.exec_id, signal_name, payload, idempotency_key).await {
-        Ok(_delivered) => Ok(ByIdSignalOutcome::Delivered),
+        Ok(_delivered_or_deduped) => Ok(ByIdSignalOutcome::Delivered),
         Err(HarvestError::NotFound(_)) => {
             // Vanishingly unlikely (the row existed a moment ago under this
             // same connection) but not impossible under a concurrent
@@ -228,9 +262,12 @@ pub async fn resolve_and_signal_by_workflow_id(
             Ok(ByIdSignalOutcome::RacedToSuccessor)
         }
         Err(HarvestError::Config(_) | HarvestError::Cancelled(_)) => {
-            // Any other terminal state discovered via the race window
-            // between our resolve and the signal attempt's own lock — the
-            // target completed/failed/cancelled/etc. on its own.
+            // A genuinely FRESH insert (the dedup pre-check above found no
+            // prior delivery for this key) against a target that is
+            // terminal — discovered either because `run` above already
+            // resolved to a terminal state (no idempotency key was
+            // supplied, or this key was never used before) or via the race
+            // window between our resolve and the signal attempt's own lock.
             Ok(ByIdSignalOutcome::NotRunning)
         }
         Err(e) => Err(e),

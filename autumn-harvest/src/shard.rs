@@ -707,12 +707,26 @@ impl ShardRouter {
 /// For [`ExternalTarget::WorkflowId`] there is no execution id yet to decode,
 /// so the shard is derived by rendezvous-hashing `(workflow_name,
 /// workflow_id)` via [`ShardRouter::pick_for_new_workflow`] — the SAME hash a
-/// fresh start of that business key would land on. Every execution in a given
+/// fresh start of that business key would land on **under the default
+/// [`ShardPlacement::Auto`] placement**. Every execution in a given
 /// `(workflow_name, workflow_id)` chain (including every continue-as-new
 /// successor, which is minted with [`ExecutionId::new_for_shard`] pinned to
-/// its predecessor's shard) therefore lives on this same shard, so resolving
-/// a `WorkflowId` target's owning shard needs no directory lookup and cannot
-/// disagree with where the data actually lives.
+/// its predecessor's shard) then lives on this same shard, so resolving a
+/// `WorkflowId` target's owning shard needs no directory lookup for the
+/// overwhelming majority of workflows.
+///
+/// # Known limitation — explicit shard placement (issue #697)
+///
+/// This function has **no visibility into an explicit shard pin**
+/// (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`) applied at start
+/// time. A workflow started with such a pin can live on a shard the pure
+/// hash never produces, and this function will silently return the WRONG
+/// shard for it — there is no directory of actual placements to consult, and
+/// adding one (or a cross-shard fan-out lookup) is a documented follow-up,
+/// out of scope for issue #751. Callers addressing a workflow by
+/// `(workflow_name, workflow_id)` should therefore only do so for workflows
+/// started under the default `Auto` placement; a workflow known to use
+/// explicit shard placement should be addressed by `ExecutionId` instead.
 ///
 /// Returns `None` only when `target` is a `WorkflowId` and the process-global
 /// shard router has not been initialized (a boot-window / non-plugin-embedder

@@ -7555,6 +7555,26 @@ impl WorkflowContext {
     /// successor rather than misdelivering to — or failing against — the
     /// sealed predecessor.
     ///
+    /// # Known limitation — explicit shard placement (issue #697)
+    ///
+    /// Resolving which shard owns `(workflow_name, workflow_id)` is done by
+    /// re-deriving the SAME rendezvous hash a fresh start of that business
+    /// key would use ([`crate::shard::external_target_owning_shard`]). This
+    /// is correct for a target started under the default
+    /// [`crate::shard::ShardPlacement::Auto`] placement — the overwhelming
+    /// majority of workflows. It is **not** correct for a target started
+    /// with an *explicit* shard pin (`ShardPlacement::Shard`/
+    /// `ShardPlacement::ResidencyKey`, issue #697): the pin can place the
+    /// workflow on a shard the pure hash would never compute, and this
+    /// resolution has no way to discover that. A `workflow_id`-addressed
+    /// signal to such a target may resolve to the wrong shard and report
+    /// [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    /// "target_unknown"` even though the target is running (just not where
+    /// the hash predicts). If a workflow is started with explicit shard
+    /// placement, address it by [`ExecutionId`](Self::signal_external_workflow)
+    /// instead of by business key. A shard-placement-aware directory lookup
+    /// is a documented follow-up, out of scope for issue #751.
+    ///
     /// # Errors
     ///
     /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
@@ -7847,6 +7867,16 @@ impl WorkflowContext {
     /// request and delivery is followed to its successor and *that* run is
     /// cancelled, rather than misdelivering to — or reporting a spurious
     /// success against — the already-sealed predecessor.
+    ///
+    /// # Known limitation — explicit shard placement (issue #697)
+    ///
+    /// See the identical limitation documented on
+    /// [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id):
+    /// shard resolution for a `WorkflowId` target re-derives the same
+    /// rendezvous hash a fresh start would use and cannot see an explicit
+    /// shard pin (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`,
+    /// issue #697). Address a pinned workflow by
+    /// [`ExecutionId`](Self::request_cancel_external_workflow) instead.
     ///
     /// # Cancel semantics vs signal
     ///

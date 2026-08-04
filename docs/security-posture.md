@@ -314,6 +314,23 @@ by its stable `(workflow_name, workflow_id)` business key instead of its
   above](#data-residency-and-shard-placement-issue-697) — the string is an
   address, not a secret, and reaching it should be gated by your embedding
   application, not by Harvest.
+- **Shard resolution assumes the default (`Auto`) placement (issue #697
+  interaction).** Resolving which shard owns a `(workflow_name, workflow_id)`
+  target re-derives the same rendezvous hash a fresh start would use
+  (`shard::external_target_owning_shard`) — it does not, and cannot without a
+  directory lookup, see an explicit shard pin applied at start time
+  (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`). A workflow started
+  with an explicit pin can therefore be unreachable — or, in a genuinely
+  pathological multi-tenant layout, misresolved to a shard hosting an
+  unrelated `(workflow_name, workflow_id)` pair — via business-key targeting.
+  This is a correctness limitation, not a privilege-escalation vector (a
+  misresolution surfaces as `target_unknown`/`NoRunFound`, never as access to
+  a target the caller could not otherwise reach), but it means
+  business-key-addressed signal/cancel should be reserved for workflows known
+  to use the default placement; address an explicitly shard-pinned workflow
+  by `ExecutionId` instead. A shard-placement-aware directory lookup for
+  business-key targeting is a documented follow-up, out of scope for issue
+  #751.
 
 ---
 
