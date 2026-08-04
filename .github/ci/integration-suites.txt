@@ -78,6 +78,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
+linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
 linux        autumn-harvest         integration                      testing                    nd_block
