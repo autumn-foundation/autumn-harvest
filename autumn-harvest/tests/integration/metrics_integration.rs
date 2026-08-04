@@ -2475,10 +2475,28 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
     // rather than the (still-eventually-true) `history_bloat_warned_at`
     // guard column, so a regression that skips the mark entirely times out
     // clearly instead of racing a state check that would pass anyway.
-    let execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+    wait_for_state(&database_url, exec_id, "FAILED").await;
 
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
+
+    // Issue #1074 CI-flake fix: `move_workflow_to_dlq_for_history_cap`
+    // (state -> FAILED) and `emit_history_bloat_warning_if_crossed`
+    // (`history_bloat_warned_at` stamp) are two SEPARATE, sequential
+    // commits within the same decision cycle -- not one atomic
+    // transaction (see `fail_workflow_for_history_cap`'s own comments on
+    // this deliberate "narrow crash window"). The `wait_for_state` poll
+    // above can therefore observe state=FAILED in the gap BEFORE the
+    // second commit lands, capturing a stale pre-stamp snapshot; under
+    // CI load that gap widens enough to make the race reproducible. The
+    // `worker.shutdown()` + `handle.await` drain barrier above is
+    // guaranteed to let the in-flight decision cycle -- including this
+    // second, trailing write -- fully complete before returning, so
+    // re-loading the row here (rather than reusing the pre-drain
+    // snapshot) removes the race without weakening the "must actually be
+    // set" assertion below or touching the deliberate FAILED-state
+    // polling/timeout strategy that catches a genuine regression.
+    let execution = load_execution(&database_url, exec_id).await;
 
     let error = execution
         .error
