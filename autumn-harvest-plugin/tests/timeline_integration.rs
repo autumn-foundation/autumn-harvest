@@ -63,6 +63,9 @@ const INIT_SQL: &str = concat!(
     // issue #617: chain-scoped lifetime cap columns (read back by WorkflowExecution::as_select()).
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
+    // issue #704: history-bloat early-warning guard column (read back by
+    // WorkflowExecution::as_select()).
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260619000000_harvest_task_queue_created_at/up.sql"
@@ -81,6 +84,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260430000000_harvest_workflow_schedules/up.sql"
     ),
+    "\n",
+    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
+    // strict XOR kind_check from the migration above must be relaxed to an OR.
+    include_str!("../../autumn-harvest/migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
