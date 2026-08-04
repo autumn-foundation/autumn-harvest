@@ -198,6 +198,11 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
     ),
+    // issue #704: history_bloat_warned_at column on harvest_workflow_executions,
+    // referenced by every WorkflowExecution::as_select() read-back in this suite.
+    include_str!(
+        "../../autumn-harvest/migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
