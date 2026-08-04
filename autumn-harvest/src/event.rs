@@ -551,7 +551,7 @@ pub enum WorkflowEvent {
     /// The signal could not be delivered. The `reason_code` is one of:
     /// - `"target_terminal"` — the target execution is already in a terminal
     ///   state (`ExecutionId`-targeted requests only).
-    /// - `"target_not_running"` — the resolved current run for a `workflow_id`
+    /// - `"not_running"` — the resolved current run for a `workflow_id`
     ///   target is definitively terminal (issue #751; no grace window needed,
     ///   since a continue-as-new always leaves an active successor behind
     ///   atomically, so this observation can never be a false negative).
@@ -561,7 +561,7 @@ pub enum WorkflowEvent {
         /// Correlation ID matching the corresponding `ExternalSignalRequested`.
         signal_id: ExternalSignalId,
         /// Machine-readable reason code (`"target_terminal"`,
-        /// `"target_not_running"`, or `"target_unknown"`).
+        /// `"not_running"`, or `"target_unknown"`).
         reason_code: String,
     },
 
