@@ -99,3 +99,54 @@ Gates run at the pinned CI toolchain (1.97.0): `cargo fmt --check` clean;
 `autumn-harvest-plugin`'s `timeline_integration` test target builds cleanly;
 all 9 `migration_hygiene` guard tests and all 13 `ci_run_coverage` guard
 tests pass unchanged (neither guard's allowlist/manifest was touched).
+
+**Follow-up: a real CI run on the fix above surfaced a second, genuine,
+test-only race.** `metrics_integration::history_bloat_counter_fires_even_when_the_same_decision_reaches_the_hard_cap`
+passed in the pre-fix baseline CI run but failed in the first real CI run
+after the fix above landed, with a NEW assertion failure:
+`history_bloat_warned_at must be stamped even when the SAME decision
+reaches the hard cap and terminally fails the execution`. This test is
+provably unrelated to the fix above (it builds its schema via the paved-path
+`full_migrations_sql()`, never the hand-rolled `INIT_SQL` consts touched
+here), so the intermittent failure was investigated on its own merits.
+
+**Root cause.** `fail_workflow_for_history_cap` (`worker.rs`) performs two
+SEPARATE, sequential commits within one decision cycle: state -> `FAILED`
+(via `move_workflow_to_dlq_for_history_cap`), then a trailing
+`history_bloat_warned_at` stamp (via `emit_history_bloat_warning_if_crossed`)
+— not one atomic transaction. The function's own extensive review-history
+comments document this ordering as a deliberate, narrow window (an
+at-least-once delivery tradeoff for the soft-threshold counter). The test's
+own comment already acknowledges `history_bloat_warned_at` becomes
+"still-eventually-true" and deliberately polls for `state == "FAILED"`
+instead (so a genuine regression — the mark never being set at all — times
+out clearly rather than looping on a condition that would never become
+true) — but then used that SAME pre-drain `wait_for_state` snapshot for the
+`history_bloat_warned_at` assertion, without accounting for the second
+commit possibly landing after the poll observed `FAILED`. Under CI load the
+gap between the two commits widens enough to make this reproducible.
+
+**Fix.** The test already performs `worker.shutdown(); handle.await`
+immediately after `wait_for_state` returns, and `Worker::run`'s
+graceful-shutdown path (`drain_in_flight`) is guaranteed to let any
+in-flight decision cycle — including this trailing write — fully complete
+before returning. Re-loading the execution row after that drain barrier
+(instead of reusing the pre-drain `wait_for_state` snapshot) removes the
+race entirely, without weakening the assertion or touching the deliberate
+`FAILED`-state polling/timeout strategy. Test-only change, zero production
+code touched.
+
+**Verification.** Confirmed via GitHub Actions `rerun_failed_jobs` against
+the PRE-fix commit that the failure is load-sensitive (not the baseline's
+one-off luck) before diagnosing; the fix itself was compile-checked
+(`cargo check -p autumn-harvest --features db --tests`, clean, 3m15s) and
+gated with `cargo fmt --check`/`rustfmt --check` (clean) and
+`cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`
+(clean) at the pinned CI toolchain. Docker/testcontainers is unavailable in
+the implementing sandbox, so this specific test (which uses
+`setup_test_database_url()`, a Docker-only helper with no
+`HARVEST_TEST_DATABASE_URL` escape hatch) could not be executed locally;
+the fix was validated by full production-code reading of
+`fail_workflow_for_history_cap`/`emit_history_bloat_warning_if_crossed` plus
+`Worker::run`'s shutdown/drain semantics, and will be confirmed by the real
+CI run this commit triggers.
