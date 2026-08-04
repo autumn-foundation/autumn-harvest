@@ -1633,6 +1633,7 @@ mod tests {
             start_source_ref: None,
             started_by: None,
             history_bloat_warned_at: None,
+            triage_note: None,
         }
     }
 

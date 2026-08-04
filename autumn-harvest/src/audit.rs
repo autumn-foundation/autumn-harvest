@@ -50,6 +50,9 @@ pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
 pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
 /// Audit operation: Resumed a paused workflow execution (issue #383).
 pub const OP_WORKFLOW_RESUME: &str = "workflow.resume";
+/// Audit operation: Set, updated, or cleared an execution's operator-mutable
+/// triage tags -- owner, severity, note (issue #759).
+pub const OP_WORKFLOW_ANNOTATE: &str = "workflow.annotate";
 /// Audit operation: Manually triggered a DAG execution.
 pub const OP_DAG_TRIGGER: &str = "dag.trigger";
 /// Audit operation: Retried a DAG run from a failed node (issue #366).
@@ -431,6 +434,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workflows/{id}/terminate", RouteClass::Mutating),
     ("POST /workflows/{id}/pause", RouteClass::Mutating),
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
+    ("PATCH /workflows/{id}/triage", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
     (
         "POST /workflows/{id}/signal/{signal_name}",
@@ -675,6 +679,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_TERMINATE,
     OP_WORKFLOW_PAUSE,
     OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_ANNOTATE,
     OP_WORKFLOW_RESET,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
@@ -907,6 +912,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ),
     ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
+    ("PATCH /workflows/{id}/triage", Some(OP_WORKFLOW_ANNOTATE)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
     (
         "POST /workflows/{id}/signal/{signal_name}",
@@ -1448,6 +1454,30 @@ mod tests {
         );
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_SET));
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_RELEASE));
+    }
+
+    #[test]
+    fn triage_route_is_classified_and_audited() {
+        // Operator-mutable triage tags (issue #759): the route is an
+        // admin-only mutation and must be classified + audited. This
+        // dedicated test -- not just the general exhaustiveness guards,
+        // which only cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES
+        // against each other -- is what catches a route dropped from BOTH
+        // lists.
+        let route = "PATCH /workflows/{id}/triage";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+            "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #759)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_ANNOTATE)),
+            "{route} must map to OP_WORKFLOW_ANNOTATE in ALL_MUTATION_ROUTES (issue #759)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_WORKFLOW_ANNOTATE));
     }
 
     #[test]

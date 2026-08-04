@@ -359,6 +359,21 @@ fn workflow_resume_is_covered() {
 }
 
 #[test]
+fn workflow_annotate_is_covered() {
+    assert_covered(&[
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--owner",
+        "team-payments",
+        "--severity",
+        "P1",
+        "--note",
+        "claimed",
+    ]);
+}
+
+#[test]
 fn workflow_fail_activity_is_covered() {
     assert_covered(&[
         "workflow",
@@ -743,6 +758,33 @@ fn workflow_pause_body_fields_are_documented() {
         "00000000-0000-0000-0000-000000000001",
         "--reason",
         "test",
+    ]);
+}
+
+#[test]
+fn workflow_annotate_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--owner",
+        "team-payments",
+        "--severity",
+        "P1",
+        "--note",
+        "claimed",
+    ]);
+}
+
+#[test]
+fn workflow_annotate_clear_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "workflow",
+        "annotate",
+        "00000000-0000-0000-0000-000000000001",
+        "--clear-owner",
+        "--clear-severity",
+        "--clear-note",
     ]);
 }
 

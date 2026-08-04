@@ -205,6 +205,10 @@ pub struct WorkflowExecution {
     /// yet warned. Never read on replay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_bloat_warned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Operator-mutable free-text triage note (issue #759). `None` = no note.
+    /// Metadata only -- never read on replay, never set at insert time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triage_note: Option<String>,
 }
 
 /// Serialize a nullable `start_source` column, reporting a `None` (pre-upgrade /

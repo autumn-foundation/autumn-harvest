@@ -350,6 +350,40 @@ fn fail_now_route_is_classified_and_audited() {
     );
 }
 
+/// The operator-mutable triage tags route (issue #759) must be registered in
+/// the live route registry, classified Mutating, and mapped to its audit
+/// operation.
+///
+/// Mirrors `workflow_count_route_is_classified`: `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router, so this pin closes that gap for the new route.
+#[test]
+fn triage_route_is_classified_and_audited() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, OP_WORKFLOW_ANNOTATE, RouteClass,
+    };
+
+    let route = "PATCH /workflows/{id}/triage";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && *class == RouteClass::Mutating),
+        "{route} must be classified Mutating in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_ANNOTATE)),
+        "{route} must be mapped to OP_WORKFLOW_ANNOTATE in ALL_MUTATION_ROUTES"
+    );
+}
+
 /// `POST /workflows/{id}/replay-diagnosis` (issue #614) must be registered in
 /// the management route list AND classified `ReadOnly` in
 /// `autumn_harvest::audit::CLASSIFIED_ROUTES` (it is a POST for the replay action

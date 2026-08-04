@@ -78,6 +78,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          transactional_start_tests
+linux        autumn-harvest         integration                      -                          triage_tests
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
@@ -119,6 +120,7 @@ linux        autumn-harvest-plugin  start_throttle_integration       -          
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
+linux        autumn-harvest-plugin  triage_integration               -                          -
 linux        autumn-harvest-plugin  ui_integration                   -                          -
 linux        autumn-harvest-plugin  webhook_receiver_integration     webhooks                   -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -

@@ -146,6 +146,8 @@ mod transactional_activity_tests;
 #[cfg(feature = "db")]
 mod transactional_start_tests;
 #[cfg(feature = "db")]
+mod triage_tests;
+#[cfg(feature = "db")]
 mod typed_stubs_tests;
 mod typed_workflow_failure_tests;
 mod updt_with_start_tests;
