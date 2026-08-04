@@ -143,6 +143,11 @@ diesel::table! {
         /// `UPDATE ... WHERE history_bloat_warned_at IS NULL`. Never read on
         /// replay; never set at insert time (always starts NULL).
         history_bloat_warned_at -> Nullable<Timestamptz>,
+        /// Operator-mutable free-text triage note (issue #759). Set/updated/
+        /// cleared at any point in an execution's life via
+        /// `PATCH /workflows/{id}/triage`. NULL = no note. Metadata only --
+        /// never read on replay, never appends a `WorkflowEvent`.
+        triage_note -> Nullable<Text>,
     }
 }
 

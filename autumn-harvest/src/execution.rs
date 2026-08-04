@@ -2854,6 +2854,179 @@ pub async fn resume_workflow_execution(
     Ok(result)
 }
 
+// ── Operator-mutable triage tags (issue #759) ─────────────────────────────────
+
+/// A partial, tri-state update to an execution's operator-mutable triage
+/// metadata (issue #759): `owner`, `severity`, and a free-text `note`.
+///
+/// Each field independently distinguishes three states, mirroring the
+/// `WorkflowSchedulePatch` (issue #771) PATCH contract: `None` ("absent from
+/// the request") means "leave this field unchanged"; `Some(None)` ("explicit
+/// JSON `null`") means "clear to NULL"; `Some(Some(v))` means "set to `v`".
+#[allow(clippy::option_option)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TriagePatch {
+    pub owner: Option<Option<String>>,
+    pub severity: Option<Option<String>>,
+    pub note: Option<Option<String>>,
+}
+
+/// A single triage-field mutation captured for the audit trail (issue #759, AC5).
+///
+/// Deliberately **not** part of [`TriageOutcome`]'s public shape — the caller
+/// (the management API handler) consumes this to build a compact old->new
+/// audit summary before it goes out of scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageFieldChange {
+    pub field: &'static str,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+/// Result of an [`annotate_workflow_execution`] call: the execution's current
+/// triage view (issue #759, AC4/AC7) plus the set of fields this call
+/// actually changed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TriageOutcome {
+    pub execution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triage_note: Option<String>,
+    /// Fields this call actually changed (old -> new). Never serialized into
+    /// the public HTTP response (issue #759 AC5) -- `Vec<TriageFieldChange>`
+    /// implements `Default`, which is all `#[serde(skip)]` requires to still
+    /// round-trip `Deserialize`.
+    #[serde(skip)]
+    pub changed_fields: Vec<TriageFieldChange>,
+}
+
+/// Resolve a single tri-state triage field against its current stored value
+/// (issue #759). Pure -- no I/O, fully unit-testable without a database.
+///
+/// Returns the resolved (post-patch) value and, when the field was present in
+/// the request (`incoming.is_some()`) *and* its new value differs from the
+/// current one, a [`TriageFieldChange`] describing the transition. A field
+/// absent from the request (`incoming.is_none()`) always resolves to the
+/// unchanged current value with no reported change.
+#[allow(clippy::option_option)]
+fn resolve_triage_field(
+    field: &'static str,
+    incoming: Option<Option<String>>,
+    current: Option<String>,
+) -> (Option<String>, Option<TriageFieldChange>) {
+    match incoming {
+        None => (current, None),
+        Some(new_val) => {
+            let change = (new_val != current).then(|| TriageFieldChange {
+                field,
+                old: current.clone(),
+                new: new_val.clone(),
+            });
+            (new_val, change)
+        }
+    }
+}
+
+type TriageColumns = (Option<String>, Option<String>, Option<String>);
+
+async fn load_triage_for_update(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<TriageColumns> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select((
+            harvest_workflow_executions::owner,
+            harvest_workflow_executions::severity,
+            harvest_workflow_executions::triage_note,
+        ))
+        .for_update()
+        .first::<TriageColumns>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+}
+
+/// Set, update, or clear an execution's operator-mutable triage tags --
+/// `owner`, `severity`, and a free-text `note` -- at any point in its life
+/// (issue #759).
+///
+/// A plain metadata update on `harvest_workflow_executions`: appends **no**
+/// [`WorkflowEvent`], is never read by the workflow function, and has zero
+/// replay-determinism impact (AC2) -- these columns are operator metadata,
+/// not event-sourced workflow state, distinct from author-controlled
+/// `search_attrs`. Works on any non-purged execution regardless of lifecycle
+/// state -- annotation is orthogonal to state (AC6): a `RUNNING`, `PAUSED`,
+/// `FAILED`, or `COMPLETED` execution is all annotated identically.
+///
+/// Idempotent by construction (AC4): applying the same patch twice yields the
+/// same final row, since every field is set unconditionally from the
+/// (already-locked) resolved value rather than incrementally modified. An
+/// empty patch (every field absent) performs no write and reports no changed
+/// fields -- the row is only locked and re-read.
+///
+/// Shard-local: the caller routes `conn` to the execution's own shard via
+/// [`ExecutionId::shard`].
+///
+/// # Errors
+///
+/// - [`HarvestError::NotFound`] when the execution does not exist (-> 404).
+/// - [`HarvestError::Database`] for persistence failures.
+pub async fn annotate_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    patch: TriagePatch,
+) -> HarvestResult<TriageOutcome> {
+    // The read + update run in one transaction so the `FOR UPDATE` lock in
+    // `load_triage_for_update` actually serializes the read-modify-write
+    // against a concurrent annotate call, rather than releasing at statement
+    // end in autocommit mode (mirrors `set_legal_hold`, issue #747).
+    Box::pin(
+        conn.transaction::<TriageOutcome, HarvestError, _>(async |conn| {
+            let (cur_owner, cur_severity, cur_note) = load_triage_for_update(conn, exec_id).await?;
+
+            let any_field_present =
+                patch.owner.is_some() || patch.severity.is_some() || patch.note.is_some();
+
+            let (new_owner, owner_change) = resolve_triage_field("owner", patch.owner, cur_owner);
+            let (new_severity, severity_change) =
+                resolve_triage_field("severity", patch.severity, cur_severity);
+            let (new_note, note_change) = resolve_triage_field("note", patch.note, cur_note);
+
+            let changed_fields: Vec<TriageFieldChange> =
+                [owner_change, severity_change, note_change]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+
+            if any_field_present {
+                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                    .set((
+                        harvest_workflow_executions::owner.eq(new_owner.clone()),
+                        harvest_workflow_executions::severity.eq(new_severity.clone()),
+                        harvest_workflow_executions::triage_note.eq(new_note.clone()),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+            }
+
+            Ok(TriageOutcome {
+                execution_id: exec_id.to_string(),
+                owner: new_owner,
+                severity: new_severity,
+                triage_note: new_note,
+                changed_fields,
+            })
+        }),
+    )
+    .await
+}
+
 /// Reactivate a `FAILED` workflow execution so a redriven dead-letter task can
 /// resume from existing history (issue #510).
 ///
@@ -6305,5 +6478,98 @@ mod pause_helper_tests {
             pause_timeout_exceeded(now, now, Duration::ZERO),
             "a zero ceiling must not strand a paused execution"
         );
+    }
+}
+
+#[cfg(test)]
+mod triage_tests {
+    use super::{TriageFieldChange, TriagePatch, resolve_triage_field};
+
+    #[test]
+    fn absent_field_leaves_current_unchanged_and_reports_no_change() {
+        let (resolved, change) = resolve_triage_field("owner", None, Some("alice".to_string()));
+        assert_eq!(resolved, Some("alice".to_string()));
+        assert!(
+            change.is_none(),
+            "an omitted field must not be reported as changed"
+        );
+    }
+
+    #[test]
+    fn setting_a_new_value_resolves_and_reports_the_change() {
+        let (resolved, change) = resolve_triage_field(
+            "owner",
+            Some(Some("bob".to_string())),
+            Some("alice".to_string()),
+        );
+        assert_eq!(resolved, Some("bob".to_string()));
+        assert_eq!(
+            change,
+            Some(TriageFieldChange {
+                field: "owner",
+                old: Some("alice".to_string()),
+                new: Some("bob".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_null_clears_and_reports_the_change() {
+        let (resolved, change) =
+            resolve_triage_field("note", Some(None), Some("investigating".to_string()));
+        assert_eq!(resolved, None);
+        assert_eq!(
+            change,
+            Some(TriageFieldChange {
+                field: "note",
+                old: Some("investigating".to_string()),
+                new: None,
+            })
+        );
+    }
+
+    #[test]
+    fn setting_the_same_value_is_idempotent_with_no_reported_change() {
+        let (resolved, change) = resolve_triage_field(
+            "severity",
+            Some(Some("P1".to_string())),
+            Some("P1".to_string()),
+        );
+        assert_eq!(resolved, Some("P1".to_string()));
+        assert!(
+            change.is_none(),
+            "re-setting the identical value must not be reported as a change \
+             -- proves idempotency at the pure-logic level (issue #759 AC4)"
+        );
+    }
+
+    #[test]
+    fn clearing_an_already_null_field_is_idempotent_with_no_reported_change() {
+        let (resolved, change) = resolve_triage_field("severity", Some(None), None);
+        assert_eq!(resolved, None);
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn setting_a_value_when_current_is_none_reports_old_as_none() {
+        let (resolved, change) =
+            resolve_triage_field("owner", Some(Some("alice".to_string())), None);
+        assert_eq!(resolved, Some("alice".to_string()));
+        assert_eq!(
+            change,
+            Some(TriageFieldChange {
+                field: "owner",
+                old: None,
+                new: Some("alice".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn default_patch_touches_no_fields() {
+        let patch = TriagePatch::default();
+        assert_eq!(patch.owner, None);
+        assert_eq!(patch.severity, None);
+        assert_eq!(patch.note, None);
     }
 }

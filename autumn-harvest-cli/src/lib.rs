@@ -1188,6 +1188,38 @@ enum WorkflowCommand {
         /// Workflow execution ID.
         execution_id: String,
     },
+    /// Set, update, or clear an execution's operator-mutable triage tags:
+    /// owner, severity, and a free-text note (issue #759).
+    ///
+    /// A plain metadata update on the execution row -- appends no workflow
+    /// event, is never read by the workflow function, and has zero
+    /// replay-determinism impact; distinct from author-controlled
+    /// `search_attrs`. `owner`/`severity` set this way are immediately
+    /// reflected in `harvest workflow list --owner ... --severity ...`.
+    /// Works on any lifecycle state (RUNNING, PAUSED, FAILED, COMPLETED,
+    /// ...). Idempotent: re-running with the same flags is a no-op.
+    Annotate {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// New owner (e.g. a team or on-call handle).
+        #[arg(long, conflicts_with = "clear_owner")]
+        owner: Option<String>,
+        /// Clear the owner (sends an explicit JSON null).
+        #[arg(long)]
+        clear_owner: bool,
+        /// New severity/priority label (freeform, e.g. "P1").
+        #[arg(long, conflicts_with = "clear_severity")]
+        severity: Option<String>,
+        /// Clear the severity (sends an explicit JSON null).
+        #[arg(long)]
+        clear_severity: bool,
+        /// New free-text triage note.
+        #[arg(long, conflicts_with = "clear_note")]
+        note: Option<String>,
+        /// Clear the note (sends an explicit JSON null).
+        #[arg(long)]
+        clear_note: bool,
+    },
     /// Erase PII payload fields from a completed workflow execution (GDPR Art. 17).
     ///
     /// Replaces all payload-bearing fields (`input`, `output`, `payload`, `details`,
@@ -5364,6 +5396,39 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             format!("/workflows/{}/resume", path_segment(execution_id)),
             None,
         )),
+        WorkflowCommand::Annotate {
+            execution_id,
+            owner,
+            clear_owner,
+            severity,
+            clear_severity,
+            note,
+            clear_note,
+        } => {
+            let mut body = Map::new();
+            // Tri-state nullable fields: --clear-* sends an explicit JSON
+            // null; clap's `conflicts_with` prevents setting and clearing
+            // the same field in one call.
+            if let Some(v) = owner {
+                body.insert("owner".to_string(), Value::String(v.clone()));
+            } else if *clear_owner {
+                body.insert("owner".to_string(), Value::Null);
+            }
+            if let Some(v) = severity {
+                body.insert("severity".to_string(), Value::String(v.clone()));
+            } else if *clear_severity {
+                body.insert("severity".to_string(), Value::Null);
+            }
+            if let Some(v) = note {
+                body.insert("note".to_string(), Value::String(v.clone()));
+            } else if *clear_note {
+                body.insert("note".to_string(), Value::Null);
+            }
+            Ok(ApiRequest::patch(
+                format!("/workflows/{}/triage", path_segment(execution_id)),
+                Value::Object(body),
+            ))
+        }
         WorkflowCommand::ErasePayloads {
             execution_id,
             reason,
