@@ -440,6 +440,43 @@ async fn wait_for_nd_block(database_url: &str, exec_id: ExecutionId) -> Workflow
     .expect("execution did not non-terminally block on non-determinism within timeout")
 }
 
+/// Wait until `history_bloat_warned_at` is stamped (issue #704's soft-
+/// threshold early-warning guard column).
+///
+/// Issue #1074 CI-flake fix, hardened per Codex review: calling
+/// `Worker::shutdown()` and then awaiting the worker handle alone is not an
+/// unconditional completion barrier for the trailing `mark_history_bloat_warned`
+/// write that follows a hard-cap terminal fail, since `Worker::drain_in_flight`
+/// races the in-flight decision cycle against a BOUNDED `shutdown_timeout` (2s
+/// in this test's `build_worker`) and returns early with just a
+/// `tracing::warn!` if that elapses first, leaving the cycle's tail (this
+/// stamp write) still running in the background. A single point-in-time
+/// reload after the handle resolves therefore cannot rule out observing the
+/// row before that trailing write lands under sufficient DB/CI delay --
+/// the exact same race, just requiring a longer delay to reproduce. Polling
+/// with its own generous, independent timeout (mirroring
+/// `wait_for_nd_block`/`wait_for_state` above) removes the dependency on the
+/// worker's internal drain deadline entirely: it is robust to any delay up
+/// to the poll's own bound, and a genuine regression (the mark never being
+/// set at all) still times out clearly rather than hanging, preserving the
+/// original test's "clear timeout on a real regression" design intent.
+async fn wait_for_history_bloat_warned(
+    database_url: &str,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let ex = load_execution(database_url, exec_id).await;
+            if ex.history_bloat_warned_at.is_some() {
+                break ex;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("history_bloat_warned_at was never stamped within timeout")
+}
+
 /// Wait until a recorded `TimerStarted { timer_id, .. }` event with the given
 /// id appears in the execution's history -- the durable, unambiguous proof
 /// that a specific live decision cycle actually ran (rather than merely
@@ -2480,23 +2517,25 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
 
-    // Issue #1074 CI-flake fix: `move_workflow_to_dlq_for_history_cap`
-    // (state -> FAILED) and `emit_history_bloat_warning_if_crossed`
-    // (`history_bloat_warned_at` stamp) are two SEPARATE, sequential
-    // commits within the same decision cycle -- not one atomic
-    // transaction (see `fail_workflow_for_history_cap`'s own comments on
-    // this deliberate "narrow crash window"). The `wait_for_state` poll
-    // above can therefore observe state=FAILED in the gap BEFORE the
-    // second commit lands, capturing a stale pre-stamp snapshot; under
-    // CI load that gap widens enough to make the race reproducible. The
-    // `worker.shutdown()` + `handle.await` drain barrier above is
-    // guaranteed to let the in-flight decision cycle -- including this
-    // second, trailing write -- fully complete before returning, so
-    // re-loading the row here (rather than reusing the pre-drain
-    // snapshot) removes the race without weakening the "must actually be
-    // set" assertion below or touching the deliberate FAILED-state
-    // polling/timeout strategy that catches a genuine regression.
-    let execution = load_execution(&database_url, exec_id).await;
+    // Issue #1074 CI-flake fix (hardened per Codex review):
+    // `move_workflow_to_dlq_for_history_cap` (state -> FAILED) and
+    // `emit_history_bloat_warning_if_crossed` (`history_bloat_warned_at`
+    // stamp) are two SEPARATE, sequential commits within the same decision
+    // cycle -- not one atomic transaction (see `fail_workflow_for_history_cap`'s
+    // own comments on this deliberate "narrow crash window"). The
+    // `wait_for_state` poll above can therefore observe state=FAILED in the
+    // gap BEFORE the second commit lands. A single reload right after
+    // `worker.shutdown(); handle.await` is NOT a reliable fix for this: the
+    // worker's own drain (`drain_in_flight`) races the in-flight cycle
+    // against a BOUNDED `shutdown_timeout` (2s in `build_worker`) and
+    // returns early -- with only a log warning -- if that elapses first,
+    // so `handle.await` unblocking does not guarantee the trailing write
+    // has landed under sufficient delay. `wait_for_history_bloat_warned`
+    // polls with its OWN generous, independent timeout instead, which is
+    // robust to arbitrary delay in the trailing write (not bounded by the
+    // worker's internal 2s drain deadline) while still timing out clearly
+    // on a genuine regression (the mark never being set at all).
+    let execution = wait_for_history_bloat_warned(&database_url, exec_id).await;
 
     let error = execution
         .error

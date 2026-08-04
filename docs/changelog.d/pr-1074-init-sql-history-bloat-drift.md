@@ -126,27 +126,49 @@ true) — but then used that SAME pre-drain `wait_for_state` snapshot for the
 commit possibly landing after the poll observed `FAILED`. Under CI load the
 gap between the two commits widens enough to make this reproducible.
 
-**Fix.** The test already performs `worker.shutdown(); handle.await`
-immediately after `wait_for_state` returns, and `Worker::run`'s
-graceful-shutdown path (`drain_in_flight`) is guaranteed to let any
-in-flight decision cycle — including this trailing write — fully complete
-before returning. Re-loading the execution row after that drain barrier
-(instead of reusing the pre-drain `wait_for_state` snapshot) removes the
-race entirely, without weakening the assertion or touching the deliberate
-`FAILED`-state polling/timeout strategy. Test-only change, zero production
-code touched.
+**Fix (first pass, since superseded).** The test already performs
+`worker.shutdown(); handle.await` immediately after `wait_for_state`
+returns. The first pass re-loaded the execution row right after that point
+instead of reusing the pre-drain `wait_for_state` snapshot, reasoning that
+`Worker::run`'s graceful-shutdown path (`drain_in_flight`) guarantees any
+in-flight decision cycle — including this trailing write — fully completes
+before `handle.await` resolves.
+
+**Hardening (automated Codex review on the PR).** That guarantee is not
+unconditional: `Worker::drain_in_flight` races the in-flight decision cycle
+against a **bounded** `shutdown_timeout` (hardcoded to `Duration::from_secs(2)`
+in this test file's `build_worker`) and returns *early* — logging only a
+`tracing::warn!` — if that timeout elapses first, meaning in-flight
+background work (including this test's trailing `history_bloat_warned_at`
+stamp) can still be running after `handle.await` unblocks. Under
+sufficient delay the identical race could therefore still manifest with the
+first-pass fix, just requiring a longer gap to trigger — exactly the "CI
+load" scenario under investigation. Verified independently by reading
+`drain_in_flight`'s source before acting on the review.
+
+**Fix (hardened).** Replaced the single point-in-time reload with a new
+`wait_for_history_bloat_warned` helper that polls the execution row with
+its **own** independent 15-second `tokio::time::timeout` (mirroring the
+existing `wait_for_nd_block`/`wait_for_state` pattern in this same file),
+entirely decoupled from the worker's internal 2-second drain deadline. This
+is robust to arbitrary delay in the trailing write up to the poll's own
+bound, while a genuine regression (the mark never being set at all) still
+fails clearly via the `.expect(...)` panic message rather than hanging.
+Test-only change, zero production code touched in either pass.
 
 **Verification.** Confirmed via GitHub Actions `rerun_failed_jobs` against
-the PRE-fix commit that the failure is load-sensitive (not the baseline's
-one-off luck) before diagnosing; the fix itself was compile-checked
-(`cargo check -p autumn-harvest --features db --tests`, clean, 3m15s) and
-gated with `cargo fmt --check`/`rustfmt --check` (clean) and
+the pre-fix commit that the failure is load-sensitive (not the baseline's
+one-off luck) before diagnosing; both passes were compile-checked
+(`cargo check -p autumn-harvest --features db --tests`, clean) and gated
+with `cargo fmt --check`/`rustfmt --check` (clean) and
 `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`
-(clean) at the pinned CI toolchain. Docker/testcontainers is unavailable in
-the implementing sandbox, so this specific test (which uses
-`setup_test_database_url()`, a Docker-only helper with no
+(clean, after fixing an unrelated `doc_lazy_continuation` lint the new doc
+comment's rustfmt-wrapped `+` line-break tripped — CommonMark parses a
+leading `+ ` as a list marker) at the pinned CI toolchain. Docker/
+testcontainers is unavailable in the implementing sandbox, so this specific
+test (which uses `setup_test_database_url()`, a Docker-only helper with no
 `HARVEST_TEST_DATABASE_URL` escape hatch) could not be executed locally;
 the fix was validated by full production-code reading of
-`fail_workflow_for_history_cap`/`emit_history_bloat_warning_if_crossed` plus
-`Worker::run`'s shutdown/drain semantics, and will be confirmed by the real
-CI run this commit triggers.
+`fail_workflow_for_history_cap`/`emit_history_bloat_warning_if_crossed`
+plus `Worker::run`'s shutdown/drain semantics, and confirmed by the real CI
+run this commit triggers.
