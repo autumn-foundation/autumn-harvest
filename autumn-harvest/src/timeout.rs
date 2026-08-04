@@ -2827,8 +2827,29 @@ pub async fn enforce_external_cancels_outbox(
                 // and any cascade-closed children of a cross-shard
                 // cancellation, which live only on the target shard) gets a
                 // fresh connection to that shard's own pool.
+                //
+                // "Same shard" here means "resolves to the same *pool*", not
+                // a raw `ShardId` equality check (issue #751 review, round
+                // 5): a legacy/pre-sharding caller execution carries
+                // `ShardId::UNENCODED`, which `exact_pool_for_execution`
+                // correctly resolves to the default shard's pool via its own
+                // fallback -- but a raw `exec_id.shard() == caller_shard`
+                // comparison would treat that as cross-shard even against an
+                // *encoded* default-shard execution physically served by the
+                // identical pool, taking the `pool.get()` branch below and
+                // self-deadlocking under the same pool-size-1 configuration
+                // this whole routing exists to protect. `pool_for(shard)`
+                // (with its own default-shard fallback) applied to
+                // `caller_shard` is a faithful, `ShardId`-only stand-in for
+                // `exact_pool_for_execution(caller_exec_id)` -- both consult
+                // only `.shard()` internally, so the two are provably
+                // equivalent without needing `caller_exec_id` itself here.
                 for (exec_id, workflow_name) in deferred_checks {
-                    if exec_id.shard() == caller_shard {
+                    let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
+                        pool.exact_pool_for_execution(exec_id)
+                            .is_some_and(|e_pool| std::ptr::eq(e_pool, pool.pool_for(caller_shard)))
+                    });
+                    if same_pool_as_caller {
                         if let Err(e) = check_and_report_unfinished_handlers(
                             conn,
                             exec_id,

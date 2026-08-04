@@ -2665,6 +2665,141 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
     );
 }
 
+// 7d. Issue #751 code review (round 5, P2): the deferred unfinished-handler
+//     check's same-pool decision must compare *resolved connection pools*,
+//     not raw `ShardId`s. A legacy/pre-sharding caller execution carries the
+//     `ShardId::UNENCODED` sentinel, which `exact_pool_for_execution`
+//     correctly resolves to the default shard's pool via its own fallback --
+//     but a raw `exec_id.shard() == caller_shard` comparison sees an
+//     unencoded caller and an *encoded* default-shard target as different
+//     shards even though both are physically served by the identical pool.
+//     That misclassification takes the "cross-shard" branch and tries to
+//     acquire a SECOND connection from that same pool while the first
+//     (`conn`) is still checked out -- a self-deadlock under the documented
+//     pool-size-1 configuration this whole routing exists to protect
+//     (issue #688's precedent).
+//
+//     This test uses a genuinely size-1 connection pool and bounds the call
+//     with a timeout, so the pre-fix deadlock is reproduced deterministically
+//     as a timeout rather than an actual indefinite hang.
+#[tokio::test]
+async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller_id() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (database_url, _container) = setup_test_database_url().await;
+
+    // A genuinely size-1 pool: any second `.get()` while the first
+    // connection is still checked out would block forever without the fix.
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+    let pool: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("failed to build size-1 test pool");
+
+    let sharded_pool = autumn_harvest::shard::ShardedDbPool::single(pool.clone());
+
+    // The caller carries the legacy `ShardId::UNENCODED` sentinel --
+    // `exact_pool_for_execution` resolves this to the default shard's pool.
+    let caller_exec_id = ExecutionId::new();
+    assert!(
+        caller_exec_id.shard().is_unencoded(),
+        "test setup must produce a genuinely unencoded caller id"
+    );
+    // The target is explicitly encoded for shard 0 -- the same physical pool
+    // the caller's sentinel falls back to under `ShardedDbPool::single`.
+    let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+    let mut conn = pool.get().await.unwrap();
+    insert_running_row(
+        &mut conn,
+        "round5_target",
+        "round5-target-1",
+        target_exec_id,
+    )
+    .await;
+    let update_id = autumn_harvest::types::UpdateId::new();
+    store::append_events(
+        &mut conn,
+        target_exec_id,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "approve".to_string(),
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed target history");
+
+    insert_running_row(
+        &mut conn,
+        "round5_caller",
+        "round5-caller-1",
+        caller_exec_id,
+    )
+    .await;
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    store::append_events(
+        &mut conn,
+        caller_exec_id,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: autumn_harvest::types::ExternalTarget::ExecutionId(target_exec_id),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    // `conn` is the size-1 pool's only connection and stays checked out for
+    // the entire outbox sweep call below -- exactly the condition that
+    // exposes a self-deadlock if the routing decision wrongly reaches for a
+    // second connection from the same pool.
+    let recorder = Arc::new(UnfinishedHandlerRecorder::default());
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        autumn_harvest::timeout::enforce_external_cancels_outbox(
+            &mut conn,
+            recorder.as_ref(),
+            Duration::from_secs(60),
+            &Some(sharded_pool),
+            &[caller_exec_id.shard()],
+        ),
+    )
+    .await;
+
+    let processed = result
+        .expect("must not deadlock: enforce_external_cancels_outbox timed out")
+        .expect("cancel outbox sweep should succeed");
+    assert_eq!(
+        processed, 1,
+        "exactly one cancel-by-id delivery should be processed"
+    );
+
+    let target_after = harvest_workflow_executions::table
+        .find(target_exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load target after cancel");
+    assert_eq!(target_after.state, "CANCELLED");
+
+    let calls = recorder.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![("round5_target".to_string(), 1)],
+        "the unfinished-handler check must still run (via the reused, \
+         same-pool connection) even though the caller's id is unencoded; \
+         got: {calls:?}"
+    );
+}
+
 // 8. AC6 end-to-end: signalling own `(workflow_name, workflow_id)` is
 //    rejected immediately, with no DB round trip needed for the rejection
 //    itself — the workflow completes cleanly, surfacing the typed
