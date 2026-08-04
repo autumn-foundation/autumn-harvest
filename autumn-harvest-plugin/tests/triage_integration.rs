@@ -645,12 +645,15 @@ async fn audit_row_records_actor_and_old_to_new_values() {
         "actor is captured on the audit row (no X-Harvest-Actor header sent in this test)"
     );
     let summary = summary.expect("a changed patch must record a diff summary");
+    // Values are quoted in the audit summary (issue #759 review) — see
+    // `audit_summary_quotes_values_so_lookalike_syntax_cannot_be_misread`
+    // below for the escaping contract itself.
     assert!(
-        summary.contains("owner: dave -> erin"),
+        summary.contains(r#"owner: "dave" -> "erin""#),
         "diff summary must record the OWNER old->new transition, got {summary:?}"
     );
     assert!(
-        summary.contains("severity: (none) -> sev2"),
+        summary.contains(r#"severity: (none) -> "sev2""#),
         "diff summary must record the SEVERITY old(absent)->new transition, got {summary:?}"
     );
 }
@@ -726,5 +729,180 @@ async fn owner_and_severity_set_via_patch_are_reflected_in_list_filter() {
     assert!(
         !old_owner_ids.contains(&claimed.as_str()),
         "the old owner must no longer match after re-routing: {old_owner_ids:?}"
+    );
+}
+
+// A whitespace-padded owner/severity value is trimmed before it is persisted
+// (issue #759 review): `GET /workflows?owner=...` trims its query value, so
+// an untrimmed stored label would be permanently unaddressable through the
+// advertised filter. Both describe and the list filter must see the
+// TRIMMED value.
+#[tokio::test]
+async fn whitespace_padded_owner_and_severity_are_trimmed_and_filterable() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    scrub(&mut conn).await;
+
+    let exec_id = seed_execution(
+        &mut conn,
+        "triage_wf",
+        "http-whitespace-1",
+        "RUNNING",
+        None,
+        None,
+    )
+    .await;
+
+    let (status, body) = patch_json_admin(
+        &app,
+        &format!("/workflows/{exec_id}/triage"),
+        json!({ "owner": "  team-a  ", "severity": "\tsev2\n" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["owner"],
+        json!("team-a"),
+        "the PATCH response must echo the TRIMMED owner, got {body}"
+    );
+    assert_eq!(
+        body["severity"],
+        json!("sev2"),
+        "the PATCH response must echo the TRIMMED severity, got {body}"
+    );
+
+    let (_, describe) = get_json(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(describe["execution"]["owner"], json!("team-a"));
+    assert_eq!(describe["execution"]["severity"], json!("sev2"));
+
+    // Filtering with the CANONICAL (untrimmed-in-the-query, but the filter
+    // itself trims) spelling now finds it -- proving the stored value is
+    // addressable through the documented filter.
+    let (status, body) = get_json(&app, "/workflows?owner=team-a&severity=sev2").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .expect("bare array on the happy path")
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&exec_id.as_str()),
+        "the trimmed-and-stored owner/severity must be findable via the list filter: {ids:?}"
+    );
+}
+
+// An all-whitespace owner/severity SET is folded into an explicit clear
+// (issue #759 review), matching how `parse_workflow_filters` already treats
+// an all-whitespace QUERY value as "no filter" -- a whitespace-only value can
+// never be persisted as a phantom, unfilterable label.
+#[tokio::test]
+async fn all_whitespace_owner_set_is_folded_into_a_clear() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    scrub(&mut conn).await;
+
+    let exec_id = seed_execution(
+        &mut conn,
+        "triage_wf",
+        "http-whitespace-2",
+        "RUNNING",
+        Some("preexisting-owner"),
+        Some("sev1"),
+    )
+    .await;
+
+    let (status, body) = patch_json_admin(
+        &app,
+        &format!("/workflows/{exec_id}/triage"),
+        json!({ "owner": "   ", "severity": "\t\t" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("owner").is_none(),
+        "an all-whitespace SET must clear owner (skip_serializing_if on None), got {body}"
+    );
+    assert!(
+        body.get("severity").is_none(),
+        "an all-whitespace SET must clear severity (skip_serializing_if on None), got {body}"
+    );
+
+    let (_, describe) = get_json(&app, &format!("/workflows/{exec_id}")).await;
+    assert!(
+        describe["execution"]["owner"].is_null(),
+        "owner must read back cleared, got {describe}"
+    );
+    assert!(
+        describe["execution"]["severity"].is_null(),
+        "severity must read back cleared, got {describe}"
+    );
+}
+
+// The audit diff summary quotes every old/new value (issue #759 review), so
+// a free-text `note` containing summary-lookalike syntax can never be
+// mistaken for a second, bogus field-change entry, and a literal value of
+// the string "(none)" is visibly distinct (quoted) from the unset sentinel
+// (unquoted).
+#[tokio::test]
+async fn audit_summary_quotes_values_so_lookalike_syntax_cannot_be_misread() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    scrub(&mut conn).await;
+
+    let exec_id = seed_execution(
+        &mut conn,
+        "triage_wf",
+        "http-escape-1",
+        "RUNNING",
+        None,
+        None,
+    )
+    .await;
+
+    // A note whose CONTENT looks like a second, bogus field-change entry.
+    let (status, _body) = patch_json_admin(
+        &app,
+        &format!("/workflows/{exec_id}/triage"),
+        json!({ "note": "ready; severity: P3 -> P0" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, summary) = latest_audit_row(&mut conn, "workflow.annotate", &exec_id).await;
+    let summary = summary.expect("a changed patch must record a diff summary");
+    // Only `note` changed, so the WHOLE summary must be exactly this one
+    // quoted field-change entry -- not merely `.contains()` it -- proving
+    // the note's embedded "; severity: P3 -> P0" text (a deliberate
+    // collision with the "; " field-change separator `triage_diff_summary`
+    // itself uses to join entries) was never split out into a second,
+    // bogus `severity:` entry appended after the note's value.
+    assert_eq!(
+        summary, r#"note: (none) -> "ready; severity: P3 -> P0""#,
+        "the lookalike note content must be wrapped in one quoted value, not read as a \
+         separate field-change entry: {summary:?}"
+    );
+
+    // A note whose value is LITERALLY the unset-sentinel string "(none)".
+    let (status, _body) = patch_json_admin(
+        &app,
+        &format!("/workflows/{exec_id}/triage"),
+        json!({ "note": "(none)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, summary) = latest_audit_row(&mut conn, "workflow.annotate", &exec_id).await;
+    let summary = summary.expect("a changed patch must record a diff summary");
+    assert!(
+        summary.contains(r#"-> "(none)""#),
+        "a literal '(none)' VALUE must render quoted, distinct from the unquoted unset \
+         sentinel: {summary:?}"
     );
 }

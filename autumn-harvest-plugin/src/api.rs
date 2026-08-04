@@ -18672,6 +18672,12 @@ async fn resume_workflow(
 /// `&'static str` `owner`/`severity` defaults from issue #372) and are
 /// persisted durably and echoed into the audit log, so they get the same cap
 /// every other free-text operator field on this router already applies.
+///
+/// `owner`/`severity` are additionally trimmed and, if empty after
+/// trimming, folded into an explicit clear -- see [`normalize_triage_label`].
+/// `note` is deliberately left untrimmed: unlike the two label fields it has
+/// no filtering requirement (issue #759 scope), so there is no read-side
+/// trim contract it needs to stay symmetric with.
 #[allow(clippy::option_option)]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18684,21 +18690,53 @@ struct TriageWorkflowRequest {
     note: Option<Option<String>>,
 }
 
+/// Trim and length-cap a triage `owner`/`severity` label before it is
+/// persisted (issue #759 review).
+///
+/// `GET /workflows?owner=...&severity=...` (`parse_workflow_filters`) trims
+/// the query value and treats an all-whitespace value as "no filter" — so an
+/// untrimmed or all-whitespace stored label would be permanently
+/// unaddressable via the advertised list filter. Trimming here keeps the
+/// write and read sides symmetric: a whitespace-only `Set` folds into an
+/// explicit `Clear` (`Some(None)`) rather than persisting a phantom,
+/// unfilterable value; an explicit `Clear` (`Some(None)`) or an absent field
+/// (`None`) both pass through the outer `Option` untouched via `and_then`.
+///
+/// `Option<Option<String>>` is the tri-state PATCH shape shared with
+/// `TriageWorkflowRequest` above (which already carries the same
+/// `#[allow(clippy::option_option)]`); this is a standalone helper (not
+/// inlined at its two call sites) because it is independently documented
+/// and exercised by
+/// `whitespace_padded_owner_and_severity_are_trimmed_and_filterable` and
+/// `all_whitespace_owner_set_is_folded_into_a_clear` in
+/// `triage_integration.rs`.
+#[allow(clippy::option_option, clippy::single_option_map)]
+fn normalize_triage_label(value: Option<Option<String>>) -> Option<Option<String>> {
+    value.map(|inner| {
+        inner.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncate_operator_reason(trimmed))
+            }
+        })
+    })
+}
+
 impl From<TriageWorkflowRequest> for TriagePatch {
     fn from(request: TriageWorkflowRequest) -> Self {
         // Bound each set value at the API boundary before it becomes a
         // durable, unbounded-length Postgres TEXT column and an audit-log
         // old->new summary -- the same `truncate_operator_reason` cap every
-        // other free-text operator field on this router applies (pause's
+        // other free-text operator field on this router already applies (pause's
         // `reason`, legal-hold's `reason`, the queue-pause `reason`). A tri-
-        // state "clear" (`Some(None)`) is unaffected by the inner `.map`.
+        // state "clear" (`Some(None)`) is unaffected by the inner `.map`/
+        // `and_then`. `owner`/`severity` are additionally trimmed via
+        // `normalize_triage_label`; `note` keeps the plain length-only cap.
         Self {
-            owner: request
-                .owner
-                .map(|v| v.map(|s| truncate_operator_reason(&s))),
-            severity: request
-                .severity
-                .map(|v| v.map(|s| truncate_operator_reason(&s))),
+            owner: normalize_triage_label(request.owner),
+            severity: normalize_triage_label(request.severity),
             note: request
                 .note
                 .map(|v| v.map(|s| truncate_operator_reason(&s))),
@@ -18735,6 +18773,27 @@ impl From<TriageOutcome> for TriageWorkflowResponse {
     }
 }
 
+/// Render one triage field's old/new value for the audit diff summary
+/// (issue #759 review).
+///
+/// Every real value is double-quoted with `"` and `\` escaped; the unset
+/// sentinel renders as the bare, unquoted `(none)`. Two ambiguities this
+/// closes: (1) a free-text value containing `"; field: a -> b"` (most
+/// plausibly `note`) can no longer be mistaken for a second, bogus
+/// field-change entry once the whole value is wrapped in quotes; (2) a
+/// value that is literally the string `"(none)"` renders as the quoted
+/// `"(none)"`, visibly distinct from the unquoted `(none)` sentinel used
+/// for "unset".
+fn escape_triage_audit_value(value: Option<&str>) -> String {
+    value.map_or_else(
+        || "(none)".to_string(),
+        |s| {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        },
+    )
+}
+
 /// Build a compact `old -> new` diff summary for the triage audit row (issue
 /// #759, AC5). `None` when the call changed nothing (an idempotent repeat),
 /// matching the pause/resume "no `error_summary` on a no-op success" style.
@@ -18749,8 +18808,8 @@ fn triage_diff_summary(changed: &[TriageFieldChange]) -> Option<String> {
                 format!(
                     "{}: {} -> {}",
                     c.field,
-                    c.old.as_deref().unwrap_or("(none)"),
-                    c.new.as_deref().unwrap_or("(none)")
+                    escape_triage_audit_value(c.old.as_deref()),
+                    escape_triage_audit_value(c.new.as_deref())
                 )
             })
             .collect::<Vec<_>>()
