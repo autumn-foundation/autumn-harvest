@@ -75,6 +75,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
     "\n",
+    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
+    // strict XOR kind_check from the migration above must be relaxed to an OR.
+    include_str!("../../migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
     include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
@@ -184,7 +188,15 @@ const INIT_SQL: &str = concat!(
     // claim in this suite (and in every suite that borrows
     // `setup_test_database_url_or_env` from here) fails with
     // `relation "harvest_queue_pauses" does not exist`.
-    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql")
+    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql"),
+    "\n",
+    // issue #704: history_bloat_warned_at column on harvest_workflow_executions.
+    // REQUIRED, not optional — `WorkflowExecution::as_select()`/`as_returning()`
+    // reference this column on every full-row read/insert-returning, so without
+    // it every such call in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column harvest_workflow_executions.history_bloat_warned_at does not exist`.
+    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -283,7 +295,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     // full-row insert touch the chain-scoped lifetime cap columns even for a
     // workflow with no chain cap configured.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
+    // issue #704: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the history-bloat early-warning guard column even
+    // for a fresh (never-warned) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
