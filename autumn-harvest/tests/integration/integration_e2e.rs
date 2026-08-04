@@ -196,7 +196,15 @@ const INIT_SQL: &str = concat!(
     // it every such call in this suite (and in every suite that borrows
     // `setup_test_database_url_or_env` from here) fails with
     // `column harvest_workflow_executions.history_bloat_warned_at does not exist`.
-    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql")
+    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql"),
+    "\n",
+    // issue #759: triage_note column on harvest_workflow_executions. REQUIRED,
+    // not optional — `WorkflowExecution::as_select()`/`as_returning()` reference
+    // this column on every full-row read/insert-returning, so without it every
+    // such call in this suite (and in every suite that borrows
+    // `setup_test_database_url_or_env` from here) fails with
+    // `column harvest_workflow_executions.triage_note does not exist`.
+    include_str!("../../migrations/20260717000000_harvest_workflow_triage_note/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -299,7 +307,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #704: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the history-bloat early-warning guard column even
     // for a fresh (never-warned) execution.
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n",
+    // issue #759: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references the operator-mutable triage note column even for
+    // a fresh (never-annotated) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

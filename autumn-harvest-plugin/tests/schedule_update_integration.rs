@@ -200,6 +200,9 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260710000002_harvest_workflow_continue_chain/up.sql"
     ),
+    // issue #759: triage_note column on harvest_workflow_executions, referenced
+    // by every WorkflowExecution::as_select() read-back in this suite.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS triage_note TEXT NULL;\n",
     // 20260706000001_harvest_start_throttle is deliberately omitted: the tick's
     // dispatch path probes `to_regclass('harvest_start_throttle')` and treats a
     // missing table as "no pending throttled starts" (see
