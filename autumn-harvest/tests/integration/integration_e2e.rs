@@ -184,7 +184,12 @@ const INIT_SQL: &str = concat!(
     // claim in this suite (and in every suite that borrows
     // `setup_test_database_url_or_env` from here) fails with
     // `relation "harvest_queue_pauses" does not exist`.
-    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql")
+    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql"),
+    "\n",
+    // issue #704: history_bloat_warned_at column on harvest_workflow_executions.
+    // `WorkflowExecution::as_select()` (and thus every full-row read-back in
+    // this suite) references it even for a fresh, never-warned execution.
+    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -283,7 +288,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     // full-row insert touch the chain-scoped lifetime cap columns even for a
     // workflow with no chain cap configured.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_execution_timeout INTERVAL NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS chain_deadline_at TIMESTAMPTZ NULL;\n",
+    // issue #704: WorkflowExecution::as_select() (the modern start path's
+    // read-back) references history_bloat_warned_at even for a fresh,
+    // never-warned execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS history_bloat_warned_at TIMESTAMPTZ NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
