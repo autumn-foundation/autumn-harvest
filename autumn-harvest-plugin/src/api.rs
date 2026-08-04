@@ -18839,7 +18839,27 @@ async fn annotate_workflow_handler(
     let route = "PATCH /workflows/{id}/triage";
 
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    // Deliberately the **exact** shard resolver, not the lenient
+    // `db_conn_for_execution` (issue #759 review): this route MUTATES, and
+    // the lenient resolver falls back to the default shard when the id's
+    // owning shard has no configured pool on this node -- the documented
+    // mid-shard-add rollout state. For a write that fallback is strictly
+    // worse than the false-404 a read would produce: it can either report a
+    // false 404 for an execution that genuinely exists on the unreachable
+    // shard, or -- if the default shard happens to hold an unrelated row
+    // sharing the same UUID -- silently mutate the wrong database. Mirrors
+    // `GET /workflows/{id}/tree` (see the `db_conn_for_execution_exact` doc
+    // comment): `Err` -> `503` when the owning shard is known but
+    // unreachable (propagated by `?`); `Ok(None)` when the id encodes a
+    // shard this deployment does not know about at all -- nothing here
+    // could ever host it, and there is no shard to audit the attempt
+    // against, so this returns the honest `404` directly rather than
+    // through the audited-failure path below.
+    let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow execution {exec_id} not found"
+        )));
+    };
     let exec_id_str = exec_id.to_string();
 
     // Body deserialization is unwrapped in-handler (rather than by a bare

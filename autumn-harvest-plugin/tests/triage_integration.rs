@@ -11,11 +11,13 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::harvest_audit_log;
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
@@ -29,7 +31,7 @@ use chrono::Utc;
 use diesel::prelude::*;
 use diesel::sql_types::{Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -67,10 +69,13 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool should build")
 }
 
-fn build_app(pool: &DbPool) -> HarvestApiApp {
+/// Build the test app from an arbitrary storage pool + router. Factored out
+/// of `build_app` so the exact-shard-resolver tests below can wire a
+/// genuinely multi-shard, partially-unavailable topology.
+fn build_app_with_router(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
-    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install_storage_pool(pool);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
         Arc::new(DagCatalog::default()),
@@ -79,9 +84,52 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::default(),
+        router,
     ));
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+fn build_app(pool: &DbPool) -> HarvestApiApp {
+    build_app_with_router(HarvestDbPool::from(pool.clone()), ShardRouter::default())
+}
+
+/// Create a fresh, fully-migrated database and return its URL -- for the
+/// exact-shard-resolver tests, which need a genuinely separate database per
+/// shard (one database pretending to be two shards would not exercise the
+/// "this shard's pool is unconfigured" case). Mirrors
+/// `lineage_tree_integration.rs::create_shard_db`.
+async fn create_shard_db(admin_url: &str, name: &str) -> String {
+    let mut admin = AsyncPgConnection::establish(admin_url)
+        .await
+        .expect("connect to admin database");
+    // Ignore "already exists" -- a re-run against a local server is fine.
+    let _ = diesel::sql_query(format!("CREATE DATABASE \"{name}\""))
+        .execute(&mut admin)
+        .await;
+
+    let url = replace_database(admin_url, name);
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to fresh shard database");
+    let bundle = String::from_utf8(init_sql()).expect("migration bundle is utf-8");
+    conn.batch_execute(&bundle)
+        .await
+        .expect("apply migration bundle");
+    url
+}
+
+fn replace_database(url: &str, name: &str) -> String {
+    let (prefix, _) = url.rsplit_once('/').expect("url has a database segment");
+    format!("{prefix}/{name}")
+}
+
+fn unique(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn router_for(shards: &[i32]) -> ShardRouter {
+    let ids: Vec<ShardId> = shards.iter().map(|s| ShardId::new(*s)).collect();
+    ShardRouter::new(ids.clone(), ids, ShardId::new(shards[0]))
 }
 
 /// An app with NO external auth boundary (built-in admin guard active). Used to
@@ -149,6 +197,15 @@ async fn send(
 
 /// Seed an execution (shard 0) in `state` with one `WorkflowStarted` event, plus
 /// optional seed owner/severity, so an annotate call has a row to act on.
+///
+/// The id is minted via `ExecutionId::new_for_shard(0)` (matching how a real
+/// deployment mints ids -- see `run_chain_integration.rs`'s `seed_run`)
+/// rather than left to Postgres's own default UUID generation: the triage
+/// handler resolves its connection via the **exact** shard resolver (issue
+/// #759 review), which decodes the target shard from the id's own bytes and
+/// has no default-shard fallback -- a randomly-generated id's bytes are
+/// essentially never shard 0, which would make every seeded row invisible to
+/// the handler regardless of the `shard_id` column value set below.
 async fn seed_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -157,30 +214,26 @@ async fn seed_execution(
     owner: Option<&str>,
     severity: Option<&str>,
 ) -> String {
-    #[derive(diesel::QueryableByName)]
-    struct IdRow {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: uuid::Uuid,
-    }
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let id = exec_id.as_uuid();
     let now = Utc::now();
-    let id: uuid::Uuid = diesel::sql_query(
+    diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
-            (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
+            (id, workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
              owner, severity)
-         VALUES ($1, $2, 0, $3, '{}'::jsonb, $4, CASE WHEN $3 = 'COMPLETED' THEN $4 ELSE NULL END,
-                 $5, $6)
-         RETURNING id",
+         VALUES ($1, $2, $3, 0, $4, '{}'::jsonb, $5, CASE WHEN $4 = 'COMPLETED' THEN $5 ELSE NULL END,
+                 $6, $7)",
     )
+    .bind::<diesel::sql_types::Uuid, _>(id)
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
     .bind::<Text, _>(state)
     .bind::<Timestamptz, _>(now)
     .bind::<Nullable<Text>, _>(owner)
     .bind::<Nullable<Text>, _>(severity)
-    .get_result::<IdRow>(conn)
+    .execute(conn)
     .await
-    .expect("insert execution")
-    .id;
+    .expect("insert execution");
 
     diesel::sql_query(
         "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data)
@@ -191,7 +244,7 @@ async fn seed_execution(
     .await
     .expect("insert event");
 
-    autumn_harvest::types::ExecutionId::from_uuid(id).to_string()
+    exec_id.to_string()
 }
 
 async fn audit_count(conn: &mut AsyncPgConnection, operation: &str, target: &str) -> i64 {
@@ -904,5 +957,87 @@ async fn audit_summary_quotes_values_so_lookalike_syntax_cannot_be_misread() {
         summary.contains(r#"-> "(none)""#),
         "a literal '(none)' VALUE must render quoted, distinct from the unquoted unset \
          sentinel: {summary:?}"
+    );
+}
+
+// ── Exact shard resolution (issue #759 review) ─────────────────────────────
+//
+// The PATCH handler resolves its connection via the **exact** shard resolver
+// (`db_conn_for_execution_exact`), not the lenient `db_conn_for_execution`
+// every other single-execution route on this router still uses. The lenient
+// resolver falls back to the **default** shard when the target execution's
+// owning shard has no configured pool on this node -- the documented
+// mid-shard-add-rollout state. For a WRITE that fallback is a genuine
+// correctness hazard, strictly worse than the false-404 a read would
+// produce: it can report a false 404 for an execution that exists on the
+// unreachable shard, or -- if the default shard happens to hold an unrelated
+// row sharing the same UUID -- silently mutate the wrong database. These two
+// tests mirror `lineage_tree_integration.rs`'s
+// `a_root_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404` /
+// `a_root_on_a_shard_this_deployment_does_not_know_is_still_404`.
+
+/// The owning shard is known to the router but has no pool configured on
+/// this process -- must fail closed with `503`, never a false `404` or a
+/// silent write to the wrong database.
+#[tokio::test]
+async fn a_target_on_a_router_known_shard_with_no_pool_is_503_not_a_false_404() {
+    let (admin_url, _guard) = setup_database().await;
+    let shard0 = create_shard_db(&admin_url, &unique("triage_s0")).await;
+
+    // The router knows shards 0 and 1, but this process only has a pool for
+    // 0 -- the documented mid-shard-add-rollout state (`readable_shards`
+    // widened before the pool is configured).
+    let pools = BTreeMap::from([(ShardId::new(0), build_pool(&shard0))]);
+    let app = build_app_with_router(
+        HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0))),
+        router_for(&[0, 1]),
+    );
+
+    // An id whose embedded shard is 1 -- the shard this process cannot query.
+    let target = ExecutionId::new_for_shard(ShardId::new(1));
+
+    let (status, body) = patch_json_admin(
+        &app,
+        &format!("/workflows/{target}/triage"),
+        json!({ "owner": "someone" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the owning shard could not be queried, so existence is unknown -- \
+         answering 404 (or worse, silently writing elsewhere) would be \
+         wrong; body: {body}"
+    );
+    let message = body.to_string();
+    assert!(
+        message.contains('1'),
+        "the response must name the shard that could not be queried: {message}"
+    );
+}
+
+/// ...but an id whose embedded shard is not known to this deployment at all
+/// (a stale id, or an operator pasting a foreign UUID) must still be a clean
+/// `404`, not a confusing `503` -- the exact resolver must not over-reach.
+#[tokio::test]
+async fn a_target_on_a_shard_this_deployment_does_not_know_is_still_404() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+
+    // Shard 7 is neither a configured pool nor known to the (single-shard,
+    // default) router this test app builds.
+    let target = ExecutionId::new_for_shard(ShardId::new(7));
+
+    let (status, body) = patch_json_admin(
+        &app,
+        &format!("/workflows/{target}/triage"),
+        json!({ "owner": "someone" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no shard in this deployment could host that id, so 404 is honest: {body}"
     );
 }
