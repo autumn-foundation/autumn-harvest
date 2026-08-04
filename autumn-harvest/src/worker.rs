@@ -1903,7 +1903,10 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
 #[derive(Clone)]
 struct SignalExternalWorkflowRun {
     signal_id: crate::types::ExternalSignalId,
-    target: ExecutionId,
+    /// Either a specific [`ExecutionId`] or a `(workflow_name, workflow_id)`
+    /// business key resolved to the current run at delivery time (issue
+    /// #751).
+    target: crate::types::ExternalTarget,
     signal_name: String,
     payload: serde_json::Value,
     /// `true` when `ExternalSignalRequested` is already durable — worker crashed
@@ -1919,7 +1922,10 @@ struct SignalExternalWorkflowRun {
 #[derive(Clone)]
 struct CancelExternalWorkflowRun {
     cancel_id: crate::types::ExternalCancelId,
-    target: ExecutionId,
+    /// Either a specific [`ExecutionId`] or a `(workflow_name, workflow_id)`
+    /// business key resolved to the current run at delivery time (issue
+    /// #751).
+    target: crate::types::ExternalTarget,
     already_requested: bool,
 }
 
@@ -2286,7 +2292,7 @@ async fn persist_external_signal_inline(
                         if !run.already_requested {
                             let requested = WorkflowEvent::ExternalSignalRequested {
                                 signal_id: run.signal_id,
-                                target: run.target,
+                                target: run.target.clone(),
                                 signal_name: run.signal_name.clone(),
                                 payload: run.payload.clone(),
                                 idempotency_key: run.idempotency_key.clone(),
@@ -2302,9 +2308,16 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // If cross-shard, skip inline delivery entirely and let
-                        // the background outbox handle it.
-                        if run.target.shard() != exec_id.shard() {
+                        // If cross-shard, skip inline delivery entirely and
+                        // let the background outbox handle it. An
+                        // undeterminable owning shard (`None`, only possible
+                        // for a `WorkflowId` target when the process-global
+                        // router isn't initialized) falls back to "assume
+                        // same shard as the caller" — see
+                        // `external_target_owning_shard`'s doc comment.
+                        if crate::shard::external_target_owning_shard(&run.target)
+                            .is_some_and(|owning| owning != exec_id.shard())
+                        {
                             continue;
                         }
 
@@ -2312,32 +2325,85 @@ async fn persist_external_signal_inline(
                         // (`Ok(false)`, idempotency-key collision) means the
                         // signal already landed once — that is success, so
                         // both outcomes record `ExternalSignalDelivered`.
-                        let terminal_opt = match signal::send_signal_idempotent(
-                            conn,
-                            run.target,
-                            &run.signal_name,
-                            run.payload,
-                            run.idempotency_key.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(_delivered_or_deduped) => {
-                                Some(WorkflowEvent::ExternalSignalDelivered {
-                                    signal_id: run.signal_id,
-                                })
+                        let terminal_opt = match &run.target {
+                            crate::types::ExternalTarget::ExecutionId(target_id) => {
+                                match signal::send_signal_idempotent(
+                                    conn,
+                                    *target_id,
+                                    &run.signal_name,
+                                    run.payload,
+                                    run.idempotency_key.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(_delivered_or_deduped) => {
+                                        Some(WorkflowEvent::ExternalSignalDelivered {
+                                            signal_id: run.signal_id,
+                                        })
+                                    }
+                                    Err(HarvestError::NotFound(_)) => {
+                                        // Same-shard target not found: suspend
+                                        // inline delivery and leave resolution
+                                        // to outbox.
+                                        None
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                        signal_id: run.signal_id,
+                                        reason_code: "target_terminal".to_string(),
+                                    }),
+                                }
                             }
-                            Err(HarvestError::NotFound(_)) => {
-                                // Same-shard target not found: suspend inline
-                                // delivery and leave resolution to outbox.
-                                None
+                            crate::types::ExternalTarget::WorkflowId {
+                                workflow_name,
+                                workflow_id,
+                            } => {
+                                match signal::resolve_and_signal_by_workflow_id(
+                                    conn,
+                                    workflow_name,
+                                    workflow_id,
+                                    &run.signal_name,
+                                    run.payload,
+                                    run.idempotency_key.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(signal::ByIdSignalOutcome::Delivered) => {
+                                        Some(WorkflowEvent::ExternalSignalDelivered {
+                                            signal_id: run.signal_id,
+                                        })
+                                    }
+                                    // The current run for this business key is
+                                    // already terminal — a genuine, immediate
+                                    // failure (unlike cancel, a signal's goal
+                                    // is never already met by a terminal
+                                    // target).
+                                    Ok(signal::ByIdSignalOutcome::NotRunning) => {
+                                        Some(WorkflowEvent::ExternalSignalFailed {
+                                            signal_id: run.signal_id,
+                                            reason_code: "not_running".to_string(),
+                                        })
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    // No run has ever existed for this business
+                                    // key, or the resolved run raced to a
+                                    // CONTINUED_AS_NEW successor between
+                                    // resolution and delivery: leave the bare
+                                    // `Requested` event and let the outbox's
+                                    // unconditional per-tick retry re-resolve
+                                    // (issue #751 AC2/AC3/AC4). Any other error
+                                    // is likewise left unresolved.
+                                    Ok(
+                                        signal::ByIdSignalOutcome::NoRunFound
+                                        | signal::ByIdSignalOutcome::RacedToSuccessor,
+                                    )
+                                    | Err(_) => None,
+                                }
                             }
-                            Err(HarvestError::Database(e)) => {
-                                return Err(HarvestError::Database(e));
-                            }
-                            Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                                signal_id: run.signal_id,
-                                reason_code: "target_terminal".to_string(),
-                            }),
                         };
 
                         if let Some(terminal) = terminal_opt {
@@ -2356,7 +2422,7 @@ async fn persist_external_signal_inline(
                         if !run.already_requested {
                             let requested = WorkflowEvent::ExternalCancelRequested {
                                 cancel_id: run.cancel_id,
-                                target: run.target,
+                                target: run.target.clone(),
                             };
                             store::append_events(
                                 conn,
@@ -2369,8 +2435,12 @@ async fn persist_external_signal_inline(
                             new_events.push(requested);
                         }
 
-                        // Cross-shard: leave for the outbox scanner.
-                        if run.target.shard() != exec_id.shard() {
+                        // Cross-shard: leave for the outbox scanner. See the
+                        // identical comment on the signal arm above for the
+                        // undeterminable-owning-shard fallback.
+                        if crate::shard::external_target_owning_shard(&run.target)
+                            .is_some_and(|owning| owning != exec_id.shard())
+                        {
                             continue;
                         }
 
@@ -2380,34 +2450,95 @@ async fn persist_external_signal_inline(
                         // Use the collect variant so the target's
                         // completion-trigger starts are spawned only after this
                         // outer transaction commits (issue #492).
-                        let terminal_opt = match cancel_workflow_execution_collect(
-                            conn,
-                            run.target,
-                            "cancelled by external request",
-                        )
-                        .await
-                        {
-                            Err(HarvestError::NotFound(_)) => {
-                                // Target not found: leave for outbox grace window.
-                                None
-                            }
-                            Err(HarvestError::Database(e)) => {
-                                return Err(HarvestError::Database(e));
-                            }
-                            Ok((_cancelled, deferred, checks, metrics_opt)) => {
-                                deferred_starts.extend(deferred);
-                                deferred_checks.extend(checks);
-                                if let Some(m) = metrics_opt {
-                                    cancel_metrics.push(m);
+                        let terminal_opt = match &run.target {
+                            crate::types::ExternalTarget::ExecutionId(target_id) => {
+                                match cancel_workflow_execution_collect(
+                                    conn,
+                                    *target_id,
+                                    "cancelled by external request",
+                                )
+                                .await
+                                {
+                                    Err(HarvestError::NotFound(_)) => {
+                                        // Target not found: leave for outbox
+                                        // grace window.
+                                        None
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    Ok((_cancelled, deferred, checks, metrics_opt)) => {
+                                        deferred_starts.extend(deferred);
+                                        deferred_checks.extend(checks);
+                                        if let Some(m) = metrics_opt {
+                                            cancel_metrics.push(m);
+                                        }
+                                        Some(WorkflowEvent::ExternalCancelDelivered {
+                                            cancel_id: run.cancel_id,
+                                        })
+                                    }
+                                    // Other Err (already terminal) = no-op success.
+                                    Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
+                                        cancel_id: run.cancel_id,
+                                    }),
                                 }
-                                Some(WorkflowEvent::ExternalCancelDelivered {
-                                    cancel_id: run.cancel_id,
-                                })
                             }
-                            // Other Err (already terminal) = no-op success.
-                            Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
-                                cancel_id: run.cancel_id,
-                            }),
+                            crate::types::ExternalTarget::WorkflowId {
+                                workflow_name,
+                                workflow_id,
+                            } => {
+                                match crate::execution::resolve_and_cancel_by_workflow_id(
+                                    conn,
+                                    workflow_name,
+                                    workflow_id,
+                                    "cancelled by external request",
+                                )
+                                .await
+                                {
+                                    Ok(crate::execution::ByIdCancelOutcome::Cancelled {
+                                        deferred,
+                                        closed_children,
+                                        metrics,
+                                        ..
+                                    }) => {
+                                        deferred_starts.extend(deferred);
+                                        deferred_checks.extend(closed_children);
+                                        if let Some(m) = metrics {
+                                            cancel_metrics.push(m);
+                                        }
+                                        Some(WorkflowEvent::ExternalCancelDelivered {
+                                            cancel_id: run.cancel_id,
+                                        })
+                                    }
+                                    // The current run for this business key is
+                                    // already terminal — the cancel goal
+                                    // ("nothing is running under this key") is
+                                    // already met (issue #751 AC5).
+                                    Ok(crate::execution::ByIdCancelOutcome::AlreadyTerminal) => {
+                                        Some(WorkflowEvent::ExternalCancelDelivered {
+                                            cancel_id: run.cancel_id,
+                                        })
+                                    }
+                                    Err(HarvestError::Database(e)) => {
+                                        return Err(HarvestError::Database(e));
+                                    }
+                                    // No run has ever existed for this business
+                                    // key: leave for outbox grace window. A
+                                    // resolved run that raced to a
+                                    // CONTINUED_AS_NEW successor between
+                                    // resolution and the cancel attempt is
+                                    // left unresolved too, so the outbox's
+                                    // unconditional per-tick retry re-resolves
+                                    // and cancels the live successor (issue
+                                    // #751 AC2/AC3). Any other error is
+                                    // likewise left unresolved.
+                                    Ok(
+                                        crate::execution::ByIdCancelOutcome::NoRunFound
+                                        | crate::execution::ByIdCancelOutcome::RacedToSuccessor,
+                                    )
+                                    | Err(_) => None,
+                                }
+                            }
                         };
 
                         if let Some(terminal) = terminal_opt {
@@ -18561,7 +18692,7 @@ mod tests {
     fn signal_requested(signal_id: crate::types::ExternalSignalId) -> WorkflowEvent {
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target: ExecutionId::new(),
+            target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
             signal_name: "s".to_string(),
             payload: serde_json::json!({}),
             idempotency_key: None,
@@ -18571,7 +18702,7 @@ mod tests {
     fn cancel_requested(cancel_id: crate::types::ExternalCancelId) -> WorkflowEvent {
         WorkflowEvent::ExternalCancelRequested {
             cancel_id,
-            target: ExecutionId::new(),
+            target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
         }
     }
 

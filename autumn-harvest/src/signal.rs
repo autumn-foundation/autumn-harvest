@@ -147,6 +147,96 @@ pub async fn send_signal_idempotent(
     .await
 }
 
+/// Outcome of resolving a `(workflow_name, workflow_id)`-targeted signal
+/// request to a concrete execution and attempting delivery (issue #751).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ByIdSignalOutcome {
+    /// The signal was queued for the resolved (current) run — freshly
+    /// inserted or an idempotency-key replay of an existing one; either way
+    /// the target has (or already had) this signal queued for delivery.
+    Delivered,
+    /// No run has ever existed for this `(workflow_name, workflow_id)`.
+    /// Callers apply the same grace-window policy used for an unrecognized
+    /// `ExecutionId` before reporting a definitive `target_unknown` failure.
+    NoRunFound,
+    /// The resolved run — whichever run was "current" at resolution time —
+    /// is already terminal. Unlike cancellation, a signal's goal is never
+    /// already met by a terminal target: the payload cannot be delivered, so
+    /// this is a genuine failure (`not_running`), never success.
+    NotRunning,
+    /// The resolved run raced to `CONTINUED_AS_NEW` between resolution and
+    /// the delivery attempt: a live successor now exists under the same
+    /// business key. Not success, not failure — the caller should leave this
+    /// attempt unresolved so a later attempt (immediate inline retry or the
+    /// next outbox tick) re-resolves and finds the live successor.
+    RacedToSuccessor,
+}
+
+/// Resolve a `(workflow_name, workflow_id)` target to its current run and
+/// deliver a signal to it, closing the continue-as-new race by construction
+/// (issue #751, AC2/AC3/AC4).
+///
+/// See [`crate::execution::resolve_and_cancel_by_workflow_id`] for the full
+/// proof that a **direct** resolution via
+/// [`crate::execution::resolve_execution_id_by_workflow_id`] can never
+/// itself return `state == "CONTINUED_AS_NEW"` — the same argument applies
+/// unchanged here, since both functions share the same resolve step. The one
+/// race that requires handling is the tiny window between this function's
+/// own resolve step and its delivery attempt: if the resolved run
+/// continues-as-new in that window,
+/// [`crate::execution::is_continued_as_new_race`] recognises it and this
+/// function reports [`ByIdSignalOutcome::RacedToSuccessor`] rather than
+/// misreporting either delivery or failure.
+///
+/// Unlike cancellation, a signal to an already-terminal resolved run is a
+/// genuine failure ([`ByIdSignalOutcome::NotRunning`]) — the payload was not,
+/// and cannot be, delivered — matching the existing `ExecutionId`-targeted
+/// signal contract's "no signal silently dropped" invariant (issue #244).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] for persistence failures. Every other
+/// outcome (no run found, not running, raced to a successor, or delivered)
+/// is reported as `Ok`.
+#[cfg(feature = "db")]
+pub async fn resolve_and_signal_by_workflow_id(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> HarvestResult<ByIdSignalOutcome> {
+    let Some(run) =
+        crate::execution::resolve_execution_id_by_workflow_id(conn, workflow_name, workflow_id)
+            .await?
+    else {
+        return Ok(ByIdSignalOutcome::NoRunFound);
+    };
+    if crate::erase::is_terminal_state(&run.state) {
+        return Ok(ByIdSignalOutcome::NotRunning);
+    }
+    match send_signal_idempotent(conn, run.exec_id, signal_name, payload, idempotency_key).await {
+        Ok(_delivered) => Ok(ByIdSignalOutcome::Delivered),
+        Err(HarvestError::NotFound(_)) => {
+            // Vanishingly unlikely (the row existed a moment ago under this
+            // same connection) but not impossible under a concurrent
+            // retention sweep; treat identically to "never existed".
+            Ok(ByIdSignalOutcome::NoRunFound)
+        }
+        Err(ref e) if crate::execution::is_continued_as_new_race(e) => {
+            Ok(ByIdSignalOutcome::RacedToSuccessor)
+        }
+        Err(HarvestError::Config(_) | HarvestError::Cancelled(_)) => {
+            // Any other terminal state discovered via the race window
+            // between our resolve and the signal attempt's own lock — the
+            // target completed/failed/cancelled/etc. on its own.
+            Ok(ByIdSignalOutcome::NotRunning)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Read-only probe: does a queued signal row already exist for
 /// `(workflow_exec_id, idempotency_key)`?
 ///

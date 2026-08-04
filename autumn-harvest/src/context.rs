@@ -29,7 +29,7 @@ use crate::replay::{
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
-    ExternalSignalId, IdempotencyKey, SessionId, TimerId, UpdateId,
+    ExternalSignalId, ExternalTarget, IdempotencyKey, SessionId, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -622,8 +622,10 @@ pub enum WorkflowCommand {
     SignalExternalWorkflow {
         /// Correlation ID shared across all three history events.
         signal_id: ExternalSignalId,
-        /// Target workflow execution to signal.
-        target: ExecutionId,
+        /// Target workflow execution to signal — either a specific
+        /// [`ExecutionId`] or a `(workflow_name, workflow_id)` business key
+        /// resolved to the current run at delivery time (issue #751).
+        target: ExternalTarget,
         /// Signal channel name on the receiver.
         signal_name: String,
         /// JSON payload to deliver.
@@ -641,8 +643,10 @@ pub enum WorkflowCommand {
     RequestCancelExternalWorkflow {
         /// Correlation ID shared across all three history events.
         cancel_id: ExternalCancelId,
-        /// Target workflow execution to cancel.
-        target: ExecutionId,
+        /// Target workflow execution to cancel — either a specific
+        /// [`ExecutionId`] or a `(workflow_name, workflow_id)` business key
+        /// resolved to the current run at delivery time (issue #751).
+        target: ExternalTarget,
         /// Outcome channel: `Ok(())` on delivery (including already-terminal),
         /// `Err(reason_code)` on failure (target unknown after grace window).
         result_tx: oneshot::Sender<Result<(), String>>,
@@ -7530,10 +7534,122 @@ impl WorkflowContext {
         payload: P,
         idempotency_key: impl Into<Option<String>>,
     ) -> HarvestResult<()> {
+        self.signal_external_target(target.into(), signal_name, payload, idempotency_key.into())
+            .await
+    }
+
+    /// `workflow_id`-targeted counterpart of
+    /// [`signal_external_workflow`](Self::signal_external_workflow) (issue
+    /// #751): send a named signal to another workflow addressed by its
+    /// `(workflow_name, workflow_id)` business key rather than a specific
+    /// `ExecutionId`.
+    ///
+    /// # Resolution
+    ///
+    /// The target resolves to the **current run** of `(workflow_name,
+    /// workflow_id)` at delivery time — the latest non-terminal execution, or
+    /// (if none is running) `HarvestError::ExternalSignalFailed { reason_code:
+    /// "not_running" }`. Resolution happens fresh on every delivery attempt
+    /// (not just once, at the first live call), so a target that
+    /// continues-as-new between the request and delivery is followed to its
+    /// successor rather than misdelivering to — or failing against — the
+    /// sealed predecessor.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    ///   "self_signal"` when `(workflow_name, workflow_id)` matches this
+    ///   execution's own business key (compared by key, not `ExecutionId`, so
+    ///   this still catches self-targeting after a continue-as-new).
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    ///   "not_running"` when the current run for this business key is already
+    ///   terminal.
+    /// - [`HarvestError::ExternalSignalFailed`] with `reason_code =
+    ///   "target_unknown"` if no run has ever existed for this business key
+    ///   within the grace window.
+    /// - Same as [`signal_external_workflow`](Self::signal_external_workflow)
+    ///   otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn signal_external_workflow_by_id<P: serde::Serialize>(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        signal_name: &str,
+        payload: P,
+    ) -> HarvestResult<()> {
+        self.signal_external_workflow_by_id_with_idempotency(
+            workflow_name,
+            workflow_id,
+            signal_name,
+            payload,
+            None,
+        )
+        .await
+    }
+
+    /// `workflow_id`-targeted counterpart of
+    /// [`signal_external_workflow_with_idempotency`](Self::signal_external_workflow_with_idempotency)
+    /// (issue #751). See [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id)
+    /// for the resolution semantics.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`signal_external_workflow_by_id`](Self::signal_external_workflow_by_id).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn signal_external_workflow_by_id_with_idempotency<P: serde::Serialize>(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        signal_name: &str,
+        payload: P,
+        idempotency_key: impl Into<Option<String>>,
+    ) -> HarvestResult<()> {
+        // Self-targeting is always an immediate, deterministic error (same
+        // rationale as `request_cancel_external_workflow`'s self-cancel
+        // check). This path records no history, so `signal_id` must be a
+        // stable sentinel (nil UUID) rather than a fresh v4, or a workflow
+        // that surfaces the error would diverge on replay. Compared by
+        // BUSINESS KEY (not `ExecutionId`) so a workflow that has since
+        // continued-as-new under the same `(workflow_name, workflow_id)`
+        // still recognises the target as itself.
+        if workflow_name == self.workflow_type() && workflow_id == self.workflow_id() {
+            return Err(HarvestError::ExternalSignalFailed {
+                signal_id: ExternalSignalId::from_uuid(uuid::Uuid::nil()),
+                target: ExternalTarget::from_workflow_id(workflow_name, workflow_id),
+                signal_name: signal_name.to_string(),
+                reason_code: "self_signal".to_string(),
+            });
+        }
+        self.signal_external_target(
+            ExternalTarget::from_workflow_id(workflow_name, workflow_id),
+            signal_name,
+            payload,
+            idempotency_key.into(),
+        )
+        .await
+    }
+
+    /// Shared implementation for `signal_external_workflow*` and
+    /// `signal_external_workflow_by_id*`, operating uniformly on the resolved
+    /// [`ExternalTarget`] so the matcher, dispatch, and error construction
+    /// exist in exactly one place regardless of how the caller addressed the
+    /// target (issue #751).
+    async fn signal_external_target<P: serde::Serialize>(
+        &self,
+        target: ExternalTarget,
+        signal_name: &str,
+        payload: P,
+        idempotency_key: Option<String>,
+    ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
-        let idempotency_key = idempotency_key.into();
-        let history_match = self.match_history(|m| m.match_external_signal(target, signal_name));
+        let history_match = self.match_history(|m| m.match_external_signal(&target, signal_name));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -7634,7 +7750,7 @@ impl WorkflowContext {
     /// (`already_requested = false`) dispatch paths.
     async fn dispatch_signal_command<P: serde::Serialize>(
         &self,
-        target: ExecutionId,
+        target: ExternalTarget,
         signal_name: &str,
         payload: P,
         signal_id: ExternalSignalId,
@@ -7645,7 +7761,7 @@ impl WorkflowContext {
         let (tx, rx) = oneshot::channel();
         self.push_command(WorkflowCommand::SignalExternalWorkflow {
             signal_id,
-            target,
+            target: target.clone(),
             signal_name: signal_name.to_string(),
             payload: payload_json,
             result_tx: tx,
@@ -7701,8 +7817,6 @@ impl WorkflowContext {
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     pub async fn request_cancel_external_workflow(&self, target: ExecutionId) -> HarvestResult<()> {
-        use crate::replay::HistoryMatch;
-
         // Self-cancel is always an immediate deterministic error. This path records
         // no history, so the `cancel_id` must be a stable sentinel (nil UUID) rather
         // than a fresh v4 — otherwise a workflow that surfaces the error (e.g.
@@ -7710,12 +7824,88 @@ impl WorkflowContext {
         if target == self.exec_id {
             return Err(HarvestError::ExternalCancelFailed {
                 cancel_id: ExternalCancelId::from_uuid(uuid::Uuid::nil()),
-                target,
+                target: ExternalTarget::ExecutionId(target),
                 reason_code: "self_cancel".to_string(),
             });
         }
 
-        let history_match = self.match_history(|m| m.match_external_cancel(target));
+        self.request_cancel_external_target(target.into()).await
+    }
+
+    /// `workflow_id`-targeted counterpart of
+    /// [`request_cancel_external_workflow`](Self::request_cancel_external_workflow)
+    /// (issue #751): request cancellation of another workflow addressed by
+    /// its `(workflow_name, workflow_id)` business key rather than a specific
+    /// `ExecutionId`.
+    ///
+    /// # Resolution
+    ///
+    /// The target resolves to the **current run** of `(workflow_name,
+    /// workflow_id)` at delivery time — the latest non-terminal execution.
+    /// Resolution happens fresh on every delivery attempt (not just once, at
+    /// the first live call), so a target that continues-as-new between the
+    /// request and delivery is followed to its successor and *that* run is
+    /// cancelled, rather than misdelivering to — or reporting a spurious
+    /// success against — the already-sealed predecessor.
+    ///
+    /// # Cancel semantics vs signal
+    ///
+    /// As with [`request_cancel_external_workflow`](Self::request_cancel_external_workflow),
+    /// a current run that is already terminal is a **no-op success**
+    /// (`ExternalCancelDelivered`): the goal (nothing running under this
+    /// business key) is already met.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalCancelFailed`] with `reason_code =
+    ///   "self_cancel"` when `(workflow_name, workflow_id)` matches this
+    ///   execution's own business key (compared by key, not `ExecutionId`, so
+    ///   this still catches self-targeting after a continue-as-new).
+    /// - [`HarvestError::ExternalCancelFailed`] with `reason_code =
+    ///   "target_unknown"` if no run has ever existed for this business key
+    ///   within the grace window.
+    /// - [`HarvestError::NonDeterministic`] if the history at this position
+    ///   does not match the requested target.
+    /// - [`HarvestError::Cancelled`] if the result channel is dropped before
+    ///   the worker resolves this command.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn request_cancel_external_workflow_by_id(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> HarvestResult<()> {
+        // Self-cancel by business key -- see the identical rationale on
+        // `request_cancel_external_workflow`'s `ExecutionId` self-check.
+        // Compared by BUSINESS KEY (not `ExecutionId`) so a workflow that has
+        // since continued-as-new under the same `(workflow_name,
+        // workflow_id)` still recognises the target as itself.
+        if workflow_name == self.workflow_type() && workflow_id == self.workflow_id() {
+            return Err(HarvestError::ExternalCancelFailed {
+                cancel_id: ExternalCancelId::from_uuid(uuid::Uuid::nil()),
+                target: ExternalTarget::from_workflow_id(workflow_name, workflow_id),
+                reason_code: "self_cancel".to_string(),
+            });
+        }
+
+        self.request_cancel_external_target(ExternalTarget::from_workflow_id(
+            workflow_name,
+            workflow_id,
+        ))
+        .await
+    }
+
+    /// Shared implementation for `request_cancel_external_workflow` and
+    /// `request_cancel_external_workflow_by_id`, operating uniformly on the
+    /// resolved [`ExternalTarget`] so the matcher, dispatch, and error
+    /// construction exist in exactly one place regardless of how the caller
+    /// addressed the target (issue #751).
+    async fn request_cancel_external_target(&self, target: ExternalTarget) -> HarvestResult<()> {
+        use crate::replay::HistoryMatch;
+
+        let history_match = self.match_history(|m| m.match_external_cancel(&target));
 
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
@@ -7781,14 +7971,14 @@ impl WorkflowContext {
     /// (`already_requested = false`) dispatch paths.
     async fn dispatch_cancel_command(
         &self,
-        target: ExecutionId,
+        target: ExternalTarget,
         cancel_id: ExternalCancelId,
         already_requested: bool,
     ) -> HarvestResult<()> {
         let (tx, rx) = oneshot::channel();
         self.push_command(WorkflowCommand::RequestCancelExternalWorkflow {
             cancel_id,
-            target,
+            target: target.clone(),
             result_tx: tx,
             already_requested,
         });
@@ -19174,7 +19364,10 @@ mod tests {
                 already_requested,
                 ..
             } => {
-                assert_eq!(*target, target_id);
+                assert_eq!(
+                    *target,
+                    crate::types::ExternalTarget::ExecutionId(target_id)
+                );
                 assert_eq!(signal_name, "tenant_cancel");
                 assert!(
                     !already_requested,
@@ -19261,7 +19454,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "tenant_cancel".into(),
                 payload: serde_json::json!({"reason": "billing_lapse"}),
                 idempotency_key: Some("recorded_key".into()),
@@ -19319,7 +19512,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "tenant_cancel".into(),
                 payload: serde_json::json!({"reason": "billing_lapse"}),
                 idempotency_key: None,
@@ -19355,7 +19548,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19396,7 +19589,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "notify".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19436,7 +19629,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19475,7 +19668,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19524,7 +19717,7 @@ mod tests {
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "cancel".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -19572,7 +19765,7 @@ mod tests {
                 already_requested,
                 ..
             } => {
-                assert_eq!(*t, target_clone);
+                assert_eq!(*t, crate::types::ExternalTarget::ExecutionId(target_clone));
                 assert!(
                     !already_requested,
                     "first call should not be already_requested"
@@ -19595,7 +19788,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
@@ -19619,7 +19815,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelFailed {
                 cancel_id,
                 reason_code: "target_unknown".into(),
@@ -19653,7 +19852,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
@@ -19691,10 +19893,308 @@ mod tests {
                 ..
             } => {
                 assert_eq!(reason_code, "self_cancel");
-                assert_eq!(target, own_id);
+                assert_eq!(target, crate::types::ExternalTarget::ExecutionId(own_id));
             }
             other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
         }
+    }
+
+    // ── workflow_id-targeted signal/cancel tests (issue #751) ────────────────
+
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_self_signal_rejected() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .signal_external_workflow_by_id("order_flow", "order-42", "tenant_cancel", Value::Null)
+            .await;
+
+        assert!(result.is_err(), "self-signal by id should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalSignalFailed {
+                reason_code,
+                target,
+                ..
+            } => {
+                assert_eq!(reason_code, "self_signal");
+                assert_eq!(
+                    target,
+                    crate::types::ExternalTarget::from_workflow_id("order_flow", "order-42")
+                );
+            }
+            other => panic!("expected ExternalSignalFailed(self_signal), got {other:?}"),
+        }
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "self-signal rejection must record no history / emit no commands"
+        );
+    }
+
+    /// AC#6's critical nuance: self-targeting is compared by BUSINESS KEY, not
+    /// `ExecutionId` -- a workflow that has continued-as-new (and therefore
+    /// runs under a fresh `exec_id`) must still recognise its own
+    /// `(workflow_name, workflow_id)` as itself.
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_self_signal_rejected_across_continue_as_new() {
+        // A DIFFERENT exec_id than any "original" -- simulating a
+        // continue-as-new successor -- sharing the same business key.
+        let successor_exec_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            successor_exec_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .signal_external_workflow_by_id("order_flow", "order-42", "tenant_cancel", Value::Null)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "self-signal by id must be rejected even under a different exec_id \
+             (continue-as-new), since it is compared by business key"
+        );
+        match result.unwrap_err() {
+            HarvestError::ExternalSignalFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "self_signal");
+            }
+            other => panic!("expected ExternalSignalFailed(self_signal), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_live_mode_emits_command_with_workflow_id_target() {
+        let ctx = WorkflowContext::new_test();
+        let cmd_fut = ctx.signal_external_workflow_by_id(
+            "billing_reconciliation",
+            "tenant-7",
+            "tenant_cancel",
+            serde_json::json!({"reason": "billing_lapse"}),
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+
+        assert_eq!(cmds.len(), 1, "one SignalExternalWorkflow command expected");
+        match &cmds[0] {
+            WorkflowCommand::SignalExternalWorkflow {
+                target,
+                signal_name,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(
+                    *target,
+                    crate::types::ExternalTarget::from_workflow_id(
+                        "billing_reconciliation",
+                        "tenant-7"
+                    )
+                );
+                assert_eq!(signal_name, "tenant_cancel");
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
+            }
+            other => panic!("expected SignalExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_by_id_replays_delivered_outcome() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::from_workflow_id(
+                    "billing_reconciliation",
+                    "tenant-7",
+                ),
+                signal_name: "tenant_cancel".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .signal_external_workflow_by_id(
+                "billing_reconciliation",
+                "tenant-7",
+                "tenant_cancel",
+                Value::Null,
+            )
+            .await;
+
+        assert!(result.is_ok(), "delivered history should return Ok(())");
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_self_cancel_rejected() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .request_cancel_external_workflow_by_id("order_flow", "order-42")
+            .await;
+
+        assert!(result.is_err(), "self-cancel by id should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalCancelFailed {
+                reason_code,
+                target,
+                ..
+            } => {
+                assert_eq!(reason_code, "self_cancel");
+                assert_eq!(
+                    target,
+                    crate::types::ExternalTarget::from_workflow_id("order_flow", "order-42")
+                );
+            }
+            other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
+        }
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "self-cancel rejection must record no history / emit no commands"
+        );
+    }
+
+    /// Same continue-as-new nuance as
+    /// `signal_external_workflow_by_id_self_signal_rejected_across_continue_as_new`.
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_self_cancel_rejected_across_continue_as_new() {
+        let successor_exec_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            successor_exec_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+        )
+        .with_workflow_name("order_flow")
+        .with_workflow_id("order-42");
+
+        let result = ctx
+            .request_cancel_external_workflow_by_id("order_flow", "order-42")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "self-cancel by id must be rejected even under a different exec_id \
+             (continue-as-new), since it is compared by business key"
+        );
+        match result.unwrap_err() {
+            HarvestError::ExternalCancelFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "self_cancel");
+            }
+            other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_live_mode_emits_command_with_workflow_id_target() {
+        let ctx = WorkflowContext::new_test();
+        let cmd_fut =
+            ctx.request_cancel_external_workflow_by_id("billing_reconciliation", "tenant-7");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+
+        assert_eq!(
+            cmds.len(),
+            1,
+            "one RequestCancelExternalWorkflow command expected"
+        );
+        match &cmds[0] {
+            WorkflowCommand::RequestCancelExternalWorkflow {
+                target,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(
+                    *target,
+                    crate::types::ExternalTarget::from_workflow_id(
+                        "billing_reconciliation",
+                        "tenant-7"
+                    )
+                );
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
+            }
+            other => panic!("expected RequestCancelExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_by_id_replays_delivered_outcome() {
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::from_workflow_id(
+                    "billing_reconciliation",
+                    "tenant-7",
+                ),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .request_cancel_external_workflow_by_id("billing_reconciliation", "tenant-7")
+            .await;
+
+        assert!(result.is_ok(), "delivered history should return Ok(())");
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
     }
 
     // ── await_external_workflow tests (issue #757) ───────────────────────────
@@ -19903,7 +20403,10 @@ mod tests {
                 activity_id,
                 output: serde_json::json!("done"),
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
@@ -19942,7 +20445,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::SignalReceived {
                 signal_name: "approved".into(),
                 payload: serde_json::json!({"ok": true}),

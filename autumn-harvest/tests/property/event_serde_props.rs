@@ -15,7 +15,9 @@
 
 use autumn_harvest::WorkflowEvent;
 use autumn_harvest::event::SideEffectKind;
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalSignalId, TimerId};
+use autumn_harvest::types::{
+    ActivityExecId, ExecutionId, ExternalSignalId, ExternalTarget, TimerId,
+};
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use serde_json::Value;
@@ -176,7 +178,7 @@ fn workflow_event() -> impl Strategy<Value = WorkflowEvent> {
             .prop_map(|(sid, target, signal_name, payload, idem)| {
                 WorkflowEvent::ExternalSignalRequested {
                     signal_id: ExternalSignalId::from_uuid(sid),
-                    target: ExecutionId::from_uuid(target),
+                    target: ExternalTarget::ExecutionId(ExecutionId::from_uuid(target)),
                     signal_name,
                     payload,
                     idempotency_key: idem,
@@ -214,7 +216,7 @@ proptest! {
     ) {
         let ev = WorkflowEvent::ExternalSignalRequested {
             signal_id: ExternalSignalId::from_uuid(sid),
-            target: ExecutionId::from_uuid(target),
+            target: ExternalTarget::ExecutionId(ExecutionId::from_uuid(target)),
             signal_name,
             payload,
             idempotency_key: Some("present".to_string()),

@@ -153,6 +153,8 @@ mod webhook_trigger_tests;
 mod worker_session_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
+#[cfg(feature = "db")]
+mod workflow_id_targeted_tests;
 mod workflow_logger_tests;
 mod workflow_mutation_tests;
 #[cfg(feature = "db")]

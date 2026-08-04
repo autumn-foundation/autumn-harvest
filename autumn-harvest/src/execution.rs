@@ -3657,6 +3657,120 @@ pub async fn resolve_execution_id_by_workflow_id(
     }))
 }
 
+/// Returns `true` when `err` reports that a target resolved by
+/// [`resolve_execution_id_by_workflow_id`] raced to `CONTINUED_AS_NEW`
+/// between resolution and a delivery/cancel attempt on it (issue #751).
+///
+/// A `CONTINUED_AS_NEW` predecessor always commits atomically together with
+/// its successor (see [`crate::worker::persist_workflow_continue_as_new`]),
+/// so whenever this fires a live successor is guaranteed to already exist
+/// under the same `(workflow_name, workflow_id)` key — the caller must
+/// re-resolve and retry rather than treating this as either success (cancel)
+/// or a definitive failure (signal), unlike every *other* terminal state,
+/// which is a conclusive dead end.
+///
+/// Both [`cancel_workflow_execution_collect`] and
+/// [`crate::signal::send_signal_idempotent`] report this as a
+/// [`HarvestError::Config`] whose message ends in `"(CONTINUED_AS_NEW)"` (each
+/// with an otherwise independently-worded prefix), so matching only the
+/// suffix is stable across the two call sites without coupling to either
+/// one's exact wording.
+pub(crate) fn is_continued_as_new_race(err: &HarvestError) -> bool {
+    matches!(err, HarvestError::Config(msg) if msg.ends_with("(CONTINUED_AS_NEW)"))
+}
+
+/// Outcome of resolving a `workflow_id`-targeted cancel request to a concrete
+/// execution and attempting to cancel it (issue #751).
+#[derive(Debug)]
+pub enum ByIdCancelOutcome {
+    /// The resolved run was cancelled. Carries the same payload
+    /// [`cancel_workflow_execution_collect`] returns on success, so callers
+    /// can spawn deferred starts / record metrics identically to the
+    /// `ExecutionId`-targeted path.
+    Cancelled {
+        cancelled: Box<CancelledWorkflowExecution>,
+        deferred: Vec<DeferredTriggerStart>,
+        closed_children: Vec<(ExecutionId, String)>,
+        metrics: Option<(String, String)>,
+    },
+    /// No run has ever existed for this `(workflow_name, workflow_id)`.
+    /// Callers apply the same grace-window policy used for an unrecognized
+    /// `ExecutionId` before reporting a definitive `target_unknown` failure.
+    NoRunFound,
+    /// The resolved run — whichever run was "current" at resolution time —
+    /// is already terminal. The goal ("nothing is running under this
+    /// business key") is already met: a no-op success, never an error.
+    AlreadyTerminal,
+    /// The resolved run raced to `CONTINUED_AS_NEW` between resolution and
+    /// the cancel attempt: a live successor now exists under the same
+    /// business key. Not success, not failure — the caller should leave this
+    /// attempt unresolved so a later attempt (immediate inline retry or the
+    /// next outbox tick) re-resolves and finds the live successor.
+    RacedToSuccessor,
+}
+
+/// Resolve a `(workflow_name, workflow_id)` target to its current run and
+/// cancel it, closing the continue-as-new race by construction (issue #751,
+/// AC2/AC3/AC5).
+///
+/// Because [`resolve_execution_id_by_workflow_id`]'s "active" query excludes
+/// every [`crate::erase::TERMINAL_STATES`] state (including
+/// `CONTINUED_AS_NEW`) and a `CONTINUED_AS_NEW` predecessor's successor
+/// always commits in the very same transaction, a **direct** resolution can
+/// never itself return `state == "CONTINUED_AS_NEW"` — the successor would
+/// already have won the "active" query, or (if the successor has since also
+/// gone terminal) sorts later than the predecessor and wins the "most
+/// recent" fallback query instead. Any terminal state observed directly here
+/// is therefore genuine, not a masked live run.
+///
+/// The one race that DOES require handling is the tiny window between this
+/// function's own resolve step and its cancel attempt: if the resolved run
+/// continues-as-new in that window, [`is_continued_as_new_race`] recognises
+/// it and this function reports [`ByIdCancelOutcome::RacedToSuccessor`]
+/// rather than misreporting either success or failure.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] for persistence failures. Every other
+/// outcome (no run found, already terminal, raced to a successor, or
+/// cancelled) is reported as `Ok`.
+pub async fn resolve_and_cancel_by_workflow_id(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    reason: &str,
+) -> HarvestResult<ByIdCancelOutcome> {
+    let Some(run) = resolve_execution_id_by_workflow_id(conn, workflow_name, workflow_id).await?
+    else {
+        return Ok(ByIdCancelOutcome::NoRunFound);
+    };
+    if crate::erase::is_terminal_state(&run.state) {
+        return Ok(ByIdCancelOutcome::AlreadyTerminal);
+    }
+    match cancel_workflow_execution_collect(conn, run.exec_id, reason).await {
+        Ok((cancelled, deferred, closed_children, metrics)) => Ok(ByIdCancelOutcome::Cancelled {
+            cancelled: Box::new(cancelled),
+            deferred,
+            closed_children,
+            metrics,
+        }),
+        Err(HarvestError::NotFound(_)) => {
+            // Vanishingly unlikely (the row existed a moment ago under this
+            // same connection) but not impossible under a concurrent retention
+            // sweep; treat identically to "never existed".
+            Ok(ByIdCancelOutcome::NoRunFound)
+        }
+        Err(ref e) if is_continued_as_new_race(e) => Ok(ByIdCancelOutcome::RacedToSuccessor),
+        Err(HarvestError::Config(_)) => {
+            // Any other terminal state discovered via the race window between
+            // our resolve and the cancel attempt's own lock — the target
+            // completed/failed/etc. on its own; goal still met.
+            Ok(ByIdCancelOutcome::AlreadyTerminal)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SignalWithStart (issue #244)
 // ─────────────────────────────────────────────────────────────────────────────

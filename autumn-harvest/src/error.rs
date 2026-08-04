@@ -10,7 +10,9 @@
 
 use uuid::Uuid;
 
-use crate::types::{ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId};
+use crate::types::{
+    ExecutionId, ExternalAwaitId, ExternalCancelId, ExternalSignalId, ExternalTarget,
+};
 
 // ---------------------------------------------------------------------------
 // PayloadKind
@@ -450,38 +452,61 @@ pub enum HarvestError {
         reason: String,
     },
 
-    /// Delivery of a `signal_external_workflow` call failed permanently.
+    /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`
+    /// call failed permanently.
+    ///
+    /// `target` is either a specific [`ExecutionId`] or a
+    /// `(workflow_name, workflow_id)` business key, depending on which
+    /// primitive was used (issue #751); [`ExternalTarget`]'s `Display`
+    /// impl renders either form.
     ///
     /// `reason_code` is one of:
-    /// - `"target_terminal"` — the target workflow is already in a terminal state.
+    /// - `"target_terminal"` — the target workflow is already in a terminal state
+    ///   (`ExecutionId`-targeted only).
+    /// - `"not_running"` — the current run resolved for a
+    ///   `workflow_id`-targeted call is already terminal
+    ///   (`workflow_id`-targeted only; issue #751 AC4).
     /// - `"target_unknown"` — no execution matching `target` was found within
     ///   the configured grace window.
+    /// - `"self_signal"` — the target is the calling workflow's own
+    ///   `(workflow_name, workflow_id)` (`workflow_id`-targeted only; issue
+    ///   #751 AC6).
     #[error(
         "external signal '{signal_name}' to {target} failed: {reason_code} (signal_id={signal_id})"
     )]
     ExternalSignalFailed {
         /// The `ExternalSignalId` recorded in the initiating event.
         signal_id: ExternalSignalId,
-        /// The target workflow execution ID.
-        target: ExecutionId,
+        /// The signal's target, as the caller specified it.
+        target: ExternalTarget,
         /// The signal channel name.
         signal_name: String,
-        /// Machine-readable failure reason (`"target_terminal"` or `"target_unknown"`).
+        /// Machine-readable failure reason (`"target_terminal"`, `"not_running"`,
+        /// `"target_unknown"`, or `"self_signal"`).
         reason_code: String,
     },
 
-    /// Delivery of a `request_cancel_external_workflow` call failed permanently.
+    /// Delivery of a `request_cancel_external_workflow`/
+    /// `request_cancel_external_workflow_by_id` call failed permanently.
+    ///
+    /// `target` is either a specific [`ExecutionId`] or a
+    /// `(workflow_name, workflow_id)` business key, depending on which
+    /// primitive was used (issue #751); [`ExternalTarget`]'s `Display`
+    /// impl renders either form.
     ///
     /// `reason_code` is one of:
     /// - `"target_unknown"` — no execution matching `target` was found within
     ///   the configured grace window.
-    /// - `"self_cancel"` — the target is the calling workflow's own `ExecutionId`.
+    /// - `"self_cancel"` — the target is the calling workflow's own
+    ///   `ExecutionId` (`ExecutionId`-targeted) or
+    ///   `(workflow_name, workflow_id)` (`workflow_id`-targeted; issue #751
+    ///   AC6).
     #[error("external cancel of {target} failed: {reason_code} (cancel_id={cancel_id})")]
     ExternalCancelFailed {
         /// The `ExternalCancelId` recorded in the initiating event.
         cancel_id: ExternalCancelId,
-        /// The target workflow execution ID.
-        target: ExecutionId,
+        /// The cancel's target, as the caller specified it.
+        target: ExternalTarget,
         /// Machine-readable failure reason (`"target_unknown"` or `"self_cancel"`).
         reason_code: String,
     },
@@ -1348,7 +1373,7 @@ mod tests {
         let target = ExecutionId::new_for_shard(crate::types::ShardId::new(0));
         let e = HarvestError::ExternalSignalFailed {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             reason_code: "target_terminal".into(),
         };
@@ -1377,7 +1402,7 @@ mod tests {
         let target = ExecutionId::new();
         let e = HarvestError::ExternalSignalFailed {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "notify".into(),
             reason_code: "target_unknown".into(),
         };

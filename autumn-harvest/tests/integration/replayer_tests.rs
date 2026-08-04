@@ -20,7 +20,7 @@ use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
 use autumn_harvest::types::{
-    ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy, TimerId, UpdateId, WorkerId,
 };
 use chrono::Utc;
 use serde_json::Value;
@@ -5476,7 +5476,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
             idempotency_key: None,
@@ -5504,7 +5504,7 @@ fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             payload: Value::Null,
             idempotency_key: None,
@@ -5562,7 +5562,11 @@ async fn replayer_replays_external_signal_delivered_successfully() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5602,7 +5606,11 @@ async fn replayer_detects_external_signal_name_mismatch() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5651,7 +5659,11 @@ async fn replayer_replays_external_signal_failed_history() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
