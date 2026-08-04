@@ -124,6 +124,9 @@ pub struct WorkerConfigView {
     /// Builder-level default activity `start_to_close`, milliseconds (issue #620);
     /// `null` when no builder-default timeout floor is configured.
     pub default_activity_start_to_close_ms: Option<u64>,
+    /// Ceiling on an author-supplied `Retry-After` delay hint, milliseconds
+    /// (issue #744). Always present (not opt-in); default 15 minutes.
+    pub retry_after_ceiling_ms: u64,
     /// Worker liveness heartbeat interval, milliseconds.
     pub worker_heartbeat_interval_ms: u64,
     /// Immutable build identifier (may be empty; not a secret).
@@ -256,6 +259,7 @@ impl WorkerConfigView {
             max_local_activity_start_to_close,
             default_activity_retry_policy,
             default_activity_start_to_close,
+            retry_after_ceiling,
             worker_heartbeat_interval,
             build_id,
             deployment_name,
@@ -295,6 +299,7 @@ impl WorkerConfigView {
                 .as_ref()
                 .map(|p| p.max_attempts),
             default_activity_start_to_close_ms: default_activity_start_to_close.map(dur_ms),
+            retry_after_ceiling_ms: dur_ms(*retry_after_ceiling),
             worker_heartbeat_interval_ms: dur_ms(*worker_heartbeat_interval),
             build_id: build_id.clone(),
             deployment_name: deployment_name.clone(),
@@ -640,6 +645,25 @@ mod tests {
         assert_eq!(json["worker_heartbeat_interval_ms"], 11_000);
         assert_eq!(json["query_timeout_ms"], 13_000);
         assert_eq!(json["poll_interval_ms"], 500);
+    }
+
+    #[test]
+    fn retry_after_ceiling_ms_surfaces_the_configured_value_issue_744() {
+        // The ceiling is not opt-in (always present, unlike the sibling
+        // default_activity_* floors) -- confirm the default AND a configured
+        // override both surface through the introspection snapshot.
+        let default_view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(
+            default_view.retry_after_ceiling_ms,
+            u64::try_from(crate::builder::DEFAULT_RETRY_AFTER_CEILING.as_millis()).unwrap(),
+        );
+
+        let configured = WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
+        let view = WorkerConfigView::from_worker_config(&configured, Duration::from_millis(500));
+        assert_eq!(view.retry_after_ceiling_ms, 90_000);
     }
 
     #[cfg(feature = "db")]

@@ -131,6 +131,17 @@ Rules of thumb:
   dispatch; retry + jitter handle individual transient failures; the breaker
   trips when those retries are consistently failing; non-retryable failures
   bypass all of the above for permanent per-request errors.
+- **Breaker vs. `retry_after` (#744)**: an activity can hand the engine a
+  downstream-supplied `Retry-After` delay hint via
+  `ActivityFailure::with_retry_after(Duration)`, overriding the policy-computed
+  backoff for one attempt. If the SAME activity also carries a breaker, be
+  aware the breaker's rolling failure window only counts a failure toward
+  tripping if it lands within `window` of the prior one — a `retry_after` hint
+  that regularly spaces consecutive attempts *wider* than `window` can defeat
+  trip detection entirely. Configure the breaker's `window` wider than the
+  largest `retry_after` hint you expect that downstream to send (see
+  [Chapter 7](../getting-started/07-reliability-knobs.md) for the full
+  `retry_after` writeup).
 - **Rate limiting moves to dispatch for breaker activities**: when an activity
   declares **both** `rate_limit_*` and `circuit_breaker`, its rate limiting is
   enforced at *dispatch* rather than at claim time. The claim query skips the

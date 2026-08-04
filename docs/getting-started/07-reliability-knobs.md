@@ -91,6 +91,72 @@ back-off delay, the retry is skipped and the same event is appended instead of
 requeuing — so the workflow sees a clean `HarvestError::Timeout { ScheduleToClose }`
 rather than an exhausted-retry failure.
 
+**Honor a downstream's own `Retry-After` (`ActivityFailure::with_retry_after`).**
+`RetryPolicy` computes a generic backoff shape, but a well-behaved downstream
+(an HTTP API, a queue broker) often tells you *exactly* how long to wait —
+`Retry-After: 30` on a `429`/`503`. Let the activity hand that hint straight to
+the engine instead of guessing a schedule that either retries too eagerly or
+waits too long:
+
+```rust
+#[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
+async fn call_rate_limited_api(ctx: &ActivityContext, req: ApiRequest)
+    -> Result<ApiResponse, String>
+{
+    let client = ctx
+        .state::<HttpClient>()
+        .ok_or_else(|| "HttpClient state must be registered".to_string())?;
+    let resp = client.post(&req).await.map_err(|e| e.to_string())?;
+    if resp.status() == 429 || resp.status() == 503 {
+        let retry_after = resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_default();
+        return Err(ActivityFailure::retryable("RateLimited", "downstream asked us to back off")
+            .with_retry_after(retry_after)
+            .into_error_payload());
+    }
+    resp.json().await.map_err(|e| e.to_string())
+}
+```
+
+`with_retry_after(Duration)` overrides the policy-computed delay **for that one
+attempt only**, scheduling the next attempt at `now + hint` instead of the
+policy's own backoff. It does **not** change how many attempts are allowed —
+`max_attempts` and the attempt counter are unaffected, so a downstream that
+keeps returning `Retry-After` still exhausts to a terminal failure/DLQ entry on
+schedule. The hint is clamped to `[0, ceiling]` (default 15 minutes, tune with
+`WorkerConfig::with_retry_after_ceiling(Duration)` /
+`HarvestBuilder::worker(..)`): a hint above the ceiling clamps down rather than
+being rejected, and a zero/absent hint falls straight through to the policy's
+own delay — so leaving `retry_after` unset is byte-for-byte today's behaviour.
+A **non-retryable** failure (`ActivityFailure::non_retryable(..)`, or a policy
+`non_retryable_errors` match) always wins over any `retry_after` hint and
+routes to the terminal/DLQ path immediately, regardless of the delay hint.
+`retry_after` also composes with `schedule_to_close` above: if `now + hint`
+would cross the cross-retry deadline, the deadline-exceeded path fires
+(`ActivityTimedOut { ScheduleToClose }`) instead of requeuing at the hinted
+time. There is no new event variant and no replay impact — the hint only
+influences the transient `harvest_task_queue.scheduled_at` column, never
+`harvest_events`.
+
+**Interaction with a per-activity circuit breaker.** If the same activity also
+carries a `#[activity(circuit_breaker = ...)]` policy (issue #369), be aware
+that the breaker's rolling failure window only counts a failure toward
+tripping the circuit when it lands within `window` of the *prior* failure. A
+`retry_after` hint that regularly spaces consecutive attempts *wider* than the
+breaker's configured `window` can defeat trip detection entirely — the
+downstream may be persistently unhealthy, yet the breaker never opens because
+consecutive failures never land inside one rolling window. If you pair
+`retry_after` with a circuit breaker on the same activity, configure the
+breaker's `window` generously — wider than the largest `retry_after` hint (or
+the ceiling) you expect that downstream to ever send. See
+[the circuit-breaker runbook](../runbooks/activity-circuit-breaker.md) for the
+breaker's own configuration guidance.
+
 **Decision matrix — which timeout to use:**
 
 | Scenario | Use |
