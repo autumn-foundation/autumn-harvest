@@ -297,6 +297,20 @@ impl FromStr for ExecutionId {
 /// confused with a bare UUID string, so there is no deserialization
 /// ambiguity between the two variants regardless of declaration order.
 ///
+/// ## Extending this enum
+///
+/// `#[serde(untagged)]` tries each variant's `Deserialize` impl in
+/// declaration order until one succeeds, with no discriminator field to
+/// disambiguate. The current two variants are safe because their wire shapes
+/// are structurally disjoint (bare string vs. JSON object). **A future third
+/// addressing mode must preserve that disjointness** — its wire shape must
+/// not be satisfiable by a bare UUID string *or* by an object carrying
+/// exactly `workflow_name`/`workflow_id` string fields (a superset/subset
+/// overlap would either mis-route to the wrong variant or fail
+/// deserialization with a misleading "expected type" error naming the wrong
+/// variant). Any new variant must ship with a round-trip test proving no
+/// collision with the existing two, not just a variant-local test.
+///
 /// ## Examples
 ///
 /// ```rust

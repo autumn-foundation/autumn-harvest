@@ -420,6 +420,81 @@ async fn resolver_signal_terminal_current_run_is_not_running() {
     assert!(pending.is_empty(), "no signal should ever be queued");
 }
 
+#[tokio::test]
+async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
+    // No run in this file's other tests has more than one terminal row under
+    // a given (workflow_name, workflow_id); this proves the live SQL
+    // `ORDER BY started_at DESC` fallback genuinely picks the most-recently
+    // STARTED terminal row -- not the most-recently-inserted one, and not
+    // just whichever the pure `select_resolved_run` merge function would
+    // pick against fabricated structs.
+    //
+    // Only ONE row per (workflow_name, workflow_id) may ever hold a state
+    // OUTSIDE {CONTINUED_AS_NEW, TERMINATED} -- that's the DB-level partial
+    // unique index every OTHER helper in this file already relies on. So
+    // "genuinely multiple terminal candidates" is modelled the way it
+    // actually arises in production: a continue-as-new chain (each
+    // predecessor released to CONTINUED_AS_NEW) ending in one real terminal
+    // row. The chain is inserted in a DELIBERATELY non-chronological
+    // started_at order (the OLDEST-by-wall-clock-insert row is given the
+    // LARGEST started_at) so a resolver that used insertion/row-id order
+    // instead of `started_at` would pick the wrong row.
+    let _guard = TEST_MUTEX.lock().await;
+    let (url, _c) = setup_test_database_url().await;
+    let mut conn = connect(&url).await;
+
+    let now = chrono::Utc::now();
+    let workflow_id = "res-multi-terminal";
+
+    let predecessor_a = ExecutionId::new_for_shard(ShardId::new(0)); // inserted 1st, started_at newest -- must win
+    let predecessor_b = ExecutionId::new_for_shard(ShardId::new(0)); // inserted 2nd, started_at middle
+    let terminus = ExecutionId::new_for_shard(ShardId::new(0)); // inserted 3rd (last), started_at oldest
+
+    insert_running_row(&mut conn, "resolver_wf", workflow_id, predecessor_a).await;
+    diesel::update(harvest_workflow_executions::table.find(predecessor_a.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(1)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("release predecessor_a from the active-uniqueness index");
+
+    insert_running_row(&mut conn, "resolver_wf", workflow_id, predecessor_b).await;
+    diesel::update(harvest_workflow_executions::table.find(predecessor_b.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(3)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("release predecessor_b from the active-uniqueness index");
+
+    insert_running_row(&mut conn, "resolver_wf", workflow_id, terminus).await;
+    diesel::update(harvest_workflow_executions::table.find(terminus.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("FAILED"),
+            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(5)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seal the chain terminus (inserted last, started_at earliest)");
+
+    let resolved =
+        execution::resolve_execution_id_by_workflow_id(&mut conn, "resolver_wf", workflow_id)
+            .await
+            .expect("resolve should succeed")
+            .expect("a terminal run must resolve");
+
+    assert_eq!(
+        resolved.exec_id, predecessor_a,
+        "resolver must pick the terminal row with the most recent started_at \
+         (predecessor_a, CONTINUED_AS_NEW, -1h) -- not the FAILED terminus \
+         (-5h, inserted last) or the middle predecessor (-3h)"
+    );
+    assert_eq!(resolved.state, "CONTINUED_AS_NEW");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolver_signal_races_to_successor_exactly_mid_delivery() {
     // Deterministic, lock-choreographed proof of the exact race window (AC3):
@@ -1289,6 +1364,18 @@ fn e2e_assert_has_event(events: &[WorkflowEvent], name: &str) {
     );
 }
 
+fn e2e_assert_no_event(events: &[WorkflowEvent], name: &str) {
+    assert!(
+        !events.iter().any(|e| e.type_name() == name),
+        "expected NO {name} in history (self-targeting must be rejected before \
+         any event append -- AC6); got: {:?}",
+        events
+            .iter()
+            .map(WorkflowEvent::type_name)
+            .collect::<Vec<_>>()
+    );
+}
+
 // 1. Same-shard signal-by-id reaches the running target and delivers the
 //    payload (AC1 baseline sanity through the real worker + public API).
 #[tokio::test]
@@ -2088,6 +2175,14 @@ async fn worker_self_signal_by_id_rejected_end_to_end() {
         Some(serde_json::json!({"result": "failed", "reason_code": "self_signal"}))
     );
 
+    // AC6: self-targeting is rejected BEFORE any event append -- assert this
+    // directly against the recorded history, not just the workflow's output.
+    let mut conn = pool.get().await.unwrap();
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    e2e_assert_no_event(&history.events, "ExternalSignalRequested");
+    e2e_assert_no_event(&history.events, "ExternalSignalDelivered");
+    e2e_assert_no_event(&history.events, "ExternalSignalFailed");
+
     worker.shutdown();
     let _ = handle.await;
 }
@@ -2146,6 +2241,14 @@ async fn worker_self_cancel_by_id_rejected_end_to_end() {
         final_exec.output,
         Some(serde_json::json!({"result": "failed", "reason_code": "self_cancel"}))
     );
+
+    // AC6: self-targeting is rejected BEFORE any event append -- assert this
+    // directly against the recorded history, not just the workflow's output.
+    let mut conn = pool.get().await.unwrap();
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    e2e_assert_no_event(&history.events, "ExternalCancelRequested");
+    e2e_assert_no_event(&history.events, "ExternalCancelDelivered");
+    e2e_assert_no_event(&history.events, "ExternalCancelFailed");
 
     worker.shutdown();
     let _ = handle.await;
