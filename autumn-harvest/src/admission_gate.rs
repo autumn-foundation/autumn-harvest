@@ -28,13 +28,18 @@
 //! | [`EventBatch`](StartProducer::EventBatch) | gated-at-admission | gated at HTTP admission; deferred scanner fire is exempt-with-bypass-counter |
 //! | [`CompletionTriggerOutbox`](StartProducer::CompletionTriggerOutbox) | gated-at-relay | cross-shard relay, gated authoritatively at relay time on the target shard's real queue: blocks a matching gate (drops the row + counts blocked), else starts + counts the bypass |
 //! | [`Outbox`](StartProducer::Outbox) | exempt-by-design | relays already-committed in-flight work; increments the bypass counter |
+//! | [`Transactional`](StartProducer::Transactional) | gated | in-process caller-owned-transaction start (issue #763) checks the gate synchronously via `check_cached` (never fails closed, so a plugin-less embedder is unaffected); blocks a match when a plugin's gate cache is present |
 //!
 //! **Out of scope — in-flight continuation, not new admission.** The gate governs
 //! *new* workflow starts. It intentionally does NOT block continuation of work
 //! already admitted: workflow-level retry (issue #523), continue-as-new, child /
-//! detached-child spawn, reset forks, and the in-process typed-client handle all
-//! start executions without a gate check because they extend an already-accepted
-//! run rather than admit a new one. See `docs/operations/admission-gate-producers.md`.
+//! detached-child spawn, and reset forks all start executions without a gate
+//! check because they extend an already-accepted run rather than admit a new
+//! one. `WorkflowHandleClient::start_or_load` — the *older*, non-transactional
+//! in-process start method — is likewise ungated today; this is a separate,
+//! pre-existing gap distinct from `start_workflow_transactional` (issue #763,
+//! `Gated` — see the table above). See
+//! `docs/operations/admission-gate-producers.md`.
 //!
 //! The core completion-trigger path reaches the shared [`AdmissionGateCache`]
 //! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static (mirroring
@@ -551,11 +556,15 @@ pub enum StartProducer {
     CompletionTriggerOutbox,
     /// The transactional workflow-start outbox relay.
     Outbox,
+    /// The in-process transactional start API
+    /// ([`crate::handle::WorkflowHandleClient::start_workflow_transactional`],
+    /// issue #763) — stages a start on a caller-owned connection/transaction.
+    Transactional,
 }
 
 impl StartProducer {
     /// Every producer, for exhaustive iteration in the contract and tests.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Api,
         Self::BatchStart,
         Self::CompletionTrigger,
@@ -566,6 +575,7 @@ impl StartProducer {
         Self::EventBatch,
         Self::CompletionTriggerOutbox,
         Self::Outbox,
+        Self::Transactional,
     ];
 
     /// The stable, low-cardinality label string for metrics and the contract.
@@ -582,6 +592,7 @@ impl StartProducer {
             Self::EventBatch => "event_batch",
             Self::CompletionTriggerOutbox => "completion_trigger_outbox",
             Self::Outbox => "outbox",
+            Self::Transactional => "transactional",
         }
     }
 }
@@ -732,6 +743,21 @@ pub fn producer_contract() -> Vec<ProducerContractEntry> {
             rationale: "Relays workflow-start requests durably committed before the gate \
                         was raised; gating would drop already-accepted in-flight work. \
                         Each relayed start increments harvest.admission.bypassed{producer=\"outbox\"}.",
+        },
+        ProducerContractEntry {
+            producer: StartProducer::Transactional.as_str(),
+            status: Gated,
+            rationale: "Stages a start on a caller-owned connection/transaction outside the \
+                        HTTP boundary (issue #763). Checks the gate synchronously with \
+                        `check_cached` (not `check`) — like the outbound half of \
+                        WebhookDelegate — because this API is reachable without a running \
+                        `HarvestPlugin` in the process, and `check_cached` never fails \
+                        closed: it silently no-ops when no process-global gate cache was \
+                        ever published, so a standalone embedder who never wires up gates is \
+                        unaffected. When a plugin IS running in this process (the dominant \
+                        deployment shape) an active fleet-wide/queue/workflow-name gate \
+                        blocks a matching transactional start and counts \
+                        harvest.admission.blocked, exactly like every other gated producer.",
         },
     ]
 }
@@ -1348,6 +1374,8 @@ mod tests {
         assert!(labels.contains(&"event_batch"));
         assert!(labels.contains(&"completion_trigger_outbox"));
         assert!(labels.contains(&"outbox"));
+        assert!(labels.contains(&"scheduler"));
+        assert!(labels.contains(&"transactional"));
         // No duplicates (each label is a distinct metric series).
         let mut sorted = labels.clone();
         sorted.sort_unstable();
@@ -1422,6 +1450,16 @@ mod tests {
             .expect("throttle entry");
         assert_eq!(throttle.status, ProducerGateStatus::GatedAtRelay);
         assert!(!throttle.rationale.is_empty());
+        // The transactional in-process start (issue #763) is gated via
+        // `check_cached`, not exempt — see `start_workflow_transactional`'s
+        // doc comment for why `check_cached` (not `check`) is the right choice
+        // for a producer reachable without a running plugin.
+        let transactional = contract
+            .iter()
+            .find(|e| e.producer == "transactional")
+            .expect("transactional entry");
+        assert_eq!(transactional.status, ProducerGateStatus::Gated);
+        assert!(!transactional.rationale.is_empty());
     }
 
     #[test]

@@ -1012,6 +1012,11 @@ pub enum StartSource {
     Reset,
     /// Started by the cross-shard outbox dispatcher.
     Outbox,
+    /// Started atomically on a caller-owned Diesel connection/transaction via
+    /// [`crate::handle::WorkflowHandleClient::start_workflow_transactional`]
+    /// (issue #763), so the run commits or rolls back together with the
+    /// caller's own domain write.
+    Transactional,
     /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
     /// stored value). This is the default.
     #[default]
@@ -1038,6 +1043,7 @@ impl StartSource {
             Self::ContinueAsNew => "continue_as_new",
             Self::Reset => "reset",
             Self::Outbox => "outbox",
+            Self::Transactional => "transactional",
             Self::Unknown => "unknown",
         }
     }
@@ -1062,6 +1068,7 @@ impl StartSource {
             "continue_as_new" => Self::ContinueAsNew,
             "reset" => Self::Reset,
             "outbox" => Self::Outbox,
+            "transactional" => Self::Transactional,
             _ => Self::Unknown,
         }
     }
@@ -1761,6 +1768,7 @@ mod tests {
             StartSource::ContinueAsNew,
             StartSource::Reset,
             StartSource::Outbox,
+            StartSource::Transactional,
             StartSource::Unknown,
         ];
         for src in all {
@@ -1793,6 +1801,7 @@ mod tests {
             StartSource::SignalWithStart,
             StartSource::CompletionTrigger,
             StartSource::ContinueAsNew,
+            StartSource::Transactional,
             StartSource::Unknown,
         ];
         for src in cases {

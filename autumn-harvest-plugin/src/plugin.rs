@@ -1239,6 +1239,11 @@ async fn start_harvest_runtime(
     .with_codecs(payload_codecs)
     .with_shared_state(runner.api_runtime().registry().shared_state())
     .with_handlers(query_handlers, update_handlers)
+    // Issue #763: registered `WorkflowInfo`s so the in-process transactional
+    // start API can resolve defaults (execution_timeout, sla, concurrency key)
+    // and published input-schema validation, the same way the HTTP start
+    // route does.
+    .with_workflows(runner.api_runtime().registry().workflows.values().cloned())
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_chain_timeout(max_workflow_chain_timeout)

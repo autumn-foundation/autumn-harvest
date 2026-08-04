@@ -155,6 +155,10 @@ name = "child_with_timeout"
 name = "ctx_info"
 
 [[example]]
+name = "transactional_start_order"
+required-features = ["db"]
+
+[[example]]
 name = "wasm_activity"
 required-features = ["wasm-activities"]
 
