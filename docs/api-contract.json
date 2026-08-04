@@ -1550,7 +1550,11 @@
         },
         {
           "status": 404,
-          "description": "Execution not found."
+          "description": "Execution not found. Also returned when the id encodes a shard neither this node's pools nor the router know about (nothing here could host it)."
+        },
+        {
+          "status": 503,
+          "description": "The execution's owning shard could not be queried, so it is unknown whether it exists or was mutated (retriable -- this endpoint is idempotent, see the idempotency note above): the id encodes a shard this deployment knows about (router-readable or default) but which has no configured storage pool on this node -- the normal state mid a shard-add rollout -- or that shard's pool connection could not be acquired. Deliberately not a 404 (a false negative for an execution that may exist on its own shard) and never a silent write to the wrong database via the default-shard fallback other single-execution routes still use."
         },
         {
           "status": 500,
