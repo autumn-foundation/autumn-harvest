@@ -29,7 +29,7 @@ use autumn_harvest::context::{
 };
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{QueryReplayOutcome, drive_query_replay};
-use autumn_harvest::types::{ActivityExecId, ExecutionId, UpdateId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalTarget, UpdateId};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 
@@ -1153,7 +1153,7 @@ fn external_workflow_commands_report_targets() {
         },
         WorkflowCommand::SignalExternalWorkflow {
             signal_id: autumn_harvest::types::ExternalSignalId::new(),
-            target: signal_target,
+            target: ExternalTarget::ExecutionId(signal_target),
             signal_name: "release".into(),
             payload: Value::Null,
             result_tx: signal_tx,
@@ -1162,7 +1162,7 @@ fn external_workflow_commands_report_targets() {
         },
         WorkflowCommand::RequestCancelExternalWorkflow {
             cancel_id: autumn_harvest::types::ExternalCancelId::new(),
-            target: cancel_target,
+            target: ExternalTarget::ExecutionId(cancel_target),
             result_tx: cancel_tx,
             already_requested: false,
         },
@@ -1900,7 +1900,7 @@ fn history_only_reports_in_flight_external_signal_and_cancel() {
             ts(5),
             WorkflowEvent::ExternalSignalRequested {
                 signal_id: resolved_signal_id,
-                target: resolved_signal_target,
+                target: ExternalTarget::ExecutionId(resolved_signal_target),
                 signal_name: "ping".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -1916,7 +1916,7 @@ fn history_only_reports_in_flight_external_signal_and_cancel() {
             ts(10),
             WorkflowEvent::ExternalSignalRequested {
                 signal_id: open_signal_id,
-                target: open_signal_target,
+                target: ExternalTarget::ExecutionId(open_signal_target),
                 signal_name: "release".into(),
                 payload: Value::Null,
                 idempotency_key: None,
@@ -1926,7 +1926,7 @@ fn history_only_reports_in_flight_external_signal_and_cancel() {
             ts(20),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id: open_cancel_id,
-                target: open_cancel_target,
+                target: ExternalTarget::ExecutionId(open_cancel_target),
             },
         ),
     ];

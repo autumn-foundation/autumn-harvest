@@ -27,6 +27,8 @@
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 
+#[cfg(feature = "db")]
+use crate::types::ExternalTarget;
 use crate::types::{ExecutionId, ShardId};
 #[cfg(feature = "db")]
 use crate::worker::DbPool;
@@ -696,6 +698,59 @@ impl ShardRouter {
     }
 }
 
+/// Resolves the shard that owns `target` (issue #751).
+///
+/// For [`ExternalTarget::ExecutionId`] this is O(1) and always authoritative
+/// — the shard is encoded in the id itself, exactly like every other
+/// `ExecutionId`-keyed lookup in the engine.
+///
+/// For [`ExternalTarget::WorkflowId`] there is no execution id yet to decode,
+/// so the shard is derived by rendezvous-hashing `(workflow_name,
+/// workflow_id)` via [`ShardRouter::pick_for_new_workflow`] — the SAME hash a
+/// fresh start of that business key would land on **under the default
+/// [`ShardPlacement::Auto`] placement**. Every execution in a given
+/// `(workflow_name, workflow_id)` chain (including every continue-as-new
+/// successor, which is minted with [`ExecutionId::new_for_shard`] pinned to
+/// its predecessor's shard) then lives on this same shard, so resolving a
+/// `WorkflowId` target's owning shard needs no directory lookup for the
+/// overwhelming majority of workflows.
+///
+/// # Known limitation — explicit shard placement (issue #697)
+///
+/// This function has **no visibility into an explicit shard pin**
+/// (`ShardPlacement::Shard`/`ShardPlacement::ResidencyKey`) applied at start
+/// time. A workflow started with such a pin can live on a shard the pure
+/// hash never produces, and this function will silently return the WRONG
+/// shard for it — there is no directory of actual placements to consult, and
+/// adding one (or a cross-shard fan-out lookup) is a documented follow-up,
+/// out of scope for issue #751. Callers addressing a workflow by
+/// `(workflow_name, workflow_id)` should therefore only do so for workflows
+/// started under the default `Auto` placement; a workflow known to use
+/// explicit shard placement should be addressed by `ExecutionId` instead.
+///
+/// Returns `None` only when `target` is a `WorkflowId` and the process-global
+/// shard router has not been initialized (a boot-window / non-plugin-embedder
+/// edge case). Callers on this path already run inside an established shard
+/// connection, so the documented, accepted fallback — shared with every other
+/// `GLOBAL_SHARD_ROUTER` consumer (e.g. `completion_trigger.rs`) — is to
+/// treat this as "assume same shard as the caller", i.e. attempt inline
+/// resolution rather than deferring to the cross-shard outbox.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn external_target_owning_shard(target: &ExternalTarget) -> Option<ShardId> {
+    match target {
+        ExternalTarget::ExecutionId(id) => Some(id.shard()),
+        ExternalTarget::WorkflowId {
+            workflow_name,
+            workflow_id,
+        } => GLOBAL_SHARD_ROUTER
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .map(|router| router.pick_for_new_workflow(workflow_name, workflow_id)),
+    }
+}
+
 impl Default for ShardRouter {
     fn default() -> Self {
         Self::single()
@@ -861,6 +916,31 @@ impl ShardedDbPool {
             return self.pools.get(&self.default_shard);
         }
         self.pools.get(&shard)
+    }
+
+    /// Resolve the pool that owns `target` exactly, with no default fallback
+    /// (issue #751).
+    ///
+    /// For [`ExternalTarget::ExecutionId`] this delegates to
+    /// [`Self::exact_pool_for_execution`]. For [`ExternalTarget::WorkflowId`]
+    /// the owning shard is resolved via [`external_target_owning_shard`];
+    /// when that returns `None` (the process-global shard router isn't
+    /// initialized), `fallback_shard` is used instead — the same
+    /// "assume same shard as the caller" contract documented on
+    /// [`external_target_owning_shard`].
+    #[must_use]
+    pub fn exact_pool_for_target(
+        &self,
+        target: &ExternalTarget,
+        fallback_shard: ShardId,
+    ) -> Option<&DbPool> {
+        match target {
+            ExternalTarget::ExecutionId(id) => self.exact_pool_for_execution(*id),
+            ExternalTarget::WorkflowId { .. } => {
+                let shard = external_target_owning_shard(target).unwrap_or(fallback_shard);
+                self.exact_pool_for(shard)
+            }
+        }
     }
 
     /// Iterate over `(shard, pool)` pairs in ascending shard order.

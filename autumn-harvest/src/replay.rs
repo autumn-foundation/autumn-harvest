@@ -551,7 +551,7 @@ enum StashedSignalTerminal {
 #[derive(Debug, Clone)]
 struct StashedExternalSignal {
     signal_id: ExternalSignalId,
-    target: ExecutionId,
+    target: crate::types::ExternalTarget,
     signal_name: String,
     /// Durable payload from the recorded `ExternalSignalRequested` event.
     /// Carried through so that crash-recovery re-dispatch uses the same
@@ -576,7 +576,7 @@ enum StashedCancelTerminal {
 #[derive(Debug, Clone)]
 struct StashedExternalCancel {
     cancel_id: ExternalCancelId,
-    target: ExecutionId,
+    target: crate::types::ExternalTarget,
     terminal: Option<StashedCancelTerminal>,
 }
 
@@ -1019,7 +1019,7 @@ impl HistoryMatcher {
         &mut self,
         cursor: usize,
         signal_id: ExternalSignalId,
-        target: ExecutionId,
+        target: crate::types::ExternalTarget,
         signal_name: String,
         payload: Value,
         idempotency_key: Option<String>,
@@ -1207,7 +1207,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -1246,7 +1246,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -1470,7 +1470,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -1509,7 +1509,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -1901,7 +1901,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         self.cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -1943,7 +1943,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -2414,7 +2414,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -2453,7 +2453,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -2565,14 +2565,14 @@ impl HistoryMatcher {
     #[allow(clippy::too_many_lines)]
     pub fn match_external_signal(
         &mut self,
-        target: ExecutionId,
+        target: &crate::types::ExternalTarget,
         signal_name: &str,
     ) -> HistoryMatch {
         // Helper: drain a matching entry from the stash and return its result.
         let try_stash = |pending: &mut Vec<StashedExternalSignal>| {
             let pos = pending
                 .iter()
-                .position(|p| p.target == target && p.signal_name == signal_name)?;
+                .position(|p| p.target == *target && p.signal_name == signal_name)?;
             let stashed = pending.remove(pos);
             Some(match stashed.terminal {
                 Some(StashedSignalTerminal::Delivered) => HistoryMatch::Matched {
@@ -2648,7 +2648,7 @@ impl HistoryMatcher {
                 payload: recorded_payload,
                 idempotency_key: recorded_idempotency_key,
             } => {
-                if *recorded_target != target {
+                if *recorded_target != *target {
                     return HistoryMatch::Diverged {
                         expected: format!(
                             "ExternalSignalRequested(target={target}, signal={signal_name})"
@@ -2742,7 +2742,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -2858,7 +2858,7 @@ impl HistoryMatcher {
     /// - `Diverged` when the history event mismatches the expected target.
     /// - `NoMatch` when there is no history at or beyond the cursor.
     #[allow(clippy::too_many_lines)]
-    pub fn match_external_cancel(&mut self, target: ExecutionId) -> HistoryMatch {
+    pub fn match_external_cancel(&mut self, target: &crate::types::ExternalTarget) -> HistoryMatch {
         // prepare_match calls drain_early_signals which eagerly stashes any
         // ExternalCancel events sitting at the current cursor. Call it first so
         // the stash check below sees freshly drained events, mirroring
@@ -2870,7 +2870,7 @@ impl HistoryMatcher {
         if let Some(pos) = self
             .pending_external_cancels
             .iter()
-            .position(|s| s.target == target)
+            .position(|s| s.target == *target)
         {
             let stashed = self.pending_external_cancels.remove(pos);
             return match stashed.terminal {
@@ -2915,7 +2915,7 @@ impl HistoryMatcher {
             };
         };
 
-        if *recorded_target != target {
+        if *recorded_target != *target {
             return HistoryMatch::Diverged {
                 expected: format!("ExternalCancelRequested(target={target})"),
                 actual: format!("ExternalCancelRequested(target={recorded_target})"),
@@ -2992,7 +2992,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *sig_target,
+                        sig_target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -3026,7 +3026,7 @@ impl HistoryMatcher {
                 } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *other_id,
-                        target: *other_target,
+                        target: other_target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -3305,7 +3305,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *sig_target,
+                        sig_target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -3339,7 +3339,7 @@ impl HistoryMatcher {
                 } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *other_id,
-                        target: *other_target,
+                        target: other_target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -3632,7 +3632,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         signal_name.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -3674,7 +3674,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -4108,7 +4108,7 @@ impl HistoryMatcher {
                 self.stash_external_signal_request(
                     scan,
                     *signal_id,
-                    *target,
+                    target.clone(),
                     signal_name.clone(),
                     payload.clone(),
                     idempotency_key.clone(),
@@ -4146,7 +4146,7 @@ impl HistoryMatcher {
             WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                 let stashed = StashedExternalCancel {
                     cancel_id: *cancel_id,
-                    target: *target,
+                    target: target.clone(),
                     terminal: None,
                 };
                 self.pending_external_cancels.push(stashed);
@@ -4462,7 +4462,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         sn.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -4492,7 +4492,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     let stashed = StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     };
                     self.pending_external_cancels.push(stashed);
@@ -4982,7 +4982,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         sn.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -5014,7 +5014,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -5678,7 +5678,7 @@ impl HistoryMatcher {
                     self.stash_external_signal_request(
                         scan_cursor,
                         *signal_id,
-                        *target,
+                        target.clone(),
                         sn.clone(),
                         payload.clone(),
                         idempotency_key.clone(),
@@ -5709,7 +5709,7 @@ impl HistoryMatcher {
                 WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
                     self.pending_external_cancels.push(StashedExternalCancel {
                         cancel_id: *cancel_id,
-                        target: *target,
+                        target: target.clone(),
                         terminal: None,
                     });
                     self.consumed_signal_events.insert(scan_cursor);
@@ -10242,7 +10242,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
-                target,
+                target: crate::types::ExternalTarget::ExecutionId(target),
                 signal_name: "poke".into(),
                 payload: serde_json::json!({"n": 1}),
                 idempotency_key: None,
@@ -10258,7 +10258,8 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
 
         assert_eq!(
-            matcher.match_external_signal(target, "poke"),
+            matcher
+                .match_external_signal(&crate::types::ExternalTarget::ExecutionId(target), "poke"),
             HistoryMatch::Matched {
                 output: Value::Null
             }

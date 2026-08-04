@@ -20,7 +20,7 @@ use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayStatus, WorkflowReplayer,
 };
 use autumn_harvest::types::{
-    ActivityExecId, ExecutionId, ParentClosePolicy, TimerId, UpdateId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy, TimerId, UpdateId, WorkerId,
 };
 use chrono::Utc;
 use serde_json::Value;
@@ -5476,7 +5476,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
             idempotency_key: None,
@@ -5504,7 +5504,7 @@ fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
-            target,
+            target: ExternalTarget::ExecutionId(target),
             signal_name: "tenant_cancel".into(),
             payload: Value::Null,
             idempotency_key: None,
@@ -5562,7 +5562,11 @@ async fn replayer_replays_external_signal_delivered_successfully() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5602,7 +5606,11 @@ async fn replayer_detects_external_signal_name_mismatch() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5651,7 +5659,11 @@ async fn replayer_replays_external_signal_failed_history() {
     let target = events
         .iter()
         .find_map(|e| {
-            if let WorkflowEvent::ExternalSignalRequested { target, .. } = e {
+            if let WorkflowEvent::ExternalSignalRequested {
+                target: ExternalTarget::ExecutionId(target),
+                ..
+            } = e
+            {
                 Some(*target)
             } else {
                 None
@@ -5685,6 +5697,193 @@ async fn replayer_replays_external_signal_failed_history() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "external signal failed history should replay successfully when error is handled: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// External signal/cancel BY WORKFLOW_ID replay tests (issue #751)
+//
+// AC7 ("replay determinism preserved") for the by-id primitives: the
+// mechanism reuses `match_external_signal`/`match_external_cancel`, which
+// compare the whole `ExternalTarget` value (never the concrete resolved
+// `ExecutionId`) via `PartialEq` -- these fixtures exercise the
+// `ExternalTarget::WorkflowId { .. }` variant specifically, which the
+// pre-existing `external_signal_*_history` fixtures above never do (they
+// only cover `ExternalTarget::ExecutionId`).
+// ---------------------------------------------------------------------------
+
+/// Build a history with a `WorkflowId`-targeted `ExternalSignalRequested` +
+/// `ExternalSignalDelivered`.
+fn external_signal_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let signal_id = autumn_harvest::types::ExternalSignalId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target: ExternalTarget::WorkflowId {
+                workflow_name: "job_pool".into(),
+                workflow_id: "job-42".into(),
+            },
+            signal_name: "drain".into(),
+            payload: serde_json::json!({"reason": "rebalance"}),
+            idempotency_key: None,
+        },
+        WorkflowEvent::ExternalSignalDelivered { signal_id },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Workflow that signals an external workflow BY `workflow_id`, then returns Ok.
+fn external_signal_by_id_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _result = ctx
+            .signal_external_workflow_by_id(
+                "job_pool",
+                "job-42",
+                "drain",
+                serde_json::json!({"reason": "rebalance"}),
+            )
+            .await;
+        Ok(Value::Null)
+    })
+}
+
+/// Same as [`external_signal_by_id_workflow`] but targets a DIFFERENT
+/// `workflow_id` than what history recorded -- must diverge on replay.
+fn external_signal_by_id_wrong_target_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.signal_external_workflow_by_id(
+            "job_pool",
+            "job-99", // recorded history says "job-42"
+            "drain",
+            serde_json::json!({"reason": "rebalance"}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn replayer_replays_external_signal_by_id_delivered_successfully() {
+    let (_exec_id, events) = external_signal_by_id_delivered_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "external_signal_by_id_workflow",
+            external_signal_by_id_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "workflow_id-targeted external signal delivered history must replay cleanly: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replayer_detects_external_signal_by_id_target_mismatch() {
+    let (_exec_id, events) = external_signal_by_id_delivered_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "external_signal_by_id_wrong_target_workflow",
+            external_signal_by_id_wrong_target_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::NonDeterminismDetected {
+                kind: NonDeterminismKind::ExternalSignalMismatch,
+                ..
+            }
+        ),
+        "a workflow_id-targeted signal whose recorded ExternalTarget differs \
+         from the replaying code's target must trigger ExternalSignalMismatch, \
+         proving match_external_signal compares the whole ExternalTarget value \
+         on replay rather than silently accepting any target: {report}"
+    );
+}
+
+/// Build a history with a `WorkflowId`-targeted `ExternalCancelRequested` +
+/// `ExternalCancelDelivered`. There is no pre-existing `ExecutionId`-targeted
+/// analogue of this fixture anywhere in this file (the cancel primitive,
+/// issue #492, had no `WorkflowReplayer`-level replay test at all before
+/// issue #751) -- this closes that gap for both addressing modes at once.
+fn external_cancel_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ExternalCancelRequested {
+            cancel_id,
+            target: ExternalTarget::WorkflowId {
+                workflow_name: "job_pool".into(),
+                workflow_id: "job-42".into(),
+            },
+        },
+        WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Workflow that cancels an external workflow BY `workflow_id`, then returns Ok.
+fn external_cancel_by_id_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _result = ctx
+            .request_cancel_external_workflow_by_id("job_pool", "job-42")
+            .await;
+        Ok(Value::Null)
+    })
+}
+
+#[tokio::test]
+async fn replayer_replays_external_cancel_by_id_delivered_successfully() {
+    let (_exec_id, events) = external_cancel_by_id_delivered_history();
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "external_cancel_by_id_workflow",
+            external_cancel_by_id_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "workflow_id-targeted external cancel delivered history must replay cleanly: {report}"
     );
 }
 

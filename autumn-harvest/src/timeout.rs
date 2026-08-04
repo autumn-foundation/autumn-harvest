@@ -25,13 +25,13 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::execution::{
-    apply_parent_close_cascade, cancel_workflow_execution, cancel_workflow_execution_collect,
+    apply_parent_close_cascade, cancel_workflow_execution_collect,
     check_and_report_unfinished_handlers,
 };
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
 use crate::telemetry::MetricsRecorder;
-use crate::types::{ActivityExecId, ExecutionId};
+use crate::types::{ActivityExecId, ExecutionId, ExternalTarget};
 use crate::{queue, store};
 
 /// The reason a task was identified as timed out.
@@ -2083,6 +2083,93 @@ pub async fn enforce_workflow_sla_breaches(
     Ok(count)
 }
 
+/// Attempt one signal delivery to `target` on `conn` (issue #751).
+///
+/// Shared by `enforce_external_signals_outbox`'s same-pool and cross-pool
+/// branches so the `ExecutionId`-vs-`WorkflowId` dispatch logic exists in
+/// exactly one place. A database error is logged and reported as `Ok(None)`
+/// ("leave pending, retry on the next sweep") rather than propagated — a
+/// transient failure delivering to ONE row must not abort the scan of every
+/// other pending row.
+async fn attempt_signal_delivery(
+    conn: &mut AsyncPgConnection,
+    target: &ExternalTarget,
+    signal_id: crate::types::ExternalSignalId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+    not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
+) -> Option<WorkflowEvent> {
+    match target {
+        ExternalTarget::ExecutionId(target_id) => {
+            match crate::signal::send_signal_idempotent(
+                conn,
+                *target_id,
+                signal_name,
+                payload,
+                idempotency_key,
+            )
+            .await
+            {
+                // Delivered or deduped (idempotency-key collision): both
+                // mean the signal landed exactly once.
+                Ok(_delivered_or_deduped) => {
+                    Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+                }
+                Err(HarvestError::NotFound(_)) => not_found_terminal(),
+                Err(HarvestError::Database(e)) => {
+                    tracing::error!(error = %e, "outbox sweep: db error during signal delivery");
+                    None
+                }
+                Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code: "target_terminal".to_string(),
+                }),
+            }
+        }
+        ExternalTarget::WorkflowId {
+            workflow_name,
+            workflow_id,
+        } => match crate::signal::resolve_and_signal_by_workflow_id(
+            conn,
+            workflow_name,
+            workflow_id,
+            signal_name,
+            payload,
+            idempotency_key,
+        )
+        .await
+        {
+            Ok(crate::signal::ByIdSignalOutcome::Delivered) => {
+                Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
+            }
+            // No run has ever existed for this business key — subject to
+            // the same grace window as an `ExecutionId`'s `NotFound`.
+            Ok(crate::signal::ByIdSignalOutcome::NoRunFound) => not_found_terminal(),
+            // The current run for this business key is already terminal — a
+            // genuine, immediate failure (unlike cancel, a signal's goal is
+            // never already met by a terminal target), never gated by the
+            // grace window (issue #751 AC4).
+            Ok(crate::signal::ByIdSignalOutcome::NotRunning) => {
+                Some(WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code: "not_running".to_string(),
+                })
+            }
+            Err(HarvestError::Database(e)) => {
+                tracing::error!(error = %e, "outbox sweep: db error during by-id signal delivery");
+                None
+            }
+            // Raced to a CONTINUED_AS_NEW successor between resolution and
+            // this delivery attempt: leave pending — NEVER converted to a
+            // grace-window failure, since the target is definitely alive,
+            // just momentarily unresolvable (issue #751 AC2/AC3). Any other
+            // error is likewise left unresolved.
+            Ok(crate::signal::ByIdSignalOutcome::RacedToSuccessor) | Err(_) => None,
+        },
+    }
+}
+
 /// Enforce all currently expired task timeouts against the database state.
 ///
 /// This mutates queue rows and workflow history so timed-out tasks are not
@@ -2200,9 +2287,11 @@ pub async fn enforce_external_signals_outbox(
                             .and_then(|lock| lock.clone())
                     });
 
+                let caller_shard = caller_exec_id.shard();
+
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
                     if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for_target(&target, caller_shard),
                         pool.exact_pool_for_execution(caller_exec_id),
                     ) {
                         std::ptr::eq(t_pool, c_pool)
@@ -2212,38 +2301,24 @@ pub async fn enforce_external_signals_outbox(
                 });
 
                 let terminal_opt = if same_pool {
-                    match crate::signal::send_signal_idempotent(
+                    attempt_signal_delivery(
                         conn,
-                        target,
+                        &target,
+                        signal_id,
                         &signal_name,
                         payload.clone(),
                         idempotency_key.as_deref(),
+                        not_found_terminal,
                     )
                     .await
-                    {
-                        // Delivered or deduped (idempotency-key collision):
-                        // both mean the signal landed exactly once.
-                        Ok(_delivered_or_deduped) => {
-                            Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
-                        }
-                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                        Err(HarvestError::Database(e)) => {
-                            tracing::error!(error = %e, "outbox sweep: db error during local signal delivery");
-                            None
-                        }
-                        Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                            signal_id,
-                            reason_code: "target_terminal".to_string(),
-                        }),
-                    }
                 } else {
                     // Different pools, so we must have a target_pool resolved
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_execution(target))
+                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
                     else {
                         tracing::warn!(
-                            target_shard = %target.shard(),
+                            target_shard = ?crate::shard::external_target_owning_shard(&target),
                             "outbox sweep: target shard is not configured locally; leaving row locked/pending for other workers"
                         );
                         return Ok(Some((false, Some(row.id))));
@@ -2257,30 +2332,16 @@ pub async fn enforce_external_signals_outbox(
                         }
                     };
 
-                    match crate::signal::send_signal_idempotent(
+                    attempt_signal_delivery(
                         &mut target_conn,
-                        target,
+                        &target,
+                        signal_id,
                         &signal_name,
                         payload.clone(),
                         idempotency_key.as_deref(),
+                        not_found_terminal,
                     )
                     .await
-                    {
-                        // Delivered or deduped (idempotency-key collision):
-                        // both mean the signal landed exactly once.
-                        Ok(_delivered_or_deduped) => {
-                            Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
-                        }
-                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                        Err(HarvestError::Database(e)) => {
-                            tracing::error!(error = %e, "outbox sweep: db error during remote signal delivery");
-                            None
-                        }
-                        Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                            signal_id,
-                            reason_code: "target_terminal".to_string(),
-                        }),
-                    }
                 };
 
                 if let Some(terminal_event) = terminal_opt {
@@ -2335,6 +2396,109 @@ pub async fn enforce_external_signals_outbox(
     Ok(count)
 }
 
+/// Deferred trigger starts / unfinished-handler checks / terminal metrics
+/// collected while attempting a cancel delivery, bundled into one out-param
+/// so [`attempt_cancel_delivery`] stays under clippy's argument-count
+/// ceiling (issue #751).
+struct CancelDeliveryAccumulators {
+    deferred_starts: Vec<crate::completion_trigger::DeferredTriggerStart>,
+    deferred_checks: Vec<(ExecutionId, String)>,
+    cancel_metrics: Vec<(String, String)>,
+}
+
+/// Attempt one cancel delivery to `target` on `conn` (issue #751).
+///
+/// Shared by `enforce_external_cancels_outbox`'s same-pool and cross-pool
+/// branches so the `ExecutionId`-vs-`WorkflowId` dispatch logic exists in
+/// exactly one place. Always resolves through the `_collect`-style deferred
+/// path (never spawns triggers itself) — the caller is responsible for
+/// spawning `acc.deferred_starts`/`acc.deferred_checks`/`acc.cancel_metrics`
+/// once its own step transaction commits. This is correct for BOTH
+/// same-pool delivery (where deferral is required — the underlying work is
+/// a savepoint nested inside the caller's still-open transaction) and
+/// cross-pool delivery (where the underlying work already committed
+/// independently on its own connection by the time this function returns,
+/// so deferring a few microseconds longer costs nothing but keeps one
+/// uniform code path).
+///
+/// A database error is logged and reported as `None` ("leave pending, retry
+/// on the next sweep") rather than propagated — matching
+/// `attempt_signal_delivery`'s "one row's transient failure must not abort
+/// the scan" contract.
+async fn attempt_cancel_delivery(
+    conn: &mut AsyncPgConnection,
+    target: &ExternalTarget,
+    cancel_id: crate::types::ExternalCancelId,
+    reason: &str,
+    not_found_terminal: impl Fn() -> Option<WorkflowEvent>,
+    acc: &mut CancelDeliveryAccumulators,
+) -> Option<WorkflowEvent> {
+    match target {
+        ExternalTarget::ExecutionId(target_id) => {
+            match cancel_workflow_execution_collect(conn, *target_id, reason).await {
+                Ok((_cancelled, deferred, checks, metrics_opt)) => {
+                    acc.deferred_starts.extend(deferred);
+                    acc.deferred_checks.extend(checks);
+                    if let Some(m) = metrics_opt {
+                        acc.cancel_metrics.push(m);
+                    }
+                    Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                }
+                Err(HarvestError::NotFound(_)) => not_found_terminal(),
+                Err(HarvestError::Database(e)) => {
+                    tracing::error!(error = %e, "cancel outbox sweep: db error");
+                    None
+                }
+                // Other Err (already terminal) = no-op success.
+                Err(_) => Some(WorkflowEvent::ExternalCancelDelivered { cancel_id }),
+            }
+        }
+        ExternalTarget::WorkflowId {
+            workflow_name,
+            workflow_id,
+        } => {
+            match crate::execution::resolve_and_cancel_by_workflow_id(
+                conn,
+                workflow_name,
+                workflow_id,
+                reason,
+            )
+            .await
+            {
+                Ok(crate::execution::ByIdCancelOutcome::Cancelled {
+                    deferred,
+                    closed_children,
+                    metrics,
+                    ..
+                }) => {
+                    acc.deferred_starts.extend(deferred);
+                    acc.deferred_checks.extend(closed_children);
+                    if let Some(m) = metrics {
+                        acc.cancel_metrics.push(m);
+                    }
+                    Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                }
+                // Already terminal = no-op success (goal already met).
+                Ok(crate::execution::ByIdCancelOutcome::AlreadyTerminal) => {
+                    Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                }
+                Ok(crate::execution::ByIdCancelOutcome::NoRunFound) => not_found_terminal(),
+                Err(HarvestError::Database(e)) => {
+                    tracing::error!(
+                        error = %e,
+                        "cancel outbox sweep: db error during by-id cancel delivery"
+                    );
+                    None
+                }
+                // A live successor now exists; leave pending so a later sweep
+                // re-resolves and cancels the successor instead. Any other
+                // error is likewise left unresolved.
+                Ok(crate::execution::ByIdCancelOutcome::RacedToSuccessor) | Err(_) => None,
+            }
+        }
+    }
+}
+
 /// Scan for `ExternalCancelRequested` events without a matching terminal event
 /// and attempt cancel delivery (issue #492).
 ///
@@ -2344,16 +2508,25 @@ pub async fn enforce_external_signals_outbox(
 /// window resolve as `ExternalCancelFailed { reason_code: "target_unknown" }`.
 ///
 /// Per-step outcome: (processed, `skipped_event_id`, deferred trigger starts,
-/// (`workflow_name`, `queue_name`) of targets newly cancelled). The deferred
-/// starts and terminal metrics are spawned/recorded only after the step
-/// transaction commits so trigger workflows never start for a cancellation that
-/// later rolls back (issue #492).
+/// (`workflow_name`, `queue_name`) of targets newly cancelled, deferred
+/// unfinished-update-handler checks, the shard `conn` (the caller-shard
+/// connection) is bound to). The deferred starts and terminal metrics are
+/// spawned/recorded only after the step transaction commits so trigger
+/// workflows never start for a cancellation that later rolls back (issue
+/// #492). The trailing shard lets the post-commit loop route each deferred
+/// handler check to the connection that actually owns its execution id
+/// (issue #751 review, round 2): for a cross-shard cancellation the target
+/// (and any cascade-closed children) live on the TARGET shard, never on
+/// `conn`, so routing every check through `conn` unconditionally would
+/// silently see zero events and never report a genuinely unfinished update
+/// handler.
 type CancelStepOutcome = (
     bool,
     Option<i64>,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(String, String)>,
     Vec<(ExecutionId, String)>,
+    crate::types::ShardId,
 );
 
 #[allow(clippy::too_many_lines)]
@@ -2372,6 +2545,17 @@ pub async fn enforce_external_cancels_outbox(
     } else {
         shard_assignments.iter().map(|s| s.as_i32()).collect()
     };
+
+    // Resolved once, up front, for routing deferred unfinished-handler
+    // checks to the correct shard's connection after each step commits
+    // (issue #751 review, round 2). Mirrors the identical resolution
+    // performed per-attempt inside the step transaction below.
+    let outer_sharded_pool = sharded_pool.clone().or_else(|| {
+        crate::shard::GLOBAL_SHARDED_POOL
+            .read()
+            .ok()
+            .and_then(|lock| lock.clone())
+    });
 
     let mut excluded_event_ids: Vec<i64> = Vec::new();
 
@@ -2414,6 +2598,11 @@ pub async fn enforce_external_cancels_outbox(
                 };
 
                 let caller_exec_id = crate::types::ExecutionId::from_uuid(row.workflow_exec_id);
+                // Computed once, up front, so every early return below (and
+                // the deferred unfinished-handler-check routing after this
+                // step commits) can tell a same-shard check apart from a
+                // cross-shard one without re-deriving it (issue #751 review).
+                let caller_shard = caller_exec_id.shard();
 
                 let (cancel_id, target) = match codecs.decode_event(row.event_data.clone()) {
                     Ok(WorkflowEvent::ExternalCancelRequested { cancel_id, target }) => {
@@ -2421,11 +2610,11 @@ pub async fn enforce_external_cancels_outbox(
                     }
                     Ok(other) => {
                         tracing::error!(event = ?other, "cancel outbox sweep: query returned non-ExternalCancelRequested event");
-                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "cancel outbox sweep: failed to decode event_data");
-                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     }
                 };
 
@@ -2457,7 +2646,7 @@ pub async fn enforce_external_cancels_outbox(
 
                 let same_pool = active_sharded_pool.as_ref().is_none_or(|pool| {
                     if let (Some(t_pool), Some(c_pool)) = (
-                        pool.exact_pool_for_execution(target),
+                        pool.exact_pool_for_target(&target, caller_shard),
                         pool.exact_pool_for_execution(caller_exec_id),
                     ) {
                         std::ptr::eq(t_pool, c_pool)
@@ -2467,85 +2656,122 @@ pub async fn enforce_external_cancels_outbox(
                 });
 
                 // Completion-trigger / cascade follow-up starts + terminal
-                // metrics from a same-pool cancellation, spawned/recorded only
-                // after this step transaction commits (issue #492). The
-                // cross-shard branch cancels on an independent target
-                // connection, so its triggers spawn correctly against that
-                // connection's own committed transaction and need no deferral.
-                let mut deferred_starts: Vec<
-                    crate::completion_trigger::DeferredTriggerStart,
-                > = Vec::new();
-                let mut cancel_metrics: Vec<(String, String)> = Vec::new();
-                let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
+                // metrics, spawned/recorded only after this step transaction
+                // commits for SAME-POOL delivery (issue #492): that work runs
+                // as a nested savepoint on `conn` itself, so it genuinely
+                // rolls back with the outer transaction and must not be
+                // acted on before that transaction commits. `attempt_cancel_delivery`
+                // routes through the `_collect`-style deferred path (issue
+                // #751) uniformly for both branches, but CROSS-POOL delivery
+                // is handled differently below -- see the comment there.
+                let mut acc = CancelDeliveryAccumulators {
+                    deferred_starts: Vec::new(),
+                    deferred_checks: Vec::new(),
+                    cancel_metrics: Vec::new(),
+                };
 
+                let mut target_conn_opt = None;
                 let terminal_opt = if same_pool {
-                    match cancel_workflow_execution_collect(
+                    attempt_cancel_delivery(
                         conn,
-                        target,
+                        &target,
+                        cancel_id,
                         "cancelled by external request",
+                        not_found_terminal,
+                        &mut acc,
                     )
                     .await
-                    {
-                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                        Err(HarvestError::Database(e)) => {
-                            tracing::error!(error = %e, "cancel outbox sweep: db error");
-                            None
-                        }
-                        Ok((_cancelled, deferred, checks, metrics_opt)) => {
-                            deferred_starts.extend(deferred);
-                            deferred_checks.extend(checks);
-                            if let Some(m) = metrics_opt {
-                                cancel_metrics.push(m);
-                            }
-                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                        }
-                        // Other Err (already terminal) = no-op success.
-                        Err(_) => {
-                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                        }
-                    }
                 } else {
                     let Some(pool) = active_sharded_pool
                         .as_ref()
-                        .and_then(|p| p.exact_pool_for_execution(target))
+                        .and_then(|p| p.exact_pool_for_target(&target, caller_shard))
                     else {
                         tracing::warn!(
-                            target_shard = %target.shard(),
+                            target_shard = ?crate::shard::external_target_owning_shard(&target),
                             "cancel outbox sweep: target shard not configured locally; skipping"
                         );
-                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                        return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                     };
 
                     let mut target_conn = match pool.get().await {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new(), caller_shard)));
                         }
                     };
 
-                    match cancel_workflow_execution(
+                    let terminal = attempt_cancel_delivery(
                         &mut target_conn,
-                        target,
+                        &target,
+                        cancel_id,
                         "cancelled by external request",
-                        metrics,
+                        not_found_terminal,
+                        &mut acc,
                     )
-                    .await
-                    {
-                        Err(HarvestError::NotFound(_)) => not_found_terminal(),
-                        Err(HarvestError::Database(e)) => {
-                            tracing::error!(
-                                error = %e,
-                                "cancel outbox sweep: db error (remote shard)"
-                            );
-                            None
-                        }
-                        // Ok or other Err (already terminal) = no-op success.
-                        Ok(_) | Err(_) => {
-                            Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
-                        }
-                    }
+                    .await;
+                    // Keep the target connection open past this branch: for
+                    // cross-pool delivery, `attempt_cancel_delivery`'s work
+                    // already committed independently on `target_conn` by
+                    // the time it returned above (a real, top-level Postgres
+                    // commit, unlike the same-pool savepoint) -- nothing
+                    // that happens afterward on the unrelated `conn`
+                    // transaction can roll it back. Its follow-ups are
+                    // therefore handled immediately below, using this same
+                    // connection, rather than deferred past `conn`'s commit
+                    // (issue #751 review, round 3).
+                    target_conn_opt = Some(target_conn);
+                    terminal
                 };
+
+                let CancelDeliveryAccumulators {
+                    deferred_starts,
+                    deferred_checks,
+                    cancel_metrics,
+                } = acc;
+
+                // Deferring a cross-pool cancellation's follow-ups past the
+                // caller-side outer transaction's commit would lose them
+                // permanently if that (unrelated) transaction subsequently
+                // failed: a retry re-attempts delivery against an
+                // already-terminal target, whose `AlreadyTerminal` outcome
+                // contributes no new checks/metrics of its own. Acting on
+                // them right here -- while `target_conn` is still open --
+                // means they can never be dropped this way (issue #751
+                // review, round 3).
+                let (deferred_starts, deferred_checks, cancel_metrics) =
+                    if let Some(mut target_conn) = target_conn_opt {
+                        for start in deferred_starts {
+                            start.spawn();
+                        }
+                        for (exec_id, workflow_name) in deferred_checks {
+                            if let Err(e) = check_and_report_unfinished_handlers(
+                                &mut target_conn,
+                                exec_id,
+                                &workflow_name,
+                                Some(metrics),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    exec_id = %exec_id,
+                                    err = %e,
+                                    "cancel outbox sweep: failed to check unfinished update handlers on target shard"
+                                );
+                            }
+                        }
+                        for (workflow_name, queue_name) in cancel_metrics {
+                            crate::telemetry::emit_workflow_terminal(
+                                metrics,
+                                &workflow_name,
+                                &queue_name,
+                                crate::telemetry::WorkflowStatus::Cancelled,
+                            );
+                        }
+                        (Vec::new(), Vec::new(), Vec::new())
+                    } else {
+                        (deferred_starts, deferred_checks, cancel_metrics)
+                    };
 
                 if let Some(terminal_event) = terminal_opt {
                     let outcome = match &terminal_event {
@@ -2569,29 +2795,110 @@ pub async fn enforce_external_cancels_outbox(
                     .await?;
                     queue::wake_workflow_task(conn, caller_exec_id).await?;
                     metrics.record_external_cancel_sent(outcome, reason_code.as_deref());
-                    Ok(Some((true, None, deferred_starts, cancel_metrics, deferred_checks)))
+                    Ok(Some((true, None, deferred_starts, cancel_metrics, deferred_checks, caller_shard)))
                 } else {
-                    Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks)))
+                    Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks, caller_shard)))
                 }
             }))
             .await;
 
         match step_res {
-            Ok(Some((processed, skipped_id, deferred_starts, cancel_metrics, deferred_checks))) => {
+            Ok(Some((
+                processed,
+                skipped_id,
+                deferred_starts,
+                cancel_metrics,
+                deferred_checks,
+                caller_shard,
+            ))) => {
                 // The step transaction has committed: now spawn trigger/cascade
                 // follow-up starts and record terminal metrics for same-pool
                 // cancellations (issue #492).
                 for start in deferred_starts {
                     start.spawn();
                 }
-                for check in deferred_checks {
-                    let _ = check_and_report_unfinished_handlers(
-                        conn,
-                        check.0,
-                        &check.1,
-                        Some(metrics),
-                    )
-                    .await;
+                // Route each deferred unfinished-handler check to whichever
+                // connection actually owns its execution id (issue #751
+                // review, round 2). A same-shard check reuses the
+                // already-committed `conn` directly (and must — re-acquiring
+                // a second connection from that same pool while `conn` is
+                // still held would self-deadlock a pool of size 1, matching
+                // issue #688's precedent). A cross-shard check (the target
+                // and any cascade-closed children of a cross-shard
+                // cancellation, which live only on the target shard) gets a
+                // fresh connection to that shard's own pool.
+                //
+                // "Same shard" here means "resolves to the same *pool*", not
+                // a raw `ShardId` equality check (issue #751 review, round
+                // 5): a legacy/pre-sharding caller execution carries
+                // `ShardId::UNENCODED`, which `exact_pool_for_execution`
+                // correctly resolves to the default shard's pool via its own
+                // fallback -- but a raw `exec_id.shard() == caller_shard`
+                // comparison would treat that as cross-shard even against an
+                // *encoded* default-shard execution physically served by the
+                // identical pool, taking the `pool.get()` branch below and
+                // self-deadlocking under the same pool-size-1 configuration
+                // this whole routing exists to protect. `pool_for(shard)`
+                // (with its own default-shard fallback) applied to
+                // `caller_shard` is a faithful, `ShardId`-only stand-in for
+                // `exact_pool_for_execution(caller_exec_id)` -- both consult
+                // only `.shard()` internally, so the two are provably
+                // equivalent without needing `caller_exec_id` itself here.
+                for (exec_id, workflow_name) in deferred_checks {
+                    let same_pool_as_caller = outer_sharded_pool.as_ref().is_none_or(|pool| {
+                        pool.exact_pool_for_execution(exec_id)
+                            .is_some_and(|e_pool| std::ptr::eq(e_pool, pool.pool_for(caller_shard)))
+                    });
+                    if same_pool_as_caller {
+                        if let Err(e) = check_and_report_unfinished_handlers(
+                            conn,
+                            exec_id,
+                            &workflow_name,
+                            Some(metrics),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                exec_id = %exec_id,
+                                err = %e,
+                                "cancel outbox sweep: failed to check unfinished update handlers"
+                            );
+                        }
+                    } else if let Some(pool) = outer_sharded_pool
+                        .as_ref()
+                        .and_then(|p| p.exact_pool_for_execution(exec_id))
+                    {
+                        match pool.get().await {
+                            Ok(mut target_conn) => {
+                                if let Err(e) = check_and_report_unfinished_handlers(
+                                    &mut target_conn,
+                                    exec_id,
+                                    &workflow_name,
+                                    Some(metrics),
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        exec_id = %exec_id,
+                                        err = %e,
+                                        "cancel outbox sweep: failed to check unfinished update handlers on target shard"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    exec_id = %exec_id,
+                                    error = %e,
+                                    "cancel outbox sweep: failed to acquire target-shard connection for unfinished-handler check"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            exec_id = %exec_id,
+                            "cancel outbox sweep: target shard for unfinished-handler check not configured locally; skipping"
+                        );
+                    }
                 }
                 for (workflow_name, queue_name) in cancel_metrics {
                     crate::telemetry::emit_workflow_terminal(

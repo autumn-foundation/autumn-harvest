@@ -1743,7 +1743,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::MarkerRecorded {
                 name: "after-cancel".into(),
                 details: Value::Null,
@@ -1776,7 +1779,10 @@ mod tests {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: crate::types::ExternalTarget::ExecutionId(target),
+            },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
         ];
 
