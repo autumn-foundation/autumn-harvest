@@ -2424,6 +2424,247 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
     );
 }
 
+/// A minimal [`MetricsRecorder`] that captures every terminal-observability
+/// call the cross-pool cancel-by-id follow-up path can make: the deferred
+/// unfinished-update-handler check, the cancel-terminal metric, and the
+/// (later, caller-side) "external cancel sent" metric. Used by the round-3
+/// review test below to prove the terminal-shard follow-ups are recorded
+/// immediately -- before the caller-side outer transaction has any chance
+/// to fail and discard them.
+#[derive(Default)]
+struct CrossPoolFollowupRecorder {
+    unfinished_handler: std::sync::Mutex<Vec<(String, u64)>>,
+    terminal: std::sync::Mutex<Vec<(String, String, autumn_harvest::telemetry::WorkflowStatus)>>,
+    external_cancel_sent: std::sync::Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for CrossPoolFollowupRecorder {
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, _kind: &str, count: u64) {
+        self.unfinished_handler
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), count));
+    }
+
+    fn record_workflow_terminal(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        outcome: autumn_harvest::telemetry::WorkflowStatus,
+    ) {
+        self.terminal
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), queue.to_string(), outcome));
+    }
+
+    fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        self.external_cancel_sent
+            .lock()
+            .unwrap()
+            .push((outcome.to_string(), reason_code.map(str::to_string)));
+    }
+}
+
+// 7c. Issue #751 code review (round 3, P2): a cross-shard cancel's target-side
+//     commit is real and irrevocable the instant `attempt_cancel_delivery`
+//     returns for the cross-pool branch -- it runs on a *fresh* connection
+//     with its own top-level `conn.transaction(...)` wrap, not a savepoint on
+//     the caller's outer transaction. If the accumulated follow-ups
+//     (unfinished-handler check, terminal metric, deferred trigger starts)
+//     are deferred past the *caller-side* outer transaction's own commit,
+//     an unrelated failure of that caller-side transaction (e.g. the
+//     `store::append_events`/`queue::wake_workflow_task` call erroring, here
+//     forced by seeding the caller's history with an undecodable third row)
+//     discards them permanently: a retry sees the target as already
+//     `AlreadyTerminal`, which produces no new checks/metrics of its own.
+//
+//     This test proves the fix: the target-shard follow-ups must be recorded
+//     immediately after the target-side commit -- using the still-open
+//     target connection -- rather than deferred past the (here, deliberately
+//     failing) caller-side transaction.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (url_a, _container_a) = setup_test_database_url().await;
+    let (url_b, _container_b) = setup_test_database_url().await;
+    let pool_a = build_test_pool(&url_a);
+    let pool_b = build_test_pool(&url_b);
+
+    let router = autumn_harvest::shard::ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    autumn_harvest::shard::install_global_router(router.clone());
+
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_a.clone());
+    pools.insert(ShardId::new(1), pool_b.clone());
+    let sharded_pool = autumn_harvest::shard::ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let (target_exec_id, caller_exec_id) =
+        e2e_cross_shard_ids(&router, "cross_can_followup_target", "ccfu-target-1");
+    assert_ne!(
+        target_exec_id.shard(),
+        caller_exec_id.shard(),
+        "test setup must guarantee a genuine cross-shard pairing"
+    );
+
+    // Seed the target on its own (physically separate) shard's database:
+    // RUNNING, with an admitted update handler that never resolved -- so the
+    // deferred unfinished-handler check has something genuine to report.
+    let mut target_conn = sharded_pool
+        .pool_for(target_exec_id.shard())
+        .get()
+        .await
+        .unwrap();
+    insert_running_row(
+        &mut target_conn,
+        "cross_can_followup_target",
+        "ccfu-target-1",
+        target_exec_id,
+    )
+    .await;
+    let update_id = autumn_harvest::types::UpdateId::new();
+    store::append_events(
+        &mut target_conn,
+        target_exec_id,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "approve".to_string(),
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed target history");
+
+    // Seed the caller with a pending `ExternalCancelRequested` targeting the
+    // business key above, PLUS a deliberately undecodable third event row --
+    // wrong `event_type` so the outbox's own scanning query (which filters on
+    // `event_type = 'ExternalCancelRequested'`) still finds row #2 normally,
+    // but malformed `event_data` so the LATER, full-history
+    // `lock_workflow_execution_and_load_history` call -- which only runs
+    // *after* the cross-pool target commit has already happened -- fails
+    // deterministically while decoding it. This reproduces "caller-side
+    // outer transaction fails after the target-side commit already
+    // succeeded" with no timing/race dependency at all.
+    let mut caller_conn = sharded_pool
+        .pool_for(caller_exec_id.shard())
+        .get()
+        .await
+        .unwrap();
+    insert_running_row(
+        &mut caller_conn,
+        "cross_can_followup_caller",
+        "ccfu-caller-1",
+        caller_exec_id,
+    )
+    .await;
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    store::append_events(
+        &mut caller_conn,
+        caller_exec_id,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: autumn_harvest::types::ExternalTarget::WorkflowId {
+                    workflow_name: "cross_can_followup_target".to_string(),
+                    workflow_id: "ccfu-target-1".to_string(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+    diesel::insert_into(autumn_harvest::schema::harvest_events::table)
+        .values(&autumn_harvest::models::NewHarvestEvent {
+            workflow_exec_id: caller_exec_id.as_uuid(),
+            event_id: 3,
+            event_type: "SomeBogusUnknownVariant",
+            event_data: serde_json::json!({"type": "SomeBogusUnknownVariant", "data": {}}),
+        })
+        .execute(&mut caller_conn)
+        .await
+        .expect("seed deliberately undecodable third row");
+
+    let recorder = Arc::new(CrossPoolFollowupRecorder::default());
+    let outcome = autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        recorder.as_ref(),
+        Duration::from_secs(60),
+        &Some(sharded_pool),
+        &[caller_exec_id.shard()],
+    )
+    .await;
+
+    // The caller-side outer transaction must genuinely fail -- proving the
+    // failure mode this test reproduces is real, not accidentally absorbed.
+    assert!(
+        outcome.is_err(),
+        "expected the caller-side outer transaction to fail while decoding \
+         the deliberately undecodable third event row; got: {outcome:?}"
+    );
+
+    // The target must still be durably CANCELLED on its own database: the
+    // cross-pool commit already happened independently and must not be
+    // rolled back by the unrelated, later-failing caller-side transaction.
+    let target_after = harvest_workflow_executions::table
+        .find(target_exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut target_conn)
+        .await
+        .expect("load target after cancel");
+    assert_eq!(
+        target_after.state, "CANCELLED",
+        "the target-side commit must be irrevocable regardless of what \
+         happens later on the unrelated caller-side transaction"
+    );
+
+    // The regression: the deferred unfinished-handler check and the
+    // cancel-terminal metric must have been recorded immediately after the
+    // target-side commit -- NOT deferred past the caller-side transaction,
+    // which fails here and would otherwise have discarded them permanently.
+    let unfinished_calls = recorder.unfinished_handler.lock().unwrap().clone();
+    assert_eq!(
+        unfinished_calls,
+        vec![("cross_can_followup_target".to_string(), 1)],
+        "the unfinished-handler check must be recorded immediately, before \
+         the failing caller-side commit, not discarded with it; \
+         got: {unfinished_calls:?}"
+    );
+    let terminal_calls = recorder.terminal.lock().unwrap().clone();
+    assert_eq!(
+        terminal_calls,
+        vec![(
+            "cross_can_followup_target".to_string(),
+            "default".to_string(),
+            autumn_harvest::telemetry::WorkflowStatus::Cancelled,
+        )],
+        "the cancel-terminal metric must be recorded immediately, before \
+         the failing caller-side commit, not discarded with it; \
+         got: {terminal_calls:?}"
+    );
+
+    // `record_external_cancel_sent` is only ever called on the caller side,
+    // after the (here, failing) history load/append -- it must NOT have
+    // fired, confirming execution genuinely never reached that later step.
+    let external_cancel_sent_calls = recorder.external_cancel_sent.lock().unwrap().clone();
+    assert!(
+        external_cancel_sent_calls.is_empty(),
+        "record_external_cancel_sent must not fire once the caller-side \
+         history load/append has failed; got: {external_cancel_sent_calls:?}"
+    );
+}
+
 // 8. AC6 end-to-end: signalling own `(workflow_name, workflow_id)` is
 //    rejected immediately, with no DB round trip needed for the rejection
 //    itself — the workflow completes cleanly, surfacing the typed

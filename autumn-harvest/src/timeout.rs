@@ -2657,16 +2657,20 @@ pub async fn enforce_external_cancels_outbox(
 
                 // Completion-trigger / cascade follow-up starts + terminal
                 // metrics, spawned/recorded only after this step transaction
-                // commits (issue #492). `attempt_cancel_delivery` always
+                // commits for SAME-POOL delivery (issue #492): that work runs
+                // as a nested savepoint on `conn` itself, so it genuinely
+                // rolls back with the outer transaction and must not be
+                // acted on before that transaction commits. `attempt_cancel_delivery`
                 // routes through the `_collect`-style deferred path (issue
-                // #751), so this deferral is uniform for both same-pool and
-                // cross-pool delivery.
+                // #751) uniformly for both branches, but CROSS-POOL delivery
+                // is handled differently below -- see the comment there.
                 let mut acc = CancelDeliveryAccumulators {
                     deferred_starts: Vec::new(),
                     deferred_checks: Vec::new(),
                     cancel_metrics: Vec::new(),
                 };
 
+                let mut target_conn_opt = None;
                 let terminal_opt = if same_pool {
                     attempt_cancel_delivery(
                         conn,
@@ -2697,7 +2701,7 @@ pub async fn enforce_external_cancels_outbox(
                         }
                     };
 
-                    attempt_cancel_delivery(
+                    let terminal = attempt_cancel_delivery(
                         &mut target_conn,
                         &target,
                         cancel_id,
@@ -2705,7 +2709,19 @@ pub async fn enforce_external_cancels_outbox(
                         not_found_terminal,
                         &mut acc,
                     )
-                    .await
+                    .await;
+                    // Keep the target connection open past this branch: for
+                    // cross-pool delivery, `attempt_cancel_delivery`'s work
+                    // already committed independently on `target_conn` by
+                    // the time it returned above (a real, top-level Postgres
+                    // commit, unlike the same-pool savepoint) -- nothing
+                    // that happens afterward on the unrelated `conn`
+                    // transaction can roll it back. Its follow-ups are
+                    // therefore handled immediately below, using this same
+                    // connection, rather than deferred past `conn`'s commit
+                    // (issue #751 review, round 3).
+                    target_conn_opt = Some(target_conn);
+                    terminal
                 };
 
                 let CancelDeliveryAccumulators {
@@ -2713,6 +2729,49 @@ pub async fn enforce_external_cancels_outbox(
                     deferred_checks,
                     cancel_metrics,
                 } = acc;
+
+                // Deferring a cross-pool cancellation's follow-ups past the
+                // caller-side outer transaction's commit would lose them
+                // permanently if that (unrelated) transaction subsequently
+                // failed: a retry re-attempts delivery against an
+                // already-terminal target, whose `AlreadyTerminal` outcome
+                // contributes no new checks/metrics of its own. Acting on
+                // them right here -- while `target_conn` is still open --
+                // means they can never be dropped this way (issue #751
+                // review, round 3).
+                let (deferred_starts, deferred_checks, cancel_metrics) =
+                    if let Some(mut target_conn) = target_conn_opt {
+                        for start in deferred_starts {
+                            start.spawn();
+                        }
+                        for (exec_id, workflow_name) in deferred_checks {
+                            if let Err(e) = check_and_report_unfinished_handlers(
+                                &mut target_conn,
+                                exec_id,
+                                &workflow_name,
+                                Some(metrics),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    exec_id = %exec_id,
+                                    err = %e,
+                                    "cancel outbox sweep: failed to check unfinished update handlers on target shard"
+                                );
+                            }
+                        }
+                        for (workflow_name, queue_name) in cancel_metrics {
+                            crate::telemetry::emit_workflow_terminal(
+                                metrics,
+                                &workflow_name,
+                                &queue_name,
+                                crate::telemetry::WorkflowStatus::Cancelled,
+                            );
+                        }
+                        (Vec::new(), Vec::new(), Vec::new())
+                    } else {
+                        (deferred_starts, deferred_checks, cancel_metrics)
+                    };
 
                 if let Some(terminal_event) = terminal_opt {
                     let outcome = match &terminal_event {
