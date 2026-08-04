@@ -2259,6 +2259,171 @@ async fn worker_cross_shard_cancel_external_workflow_by_id() {
     let _ = handle.await;
 }
 
+/// A minimal [`MetricsRecorder`] that only captures
+/// `record_workflow_unfinished_handlers` calls, for asserting the exact
+/// `(workflow_name, count)` the deferred unfinished-handler check reports.
+#[derive(Default)]
+struct UnfinishedHandlerRecorder {
+    calls: std::sync::Mutex<Vec<(String, u64)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for UnfinishedHandlerRecorder {
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, _kind: &str, count: u64) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((workflow_name.to_string(), count));
+    }
+}
+
+// 7b. Issue #751 code review (round 2, P2): a cross-shard cancel's deferred
+//     unfinished-update-handler check must run against the connection that
+//     actually owns the checked execution id, not unconditionally against
+//     the caller's own shard connection -- otherwise the check silently sees
+//     zero events (the target's rows simply are not on that physical
+//     database) and never reports a genuinely unfinished update handler.
+//
+//     Unlike the other `worker_cross_shard_*` tests in this file, this test
+//     deliberately uses TWO GENUINELY SEPARATE physical databases (two
+//     independent `setup_test_database_url()` calls) rather than one
+//     Postgres instance shared by two logical shard ids: the bug only
+//     manifests when the wrong connection cannot physically see the
+//     target's rows at all, which a shared-physical-database "cross-shard"
+//     setup can never reproduce (every row lives in the one database
+//     regardless of which logical connection reads it).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (url_a, _container_a) = setup_test_database_url().await;
+    let (url_b, _container_b) = setup_test_database_url().await;
+    let pool_a = build_test_pool(&url_a);
+    let pool_b = build_test_pool(&url_b);
+
+    let router = autumn_harvest::shard::ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    autumn_harvest::shard::install_global_router(router.clone());
+
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), pool_a.clone());
+    pools.insert(ShardId::new(1), pool_b.clone());
+    let sharded_pool = autumn_harvest::shard::ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let (target_exec_id, caller_exec_id) =
+        e2e_cross_shard_ids(&router, "cross_can_unfinished_target", "cchu-target-1");
+    assert_ne!(
+        target_exec_id.shard(),
+        caller_exec_id.shard(),
+        "test setup must guarantee a genuine cross-shard pairing"
+    );
+
+    // Seed the target on ITS OWN (physically separate) shard's database:
+    // RUNNING, with an admitted update handler that never resolved.
+    let mut target_conn = sharded_pool
+        .pool_for(target_exec_id.shard())
+        .get()
+        .await
+        .unwrap();
+    insert_running_row(
+        &mut target_conn,
+        "cross_can_unfinished_target",
+        "cchu-target-1",
+        target_exec_id,
+    )
+    .await;
+    let update_id = autumn_harvest::types::UpdateId::new();
+    store::append_events(
+        &mut target_conn,
+        target_exec_id,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "approve".to_string(),
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed target history");
+
+    // Seed the caller on its own shard's database with a pending
+    // `ExternalCancelRequested` targeting the business key above -- exactly
+    // the durable row `enforce_external_cancels_outbox` scans for.
+    let mut caller_conn = sharded_pool
+        .pool_for(caller_exec_id.shard())
+        .get()
+        .await
+        .unwrap();
+    insert_running_row(
+        &mut caller_conn,
+        "cross_can_unfinished_caller",
+        "cchu-caller-1",
+        caller_exec_id,
+    )
+    .await;
+    let cancel_id = autumn_harvest::types::ExternalCancelId::new();
+    store::append_events(
+        &mut caller_conn,
+        caller_exec_id,
+        &[
+            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id,
+                target: autumn_harvest::types::ExternalTarget::WorkflowId {
+                    workflow_name: "cross_can_unfinished_target".to_string(),
+                    workflow_id: "cchu-target-1".to_string(),
+                },
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("seed caller history");
+
+    let recorder = Arc::new(UnfinishedHandlerRecorder::default());
+    let processed = autumn_harvest::timeout::enforce_external_cancels_outbox(
+        &mut caller_conn,
+        recorder.as_ref(),
+        Duration::from_secs(60),
+        &Some(sharded_pool),
+        &[caller_exec_id.shard()],
+    )
+    .await
+    .expect("cancel outbox sweep should succeed");
+    assert_eq!(
+        processed, 1,
+        "exactly one cancel-by-id delivery should be processed"
+    );
+
+    // The target must actually be CANCELLED on its own database.
+    let target_after = harvest_workflow_executions::table
+        .find(target_exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut target_conn)
+        .await
+        .expect("load target after cancel");
+    assert_eq!(target_after.state, "CANCELLED");
+
+    // The regression: the deferred unfinished-handler check must have run
+    // against the TARGET's shard and reported the genuinely unfinished
+    // `approve` update -- not silently seen zero events because it ran on
+    // the caller's (wrong, physically separate) connection.
+    let calls = recorder.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![("cross_can_unfinished_target".to_string(), 1)],
+        "the unfinished-handler check must run against the target's own \
+         shard and report exactly the one still-admitted update handler; \
+         got: {calls:?}"
+    );
+}
+
 // 8. AC6 end-to-end: signalling own `(workflow_name, workflow_id)` is
 //    rejected immediately, with no DB round trip needed for the rejection
 //    itself — the workflow completes cleanly, surfacing the typed
