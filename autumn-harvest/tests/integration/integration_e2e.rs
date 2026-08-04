@@ -75,6 +75,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
     "\n",
+    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
+    // strict XOR kind_check from the migration above must be relaxed to an OR.
+    include_str!("../../migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
+    "\n",
     include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
     "\n",
     include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
