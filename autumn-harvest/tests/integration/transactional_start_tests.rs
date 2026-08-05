@@ -1361,6 +1361,301 @@ async fn idempotency_key_is_not_burned_by_a_rolled_back_start() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Committed-replay probe ordering & configured window (PR review findings).
+//
+// A code-review pass on this PR found two real bugs in `start_workflow_transactional`:
+// (1) the idempotency-key dedup check ran *after* the fresh-start-only
+//     validation (schema, debounce/batch/throttle rejection), so a retry of
+//     an already-committed keyed start could be spuriously rejected by a
+//     rule that only makes sense for a genuinely fresh admission if that
+//     rule had changed (or newly applied) since the original delivery; and
+// (2) the reserve step hardcoded `DEFAULT_START_IDEMPOTENCY_WINDOW` (24h)
+//     instead of the client's configured
+//     `WorkflowHandleClient::with_start_idempotency_window`, silently
+//     ignoring an operator's shorter (or longer) configured window.
+//
+// Both mirror the already-established issue #808 invariant the HTTP start
+// route enforces (`probe_committed_start_replay` runs before every
+// fresh-start-only rejection, and reads `api_state.start_idempotency_window()`
+// rather than the hardcoded default) -- these tests prove the in-process
+// `start_workflow_transactional` path now matches it.
+// ---------------------------------------------------------------------------
+
+/// Finding (1): a retry of an already-committed keyed start must dedupe even
+/// when the target workflow's published input schema has *tightened* since
+/// the original delivery. Two separate clients simulate the drift: the first
+/// (used for the original delivery) has no schema attached to
+/// `t763_plain_workflow`; the second (used for the retry) attaches a schema
+/// the very same raw input would fail if validation genuinely ran. Both
+/// point at the same database and register the same handler function under
+/// the same name, so the `(workflow_name, idempotency_key)` dedup key
+/// resolves identically for both.
+#[tokio::test]
+async fn committed_replay_dedupes_despite_a_schema_that_tightened_since_the_original_delivery() {
+    let (database_url, _container) = setup_database().await;
+    let key = "checkout-schema-drift-1";
+    let order_id = "order-schema-drift-1";
+    // Missing "amount_cents" -- `order_input_schema()` would reject this if
+    // it were ever checked against it.
+    let input = serde_json::json!({"order_id": order_id});
+
+    let lenient_client =
+        WorkflowHandleClient::single(build_pool(&database_url), database_url.clone())
+            .with_workflows(vec![t763_plain_workflow_info()]);
+
+    let mut conn = connect(&database_url).await;
+    let first = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = lenient_client.clone();
+        let input = input.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    order_id,
+                    input,
+                    TransactionalStartOptions::new().with_idempotency_key(key),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("first (schema-free) keyed start must succeed");
+    assert!(first.created);
+
+    let strict_client =
+        WorkflowHandleClient::single(build_pool(&database_url), database_url.clone())
+            .with_workflows(vec![
+                t763_plain_workflow_info().with_input_schema_fn(order_input_schema),
+            ]);
+
+    let mut conn2 = connect(&database_url).await;
+    let retry = Box::pin(conn2.transaction::<_, HarvestError, _>({
+        let client = strict_client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    order_id,
+                    input,
+                    TransactionalStartOptions::new().with_idempotency_key(key),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect(
+        "the retry must dedupe to the already-committed run, not be rejected by a schema \
+         that only exists on the retrying client -- a schema/input mismatch on a duplicate \
+         must never surface as InputValidationFailed",
+    );
+
+    assert_eq!(
+        retry.exec_id, first.exec_id,
+        "the retry must resolve to the SAME execution as the original delivery"
+    );
+    assert!(
+        !retry.created,
+        "the retry must report created = false (it is a replay, not a fresh start)"
+    );
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(
+        execution_row_count(&mut fresh, order_id).await,
+        1,
+        "exactly one execution row must exist"
+    );
+}
+
+/// Finding (1), the debounce disjunct: a retry of an already-committed keyed
+/// start must dedupe even when the target workflow has *gained* a debounce
+/// policy since the original delivery -- the debounce/batch/throttle
+/// deferred-admission rejection only applies to a genuinely fresh start.
+#[tokio::test]
+async fn committed_replay_dedupes_despite_a_debounce_policy_gained_since_the_original_delivery() {
+    let (database_url, _container) = setup_database().await;
+    let key = "checkout-debounce-drift-1";
+    let order_id = "order-debounce-drift-1";
+    let input = serde_json::json!({"order_id": order_id, "amount_cents": 1});
+
+    let no_policy_client =
+        WorkflowHandleClient::single(build_pool(&database_url), database_url.clone())
+            .with_workflows(vec![t763_plain_workflow_info()]);
+
+    let mut conn = connect(&database_url).await;
+    let first = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = no_policy_client.clone();
+        let input = input.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    order_id,
+                    input,
+                    TransactionalStartOptions::new().with_idempotency_key(key),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("first (policy-free) keyed start must succeed");
+    assert!(first.created);
+
+    let now_debounced_client =
+        WorkflowHandleClient::single(build_pool(&database_url), database_url.clone())
+            .with_workflows(vec![t763_plain_workflow_info().with_debounce(
+                autumn_harvest::debounce::DebouncePolicy {
+                    key_expr: "input.order_id",
+                    window: Duration::from_secs(10),
+                    max_wait: None,
+                },
+            )]);
+
+    let mut conn2 = connect(&database_url).await;
+    let retry = Box::pin(conn2.transaction::<_, HarvestError, _>({
+        let client = now_debounced_client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    order_id,
+                    input,
+                    TransactionalStartOptions::new().with_idempotency_key(key),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect(
+        "the retry must dedupe to the already-committed run, not be rejected by the \
+         debounce deferred-admission guard, which only applies to a genuinely fresh start",
+    );
+
+    assert_eq!(retry.exec_id, first.exec_id);
+    assert!(!retry.created);
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(execution_row_count(&mut fresh, order_id).await, 1);
+}
+
+/// Finding (2): the idempotency dedup window must be the CLIENT's configured
+/// [`WorkflowHandleClient::with_start_idempotency_window`], not the hardcoded
+/// `DEFAULT_START_IDEMPOTENCY_WINDOW` (24h). Proven by backdating the
+/// reservation 5 minutes -- past a short 60-second configured window, but
+/// still well inside the 24h default -- and asserting the retry is treated
+/// as EXPIRED (a genuinely fresh execution), which could only happen if the
+/// short window is actually consulted; under the pre-fix hardcoded default
+/// this same backdate would still be "live" and the retry would wrongly
+/// dedupe.
+///
+/// The two calls use **different `workflow_id`s** (mirroring
+/// `idempotency_key_deduplicates_two_committed_starts`) so the ONLY possible
+/// source of a dedupe is the idempotency-key reservation itself, never the
+/// orthogonal `workflow_id`-based reuse-policy collision (which would
+/// legitimately attach to a still-non-terminal first execution regardless of
+/// the idempotency window, since no worker runs in this test to complete
+/// it) -- that confound would otherwise mask whichever window is actually
+/// consulted.
+#[tokio::test]
+async fn keyed_retry_honors_the_clients_configured_idempotency_window_not_the_hardcoded_default() {
+    let (database_url, _container) = setup_database().await;
+    let key = "checkout-window-1";
+    let first_workflow_id = "order-window-a";
+    let retry_workflow_id = "order-window-b";
+
+    let short_window_client =
+        WorkflowHandleClient::single(build_pool(&database_url), database_url.clone())
+            .with_workflows(vec![t763_plain_workflow_info()])
+            .with_start_idempotency_window(Duration::from_secs(60));
+    assert_eq!(
+        short_window_client.start_idempotency_window(),
+        Duration::from_secs(60)
+    );
+
+    let mut conn = connect(&database_url).await;
+    let first = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = short_window_client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    first_workflow_id,
+                    serde_json::json!({"order_id": first_workflow_id, "amount_cents": 1}),
+                    TransactionalStartOptions::new().with_idempotency_key(key),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("first keyed start must succeed");
+    assert!(first.created);
+
+    // Backdate the reservation 5 minutes -- past the configured 60-second
+    // window, but still well inside the hardcoded 24h default. If the
+    // hardcoded default were still consulted (the bug this test guards
+    // against), the retry below would wrongly dedupe to `first` even though
+    // it targets a completely different `workflow_id`.
+    let mut admin = connect(&database_url).await;
+    diesel::sql_query(
+        "UPDATE harvest_start_idempotency SET created_at = now() - interval '5 minutes' \
+         WHERE workflow_name = $1 AND idempotency_key = $2",
+    )
+    .bind::<Text, _>("t763_plain_workflow")
+    .bind::<Text, _>(key)
+    .execute(&mut admin)
+    .await
+    .expect("backdate must succeed");
+
+    let mut conn2 = connect(&database_url).await;
+    let retry = Box::pin(conn2.transaction::<_, HarvestError, _>({
+        let client = short_window_client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    retry_workflow_id,
+                    serde_json::json!({"order_id": retry_workflow_id, "amount_cents": 1}),
+                    TransactionalStartOptions::new().with_idempotency_key(key),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("retry past the configured window must still succeed, as a fresh start");
+
+    assert_ne!(
+        retry.exec_id, first.exec_id,
+        "the retry must be treated as a genuinely new start once the CLIENT's configured \
+         (short) window has elapsed -- it must not dedupe under the hardcoded 24h default"
+    );
+    assert!(
+        retry.created,
+        "an expired-window retry must create a fresh execution, not attach"
+    );
+    assert_eq!(
+        retry.workflow_id, retry_workflow_id,
+        "the fresh execution must carry the retry's own workflow_id, proving it was not an \
+         attach to the first execution under a different guise"
+    );
+
+    let mut fresh = connect(&database_url).await;
+    let total = count_rows(
+        &mut fresh,
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_id LIKE 'order-window-%'",
+    )
+    .await;
+    assert_eq!(
+        total, 2,
+        "two independent execution rows must exist once the short window expired"
+    );
+}
+
 #[tokio::test]
 async fn schema_validation_failure_aborts_without_writing_anything() {
     let (database_url, _container) = setup_database().await;

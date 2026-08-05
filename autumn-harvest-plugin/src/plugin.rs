@@ -1054,6 +1054,13 @@ async fn start_harvest_runtime(
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
     let default_debounce_max_wait = built.worker_config().default_debounce_max_wait;
+    // Issue #763 review (Codex finding): the transactional-start idempotency
+    // dedup window must honor the operator's configured
+    // `HarvestBuilder::start_idempotency_window`, the same value the HTTP
+    // start route and the purge scanner already use (see `api_state.set_start_idempotency_window`
+    // and `start_idempotency::set_purge_window_secs` above) -- not a hardcoded
+    // default.
+    let start_idempotency_window = built.start_idempotency_window;
     // Pre-flight: reject a multi-shard WorkerConfig before spawning any background
     // tasks.  The plugin configures WorkflowHandleClient with only shard-0's
     // LISTEN/NOTIFY URL; workflows hashed to non-zero shards would fail
@@ -1253,6 +1260,9 @@ async fn start_harvest_runtime(
     .with_history_policy(runner.api_runtime().registry().history_policy())
     .with_default_debounce_max_wait(default_debounce_max_wait)
     .with_max_workflow_attempts(max_workflow_attempts)
+    // Issue #763 review: use the operator-configured idempotency window for
+    // transactional-start dedup, matching the HTTP start route.
+    .with_start_idempotency_window(start_idempotency_window)
     // Issue #684: wire the engine recorder so the in-process typed-update path
     // emits harvest.update.admitted, matching the HTTP/UI admission paths.
     .with_metrics(runner.api_runtime().registry().telemetry().metrics.clone());

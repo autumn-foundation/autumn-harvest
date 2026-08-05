@@ -23,7 +23,7 @@ use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, check_and_report_unfinished_handlers,
+    cancel_workflow_execution, check_and_report_unfinished_handlers, load_execution,
     start_or_load_workflow_execution, start_or_load_workflow_execution_collect,
     terminate_workflow_execution,
 };
@@ -32,8 +32,8 @@ use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
 use crate::schema::harvest_workflow_executions;
 use crate::shard::{ShardPlacement, ShardRouter, ShardedDbPool};
 use crate::start_idempotency::{
-    DEFAULT_START_IDEMPOTENCY_WINDOW, StartIdempotencyReservation, repoint_start_idempotency_claim,
-    reserve_start_idempotency,
+    StartIdempotencyReservation, lookup_live_start_idempotency_claim,
+    repoint_start_idempotency_claim, reserve_start_idempotency,
 };
 use crate::types::{
     ExecutionId, ShardId, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
@@ -192,6 +192,17 @@ struct WorkflowHandleClientInner {
     default_debounce_max_wait: Duration,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
     max_workflow_attempts: Option<u32>,
+    /// Idempotency-key dedup retention window for
+    /// [`WorkflowHandleClient::start_workflow_transactional`] (issue #763 review).
+    /// Must mirror the operator-configured `HarvestBuilder::start_idempotency_window`
+    /// that the HTTP start route and the purge scanner already honor -- a
+    /// transactional-start client that used a different window than the HTTP
+    /// route would dedupe a keyed retry for a shorter or longer time than the
+    /// operator configured. Defaults to
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] when the
+    /// client is built without an explicit
+    /// [`WorkflowHandleClient::with_start_idempotency_window`] call.
+    start_idempotency_window: Duration,
     /// Engine metrics recorder (issue #684). Wired by the runtime so the
     /// in-process update path (`execute_update_in_process`) can emit
     /// `harvest.update.admitted` at admission, matching the HTTP/UI paths.
@@ -228,6 +239,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("history_policy", &self.history_policy)
             .field("default_debounce_max_wait", &self.default_debounce_max_wait)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("start_idempotency_window", &self.start_idempotency_window)
             .field("metrics", &"<MetricsRecorder>")
             .finish()
     }
@@ -291,6 +303,8 @@ impl WorkflowHandleClient {
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
                 default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
                 max_workflow_attempts: None,
+                start_idempotency_window:
+                    crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
                 metrics: Arc::new(crate::telemetry::NoOpMetrics),
             }),
         }
@@ -474,6 +488,33 @@ impl WorkflowHandleClient {
         }
     }
 
+    /// Get the idempotency-key dedup retention window used by
+    /// [`WorkflowHandleClient::start_workflow_transactional`] (issue #763).
+    ///
+    /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
+    /// unless overridden with [`Self::with_start_idempotency_window`].
+    #[must_use]
+    pub fn start_idempotency_window(&self) -> Duration {
+        self.inner.start_idempotency_window
+    }
+
+    /// Set the idempotency-key dedup retention window for
+    /// [`WorkflowHandleClient::start_workflow_transactional`] (issue #763 review).
+    ///
+    /// This should mirror the operator-configured
+    /// `HarvestBuilder::start_idempotency_window` value the HTTP start route
+    /// and the purge scanner already use -- a mismatched window means a
+    /// transactionally-started keyed retry dedupes for a different duration
+    /// than a plain HTTP-started one.
+    #[must_use]
+    pub fn with_start_idempotency_window(self, window: Duration) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.start_idempotency_window = window;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
@@ -643,6 +684,28 @@ impl WorkflowHandleClient {
         input: Value,
         options: TransactionalStartOptions,
     ) -> HarvestResult<TransactionalStartOutcome> {
+        // Issue #763 review (Codex finding): a committed-replay probe must run
+        // BEFORE any fresh-start-only rejection -- the same issue #808
+        // invariant `autumn-harvest-plugin::api::start_workflow` documents and
+        // enforces at the HTTP boundary via `probe_committed_start_replay`.
+        // Without this, a retry of an already-committed keyed start could be
+        // rejected by a rule that only makes sense for a *fresh* admission --
+        // e.g. the target workflow's published input schema tightened, or it
+        // gained a debounce/batch/throttle policy, since the original
+        // delivery -- even though the retry is replaying an already-succeeded
+        // start, not attempting a new one. `conn` is definitionally the shard
+        // this idempotency claim lives on (the same connection the caller
+        // intends to write the start to, per this method's own shard
+        // contract), so no separate shard resolution is needed here, unlike
+        // the HTTP layer's own probe.
+        if let Some(key) = options.idempotency_key.as_deref()
+            && let Some(outcome) = self
+                .probe_transactional_committed_replay(conn, workflow_name, key)
+                .await
+        {
+            return Ok(outcome);
+        }
+
         let info = self.validate_transactional_start_request(
             workflow_name,
             workflow_id,
@@ -748,6 +811,65 @@ impl WorkflowHandleClient {
                 checks: deferred_checks,
                 cancel_metrics,
             },
+        })
+    }
+
+    /// Read-only committed-replay probe for a keyed transactional start
+    /// (issue #763 review). Mirrors
+    /// `autumn-harvest-plugin::api::probe_committed_start_replay`: on a hit
+    /// this returns the already-committed execution's identity directly,
+    /// without ever reaching [`Self::validate_transactional_start_request`]
+    /// (schema validation, the debounce/batch/throttle rejection) or the
+    /// reserve/start path -- so a retry of an already-succeeded keyed start
+    /// can never be rejected by a rule meant only for a genuinely fresh
+    /// admission.
+    ///
+    /// Returns `None` on a probe miss: no live claim for `key`, the claimed
+    /// row vanished between the claim lookup and this read, or the lookup
+    /// itself errored. In every miss case the caller falls through to the
+    /// normal validate-then-reserve-then-start path, which re-reserves /
+    /// reclaims as needed -- exactly the same graceful-degradation posture
+    /// the HTTP-layer probe uses.
+    ///
+    /// No audit row is written here, matching every other call site in this
+    /// file (including the in-transaction `StartIdempotencyReservation::Duplicate`
+    /// arm inside [`Self::start_workflow_transactional_idempotent`], which
+    /// resolves the identical "already started" outcome and likewise writes
+    /// none): audit logging is an HTTP/management-API concern this in-process
+    /// client does not currently own.
+    async fn probe_transactional_committed_replay(
+        &self,
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        key: &str,
+    ) -> Option<TransactionalStartOutcome> {
+        let claim_exec_id = lookup_live_start_idempotency_claim(
+            conn,
+            workflow_name,
+            key,
+            self.inner.start_idempotency_window.as_secs_f64(),
+        )
+        .await
+        .ok()??;
+        // `lookup_live_start_idempotency_claim` JOINs to the execution row, so
+        // a `Some` claim implies the row existed at lookup time; re-read it
+        // for the exact `(workflow_id, state)` to echo. A `NotFound` here
+        // (the row vanished in the interim, e.g. retention) is treated as a
+        // probe miss, not an error -- the normal path below re-reserves.
+        let execution = load_execution(conn, claim_exec_id).await.ok()?;
+        Some(TransactionalStartOutcome {
+            exec_id: claim_exec_id,
+            workflow_name: workflow_name.to_string(),
+            workflow_id: execution.workflow_id,
+            state: execution.state,
+            created: false,
+            client: self.clone(),
+            // The shard the claimed execution actually lives on, not
+            // `options.shard` -- a probe hit never produces deferred
+            // follow-ups (below), so this is inert for `finish()` today, but
+            // it is the semantically correct value if that ever changes.
+            shard: claim_exec_id.shard(),
+            deferred: PendingStartFollowUps::default(),
         })
     }
 
@@ -958,7 +1080,14 @@ impl WorkflowHandleClient {
                 idempotency_key,
                 new_exec_id,
                 shard_id,
-                DEFAULT_START_IDEMPOTENCY_WINDOW.as_secs_f64(),
+                // Issue #763 review (Codex finding): use the client's
+                // configured window (defaults to
+                // `DEFAULT_START_IDEMPOTENCY_WINDOW`, overridable via
+                // `WorkflowHandleClient::with_start_idempotency_window`), not
+                // the hardcoded default directly -- must match the operator's
+                // `HarvestBuilder::start_idempotency_window`, which the HTTP
+                // start route and the purge scanner already honor.
+                self.inner.start_idempotency_window.as_secs_f64(),
             )
             .await?
             {
