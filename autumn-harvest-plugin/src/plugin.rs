@@ -1251,6 +1251,13 @@ async fn start_harvest_runtime(
     // and published input-schema validation, the same way the HTTP start
     // route does.
     .with_workflows(runner.api_runtime().registry().workflows.values().cloned())
+    // Issue #763 review ("Carry the default queue on the handle client"): the
+    // SAME runtime-carried queue list `POST /workflows/{name}/start` resolves
+    // its own default queue from, so a start with no explicit
+    // `TransactionalStartOptions::queue_name` lands on a queue this fleet's
+    // workers actually poll instead of the (possibly unset or stale)
+    // process-global default.
+    .with_queues(runner.api_runtime().queues().iter().map(String::as_str))
     .with_max_workflow_input_bytes(max_workflow_input_bytes)
     .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
     .with_max_workflow_chain_timeout(max_workflow_chain_timeout)

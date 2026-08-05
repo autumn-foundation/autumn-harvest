@@ -403,6 +403,28 @@ async fn task_queue_row_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId
     .n
 }
 
+/// Reads back the `queue_name` column on the initial dispatchable
+/// `harvest_task_queue` row for a transactionally-started workflow — used by
+/// the "Carry the default queue on the handle client" review-finding tests
+/// below to prove which queue a start with no explicit
+/// `TransactionalStartOptions::queue_name` override actually resolved to.
+async fn task_queue_row_queue_name(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct QueueNameRow {
+        #[diesel(sql_type = Text)]
+        queue_name: String,
+    }
+    diesel::sql_query(
+        "SELECT queue_name FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .get_result::<QueueNameRow>(conn)
+    .await
+    .expect("task queue row queue_name query")
+    .queue_name
+}
+
 #[derive(diesel::QueryableByName)]
 struct ExecutionColumns {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
@@ -957,6 +979,117 @@ async fn plain_workflow_with_no_declared_policies_gets_no_defaults() {
         load_task_concurrency(&mut fresh, outcome.exec_id).await;
     assert!(concurrency_key.is_none());
     assert!(concurrency_cap.is_none());
+}
+
+/// Codex review (issue #763), "Carry the default queue on the handle
+/// client": the falsifying proof. `resolve_transactional_queue_name` used to
+/// fall back to the process-global `completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE`
+/// static when a start supplied no explicit `TransactionalStartOptions::queue_name`
+/// — a static that is write-once-if-unset and first-writer-wins for the whole
+/// process, so it goes stale the moment a SECOND, differently-configured
+/// runtime is built in the same process after an earlier one already
+/// initialized it (exactly the finding's named "second runtime after an
+/// earlier one initialized the global" scenario).
+///
+/// This test reproduces that scenario directly: it pre-poisons the global
+/// with a queue name that belongs to nobody real (`stale-global-queue`,
+/// simulating an unrelated earlier runtime), then builds a client carrying
+/// its OWN, different queue list via `.with_queues(...)` (mirroring how the
+/// plugin's production wiring in `autumn-harvest-plugin/src/plugin.rs` now
+/// threads `runtime.api_runtime().queues()` through). A start with no
+/// explicit per-call override must land on the CLIENT's own configured queue
+/// — never the stale global, and never the literal `"default"`.
+///
+/// Under the pre-fix code this assertion fails (it resolves to
+/// `stale-global-queue`, the poisoned global), which is exactly why this is
+/// the decisive regression test for the fix rather than merely exercising
+/// the new code path.
+#[tokio::test]
+async fn queue_defaults_to_the_clients_own_configured_queue_not_a_stale_process_global() {
+    let (database_url, _container) = setup_database().await;
+
+    // Simulate an earlier, unrelated runtime having already initialized the
+    // process-global default queue static to a value that belongs to no real
+    // worker fleet in this test.
+    {
+        let mut lock = autumn_harvest::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE
+            .write()
+            .expect("global default queue lock must not be poisoned");
+        *lock = Some("stale-global-queue".to_string());
+    }
+
+    let client =
+        single_shard_client(&database_url).with_queues(["priority-orders", "fallback-queue"]);
+    let mut conn = connect(&database_url).await;
+
+    let outcome = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    "order-client-queue-1",
+                    serde_json::json!({"order_id": "order-client-queue-1", "amount_cents": 1}),
+                    TransactionalStartOptions::new(),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("start must succeed");
+
+    // Restore the global immediately so this poisoning cannot leak into any
+    // other test in the same `--test-threads=1` process.
+    {
+        let mut lock = autumn_harvest::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE
+            .write()
+            .expect("global default queue lock must not be poisoned");
+        *lock = None;
+    }
+
+    let mut fresh = connect(&database_url).await;
+    let resolved_queue = task_queue_row_queue_name(&mut fresh, outcome.exec_id).await;
+    assert_eq!(
+        resolved_queue, "priority-orders",
+        "the start must resolve to the client's own first configured queue, never the stale \
+         process global (\"stale-global-queue\") and never the literal \"default\""
+    );
+}
+
+/// Companion to the test above: with no `.with_queues(...)` call at all (the
+/// plain `single_shard_client` helper every other test in this file uses),
+/// a start with no explicit per-call override must still fall through to the
+/// literal `"default"` — the same final fallback the HTTP
+/// `POST /workflows/{name}/start` route uses. Guards the innermost fallback
+/// tier against an accidental future regression now that the process-global
+/// fallback tier has been removed entirely.
+#[tokio::test]
+async fn queue_falls_back_to_the_literal_default_with_no_configured_queues() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+    let mut conn = connect(&database_url).await;
+
+    let outcome = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    "order-default-queue-1",
+                    serde_json::json!({"order_id": "order-default-queue-1", "amount_cents": 1}),
+                    TransactionalStartOptions::new(),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("start must succeed");
+
+    let mut fresh = connect(&database_url).await;
+    let resolved_queue = task_queue_row_queue_name(&mut fresh, outcome.exec_id).await;
+    assert_eq!(resolved_queue, "default");
 }
 
 #[tokio::test]

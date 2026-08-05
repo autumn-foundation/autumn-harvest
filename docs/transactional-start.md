@@ -80,9 +80,21 @@ register it via `.with_workflows([fulfill_order_info()])` when constructing the
 the same defaults (execution timeout, SLA, per-key concurrency, published input
 schema) that `POST /workflows/{name}/start` resolves.
 
+It should also know the fleet's task queues via `.with_queues([...])`, in
+priority order. A start that supplies no explicit
+`TransactionalStartOptions::with_queue_name(...)` resolves its queue from the
+client's own `queues.first()` — the same source `POST /workflows/{name}/start`
+resolves its default from. Skip this call only when every worker in the fleet
+genuinely polls the literal `"default"` queue; the `HarvestPlugin` embedding
+wires it automatically from the runtime's own configured queue list, so this
+is only something you set by hand when constructing a `WorkflowHandleClient`
+outside the plugin (for example, a process that hosts nothing but this client,
+with its worker fleet running entirely in a separate deployment).
+
 ```rust
 let client = WorkflowHandleClient::single(pool, notification_url)
-    .with_workflows([fulfill_order_info()]);
+    .with_workflows([fulfill_order_info()])
+    .with_queues(["order-fulfillment"]);
 ```
 
 When the call returns `Ok(outcome)`:
@@ -271,6 +283,12 @@ yet. If your use case needs one of them, that is the extension point.
   `WorkflowHandleClient::with_workflows([...])` with every workflow you intend
   to start this way. An unregistered name is rejected with
   `HarvestError::Config` before any database call.
+- **The client's queue list should match its worker fleet.** Call
+  `WorkflowHandleClient::with_queues([...])` (in priority order) so a start
+  with no explicit `TransactionalStartOptions::with_queue_name(...)` resolves
+  to a queue this fleet's workers actually poll. Without it, an un-queue-named
+  start falls back to the literal `"default"` — silently wrong if nothing
+  polls that queue. See item 5 below, "Queue resolution."
 - **A multi-shard client requires `TransactionalStartOptions::with_shard(...)`.**
   See "In a sharded deployment" above.
 - **Keep the transaction short.** The caller's own domain write and the start
@@ -350,6 +368,19 @@ organized cheapest-and-most-decisive first:
    it, so a later failure on that same bare connection cannot roll the start
    back. Dual-write atomicity requires the caller's own already-open
    transaction, as the usage example at the top of this document shows.
+5. **Queue resolution** — a start with no explicit
+   `TransactionalStartOptions::with_queue_name(...)` resolves its queue from
+   the client's own `.with_queues([...])` list, never a process-global
+   default.
+   `queue_defaults_to_the_clients_own_configured_queue_not_a_stale_process_global`
+   is the falsifying proof: it pre-poisons the (now-unread)
+   `completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE` static with an
+   unrelated queue name — simulating a second, differently-configured runtime
+   having initialized it first in the same process — and shows the client
+   still resolves to its *own* configured queue rather than the stale global.
+   `queue_falls_back_to_the_literal_default_with_no_configured_queues` covers
+   the innermost fallback tier: with no `.with_queues([...])` call at all, a
+   start still resolves to the literal `"default"`.
 
 Run it with a real Postgres available (`HARVEST_TEST_DATABASE_URL`) or let it
 boot its own via `testcontainers`:

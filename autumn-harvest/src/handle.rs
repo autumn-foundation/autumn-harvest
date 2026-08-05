@@ -179,6 +179,20 @@ struct WorkflowHandleClientInner {
     /// key, input schema) the same way the HTTP start route does. Empty by
     /// default — set via [`WorkflowHandleClient::with_workflows`].
     workflows: HashMap<String, crate::info::WorkflowInfo>,
+    /// The owning runtime's configured task queues, in priority order (issue
+    /// #763 review, "Carry the default queue on the handle client"). Used by
+    /// [`WorkflowHandleClient::start_workflow_transactional`] to resolve the
+    /// default queue for a start that supplies no explicit
+    /// [`TransactionalStartOptions::queue_name`] override, exactly mirroring
+    /// how `POST /workflows/{name}/start` resolves it from the HTTP runtime's
+    /// own `queues` list — never a process-global static, which is write-once
+    /// and can therefore be `None` (a plugin-less process whose workers run
+    /// entirely in a separate process) or stale (a second, differently
+    /// configured runtime built in the same process after an earlier one
+    /// already initialized the global). Empty by default — set via
+    /// [`WorkflowHandleClient::with_queues`]; an empty list falls back to the
+    /// literal `"default"`, matching the HTTP route's own final fallback.
+    queues: Vec<String>,
     max_workflow_input_bytes: u64,
     max_workflow_execution_timeout: Option<Duration>,
     /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
@@ -224,6 +238,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("update_handlers_count", &self.update_handlers.len())
             .field("query_handlers_count", &self.query_handlers.len())
             .field("workflows_count", &self.workflows.len())
+            .field("queues", &self.queues)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field(
                 "max_workflow_execution_timeout",
@@ -294,6 +309,7 @@ impl WorkflowHandleClient {
                 update_handlers: Vec::new(),
                 query_handlers: Vec::new(),
                 workflows: HashMap::new(),
+                queues: Vec::new(),
                 max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
                 max_workflow_execution_timeout: None,
                 max_workflow_chain_timeout: None,
@@ -375,6 +391,26 @@ impl WorkflowHandleClient {
             .into_iter()
             .map(|w| (w.name.to_string(), w))
             .collect();
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Carry the owning runtime's configured task queues, in priority order
+    /// (issue #763 review, "Carry the default queue on the handle client").
+    ///
+    /// [`Self::start_workflow_transactional`] resolves a start's default
+    /// queue from `queues.first()` when the call supplies no explicit
+    /// [`TransactionalStartOptions::queue_name`] override — mirroring exactly
+    /// how `POST /workflows/{name}/start` resolves its own default from the
+    /// HTTP runtime's `queues` list. Without this call the client has no
+    /// queue list of its own and falls back to the literal `"default"`,
+    /// which is only correct when every worker in the fleet actually polls
+    /// `"default"`.
+    #[must_use]
+    pub fn with_queues<'a>(self, queues: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.queues = queues.into_iter().map(str::to_string).collect();
         Self {
             inner: Arc::new(inner),
         }
@@ -744,7 +780,7 @@ impl WorkflowHandleClient {
         // `Self::resolve_transactional_shard`'s doc comment.
         let shard = self.resolve_transactional_shard(&options);
         let exec_id = ExecutionId::new_for_shard(shard);
-        let queue_name = Self::resolve_transactional_queue_name(&options);
+        let queue_name = self.resolve_transactional_queue_name(&options);
         let defaults = self.resolve_transactional_start_defaults(info, &input);
 
         let params = StartWorkflowParams {
@@ -1085,20 +1121,34 @@ impl WorkflowHandleClient {
     }
 
     /// Resolve the effective task-queue name for a transactional start (issue
-    /// #763). Mirrors `completion_trigger::default_workflow_queue()`: the
-    /// process-global registered default queue (set at plugin boot from the
-    /// worker's own configured queue list), else the literal `"default"`.
-    /// Shard-independent, so it is always safe to read here. Split out of
+    /// #763; queue source corrected per the "Carry the default queue on the
+    /// handle client" review finding).
+    ///
+    /// `options.queue_name` wins when set. Otherwise falls back to *this
+    /// client's own* configured `queues` (via [`Self::with_queues`]) — the
+    /// same runtime-carried source `POST /workflows/{name}/start` resolves
+    /// its default from (`runtime.queues.first()`) — else the literal
+    /// `"default"`.
+    ///
+    /// Deliberately **not** the process-global
+    /// `completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE` static this used to
+    /// read: that global is write-once-if-unset and first-writer-wins across
+    /// the whole process, so it is `None` forever in a process that never
+    /// constructs a `Worker`/`HarvestApiRuntime` in-process (e.g. a
+    /// plugin-less caller whose workers run in a separate process), and it is
+    /// silently stale for any but the *first* runtime built in a process that
+    /// constructs more than one (e.g. two differently-configured runtimes in
+    /// one test binary). Reading the client's own carried `queues` instead
+    /// makes the resolved default correct per-client, matching the HTTP
+    /// route's per-runtime resolution exactly. Split out of
     /// [`Self::start_workflow_transactional`] purely to keep that function
     /// under the workspace's line-count lint.
-    fn resolve_transactional_queue_name(options: &TransactionalStartOptions) -> String {
-        options.queue_name.clone().unwrap_or_else(|| {
-            crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE
-                .read()
-                .ok()
-                .and_then(|lock| lock.clone())
-                .unwrap_or_else(|| "default".to_string())
-        })
+    fn resolve_transactional_queue_name(&self, options: &TransactionalStartOptions) -> String {
+        options
+            .queue_name
+            .clone()
+            .or_else(|| self.inner.queues.as_slice().first().cloned())
+            .unwrap_or_else(|| "default".to_string())
     }
 
     /// Resolve every `WorkflowInfo`-derived (and client-ceiling-derived)
