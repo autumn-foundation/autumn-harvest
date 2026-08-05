@@ -620,18 +620,39 @@ impl WorkflowHandleClient {
         Ok(StartedWorkflowHandle { started, handle })
     }
 
-    /// Stage a workflow start on a caller-owned Diesel connection or
-    /// transaction so it commits or rolls back atomically with the caller's
-    /// own domain write (issue #763).
+    /// Stage a workflow start on a caller-owned Diesel connection so it
+    /// commits or rolls back atomically with the caller's own domain write
+    /// (issue #763) — **provided the caller has already opened a transaction
+    /// on `conn` before calling this method.**
     ///
-    /// `conn` may be a plain connection or an already-open transaction on the
-    /// same connection — either way, this call composes correctly via Diesel's
-    /// nested-transaction (`SAVEPOINT`) semantics: it never opens a *new*
-    /// top-level transaction of its own. The `WorkflowStarted` event, the
-    /// execution row, and the initial dispatchable task-queue row all live only
-    /// inside whatever transaction is open on `conn` at the time this call
-    /// starts. If the caller later rolls that transaction back, none of them
-    /// exist and no worker ever claims the run.
+    /// ## Connection discipline — this distinction is load-bearing
+    ///
+    /// - **`conn` is already inside an open transaction** (the intended, and
+    ///   only fully atomic, usage — see the module-level example in
+    ///   [`docs/transactional-start.md`](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/transactional-start.md)):
+    ///   this call composes correctly via Diesel's nested-transaction
+    ///   (`SAVEPOINT`) semantics. The `WorkflowStarted` event, the execution
+    ///   row, and the initial dispatchable task-queue row all live only
+    ///   inside the caller's already-open transaction. If the caller later
+    ///   rolls that transaction back — because their own domain write failed,
+    ///   or for any other reason — none of them exist and no worker ever
+    ///   claims the run. This is the genuine dual-write atomicity guarantee
+    ///   this method exists to provide.
+    /// - **`conn` is a genuinely bare connection** (no transaction open on it
+    ///   yet): `diesel-async`'s nested-transaction machinery has nothing to
+    ///   nest *into*, so it issues a real, top-level `BEGIN` of its own and
+    ///   **commits it before this call returns.** By the time the caller
+    ///   receives `Ok(outcome)`, the workflow start is already durably
+    ///   committed — there is nothing left "open" for a caller write made
+    ///   afterward on that same connection to share a rollback boundary
+    ///   with. **A bare connection therefore does NOT provide atomicity
+    ///   between the workflow start and any of the caller's own writes** —
+    ///   only Harvest's own *internal* multi-statement sequences within this
+    ///   one call stay atomic as a unit (for example, a `TerminateExisting`
+    ///   collision's cancel-then-replace pair either both happen or neither
+    ///   does, even without an outer transaction). If your goal is dual-write
+    ///   atomicity with your own domain write, always open your own
+    ///   `conn.transaction(...)` **first** and perform both writes inside it.
     ///
     /// `workflow_name` must have been registered on this client via
     /// [`Self::with_workflows`]; that registration also supplies the

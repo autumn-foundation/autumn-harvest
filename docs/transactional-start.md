@@ -114,6 +114,42 @@ periodic background scanner delivers the same follow-ups on its own schedule
 if `finish()` is skipped entirely (or the process crashes before it runs).
 Dropping the outcome without calling `finish()` is safe.
 
+## Connection discipline
+
+`start_workflow_transactional` accepts a caller-owned `AsyncPgConnection` —
+either a plain, "bare" connection, or one already inside a transaction the
+caller opened themselves. **These are not equivalent, and only one of them
+gives you the dual-write atomicity guarantee this whole feature exists for:**
+
+- **`conn` already has a transaction open on it** (the usage example above —
+  the caller calls `conn.transaction(...)` *first*, then performs both their
+  own domain write and this call inside the closure). This is the only mode
+  that provides real atomicity between your write and the workflow start:
+  `diesel-async`'s nested-transaction (`SAVEPOINT`) machinery stages the
+  workflow start inside your already-open transaction, so it commits or rolls
+  back together with everything else in it.
+- **`conn` is a genuinely bare connection** — no `conn.transaction(...)` has
+  been opened on it. In this mode `diesel-async` has nothing to nest into, so
+  the call issues a real, top-level `BEGIN ... COMMIT` of its own **before it
+  returns**. By the time you get `Ok(outcome)` back, the workflow start is
+  already durably committed — there is nothing left "open" for a write you
+  make afterward, on that same connection, to share a rollback boundary with.
+  **A bare connection does not give you dual-write atomicity.** The only
+  atomicity a bare connection provides is *internal* to this one call: a
+  multi-statement sequence Harvest itself needs to run atomically (for
+  example, a `WorkflowIdConflictPolicy::TerminateExisting` collision's
+  cancel-then-replace pair) still happens as an all-or-nothing unit, even
+  without an outer transaction — it is just not tied to anything the caller
+  does before or after the call.
+
+If your goal is what this feature is for — an atomic guarantee between your
+own domain write and the workflow start — **always open your own
+`conn.transaction(...)` first**, exactly as the usage example above does.
+Passing a bare connection is a legitimate, narrower usage (e.g. "start this
+workflow now, and give me Harvest's own internal atomicity for a
+`TerminateExisting` collision, but I have no domain write of my own to tie it
+to"), not a shortcut that silently gets you the same guarantee.
+
 ## Replaying a transactionally-started workflow
 
 From the workflow's own perspective, and from every other client of the
@@ -303,6 +339,17 @@ organized cheapest-and-most-decisive first:
    genuinely separate Postgres databases), a multi-shard client without
    `.with_shard(...)` is rejected and writes nothing, and a single-shard
    deployment needs no `.with_shard(...)` call at all.
+4. **Connection discipline** — see "Connection discipline" above.
+   `bare_connection_terminate_existing_collision_reverts_cancellation_on_replacement_failure`
+   proves Harvest's own *internal* multi-statement atomicity (the
+   `TerminateExisting` cancel-then-replace pair) holds on a bare connection.
+   `bare_connection_commits_the_start_immediately_no_dual_write_atomicity`
+   proves the boundary of that guarantee: the workflow start on a bare
+   connection is already durably committed — visible from a completely
+   independent connection — before the caller ever writes anything else on
+   it, so a later failure on that same bare connection cannot roll the start
+   back. Dual-write atomicity requires the caller's own already-open
+   transaction, as the usage example at the top of this document shows.
 
 Run it with a real Postgres available (`HARVEST_TEST_DATABASE_URL`) or let it
 boot its own via `testcontainers`:

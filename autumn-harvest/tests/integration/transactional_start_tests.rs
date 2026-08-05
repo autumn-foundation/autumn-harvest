@@ -1271,6 +1271,13 @@ async fn outer_rollback_after_a_terminate_existing_collision_undoes_the_cancella
 /// sequence becomes atomic on its own, without requiring the caller to have
 /// opened one. This test proves that atomicity holds on a bare connection,
 /// not just on one already wrapped by the caller.
+///
+/// **This is Harvest's own *internal* multi-statement atomicity — not the
+/// same thing as dual-write atomicity with a caller's own domain write.**
+/// See `bare_connection_commits_the_start_immediately_no_dual_write_atomicity`
+/// immediately below for the boundary of that distinction (the subject of a
+/// later Codex finding on this same fix, "Require an outer transaction for
+/// atomic starts").
 #[tokio::test]
 async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_replacement_failure()
 {
@@ -1356,6 +1363,111 @@ async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_re
         execution_row_count(&mut verify, workflow_id).await,
         1,
         "no replacement execution row may have been left behind either"
+    );
+}
+
+/// Codex review (issue #763), "Require an outer transaction for atomic
+/// starts": documents and proves the precise boundary of the atomicity
+/// guarantee for a genuinely bare (non-transaction-wrapped) connection.
+///
+/// The test immediately above proves Harvest's own *internal*
+/// multi-statement sequence (a `TerminateExisting` collision's
+/// cancel-then-replace pair) stays atomic as a unit on a bare connection —
+/// but that is a narrower guarantee than this call's headline promise
+/// ("commits or rolls back atomically with the caller's own domain write").
+/// On a bare connection, `diesel-async`'s nested-transaction machinery has
+/// nothing to nest *into*: it issues a real, top-level `BEGIN ... COMMIT` of
+/// its own that fully completes *before* `start_workflow_transactional`
+/// returns (confirmed against `diesel-async 0.9.2`'s own transaction manager,
+/// which branches on `TransactionManagerStatus::transaction_depth()` —
+/// `None` on a bare connection issues `BEGIN`/`COMMIT`; `Some(_)` on an
+/// already-open transaction issues `SAVEPOINT`/`RELEASE SAVEPOINT` instead).
+/// There is nothing left "open" for a caller write performed afterward on
+/// that same connection to share a rollback boundary with.
+///
+/// This proves that boundary concretely: after calling
+/// `start_workflow_transactional` on a bare connection, the started
+/// execution's row and `WorkflowStarted` event are ALREADY visible from a
+/// completely independent connection — durably committed — even though this
+/// test itself never issues an explicit `COMMIT`. A caller's own domain
+/// write, made afterward on that same bare connection, subsequently failing
+/// does NOT roll the workflow start back — proving a bare connection does
+/// not provide dual-write atomicity. See "Connection discipline" in
+/// `docs/transactional-start.md` for the corrected usage guidance (the fix
+/// for this finding was a documentation correction — see the doc comment on
+/// `WorkflowHandleClient::start_workflow_transactional` — not a runtime
+/// behavior change: rejecting bare connections outright would break the
+/// legitimate narrower use case the test above already relies on and
+/// documents).
+#[tokio::test]
+async fn bare_connection_commits_the_start_immediately_no_dual_write_atomicity() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+    let workflow_id = "order-bare-conn-no-atomicity-1";
+
+    let mut bare_conn = connect(&database_url).await;
+    let outcome = client
+        .start_workflow_transactional(
+            &mut bare_conn,
+            "t763_plain_workflow",
+            workflow_id,
+            serde_json::json!({"order_id": workflow_id, "amount_cents": 1}),
+            TransactionalStartOptions::new(),
+        )
+        .await
+        .expect("bare-connection start must succeed");
+    assert!(outcome.created);
+
+    // Not a single explicit COMMIT has been issued by this test on
+    // `bare_conn` -- yet the workflow start is already fully durable, visible
+    // from a completely independent connection. There is nothing left
+    // "pending" for a caller write made afterward on `bare_conn` to share an
+    // atomic rollback boundary with.
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(execution_row_count(&mut fresh, workflow_id).await, 1);
+    assert_eq!(
+        workflow_started_event_count(&mut fresh, outcome.exec_id).await,
+        1
+    );
+    assert_eq!(
+        execution_state(&mut fresh, outcome.exec_id).await,
+        "RUNNING"
+    );
+
+    // Simulate the caller's OWN domain write, on the SAME bare connection,
+    // subsequently failing -- a primary-key violation on a second insert of
+    // the same row is the simplest reliable way to force one. If a bare
+    // connection provided dual-write atomicity, this failure would have to
+    // roll the workflow start back too; it does not, because the start
+    // already committed before this test ever touched `bare_conn` again.
+    diesel::sql_query("INSERT INTO t763_orders (id, exec_id) VALUES ($1, $2)")
+        .bind::<Text, _>(workflow_id.to_string())
+        .bind::<SqlUuid, _>(outcome.exec_id.as_uuid())
+        .execute(&mut bare_conn)
+        .await
+        .expect("first domain insert on the bare connection must succeed");
+    let duplicate_insert_result =
+        diesel::sql_query("INSERT INTO t763_orders (id, exec_id) VALUES ($1, $2)")
+            .bind::<Text, _>(workflow_id.to_string())
+            .bind::<SqlUuid, _>(outcome.exec_id.as_uuid())
+            .execute(&mut bare_conn)
+            .await;
+    assert!(
+        duplicate_insert_result.is_err(),
+        "the duplicate-primary-key insert must fail"
+    );
+
+    let mut verify = connect(&database_url).await;
+    assert_eq!(
+        execution_row_count(&mut verify, workflow_id).await,
+        1,
+        "the workflow start is UNAFFECTED by the caller's own later write \
+         failing on the same bare connection -- it was already committed"
+    );
+    assert_eq!(
+        workflow_started_event_count(&mut verify, outcome.exec_id).await,
+        1,
+        "the WorkflowStarted event is likewise unaffected"
     );
 }
 
