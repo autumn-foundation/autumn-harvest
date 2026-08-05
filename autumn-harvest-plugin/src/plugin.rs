@@ -2,6 +2,7 @@
 //! the Harvest workflow engine into an Autumn [`AppBuilder`].
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use autumn_web::AppState;
@@ -1250,7 +1251,14 @@ async fn start_harvest_runtime(
     // start API can resolve defaults (execution_timeout, sla, concurrency key)
     // and published input-schema validation, the same way the HTTP start
     // route does.
-    .with_workflows(runner.api_runtime().registry().workflows.values().cloned())
+    //
+    // Issue #763 review ("Exclude registered DAGs from transactional workflow
+    // starts"): unified DAGs are filtered out by `transactional_client_workflows`
+    // below — see its doc comment for the full rationale.
+    .with_workflows(transactional_client_workflows(
+        runner.api_runtime().registry().workflows.values(),
+        runner.api_runtime().registered_dag_names(),
+    ))
     // Issue #763 review ("Carry the default queue on the handle client"): the
     // SAME runtime-carried queue list `POST /workflows/{name}/start` resolves
     // its own default queue from, so a start with no explicit
@@ -1547,6 +1555,35 @@ async fn start_harvest_runtime(
     // F-round7); `stop_harvest_runtime` clears them (ptr-eq guarded) on shutdown.
     admission_guard.commit();
     Ok(())
+}
+
+/// Workflows to expose on the in-process transactional-start client (issue
+/// #763), with unified DAGs excluded (issue #763 review, "Exclude registered
+/// DAGs from transactional workflow starts").
+///
+/// A unified DAG's shadow `WorkflowInfo` (issue #256) lives in
+/// `registry.workflows` right alongside ordinary workflows, but
+/// `POST /workflows/{name}/start` rejects a DAG name outright and points
+/// callers at `POST /dags/{name}/trigger` instead — the only path that runs
+/// `trigger_unified_dag`'s pause / `max_active_runs` admission checks and
+/// schedule bookkeeping. Passing every registry workflow straight through
+/// would let `start_workflow_transactional` start a paused or
+/// capacity-saturated DAG as an ordinary workflow execution, silently
+/// bypassing those checks. Filtering here — against the exact same
+/// `registered_dag_names()` set `HarvestApiRuntime::is_registered_dag` checks
+/// against for the HTTP route — means the transactional client never
+/// registers a DAG name at all; a caller naming one is rejected the same way
+/// any other unregistered workflow name is. Extracted as a pure function
+/// (rather than an inline closure in the builder chain) so the exclusion is
+/// directly unit-testable without booting a plugin/database.
+fn transactional_client_workflows<'a>(
+    workflows: impl Iterator<Item = &'a WorkflowInfo>,
+    registered_dag_names: &HashSet<String>,
+) -> Vec<WorkflowInfo> {
+    workflows
+        .filter(|info| !registered_dag_names.contains(info.name))
+        .cloned()
+        .collect()
 }
 
 fn resolve_harvest_pool(
@@ -2019,6 +2056,53 @@ mod tests {
             execution_timeout: None,
             sla: None,
         }
+    }
+
+    /// Issue #763 review, "Exclude registered DAGs from transactional workflow
+    /// starts": `transactional_client_workflows` must drop exactly the names
+    /// present in `registered_dag_names` and keep every other registered
+    /// workflow untouched, mirroring what `HarvestApiRuntime::is_registered_dag`
+    /// checks against for the HTTP start route.
+    #[test]
+    fn transactional_client_workflows_excludes_registered_dag_names() {
+        let plain = fake_workflow_info();
+        let dag_shadow = WorkflowInfo {
+            name: "daily",
+            ..fake_workflow_info()
+        };
+        let registered_dags: HashSet<String> = HashSet::from(["daily".to_string()]);
+
+        let kept =
+            transactional_client_workflows([&plain, &dag_shadow].into_iter(), &registered_dags);
+
+        let kept_names: Vec<&str> = kept.iter().map(|w| w.name).collect();
+        assert_eq!(
+            kept_names,
+            vec!["echo"],
+            "the DAG-shadow WorkflowInfo (name \"daily\", present in \
+             registered_dag_names) must be excluded so a caller naming it hits the \
+             same 'not registered' rejection as any other unregistered workflow \
+             name -- never a silent bypass of trigger_unified_dag's pause / \
+             max_active_runs admission checks"
+        );
+    }
+
+    /// Regression guard for the fix above: with no DAGs registered at all, every
+    /// workflow passes through unchanged -- the filter must not accidentally cut
+    /// out ordinary workflows.
+    #[test]
+    fn transactional_client_workflows_keeps_everything_when_no_dags_registered() {
+        let a = fake_workflow_info();
+        let b = WorkflowInfo {
+            name: "other",
+            ..fake_workflow_info()
+        };
+        let registered_dags: HashSet<String> = HashSet::new();
+
+        let kept = transactional_client_workflows([&a, &b].into_iter(), &registered_dags);
+
+        let kept_names: Vec<&str> = kept.iter().map(|w| w.name).collect();
+        assert_eq!(kept_names, vec!["echo", "other"]);
     }
 
     #[cfg(feature = "webhooks")]

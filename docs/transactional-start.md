@@ -275,6 +275,16 @@ yet. If your use case needs one of them, that is the extension point.
   client.start_workflow_transactional(conn, "throttled_workflow", &id, input, opts).await?;
   ```
 
+- **A registered unified DAG (issue #256) cannot be started this way.**
+  `POST /workflows/{name}/start` rejects a DAG name outright — it must go
+  through `POST /dags/{name}/trigger`, the only path that runs
+  `trigger_unified_dag`'s pause / `max_active_runs` admission checks and
+  schedule bookkeeping. The `HarvestPlugin`-embedded client never registers a
+  DAG's name at all, so `start_workflow_transactional("my_dag", ...)` is
+  rejected with the same "not registered" `HarvestError::Config` an
+  unregistered workflow name gets — never a silent bypass of the DAG trigger
+  path's checks. Trigger a DAG via the management API's DAG-trigger route
+  instead.
 - **Not available over HTTP.** This is an in-process API only — there is no
   `POST` route for it, because the whole point is composing with a Diesel
   transaction your own handler already has open. An HTTP request/response
