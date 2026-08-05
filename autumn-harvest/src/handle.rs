@@ -684,6 +684,11 @@ impl WorkflowHandleClient {
         input: Value,
         options: TransactionalStartOptions,
     ) -> HarvestResult<TransactionalStartOutcome> {
+        // Codex review (issue #763): validate/trim/cap the idempotency key
+        // BEFORE anything else runs -- see
+        // `Self::normalize_transactional_idempotency_key`'s doc comment.
+        let options = Self::normalize_transactional_idempotency_key(options)?;
+
         // Issue #763 review (Codex finding): a committed-replay probe must run
         // BEFORE any fresh-start-only rejection -- the same issue #808
         // invariant `autumn-harvest-plugin::api::start_workflow` documents and
@@ -713,7 +718,10 @@ impl WorkflowHandleClient {
             &options,
         )?;
 
-        let shard = options.shard.unwrap_or(ShardId::UNENCODED);
+        // Codex review (issue #763): resolve the single-shard fallback to
+        // this client's ACTUAL configured default shard -- see
+        // `Self::resolve_transactional_shard`'s doc comment.
+        let shard = self.resolve_transactional_shard(&options);
         let exec_id = ExecutionId::new_for_shard(shard);
         let queue_name = Self::resolve_transactional_queue_name(&options);
         let defaults = self.resolve_transactional_start_defaults(info, &input);
@@ -995,6 +1003,64 @@ impl WorkflowHandleClient {
         }
 
         Ok(info)
+    }
+
+    /// Validate/trim/cap `options.idempotency_key` (issue #763 Codex review).
+    ///
+    /// Mirrors `autumn-harvest-plugin::api::validate_start_idempotency_key`
+    /// (the HTTP start route's own validation, which also runs first, before
+    /// its committed-replay probe). Without this, a caller-supplied empty or
+    /// whitespace-only key became a real `(workflow_name, "")` claim in
+    /// `harvest_start_idempotency` that silently deduplicated every other
+    /// unrelated transactional start for the same workflow against each
+    /// other, and an oversized key could exceed Postgres's btree tuple limit
+    /// and abort the caller's own transaction with a raw database error
+    /// instead of a clean, typed rejection. The trimmed key is written back
+    /// into the returned `options` so every later read in
+    /// [`Self::start_workflow_transactional`] (the committed-replay probe and
+    /// the eventual reservation) sees the same normalized value. Split out of
+    /// that function purely to keep it under the workspace's line-count
+    /// lint.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::error::HarvestError::Config`] from
+    /// [`crate::start_idempotency::validate_start_idempotency_key`].
+    fn normalize_transactional_idempotency_key(
+        mut options: TransactionalStartOptions,
+    ) -> HarvestResult<TransactionalStartOptions> {
+        options.idempotency_key = crate::start_idempotency::validate_start_idempotency_key(
+            options.idempotency_key.as_deref(),
+        )?;
+        Ok(options)
+    }
+
+    /// Resolve the effective shard for an un-pinned transactional start
+    /// (issue #763 Codex review, "Default transactional starts to the actual
+    /// shard").
+    ///
+    /// [`Self::validate_transactional_start_request`] only requires
+    /// `.with_shard(...)` when this client's pool has more than one shard --
+    /// a genuinely single-shard client (whose one shard is not necessarily
+    /// numbered 0, e.g. carved out of a larger topology) is allowed to omit
+    /// it. Before this fix the fallback was the bare [`ShardId::UNENCODED`]
+    /// sentinel rather than this client's actual configured default shard.
+    /// Every OTHER start path in this codebase (the HTTP start route, the
+    /// scheduler, ...) always mints its exec id with a concretely resolved
+    /// `ShardId`, because `StartWorkflowParams::shard_id()` -- which
+    /// persists the row's `shard_id` column, read by every shard-scoped
+    /// admission gate and the idempotency purge scanner -- hardcodes `0` for
+    /// an unencoded id rather than consulting a router. Leaving the id
+    /// unencoded for a non-zero single shard would therefore silently
+    /// persist `shard_id = 0` for a write that actually landed on, say,
+    /// shard 5. For [`Self::single`] (the common case) `default_shard()` is
+    /// `ShardId::new(0)`, so this is byte-for-byte unchanged there. Split
+    /// out of [`Self::start_workflow_transactional`] purely to keep that
+    /// function under the workspace's line-count lint.
+    fn resolve_transactional_shard(&self, options: &TransactionalStartOptions) -> ShardId {
+        options
+            .shard
+            .unwrap_or_else(|| self.inner.router.default_shard())
     }
 
     /// Resolve the effective task-queue name for a transactional start (issue

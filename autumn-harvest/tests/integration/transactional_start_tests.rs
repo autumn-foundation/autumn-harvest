@@ -341,6 +341,26 @@ async fn execution_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> 
         .state
 }
 
+/// Reads back the persisted `shard_id` column on `harvest_workflow_executions`
+/// — used to prove a start actually PERSISTED the shard it claims to be on
+/// (issue #763 Codex review, "Default transactional starts to the actual
+/// shard"), since `ExecutionId::shard()` alone only proves what got ENCODED
+/// into the id, not what `StartWorkflowParams::shard_id()` chose to write to
+/// the row.
+async fn persisted_shard_id(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i32 {
+    #[derive(diesel::QueryableByName)]
+    struct ShardIdRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        shard_id: i32,
+    }
+    diesel::sql_query("SELECT shard_id FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .get_result::<ShardIdRow>(conn)
+        .await
+        .expect("shard_id query")
+        .shard_id
+}
+
 async fn workflow_started_event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
     diesel::sql_query(
         "SELECT COUNT(*) AS n FROM harvest_events \
@@ -1339,6 +1359,234 @@ async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_re
     );
 }
 
+/// Codex review (issue #763), "Validate transactional idempotency keys":
+/// unlike the plain HTTP start route
+/// (`autumn-harvest-plugin::api::validate_start_idempotency_key`), the
+/// transactional-start client accepted ANY string as an idempotency key with
+/// no trim/empty/length validation — an accidental empty or whitespace-only
+/// key became a real `(workflow_name, "")` claim in `harvest_start_idempotency`
+/// that would silently dedupe every OTHER unrelated transactional start for
+/// the same workflow against each other. This proves an empty key is now
+/// rejected before anything is written, matching the HTTP route.
+#[tokio::test]
+async fn empty_idempotency_key_is_rejected_writes_nothing() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+    let mut conn = connect(&database_url).await;
+
+    let result: Result<TransactionalStartOutcome, HarvestError> =
+        Box::pin(conn.transaction::<_, HarvestError, _>({
+            let client = client.clone();
+            async move |conn| {
+                client
+                    .start_workflow_transactional(
+                        conn,
+                        "t763_plain_workflow",
+                        "order-empty-idem-key-1",
+                        serde_json::json!({"order_id": "order-empty-idem-key-1", "amount_cents": 1}),
+                        TransactionalStartOptions::new().with_idempotency_key(""),
+                    )
+                    .await
+            }
+        }))
+        .await;
+
+    assert!(
+        matches!(result, Err(HarvestError::Config(_))),
+        "expected Config rejection for an empty idempotency_key, got {result:?}"
+    );
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(
+        execution_row_count(&mut fresh, "order-empty-idem-key-1").await,
+        0,
+        "an empty idempotency_key must write no execution row"
+    );
+    assert_eq!(
+        count_rows(
+            &mut fresh,
+            "SELECT COUNT(*) AS n FROM harvest_start_idempotency \
+             WHERE workflow_name = 't763_plain_workflow'"
+        )
+        .await,
+        0,
+        "an empty idempotency_key must claim no idempotency row either — this \
+         is exactly the bug: an unvalidated empty key becomes a real, shared \
+         claim that would dedupe unrelated starts against each other"
+    );
+}
+
+/// Sibling to the empty-key case: a whitespace-only key must be treated the
+/// same as empty (rejected), not accepted as a distinct, non-empty-looking
+/// key that happens to be all spaces.
+#[tokio::test]
+async fn whitespace_only_idempotency_key_is_rejected_writes_nothing() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+    let mut conn = connect(&database_url).await;
+
+    let result: Result<TransactionalStartOutcome, HarvestError> =
+        Box::pin(conn.transaction::<_, HarvestError, _>({
+            let client = client.clone();
+            async move |conn| {
+                client
+                    .start_workflow_transactional(
+                        conn,
+                        "t763_plain_workflow",
+                        "order-whitespace-idem-key-1",
+                        serde_json::json!({
+                            "order_id": "order-whitespace-idem-key-1",
+                            "amount_cents": 1
+                        }),
+                        TransactionalStartOptions::new().with_idempotency_key("   \t  "),
+                    )
+                    .await
+            }
+        }))
+        .await;
+
+    assert!(
+        matches!(result, Err(HarvestError::Config(_))),
+        "expected Config rejection for a whitespace-only idempotency_key, got {result:?}"
+    );
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(
+        execution_row_count(&mut fresh, "order-whitespace-idem-key-1").await,
+        0
+    );
+}
+
+/// A key that survives trimming but is absurdly long must be rejected with a
+/// clean, typed error — not left to abort the caller's own transaction with a
+/// raw Postgres error when the `(workflow_name, idempotency_key)` composite
+/// PRIMARY KEY on `harvest_start_idempotency` exceeds btree's index tuple
+/// size limit.
+#[tokio::test]
+async fn oversized_idempotency_key_is_rejected_writes_nothing() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+    let mut conn = connect(&database_url).await;
+    let oversized_key = "k".repeat(513); // MAX_START_IDEMPOTENCY_KEY_LEN is 512
+
+    let result: Result<TransactionalStartOutcome, HarvestError> =
+        Box::pin(conn.transaction::<_, HarvestError, _>({
+            let client = client.clone();
+            async move |conn| {
+                client
+                    .start_workflow_transactional(
+                        conn,
+                        "t763_plain_workflow",
+                        "order-oversized-idem-key-1",
+                        serde_json::json!({
+                            "order_id": "order-oversized-idem-key-1",
+                            "amount_cents": 1
+                        }),
+                        TransactionalStartOptions::new().with_idempotency_key(oversized_key),
+                    )
+                    .await
+            }
+        }))
+        .await;
+
+    assert!(
+        matches!(result, Err(HarvestError::Config(_))),
+        "expected Config rejection for an oversized idempotency_key, got {result:?}"
+    );
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(
+        execution_row_count(&mut fresh, "order-oversized-idem-key-1").await,
+        0
+    );
+}
+
+/// A key exactly AT the cap must still be accepted — the cap rejects
+/// strictly-over, not at-or-over, mirroring the HTTP route's own boundary.
+#[tokio::test]
+async fn idempotency_key_at_exactly_the_length_cap_is_accepted() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+    let mut conn = connect(&database_url).await;
+    let key_at_cap = "k".repeat(512);
+
+    let outcome = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = client.clone();
+        let key_at_cap = key_at_cap.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    "order-cap-idem-key-1",
+                    serde_json::json!({"order_id": "order-cap-idem-key-1", "amount_cents": 1}),
+                    TransactionalStartOptions::new().with_idempotency_key(key_at_cap),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("a key exactly at the length cap must be accepted");
+
+    assert!(outcome.created);
+}
+
+/// A key with leading/trailing whitespace must be TRIMMED before use, and the
+/// trimmed form must be what's actually stored/matched — proven by starting
+/// once with a padded key and once with its already-trimmed equivalent, and
+/// asserting they dedupe to the SAME execution (if trimming didn't happen,
+/// `"  key  "` and `"key"` would be treated as two distinct keys and would
+/// NOT dedupe, landing two separate executions instead of one).
+#[tokio::test]
+async fn idempotency_key_is_trimmed_before_use() {
+    let (database_url, _container) = setup_database().await;
+    let client = single_shard_client(&database_url);
+
+    let start_with_key = |workflow_id: &'static str, key: &'static str| {
+        let client = client.clone();
+        let database_url = database_url.clone();
+        async move {
+            let mut conn = connect(&database_url).await;
+            Box::pin(conn.transaction::<_, HarvestError, _>(async move |conn| {
+                client
+                    .start_workflow_transactional(
+                        conn,
+                        "t763_plain_workflow",
+                        workflow_id,
+                        serde_json::json!({"order_id": workflow_id, "amount_cents": 1}),
+                        TransactionalStartOptions::new().with_idempotency_key(key),
+                    )
+                    .await
+            }))
+            .await
+        }
+    };
+
+    let first = start_with_key("order-trim-idem-a", "  trimmed-key-xyz  ")
+        .await
+        .expect("padded-key start must succeed");
+    let second = start_with_key("order-trim-idem-b", "trimmed-key-xyz")
+        .await
+        .expect("already-trimmed-key start must dedupe, not error");
+
+    assert_eq!(
+        first.exec_id, second.exec_id,
+        "the padded key and its trimmed equivalent must dedupe to ONE \
+         execution, proving the key was actually trimmed before being used \
+         as the idempotency claim"
+    );
+    assert!(first.created);
+    assert!(!second.created);
+
+    let mut fresh = connect(&database_url).await;
+    let total = count_rows(
+        &mut fresh,
+        "SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE workflow_id LIKE 'order-trim-idem-%'",
+    )
+    .await;
+    assert_eq!(total, 1, "exactly one execution row must exist");
+}
+
 #[tokio::test]
 async fn idempotency_key_deduplicates_two_committed_starts() {
     let (database_url, _container) = setup_database().await;
@@ -2209,13 +2457,84 @@ async fn single_shard_deployment_needs_no_with_shard_call() {
         1
     );
     // An un-pinned transactional start mints its `ExecutionId` with the
-    // `UNENCODED` sentinel — the caller already told us exactly which
-    // connection/database to write to, so there is no shard number to
-    // resolve or encode for *this* write. (Any *later* read/write that goes
-    // through `ShardedDbPool::pool_for_execution` resolves an unencoded id to
-    // the router's configured default shard — a single-shard deployment needs
-    // no shard-aware code at all, matching AC4.)
-    assert_eq!(outcome.exec_id.shard(), ShardId::UNENCODED);
+    // caller's client's CONCRETELY resolved default shard (issue #763 Codex
+    // review, "Default transactional starts to the actual shard") — never the
+    // bare `UNENCODED` sentinel, even in the single-shard case. This client's
+    // router is `ShardRouter::single()`, whose `default_shard()` is
+    // `ShardId::new(0)`, so this is byte-for-byte the "pre-sharding runtime"
+    // shard for a single-shard deployment. The point is that a single-shard
+    // deployment whose one shard is numbered something OTHER than 0 (see
+    // `unpinned_start_on_a_non_default_single_shard_client_encodes_that_shard_not_zero`
+    // below) now correctly encodes ITS shard instead of leaving the id
+    // unencoded and letting the row's persisted `shard_id` column silently
+    // default to 0 regardless — a single-shard deployment still needs no
+    // shard-aware code at all, matching AC4.
+    assert_eq!(outcome.exec_id.shard(), ShardId::new(0));
+}
+
+/// Codex review (issue #763), "Default transactional starts to the actual
+/// shard": a client built from a genuinely single-shard `ShardedDbPool`/
+/// `ShardRouter` pair whose one shard is NOT numbered 0 (carved out of a
+/// larger topology, or simply configured that way) must have an un-pinned
+/// start encode THAT shard — both in the returned `exec_id` and in the row's
+/// persisted `shard_id` column — never the bare `UNENCODED` sentinel and
+/// never a hardcoded 0. Before the fix, `StartWorkflowParams::shard_id()`
+/// (which persists the column every shard-scoped admission gate and the
+/// idempotency purge scanner reads) hardcoded 0 for an unencoded id
+/// regardless of the actual configured default shard, silently mislabeling
+/// this write's shard.
+#[tokio::test]
+async fn unpinned_start_on_a_non_default_single_shard_client_encodes_that_shard_not_zero() {
+    let (database_url, _container) = setup_database().await;
+    let shard = ShardId::new(5);
+    let pool = build_pool(&database_url);
+    let router = ShardRouter::new(vec![shard], vec![shard], shard);
+    let mut shard_pools = std::collections::BTreeMap::new();
+    shard_pools.insert(shard, pool);
+    let sharded_pool = ShardedDbPool::from_map(shard_pools, shard);
+
+    let client = WorkflowHandleClient::new(sharded_pool, router, [(shard, database_url.clone())])
+        .with_workflows(all_test_workflows());
+
+    let mut conn = connect(&database_url).await;
+    let outcome = Box::pin(conn.transaction::<_, HarvestError, _>({
+        let client = client.clone();
+        async move |conn| {
+            client
+                .start_workflow_transactional(
+                    conn,
+                    "t763_plain_workflow",
+                    "order-single-nondefault-shard-1",
+                    serde_json::json!({
+                        "order_id": "order-single-nondefault-shard-1",
+                        "amount_cents": 1
+                    }),
+                    // Deliberately NO `.with_shard(...)` — the whole point is
+                    // that `pools.len() == 1` lets the caller omit it, and
+                    // the fallback must still resolve to shard 5, not 0.
+                    TransactionalStartOptions::new(),
+                )
+                .await
+        }
+    }))
+    .await
+    .expect("single-shard (non-default-numbered) start must succeed with no shard option");
+
+    assert_eq!(
+        outcome.exec_id.shard(),
+        shard,
+        "the returned exec_id must encode this client's actual shard (5), \
+         not the UNENCODED sentinel and not shard 0"
+    );
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(
+        persisted_shard_id(&mut fresh, outcome.exec_id).await,
+        5,
+        "the row's persisted shard_id column must also read 5, not 0 — this \
+         is what every shard-scoped admission gate and the idempotency purge \
+         scanner actually consult"
+    );
 }
 
 // ---------------------------------------------------------------------------
