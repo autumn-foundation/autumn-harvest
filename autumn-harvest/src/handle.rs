@@ -786,15 +786,56 @@ impl WorkflowHandleClient {
                 self.start_workflow_transactional_idempotent(conn, params, key)
                     .await?
             } else {
-                start_or_load_workflow_execution_collect(
-                    conn,
-                    params,
-                    /* in_outer_transaction = */ true,
-                    /* reject_fresh_if_debounced = */ false,
-                    Some(self.inner.metrics.as_ref()
-                        as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
-                    Some(crate::admission_gate::GateMode::CheckCached),
-                )
+                // Issue #763 review (Codex finding): `in_outer_transaction = true`
+                // below tells `start_or_load_workflow_execution_collect` that a
+                // `TerminateIfRunning` pre-check cancellation which commits before
+                // a subsequently-failing replacement start will be reverted by
+                // *something* -- so its follow-up dispatch can be safely deferred.
+                // That assumption only holds when there genuinely is an
+                // enclosing transaction to revert it. This method's own docs
+                // explicitly permit `conn` to be a bare (non-transaction-wrapped)
+                // connection, in which case there is nothing to make that true --
+                // without this wrapper, a bare-connection caller could durably
+                // cancel a prior run and then, on a subsequent write failure, lose
+                // its follow-up dispatch permanently (the whole call returns `Err`,
+                // so there is no `TransactionalStartOutcome.deferred` to recover
+                // it from either).
+                //
+                // Rather than detect whether `conn` already has an open
+                // transaction (which would need to reach into diesel_async's
+                // internal transaction-manager bookkeeping), this wraps the call
+                // in its own nested `conn.transaction()` -- a `SAVEPOINT` when
+                // `conn` is already inside the caller's transaction, a real
+                // top-level `BEGIN` otherwise -- exactly mirroring
+                // `start_workflow_transactional_idempotent`'s own wrapper just
+                // above (`Box::pin(conn.transaction(...))` around its reservation
+                // + start). This makes `in_outer_transaction = true` correct
+                // *unconditionally*: whatever the pre-check cancellation did is
+                // now guaranteed nested inside a transaction level this call
+                // itself establishes, so a subsequent replacement-start failure
+                // reverts the cancellation along with everything else -- there is
+                // nothing left to follow up on, because it never durably
+                // happened. A bare-connection caller therefore gets full
+                // atomicity for the cancel-then-replace sequence, not just a
+                // correctly-suppressed (or correctly-fired) follow-up.
+                Box::pin(conn.transaction::<(
+                    StartedWorkflowExecution,
+                    Vec<DeferredTriggerStart>,
+                    Vec<(ExecutionId, String)>,
+                    Vec<(String, String)>,
+                ), HarvestError, _>(async |conn| {
+                    let params = params;
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        params,
+                        /* in_outer_transaction = */ true,
+                        /* reject_fresh_if_debounced = */ false,
+                        Some(self.inner.metrics.as_ref()
+                            as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
+                        Some(crate::admission_gate::GateMode::CheckCached),
+                    )
+                    .await
+                }))
                 .await?
             };
 

@@ -1223,6 +1223,122 @@ async fn outer_rollback_after_a_terminate_existing_collision_undoes_the_cancella
     );
 }
 
+/// Regression guard for a Codex review finding on PR #1148 ("Require a real
+/// outer transaction"): the module doc comment's Section 4 above explicitly
+/// documents (and the two tests immediately above already exercise, always
+/// via an outer `conn.transaction()` wrapper) that
+/// `start_workflow_transactional` permits a caller to pass a genuinely
+/// *bare*, non-transaction-wrapped `conn`. The non-keyed branch tells
+/// `start_or_load_workflow_execution_collect` `in_outer_transaction = true`,
+/// which lets a `TerminateExisting`/`TerminateIfRunning` pre-check
+/// cancellation defer its follow-up dispatch on the assumption that
+/// *something* will revert the cancellation if the replacement start
+/// subsequently fails. On a genuinely bare connection there was previously
+/// nothing to make that true: a replacement-start failure (forced here via
+/// an oversized input, so `execution::replace_execution`'s payload-cap check
+/// fails *after* `execution::inline_cancel` has already durably cancelled
+/// the prior in the same statement sequence) would leave the prior
+/// permanently cancelled with no successor and no way to recover the lost
+/// follow-up dispatch — the whole call returns `Err`, so there is no
+/// `TransactionalStartOutcome.deferred` to recover it from either.
+///
+/// The fix wraps the whole non-keyed call to
+/// `start_or_load_workflow_execution_collect` in its own nested
+/// `conn.transaction()` (mirroring the keyed branch,
+/// `start_workflow_transactional_idempotent`, which already did this
+/// before this PR) — `diesel_async` issues a genuine top-level `BEGIN` when
+/// `conn` has no already-open transaction, so the cancel-then-replace
+/// sequence becomes atomic on its own, without requiring the caller to have
+/// opened one. This test proves that atomicity holds on a bare connection,
+/// not just on one already wrapped by the caller.
+#[tokio::test]
+async fn bare_connection_terminate_existing_collision_reverts_cancellation_on_replacement_failure()
+{
+    let (database_url, _container) = setup_database().await;
+    // The cap must comfortably exceed the first (legitimate) start's ~59-byte
+    // serialized payload but sit well under the second (deliberately
+    // oversized) call's padded payload below.
+    let client = single_shard_client(&database_url).with_max_workflow_input_bytes(100);
+    let workflow_id = "order-bare-conn-terminate-1";
+
+    // Start the first execution normally, via a transaction wrapper (how it
+    // starts is irrelevant to what this test proves — only the SECOND call
+    // below, on a genuinely bare connection, matters).
+    let mut setup_conn = connect(&database_url).await;
+    let first: TransactionalStartOutcome = Box::pin(
+        setup_conn.transaction::<TransactionalStartOutcome, HarvestError, _>({
+            let client = client.clone();
+            async move |conn| {
+                client
+                    .start_workflow_transactional(
+                        conn,
+                        "t763_plain_workflow",
+                        workflow_id,
+                        serde_json::json!({"order_id": workflow_id, "amount_cents": 1}),
+                        TransactionalStartOptions::new(),
+                    )
+                    .await
+            }
+        }),
+    )
+    .await
+    .expect("first start must commit");
+    assert!(first.created);
+    let first_exec_id = first.exec_id;
+
+    let mut fresh = connect(&database_url).await;
+    assert_eq!(execution_state(&mut fresh, first_exec_id).await, "RUNNING");
+
+    // The whole point of this test: a BARE connection with no
+    // `conn.transaction()` wrapper at all — exactly what the module doc's
+    // Section 4 documents as permitted, and what this call is documented to
+    // make safe entirely on its own.
+    let mut bare_conn = connect(&database_url).await;
+    let oversized_input = serde_json::json!({
+        "order_id": workflow_id,
+        "amount_cents": 1,
+        "padding": "x".repeat(200),
+    });
+    let result = client
+        .start_workflow_transactional(
+            &mut bare_conn,
+            "t763_plain_workflow",
+            workflow_id,
+            oversized_input,
+            TransactionalStartOptions::new()
+                .with_conflict_policy(WorkflowIdConflictPolicy::TerminateExisting),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(HarvestError::PayloadTooLarge { .. })),
+        "expected the oversized replacement input to fail with \
+         PayloadTooLarge, got {result:?}"
+    );
+
+    let mut verify = connect(&database_url).await;
+    assert_eq!(
+        execution_state(&mut verify, first_exec_id).await,
+        "RUNNING",
+        "the prior must NOT be left durably cancelled on a bare connection \
+         when the replacement start subsequently fails — the nested \
+         transaction this call wraps itself in must have reverted \
+         inline_cancel's work too, exactly as it would have if the caller \
+         had wrapped the call in their own transaction"
+    );
+    assert_eq!(
+        workflow_cancelled_event_count(&mut verify, first_exec_id).await,
+        0,
+        "inline_cancel's WorkflowCancelled event must be rolled back, not \
+         left stranded against a still-RUNNING execution"
+    );
+    assert_eq!(
+        execution_row_count(&mut verify, workflow_id).await,
+        1,
+        "no replacement execution row may have been left behind either"
+    );
+}
+
 #[tokio::test]
 async fn idempotency_key_deduplicates_two_committed_starts() {
     let (database_url, _container) = setup_database().await;
