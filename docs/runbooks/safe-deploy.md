@@ -196,6 +196,25 @@ after every drain or deploy:
   `harvest queue coverage --queue <name>` is the right tool to confirm
   nothing is left stranding.
 
+  **On a multi-shard deployment, scope the pre-cutover check to every shard
+  that could own the new work, not just the fleet as a whole.** A queue name
+  carries no fixed shard affinity — the new work's `PENDING` rows can land on
+  any shard in `writable_shards` (spread by the rendezvous hash over each new
+  execution's `(workflow_name, workflow_id)`, or landing on one specific
+  shard if the workflow uses explicit residency placement, see
+  `docs/sharding.md`) — so an unscoped `harvest worker list --queue <name>
+  --status Active --health healthy` can find a healthy worker that is only
+  assigned to shard 0 and read as "covered" even though the new work will
+  route to shard 1, which has zero pollers. Repeat the check with
+  `--shard-id <N>` (or `GET /workers?queue=<name>&status=Active&health=
+  healthy&shard_id=<N>`) for every shard in your deployment's
+  `writable_shards`, and require a hit on each one before cutover — a
+  single-shard deployment has nothing extra to do here, since its only
+  writable shard is `0`. If any response carries a non-empty
+  `unavailable_shards` (the `partial`/`unavailable` cross-shard degradation,
+  issue #756), treat the check as **inconclusive**, not a pass — retry once
+  every shard is reachable.
+
 ```bash
 harvest queue coverage --json
 # or: GET /api/harvest/admin/queue-coverage
