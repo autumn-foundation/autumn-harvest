@@ -22,8 +22,10 @@
 //! workers (and stale/absent heartbeats) fail to cover. A worker registered
 //! with an **empty** `shard_assignments` array (the `Worker::run` legacy
 //! single-shard path, which polls the default pool with no explicit
-//! assignment) is treated as covering shard `0` — matching what it actually
-//! polls, not what its registration literally lists.
+//! assignment) is treated as covering *whichever shard is being inspected* —
+//! matching what it actually polls, not what its registration literally
+//! lists — since this module only ever asks that question against a worker
+//! row already known to be registered on that exact shard's own database.
 //!
 //! ## Distinct from build-id reachability (#171) and shard health (#522)
 //!
@@ -64,11 +66,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use autumn_harvest::error::HarvestResult;
 use autumn_harvest::queue::{self, PendingQueueDemand};
 use autumn_harvest::queue_pause;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
 use chrono::{DateTime, Utc};
+use diesel_async::AsyncPgConnection;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -113,11 +117,14 @@ impl std::error::Error for InvalidQueryEncoding {}
 ///
 /// # Errors
 ///
-/// Returns [`InvalidQueryEncoding`] on the first key or value whose
-/// percent-decoded bytes are not valid UTF-8. This is the one place in the
-/// `queue-coverage` request path that *can* reject an input outright —
-/// [`QueueCoverageQuery::from_query_pairs`] below, which consumes this
-/// function's output, stays infallible by construction.
+/// Returns [`InvalidQueryEncoding`] on the first key or value that is
+/// malformed in either of two ways: a syntactically invalid `%` escape (not
+/// followed by exactly two hex digits, e.g. `%`, `%2`, `%GG`), or a
+/// syntactically valid escape whose decoded bytes are not valid UTF-8 (e.g.
+/// `%FF`). This is the one place in the `queue-coverage` request path that
+/// *can* reject an input outright — [`QueueCoverageQuery::from_query_pairs`]
+/// below, which consumes this function's output, stays infallible by
+/// construction.
 pub fn parse_raw_query_pairs_strict(
     raw_query: &str,
 ) -> Result<Vec<(String, String)>, InvalidQueryEncoding> {
@@ -139,11 +146,45 @@ pub fn parse_raw_query_pairs_strict(
 /// key/value component: `+` -> space first, then `%XX` percent-decoding
 /// with strict (non-lossy) UTF-8 validation of the resulting bytes.
 fn decode_form_component_strict(raw: &str) -> Result<String, InvalidQueryEncoding> {
+    if !has_only_well_formed_percent_escapes(raw) {
+        return Err(InvalidQueryEncoding);
+    }
     let space_decoded = raw.replace('+', " ");
     percent_encoding::percent_decode_str(&space_decoded)
         .decode_utf8()
         .map(std::borrow::Cow::into_owned)
         .map_err(|_| InvalidQueryEncoding)
+}
+
+/// Whether every `%` in `s` is immediately followed by exactly two ASCII
+/// hex digits.
+///
+/// `percent_encoding::percent_decode_str` does **not** reject a malformed
+/// escape on its own: an incomplete (`%`, `%2`) or non-hex (`%GG`) sequence
+/// is left as a **literal, undecoded** run of bytes rather than an error --
+/// and since those bytes (`%`, `G`, digits, ...) are themselves valid ASCII,
+/// `decode_utf8()` still succeeds trivially. Without this pre-check,
+/// `?queue_name=orders%GG` would silently decode to the literal string
+/// `"orders%GG"` and query that (almost certainly nonexistent) queue name
+/// instead of being rejected -- a second, distinct malformed-encoding
+/// shape from the already-handled `%FF`-decodes-to-invalid-UTF-8 case
+/// (issue #774 review).
+fn has_only_well_formed_percent_escapes(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let well_formed = bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
+            if !well_formed {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
 }
 
 /// Query string accepted by `GET /admin/queue-coverage`.
@@ -450,6 +491,54 @@ fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> b
     is_live && assigned_to_shard && has_queue
 }
 
+/// Load only the workers that can possibly count as coverage on this shard's
+/// own connection: `status IN (Active, Draining)`, applied server-side.
+///
+/// `worker_covers_queue` only ever treats an `Active`/`Draining` worker as
+/// live -- a `Stopped` row can never contribute coverage. Loading every
+/// worker row this shard's database has ever held (as an unfiltered,
+/// `limit: i64::MAX` `list_workers` call previously did) means a long-lived
+/// deployment that mints a fresh registry row on every restart -- the
+/// default when `WorkerId` is a random UUID rather than a stable per-host
+/// identity -- pays for deserializing an ever-growing pile of departed
+/// workers on every coverage check that finds even one pending task (issue
+/// #774 review).
+///
+/// `WorkerFilters.status` only accepts a single exact value, so this issues
+/// one bounded, server-side-filtered query per live status and merges the
+/// results rather than widening the shared core-crate filter type for this
+/// one caller -- the two statuses are mutually exclusive, so the merge can
+/// never produce a duplicate row. Each query is capped at
+/// [`WorkerFilters::MAX_LIMIT`] (the crate's own established defensive
+/// ceiling, matching what `GET /workers` itself allows) rather than
+/// `i64::MAX`; a fleet running more concurrently live workers than that on
+/// one shard already needs the paginated `GET /workers` surface, not this
+/// deploy-safety smoke check.
+///
+/// Does **not** filter by heartbeat freshness in SQL -- `WorkerHealth` is
+/// still classified client-side from `last_heartbeat_at`, exactly as
+/// before, so a `Stale` `Active`/`Draining` worker is still loaded and then
+/// correctly excluded by `worker_covers_queue`'s `is_live` check. That
+/// residual population (a worker that crashed recently enough to still
+/// carry a live-looking status) is bounded by real time-to-heartbeat-expiry,
+/// not by fleet history, so it does not reproduce the unbounded-scan
+/// problem this fix targets.
+async fn fetch_potentially_live_workers(
+    conn: &mut AsyncPgConnection,
+    worker_stale_threshold: Duration,
+) -> HarvestResult<Vec<WorkerRow>> {
+    let mut workers = Vec::new();
+    for status in [WorkerStatus::Active, WorkerStatus::Draining] {
+        let filters = WorkerFilters {
+            status: Some(status.as_str().to_string()),
+            limit: WorkerFilters::MAX_LIMIT,
+            ..WorkerFilters::new()
+        };
+        workers.extend(list_workers(conn, &filters, worker_stale_threshold).await?);
+    }
+    Ok(workers)
+}
+
 /// One shard's fully-inspected observation: the uncovered-demand rows plus
 /// the queue names that were excluded solely because they are paused (see
 /// [`merge_excluded_paused_queues`]). On any error path the second element
@@ -511,11 +600,7 @@ async fn observe_shard(
         );
     }
 
-    let worker_filters = WorkerFilters {
-        limit: i64::MAX,
-        ..WorkerFilters::new()
-    };
-    let workers = match list_workers(&mut conn, &worker_filters, worker_stale_threshold).await {
+    let workers = match fetch_potentially_live_workers(&mut conn, worker_stale_threshold).await {
         Ok(workers) => workers,
         Err(error) => {
             return (
@@ -1331,6 +1416,53 @@ mod tests {
         assert_eq!(
             parse_raw_query_pairs_strict("%FF=value"),
             Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_rejects_a_lone_trailing_percent() {
+        // `%` with nothing after it -- percent_decode_str leaves it as a
+        // literal `%` (still valid UTF-8 on its own), so only an explicit
+        // hex-escape well-formedness check catches this.
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=orders%"),
+            Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_rejects_a_percent_with_one_hex_digit() {
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=orders%2"),
+            Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_rejects_non_hex_percent_escape() {
+        // `%GG` -- the exact review-flagged repro. `G` is not a hex digit,
+        // so percent_decode_str leaves `%GG` undecoded rather than erroring;
+        // the caller must not silently query the literal "orders%GG".
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=orders%GG"),
+            Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_rejects_non_hex_percent_escape_in_key() {
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue%ZZname=value"),
+            Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_accepts_well_formed_lowercase_hex_escape() {
+        // Lowercase hex digits are just as well-formed as uppercase.
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=hello%2fworld"),
+            Ok(vec![("queue_name".to_string(), "hello/world".to_string())])
         );
     }
 

@@ -571,6 +571,62 @@ async fn stopped_worker_does_not_cover_the_queue() {
 }
 
 #[tokio::test]
+async fn many_historical_stopped_workers_do_not_prevent_correct_coverage_detection() {
+    // Issue #774 review: the coverage check must filter `Stopped` workers
+    // server-side (`status IN (Active, Draining)`) rather than loading every
+    // worker a shard's database has ever registered (including a long
+    // history of departed workers from restarts using random UUID worker
+    // IDs) and filtering client-side. This seeds a realistic-shaped
+    // historical pile of 30 `Stopped` rows on the SAME queue name a
+    // genuinely live worker also polls, so a regression that silently
+    // drops or mis-scopes the live/status-filtered query -- not just a
+    // regression that fails to bound the *unfiltered* scan -- would show up
+    // as a false "uncovered" report here.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(
+        &database_url,
+        ShardId::new(0),
+        "email-workers",
+        "onboarding",
+    )
+    .await;
+    for i in 0..30 {
+        insert_worker(
+            &database_url,
+            &format!("departed-worker-{i}"),
+            &["email-workers"],
+            &[0],
+            WorkerStatus::Stopped,
+        )
+        .await;
+    }
+    insert_worker(
+        &database_url,
+        "worker-live",
+        &["email-workers"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report.get("uncovered"),
+        Some(&json!(false)),
+        "a genuinely live Active worker must still be found covering the \
+         queue even with 30 historical Stopped rows in the registry: {report:?}"
+    );
+    assert_eq!(report.get("total_uncovered_queues"), Some(&json!(0)));
+}
+
+#[tokio::test]
 async fn stale_worker_does_not_cover_the_queue() {
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;
@@ -909,6 +965,40 @@ async fn malformed_percent_encoding_in_an_unknown_query_key_also_returns_400() {
 
     let (status, body) = get_json(&app, "/admin/queue-coverage?%FF=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("malformed query string: invalid percent-encoded UTF-8")
+    );
+}
+
+#[tokio::test]
+async fn syntactically_invalid_percent_escape_also_returns_400() {
+    // Issue #774 review, second finding: `%FF` above covers a
+    // *well-formed* escape that decodes to invalid UTF-8. `%GG` is a
+    // distinct malformed-encoding shape -- `G` is not a hex digit, so
+    // `percent_encoding::percent_decode_str` leaves `%GG` as a literal,
+    // undecoded byte run rather than erroring, and since `%`/`G` are
+    // themselves valid ASCII the subsequent UTF-8 check trivially
+    // succeeds. Without the explicit hex-escape well-formedness check this
+    // silently queries the (almost certainly nonexistent) literal queue
+    // name "orders%GG" and reports a false-clean `uncovered: false`
+    // instead of rejecting the malformed request.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(&database_url, ShardId::new(0), "typo_queue_b", "onboarding").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, body) = get_json(&app, "/admin/queue-coverage?queue_name=orders%GG").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a syntactically invalid percent escape must 400, not silently query \
+         the literal mangled string and report a false-clean result: {body:?}"
+    );
     assert_eq!(
         body.get("error").and_then(Value::as_str),
         Some("malformed query string: invalid percent-encoded UTF-8")
