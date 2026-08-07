@@ -18,6 +18,7 @@ use futures::future::join_all;
 use serde::Serialize;
 
 use crate::api::{HarvestApiRuntime, HarvestApiState};
+use crate::shard_fanout;
 
 /// Deployment readiness for a shard.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -946,16 +947,12 @@ fn worker_can_cover(worker: &WorkerRow, queue: &str, shard_id: i32) -> bool {
     has_queue && worker_assigned_to_shard(worker, shard_id)
 }
 
+/// Delegates to the shared [`shard_fanout::worker_covers_shard`] predicate --
+/// see its doc comment for why an empty `shard_assignments` array must be
+/// treated as covering *any* shard being inspected, not "assigned to
+/// nothing" or hardcoded to shard 0 (issue #1150).
 fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
-    worker
-        .worker
-        .shard_assignments
-        .as_array()
-        .is_some_and(|shards| {
-            shards
-                .iter()
-                .any(|value| value.as_i64() == Some(i64::from(shard_id)))
-        })
+    shard_fanout::worker_covers_shard(worker, shard_id)
 }
 
 async fn load_queue_depth(
@@ -1336,6 +1333,79 @@ mod tests {
     /// cross-build compatibility.
     fn empty_compat() -> autumn_harvest::build_routing::BuildCompatibilitySet {
         autumn_harvest::build_routing::BuildCompatibilitySet::default()
+    }
+
+    // ── worker_assigned_to_shard / worker_can_cover: legacy empty-array
+    //    shard_assignments (issue #1150, discovered via #774's review) ────
+
+    fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: "legacy-worker".to_string(),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(queues),
+                shard_assignments: serde_json::json!(shard_assignments),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: WorkerStatus::Active.as_str().to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
+            },
+            health: WorkerHealth::Healthy,
+            active_task_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_assigned_to_shard_treats_empty_array_as_covering_shard_zero() {
+        // A `Worker::run` legacy single-shard worker (no explicit
+        // `shard_assignments` configured) registers with a literal `[]`, but
+        // its poll loop falls back to the default pool and claims work
+        // against whatever database that pool points at -- this shard-
+        // membership check must treat that the same way, or a perfectly
+        // healthy legacy worker's readiness/coverage counts under-report it
+        // (issue #1150).
+        let worker = worker_row_with_shard_assignments(&[], &["default"]);
+        assert!(worker_assigned_to_shard(&worker, 0));
+    }
+
+    #[test]
+    fn worker_assigned_to_shard_empty_array_is_not_hardcoded_to_shard_zero() {
+        // The empty-array normalization must NOT be hardcoded to shard 0 --
+        // this predicate is only ever evaluated with a worker/shard_id pair
+        // already scoped to one shard's own connection (`observe_shard`), so
+        // an empty-array worker found there covers whatever `shard_id` is
+        // being evaluated, including a deployment whose single/default shard
+        // is numbered something other than 0 (`ShardRouter::new` accepts an
+        // arbitrary `default_shard`; see `queue_coverage.rs`'s identical
+        // fix and its doc comment for the full rationale).
+        let worker = worker_row_with_shard_assignments(&[], &["default"]);
+        assert!(worker_assigned_to_shard(&worker, 5));
+    }
+
+    #[test]
+    fn worker_assigned_to_shard_nonempty_array_still_matches_only_its_own_shards() {
+        // Regression guard: the empty-array special case must not widen a
+        // worker with an EXPLICIT, non-empty assignment list into matching
+        // every shard.
+        let worker = worker_row_with_shard_assignments(&[2], &["default"]);
+        assert!(worker_assigned_to_shard(&worker, 2));
+        assert!(!worker_assigned_to_shard(&worker, 0));
+    }
+
+    #[test]
+    fn worker_can_cover_legacy_empty_array_worker_covers_its_queue() {
+        let worker = worker_row_with_shard_assignments(&[], &["orphan_queue"]);
+        assert!(worker_can_cover(&worker, "orphan_queue", 3));
     }
 
     #[test]

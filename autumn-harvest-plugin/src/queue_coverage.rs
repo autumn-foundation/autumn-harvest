@@ -70,7 +70,7 @@ use autumn_harvest::error::HarvestResult;
 use autumn_harvest::queue::{self, PendingQueueDemand};
 use autumn_harvest::queue_pause;
 use autumn_harvest::worker::DbPool;
-use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
+use autumn_harvest::workers::{WorkerHealth, WorkerRow, WorkerStatus};
 use chrono::{DateTime, Utc};
 use diesel_async::AsyncPgConnection;
 use futures::future::join_all;
@@ -437,118 +437,94 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// coverage purposes: assigned to the shard, has a fresh heartbeat, is
 /// `Active` or `Draining` (not `Stopped`), and lists the queue.
 ///
-/// An **empty** `shard_assignments` array is a special case, not "assigned to
-/// nothing": `WorkerConfig::shard_assignments` defaults to `[ShardId::new(0)]`,
-/// but a worker started via the raw `Worker::run` legacy single-shard path
-/// with no explicit assignment still registers with a literal `[]` -- even
-/// though its poll loop (`claim_pool = match shard_targets.as_slice() { [] =>
-/// pool }` in `worker.rs`) falls back to the caller's default `pool` argument
-/// and actually claims work against whatever database that pool points at
-/// ("legacy behavior, byte-for-byte unchanged"). That is also the SAME pool
-/// `run_with_listener` uses to call `register_in_fleet`, so an empty-array
-/// worker's registry row is written into that exact database -- and this
-/// function is only ever called with a `worker`/`shard_id` pair the caller
-/// (`observe_shard`) has already scoped to one shard's own connection, so an
-/// empty-array worker found there is unconditionally covering `shard_id`,
-/// whatever numeric value the deployment's single/default shard happens to
-/// carry (`ShardRouter::new` accepts an arbitrary `default_shard`, not just
-/// `0` -- see `ShardRouter::single()` vs the general constructor). Hardcoding
-/// `shard_id == 0` here would falsely report a healthy legacy worker as
-/// uncovered on any deployment whose single shard isn't literally numbered
-/// `0` (issue #774 review). Without this normalization at all, a perfectly
-/// healthy legacy single-shard worker would be reported as covering no shard
-/// whatsoever, falsely flagging every queue it actually polls.
-///
-/// `autumn-harvest-plugin/src/shard_health.rs::worker_assigned_to_shard` has
-/// an analogous gap in the identical `observe_shard`-then-per-shard-scoped-
-/// worker-list shape (its own `observe_shard` also loads workers on a
-/// connection already acquired from one shard's own pool), tracked in issue
-/// #1150 -- that fix was corrected to the same "unconditionally covers
-/// `shard_id`" rule this function uses, rather than a `shard_id == 0`
-/// hardcode, once this function's own fix surfaced why the hardcode is wrong.
+/// Shard-membership (including the empty-`shard_assignments` legacy-worker
+/// special case) is delegated to the shared
+/// [`shard_fanout::worker_covers_shard`] predicate -- see its doc comment
+/// for the full rationale. That helper also backs
+/// `shard_health.rs::worker_assigned_to_shard`/`worker_can_cover`, which had
+/// the identical gap (issue #1150, discovered as a duplicate of this
+/// function's own bug while implementing #774) -- factoring the predicate
+/// into one shared function means the two consumers cannot drift apart
+/// again.
 fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
             || worker.worker.status == WorkerStatus::Draining.as_str());
-    let assigned_to_shard = worker
-        .worker
-        .shard_assignments
-        .as_array()
-        .is_some_and(|shards| {
-            if shards.is_empty() {
-                true
-            } else {
-                shards
-                    .iter()
-                    .any(|value| value.as_i64() == Some(i64::from(shard_id)))
-            }
-        });
     let has_queue = worker.worker.queues.as_array().is_some_and(|queues| {
         queues
             .iter()
             .any(|value| value.as_str() == Some(queue_name))
     });
-    is_live && assigned_to_shard && has_queue
+    is_live && shard_fanout::worker_covers_shard(worker, shard_id) && has_queue
 }
 
 /// Load only the workers that can possibly count as coverage on this shard's
-/// own connection: `status IN (Active, Draining)`, applied server-side, then
-/// narrowed in-process to a fresh heartbeat (`WorkerHealth::Healthy`).
+/// own connection: `status IN (Active, Draining)` **and** a fresh heartbeat,
+/// both applied server-side, in a single query.
 ///
-/// `worker_covers_queue` only ever treats an `Active`/`Draining` worker as
-/// live -- a `Stopped` row can never contribute coverage. Loading every
-/// worker row this shard's database has ever held (as an unfiltered,
-/// `limit: i64::MAX` `list_workers` call with no status/health filter at all
-/// previously did) means a long-lived deployment that mints a fresh registry
-/// row on every restart -- the default when `WorkerId` is a random UUID
-/// rather than a stable per-host identity -- pays for deserializing an
-/// ever-growing pile of departed workers on every coverage check that finds
-/// even one pending task (issue #774 review).
+/// `worker_covers_queue` only ever treats an `Active`/`Draining` worker with
+/// a fresh heartbeat as live -- a `Stopped` row, or a crashed-but-still-
+/// `Active` row (nothing ever calls `transition_status` on a dead process;
+/// only its heartbeat goes stale) can never contribute coverage. A prior
+/// revision reused the shared, general-purpose `list_workers`/`WorkerFilters`
+/// surface, which applies only `status` in SQL and filters heartbeat
+/// freshness (`health`) client-side, *after* loading every status-matching
+/// row (`autumn_harvest::workers::apply_worker_filters`) -- so once the
+/// artificial `WorkerFilters::MAX_LIMIT` cap that bug caused was removed
+/// (see the git history for that round), this call had **no** bound at all
+/// on how many crashed-but-`Active`/`Draining` rows it deserialized on every
+/// coverage check that finds even one pending task, on a long-lived
+/// deployment that never cleanly shuts down every worker (issue #774
+/// review, fourth round).
 ///
-/// `WorkerFilters.status` only accepts a single exact value, so this issues
-/// one server-side-status-filtered query per live status and merges the
-/// results rather than widening the shared core-crate filter type for this
-/// one caller -- the two statuses are mutually exclusive, so the merge can
-/// never produce a duplicate row.
-///
-/// **No `WorkerFilters.limit` cap is applied here** (issue #774 review,
-/// third round). `list_workers`'s SQL issues no `.limit()` clause of its own
-/// -- it always loads the *entire* status-matching set into memory before
-/// `apply_worker_filters` retains/truncates client-side (see that function's
-/// doc comment) -- so passing a smaller `limit` buys zero query-cost
-/// savings; it can only ever discard already-loaded rows. Capping this
-/// specific call at `WorkerFilters::MAX_LIMIT` (as an earlier revision did)
-/// meant a shard running more than 500 currently-healthy `Active` (or 500
-/// `Draining`) workers could have its unordered result set truncated before
-/// the one worker actually polling the queue under test was ever inspected
-/// -- a false "uncovered" verdict for a queue that genuinely has a live
-/// poller, exactly the failure mode this deploy-safety gate exists to rule
-/// out. After the `status`/`health` server-/client-side filters above, the
-/// set this loads is bounded by the number of processes that are *actually
-/// running right now* (crashed-but-still-`Active` rows are excluded by the
-/// health retain, and `Stopped` rows never reach this query at all), which
-/// -- unlike the ever-growing historical-row problem this function was
-/// originally written to fix -- does not grow without bound over a
-/// deployment's lifetime, so there is no equivalent unbounded-scan risk to
-/// guard against by truncating it.
+/// This bypasses `list_workers` entirely and issues a purpose-built
+/// existence query instead: the heartbeat cutoff
+/// (`Utc::now() - worker_stale_threshold`) is computed once, in Rust, then
+/// bound as a plain timestamp comparison alongside the `status IN (...)`
+/// filter -- so Postgres itself excludes every crashed/stale row before a
+/// single byte crosses the wire, and there is no need for (and no risk of
+/// re-truncating past) any row-count limit at all. `.ge(cutoff)` matches
+/// `WorkerHealth::classify`'s own boundary exactly (`elapsed <=
+/// stale_threshold` is Healthy, i.e. `last_heartbeat_at >= now -
+/// stale_threshold`), so a row that passes this SQL filter is *guaranteed*
+/// to classify as `Healthy` a moment later -- the trailing `WorkerHealth::classify`
+/// call below is therefore a cheap, defense-in-depth confirmation of an
+/// already-SQL-filtered set, not a second unbounded pass over stale rows.
 async fn fetch_potentially_live_workers(
     conn: &mut AsyncPgConnection,
     worker_stale_threshold: Duration,
 ) -> HarvestResult<Vec<WorkerRow>> {
-    let mut workers = Vec::new();
-    for status in [WorkerStatus::Active, WorkerStatus::Draining] {
-        let filters = WorkerFilters {
-            status: Some(status.as_str().to_string()),
-            health: Some(WorkerHealth::Healthy),
-            // Deliberately unbounded -- see the function doc comment above
-            // for why `WorkerFilters::MAX_LIMIT` is the wrong tool for an
-            // existence check and costs nothing to remove here.
-            limit: i64::MAX,
-            ..WorkerFilters::new()
-        };
-        workers.extend(list_workers(conn, &filters, worker_stale_threshold).await?);
-    }
-    Ok(workers)
+    use autumn_harvest::models::HarvestWorker;
+    use autumn_harvest::schema::harvest_workers;
+    use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+    use diesel_async::RunQueryDsl;
+
+    let stale_secs = i64::try_from(worker_stale_threshold.as_secs()).unwrap_or(i64::MAX);
+    let cutoff = Utc::now() - chrono::Duration::seconds(stale_secs);
+
+    let rows: Vec<HarvestWorker> = harvest_workers::table
+        .select(HarvestWorker::as_select())
+        .filter(harvest_workers::status.eq_any([
+            WorkerStatus::Active.as_str(),
+            WorkerStatus::Draining.as_str(),
+        ]))
+        .filter(harvest_workers::last_heartbeat_at.ge(cutoff))
+        .load(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|w| {
+            let health = WorkerHealth::classify(w.last_heartbeat_at, worker_stale_threshold);
+            WorkerRow {
+                worker: w,
+                health,
+                active_task_ids: Vec::new(),
+            }
+        })
+        .filter(|w| w.health == WorkerHealth::Healthy)
+        .collect())
 }
 
 /// One shard's fully-inspected observation: the uncovered-demand rows plus

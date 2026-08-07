@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use autumn_harvest::worker::DbPool;
+use autumn_harvest::workers::WorkerRow;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -76,6 +77,54 @@ pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
         .signed_duration_since(started_at)
         .num_seconds()
         .max(0)
+}
+
+/// Whether `worker`'s registered `shard_assignments` cover `shard_id`.
+///
+/// An **empty** `shard_assignments` array is a special case, not "assigned to
+/// nothing": `WorkerConfig::shard_assignments` defaults to `[ShardId::new(0)]`,
+/// but a worker started via the raw `Worker::run` legacy single-shard path
+/// with no explicit assignment still registers with a literal `[]` -- even
+/// though its poll loop (`claim_pool = match shard_targets.as_slice() { [] =>
+/// pool }` in `autumn-harvest/src/worker.rs`) falls back to the caller's
+/// default `pool` argument and actually claims work against whatever database
+/// that pool points at ("legacy behavior, byte-for-byte unchanged"). That is
+/// also the SAME pool `run_with_listener` uses to call `register_in_fleet`, so
+/// an empty-array worker's registry row is written into that exact database.
+///
+/// Every caller of this function loads `worker` from a connection already
+/// scoped to one shard's own database (`observe_shard` in both
+/// `queue_coverage.rs` and `shard_health.rs`), so an empty-array worker found
+/// there is unconditionally covering `shard_id`, whatever numeric value the
+/// deployment's single/default shard happens to carry (`ShardRouter::new`
+/// accepts an arbitrary `default_shard`, not just `0` -- see
+/// `ShardRouter::single()` vs. the general constructor). Hardcoding
+/// `shard_id == 0` here would falsely report a healthy legacy worker as
+/// uncovered on any deployment whose single shard isn't literally numbered
+/// `0`. Without this normalization at all, a perfectly healthy legacy
+/// single-shard worker would be reported as covering no shard whatsoever,
+/// falsely flagging every queue it actually polls.
+///
+/// Shared by `queue_coverage.rs::worker_covers_queue` (issue #774) and
+/// `shard_health.rs::worker_assigned_to_shard`/`worker_can_cover` (issue
+/// #522; the empty-array gap here was issue #1150, discovered as a
+/// duplicate of the identical bug pattern while implementing #774) so the
+/// two shard-membership predicates cannot drift again.
+#[must_use]
+pub fn worker_covers_shard(worker: &WorkerRow, shard_id: i32) -> bool {
+    worker
+        .worker
+        .shard_assignments
+        .as_array()
+        .is_some_and(|shards| {
+            if shards.is_empty() {
+                true
+            } else {
+                shards
+                    .iter()
+                    .any(|value| value.as_i64() == Some(i64::from(shard_id)))
+            }
+        })
 }
 
 /// Cross-shard completeness of a fanned-out read.
