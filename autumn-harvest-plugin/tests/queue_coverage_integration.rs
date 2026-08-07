@@ -717,6 +717,80 @@ async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
 }
 
 #[tokio::test]
+async fn healthy_workers_exceeding_the_cap_do_not_crowd_out_a_covering_poller() {
+    // Issue #774 review, fourth finding: even after pre-filtering to
+    // `WorkerHealth::Healthy` (the previous fix), `fetch_potentially_live_workers`
+    // still truncated each status's result set at `WorkerFilters::MAX_LIMIT`
+    // (500). A shard running more than 500 concurrently healthy `Active`
+    // workers could have the ONE worker actually covering a pending queue
+    // fall outside that cap -- an unordered truncation, not a ranked one --
+    // producing a false "uncovered" verdict even though a live poller
+    // exists. `list_workers`'s SQL issues no server-side `LIMIT` at all (it
+    // always loads the full status-matching set before any client-side
+    // filtering), so the cap bought zero query-cost savings here; it has
+    // been removed entirely for this internal existence check.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(
+        &database_url,
+        ShardId::new(0),
+        "email-workers",
+        "onboarding",
+    )
+    .await;
+
+    // Bulk-register 500 (== MAX_LIMIT) genuinely healthy `Active` workers on
+    // one reused connection, all polling an UNRELATED queue.
+    let mut conn = connect(&database_url).await;
+    for i in 0..500 {
+        let worker_id = format!("healthy-noise-{i}");
+        register_worker(
+            &mut conn,
+            &worker_id,
+            &["unrelated-queue".to_string()],
+            &[0],
+            10,
+            "test-host",
+            None,
+            "",
+            None,
+            &HashMap::<String, String>::new(),
+            0,
+        )
+        .await
+        .expect("failed to register noise worker");
+    }
+
+    // The one worker that actually covers "email-workers", registered LAST
+    // so it lands past the (now-removed) 500-row cap under insertion-order
+    // sequential scan -- the exact ordering the pre-fix `truncate(500)`
+    // would have dropped.
+    insert_worker(
+        &database_url,
+        "worker-live",
+        &["email-workers"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report.get("uncovered"),
+        Some(&json!(false)),
+        "500 genuinely healthy, non-covering Active rows must not truncate \
+         away the one worker actually covering the pending queue: {report:?}"
+    );
+    assert_eq!(report.get("total_uncovered_queues"), Some(&json!(0)));
+}
+
+#[tokio::test]
 async fn stale_worker_does_not_cover_the_queue() {
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;

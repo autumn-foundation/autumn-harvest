@@ -492,35 +492,45 @@ fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> b
 }
 
 /// Load only the workers that can possibly count as coverage on this shard's
-/// own connection: `status IN (Active, Draining)`, applied server-side.
+/// own connection: `status IN (Active, Draining)`, applied server-side, then
+/// narrowed in-process to a fresh heartbeat (`WorkerHealth::Healthy`).
 ///
 /// `worker_covers_queue` only ever treats an `Active`/`Draining` worker as
 /// live -- a `Stopped` row can never contribute coverage. Loading every
 /// worker row this shard's database has ever held (as an unfiltered,
-/// `limit: i64::MAX` `list_workers` call previously did) means a long-lived
-/// deployment that mints a fresh registry row on every restart -- the
-/// default when `WorkerId` is a random UUID rather than a stable per-host
-/// identity -- pays for deserializing an ever-growing pile of departed
-/// workers on every coverage check that finds even one pending task (issue
-/// #774 review).
+/// `limit: i64::MAX` `list_workers` call with no status/health filter at all
+/// previously did) means a long-lived deployment that mints a fresh registry
+/// row on every restart -- the default when `WorkerId` is a random UUID
+/// rather than a stable per-host identity -- pays for deserializing an
+/// ever-growing pile of departed workers on every coverage check that finds
+/// even one pending task (issue #774 review).
 ///
 /// `WorkerFilters.status` only accepts a single exact value, so this issues
-/// one bounded, server-side-filtered query per live status and merges the
+/// one server-side-status-filtered query per live status and merges the
 /// results rather than widening the shared core-crate filter type for this
 /// one caller -- the two statuses are mutually exclusive, so the merge can
-/// never produce a duplicate row. Each query is capped at
-/// [`WorkerFilters::MAX_LIMIT`] (the crate's own established defensive
-/// ceiling, matching what `GET /workers` itself allows) rather than
-/// `i64::MAX`; a fleet running more concurrently live workers than that on
-/// one shard already needs the paginated `GET /workers` surface, not this
-/// deploy-safety smoke check.
+/// never produce a duplicate row.
 ///
-/// Also pre-filters to a fresh heartbeat (`WorkerHealth::Healthy`) --
-/// `WorkerHealth` is still classified client-side from `last_heartbeat_at`,
-/// exactly as before, but the retain now runs *before* the `MAX_LIMIT`
-/// truncation rather than after it. See the inline comment on the filter
-/// literal below for why that ordering matters (issue #774 review, second
-/// round): a `status` column can outlive the process that set it.
+/// **No `WorkerFilters.limit` cap is applied here** (issue #774 review,
+/// third round). `list_workers`'s SQL issues no `.limit()` clause of its own
+/// -- it always loads the *entire* status-matching set into memory before
+/// `apply_worker_filters` retains/truncates client-side (see that function's
+/// doc comment) -- so passing a smaller `limit` buys zero query-cost
+/// savings; it can only ever discard already-loaded rows. Capping this
+/// specific call at `WorkerFilters::MAX_LIMIT` (as an earlier revision did)
+/// meant a shard running more than 500 currently-healthy `Active` (or 500
+/// `Draining`) workers could have its unordered result set truncated before
+/// the one worker actually polling the queue under test was ever inspected
+/// -- a false "uncovered" verdict for a queue that genuinely has a live
+/// poller, exactly the failure mode this deploy-safety gate exists to rule
+/// out. After the `status`/`health` server-/client-side filters above, the
+/// set this loads is bounded by the number of processes that are *actually
+/// running right now* (crashed-but-still-`Active` rows are excluded by the
+/// health retain, and `Stopped` rows never reach this query at all), which
+/// -- unlike the ever-growing historical-row problem this function was
+/// originally written to fix -- does not grow without bound over a
+/// deployment's lifetime, so there is no equivalent unbounded-scan risk to
+/// guard against by truncating it.
 async fn fetch_potentially_live_workers(
     conn: &mut AsyncPgConnection,
     worker_stale_threshold: Duration,
@@ -529,26 +539,11 @@ async fn fetch_potentially_live_workers(
     for status in [WorkerStatus::Active, WorkerStatus::Draining] {
         let filters = WorkerFilters {
             status: Some(status.as_str().to_string()),
-            // `list_workers` applies `status` in SQL but `health` and
-            // `limit` both client-side, via `apply_worker_filters` --
-            // whose own doc comment states the limit is "intentionally
-            // applied after the in-process retain passes so that a
-            // SQL-level page size cannot silently exclude matching rows".
-            // That guarantee only holds when a caller actually supplies
-            // the retain criteria it cares about: a crashed worker's
-            // `status` column can stay `Active` forever (nothing ever
-            // calls `transition_status` on a dead process -- only its
-            // heartbeat goes stale), so a fleet that has accumulated more
-            // than `MAX_LIMIT` such permanently-stale-but-`Active` rows
-            // could truncate away the one genuinely healthy poller before
-            // `worker_covers_queue`'s own health check ever saw it. Since
-            // this function's only consumer is that same health check
-            // (`is_live = health == Healthy && status in {Active,
-            // Draining}`), pre-filtering to `Healthy` here loses nothing a
-            // caller needs and puts the retain-before-truncate ordering
-            // back on the right side of the cap (issue #774 review).
             health: Some(WorkerHealth::Healthy),
-            limit: WorkerFilters::MAX_LIMIT,
+            // Deliberately unbounded -- see the function doc comment above
+            // for why `WorkerFilters::MAX_LIMIT` is the wrong tool for an
+            // existence check and costs nothing to remove here.
+            limit: i64::MAX,
             ..WorkerFilters::new()
         };
         workers.extend(list_workers(conn, &filters, worker_stale_threshold).await?);
