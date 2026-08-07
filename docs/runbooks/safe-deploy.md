@@ -153,6 +153,58 @@ and `request_id`.
 
 ---
 
+## Post-drain check — confirm no queue was left uncovered (issue #774)
+
+Draining removes a worker's capacity for every queue it served. If it was
+the *last* worker polling one of those queues, pending work on that queue is
+now stranded with nothing to claim it — silently, since a successful drain
+call does not fail just because it happened to orphan a queue.
+
+Run the queue-coverage check after every drain, and again once a rolling
+deploy's replacement workers are up:
+
+```bash
+harvest queue coverage --json
+# or: GET /api/harvest/admin/queue-coverage
+```
+
+`uncovered: true` (equivalently, a nonzero `total_uncovered_queues`) means at
+least one queue has `PENDING` tasks and zero live pollers assigned to it on
+the shard that owns the pending work — `Active` **or** `Draining` workers
+both count as covering (a draining worker still finishes work already in
+flight), only `Stopped` and stale (heartbeat-expired) workers do not. Each
+uncovered queue's report entry carries bounded sample `task_ids`/
+`execution_ids` (capped at 5) so you can open a specific stranded task
+directly:
+
+```bash
+harvest workflow stack <execution_id>
+```
+
+`?queue_name=<name>` (`--queue <name>` on the CLI) narrows the check to one
+queue. `harvest queue coverage` exits non-zero (exit code 2 — the same
+"deploy hazard" convention `harvest workflow-types reachability` uses) when
+`uncovered: true`, so it composes as a CI/CD gate the same way.
+
+**This is a distinct question from build-id reachability (#171) and the
+pre-cutover handler-coverage gate immediately below (#520/#700).** Build-id
+routing asks *"can a worker running this build safely resume this
+execution's history?"*; the handler-coverage gate asks *"does a registered
+handler still exist for this workflow type?"*; queue coverage asks a
+narrower, worker-fleet-topology question that is orthogonal to both: *"is
+any live worker even polling the queue this pending task sits on, regardless
+of which build or handler it's running?"* A queue can be reported uncovered
+even when every worker in the fleet is fully build-compatible and
+handler-complete — it simply isn't subscribed to that queue name (a typo'd
+`--queues` flag, a config that dropped a queue during a rolling deploy, or a
+drain that removed the last subscriber). Fix by adding or re-subscribing a
+worker to the named queue, not by adjusting build policy or removing
+handlers. An unreachable shard is never silently dropped from the report —
+it is named in `unavailable_shards` and degrades `status` to `partial`/
+`unavailable`, so a partial report is never mistaken for "fully covered".
+
+---
+
 # Runbook: Build-Id Routing for Safe Rolling Deploys
 
 Use Harvest's build-id routing to gate which workers may resume specific
@@ -539,6 +591,8 @@ Response fields:
 Before cutting a **default (non-build-routed)** deployment over to code that has **deleted or renamed a `#[workflow]` handler**, confirm no in-flight run still needs that handler. A non-terminal execution's `workflow_name` names the handler its next replay requires — removing it strands those runs in permanent `HandlerNotFound` replay failure, surfacing only later as a timeout/DLQ entry.
 
 **Where this sits in the deploy ladder:** worker drain (#386) → **this pre-cutover handler-coverage gate** → [Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) → non-determinism block (#480) → history reset/redrive (#614) → reset-from-history (#538 / #510). Run this gate **before** the replay canary: the canary replays runs of handlers that still exist; this gate catches runs whose handler is about to disappear entirely.
+
+This gate answers *"does a registered handler still exist for this workflow type?"* — a code-compatibility question. It is deliberately distinct from the [post-drain queue-coverage check](#post-drain-check--confirm-no-queue-was-left-uncovered-issue-774) above, which answers a worker-fleet-topology question instead — *"is any live worker even polling the queue this pending task sits on?"* A run can fail either check independently: a fully covered queue can still be `orphaned` if its handler was removed, and a fully handler-complete deployment can still leave a queue `uncovered` if no worker subscribes to it.
 
 ## CI/CD gate — one field asserts "zero orphans"
 

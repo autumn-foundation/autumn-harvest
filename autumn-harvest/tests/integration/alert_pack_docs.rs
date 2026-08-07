@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 const REQUIRED_ALERTS: &[&str] = &[
     "harvest_preflight_failed",
     "harvest_no_active_workers",
+    "harvest_queue_uncovered",
     "harvest_worker_saturation",
     "harvest_queue_schedule_to_start_high",
     "harvest_queue_backlog_growth",

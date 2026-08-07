@@ -2861,6 +2861,104 @@ pub async fn sample_rate_limit_buckets(
     .map_err(crate::error::database_error)
 }
 
+/// Bound on representative task/execution ids returned per queue.
+///
+/// Used by [`pending_queue_demand_by_queue_name`] (issue #774 AC3), mirroring
+/// [`crate::execution::REACHABILITY_SAMPLE_CAP`]'s pattern with a *separate*
+/// constant deliberately not shared across the two unrelated domains — a
+/// future change to the workflow-reachability cap must not silently also
+/// change the queue-coverage cap.
+pub const QUEUE_COVERAGE_SAMPLE_CAP: usize = 5;
+
+/// One queue's fleet-wide `PENDING` demand on a single shard: how many tasks
+/// are queued, plus bounded, oldest-first representative ids for drill-down
+/// (issue #774).
+///
+/// `sample_task_ids` chains into the per-task eligibility explainer
+/// (`GET /admin/tasks/{id}/eligibility`, issues #380/#611);
+/// `sample_execution_ids` chains directly into `GET /workflows/{id}`. Both are
+/// **representative and bounded** — not a guaranteed global-oldest set — per
+/// the same shard-then-cross-shard capping convention documented on
+/// [`crate::execution::WorkflowTypeNonTerminalCount`].
+#[derive(Debug, Clone)]
+pub struct PendingQueueDemand {
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub sample_task_ids: Vec<Uuid>,
+    pub sample_execution_ids: Vec<Uuid>,
+}
+
+/// The `pending_queue_demand_by_queue_name` query — extracted so the real
+/// call site and the sample-cap drift guard test share one source of truth.
+///
+/// Deliberately **not** [`claimable_pending_demand_query`]: this is the
+/// literal, unfiltered "does anything have PENDING work on this queue" signal
+/// issue #774 asks for (queue coverage), not the claim-eligible-right-now
+/// signal `claimable_pending_demand_by_queue` computes for worker-capacity
+/// concerns (issue #522/#531/#742, explicitly out of scope here). Filtering
+/// by concurrency cap / rate-limit / `schedule_to_close` expiry would hide a
+/// genuinely-uncovered queue behind an unrelated, separately-alerted
+/// condition.
+#[must_use]
+pub const fn pending_queue_demand_query() -> &'static str {
+    "SELECT queue_name::TEXT AS queue_name, \
+            COUNT(*)::BIGINT AS pending_count, \
+            (ARRAY_AGG(id ORDER BY scheduled_at ASC, id ASC))[1:5] AS sample_task_ids, \
+            COALESCE( \
+                (ARRAY_AGG(workflow_exec_id ORDER BY scheduled_at ASC, id ASC) \
+                    FILTER (WHERE workflow_exec_id IS NOT NULL))[1:5], \
+                ARRAY[]::UUID[] \
+            ) AS sample_execution_ids \
+     FROM harvest_task_queue \
+     WHERE state = 'PENDING' \
+       AND ($1::TEXT IS NULL OR queue_name = $1::TEXT) \
+     GROUP BY queue_name \
+     ORDER BY queue_name"
+}
+
+/// Fleet-visibility read for issue #774: every queue with `PENDING` work on
+/// this shard, with bounded representative sample ids.
+///
+/// This is deliberately the *simple*, unfiltered PENDING count — see
+/// [`pending_queue_demand_query`]'s doc comment for why it does not reuse
+/// [`claimable_pending_demand_by_queue`]'s constraint-aware filtering.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn pending_queue_demand_by_queue_name(
+    conn: &mut AsyncPgConnection,
+    queue_name_filter: Option<&str>,
+) -> HarvestResult<Vec<PendingQueueDemand>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        pending_count: i64,
+        #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+        sample_task_ids: Vec<Uuid>,
+        #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+        sample_execution_ids: Vec<Uuid>,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(pending_queue_demand_query())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue_name_filter)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingQueueDemand {
+            queue_name: r.queue_name,
+            pending_count: r.pending_count,
+            sample_task_ids: r.sample_task_ids,
+            sample_execution_ids: r.sample_execution_ids,
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2868,6 +2966,40 @@ pub async fn sample_rate_limit_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Issue #774: queue coverage — pending-demand query ───────────────────
+
+    /// The hot query embeds two `[1:N]` slices (task ids, execution ids); both
+    /// must stay bound to `QUEUE_COVERAGE_SAMPLE_CAP` since Diesel `sql_query`
+    /// cannot interpolate the const directly.
+    #[test]
+    fn pending_queue_demand_sql_sample_slices_match_the_cap() {
+        let sql = pending_queue_demand_query();
+        let needle = format!("[1:{QUEUE_COVERAGE_SAMPLE_CAP}]");
+        assert_eq!(
+            sql.matches(&needle).count(),
+            2,
+            "pending_queue_demand_query() must slice both sample arrays to \
+             exactly QUEUE_COVERAGE_SAMPLE_CAP ({QUEUE_COVERAGE_SAMPLE_CAP}); \
+             found {} occurrences of '{needle}' in:\n{sql}",
+            sql.matches(&needle).count()
+        );
+    }
+
+    /// The query must filter to `state = 'PENDING'` only — no `claim_task`-style
+    /// constraint gating (concurrency cap, rate limit, `schedule_to_close`,
+    /// PAUSED-workflow exclusion). That is deliberate scope: #774 answers "is
+    /// anyone polling this queue at all", not "is this specific row claimable
+    /// right now" (owned by #531/#742/#171).
+    #[test]
+    fn pending_queue_demand_sql_has_no_claim_eligibility_filtering() {
+        let sql = pending_queue_demand_query();
+        assert!(sql.contains("state = 'PENDING'"));
+        assert!(!sql.contains("schedule_to_close_at"));
+        assert!(!sql.contains("concurrency_cap"));
+        assert!(!sql.contains("rate_limit"));
+        assert!(!sql.contains("PAUSED"));
+    }
 
     // ── Queue pause: claim gate + its mirrors (issue #619) ──────────────────
 

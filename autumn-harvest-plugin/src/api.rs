@@ -4543,6 +4543,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(shards_health).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/queue-coverage",
+            get(queue_coverage).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/status",
             get(admin_status).route_layer(require_admin.clone()),
         )
@@ -5523,6 +5527,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/health"),
         ("GET", "/admin/preflight"),
         ("GET", "/admin/shards/health"),
+        ("GET", "/admin/queue-coverage"),
         ("GET", "/admin/status"),
         ("GET", "/admin/config"),
         ("GET", "/admin/canary"),
@@ -6717,6 +6722,23 @@ pub const fn management_api_response_fields()
         ),
         (
             "GET",
+            "/admin/queue-coverage",
+            // `sample_task_ids`/`sample_execution_ids`/`shard_breakdown` (issue
+            // #774 AC3) are nested inside items[] and are documented in the
+            // contract description, not listed here — this list is top-level
+            // fields only (precedent: /admin/workflow-types/reachability).
+            Some(&[
+                "status",
+                "observed_at",
+                "filter",
+                "uncovered",
+                "total_uncovered_queues",
+                "items",
+                "shards",
+            ]),
+        ),
+        (
+            "GET",
             "/admin/status",
             Some(&["status", "as_of", "subsystems", "unavailable_shards"]),
         ),
@@ -7289,6 +7311,22 @@ async fn shards_health(
     Query(query): Query<ShardHealthQuery>,
 ) -> Json<ShardHealthReport> {
     Json(build_shard_health_report(&api_state, query.candidate_shard).await)
+}
+
+/// `GET /admin/queue-coverage` — report task queues with pending work but
+/// zero live workers polling them (issue #774).
+///
+/// Read-only, admin-gated, and infallible: fans out across every readable
+/// shard and folds a per-shard failure into that shard's inspection error
+/// rather than failing the request wholesale (see
+/// [`crate::queue_coverage`]'s module docs for the coverage definition,
+/// paused-queue exclusion, and the distinction from build-id reachability
+/// (#171) and shard health (#522)).
+async fn queue_coverage(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<crate::queue_coverage::QueueCoverageQuery>,
+) -> Json<crate::queue_coverage::QueueCoverageReport> {
+    Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
 }
 
 /// `GET /admin/status` — rolled-up management health summary (issue #679).

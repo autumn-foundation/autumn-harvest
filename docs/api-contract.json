@@ -4062,6 +4062,40 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queue-coverage",
+      "category": "admin",
+      "read_only": true,
+      "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's). A queue currently paused via the queue-pause primitive is excluded (already covered by harvest_queue_paused_too_long). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. Distinguishes 'no live worker polls this queue at all' from 'workers poll it but are build-incompatible with required_build_id' (the latter is issue #171's build-id reachability, reported there not here). An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. No new WorkflowEvent variant, no migration -- read path only.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "query",
+          "required": false,
+          "description": "Narrow the report to a single queue name. Any string is accepted; an unknown or never-scheduled queue simply yields uncovered: false."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "filter",
+          "uncovered",
+          "total_uncovered_queues",
+          "items",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Database or shard connectivity error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/status",
       "category": "admin",
       "read_only": true,

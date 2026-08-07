@@ -3996,6 +3996,21 @@
             "mode": "markdown",
             "content": "### Build-routing compatibility\n\n**Alert: harvest_no_compatible_worker** \u2014 no native ADR-0001 metric exists for this check; run the management check directly or export it through your own probe with bounded labels.\n\nBuild-aware routing is protecting replay safety, but no live worker is eligible for an execution's required build.\n\n**First action:**\n\n```\nharvest workflow stack <execution_id>\n```\n\n**API:** `GET /api/harvest/workers/health`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker)"
           }
+        },
+        {
+          "id": 916,
+          "type": "text",
+          "title": "Readiness: Queue coverage",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 84
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "### Queue coverage\n\n**Alert: harvest_queue_uncovered** \u2014 no native ADR-0001 metric exists for this check by design (a continuously-sampled gauge labeled by queue name would be unbounded cardinality for dynamically-named queues); run the management check directly or export it through your own probe with a bounded, allowlisted queue-name label.\n\nA queue has pending work but zero live (Active or Draining) workers are polling it. Distinct from Worker fleet coverage above, which checks static, declared-required-queue coverage regardless of pending work \u2014 this alert is data-driven and fires only on real stranded work, so it also catches ad-hoc/dynamically-named queues.\n\n**First action:**\n\n```\nharvest queue coverage --json\n```\n\n**API:** `GET /api/harvest/admin/queue-coverage`\n\n**Runbook:** [docs/runbooks/harvest-alerts.md#harvest_queue_uncovered](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/runbooks/harvest-alerts.md#harvest_queue_uncovered)"
+          }
         }
       ]
     },

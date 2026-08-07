@@ -369,6 +369,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /dead-letters", RouteClass::ReadOnly),
     ("GET /admin/preflight", RouteClass::ReadOnly),
     ("GET /admin/shards/health", RouteClass::ReadOnly),
+    // Fleet-wide task-queue coverage (issue #774): read-only.
+    ("GET /admin/queue-coverage", RouteClass::ReadOnly),
     ("GET /admin/status", RouteClass::ReadOnly),
     // Effective runtime-config introspection (issue #695): read-only, secret-free.
     ("GET /admin/config", RouteClass::ReadOnly),
@@ -784,6 +786,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /health",
     "GET /admin/preflight",
     "GET /admin/shards/health",
+    "GET /admin/queue-coverage",
     "GET /admin/status",
     "GET /admin/config",
     "GET /admin/canary",
@@ -947,6 +950,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /health", None),
     ("GET /admin/preflight", None),
     ("GET /admin/shards/health", None),
+    ("GET /admin/queue-coverage", None),
     ("GET /admin/status", None),
     ("GET /admin/config", None),
     ("GET /admin/canary", None),
@@ -1596,6 +1600,35 @@ mod tests {
         assert!(
             EXCLUDED_ROUTES.contains(&route),
             "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #690)"
+        );
+    }
+
+    #[test]
+    fn queue_coverage_route_is_classified_read_only() {
+        // The fleet-wide task-queue coverage read model (issue #774) is a
+        // read-only fan-out projection, no different from the other cross-shard
+        // read models it's modeled after (workflow_reachability, workflow_count,
+        // shard_health). This pinned test — not just the general exhaustiveness
+        // guards below, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other rather than against the live
+        // router — is what actually catches the route being dropped from BOTH
+        // lists at once.
+        let route = "GET /admin/queue-coverage";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::ReadOnly),
+            "{route} must be classified RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #774)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && op.is_none()),
+            "{route} must appear in ALL_MUTATION_ROUTES with no audit operation (issue #774)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&route),
+            "{route} must appear in EXCLUDED_ROUTES (read-only, no audit trail; issue #774)"
         );
     }
 

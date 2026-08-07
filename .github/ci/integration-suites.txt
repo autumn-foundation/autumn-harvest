@@ -107,6 +107,7 @@ linux        autumn-harvest-plugin  legal_hold_integration           -          
 linux        autumn-harvest-plugin  lineage_tree_integration         -                          -
 linux        autumn-harvest-plugin  progress_stream_integration      -                          -
 linux        autumn-harvest-plugin  query_integration                -                          -
+linux        autumn-harvest-plugin  queue_coverage_integration       -                          -
 linux        autumn-harvest-plugin  queue_pause_integration          -                          -
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
