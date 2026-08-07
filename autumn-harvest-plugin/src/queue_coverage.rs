@@ -19,7 +19,11 @@
 //! (`WorkerHealth::Healthy`) and its lifecycle status is `Active` **or**
 //! `Draining` — a draining worker is still finishing in-flight work and
 //! still counts as covering the queue it was assigned. Only `Stopped`
-//! workers (and stale/absent heartbeats) fail to cover.
+//! workers (and stale/absent heartbeats) fail to cover. A worker registered
+//! with an **empty** `shard_assignments` array (the `Worker::run` legacy
+//! single-shard path, which polls the default pool with no explicit
+//! assignment) is treated as covering shard `0` — matching what it actually
+//! polls, not what its registration literally lists.
 //!
 //! ## Distinct from build-id reachability (#171) and shard health (#522)
 //!
@@ -316,6 +320,18 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// Whether `worker` is a live poller of `queue_name` on `shard_id` for
 /// coverage purposes: assigned to the shard, has a fresh heartbeat, is
 /// `Active` or `Draining` (not `Stopped`), and lists the queue.
+///
+/// An **empty** `shard_assignments` array is a special case, not "assigned to
+/// nothing": `WorkerConfig::shard_assignments` defaults to `[ShardId::new(0)]`,
+/// but a worker started via the raw `Worker::run` legacy single-shard path
+/// with no explicit assignment still registers with a literal `[]` -- even
+/// though its poll loop (`claim_pool = match shard_targets.as_slice() { [] =>
+/// pool }` in `worker.rs`) falls back to the caller's default pool and
+/// actually claims work as shard 0 ("legacy behavior, byte-for-byte
+/// unchanged"). The DLQ-depth sampler in the same file hits the identical
+/// case and hardcodes the same `0` fallback. Without this normalization a
+/// perfectly healthy legacy single-shard worker would be reported as covering
+/// no shard at all, falsely flagging every queue it actually polls.
 fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
@@ -325,9 +341,13 @@ fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> b
         .shard_assignments
         .as_array()
         .is_some_and(|shards| {
-            shards
-                .iter()
-                .any(|value| value.as_i64() == Some(i64::from(shard_id)))
+            if shards.is_empty() {
+                shard_id == 0
+            } else {
+                shards
+                    .iter()
+                    .any(|value| value.as_i64() == Some(i64::from(shard_id)))
+            }
         });
     let has_queue = worker.worker.queues.as_array().is_some_and(|queues| {
         queues
@@ -893,6 +913,36 @@ mod tests {
             &["orphan_queue"],
         );
         assert!(!worker_covers_queue(&worker, "orphan_queue", 0));
+    }
+
+    #[test]
+    fn legacy_worker_with_empty_shard_assignments_covers_default_shard() {
+        // A `Worker::run` legacy single-shard worker (no explicit
+        // `shard_assignments` configured) registers with a literal `[]`, but
+        // its poll loop falls back to the default pool and claims work as
+        // shard 0 -- this coverage check must treat that the same way, or
+        // every queue a perfectly healthy legacy worker actually polls is
+        // falsely reported uncovered.
+        let worker = worker_row(
+            WorkerStatus::Active,
+            WorkerHealth::Healthy,
+            &[],
+            &["orphan_queue"],
+        );
+        assert!(worker_covers_queue(&worker, "orphan_queue", 0));
+    }
+
+    #[test]
+    fn legacy_worker_with_empty_shard_assignments_does_not_cover_non_default_shard() {
+        // The empty-array normalization is scoped to shard 0 specifically --
+        // it must not be read as "covers every shard".
+        let worker = worker_row(
+            WorkerStatus::Active,
+            WorkerHealth::Healthy,
+            &[],
+            &["orphan_queue"],
+        );
+        assert!(!worker_covers_queue(&worker, "orphan_queue", 1));
     }
 
     #[test]
