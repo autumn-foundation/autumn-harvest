@@ -856,6 +856,66 @@ async fn duplicate_and_unknown_query_params_do_not_400() {
 }
 
 #[tokio::test]
+async fn malformed_percent_encoded_query_param_returns_400() {
+    // Issue #774 review: axum's built-in `Query<Vec<(String, String)>>`
+    // extractor is backed by `serde_urlencoded`/`form_urlencoded`, which
+    // *always* succeeds by silently substituting U+FFFD for a malformed
+    // percent-encoded byte sequence -- so a corrupted `queue_name` would
+    // otherwise silently resolve to a DIFFERENT (nonexistent) queue and
+    // report a false-clean `uncovered: false`, defeating a scoped CI/CD
+    // deploy-gate request. `%FF` alone is not valid UTF-8 -- this is the
+    // exact repro from the review comment. End-to-end proof over the real
+    // axum route (not just the unit-level `parse_raw_query_pairs_strict`
+    // tests in `queue_coverage.rs`): the handler must reject with a genuine
+    // JSON 400 body (via `get_json`'s `.expect("response must be JSON")`),
+    // never a lossily-decoded 200 and never a bare `text/plain` 400.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(&database_url, ShardId::new(0), "typo_queue_a", "onboarding").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, body) = get_json(&app, "/admin/queue-coverage?queue_name=%FF").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed percent-encoded byte sequence must 400, not silently \
+         decode to U+FFFD and report a false-clean result: {body:?}"
+    );
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("malformed query string: invalid percent-encoded UTF-8")
+    );
+}
+
+#[tokio::test]
+async fn malformed_percent_encoding_in_an_unknown_query_key_also_returns_400() {
+    // The decode-before-parse ordering means a malformed byte sequence in
+    // *any* key or value -- including a key `QueueCoverageQuery` does not
+    // even recognize -- is still rejected up front, rather than being
+    // silently dropped as an unknown param the way a genuinely-unknown
+    // *valid-UTF-8* key already is (see
+    // `duplicate_and_unknown_query_params_do_not_400`).
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, body) = get_json(&app, "/admin/queue-coverage?%FF=1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("malformed query string: invalid percent-encoded UTF-8")
+    );
+}
+
+#[tokio::test]
 async fn unavailable_shard_makes_report_partial_and_is_named() {
     // AC6: an unreachable shard is named, never silently dropped, and the
     // reachable shard's uncovered queue is still reported.

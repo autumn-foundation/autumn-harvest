@@ -7317,18 +7317,44 @@ async fn shards_health(
 /// `GET /admin/queue-coverage` — report task queues with pending work but
 /// zero live workers polling them (issue #774).
 ///
-/// Read-only, admin-gated, and infallible: fans out across every readable
-/// shard and folds a per-shard failure into that shard's inspection error
-/// rather than failing the request wholesale (see
-/// [`crate::queue_coverage`]'s module docs for the coverage definition,
+/// Read-only, admin-gated, and infallible with respect to shard reachability:
+/// fans out across every readable shard and folds a per-shard failure into
+/// that shard's inspection error rather than failing the request wholesale
+/// (see [`crate::queue_coverage`]'s module docs for the coverage definition,
 /// paused-queue exclusion, and the distinction from build-id reachability
 /// (#171) and shard health (#522)).
+///
+/// The one thing this endpoint *does* reject outright is a malformed query
+/// string: the raw query is parsed via
+/// [`crate::queue_coverage::parse_raw_query_pairs_strict`] rather than
+/// axum's built-in `Query<Vec<(String, String)>>` extractor, so an invalid
+/// percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
+/// documented `400` JSON error instead of silently substituting `U+FFFD`
+/// and reporting a false-clean result for a scoped deploy gate (issue #774
+/// review).
 async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(pairs): Query<Vec<(String, String)>>,
-) -> Json<crate::queue_coverage::QueueCoverageReport> {
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let pairs = match raw_query
+        .as_deref()
+        .map(crate::queue_coverage::parse_raw_query_pairs_strict)
+    {
+        None => Vec::new(),
+        Some(Ok(pairs)) => pairs,
+        Some(Err(crate::queue_coverage::InvalidQueryEncoding)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "malformed query string: invalid percent-encoded UTF-8"
+                })),
+            )
+                .into_response();
+        }
+    };
     let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
     Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
+        .into_response()
 }
 
 /// `GET /admin/status` — rolled-up management health summary (issue #679).

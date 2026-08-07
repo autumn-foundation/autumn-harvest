@@ -76,12 +76,85 @@ use uuid::Uuid;
 use crate::api::HarvestApiState;
 use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 
+/// A query string component's percent-decoded bytes are not valid UTF-8.
+///
+/// Returned by [`parse_raw_query_pairs_strict`]; the caller (`GET
+/// /admin/queue-coverage`) maps this to a `400` JSON response rather than
+/// silently substituting `U+FFFD`, the fallback axum's built-in
+/// `Query<T>` extractor performs via `serde_urlencoded`/`form_urlencoded`
+/// (issue #774 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidQueryEncoding;
+
+impl std::fmt::Display for InvalidQueryEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query string contains an invalid percent-encoded UTF-8 byte sequence"
+        )
+    }
+}
+
+impl std::error::Error for InvalidQueryEncoding {}
+
+/// Strictly percent-decodes a raw query string into `(key, value)` pairs.
+///
+/// A malformed value like `?queue_name=%FF` would otherwise silently decode
+/// to `queue_name=<U+FFFD>` via axum's lossy `Query<T>` extractor — a
+/// legitimate-looking but wrong filter that lets a scoped deploy gate
+/// (`GET /admin/queue-coverage`) pass instead of rejecting the request with
+/// the documented `400` (issue #774 review).
+///
+/// Mirrors `form_urlencoded::parse`'s grammar exactly: split on `&`, split
+/// each segment on the first `=` (a segment with no `=` is a key with an
+/// empty value), `+` decodes to a literal space *before* percent-decoding.
+/// An empty segment (from a leading/trailing/doubled `&`, or an entirely
+/// empty query string) is skipped.
+///
+/// # Errors
+///
+/// Returns [`InvalidQueryEncoding`] on the first key or value whose
+/// percent-decoded bytes are not valid UTF-8. This is the one place in the
+/// `queue-coverage` request path that *can* reject an input outright —
+/// [`QueueCoverageQuery::from_query_pairs`] below, which consumes this
+/// function's output, stays infallible by construction.
+pub fn parse_raw_query_pairs_strict(
+    raw_query: &str,
+) -> Result<Vec<(String, String)>, InvalidQueryEncoding> {
+    let mut pairs = Vec::new();
+    for segment in raw_query.split('&') {
+        if segment.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = segment.split_once('=').unwrap_or((segment, ""));
+        pairs.push((
+            decode_form_component_strict(raw_key)?,
+            decode_form_component_strict(raw_value)?,
+        ));
+    }
+    Ok(pairs)
+}
+
+/// Strictly percent-decodes one `application/x-www-form-urlencoded`
+/// key/value component: `+` -> space first, then `%XX` percent-decoding
+/// with strict (non-lossy) UTF-8 validation of the resulting bytes.
+fn decode_form_component_strict(raw: &str) -> Result<String, InvalidQueryEncoding> {
+    let space_decoded = raw.replace('+', " ");
+    percent_encoding::percent_decode_str(&space_decoded)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| InvalidQueryEncoding)
+}
+
 /// Query string accepted by `GET /admin/queue-coverage`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QueueCoverageQuery {
-    /// Narrow the report to a single queue name. Any string is a valid
-    /// value — an unknown/never-scheduled queue simply yields
+    /// Narrow the report to a single queue name. Any *decoded* string is a
+    /// valid value — an unknown/never-scheduled queue simply yields
     /// `uncovered: false` (there is nothing pending on it), never an error.
+    /// A malformed *encoding* (invalid percent-decoded UTF-8) is rejected
+    /// earlier, by [`parse_raw_query_pairs_strict`], before it ever reaches
+    /// this type — see that function's doc comment.
     pub queue_name: Option<String>,
 }
 
@@ -91,12 +164,14 @@ impl QueueCoverageQuery {
     ///
     /// Infallible by construction (issue #774 AC8, matching the
     /// `dlq::DlqAggregateParams`/`workflow_count::WorkflowCountParams`/
-    /// `usage::UsageParams` convention): `queue_name` is a free-text filter
-    /// with no invalid *value* — any string is a legitimate (if possibly
-    /// never-scheduled) queue name — so unlike a `group_by`/`state`/date
-    /// param, there is no value to reject here. A repeated `queue_name` key
-    /// resolves last-value-wins (never an error); an unrecognized key is
-    /// ignored for forward-compatibility.
+    /// `usage::UsageParams` convention) **once the pairs are already valid
+    /// decoded strings** — see [`parse_raw_query_pairs_strict`] for the
+    /// upstream check that actually can reject a request. `queue_name` is a
+    /// free-text filter with no invalid *decoded value* — any string is a
+    /// legitimate (if possibly never-scheduled) queue name — so unlike a
+    /// `group_by`/`state`/date param, there is no value to reject here. A
+    /// repeated `queue_name` key resolves last-value-wins (never an error);
+    /// an unrecognized key is ignored for forward-compatibility.
     ///
     /// The value is preserved **verbatim** (never trimmed) — only the
     /// literal empty string `""` normalizes to "no filter". This
@@ -1170,5 +1245,111 @@ mod tests {
         let pairs = vec![("queue_name".to_string(), "  email-workers  ".to_string())];
         let query = QueueCoverageQuery::from_query_pairs(&pairs);
         assert_eq!(query.queue_name.as_deref(), Some("  email-workers  "));
+    }
+
+    // ── parse_raw_query_pairs_strict (issue #774 review) ────────────────
+
+    #[test]
+    fn parse_raw_query_pairs_strict_empty_input_is_empty_pairs() {
+        assert_eq!(parse_raw_query_pairs_strict(""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_decodes_normal_pairs() {
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=email"),
+            Ok(vec![("queue_name".to_string(), "email".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_decodes_percent_encoded_values() {
+        // %20 must decode to a literal space, matching form_urlencoded.
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=hello%20world"),
+            Ok(vec![("queue_name".to_string(), "hello world".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_decodes_plus_as_space() {
+        // application/x-www-form-urlencoded: unescaped `+` means space.
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=a+b"),
+            Ok(vec![("queue_name".to_string(), "a b".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_a_literal_plus_is_encoded_as_percent_2b() {
+        // %2B is a percent-encoded literal '+', distinct from bare '+'
+        // (which means space) -- the two must decode differently.
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=a%2Bb"),
+            Ok(vec![("queue_name".to_string(), "a+b".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_rejects_invalid_utf8_in_value() {
+        // 0xFF is never a valid standalone UTF-8 byte -- this is the exact
+        // review-flagged repro (`?queue_name=%FF`).
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=%FF"),
+            Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_rejects_invalid_utf8_in_key() {
+        assert_eq!(
+            parse_raw_query_pairs_strict("%FF=value"),
+            Err(InvalidQueryEncoding)
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_skips_empty_segments() {
+        // A leading/trailing/doubled `&` must not produce a spurious
+        // empty-key pair.
+        assert_eq!(
+            parse_raw_query_pairs_strict("&a=1&&b=2&"),
+            Ok(vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_key_without_equals_has_empty_value() {
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name"),
+            Ok(vec![("queue_name".to_string(), String::new())])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_preserves_percent_encoded_whitespace_padding() {
+        // Regression tie-in to the whitespace-preservation fix above: a
+        // caller who genuinely percent-encodes surrounding whitespace must
+        // still get it back verbatim through the strict decoder.
+        assert_eq!(
+            parse_raw_query_pairs_strict("queue_name=%20email%20"),
+            Ok(vec![("queue_name".to_string(), " email ".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_raw_query_pairs_strict_duplicate_and_unknown_keys_survive_to_from_query_pairs() {
+        // The strict decoder itself must not reject a duplicate/unknown
+        // key -- that's `QueueCoverageQuery::from_query_pairs`'s job (last-
+        // value-wins / ignore), matching `duplicate_and_unknown_query_params_do_not_400`.
+        let pairs = parse_raw_query_pairs_strict(
+            "queue_name=typo_queue_a&queue_name=typo_queue_b&unknown_param=1",
+        )
+        .expect("well-formed UTF-8 pairs must parse");
+        let query = QueueCoverageQuery::from_query_pairs(&pairs);
+        assert_eq!(query.queue_name.as_deref(), Some("typo_queue_b"));
     }
 }

@@ -4071,7 +4071,7 @@
           "name": "queue_name",
           "in": "query",
           "required": false,
-          "description": "Narrow the report to a single queue name. Any string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and the value is matched verbatim (never trimmed; only the literal empty string normalizes to no filter, since a queue name may legitimately carry surrounding or all whitespace); an unknown or never-scheduled queue name simply yields uncovered: false, never an error."
+          "description": "Narrow the report to a single queue name. Any *decoded* string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and the value is matched verbatim (never trimmed; only the literal empty string normalizes to no filter, since a queue name may legitimately carry surrounding or all whitespace); an unknown or never-scheduled queue name simply yields uncovered: false, never an error. A malformed percent-encoding (e.g. an invalid UTF-8 byte sequence like %FF) is rejected with a 400 before decoding is even attempted -- see the 400 error_responses entry."
         }
       ],
       "request_body": null,
@@ -4089,6 +4089,10 @@
         ]
       },
       "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        },
         {
           "status": 503,
           "description": "Database or shard connectivity error."

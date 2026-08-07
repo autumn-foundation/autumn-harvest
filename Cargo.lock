@@ -349,6 +349,7 @@ dependencies = [
  "futures",
  "matchit",
  "maud",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

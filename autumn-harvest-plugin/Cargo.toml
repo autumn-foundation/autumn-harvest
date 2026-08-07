@@ -48,6 +48,16 @@ tower = "0.5"
 # CLASSIFIED_ROUTES to recover its RouteClass, with correct static-beats-param
 # precedence. MatchedPath is unusable in a nested-router layer (axum #1441).
 matchit = "0.8"
+# Strict (non-lossy) percent-decoding for `GET /admin/queue-coverage`'s raw
+# query string (issue #774 review): axum's built-in `Query` extractor is
+# backed by `serde_urlencoded`/`form_urlencoded`, which always succeeds by
+# silently substituting U+FFFD for a malformed percent-encoded byte
+# sequence -- so a caller CI/CD deploy-gate request with corrupted
+# encoding would otherwise silently query a different (nonexistent) queue
+# and report a false-clean `uncovered: false` instead of a `400`. Already a
+# transitive dependency (via `url`/`serde_urlencoded`); pinned directly so
+# `queue_coverage.rs` can call it without pulling in the rest of `url`.
+percent-encoding = "2.3"
 maud = { version = "0.27", features = ["axum"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
