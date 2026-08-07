@@ -166,16 +166,29 @@ ever claim — and that queue never appears in `fleet_health.by_queue` at
 all, since it counts workers *per queue* and has nothing to count for a
 queue with zero subscribers.
 
-Run the queue-coverage check in both directions:
+Cover both directions — before any work is scheduled onto a new queue, and
+after every drain or deploy:
 
-- **Post-drain / post-deploy smoke check** — after every drain, and again
-  once a rolling deploy's replacement workers are up, to confirm nothing was
-  left orphaned.
+- **Post-drain / post-deploy smoke check** — after every drain **has
+  actually finished** (either `harvest worker drain --wait`, or poll
+  `GET /workers/{id}` until `status: "Stopped"`), and again once a rolling
+  deploy's replacement workers are up, to confirm nothing was left orphaned.
+  Running the check the instant `harvest worker drain` returns (without
+  `--wait`) is not enough on its own: a `Draining` worker still counts as
+  covering every queue it was assigned, so the report can read "covered"
+  right up until the worker finishes its in-flight work and transitions to
+  `Stopped` — check after that transition, not before it.
 - **Pre-cutover check when adding a queue** — before routing traffic (or
   flipping a workflow's `queue` attribute) onto a queue name that didn't
-  exist before, to confirm at least one worker is already subscribed and
-  live, rather than discovering the gap only after the first activity is
-  scheduled onto it.
+  exist before, confirm at least one worker is already subscribed with
+  `harvest worker list --queue <name>` (or `GET /workers?queue=<name>`), not
+  `harvest queue coverage`. The coverage report is built entirely from
+  *pending* `harvest_task_queue` rows, so a brand-new queue with no
+  scheduled work yet has nothing to compare workers against and always
+  reports `uncovered: false` — a vacuous "fine" regardless of whether any
+  worker is actually subscribed. Once traffic is flowing,
+  `harvest queue coverage --queue <name>` is the right tool to confirm
+  nothing is left stranding.
 
 ```bash
 harvest queue coverage --json

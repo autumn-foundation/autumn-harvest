@@ -4071,7 +4071,7 @@
           "name": "queue_name",
           "in": "query",
           "required": false,
-          "description": "Narrow the report to a single queue name. Any string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and a blank/whitespace value normalizes to no filter; an unknown or never-scheduled queue name simply yields uncovered: false, never an error."
+          "description": "Narrow the report to a single queue name. Any string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and the value is matched verbatim (never trimmed; only the literal empty string normalizes to no filter, since a queue name may legitimately carry surrounding or all whitespace); an unknown or never-scheduled queue name simply yields uncovered: false, never an error."
         }
       ],
       "request_body": null,

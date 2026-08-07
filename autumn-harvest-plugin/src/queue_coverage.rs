@@ -92,22 +92,35 @@ impl QueueCoverageQuery {
     /// never-scheduled) queue name — so unlike a `group_by`/`state`/date
     /// param, there is no value to reject here. A repeated `queue_name` key
     /// resolves last-value-wins (never an error); an unrecognized key is
-    /// ignored for forward-compatibility; a blank/whitespace-only value
-    /// normalizes to "no filter" rather than a filter that matches nothing
-    /// (mirroring `WorkerFilters::queue`'s trim-and-treat-blank-as-absent
-    /// convention). This intentionally sidesteps a real pre-#774-hardening
-    /// bug where the derive-based `Query<QueueCoverageQuery>` extractor's
-    /// built-in duplicate-key rejection surfaced as a `400` with a
-    /// `text/plain` body rather than the JSON `400` AC8 requires — using
-    /// this hand-parsed, always-succeeding path removes that failure mode
-    /// entirely instead of just recoloring its response body.
+    /// ignored for forward-compatibility.
+    ///
+    /// The value is preserved **verbatim** (never trimmed) — only the
+    /// literal empty string `""` normalizes to "no filter". This
+    /// deliberately diverges from `WorkerFilters::queue`'s
+    /// trim-and-treat-blank-as-absent convention: `WorkerConfig::with_queues`
+    /// rejects only an *exactly-empty* queue name (`assert!(!q.is_empty())`)
+    /// — it does **not** reject leading/trailing whitespace or an
+    /// all-whitespace name, so a queue registered as e.g. `" priority "` or
+    /// `" "` is unusual but valid. Trimming the filter here would silently
+    /// retarget such a query onto a *different* (trimmed) queue name than
+    /// the one actually registered — this endpoint's whole job is confirming
+    /// coverage for one exact, operator-supplied name — and an
+    /// all-whitespace value would collapse to "unfiltered" (matching
+    /// *every* queue) rather than "match this one whitespace-named queue",
+    /// the opposite of what a caller who typed that value intended. An
+    /// exact match that legitimately finds nothing is safer than either.
+    /// This intentionally sidesteps a real pre-#774-hardening bug where the
+    /// derive-based `Query<QueueCoverageQuery>` extractor's built-in
+    /// duplicate-key rejection surfaced as a `400` with a `text/plain` body
+    /// rather than the JSON `400` AC8 requires — using this hand-parsed,
+    /// always-succeeding path removes that failure mode entirely instead of
+    /// just recoloring its response body.
     #[must_use]
     pub fn from_query_pairs(pairs: &[(String, String)]) -> Self {
         let mut params = Self::default();
         for (key, value) in pairs {
             if key == "queue_name" {
-                let trimmed = value.trim();
-                params.queue_name = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                params.queue_name = (!value.is_empty()).then(|| value.clone());
             }
             // Unknown keys are ignored for forward-compatibility.
         }
@@ -1079,16 +1092,33 @@ mod tests {
     }
 
     #[test]
-    fn from_query_pairs_blank_value_normalizes_to_no_filter() {
-        let pairs = vec![("queue_name".to_string(), "   ".to_string())];
+    fn from_query_pairs_empty_string_value_normalizes_to_no_filter() {
+        // Only the literal empty string means "no filter" -- see the
+        // exact-match rationale on `from_query_pairs` itself.
+        let pairs = vec![("queue_name".to_string(), String::new())];
         let query = QueueCoverageQuery::from_query_pairs(&pairs);
         assert_eq!(query.queue_name, None);
     }
 
     #[test]
-    fn from_query_pairs_trims_surrounding_whitespace() {
+    fn from_query_pairs_whitespace_only_value_is_preserved_as_exact_filter() {
+        // A whitespace-only value is NOT normalized away -- `with_queues`
+        // permits a queue name that is entirely whitespace (it only rejects
+        // the exactly-empty string), so trimming/dropping this filter would
+        // make it impossible to query coverage for such a queue, and would
+        // silently widen the filter to "match every queue" instead.
+        let pairs = vec![("queue_name".to_string(), "   ".to_string())];
+        let query = QueueCoverageQuery::from_query_pairs(&pairs);
+        assert_eq!(query.queue_name.as_deref(), Some("   "));
+    }
+
+    #[test]
+    fn from_query_pairs_preserves_surrounding_whitespace() {
+        // Surrounding whitespace is preserved verbatim, not trimmed -- a
+        // queue registered as e.g. " email-workers " (unusual but valid
+        // under `with_queues`) must be filterable by its exact name.
         let pairs = vec![("queue_name".to_string(), "  email-workers  ".to_string())];
         let query = QueueCoverageQuery::from_query_pairs(&pairs);
-        assert_eq!(query.queue_name.as_deref(), Some("email-workers"));
+        assert_eq!(query.queue_name.as_deref(), Some("  email-workers  "));
     }
 }
