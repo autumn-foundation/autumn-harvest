@@ -293,9 +293,10 @@ it simply is not subscribed to that queue name.
 4. Run `harvest worker health --output json` (or `harvest worker list --queue <queue>`)
    to confirm no worker is currently subscribed to the named queue.
 5. Check `status` in the report: `partial`/`unavailable` means at least one
-   shard could not be inspected — `unavailable_shards` names it and its
-   pending demand is **not** reflected in the report; do not read a
-   `partial` result as "fully covered".
+   shard could not be inspected — walk `shards[]` for the entry carrying
+   `status: "unavailable"` to identify it; that shard's pending demand is
+   **not** reflected in the report, so do not read a `partial` result as
+   "fully covered".
 
 ### Likely causes
 
@@ -313,16 +314,21 @@ set and the live worker registry on every call, not sampled. A queue that
 is intentionally paused (`GET /admin/queues/paused`) is excluded from the
 uncovered list by design (paused work is expected to sit idle, not
 stranded) — confirm the queue is not paused before treating a report as a
-false positive. A `partial`/`unavailable` `status` can under-report (an
-unreachable shard's pending demand is invisible), never over-report.
+false positive. Don't stop there, though: a paused queue with pending work
+and no live poller is still surfaced, separately, in the report's
+`excluded_paused_queues` array — a non-empty entry there is not a false
+positive, it's a pre-unpause TODO (unpausing that queue today would make it
+uncovered immediately). A `partial`/`unavailable` `status` can under-report
+(an unreachable shard's pending demand is invisible), never over-report.
 
 ### Safe actions
 
 Add or re-subscribe a worker to the named queue (`with_queues([...])` /
 `--queues`), or resume routing if the queue was meant to be a synonym for
 one an existing worker already polls. Do not adjust build policy or remove
-workflow handlers to fix this — coverage is orthogonal to both (see
-`docs/runbooks/safe-deploy.md`'s "Post-drain check").
+workflow handlers to fix this — coverage is orthogonal to both (see the
+["Queue-coverage check" section](safe-deploy.md#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774)
+of `docs/runbooks/safe-deploy.md`).
 
 ### Escalation criteria
 

@@ -153,15 +153,29 @@ and `request_id`.
 
 ---
 
-## Post-drain check — confirm no queue was left uncovered (issue #774)
+## Queue-coverage check — confirm every queue has a live poller (issue #774)
 
 Draining removes a worker's capacity for every queue it served. If it was
 the *last* worker polling one of those queues, pending work on that queue is
 now stranded with nothing to claim it — silently, since a successful drain
-call does not fail just because it happened to orphan a queue.
+call does not fail just because it happened to orphan a queue. The same
+failure shape shows up **before** a drain too: a workflow that schedules
+activities onto a brand-new queue whose worker deployment hasn't shipped
+yet (or a typo'd queue name) produces `PENDING` rows no live worker will
+ever claim — and that queue never appears in `fleet_health.by_queue` at
+all, since it counts workers *per queue* and has nothing to count for a
+queue with zero subscribers.
 
-Run the queue-coverage check after every drain, and again once a rolling
-deploy's replacement workers are up:
+Run the queue-coverage check in both directions:
+
+- **Post-drain / post-deploy smoke check** — after every drain, and again
+  once a rolling deploy's replacement workers are up, to confirm nothing was
+  left orphaned.
+- **Pre-cutover check when adding a queue** — before routing traffic (or
+  flipping a workflow's `queue` attribute) onto a queue name that didn't
+  exist before, to confirm at least one worker is already subscribed and
+  live, rather than discovering the gap only after the first activity is
+  scheduled onto it.
 
 ```bash
 harvest queue coverage --json
@@ -172,10 +186,12 @@ harvest queue coverage --json
 least one queue has `PENDING` tasks and zero live pollers assigned to it on
 the shard that owns the pending work — `Active` **or** `Draining` workers
 both count as covering (a draining worker still finishes work already in
-flight), only `Stopped` and stale (heartbeat-expired) workers do not. Each
-uncovered queue's report entry carries bounded sample `task_ids`/
-`execution_ids` (capped at 5) so you can open a specific stranded task
-directly:
+flight), only `Stopped` and stale (heartbeat-expired) workers do not, and
+coverage means *a poller exists*, not that capacity is free — a queue whose
+workers are all saturated at `max_concurrency` is still covered (that's
+#531/#742's job). Each uncovered queue's report entry carries bounded sample
+`task_ids`/`execution_ids` (capped at 5) so you can open a specific stranded
+task directly:
 
 ```bash
 harvest workflow stack <execution_id>
@@ -183,8 +199,20 @@ harvest workflow stack <execution_id>
 
 `?queue_name=<name>` (`--queue <name>` on the CLI) narrows the check to one
 queue. `harvest queue coverage` exits non-zero (exit code 2 — the same
-"deploy hazard" convention `harvest workflow-types reachability` uses) when
-`uncovered: true`, so it composes as a CI/CD gate the same way.
+"deploy hazard" convention `harvest workflow-types reachability` uses)
+whenever `uncovered: true` **or** the cross-shard `status` is `partial`/
+`unavailable` — an incomplete answer is treated as unsafe, never silently
+downgraded to "looks fine" just because the shards it *did* reach happened
+to be clean.
+
+**A queue currently paused via the queue-pause primitive is deliberately
+excluded** from `items`/`uncovered` (that intent is already surfaced by the
+separate `harvest_queue_paused_too_long` alert), but a paused queue that
+also has real pending work and zero live pollers is still named in
+`excluded_paused_queues` — the moment it's unpaused without a worker being
+added, it becomes uncovered, and `harvest_queue_paused_too_long` alone can
+miss that combination for its full grace window. Treat a non-empty
+`excluded_paused_queues` as a pre-unpause TODO, not a false negative.
 
 **This is a distinct question from build-id reachability (#171) and the
 pre-cutover handler-coverage gate immediately below (#520/#700).** Build-id
@@ -200,8 +228,9 @@ handler-complete — it simply isn't subscribed to that queue name (a typo'd
 drain that removed the last subscriber). Fix by adding or re-subscribing a
 worker to the named queue, not by adjusting build policy or removing
 handlers. An unreachable shard is never silently dropped from the report —
-it is named in `unavailable_shards` and degrades `status` to `partial`/
-`unavailable`, so a partial report is never mistaken for "fully covered".
+it is named in `shards[]` with `status: "unavailable"` and degrades the
+top-level `status` to `partial`/`unavailable`, so a partial report is never
+mistaken for "fully covered".
 
 ---
 
@@ -590,9 +619,9 @@ Response fields:
 
 Before cutting a **default (non-build-routed)** deployment over to code that has **deleted or renamed a `#[workflow]` handler**, confirm no in-flight run still needs that handler. A non-terminal execution's `workflow_name` names the handler its next replay requires — removing it strands those runs in permanent `HandlerNotFound` replay failure, surfacing only later as a timeout/DLQ entry.
 
-**Where this sits in the deploy ladder:** worker drain (#386) → **this pre-cutover handler-coverage gate** → [Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) → non-determinism block (#480) → history reset/redrive (#614) → reset-from-history (#538 / #510). Run this gate **before** the replay canary: the canary replays runs of handlers that still exist; this gate catches runs whose handler is about to disappear entirely.
+**Where this sits in the deploy ladder:** worker drain (#386) → **this pre-cutover handler-coverage gate** → [queue-coverage check](#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774) (#774) → [Pre-Deploy Replay Canary](#runbook-pre-deploy-replay-canary) (#512) → non-determinism block (#480) → history reset/redrive (#614) → reset-from-history (#538 / #510). Run this gate **before** the replay canary: the canary replays runs of handlers that still exist; this gate catches runs whose handler is about to disappear entirely. Queue coverage is a sibling gate, not a stricter/looser version of this one — it asks a worker-fleet-topology question (*is anyone polling this queue at all?*) that is orthogonal to handler coverage's code-compatibility question, so run both.
 
-This gate answers *"does a registered handler still exist for this workflow type?"* — a code-compatibility question. It is deliberately distinct from the [post-drain queue-coverage check](#post-drain-check--confirm-no-queue-was-left-uncovered-issue-774) above, which answers a worker-fleet-topology question instead — *"is any live worker even polling the queue this pending task sits on?"* A run can fail either check independently: a fully covered queue can still be `orphaned` if its handler was removed, and a fully handler-complete deployment can still leave a queue `uncovered` if no worker subscribes to it.
+This gate answers *"does a registered handler still exist for this workflow type?"* — a code-compatibility question. It is deliberately distinct from the [queue-coverage check](#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774) above, which answers a worker-fleet-topology question instead — *"is any live worker even polling the queue this pending task sits on?"* A run can fail either check independently: a fully covered queue can still be `orphaned` if its handler was removed, and a fully handler-complete deployment can still leave a queue `uncovered` if no worker subscribes to it.
 
 ## CI/CD gate — one field asserts "zero orphans"
 

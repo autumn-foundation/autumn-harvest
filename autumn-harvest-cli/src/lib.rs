@@ -4426,6 +4426,51 @@ fn queue_coverage_exit_code(value: &Value) -> i32 {
     if uncovered { 2 } else { 0 }
 }
 
+/// "WARNING: unavailable shards [..]" footer, or empty when every shard was
+/// reached. Extracted so [`format_queue_coverage_table`] stays under the
+/// line-count lint.
+fn queue_coverage_unavailable_footer(value: &Value) -> String {
+    let unavailable = value
+        .get("shards")
+        .and_then(Value::as_array)
+        .map(|shards| {
+            shards
+                .iter()
+                .filter(|shard| shard.get("status").and_then(Value::as_str) == Some("unavailable"))
+                .filter_map(|shard| shard.get("shard_id").and_then(Value::as_i64))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if unavailable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nWARNING: unavailable shards [{}] — coverage is provisional, not fully verified.",
+            unavailable.join(", ")
+        )
+    }
+}
+
+/// "NOTE: paused queues .." footer, or empty when nothing was excluded.
+/// Extracted so [`format_queue_coverage_table`] stays under the line-count
+/// lint.
+fn queue_coverage_paused_note(value: &Value) -> String {
+    let paused_uncovered = value
+        .get("excluded_paused_queues")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if paused_uncovered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nNOTE: paused queues with pending work and no live poller (excluded from the count above; unpausing without adding a worker would make them uncovered immediately): {}",
+            paused_uncovered.join(", ")
+        )
+    }
+}
+
 fn format_queue_coverage_table(value: &Value) -> String {
     let status = value
         .get("status")
@@ -4444,35 +4489,23 @@ fn format_queue_coverage_table(value: &Value) -> String {
     // return path below, even the friendly "fully covered" shortcuts — a
     // partial/unavailable report's "nothing uncovered" claim is unverified
     // for the shards it never reached, and must never read as clean.
-    let unavailable = value
-        .get("shards")
-        .and_then(Value::as_array)
-        .map(|shards| {
-            shards
-                .iter()
-                .filter(|shard| shard.get("status").and_then(Value::as_str) == Some("unavailable"))
-                .filter_map(|shard| shard.get("shard_id").and_then(Value::as_i64))
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let footer = if unavailable.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nWARNING: unavailable shards [{}] — coverage is provisional, not fully verified.",
-            unavailable.join(", ")
-        )
-    };
+    let footer = queue_coverage_unavailable_footer(value);
+
+    // A paused, pollerless queue with real pending work is deliberately
+    // excluded from `items`/`uncovered` (see the endpoint's docs), but must
+    // still surface here — unpausing it without adding a worker would
+    // immediately make it uncovered, and `--json` is the only other way to
+    // see this list.
+    let paused_note = queue_coverage_paused_note(value);
 
     let Some(items) = value.get("items").and_then(Value::as_array) else {
         return format!(
-            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\nNo uncovered queues.{footer}"
+            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\nNo uncovered queues.{footer}{paused_note}"
         );
     };
     if items.is_empty() {
         return format!(
-            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: 0\nAll queues with pending work are covered.{footer}"
+            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: 0\nAll queues with pending work are covered.{footer}{paused_note}"
         );
     }
 
@@ -4530,7 +4563,7 @@ fn format_queue_coverage_table(value: &Value) -> String {
         .join("\n");
 
     format!(
-        "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}"
+        "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}{paused_note}"
     )
 }
 
@@ -8429,6 +8462,85 @@ mod reuse_policy_tests {
         });
         let rendered = format_queue_coverage_table(&value);
         assert!(rendered.contains("WARNING: unavailable shards [1]"));
+    }
+
+    #[test]
+    fn queue_coverage_table_surfaces_excluded_paused_queues() {
+        // The paused-but-pollerless exclusion (module docs on
+        // `queue_coverage.rs`) must not be invisible outside `--json` --
+        // an operator using the default table view needs to see it too.
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": ["seasonal-batch"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("All queues with pending work are covered."));
+        assert!(rendered.contains("NOTE: paused queues"));
+        assert!(rendered.contains("seasonal-batch"));
+    }
+
+    #[test]
+    fn queue_coverage_table_with_uncovered_items_also_surfaces_paused_note() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 1,
+            "uncovered": true,
+            "items": [
+                {
+                    "queue_name": "typo_queue",
+                    "pending_count": 1,
+                    "sample_task_ids": [],
+                    "sample_execution_ids": [],
+                    "shard_breakdown": [{ "shard_id": 0, "pending_count": 1 }]
+                }
+            ],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": ["seasonal-batch"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("typo_queue"));
+        assert!(rendered.contains("NOTE: paused queues"));
+        assert!(rendered.contains("seasonal-batch"));
+    }
+
+    #[test]
+    fn queue_coverage_table_omits_paused_note_when_nothing_excluded() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": []
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(!rendered.contains("NOTE: paused queues"));
+    }
+
+    #[test]
+    fn queue_coverage_wants_raw_json_only_with_the_json_flag() {
+        assert!(queue_coverage_wants_raw_json(&parse(&[
+            "queue", "coverage", "--json"
+        ])));
+        assert!(!queue_coverage_wants_raw_json(&parse(&[
+            "queue", "coverage"
+        ])));
+        assert!(!queue_coverage_wants_raw_json(&parse(&["shard", "health"])));
+    }
+
+    #[test]
+    fn queue_coverage_wants_table_only_without_the_json_flag_in_pretty_mode() {
+        assert!(queue_coverage_wants_table(&parse(&["queue", "coverage"])));
+        assert!(!queue_coverage_wants_table(&parse(&[
+            "queue", "coverage", "--json"
+        ])));
     }
 
     #[test]

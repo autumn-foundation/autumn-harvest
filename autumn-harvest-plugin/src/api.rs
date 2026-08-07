@@ -6735,6 +6735,7 @@ pub const fn management_api_response_fields()
                 "total_uncovered_queues",
                 "items",
                 "shards",
+                "excluded_paused_queues",
             ]),
         ),
         (
@@ -7324,8 +7325,9 @@ async fn shards_health(
 /// (#171) and shard health (#522)).
 async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
-    Query(query): Query<crate::queue_coverage::QueueCoverageQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Json<crate::queue_coverage::QueueCoverageReport> {
+    let query = crate::queue_coverage::QueueCoverageQuery::from_query_pairs(&pairs);
     Json(crate::queue_coverage::build_queue_coverage_report(&api_state, query).await)
 }
 

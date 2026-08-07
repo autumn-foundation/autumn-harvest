@@ -345,6 +345,32 @@ async fn pause_queue(database_url: &str, queue_name: &str) {
         .expect("failed to pause queue");
 }
 
+/// Fully saturate a worker (`in_flight_count == max_concurrency`) for the
+/// AC2 "coverage != capacity" test — coverage must ignore utilization.
+async fn saturate_worker(database_url: &str, worker_id: &str) {
+    use autumn_harvest::schema::harvest_workers;
+
+    let mut conn = connect(database_url).await;
+    diesel::update(harvest_workers::table.find(worker_id))
+        .set(harvest_workers::in_flight_count.eq(harvest_workers::max_concurrency))
+        .execute(&mut conn)
+        .await
+        .expect("failed to saturate worker");
+}
+
+/// Set a worker's `build_id` for the AC5 "coverage is orthogonal to build
+/// compatibility" test -- `worker_covers_queue` must never consult it.
+async fn set_worker_build_id(database_url: &str, worker_id: &str, build_id: &str) {
+    use autumn_harvest::schema::harvest_workers;
+
+    let mut conn = connect(database_url).await;
+    diesel::update(harvest_workers::table.find(worker_id))
+        .set(harvest_workers::build_id.eq(build_id))
+        .execute(&mut conn)
+        .await
+        .expect("failed to set worker build_id");
+}
+
 /// Scrubs `harvest_workflow_executions` (cascades to `harvest_task_queue`
 /// and every other execution-scoped table via `ON DELETE CASCADE`) plus the
 /// two standalone tables this suite writes with no FK back to an execution
@@ -611,6 +637,130 @@ async fn paused_queue_is_excluded_from_the_uncovered_list() {
         report.get("items").and_then(Value::as_array).map(Vec::len),
         Some(0)
     );
+    // The pause exclusion is not invisible: a paused, pollerless queue that
+    // has real pending work must still be named so it doesn't silently
+    // outlast `harvest_queue_paused_too_long`'s own grace window.
+    assert_eq!(
+        report.get("excluded_paused_queues"),
+        Some(&json!(["seasonal-batch"])),
+        "the paused, pollerless queue must be surfaced in excluded_paused_queues"
+    );
+}
+
+#[tokio::test]
+async fn paused_and_covered_queue_is_absent_from_excluded_paused_queues() {
+    // A paused queue that already has a live poller has nothing interesting
+    // to report -- it would not have been uncovered even if unpaused right
+    // now, so it must not clutter excluded_paused_queues either.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(
+        &database_url,
+        ShardId::new(0),
+        "seasonal-batch",
+        "onboarding",
+    )
+    .await;
+    insert_worker(
+        &database_url,
+        "worker-1",
+        &["seasonal-batch"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+    pause_queue(&database_url, "seasonal-batch").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(report.get("uncovered"), Some(&json!(false)));
+    assert_eq!(
+        report.get("excluded_paused_queues"),
+        Some(&json!([])),
+        "a paused-but-covered queue must not appear in excluded_paused_queues"
+    );
+}
+
+#[tokio::test]
+async fn saturated_worker_still_covers_the_queue() {
+    // AC2: coverage means a poller exists, not that capacity is free. A
+    // worker fully saturated at max_concurrency must still count as
+    // covering -- utilization is #531/#742's job, out of scope here.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(
+        &database_url,
+        ShardId::new(0),
+        "email-workers",
+        "onboarding",
+    )
+    .await;
+    insert_worker(
+        &database_url,
+        "worker-1",
+        &["email-workers"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+    saturate_worker(&database_url, "worker-1").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report.get("uncovered"),
+        Some(&json!(false)),
+        "a fully saturated worker must still count as a live poller"
+    );
+}
+
+#[tokio::test]
+async fn build_incompatible_worker_still_covers_the_queue() {
+    // AC5: this endpoint answers "does any live worker poll this queue at
+    // all" -- never "...with a build compatible with the pending task's
+    // required_build_id", which is #171's build_reachability. Coverage
+    // must never depend on `build_id`.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(
+        &database_url,
+        ShardId::new(0),
+        "email-workers",
+        "onboarding",
+    )
+    .await;
+    insert_worker(
+        &database_url,
+        "worker-1",
+        &["email-workers"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+    set_worker_build_id(&database_url, "worker-1", "some-arbitrary-build-sha").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report.get("uncovered"),
+        Some(&json!(false)),
+        "worker build_id must never affect coverage"
+    );
 }
 
 #[tokio::test]
@@ -640,6 +790,69 @@ async fn queue_name_filter_narrows_the_report_to_one_queue() {
         .filter_map(|item| item.get("queue_name").and_then(Value::as_str))
         .collect();
     assert_eq!(names, vec!["typo_queue_a"]);
+}
+
+#[tokio::test]
+async fn queue_name_filter_matching_nothing_is_fully_covered() {
+    // An unrecognized/never-scheduled queue name yields uncovered: false --
+    // there is nothing pending on it, never an error (module doc contract).
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(&database_url, ShardId::new(0), "typo_queue_a", "onboarding").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage?queue_name=never_scheduled").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report.get("filter").and_then(Value::as_str),
+        Some("never_scheduled")
+    );
+    assert_eq!(report.get("uncovered"), Some(&json!(false)));
+    assert_eq!(report.get("total_uncovered_queues"), Some(&json!(0)));
+    assert_eq!(
+        report.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn duplicate_and_unknown_query_params_do_not_400() {
+    // AC8: invalid params return 400 with a JSON error body -- but a
+    // *duplicate* or *unknown* query key is not an invalid VALUE
+    // (queue_name has no invalid value), so per the codebase's
+    // `from_query_pairs` convention it must resolve, never reject. This is
+    // the end-to-end proof over the real axum route: the pre-hardening
+    // derive-based `Query<QueueCoverageQuery>` extractor 400'd a duplicate
+    // key with a `text/plain` body instead.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(&database_url, ShardId::new(0), "typo_queue_b", "onboarding").await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(
+        &app,
+        "/admin/queue-coverage?queue_name=typo_queue_a&queue_name=typo_queue_b&unknown_param=1",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a duplicate/unknown query key must never 400"
+    );
+    assert_eq!(
+        report.get("filter").and_then(Value::as_str),
+        Some("typo_queue_b"),
+        "a duplicate key must resolve last-value-wins"
+    );
+    assert_eq!(report.get("total_uncovered_queues"), Some(&json!(1)));
 }
 
 #[tokio::test]
