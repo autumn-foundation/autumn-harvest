@@ -627,6 +627,96 @@ async fn many_historical_stopped_workers_do_not_prevent_correct_coverage_detecti
 }
 
 #[tokio::test]
+async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
+    use autumn_harvest::schema::harvest_workers;
+
+    // Issue #774 review, third finding: `fetch_potentially_live_workers`'s
+    // `MAX_LIMIT` (500) truncation runs *inside* `list_workers` via
+    // `apply_worker_filters`, whose own doc comment states the limit is
+    // "intentionally applied after the in-process retain passes" -- but
+    // that guarantee only holds when the caller actually supplies the
+    // retain criteria it needs. A crashed worker's `status` column can
+    // stay `Active` forever (nothing ever calls `transition_status` on a
+    // dead process -- only its heartbeat goes stale), so a fleet with more
+    // than `MAX_LIMIT` such permanently-stale-but-`Active` rows must not
+    // be able to truncate away the one genuinely healthy poller before
+    // this endpoint's own health check ever sees it. Distinct from
+    // `many_historical_stopped_workers_do_not_prevent_correct_coverage_detection`
+    // above (which used `Stopped` status, filtered out server-side by the
+    // `status` predicate itself, well under the cap) -- this test's rows
+    // are all `status = 'Active'`, so only a health-*before*-truncate
+    // ordering (not the status filter) can save the healthy poller.
+    let (database_url, _container) = setup_db_env_or_container().await;
+    scrub(&database_url).await;
+    insert_pending_task(
+        &database_url,
+        ShardId::new(0),
+        "email-workers",
+        "onboarding",
+    )
+    .await;
+
+    // Bulk-register MAX_LIMIT + 1 (501) `Active` workers on ONE reused
+    // connection (avoiding 501 separate connection-establish round trips),
+    // all polling "email-workers".
+    let mut conn = connect(&database_url).await;
+    let mut stale_worker_ids = Vec::with_capacity(501);
+    for i in 0..501 {
+        let worker_id = format!("stale-active-{i}");
+        register_worker(
+            &mut conn,
+            &worker_id,
+            &["email-workers".to_string()],
+            &[0],
+            10,
+            "test-host",
+            None,
+            "",
+            None,
+            &HashMap::<String, String>::new(),
+            0,
+        )
+        .await
+        .expect("failed to register stale worker");
+        stale_worker_ids.push(worker_id);
+    }
+    // Backdate all 501 in one query so they classify `Stale` against the
+    // default 10s threshold, instead of 501 individual round trips.
+    diesel::update(
+        harvest_workers::table.filter(harvest_workers::worker_id.eq_any(&stale_worker_ids)),
+    )
+    .set(harvest_workers::last_heartbeat_at.eq(Utc::now() - ChronoDuration::seconds(60)))
+    .execute(&mut conn)
+    .await
+    .expect("failed to bulk-backdate stale workers");
+
+    // One genuinely healthy poller for the same queue.
+    insert_worker(
+        &database_url,
+        "worker-live",
+        &["email-workers"],
+        &[0],
+        WorkerStatus::Active,
+    )
+    .await;
+
+    let app = build_api_app(
+        HarvestDbPool::single(build_test_pool(&database_url)),
+        single_shard_router(),
+    );
+
+    let (status, report) = get_json(&app, "/admin/queue-coverage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report.get("uncovered"),
+        Some(&json!(false)),
+        "501 stale-but-Active rows must not truncate away the one healthy \
+         poller before the health check runs: {report:?}"
+    );
+    assert_eq!(report.get("total_uncovered_queues"), Some(&json!(0)));
+}
+
+#[tokio::test]
 async fn stale_worker_does_not_cover_the_queue() {
     let (database_url, _container) = setup_db_env_or_container().await;
     scrub(&database_url).await;

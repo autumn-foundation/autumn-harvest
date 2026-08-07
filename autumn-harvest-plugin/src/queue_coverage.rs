@@ -515,14 +515,12 @@ fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> b
 /// one shard already needs the paginated `GET /workers` surface, not this
 /// deploy-safety smoke check.
 ///
-/// Does **not** filter by heartbeat freshness in SQL -- `WorkerHealth` is
-/// still classified client-side from `last_heartbeat_at`, exactly as
-/// before, so a `Stale` `Active`/`Draining` worker is still loaded and then
-/// correctly excluded by `worker_covers_queue`'s `is_live` check. That
-/// residual population (a worker that crashed recently enough to still
-/// carry a live-looking status) is bounded by real time-to-heartbeat-expiry,
-/// not by fleet history, so it does not reproduce the unbounded-scan
-/// problem this fix targets.
+/// Also pre-filters to a fresh heartbeat (`WorkerHealth::Healthy`) --
+/// `WorkerHealth` is still classified client-side from `last_heartbeat_at`,
+/// exactly as before, but the retain now runs *before* the `MAX_LIMIT`
+/// truncation rather than after it. See the inline comment on the filter
+/// literal below for why that ordering matters (issue #774 review, second
+/// round): a `status` column can outlive the process that set it.
 async fn fetch_potentially_live_workers(
     conn: &mut AsyncPgConnection,
     worker_stale_threshold: Duration,
@@ -531,6 +529,25 @@ async fn fetch_potentially_live_workers(
     for status in [WorkerStatus::Active, WorkerStatus::Draining] {
         let filters = WorkerFilters {
             status: Some(status.as_str().to_string()),
+            // `list_workers` applies `status` in SQL but `health` and
+            // `limit` both client-side, via `apply_worker_filters` --
+            // whose own doc comment states the limit is "intentionally
+            // applied after the in-process retain passes so that a
+            // SQL-level page size cannot silently exclude matching rows".
+            // That guarantee only holds when a caller actually supplies
+            // the retain criteria it cares about: a crashed worker's
+            // `status` column can stay `Active` forever (nothing ever
+            // calls `transition_status` on a dead process -- only its
+            // heartbeat goes stale), so a fleet that has accumulated more
+            // than `MAX_LIMIT` such permanently-stale-but-`Active` rows
+            // could truncate away the one genuinely healthy poller before
+            // `worker_covers_queue`'s own health check ever saw it. Since
+            // this function's only consumer is that same health check
+            // (`is_live = health == Healthy && status in {Active,
+            // Draining}`), pre-filtering to `Healthy` here loses nothing a
+            // caller needs and puts the retain-before-truncate ordering
+            // back on the right side of the cap (issue #774 review).
+            health: Some(WorkerHealth::Healthy),
             limit: WorkerFilters::MAX_LIMIT,
             ..WorkerFilters::new()
         };
