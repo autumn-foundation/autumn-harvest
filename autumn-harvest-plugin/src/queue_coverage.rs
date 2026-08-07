@@ -401,12 +401,30 @@ fn merge_excluded_paused_queues(sets: Vec<BTreeSet<String>>) -> Vec<String> {
 /// but a worker started via the raw `Worker::run` legacy single-shard path
 /// with no explicit assignment still registers with a literal `[]` -- even
 /// though its poll loop (`claim_pool = match shard_targets.as_slice() { [] =>
-/// pool }` in `worker.rs`) falls back to the caller's default pool and
-/// actually claims work as shard 0 ("legacy behavior, byte-for-byte
-/// unchanged"). The DLQ-depth sampler in the same file hits the identical
-/// case and hardcodes the same `0` fallback. Without this normalization a
-/// perfectly healthy legacy single-shard worker would be reported as covering
-/// no shard at all, falsely flagging every queue it actually polls.
+/// pool }` in `worker.rs`) falls back to the caller's default `pool` argument
+/// and actually claims work against whatever database that pool points at
+/// ("legacy behavior, byte-for-byte unchanged"). That is also the SAME pool
+/// `run_with_listener` uses to call `register_in_fleet`, so an empty-array
+/// worker's registry row is written into that exact database -- and this
+/// function is only ever called with a `worker`/`shard_id` pair the caller
+/// (`observe_shard`) has already scoped to one shard's own connection, so an
+/// empty-array worker found there is unconditionally covering `shard_id`,
+/// whatever numeric value the deployment's single/default shard happens to
+/// carry (`ShardRouter::new` accepts an arbitrary `default_shard`, not just
+/// `0` -- see `ShardRouter::single()` vs the general constructor). Hardcoding
+/// `shard_id == 0` here would falsely report a healthy legacy worker as
+/// uncovered on any deployment whose single shard isn't literally numbered
+/// `0` (issue #774 review). Without this normalization at all, a perfectly
+/// healthy legacy single-shard worker would be reported as covering no shard
+/// whatsoever, falsely flagging every queue it actually polls.
+///
+/// `autumn-harvest-plugin/src/shard_health.rs::worker_assigned_to_shard` has
+/// an analogous gap in the identical `observe_shard`-then-per-shard-scoped-
+/// worker-list shape (its own `observe_shard` also loads workers on a
+/// connection already acquired from one shard's own pool), tracked in issue
+/// #1150 -- that fix was corrected to the same "unconditionally covers
+/// `shard_id`" rule this function uses, rather than a `shard_id == 0`
+/// hardcode, once this function's own fix surfaced why the hardcode is wrong.
 fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     let is_live = worker.health == WorkerHealth::Healthy
         && (worker.worker.status == WorkerStatus::Active.as_str()
@@ -417,7 +435,7 @@ fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> b
         .as_array()
         .is_some_and(|shards| {
             if shards.is_empty() {
-                shard_id == 0
+                true
             } else {
                 shards
                     .iter()
@@ -991,13 +1009,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_worker_with_empty_shard_assignments_covers_default_shard() {
+    fn legacy_worker_with_empty_shard_assignments_covers_shard_zero() {
         // A `Worker::run` legacy single-shard worker (no explicit
         // `shard_assignments` configured) registers with a literal `[]`, but
-        // its poll loop falls back to the default pool and claims work as
-        // shard 0 -- this coverage check must treat that the same way, or
-        // every queue a perfectly healthy legacy worker actually polls is
-        // falsely reported uncovered.
+        // its poll loop falls back to the default pool and claims work
+        // against whatever database that pool points at -- this coverage
+        // check must treat that the same way, or every queue a perfectly
+        // healthy legacy worker actually polls is falsely reported
+        // uncovered.
         let worker = worker_row(
             WorkerStatus::Active,
             WorkerHealth::Healthy,
@@ -1008,16 +1027,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_worker_with_empty_shard_assignments_does_not_cover_non_default_shard() {
-        // The empty-array normalization is scoped to shard 0 specifically --
-        // it must not be read as "covers every shard".
+    fn legacy_worker_with_empty_shard_assignments_covers_a_nonzero_shard_too() {
+        // The empty-array normalization must NOT be hardcoded to shard 0:
+        // `worker_covers_queue` is only ever called by `observe_shard` with a
+        // worker/shard_id pair already scoped to that one shard's own
+        // connection, so an empty-array worker found there covers whatever
+        // `shard_id` is being evaluated -- including a deployment whose
+        // single/default shard is numbered something other than 0 (issue
+        // #774 review). A worker row is identical regardless of which shard
+        // it was fetched from; only the `shard_id` argument -- standing in
+        // for which shard's connection produced this row -- changes here.
         let worker = worker_row(
             WorkerStatus::Active,
             WorkerHealth::Healthy,
             &[],
             &["orphan_queue"],
         );
-        assert!(!worker_covers_queue(&worker, "orphan_queue", 1));
+        assert!(worker_covers_queue(&worker, "orphan_queue", 1));
     }
 
     #[test]
