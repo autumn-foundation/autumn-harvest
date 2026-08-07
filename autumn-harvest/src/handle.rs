@@ -4,7 +4,7 @@
 //! workflow behind an HTTP route and wants to await the terminal result without
 //! polling the full event history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,21 +12,32 @@ use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
+use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
+use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
     CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
+    cancel_workflow_execution, check_and_report_unfinished_handlers, load_execution,
+    start_or_load_workflow_execution, start_or_load_workflow_execution_collect,
+    terminate_workflow_execution,
 };
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
 use crate::schema::harvest_workflow_executions;
 use crate::shard::{ShardPlacement, ShardRouter, ShardedDbPool};
-use crate::types::{ExecutionId, ShardId};
+use crate::start_idempotency::{
+    StartIdempotencyReservation, lookup_live_start_idempotency_claim,
+    repoint_start_idempotency_claim, reserve_start_idempotency,
+};
+use crate::types::{
+    ExecutionId, ShardId, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+};
 use crate::worker::DbPool;
 
 /// Compact public state for a workflow result response.
@@ -162,6 +173,26 @@ struct WorkflowHandleClientInner {
     shared_state: crate::context::SharedState,
     update_handlers: Vec<crate::info::UpdateHandlerInfo>,
     query_handlers: Vec<crate::info::QueryHandlerInfo>,
+    /// Registered workflow metadata, keyed by [`crate::info::WorkflowInfo::name`]
+    /// (issue #763). Used by [`WorkflowHandleClient::start_workflow_transactional`]
+    /// to resolve `WorkflowInfo` defaults (execution timeout, sla, concurrency
+    /// key, input schema) the same way the HTTP start route does. Empty by
+    /// default — set via [`WorkflowHandleClient::with_workflows`].
+    workflows: HashMap<String, crate::info::WorkflowInfo>,
+    /// The owning runtime's configured task queues, in priority order (issue
+    /// #763 review, "Carry the default queue on the handle client"). Used by
+    /// [`WorkflowHandleClient::start_workflow_transactional`] to resolve the
+    /// default queue for a start that supplies no explicit
+    /// [`TransactionalStartOptions::queue_name`] override, exactly mirroring
+    /// how `POST /workflows/{name}/start` resolves it from the HTTP runtime's
+    /// own `queues` list — never a process-global static, which is write-once
+    /// and can therefore be `None` (a plugin-less process whose workers run
+    /// entirely in a separate process) or stale (a second, differently
+    /// configured runtime built in the same process after an earlier one
+    /// already initialized the global). Empty by default — set via
+    /// [`WorkflowHandleClient::with_queues`]; an empty list falls back to the
+    /// literal `"default"`, matching the HTTP route's own final fallback.
+    queues: Vec<String>,
     max_workflow_input_bytes: u64,
     max_workflow_execution_timeout: Option<Duration>,
     /// Server-side ceiling on the chain-scoped lifetime cap AND fleet-wide chain
@@ -175,6 +206,17 @@ struct WorkflowHandleClientInner {
     default_debounce_max_wait: Duration,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
     max_workflow_attempts: Option<u32>,
+    /// Idempotency-key dedup retention window for
+    /// [`WorkflowHandleClient::start_workflow_transactional`] (issue #763 review).
+    /// Must mirror the operator-configured `HarvestBuilder::start_idempotency_window`
+    /// that the HTTP start route and the purge scanner already honor -- a
+    /// transactional-start client that used a different window than the HTTP
+    /// route would dedupe a keyed retry for a shorter or longer time than the
+    /// operator configured. Defaults to
+    /// [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`] when the
+    /// client is built without an explicit
+    /// [`WorkflowHandleClient::with_start_idempotency_window`] call.
+    start_idempotency_window: Duration,
     /// Engine metrics recorder (issue #684). Wired by the runtime so the
     /// in-process update path (`execute_update_in_process`) can emit
     /// `harvest.update.admitted` at admission, matching the HTTP/UI paths.
@@ -195,6 +237,8 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("shared_state", &"<SharedState>")
             .field("update_handlers_count", &self.update_handlers.len())
             .field("query_handlers_count", &self.query_handlers.len())
+            .field("workflows_count", &self.workflows.len())
+            .field("queues", &self.queues)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field(
                 "max_workflow_execution_timeout",
@@ -210,6 +254,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("history_policy", &self.history_policy)
             .field("default_debounce_max_wait", &self.default_debounce_max_wait)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("start_idempotency_window", &self.start_idempotency_window)
             .field("metrics", &"<MetricsRecorder>")
             .finish()
     }
@@ -263,6 +308,8 @@ impl WorkflowHandleClient {
                 shared_state: crate::context::empty_shared_state(),
                 update_handlers: Vec::new(),
                 query_handlers: Vec::new(),
+                workflows: HashMap::new(),
+                queues: Vec::new(),
                 max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
                 max_workflow_execution_timeout: None,
                 max_workflow_chain_timeout: None,
@@ -272,6 +319,8 @@ impl WorkflowHandleClient {
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
                 default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
                 max_workflow_attempts: None,
+                start_idempotency_window:
+                    crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
                 metrics: Arc::new(crate::telemetry::NoOpMetrics),
             }),
         }
@@ -320,6 +369,48 @@ impl WorkflowHandleClient {
         let mut inner = (*self.inner).clone();
         inner.query_handlers = query_handlers;
         inner.update_handlers = update_handlers;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Add registered workflow metadata to the client (issue #763).
+    ///
+    /// Used by [`Self::start_workflow_transactional`] to resolve `WorkflowInfo`
+    /// defaults (execution timeout, sla, concurrency key) and published
+    /// input-schema validation, the same way the HTTP `POST /workflows/{name}/start`
+    /// route does. A workflow name absent from this set is rejected by
+    /// `start_workflow_transactional` with [`HarvestError::Config`].
+    #[must_use]
+    pub fn with_workflows(
+        self,
+        workflows: impl IntoIterator<Item = crate::info::WorkflowInfo>,
+    ) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.workflows = workflows
+            .into_iter()
+            .map(|w| (w.name.to_string(), w))
+            .collect();
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Carry the owning runtime's configured task queues, in priority order
+    /// (issue #763 review, "Carry the default queue on the handle client").
+    ///
+    /// [`Self::start_workflow_transactional`] resolves a start's default
+    /// queue from `queues.first()` when the call supplies no explicit
+    /// [`TransactionalStartOptions::queue_name`] override — mirroring exactly
+    /// how `POST /workflows/{name}/start` resolves its own default from the
+    /// HTTP runtime's `queues` list. Without this call the client has no
+    /// queue list of its own and falls back to the literal `"default"`,
+    /// which is only correct when every worker in the fleet actually polls
+    /// `"default"`.
+    #[must_use]
+    pub fn with_queues<'a>(self, queues: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.queues = queues.into_iter().map(str::to_string).collect();
         Self {
             inner: Arc::new(inner),
         }
@@ -433,6 +524,33 @@ impl WorkflowHandleClient {
         }
     }
 
+    /// Get the idempotency-key dedup retention window used by
+    /// [`WorkflowHandleClient::start_workflow_transactional`] (issue #763).
+    ///
+    /// Defaults to [`crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW`]
+    /// unless overridden with [`Self::with_start_idempotency_window`].
+    #[must_use]
+    pub fn start_idempotency_window(&self) -> Duration {
+        self.inner.start_idempotency_window
+    }
+
+    /// Set the idempotency-key dedup retention window for
+    /// [`WorkflowHandleClient::start_workflow_transactional`] (issue #763 review).
+    ///
+    /// This should mirror the operator-configured
+    /// `HarvestBuilder::start_idempotency_window` value the HTTP start route
+    /// and the purge scanner already use -- a mismatched window means a
+    /// transactionally-started keyed retry dedupes for a different duration
+    /// than a plain HTTP-started one.
+    #[must_use]
+    pub fn with_start_idempotency_window(self, window: Duration) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.start_idempotency_window = window;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {
@@ -536,6 +654,880 @@ impl WorkflowHandleClient {
         let started = start_or_load_workflow_execution(conn, request, None).await?;
         let handle = self.handle(started.exec_id);
         Ok(StartedWorkflowHandle { started, handle })
+    }
+
+    /// Stage a workflow start on a caller-owned Diesel connection so it
+    /// commits or rolls back atomically with the caller's own domain write
+    /// (issue #763) — **provided the caller has already opened a transaction
+    /// on `conn` before calling this method.**
+    ///
+    /// ## Connection discipline — this distinction is load-bearing
+    ///
+    /// - **`conn` is already inside an open transaction** (the intended, and
+    ///   only fully atomic, usage — see the module-level example in
+    ///   [`docs/transactional-start.md`](https://github.com/autumn-foundation/autumn-harvest/blob/trunk-dev/docs/transactional-start.md)):
+    ///   this call composes correctly via Diesel's nested-transaction
+    ///   (`SAVEPOINT`) semantics. The `WorkflowStarted` event, the execution
+    ///   row, and the initial dispatchable task-queue row all live only
+    ///   inside the caller's already-open transaction. If the caller later
+    ///   rolls that transaction back — because their own domain write failed,
+    ///   or for any other reason — none of them exist and no worker ever
+    ///   claims the run. This is the genuine dual-write atomicity guarantee
+    ///   this method exists to provide.
+    /// - **`conn` is a genuinely bare connection** (no transaction open on it
+    ///   yet): `diesel-async`'s nested-transaction machinery has nothing to
+    ///   nest *into*, so it issues a real, top-level `BEGIN` of its own and
+    ///   **commits it before this call returns.** By the time the caller
+    ///   receives `Ok(outcome)`, the workflow start is already durably
+    ///   committed — there is nothing left "open" for a caller write made
+    ///   afterward on that same connection to share a rollback boundary
+    ///   with. **A bare connection therefore does NOT provide atomicity
+    ///   between the workflow start and any of the caller's own writes** —
+    ///   only Harvest's own *internal* multi-statement sequences within this
+    ///   one call stay atomic as a unit (for example, a `TerminateExisting`
+    ///   collision's cancel-then-replace pair either both happen or neither
+    ///   does, even without an outer transaction). If your goal is dual-write
+    ///   atomicity with your own domain write, always open your own
+    ///   `conn.transaction(...)` **first** and perform both writes inside it.
+    ///
+    /// `workflow_name` must have been registered on this client via
+    /// [`Self::with_workflows`]; that registration also supplies the
+    /// `WorkflowInfo` defaults (`execution_timeout`, `sla`, concurrency key,
+    /// input schema) applied here, mirroring `POST /workflows/{name}/start`.
+    ///
+    /// Returns synchronously with the assigned `ExecutionId` so the caller can
+    /// persist it on their own domain row inside the same transaction. Call
+    /// [`TransactionalStartOutcome::finish`] **after** the caller's transaction
+    /// has committed to eagerly dispatch any deferred completion-trigger
+    /// follow-ups the start produced; this is an optional latency optimization
+    /// (a periodic scanner delivers the same follow-ups if `finish` is never
+    /// called), never a correctness requirement.
+    ///
+    /// In a sharded deployment the started workflow lands on the shard given by
+    /// [`TransactionalStartOptions::with_shard`] — the shard backing `conn` —
+    /// never a freshly rendezvous-hashed shard, since a cross-shard transaction
+    /// is impossible. **A multi-shard client requires `.with_shard(...)`**:
+    /// omitting it would mint an execution id whose *encoded* shard (used by
+    /// every later exec-id-routed lookup — signal, cancel, describe, the
+    /// timeout scanner, ...) has no relationship to wherever `conn` actually
+    /// writes the row, silently producing an execution that commits
+    /// successfully but can never be found again. This method therefore
+    /// rejects with [`HarvestError::Config`] rather than guessing. A
+    /// single-shard client (built via [`Self::single`]) has no such ambiguity
+    /// and needs no `.with_shard(...)` call at all — the caller's connection
+    /// is definitionally on the only shard there is.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] when `workflow_name` is not registered on
+    ///   this client; when the target workflow is configured with a debounce,
+    ///   batch, or throttle policy (those require deferred admission,
+    ///   possibly to a *different* `ExecutionId`, which is structurally
+    ///   incompatible with returning one synchronously inside the caller's
+    ///   transaction); or when this client is registered with more than one
+    ///   shard and `options` did not specify one via
+    ///   [`TransactionalStartOptions::with_shard`].
+    /// - [`HarvestError::InputValidationFailed`] when `input` fails the
+    ///   workflow's published JSON Schema (issue #373). Nothing is written —
+    ///   validation runs before any database call.
+    /// - [`HarvestError::AlreadyExists`] when the configured id-reuse /
+    ///   conflict policy rejects a duplicate `(workflow_name, workflow_id)`.
+    /// - Propagates database / queue / event-store failures.
+    pub async fn start_workflow_transactional(
+        &self,
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        workflow_id: &str,
+        input: Value,
+        options: TransactionalStartOptions,
+    ) -> HarvestResult<TransactionalStartOutcome> {
+        // Codex review (issue #763): validate/trim/cap the idempotency key
+        // BEFORE anything else runs -- see
+        // `Self::normalize_transactional_idempotency_key`'s doc comment.
+        let options = Self::normalize_transactional_idempotency_key(options)?;
+
+        // Issue #763 review (Codex finding): a committed-replay probe must run
+        // BEFORE any fresh-start-only rejection -- the same issue #808
+        // invariant `autumn-harvest-plugin::api::start_workflow` documents and
+        // enforces at the HTTP boundary via `probe_committed_start_replay`.
+        // Without this, a retry of an already-committed keyed start could be
+        // rejected by a rule that only makes sense for a *fresh* admission --
+        // e.g. the target workflow's published input schema tightened, or it
+        // gained a debounce/batch/throttle policy, since the original
+        // delivery -- even though the retry is replaying an already-succeeded
+        // start, not attempting a new one. `conn` is definitionally the shard
+        // this idempotency claim lives on (the same connection the caller
+        // intends to write the start to, per this method's own shard
+        // contract), so no separate shard resolution is needed here, unlike
+        // the HTTP layer's own probe.
+        if let Some(key) = options.idempotency_key.as_deref()
+            && let Some(outcome) = self
+                .probe_transactional_committed_replay(conn, workflow_name, key)
+                .await
+        {
+            return Ok(outcome);
+        }
+
+        let info = self.validate_transactional_start_request(
+            workflow_name,
+            workflow_id,
+            &input,
+            &options,
+        )?;
+
+        // Codex review (issue #763): resolve the single-shard fallback to
+        // this client's ACTUAL configured default shard -- see
+        // `Self::resolve_transactional_shard`'s doc comment.
+        let shard = self.resolve_transactional_shard(&options);
+        let exec_id = ExecutionId::new_for_shard(shard);
+        let queue_name = self.resolve_transactional_queue_name(&options);
+        let defaults = self.resolve_transactional_start_defaults(info, &input);
+
+        let params = StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input,
+            parent_id: options.parent_id,
+            queue_name: &queue_name,
+            execution_timeout: defaults.execution_timeout,
+            memo: options.memo.clone(),
+            search_attrs: options.search_attrs.clone(),
+            reuse_policy: options.reuse_policy,
+            conflict_policy: options.conflict_policy,
+            trace_context: None,
+            max_execution_timeout_ceiling: defaults.max_workflow_execution_timeout_ceiling,
+            chain_execution_timeout: defaults.chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling: defaults.max_workflow_chain_timeout_ceiling,
+            inherited_chain_deadline_at: None,
+            concurrency_key: defaults.concurrency_key,
+            concurrency_limit: defaults.concurrency_limit,
+            priority: crate::types::Priority::default(),
+            max_workflow_input_bytes: defaults.max_workflow_input_bytes,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: Some(defaults.max_workflow_start_delay),
+            owner: info.owner,
+            runbook_url: info.runbook_url,
+            severity: info.severity,
+            context_headers: None,
+            sla: defaults.sla,
+            schedule_id: None,
+            scheduled_for: None,
+            // 1 = first attempt (see `StartWorkflowParams::workflow_attempt`'s doc
+            // comment). Every other fresh-start call site in the workspace uses
+            // `1`; using `0` here would silently grant one extra retry attempt
+            // beyond a workflow's configured `max_attempts` (e.g. a
+            // `max_attempts = 1` "never retry" policy would still retry once,
+            // since `0 >= 1` is false on the first attempt).
+            workflow_attempt: 1,
+            workflow_retry_policy: info.retry_policy.clone(),
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: self.inner.max_workflow_attempts,
+            origin: None,
+            completion_callbacks: None,
+            start_source: StartSource::Transactional,
+            start_source_ref: None,
+            started_by: None,
+        };
+
+        // Gated via `GateMode::CheckCached` (issue #618/#377 "halt beats pace"),
+        // not `GateMode::Check` — the same choice `throttle.rs`/
+        // `completion_trigger.rs` make for other in-process producers that may
+        // run without a `HarvestPlugin` in the same process. `CheckCached` never
+        // fails closed: `evaluate_start_gate` returns `None` immediately when no
+        // process-global gate cache was ever published (i.e. no plugin/manual
+        // caller has installed one), so a standalone embedder who never wires up
+        // gates is completely unaffected. When a plugin *is* running in this
+        // process (the dominant deployment shape — `HarvestPlugin::build()`
+        // injects an already-`.with_workflows(...)`-populated
+        // `WorkflowHandleClient` into `AppState` for exactly this API) an active
+        // fleet-wide/queue/workflow-name gate now blocks a matching transactional
+        // start and increments `harvest.admission.blocked`, exactly like every
+        // other in-process producer. See `StartProducer::Transactional` in the
+        // admission-gate contract (`admission_gate.rs`) for the full rationale.
+        let (started, deferred_starts, deferred_checks, cancel_metrics) =
+            if let Some(key) = options.idempotency_key.as_deref() {
+                self.start_workflow_transactional_idempotent(conn, params, key)
+                    .await?
+            } else {
+                // Issue #763 review (Codex finding): `in_outer_transaction = true`
+                // below tells `start_or_load_workflow_execution_collect` that a
+                // `TerminateIfRunning` pre-check cancellation which commits before
+                // a subsequently-failing replacement start will be reverted by
+                // *something* -- so its follow-up dispatch can be safely deferred.
+                // That assumption only holds when there genuinely is an
+                // enclosing transaction to revert it. This method's own docs
+                // explicitly permit `conn` to be a bare (non-transaction-wrapped)
+                // connection, in which case there is nothing to make that true --
+                // without this wrapper, a bare-connection caller could durably
+                // cancel a prior run and then, on a subsequent write failure, lose
+                // its follow-up dispatch permanently (the whole call returns `Err`,
+                // so there is no `TransactionalStartOutcome.deferred` to recover
+                // it from either).
+                //
+                // Rather than detect whether `conn` already has an open
+                // transaction (which would need to reach into diesel_async's
+                // internal transaction-manager bookkeeping), this wraps the call
+                // in its own nested `conn.transaction()` -- a `SAVEPOINT` when
+                // `conn` is already inside the caller's transaction, a real
+                // top-level `BEGIN` otherwise -- exactly mirroring
+                // `start_workflow_transactional_idempotent`'s own wrapper just
+                // above (`Box::pin(conn.transaction(...))` around its reservation
+                // + start). This makes `in_outer_transaction = true` correct
+                // *unconditionally*: whatever the pre-check cancellation did is
+                // now guaranteed nested inside a transaction level this call
+                // itself establishes, so a subsequent replacement-start failure
+                // reverts the cancellation along with everything else -- there is
+                // nothing left to follow up on, because it never durably
+                // happened. A bare-connection caller therefore gets full
+                // atomicity for the cancel-then-replace sequence, not just a
+                // correctly-suppressed (or correctly-fired) follow-up.
+                Box::pin(conn.transaction::<(
+                    StartedWorkflowExecution,
+                    Vec<DeferredTriggerStart>,
+                    Vec<(ExecutionId, String)>,
+                    Vec<(String, String)>,
+                ), HarvestError, _>(async |conn| {
+                    let params = params;
+                    start_or_load_workflow_execution_collect(
+                        conn,
+                        params,
+                        /* in_outer_transaction = */ true,
+                        /* reject_fresh_if_debounced = */ false,
+                        Some(self.inner.metrics.as_ref()
+                            as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
+                        Some(crate::admission_gate::GateMode::CheckCached),
+                    )
+                    .await
+                }))
+                .await?
+            };
+
+        Ok(TransactionalStartOutcome {
+            exec_id: started.exec_id,
+            workflow_name: started.workflow_name,
+            workflow_id: started.workflow_id,
+            state: started.state,
+            created: started.created,
+            client: self.clone(),
+            shard,
+            deferred: PendingStartFollowUps {
+                starts: deferred_starts,
+                checks: deferred_checks,
+                cancel_metrics,
+            },
+        })
+    }
+
+    /// Read-only committed-replay probe for a keyed transactional start
+    /// (issue #763 review). Mirrors
+    /// `autumn-harvest-plugin::api::probe_committed_start_replay`: on a hit
+    /// this returns the already-committed execution's identity directly,
+    /// without ever reaching [`Self::validate_transactional_start_request`]
+    /// (schema validation, the debounce/batch/throttle rejection) or the
+    /// reserve/start path -- so a retry of an already-succeeded keyed start
+    /// can never be rejected by a rule meant only for a genuinely fresh
+    /// admission.
+    ///
+    /// Returns `None` on a probe miss: no live claim for `key`, the claimed
+    /// row vanished between the claim lookup and this read, or the lookup
+    /// itself errored. In every miss case the caller falls through to the
+    /// normal validate-then-reserve-then-start path, which re-reserves /
+    /// reclaims as needed -- exactly the same graceful-degradation posture
+    /// the HTTP-layer probe uses.
+    ///
+    /// No audit row is written here, matching every other call site in this
+    /// file (including the in-transaction `StartIdempotencyReservation::Duplicate`
+    /// arm inside [`Self::start_workflow_transactional_idempotent`], which
+    /// resolves the identical "already started" outcome and likewise writes
+    /// none): audit logging is an HTTP/management-API concern this in-process
+    /// client does not currently own.
+    async fn probe_transactional_committed_replay(
+        &self,
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        key: &str,
+    ) -> Option<TransactionalStartOutcome> {
+        let claim_exec_id = lookup_live_start_idempotency_claim(
+            conn,
+            workflow_name,
+            key,
+            self.inner.start_idempotency_window.as_secs_f64(),
+        )
+        .await
+        .ok()??;
+        // `lookup_live_start_idempotency_claim` JOINs to the execution row, so
+        // a `Some` claim implies the row existed at lookup time; re-read it
+        // for the exact `(workflow_id, state)` to echo. A `NotFound` here
+        // (the row vanished in the interim, e.g. retention) is treated as a
+        // probe miss, not an error -- the normal path below re-reserves.
+        let execution = load_execution(conn, claim_exec_id).await.ok()?;
+        Some(TransactionalStartOutcome {
+            exec_id: claim_exec_id,
+            workflow_name: workflow_name.to_string(),
+            workflow_id: execution.workflow_id,
+            state: execution.state,
+            created: false,
+            client: self.clone(),
+            // The shard the claimed execution actually lives on, not
+            // `options.shard` -- a probe hit never produces deferred
+            // follow-ups (below), so this is inert for `finish()` today, but
+            // it is the semantically correct value if that ever changes.
+            shard: claim_exec_id.shard(),
+            deferred: PendingStartFollowUps::default(),
+        })
+    }
+
+    /// Validate a transactional-start request before touching the database
+    /// (issue #763). Consolidates the five fast-fail checks
+    /// [`Self::start_workflow_transactional`] must run before it can safely
+    /// resolve a shard/exec-id and build [`StartWorkflowParams`]: the target
+    /// workflow must be registered on this client, must not be configured
+    /// with a debounce/batch/throttle policy (all three defer admission,
+    /// possibly to a *different* `ExecutionId`, which cannot be returned
+    /// synchronously), `input` must satisfy the workflow's published JSON
+    /// Schema when one is set, — for a client spanning more than one shard —
+    /// the caller must have named which shard backs their connection via
+    /// [`TransactionalStartOptions::with_shard`], and an explicitly-named
+    /// shard must actually be a member of this client's router (readable
+    /// *and* writable), not merely *some* shard id. Split out of
+    /// [`Self::start_workflow_transactional`] purely to keep that function
+    /// under the workspace's line-count lint.
+    fn validate_transactional_start_request(
+        &self,
+        workflow_name: &str,
+        workflow_id: &str,
+        input: &Value,
+        options: &TransactionalStartOptions,
+    ) -> HarvestResult<&crate::info::WorkflowInfo> {
+        let info = self.inner.workflows.get(workflow_name).ok_or_else(|| {
+            HarvestError::Config(format!(
+                "workflow '{workflow_name}' is not registered on this \
+                 WorkflowHandleClient; pass it to `.with_workflows(...)` when \
+                 constructing the client (issue #763)"
+            ))
+        })?;
+
+        if info.debounce.is_some() || info.batch.is_some() || info.throttle.is_some() {
+            return Err(HarvestError::Config(format!(
+                "workflow '{workflow_name}' is configured with a debounce, batch, or \
+                 throttle policy, which defers admission (possibly to a different \
+                 ExecutionId) and cannot return one synchronously; transactional start \
+                 is not supported for it (issue #763)"
+            )));
+        }
+
+        info.validate_input(input)
+            .map_err(|violations| HarvestError::InputValidationFailed { violations })?;
+
+        match options.shard {
+            None => {
+                if self.inner.pools.len() > 1 {
+                    return Err(HarvestError::Config(format!(
+                        "this WorkflowHandleClient is registered with {} shards, so \
+                         `start_workflow_transactional` cannot infer which one the caller's \
+                         connection belongs to; pass \
+                         `TransactionalStartOptions::new().with_shard(...)` naming the shard \
+                         that owns `conn` (issue #763). Leaving the shard unspecified would \
+                         mint an execution id whose *encoded* shard disagrees with wherever \
+                         `conn` actually writes the row, making the execution unreachable by \
+                         any later exec-id-routed lookup (signal, cancel, describe, ...) even \
+                         though the row itself committed successfully.",
+                        self.inner.pools.len()
+                    )));
+                }
+            }
+            Some(shard) => {
+                // A caller-supplied shard must be a real, currently-writable member
+                // of this client's router — never merely "some `ShardId`". A shard
+                // that is unregistered (typo, stale config, topology drift between
+                // wherever the caller sourced their `ShardId` and how *this* client
+                // was constructed) or has been drained out of `writable_shards`
+                // would otherwise mint an exec id that writes successfully via
+                // `conn` yet silently routes every later exec-id lookup (signal,
+                // cancel, describe, the timeout scanner) to the *default* shard
+                // instead — the row commits but becomes permanently unreachable
+                // through this client. `resolve_shard_placement` is the same
+                // validated primitive the HTTP start route's `shard_id` option uses
+                // (issue #697); reusing it here closes exactly that gap.
+                self.resolve_shard_placement(
+                    &ShardPlacement::Shard(shard),
+                    workflow_name,
+                    workflow_id,
+                )?;
+            }
+        }
+
+        Ok(info)
+    }
+
+    /// Validate/trim/cap `options.idempotency_key` (issue #763 Codex review).
+    ///
+    /// Mirrors `autumn-harvest-plugin::api::validate_start_idempotency_key`
+    /// (the HTTP start route's own validation, which also runs first, before
+    /// its committed-replay probe). Without this, a caller-supplied empty or
+    /// whitespace-only key became a real `(workflow_name, "")` claim in
+    /// `harvest_start_idempotency` that silently deduplicated every other
+    /// unrelated transactional start for the same workflow against each
+    /// other, and an oversized key could exceed Postgres's btree tuple limit
+    /// and abort the caller's own transaction with a raw database error
+    /// instead of a clean, typed rejection. The trimmed key is written back
+    /// into the returned `options` so every later read in
+    /// [`Self::start_workflow_transactional`] (the committed-replay probe and
+    /// the eventual reservation) sees the same normalized value. Split out of
+    /// that function purely to keep it under the workspace's line-count
+    /// lint.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::error::HarvestError::Config`] from
+    /// [`crate::start_idempotency::validate_start_idempotency_key`].
+    fn normalize_transactional_idempotency_key(
+        mut options: TransactionalStartOptions,
+    ) -> HarvestResult<TransactionalStartOptions> {
+        options.idempotency_key = crate::start_idempotency::validate_start_idempotency_key(
+            options.idempotency_key.as_deref(),
+        )?;
+        Ok(options)
+    }
+
+    /// Resolve the effective shard for an un-pinned transactional start
+    /// (issue #763 Codex review, "Default transactional starts to the actual
+    /// shard").
+    ///
+    /// [`Self::validate_transactional_start_request`] only requires
+    /// `.with_shard(...)` when this client's pool has more than one shard --
+    /// a genuinely single-shard client (whose one shard is not necessarily
+    /// numbered 0, e.g. carved out of a larger topology) is allowed to omit
+    /// it. Before this fix the fallback was the bare [`ShardId::UNENCODED`]
+    /// sentinel rather than this client's actual configured default shard.
+    /// Every OTHER start path in this codebase (the HTTP start route, the
+    /// scheduler, ...) always mints its exec id with a concretely resolved
+    /// `ShardId`, because `StartWorkflowParams::shard_id()` -- which
+    /// persists the row's `shard_id` column, read by every shard-scoped
+    /// admission gate and the idempotency purge scanner -- hardcodes `0` for
+    /// an unencoded id rather than consulting a router. Leaving the id
+    /// unencoded for a non-zero single shard would therefore silently
+    /// persist `shard_id = 0` for a write that actually landed on, say,
+    /// shard 5. For [`Self::single`] (the common case) `default_shard()` is
+    /// `ShardId::new(0)`, so this is byte-for-byte unchanged there. Split
+    /// out of [`Self::start_workflow_transactional`] purely to keep that
+    /// function under the workspace's line-count lint.
+    fn resolve_transactional_shard(&self, options: &TransactionalStartOptions) -> ShardId {
+        options
+            .shard
+            .unwrap_or_else(|| self.inner.router.default_shard())
+    }
+
+    /// Resolve the effective task-queue name for a transactional start (issue
+    /// #763; queue source corrected per the "Carry the default queue on the
+    /// handle client" review finding).
+    ///
+    /// `options.queue_name` wins when set. Otherwise falls back to *this
+    /// client's own* configured `queues` (via [`Self::with_queues`]) — the
+    /// same runtime-carried source `POST /workflows/{name}/start` resolves
+    /// its default from (`runtime.queues.first()`) — else the literal
+    /// `"default"`.
+    ///
+    /// Deliberately **not** the process-global
+    /// `completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE` static this used to
+    /// read: that global is write-once-if-unset and first-writer-wins across
+    /// the whole process, so it is `None` forever in a process that never
+    /// constructs a `Worker`/`HarvestApiRuntime` in-process (e.g. a
+    /// plugin-less caller whose workers run in a separate process), and it is
+    /// silently stale for any but the *first* runtime built in a process that
+    /// constructs more than one (e.g. two differently-configured runtimes in
+    /// one test binary). Reading the client's own carried `queues` instead
+    /// makes the resolved default correct per-client, matching the HTTP
+    /// route's per-runtime resolution exactly. Split out of
+    /// [`Self::start_workflow_transactional`] purely to keep that function
+    /// under the workspace's line-count lint.
+    fn resolve_transactional_queue_name(&self, options: &TransactionalStartOptions) -> String {
+        options
+            .queue_name
+            .clone()
+            .or_else(|| self.inner.queues.as_slice().first().cloned())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Resolve every `WorkflowInfo`-derived (and client-ceiling-derived)
+    /// default for a transactional start (issue #763), mirroring
+    /// `POST /workflows/{name}/start`'s resolution exactly. Returns owned
+    /// values only (no borrows into `info`/`input`), so it can be called
+    /// independently of the [`StartWorkflowParams`] it feeds — split out of
+    /// [`Self::start_workflow_transactional`] purely to keep that function
+    /// under the workspace's line-count lint.
+    fn resolve_transactional_start_defaults(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        input: &Value,
+    ) -> ResolvedStartDefaults {
+        let concurrency_key = info
+            .concurrency
+            .as_ref()
+            .and_then(|policy| crate::concurrency::resolve_concurrency_key(policy.key_expr, input));
+        let concurrency_limit = info.concurrency.as_ref().map(|policy| policy.limit);
+
+        let execution_timeout = info
+            .execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        // Effective SLA clamped to at most the hard execution timeout, mirroring
+        // the HTTP start route's resolution (never a soft deadline past the hard
+        // one).
+        let sla = info
+            .sla
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
+        let chain_execution_timeout = info
+            .chain_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_workflow_input_bytes = self.max_workflow_input_bytes(info.max_input_bytes);
+        let max_workflow_execution_timeout_ceiling = self
+            .inner
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_workflow_chain_timeout_ceiling = self
+            .inner
+            .max_workflow_chain_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_workflow_start_delay =
+            chrono::Duration::from_std(self.inner.max_workflow_start_delay)
+                .unwrap_or_else(|_| chrono::Duration::days(365));
+
+        ResolvedStartDefaults {
+            concurrency_key,
+            concurrency_limit,
+            execution_timeout,
+            sla,
+            chain_execution_timeout,
+            max_workflow_input_bytes,
+            max_workflow_execution_timeout_ceiling,
+            max_workflow_chain_timeout_ceiling,
+            max_workflow_start_delay,
+        }
+    }
+
+    /// Idempotency-key variant of the transactional start (issue #808 semantics
+    /// reimplemented for issue #763).
+    ///
+    /// [`start_or_load_workflow_execution_idempotent`](crate::execution::start_or_load_workflow_execution_idempotent)
+    /// is not reused here: it unconditionally spawns deferred follow-ups the
+    /// instant its own internal transaction returns `Ok`, assuming that
+    /// transaction was the outermost one. When nested (via `SAVEPOINT`) inside
+    /// a caller's own still-open outer transaction, that assumption is false —
+    /// the follow-ups would be dispatched (via a fresh, independently-committed
+    /// connection) even if the caller's outer transaction is later rolled back,
+    /// violating the atomicity this API exists to provide. This method performs
+    /// the identical reserve-then-start sequence but returns the deferred
+    /// follow-ups to the caller instead, exactly like the non-keyed path above.
+    async fn start_workflow_transactional_idempotent(
+        &self,
+        conn: &mut AsyncPgConnection,
+        params: StartWorkflowParams<'_>,
+        idempotency_key: &str,
+    ) -> HarvestResult<(
+        StartedWorkflowExecution,
+        Vec<DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
+        Vec<(String, String)>,
+    )> {
+        let new_exec_id = params.exec_id;
+        let shard_id = params.shard_id();
+        let metrics =
+            Some(self.inner.metrics.as_ref()
+                as &(dyn crate::telemetry::MetricsRecorder + Send + Sync));
+
+        // Wrapped in its own transaction (a nested `SAVEPOINT` when `conn` is
+        // already inside the caller's outer transaction) so the reservation
+        // UPSERT and the start below are atomic *together*, exactly like
+        // `start_or_load_workflow_execution_idempotent`: a start failure after a
+        // successful reservation rolls the reservation back too, rather than
+        // leaving a dangling claim inside the caller's still-open transaction.
+        Box::pin(conn.transaction::<(
+            StartedWorkflowExecution,
+            Vec<DeferredTriggerStart>,
+            Vec<(ExecutionId, String)>,
+            Vec<(String, String)>,
+        ), HarvestError, _>(async |conn| {
+            let params = params;
+            let workflow_name = params.workflow_name.to_string();
+            match reserve_start_idempotency(
+                conn,
+                &workflow_name,
+                idempotency_key,
+                new_exec_id,
+                shard_id,
+                // Issue #763 review (Codex finding): use the client's
+                // configured window (defaults to
+                // `DEFAULT_START_IDEMPOTENCY_WINDOW`, overridable via
+                // `WorkflowHandleClient::with_start_idempotency_window`), not
+                // the hardcoded default directly -- must match the operator's
+                // `HarvestBuilder::start_idempotency_window`, which the HTTP
+                // start route and the purge scanner already honor.
+                self.inner.start_idempotency_window.as_secs_f64(),
+            )
+            .await?
+            {
+                StartIdempotencyReservation::Duplicate {
+                    exec_id,
+                    workflow_id,
+                    state,
+                } => Ok((
+                    StartedWorkflowExecution {
+                        exec_id,
+                        workflow_name,
+                        workflow_id,
+                        state,
+                        created: false,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                StartIdempotencyReservation::Reserved => {
+                    let (started, deferred_starts, deferred_checks, cancel_metrics) =
+                        start_or_load_workflow_execution_collect(
+                            conn,
+                            params,
+                            true,
+                            false,
+                            metrics,
+                            Some(crate::admission_gate::GateMode::CheckCached),
+                        )
+                        .await?;
+                    // The reserve wrote the claim pointing at `new_exec_id`. If the
+                    // reuse policy resolved this fresh-key start to an *existing*
+                    // run (e.g. `AllowDuplicate` attaching to a prior `workflow_id`
+                    // collision), `new_exec_id` was never inserted — repoint the
+                    // claim at the real run so a later same-key request
+                    // deduplicates cleanly instead of hitting the defensive
+                    // reclaim path.
+                    if started.exec_id != new_exec_id {
+                        repoint_start_idempotency_claim(
+                            conn,
+                            &workflow_name,
+                            idempotency_key,
+                            started.exec_id,
+                        )
+                        .await?;
+                    }
+                    Ok((started, deferred_starts, deferred_checks, cancel_metrics))
+                }
+            }
+        }))
+        .await
+    }
+}
+
+/// Options for [`WorkflowHandleClient::start_workflow_transactional`] (issue #763).
+///
+/// All fields are optional. Omitted fields fall back to the target workflow's
+/// registered [`crate::info::WorkflowInfo`] defaults, mirroring
+/// `POST /workflows/{name}/start`.
+#[derive(Debug, Clone, Default)]
+pub struct TransactionalStartOptions {
+    shard: Option<ShardId>,
+    reuse_policy: WorkflowIdReusePolicy,
+    conflict_policy: WorkflowIdConflictPolicy,
+    idempotency_key: Option<String>,
+    queue_name: Option<String>,
+    memo: Option<Value>,
+    search_attrs: Option<Value>,
+    parent_id: Option<Uuid>,
+}
+
+impl TransactionalStartOptions {
+    /// The default options: default (rendezvous) shard placement,
+    /// `AllowDuplicate` / `Unspecified` id-reuse semantics, no idempotency key,
+    /// the `"default"` queue, no memo/search attrs/parent.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin the started workflow to the shard backing the connection passed to
+    /// `start_workflow_transactional` (issue #763, AC4). Required in a sharded
+    /// deployment to avoid a cross-shard transaction; omit in a single-shard
+    /// deployment (the default shard is the only shard).
+    #[must_use]
+    pub const fn with_shard(mut self, shard: ShardId) -> Self {
+        self.shard = Some(shard);
+        self
+    }
+
+    /// Set the `WorkflowIdReusePolicy` applied to a duplicate
+    /// `(workflow_name, workflow_id)` collision against a **terminal** prior run.
+    #[must_use]
+    pub const fn with_reuse_policy(mut self, policy: WorkflowIdReusePolicy) -> Self {
+        self.reuse_policy = policy;
+        self
+    }
+
+    /// Set the `WorkflowIdConflictPolicy` applied to a duplicate
+    /// `(workflow_name, workflow_id)` collision against an **active** prior run.
+    #[must_use]
+    pub const fn with_conflict_policy(mut self, policy: WorkflowIdConflictPolicy) -> Self {
+        self.conflict_policy = policy;
+        self
+    }
+
+    /// Deduplicate this start against an earlier one carrying the same key
+    /// (issue #808 semantics), scoped to `(workflow_name, idempotency_key)`.
+    #[must_use]
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+
+    /// Override the task-queue the workflow's activities are dispatched on.
+    /// Defaults to `"default"`.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
+        self.queue_name = Some(queue_name.into());
+        self
+    }
+
+    /// Attach an operator-visible memo.
+    #[must_use]
+    pub fn with_memo(mut self, memo: Value) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    /// Attach filterable search attributes.
+    #[must_use]
+    pub fn with_search_attrs(mut self, search_attrs: Value) -> Self {
+        self.search_attrs = Some(search_attrs);
+        self
+    }
+
+    /// Record a parent execution id (for child-workflow style provenance).
+    #[must_use]
+    pub const fn with_parent_id(mut self, parent_id: Uuid) -> Self {
+        self.parent_id = Some(parent_id);
+        self
+    }
+}
+
+/// Owned, `WorkflowInfo`-derived defaults resolved for a transactional start
+/// (issue #763) — see
+/// [`WorkflowHandleClient::resolve_transactional_start_defaults`].
+struct ResolvedStartDefaults {
+    concurrency_key: Option<String>,
+    concurrency_limit: Option<u32>,
+    execution_timeout: Option<chrono::Duration>,
+    sla: Option<chrono::Duration>,
+    chain_execution_timeout: Option<chrono::Duration>,
+    max_workflow_input_bytes: u64,
+    max_workflow_execution_timeout_ceiling: Option<chrono::Duration>,
+    max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+    max_workflow_start_delay: chrono::Duration,
+}
+
+/// The three kinds of post-commit follow-up work a transactional start can
+/// produce, bundled for [`TransactionalStartOutcome::finish`] (issue #763).
+///
+/// Only ever non-empty for the `WorkflowIdConflictPolicy::Terminate` case,
+/// where resolving the collision cancels a prior execution that itself has
+/// registered completion triggers — the overwhelming majority of fresh starts
+/// produce none of these.
+#[derive(Debug, Default)]
+struct PendingStartFollowUps {
+    starts: Vec<DeferredTriggerStart>,
+    checks: Vec<(ExecutionId, String)>,
+    cancel_metrics: Vec<(String, String)>,
+}
+
+/// Result of a staged, in-transaction workflow start (issue #763).
+///
+/// The `WorkflowStarted` event, the execution row, and the initial
+/// dispatchable task-queue row exist only inside the caller's own connection's
+/// transaction until it commits. If the caller rolls back, none of them exist
+/// and no worker ever claims the run — no explicit action is needed here for
+/// that guarantee to hold.
+///
+/// After the caller's transaction has committed, call [`Self::finish`] to
+/// eagerly dispatch any deferred completion-trigger follow-ups the start
+/// produced. This is an optional latency optimization: a periodic scanner
+/// eventually delivers the same follow-ups if `finish` is never called (or the
+/// process crashes before it runs), so the started workflow itself runs
+/// correctly either way.
+#[derive(Debug)]
+#[must_use = "call `.finish().await` once your outer transaction has committed to eagerly \
+              dispatch any deferred completion-trigger follow-ups; the workflow itself is \
+              fully started the moment your transaction commits even if this is dropped"]
+pub struct TransactionalStartOutcome {
+    /// The execution id assigned to the started (or attached-to) workflow.
+    pub exec_id: ExecutionId,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The business `workflow_id` this execution was started (or attached) under.
+    pub workflow_id: String,
+    /// The execution's state immediately after the start decision (e.g. `"RUNNING"`).
+    pub state: String,
+    /// `true` when a fresh execution was created; `false` when the call
+    /// attached to an already-live execution under the configured id-reuse /
+    /// conflict policy.
+    pub created: bool,
+    client: WorkflowHandleClient,
+    shard: ShardId,
+    deferred: PendingStartFollowUps,
+}
+
+impl TransactionalStartOutcome {
+    /// Eagerly dispatch deferred completion-trigger follow-ups produced by
+    /// this start (issue #763).
+    ///
+    /// Call this only **after** the caller's outer transaction has committed —
+    /// calling it before commit and then rolling back would durably dispatch
+    /// cascades for a start that never became durable itself. Safe (and a
+    /// documented no-op in the overwhelming majority of calls, since
+    /// `deferred` is empty unless a `WorkflowIdConflictPolicy::Terminate`
+    /// collision was resolved) to skip entirely.
+    pub async fn finish(self) {
+        for start in self.deferred.starts {
+            start.spawn();
+        }
+        if !self.deferred.checks.is_empty() {
+            // `pool_for` (not `exact_pool_for`) so this works for a single-shard
+            // client, where `self.shard` is `ShardId::UNENCODED` (no
+            // `.with_shard(...)` call needed) and `exact_pool_for` would return
+            // `None`, silently dropping this diagnostic entirely.
+            // `ShardedDbPool::single`/`from_map` guarantee a default-shard entry,
+            // so `pool_for` never needs its own fallible path here.
+            let pool = self.client.inner.pools.pool_for(self.shard);
+            match pool.get().await {
+                Ok(mut fresh_conn) => {
+                    for (exec_id, workflow_name) in self.deferred.checks {
+                        let _ = check_and_report_unfinished_handlers(
+                            &mut fresh_conn,
+                            exec_id,
+                            &workflow_name,
+                            Some(self.client.inner.metrics.as_ref()
+                                as &(dyn crate::telemetry::MetricsRecorder + Send + Sync)),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "[transactional_start] failed to acquire a connection to report \
+                         unfinished-handler diagnostics; this is a best-effort diagnostic \
+                         only and does not affect the started workflow"
+                    );
+                }
+            }
+        }
+        for (workflow_name, queue_name) in self.deferred.cancel_metrics {
+            crate::telemetry::emit_workflow_terminal(
+                self.client.inner.metrics.as_ref(),
+                &workflow_name,
+                &queue_name,
+                crate::telemetry::WorkflowStatus::Cancelled,
+            );
+        }
     }
 }
 

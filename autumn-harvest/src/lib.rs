@@ -354,8 +354,9 @@ pub use guardrail::{
 };
 #[cfg(feature = "db")]
 pub use handle::{
-    StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
-    WorkflowResultState, start_or_load_workflow_execution_with_handle,
+    StartedWorkflowHandle, TransactionalStartOptions, TransactionalStartOutcome, WorkflowHandle,
+    WorkflowHandleClient, WorkflowResult, WorkflowResultState,
+    start_or_load_workflow_execution_with_handle,
 };
 #[cfg(feature = "db")]
 pub use handle_typed::{

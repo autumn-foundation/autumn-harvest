@@ -72,6 +72,59 @@ pub const DEFAULT_START_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(24 * 
 /// per-tick cost on a large backlog.
 pub const START_IDEMPOTENCY_PURGE_BATCH: i64 = 1000;
 
+/// Maximum accepted length (in bytes, after trimming) for a request-scoped
+/// `idempotency_key` on any start path.
+///
+/// Applied by both the plain-start HTTP route
+/// (`autumn-harvest-plugin::api::validate_start_idempotency_key`) and
+/// [`crate::handle::TransactionalStartOptions::with_idempotency_key`] (issue
+/// #763's review). The key is half of the composite PRIMARY KEY
+/// `(workflow_name, idempotency_key)` on `harvest_start_idempotency`; an
+/// oversized key would exceed Postgres's ~2704-byte btree index tuple limit
+/// and error at INSERT, leaking a raw database error on client-controlled
+/// input. Capped conservatively so `workflow_name` + key stays well under
+/// that limit.
+pub const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
+
+/// Shared trim + empty-rejection + length-cap validation for a request-scoped
+/// `idempotency_key`.
+///
+/// Every start path should agree on what a "valid" key looks like, rather
+/// than each independently (re)implementing -- or, as issue #763's review
+/// found for the transactional-start client, omitting -- the same rule. An
+/// unvalidated key would let an accidental empty/whitespace value become a
+/// real `(workflow_name, "")` claim that silently dedupes every *other*
+/// unrelated start for that workflow against each other.
+///
+/// `Ok(None)` = no key supplied; `Ok(Some(trimmed))` = a valid, trimmed key;
+/// `Err(_)` = the key is present but empty/whitespace-only, or exceeds
+/// [`MAX_START_IDEMPOTENCY_KEY_LEN`] bytes after trimming.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Config`] naming the specific
+/// violation (empty vs. too long).
+pub fn validate_start_idempotency_key(
+    raw: Option<&str>,
+) -> crate::error::HarvestResult<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Err(crate::error::HarvestError::Config(
+            "idempotency_key must not be empty".to_string(),
+        )),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
+                Err(crate::error::HarvestError::Config(format!(
+                    "idempotency_key too long (max {MAX_START_IDEMPOTENCY_KEY_LEN} bytes)"
+                )))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+    }
+}
+
 /// The default retention window expressed as `f64` seconds, for the const
 /// initializer of [`PURGE_WINDOW_SECS_BITS`] (`Duration::as_secs_f64` is not
 /// `const`).

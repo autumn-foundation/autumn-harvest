@@ -144,6 +144,8 @@ mod throttle_tests;
 #[cfg(feature = "db")]
 mod transactional_activity_tests;
 #[cfg(feature = "db")]
+mod transactional_start_tests;
+#[cfg(feature = "db")]
 mod triage_tests;
 #[cfg(feature = "db")]
 mod typed_stubs_tests;
