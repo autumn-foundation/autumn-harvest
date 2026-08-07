@@ -2861,6 +2861,141 @@ pub async fn sample_rate_limit_buckets(
     .map_err(crate::error::database_error)
 }
 
+/// Bound on representative task/execution ids returned per queue.
+///
+/// Used by [`pending_queue_demand_by_queue_name`] (issue #774 AC3), mirroring
+/// [`crate::execution::REACHABILITY_SAMPLE_CAP`]'s pattern with a *separate*
+/// constant deliberately not shared across the two unrelated domains — a
+/// future change to the workflow-reachability cap must not silently also
+/// change the queue-coverage cap.
+pub const QUEUE_COVERAGE_SAMPLE_CAP: usize = 5;
+
+/// One queue's fleet-wide `PENDING` demand on a single shard: how many tasks
+/// are queued, plus bounded, oldest-first representative ids for drill-down
+/// (issue #774).
+///
+/// `sample_task_ids` chains into the per-task eligibility explainer
+/// (`GET /admin/tasks/{id}/eligibility`, issues #380/#611);
+/// `sample_execution_ids` chains directly into `GET /workflows/{id}`. Both are
+/// **representative and bounded** — not a guaranteed global-oldest set — per
+/// the same shard-then-cross-shard capping convention documented on
+/// [`crate::execution::WorkflowTypeNonTerminalCount`].
+#[derive(Debug, Clone)]
+pub struct PendingQueueDemand {
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub sample_task_ids: Vec<Uuid>,
+    pub sample_execution_ids: Vec<Uuid>,
+}
+
+/// The `pending_queue_demand_by_queue_name` query — extracted so the real
+/// call site and the sample-cap drift guard test share one source of truth.
+///
+/// Deliberately **not** [`claimable_pending_demand_query`]: this is the
+/// literal, unfiltered "does anything have PENDING work on this queue" signal
+/// issue #774 asks for (queue coverage), not the claim-eligible-right-now
+/// signal `claimable_pending_demand_by_queue` computes for worker-capacity
+/// concerns (issue #522/#531/#742, explicitly out of scope here). Filtering
+/// by concurrency cap / rate-limit / `schedule_to_close` expiry would hide a
+/// genuinely-uncovered queue behind an unrelated, separately-alerted
+/// condition.
+///
+/// Samples are drawn via a `LEFT JOIN LATERAL ... LIMIT N`, **not** a full
+/// `ARRAY_AGG(...)[1:N]` slice (issue #774 review): the `[1:N]` form only
+/// bounds the *returned* array — Postgres must still materialize a
+/// transition array covering every `PENDING` row in the queue before
+/// slicing it, so a heavily stranded queue (exactly the failure mode this
+/// operational gate exists to surface) would make the query's memory use
+/// scale with the full backlog. A `LIMIT`-bounded lateral subquery lets the
+/// planner use a bounded top-N heap sort instead, so per-queue sampling
+/// work stays proportional to `QUEUE_COVERAGE_SAMPLE_CAP`, not to backlog
+/// size. Each lateral subquery mirrors the original ordering/filtering
+/// exactly: `sample_task_ids` takes the first `QUEUE_COVERAGE_SAMPLE_CAP`
+/// pending rows by `(scheduled_at, id)`; `sample_execution_ids` takes the
+/// first `QUEUE_COVERAGE_SAMPLE_CAP` *non-null* `workflow_exec_id`s in that
+/// same order (a task row can have a `NULL` `workflow_exec_id`, so this is
+/// filtered independently rather than derived from the task sample).
+#[must_use]
+pub const fn pending_queue_demand_query() -> &'static str {
+    "SELECT q.queue_name, \
+            q.pending_count, \
+            COALESCE(t.sample_task_ids, ARRAY[]::UUID[]) AS sample_task_ids, \
+            COALESCE(e.sample_execution_ids, ARRAY[]::UUID[]) AS sample_execution_ids \
+     FROM ( \
+         SELECT queue_name::TEXT AS queue_name, COUNT(*)::BIGINT AS pending_count \
+         FROM harvest_task_queue \
+         WHERE state = 'PENDING' \
+           AND ($1::TEXT IS NULL OR queue_name = $1::TEXT) \
+         GROUP BY queue_name \
+     ) q \
+     LEFT JOIN LATERAL ( \
+         SELECT ARRAY_AGG(id ORDER BY scheduled_at ASC, id ASC) AS sample_task_ids \
+         FROM ( \
+             SELECT id, scheduled_at \
+             FROM harvest_task_queue \
+             WHERE state = 'PENDING' AND queue_name = q.queue_name \
+             ORDER BY scheduled_at ASC, id ASC \
+             LIMIT 5 \
+         ) top_tasks \
+     ) t ON TRUE \
+     LEFT JOIN LATERAL ( \
+         SELECT ARRAY_AGG(workflow_exec_id ORDER BY scheduled_at ASC, id ASC) AS sample_execution_ids \
+         FROM ( \
+             SELECT workflow_exec_id, scheduled_at, id \
+             FROM harvest_task_queue \
+             WHERE state = 'PENDING' \
+               AND queue_name = q.queue_name \
+               AND workflow_exec_id IS NOT NULL \
+             ORDER BY scheduled_at ASC, id ASC \
+             LIMIT 5 \
+         ) top_execs \
+     ) e ON TRUE \
+     ORDER BY q.queue_name"
+}
+
+/// Fleet-visibility read for issue #774: every queue with `PENDING` work on
+/// this shard, with bounded representative sample ids.
+///
+/// This is deliberately the *simple*, unfiltered PENDING count — see
+/// [`pending_queue_demand_query`]'s doc comment for why it does not reuse
+/// [`claimable_pending_demand_by_queue`]'s constraint-aware filtering.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn pending_queue_demand_by_queue_name(
+    conn: &mut AsyncPgConnection,
+    queue_name_filter: Option<&str>,
+) -> HarvestResult<Vec<PendingQueueDemand>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        pending_count: i64,
+        #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+        sample_task_ids: Vec<Uuid>,
+        #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
+        sample_execution_ids: Vec<Uuid>,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(pending_queue_demand_query())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue_name_filter)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingQueueDemand {
+            queue_name: r.queue_name,
+            pending_count: r.pending_count,
+            sample_task_ids: r.sample_task_ids,
+            sample_execution_ids: r.sample_execution_ids,
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2868,6 +3003,64 @@ pub async fn sample_rate_limit_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Issue #774: queue coverage — pending-demand query ───────────────────
+
+    /// The hot query embeds two `LEFT JOIN LATERAL ... LIMIT N` sample
+    /// subqueries (task ids, execution ids); both must stay bound to
+    /// `QUEUE_COVERAGE_SAMPLE_CAP` since Diesel `sql_query` cannot
+    /// interpolate the const directly.
+    #[test]
+    fn pending_queue_demand_sql_sample_limits_match_the_cap() {
+        let sql = pending_queue_demand_query();
+        let needle = format!("LIMIT {QUEUE_COVERAGE_SAMPLE_CAP}");
+        assert_eq!(
+            sql.matches(&needle).count(),
+            2,
+            "pending_queue_demand_query() must bound both sample subqueries \
+             to exactly QUEUE_COVERAGE_SAMPLE_CAP ({QUEUE_COVERAGE_SAMPLE_CAP}) \
+             rows via LIMIT; found {} occurrences of '{needle}' in:\n{sql}",
+            sql.matches(&needle).count()
+        );
+    }
+
+    /// Regression guard for the review-flagged unbounded
+    /// `ARRAY_AGG(...)[1:N]` pattern (issue #774 review): a `[1:N]` slice
+    /// only bounds the *returned* array, not the transition-array memory
+    /// Postgres must first build over every `PENDING` row in the queue --
+    /// exactly the failure mode (a queue stranded with thousands of
+    /// unclaimed tasks) this operational gate exists to surface. Each
+    /// sample must come from its own `LIMIT`-bounded lateral subquery
+    /// instead, so a `LEFT JOIN LATERAL` (not a bare `ARRAY_AGG` slice) is
+    /// what actually appears in the query.
+    #[test]
+    fn pending_queue_demand_sql_bounds_samples_via_lateral_limit_not_full_array_agg() {
+        let sql = pending_queue_demand_query();
+        assert!(
+            !sql.contains("[1:"),
+            "must not slice a full ARRAY_AGG -- use a LIMIT-bounded lateral \
+             subquery instead:\n{sql}"
+        );
+        assert!(
+            sql.to_uppercase().contains("LATERAL"),
+            "expected LEFT JOIN LATERAL sample subqueries in:\n{sql}"
+        );
+    }
+
+    /// The query must filter to `state = 'PENDING'` only — no `claim_task`-style
+    /// constraint gating (concurrency cap, rate limit, `schedule_to_close`,
+    /// PAUSED-workflow exclusion). That is deliberate scope: #774 answers "is
+    /// anyone polling this queue at all", not "is this specific row claimable
+    /// right now" (owned by #531/#742/#171).
+    #[test]
+    fn pending_queue_demand_sql_has_no_claim_eligibility_filtering() {
+        let sql = pending_queue_demand_query();
+        assert!(sql.contains("state = 'PENDING'"));
+        assert!(!sql.contains("schedule_to_close_at"));
+        assert!(!sql.contains("concurrency_cap"));
+        assert!(!sql.contains("rate_limit"));
+        assert!(!sql.contains("PAUSED"));
+    }
 
     // ── Queue pause: claim gate + its mirrors (issue #619) ──────────────────
 

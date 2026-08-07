@@ -1206,6 +1206,18 @@ fn queue_list_paused_is_covered() {
     assert_covered(&["queue", "list-paused"]);
 }
 
+// ── Queue coverage (issue #774) ─────────────────────────────────────────────
+
+#[test]
+fn queue_coverage_is_covered() {
+    assert_covered(&["queue", "coverage"]);
+}
+
+#[test]
+fn queue_coverage_with_filter_is_covered() {
+    assert_covered(&["queue", "coverage", "--queue", "email-workers"]);
+}
+
 #[test]
 fn token_create_is_covered() {
     assert_covered(&["token", "create", "ci-bot", "--scope", "read"]);

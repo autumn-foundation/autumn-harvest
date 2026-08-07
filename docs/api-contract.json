@@ -4062,6 +4062,41 @@
     },
     {
       "method": "GET",
+      "path": "/admin/queue-coverage",
+      "category": "admin",
+      "read_only": true,
+      "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. No new WorkflowEvent variant, no migration -- read path only.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "query",
+          "required": false,
+          "description": "Narrow the report to a single queue name. Any *decoded* string is accepted -- there is no invalid value, so a repeated key resolves last-value-wins and the value is matched verbatim (never trimmed; only the literal empty string normalizes to no filter, since a queue name may legitimately carry surrounding or all whitespace); an unknown or never-scheduled queue name simply yields uncovered: false, never an error. A malformed percent-encoding (e.g. an invalid UTF-8 byte sequence like %FF) is rejected with a 400 before decoding is even attempted -- see the 400 error_responses entry."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "filter",
+          "uncovered",
+          "total_uncovered_queues",
+          "items",
+          "shards",
+          "excluded_paused_queues"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/status",
       "category": "admin",
       "read_only": true,

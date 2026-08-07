@@ -266,6 +266,77 @@ queue. Avoid bulk replay until coverage is fresh.
 Escalate if coverage is absent for more than two heartbeat windows after a
 worker restart, or if multiple shards report the same missing queue.
 
+## harvest_queue_uncovered
+
+**Data-driven queue coverage gap** (issue #774). A queue has real pending
+work but zero live workers are polling it right now. Unlike
+`harvest_no_active_workers` above — which checks *static, declared*
+required-queue coverage (derived from registered workflow/activity default
+queues and schedules) regardless of whether any work is currently
+pending — this alert is *data-driven*: it fires only when there is actual
+stranded work, so it also catches ad-hoc or dynamically-named queues that
+were never declared as required. It is distinct from build-id reachability
+(#171) and the pre-cutover handler-coverage gate (#520/#700, see
+`docs/runbooks/safe-deploy.md`): a queue can be reported uncovered even when
+every worker in the fleet is fully build-compatible and handler-complete —
+it simply is not subscribed to that queue name.
+
+### Triage steps
+
+1. Run `harvest queue coverage --json` (or `GET /api/harvest/admin/queue-coverage`).
+2. Read `uncovered` / `total_uncovered_queues` for the single-field CI-gate
+   answer, then walk `items[]` for the specific queue name(s), each carrying
+   `pending_count` and a `shard_breakdown`.
+3. Each uncovered item's `sample_task_ids` / `sample_execution_ids` (capped
+   at 5) name real stranded rows — open one directly with
+   `harvest workflow stack <execution_id>`.
+4. Run `harvest worker health --output json` (or `harvest worker list --queue <queue>`)
+   to confirm no worker is currently subscribed to the named queue.
+5. Check `status` in the report: `partial`/`unavailable` means at least one
+   shard could not be inspected — walk `shards[]` for the entry carrying
+   `status: "unavailable"` to identify it; that shard's pending demand is
+   **not** reflected in the report, so do not read a `partial` result as
+   "fully covered".
+
+### Likely causes
+
+A worker deployment dropped a queue from its `--queues`/`with_queues(...)`
+configuration (typo, config drift during a rolling deploy), the last worker
+subscribed to the queue was drained or crashed with no replacement, a
+schedule or webhook started routing work to a new/ad-hoc queue name that no
+worker was ever configured to poll, or the queue was paused and then had its
+pause lifted without a worker being re-added.
+
+### False positives
+
+None from staleness — the report is computed live from the current pending
+set and the live worker registry on every call, not sampled. A queue that
+is intentionally paused (`GET /admin/queues/paused`) is excluded from the
+uncovered list by design (paused work is expected to sit idle, not
+stranded) — confirm the queue is not paused before treating a report as a
+false positive. Don't stop there, though: a paused queue with pending work
+and no live poller is still surfaced, separately, in the report's
+`excluded_paused_queues` array — a non-empty entry there is not a false
+positive, it's a pre-unpause TODO (unpausing that queue today would make it
+uncovered immediately). A `partial`/`unavailable` `status` can under-report
+(an unreachable shard's pending demand is invisible), never over-report.
+
+### Safe actions
+
+Add or re-subscribe a worker to the named queue (`with_queues([...])` /
+`--queues`), or resume routing if the queue was meant to be a synonym for
+one an existing worker already polls. Do not adjust build policy or remove
+workflow handlers to fix this — coverage is orthogonal to both (see the
+["Queue-coverage check" section](safe-deploy.md#queue-coverage-check--confirm-every-queue-has-a-live-poller-issue-774)
+of `docs/runbooks/safe-deploy.md`).
+
+### Escalation criteria
+
+Escalate if a required (previously-covered) queue stays uncovered for more
+than two heartbeat windows after a worker restart or deploy, or if
+`total_uncovered_queues` grows across successive polls rather than
+shrinking once replacement workers come up.
+
 ## harvest_worker_saturation
 
 ### Triage steps

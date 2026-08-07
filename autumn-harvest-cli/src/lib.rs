@@ -339,6 +339,17 @@ pub enum CliError {
         context: String,
     },
 
+    /// Queue coverage found an uncovered task queue or an incomplete report.
+    ///
+    /// `context` carries either the original transport error (connection
+    /// failure, auth error, server 5xx) so operators can distinguish infra
+    /// misconfiguration from an unsafe-deploy verdict (issue #774).
+    #[error("queue coverage gate failed: {context}")]
+    QueueCoverageGate {
+        /// Human-readable cause: transport error string or verdict summary.
+        context: String,
+    },
+
     /// `--wait` timed out before the worker reached `Stopped`.
     #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
     DrainWaitTimeout {
@@ -378,10 +389,11 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::PreflightGate { status } if status == "warn" => 2,
-            // Issue #520: the reachability gate uses exit code 2 specifically so
-            // CI can distinguish "an orphaned/partial deploy hazard" from a
-            // generic transport/usage failure (exit 1).
-            Self::WorkflowReachabilityGate { .. } => 2,
+            // Issue #520 / #774: both the workflow-reachability gate and the
+            // queue-coverage gate use exit code 2 specifically so CI can
+            // distinguish "an orphaned/partial/uncovered deploy hazard" from
+            // a generic transport/usage failure (exit 1).
+            Self::WorkflowReachabilityGate { .. } | Self::QueueCoverageGate { .. } => 2,
             _ => 1,
         }
     }
@@ -1744,6 +1756,20 @@ enum QueueCommand {
     /// List every currently-paused queue with its reason and held-task count.
     #[command(alias = "list", alias = "status")]
     ListPaused,
+    /// Report task queues with pending work but zero live workers polling
+    /// them (issue #774).
+    ///
+    /// Exits `2` when any queue is uncovered, or when the report is
+    /// incomplete (a shard was unreachable), so it can gate a deploy or
+    /// migration in CI.
+    Coverage {
+        /// Narrow the report to a single queue name.
+        #[arg(long = "queue")]
+        queue_name: Option<String>,
+        /// Output raw JSON instead of the summary table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Per-execution legal hold (issue #747): exempt an execution's history from
@@ -2360,6 +2386,14 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
                     context: err.to_string(),
                 });
             }
+            // Issue #774: same fail-closed convention as the reachability gate
+            // above -- a transport error on a queue-coverage deploy gate must
+            // also read as "deploy hazard" (exit 2), not a generic error (exit 1).
+            if queue_coverage_should_gate(&cli) {
+                return Err(CliError::QueueCoverageGate {
+                    context: err.to_string(),
+                });
+            }
             return Err(err);
         }
     };
@@ -2402,6 +2436,11 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return Err(CliError::WorkflowReachabilityGate {
             context: "orphaned verdict, in_use with type filter, or incomplete shard report"
                 .to_string(),
+        });
+    }
+    if queue_coverage_should_gate(&cli) && queue_coverage_exit_code(&response) != 0 {
+        return Err(CliError::QueueCoverageGate {
+            context: "uncovered queue or incomplete shard report".to_string(),
         });
     }
     if queue_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
@@ -3215,6 +3254,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if workflow_reachability_wants_table(cli) {
         return Ok(format_workflow_reachability_table(value));
     }
+    if queue_coverage_wants_table(cli) {
+        return Ok(format_queue_coverage_table(value));
+    }
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
@@ -3234,6 +3276,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
         || workflow_reachability_wants_raw_json(cli)
+        || queue_coverage_wants_raw_json(cli)
         || usage_wants_raw_json(cli)
     {
         OutputFormat::Json
@@ -4329,6 +4372,199 @@ fn format_workflow_reachability_table(value: &Value) -> String {
     };
 
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}{footer}")
+}
+
+// ─── Queue coverage helpers (issue #774) ───────────────────────────────────
+
+fn queue_coverage_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn queue_coverage_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { json: true, .. }
+        }
+    )
+}
+
+const fn queue_coverage_should_gate(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Queue {
+            command: QueueCommand::Coverage { .. }
+        }
+    )
+}
+
+/// Exit `2` when the report is unsafe to deploy against:
+///
+/// - `partial`/`unavailable` cross-shard status: an incomplete answer must
+///   never be mistaken for "fully covered".
+/// - Any queue reported `uncovered: true`: pending work with zero live
+///   pollers, the exact deploy hazard this gate exists to catch.
+///
+/// Exit `0` otherwise.
+fn queue_coverage_exit_code(value: &Value) -> i32 {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    if matches!(status, "partial" | "unavailable") {
+        return 2;
+    }
+    let uncovered = value
+        .get("uncovered")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if uncovered { 2 } else { 0 }
+}
+
+/// "WARNING: unavailable shards [..]" footer, or empty when every shard was
+/// reached. Extracted so [`format_queue_coverage_table`] stays under the
+/// line-count lint.
+fn queue_coverage_unavailable_footer(value: &Value) -> String {
+    let unavailable = value
+        .get("shards")
+        .and_then(Value::as_array)
+        .map(|shards| {
+            shards
+                .iter()
+                .filter(|shard| shard.get("status").and_then(Value::as_str) == Some("unavailable"))
+                .filter_map(|shard| shard.get("shard_id").and_then(Value::as_i64))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if unavailable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nWARNING: unavailable shards [{}] — coverage is provisional, not fully verified.",
+            unavailable.join(", ")
+        )
+    }
+}
+
+/// "NOTE: paused queues .." footer, or empty when nothing was excluded.
+/// Extracted so [`format_queue_coverage_table`] stays under the line-count
+/// lint.
+fn queue_coverage_paused_note(value: &Value) -> String {
+    let paused_uncovered = value
+        .get("excluded_paused_queues")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if paused_uncovered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nNOTE: paused queues with pending work and no live poller (excluded from the count above; unpausing without adding a worker would make them uncovered immediately): {}",
+            paused_uncovered.join(", ")
+        )
+    }
+}
+
+fn format_queue_coverage_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let total_uncovered = value
+        .get("total_uncovered_queues")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    // Computed up front so an unavailable shard is warned about on EVERY
+    // return path below, even the friendly "fully covered" shortcuts — a
+    // partial/unavailable report's "nothing uncovered" claim is unverified
+    // for the shards it never reached, and must never read as clean.
+    let footer = queue_coverage_unavailable_footer(value);
+
+    // A paused, pollerless queue with real pending work is deliberately
+    // excluded from `items`/`uncovered` (see the endpoint's docs), but must
+    // still surface here — unpausing it without adding a worker would
+    // immediately make it uncovered, and `--json` is the only other way to
+    // see this list.
+    let paused_note = queue_coverage_paused_note(value);
+
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\nNo uncovered queues.{footer}{paused_note}"
+        );
+    };
+    if items.is_empty() {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: 0\nAll queues with pending work are covered.{footer}{paused_note}"
+        );
+    }
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "QUEUE_NAME".to_string(),
+        "PENDING".to_string(),
+        "SAMPLE_TASK_IDS".to_string(),
+        "SAMPLE_EXECUTION_IDS".to_string(),
+    ]);
+    for item in items {
+        let sample_tasks = item
+            .get("sample_task_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let sample_execs = item
+            .get("sample_execution_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        rows.push(vec![
+            cell_str(item.get("queue_name")),
+            cell_number(item.get("pending_count")),
+            sample_tasks,
+            sample_execs,
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}{paused_note}"
+    )
 }
 
 fn audit_list_wants_table(cli: &Cli) -> bool {
@@ -6234,6 +6470,15 @@ fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
             ))
         }
         QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+        QueueCommand::Coverage { queue_name, .. } => Ok(queue_name.as_ref().map_or_else(
+            || ApiRequest::get("/admin/queue-coverage"),
+            |value| {
+                ApiRequest::get(format!(
+                    "/admin/queue-coverage?queue_name={}",
+                    query_encode(value)
+                ))
+            },
+        )),
     }
 }
 
@@ -8093,6 +8338,217 @@ mod reuse_policy_tests {
         assert_eq!(workflow_reachability_exit_code(&value), 2);
         let unavailable = json!({ "status": "unavailable", "items": [] });
         assert_eq!(workflow_reachability_exit_code(&unavailable), 2);
+    }
+
+    // ─── Queue coverage CLI tests (issue #774) ────────────────────────────────
+
+    #[test]
+    fn queue_coverage_builds_unfiltered_request() {
+        let cli = parse(&["queue", "coverage"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/queue-coverage");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn queue_coverage_threads_queue_name_filter() {
+        let cli = parse(&["queue", "coverage", "--queue", "email-workers"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(req.path, "/admin/queue-coverage?queue_name=email-workers");
+    }
+
+    #[test]
+    fn queue_coverage_query_encodes_the_filter() {
+        let cli = parse(&["queue", "coverage", "--queue", "weird queue&name"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(
+            req.path,
+            "/admin/queue-coverage?queue_name=weird%20queue%26name"
+        );
+    }
+
+    #[test]
+    fn queue_coverage_exit_code_zero_when_fully_covered() {
+        let value = json!({
+            "status": "complete",
+            "uncovered": false,
+            "items": []
+        });
+        assert_eq!(queue_coverage_exit_code(&value), 0);
+    }
+
+    #[test]
+    fn queue_coverage_exit_code_two_on_uncovered_queue() {
+        let value = json!({
+            "status": "complete",
+            "uncovered": true,
+            "items": [{ "queue_name": "typo_queue", "pending_count": 5 }]
+        });
+        assert_eq!(queue_coverage_exit_code(&value), 2);
+    }
+
+    #[test]
+    fn queue_coverage_exit_code_two_on_partial_report() {
+        // A partial answer must never be mistaken for fully covered: fail closed.
+        let value = json!({ "status": "partial", "uncovered": false, "items": [] });
+        assert_eq!(queue_coverage_exit_code(&value), 2);
+        let unavailable = json!({ "status": "unavailable", "uncovered": false, "items": [] });
+        assert_eq!(queue_coverage_exit_code(&unavailable), 2);
+    }
+
+    #[test]
+    fn queue_coverage_should_gate_only_matches_coverage_subcommand() {
+        assert!(queue_coverage_should_gate(&parse(&["queue", "coverage"])));
+        assert!(!queue_coverage_should_gate(&parse(&[
+            "queue",
+            "list-paused"
+        ])));
+        assert!(!queue_coverage_should_gate(&parse(&["shard", "health"])));
+    }
+
+    #[test]
+    fn queue_coverage_table_lists_uncovered_queues_with_samples() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 1,
+            "uncovered": true,
+            "items": [
+                {
+                    "queue_name": "typo_queue",
+                    "pending_count": 42,
+                    "sample_task_ids": ["11111111-1111-1111-1111-111111111111"],
+                    "sample_execution_ids": ["22222222-2222-2222-2222-222222222222"],
+                    "shard_breakdown": [{ "shard_id": 0, "pending_count": 42 }]
+                }
+            ],
+            "shards": [{ "shard_id": 0, "status": "inspected" }]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("typo_queue"));
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains("11111111-1111-1111-1111-111111111111"));
+        assert!(rendered.contains("22222222-2222-2222-2222-222222222222"));
+        assert!(!rendered.contains("WARNING"));
+    }
+
+    #[test]
+    fn queue_coverage_table_reports_fully_covered_with_no_items() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("All queues with pending work are covered."));
+    }
+
+    #[test]
+    fn queue_coverage_table_warns_on_unavailable_shard() {
+        let value = json!({
+            "status": "partial",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [
+                { "shard_id": 0, "status": "inspected" },
+                { "shard_id": 1, "status": "unavailable", "error": "connection refused" }
+            ]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("WARNING: unavailable shards [1]"));
+    }
+
+    #[test]
+    fn queue_coverage_table_surfaces_excluded_paused_queues() {
+        // The paused-but-pollerless exclusion (module docs on
+        // `queue_coverage.rs`) must not be invisible outside `--json` --
+        // an operator using the default table view needs to see it too.
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": ["seasonal-batch"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("All queues with pending work are covered."));
+        assert!(rendered.contains("NOTE: paused queues"));
+        assert!(rendered.contains("seasonal-batch"));
+    }
+
+    #[test]
+    fn queue_coverage_table_with_uncovered_items_also_surfaces_paused_note() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 1,
+            "uncovered": true,
+            "items": [
+                {
+                    "queue_name": "typo_queue",
+                    "pending_count": 1,
+                    "sample_task_ids": [],
+                    "sample_execution_ids": [],
+                    "shard_breakdown": [{ "shard_id": 0, "pending_count": 1 }]
+                }
+            ],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": ["seasonal-batch"]
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(rendered.contains("typo_queue"));
+        assert!(rendered.contains("NOTE: paused queues"));
+        assert!(rendered.contains("seasonal-batch"));
+    }
+
+    #[test]
+    fn queue_coverage_table_omits_paused_note_when_nothing_excluded() {
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-08-07T00:00:00Z",
+            "total_uncovered_queues": 0,
+            "uncovered": false,
+            "items": [],
+            "shards": [{ "shard_id": 0, "status": "inspected" }],
+            "excluded_paused_queues": []
+        });
+        let rendered = format_queue_coverage_table(&value);
+        assert!(!rendered.contains("NOTE: paused queues"));
+    }
+
+    #[test]
+    fn queue_coverage_wants_raw_json_only_with_the_json_flag() {
+        assert!(queue_coverage_wants_raw_json(&parse(&[
+            "queue", "coverage", "--json"
+        ])));
+        assert!(!queue_coverage_wants_raw_json(&parse(&[
+            "queue", "coverage"
+        ])));
+        assert!(!queue_coverage_wants_raw_json(&parse(&["shard", "health"])));
+    }
+
+    #[test]
+    fn queue_coverage_wants_table_only_without_the_json_flag_in_pretty_mode() {
+        assert!(queue_coverage_wants_table(&parse(&["queue", "coverage"])));
+        assert!(!queue_coverage_wants_table(&parse(&[
+            "queue", "coverage", "--json"
+        ])));
+    }
+
+    #[test]
+    fn queue_coverage_gate_maps_to_exit_code_two() {
+        let error = CliError::QueueCoverageGate {
+            context: "uncovered queue".to_string(),
+        };
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

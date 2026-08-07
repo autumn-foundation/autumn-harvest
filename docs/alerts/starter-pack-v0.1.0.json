@@ -65,6 +65,35 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_active_workers"
     },
     {
+      "id": "harvest_queue_uncovered",
+      "status": "enforceable",
+      "signal_source": "Queue-coverage report from GET /api/harvest/admin/queue-coverage (issue #774), computed on demand from pending harvest_task_queue rows cross-shard-joined against the live worker registry \u2014 not a continuously-sampled metric.",
+      "default_threshold": "Page when any queue reports uncovered == true (>= 1 PENDING task with zero live \u2014 Active or Draining \u2014 workers assigned to it on the shard that owns the pending work).",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "A queue has pending work but no live worker is polling it. This is distinct from harvest_no_active_workers, which checks STATIC, declared-required-queue coverage (derived from registered workflow/activity default queues and schedules) regardless of whether work is currently pending. harvest_queue_uncovered is DATA-DRIVEN \u2014 it fires only when there is real stranded work right now, so it also catches ad-hoc or dynamically-named queues that were never declared as required. It is also distinct from build-id reachability (#171) and the pre-cutover handler-coverage gate (#520/#700): a queue can be reported uncovered even when every worker in the fleet is fully build-compatible and handler-complete \u2014 it simply is not subscribed to that queue name.",
+      "first_action": "harvest queue coverage --json",
+      "dependencies": [
+        {
+          "ref": "#774",
+          "status": "shipped",
+          "surface": "GET /api/harvest/admin/queue-coverage and harvest queue coverage"
+        }
+      ],
+      "prometheus": {
+        "mode": "api-exporter-pseudo",
+        "notes": "No native ADR-0001 per-queue coverage metric exists by design: a continuously-sampled gauge labeled by queue name would be unbounded cardinality for dynamically-named/tenant-derived queues (explicitly out of scope per issue #774). Poll the management API/CLI directly, or export queue-coverage results only with a bounded, allowlisted queue-name label if Prometheus alerting is required.",
+        "expressions": []
+      },
+      "management_checks": [
+        "harvest queue coverage --json",
+        "GET /api/harvest/admin/queue-coverage",
+        "harvest worker health --output json",
+        "harvest workflow stack <execution_id>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_queue_uncovered"
+    },
+    {
       "id": "harvest_worker_saturation",
       "status": "enforceable",
       "signal_source": "Worker health, worker list, drain status, and concurrency status from the management API.",

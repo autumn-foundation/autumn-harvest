@@ -115,6 +115,7 @@ panel finds the way back to the rule and its runbook section.
 |---|---|---|---|
 | `harvest_preflight_failed` | Readiness checks | Readiness: Deployment preflight (text) | [runbook](../runbooks/harvest-alerts.md#harvest_preflight_failed) |
 | `harvest_no_active_workers` | Readiness checks | Readiness: Worker fleet coverage (text) | [runbook](../runbooks/harvest-alerts.md#harvest_no_active_workers) |
+| `harvest_queue_uncovered` | Readiness checks | Readiness: Queue coverage (text) | [runbook](../runbooks/harvest-alerts.md#harvest_queue_uncovered) |
 | `harvest_worker_saturation` | Readiness checks | Readiness: Worker fleet saturation (text; proxies: Overview → Worker slot utilization) | [runbook](../runbooks/harvest-alerts.md#harvest_worker_saturation) |
 | `harvest_queue_schedule_to_start_high` | Overview | Schedule-to-start latency p99 | [runbook](../runbooks/harvest-alerts.md#harvest_queue_schedule_to_start_high) |
 | `harvest_queue_backlog_growth` | Overview | Queue depth (companion: Queues & workers → Oldest pending task age) | [runbook](../runbooks/harvest-alerts.md#harvest_queue_backlog_growth) |

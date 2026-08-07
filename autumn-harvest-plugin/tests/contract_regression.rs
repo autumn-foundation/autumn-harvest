@@ -688,6 +688,34 @@ fn dag_run_graph_route_is_classified() {
     );
 }
 
+/// The fleet-wide task-queue coverage read model (issue #774) must be
+/// registered in the live route registry and classified `ReadOnly` in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `dag_run_graph_route_is_classified`: `audit.rs`'s own
+/// exhaustiveness tests only cross-check `CLASSIFIED_ROUTES` and
+/// `ALL_MUTATION_ROUTES` against each other (which stays green if a route is
+/// dropped from BOTH), never against the live router — this pin closes that
+/// gap for the new route.
+#[test]
+fn queue_coverage_route_is_classified() {
+    use autumn_harvest::audit::{CLASSIFIED_ROUTES, RouteClass};
+
+    let route = "GET /admin/queue-coverage";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && *class == RouteClass::ReadOnly),
+        "{route} must be classified ReadOnly in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {

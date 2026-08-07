@@ -2679,6 +2679,53 @@ fn queue_pause_requires_a_reason() {
     );
 }
 
+// ── Queue coverage (issue #774) ────────────────────────────────────────────
+
+#[test]
+fn queue_coverage_maps_to_the_read_route_unfiltered() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "coverage"]).expect("args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/queue-coverage");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_coverage_threads_the_queue_filter_into_the_query_string() {
+    let cli = Cli::try_parse_from(["harvest", "queue", "coverage", "--queue", "email-workers"])
+        .expect("args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/queue-coverage?queue_name=email-workers"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn queue_coverage_query_encodes_a_queue_name_with_special_characters() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "queue",
+        "coverage",
+        "--queue",
+        "email workers/eu",
+    ])
+    .expect("args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(
+        request.path,
+        "/admin/queue-coverage?queue_name=email%20workers%2Feu"
+    );
+}
+
 // ── Scoped API tokens (issue #942) ────────────────────────────────────────────
 
 #[test]
