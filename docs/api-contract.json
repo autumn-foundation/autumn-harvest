@@ -4092,10 +4092,6 @@
         {
           "status": 400,
           "description": "Malformed query string: a percent-encoded byte sequence in the query does not decode to valid UTF-8."
-        },
-        {
-          "status": 503,
-          "description": "Database or shard connectivity error."
         }
       ]
     },

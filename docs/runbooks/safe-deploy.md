@@ -180,13 +180,19 @@ after every drain or deploy:
   `Stopped` — check after that transition, not before it.
 - **Pre-cutover check when adding a queue** — before routing traffic (or
   flipping a workflow's `queue` attribute) onto a queue name that didn't
-  exist before, confirm at least one worker is already subscribed with
-  `harvest worker list --queue <name>` (or `GET /workers?queue=<name>`), not
-  `harvest queue coverage`. The coverage report is built entirely from
-  *pending* `harvest_task_queue` rows, so a brand-new queue with no
-  scheduled work yet has nothing to compare workers against and always
-  reports `uncovered: false` — a vacuous "fine" regardless of whether any
-  worker is actually subscribed. Once traffic is flowing,
+  exist before, confirm at least one **live** worker is already subscribed
+  with `harvest worker list --queue <name> --status Active --health healthy`
+  (or `GET /workers?queue=<name>&status=Active&health=healthy`), not
+  `harvest queue coverage`. Filter on both `--status` and `--health` — an
+  unqualified `harvest worker list --queue <name>` still returns a worker row
+  that registered, crashed, and stopped heartbeating (still `Active` but
+  `stale`), or one that has fully transitioned to `Stopped`, so it can't
+  distinguish "a live poller is subscribed" from "a subscription used to
+  exist." The coverage report is built entirely from *pending*
+  `harvest_task_queue` rows, so a brand-new queue with no scheduled work yet
+  has nothing to compare workers against and always reports
+  `uncovered: false` — a vacuous "fine" regardless of whether any worker is
+  actually subscribed. Once traffic is flowing,
   `harvest queue coverage --queue <name>` is the right tool to confirm
   nothing is left stranding.
 
