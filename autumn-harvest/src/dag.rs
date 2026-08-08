@@ -1985,4 +1985,178 @@ mod tests {
             "condition must see b's output at ups[0] (edges: [b, a])"
         );
     }
+
+    // ── Issue #780 — declarative DAG node compensation ─────────────────────
+
+    // Compensator activity fn items — distinct fns so the typed
+    // `.compensate(f)` derives distinct short names (same mechanism as
+    // `DagBuilder::activity`).
+    fn release_inventory() {}
+    fn refund_payment() {}
+
+    /// T1 — `.compensate(f)` (typed) derives the short activity name exactly
+    /// like `DagBuilder::activity`; `.compensate_named(name)` stores the given
+    /// string verbatim; an undecorated node carries `None`.
+    #[test]
+    fn compensate_sets_the_task_field() {
+        let mut builder = DagBuilder::new();
+        // Typed — name derived from the fn item.
+        let _typed = builder
+            .activity(dummy_activity)
+            .compensate(release_inventory); // 0
+        // Named — explicit string.
+        let _named = builder
+            .activity(dummy_activity2)
+            .compensate_named("refund_payment"); // 1
+        // Undecorated — no compensator declared.
+        let _plain = builder.activity(dummy_activity3); // 2
+
+        let dag = builder.build().expect("compensated DAG builds");
+        let tasks = dag.tasks();
+        assert_eq!(
+            tasks[0].compensate.as_deref(),
+            Some("release_inventory"),
+            "typed `.compensate(f)` must derive the short activity name"
+        );
+        assert_eq!(
+            tasks[1].compensate.as_deref(),
+            Some("refund_payment"),
+            "`.compensate_named(..)` must store the given name verbatim"
+        );
+        assert_eq!(
+            tasks[2].compensate, None,
+            "an undecorated node must carry no compensator"
+        );
+    }
+
+    /// T2 — a signal gate dispatches no activity, so there is nothing for a
+    /// compensator to undo; declaring one is a build error naming the gate.
+    #[test]
+    fn compensate_on_a_signal_gate_is_a_build_error() {
+        let mut builder = DagBuilder::new();
+        let root = builder.activity(dummy_activity); // 0
+        let gate = builder.signal_gate("approval").upstream(&root); // 1
+        let _ = gate.compensate_named("undo_approval");
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::CompensateOnGate { ref task } if task == "approval"
+            ),
+            "compensate on a signal gate must be a build error naming the gate, got {err:?}"
+        );
+    }
+
+    /// T3 — an empty compensator name would dispatch a nameless activity;
+    /// reject it at build time rather than at unwind time.
+    #[test]
+    fn empty_compensator_name_is_a_build_error() {
+        let mut builder = DagBuilder::new();
+        let _ = builder.activity(dummy_activity).compensate_named("");
+
+        let err = builder.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::EmptyCompensator { ref task } if task == "dummy_activity"
+            ),
+            "an empty compensator name must be a build error naming the node, got {err:?}"
+        );
+    }
+
+    /// T4 — a compensator name that collides with a **forward node's** identity
+    /// is rejected: the unwind dispatches compensators by name, so a collision
+    /// makes the compensation indistinguishable from the forward node (and
+    /// would make the DAG ambiguous for issue #366 retry-from-node).
+    ///
+    /// Three sub-cases: another node's name, the declaring node's own name, and
+    /// a signal gate's name (a gate's identity is its signal name).
+    #[test]
+    fn compensator_named_after_a_forward_node_is_a_build_error() {
+        // (a) Named after ANOTHER forward node.
+        let mut b1 = DagBuilder::new();
+        let _a = b1.activity(dummy_activity); // 0 "dummy_activity"
+        let _b = b1
+            .activity(dummy_activity2) // 1 "dummy_activity2"
+            .compensate_named("dummy_activity");
+        let err = b1.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::CompensatorNameCollidesWithNode { ref task, ref compensator }
+                    if task == "dummy_activity2" && compensator == "dummy_activity"
+            ),
+            "a compensator named after another forward node must be rejected, got {err:?}"
+        );
+
+        // (b) Named after the DECLARING node itself.
+        let mut b2 = DagBuilder::new();
+        let _self_named = b2
+            .activity(dummy_activity) // 0 "dummy_activity"
+            .compensate_named("dummy_activity");
+        let err = b2.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::CompensatorNameCollidesWithNode { ref task, ref compensator }
+                    if task == "dummy_activity" && compensator == "dummy_activity"
+            ),
+            "a self-named compensator must be rejected, got {err:?}"
+        );
+
+        // (c) Named after a signal GATE (a gate's identity is its signal name).
+        let mut b3 = DagBuilder::new();
+        let _gate = b3.signal_gate("approval"); // 0, identity "approval"
+        let _node = b3
+            .activity(dummy_activity) // 1
+            .compensate_named("approval");
+        let err = b3.build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DagBuildError::CompensatorNameCollidesWithNode { ref task, ref compensator }
+                    if task == "dummy_activity" && compensator == "approval"
+            ),
+            "a compensator named after a signal gate must be rejected, got {err:?}"
+        );
+    }
+
+    /// T5 — one compensator activity may be shared by several nodes (the
+    /// envelope's `dag_compensate` field disambiguates which node it is undoing),
+    /// so a shared compensator is NOT a collision.
+    #[test]
+    fn one_compensator_shared_by_several_nodes_builds_cleanly() {
+        let mut builder = DagBuilder::new();
+        let a = builder
+            .activity(dummy_activity)
+            .compensate(release_inventory); // 0
+        let b = builder
+            .activity(dummy_activity2)
+            .upstream(&a)
+            .compensate(release_inventory); // 1
+        let _c = builder
+            .activity(dummy_activity3)
+            .upstream(&b)
+            .compensate(release_inventory); // 2
+
+        let dag = builder
+            .build()
+            .expect("one compensator may be shared by several nodes");
+        for (i, task) in dag.tasks().iter().enumerate() {
+            assert_eq!(
+                task.compensate.as_deref(),
+                Some("release_inventory"),
+                "node {i} must keep the shared compensator"
+            );
+        }
+        // A distinct compensator on a sibling DAG is likewise fine — the guard
+        // is "collides with a forward NODE", not "used more than once".
+        let mut other = DagBuilder::new();
+        let _ = other.activity(dummy_activity).compensate(refund_payment);
+        assert_eq!(
+            other.build().unwrap().tasks()[0].compensate.as_deref(),
+            Some("refund_payment")
+        );
+    }
 }

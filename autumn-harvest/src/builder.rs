@@ -3721,6 +3721,115 @@ mod tests {
         assert_eq!(builder.dag_count(), 1);
     }
 
+    // ── Issue #780 — declarative DAG node compensation validations ──────────
+
+    /// T6 — a compensator that resolves to a **local** activity is rejected by
+    /// `validate_dags_do_not_use_local_activities`. A compensator is dispatched
+    /// through the ordinary DAG activity-queue lowering (`execute_activity_raw_with_opts`),
+    /// exactly like a forward node, so a local activity is just as invalid there.
+    /// The error must name the COMPENSATOR (not the forward node that declares it).
+    #[test]
+    fn local_activity_compensator_is_rejected_by_the_builder() {
+        fn forward() {}
+
+        let dag_with_local_compensator = DagInfo {
+            name: "etl_with_local_comp",
+            module: "test",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let _node = dag.activity(forward).compensate_named("undo_forward");
+            },
+            // Unified, so the classic-DAG compensation guard (T7) cannot fire
+            // first and mask the local-activity rejection under test.
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        };
+
+        let result = HarvestBuilder::new()
+            .dags(vec![dag_with_local_compensator])
+            .activities(vec![make_local_activity("undo_forward", None)])
+            .try_build();
+
+        let err = result.expect_err("a local-activity compensator must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::LocalActivityInDag { ref activity, ref dag }
+                    if activity == "undo_forward" && dag == "etl_with_local_comp"
+            ),
+            "the rejection must name the compensator and its DAG, got: {err:?}"
+        );
+    }
+
+    /// T7 — a **classic** (non-unified) DAG (`workflow_handler: None`) that
+    /// declares a compensator is rejected at `try_build`. Compensation lowers
+    /// onto the unified workflow-handler path (`run_unified_dag`'s terminal
+    /// unwind via `Saga`); the classic DAG executor has no unwind step, so the
+    /// compensator would silently never run. Mirrors
+    /// `DagSignalGateRequiresUnifiedExecution` (issue #746).
+    #[test]
+    fn classic_dag_with_a_compensator_is_rejected() {
+        fn forward() {}
+
+        let classic_compensated_dag = DagInfo {
+            name: "classic_compensated_dag",
+            module: "test",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let _node = dag.activity(forward).compensate_named("undo_forward");
+            },
+            // The unified-vs-classic discriminator.
+            workflow_handler: None,
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        };
+
+        let result = HarvestBuilder::new()
+            .dags(vec![classic_compensated_dag])
+            .try_build();
+
+        let err = result.expect_err("a classic DAG with a compensator must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::DagCompensationRequiresUnifiedExecution {
+                    ref dag,
+                    ref task,
+                    ref compensate,
+                } if dag == "classic_compensated_dag"
+                    && task == "forward"
+                    && compensate == "undo_forward"
+            ),
+            "the rejection must name the DAG, the node, and the compensator, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("classic_compensated_dag") && msg.contains("undo_forward"),
+            "the message must name the DAG and the compensator, got: {msg}"
+        );
+    }
+
     #[cfg(feature = "unified-dag-execution")]
     #[test]
     fn harvest_builder_rejects_workflow_schedule_targeting_auto_registered_dag_name() {

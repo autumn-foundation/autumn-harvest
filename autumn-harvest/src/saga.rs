@@ -448,4 +448,99 @@ mod tests {
         // but we can verify the method exists and returns a reference.
         let _ = saga.context();
     }
+
+    // ── Issue #780 — register-only compensation + caller-supplied original ──
+
+    /// T21 — `push_compensation` registers a compensation WITHOUT running a
+    /// forward step (the DAG unwind already knows which nodes succeeded from
+    /// recorded history, so it must not re-execute them). The closure is stored,
+    /// not invoked.
+    #[tokio::test]
+    async fn push_compensation_registers_without_a_forward_step() {
+        let ctx = WorkflowContext::new_test();
+        let mut saga = Saga::new(&ctx);
+
+        let ran = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&ran);
+        saga.push_compensation(move || {
+            let flag = Arc::clone(&flag);
+            async move {
+                *flag.lock().await = true;
+                Ok::<(), HarvestError>(())
+            }
+        });
+
+        assert_eq!(
+            saga.pending_compensation_count(),
+            1,
+            "push_compensation must register exactly one pending compensation"
+        );
+        assert!(
+            !*ran.lock().await,
+            "push_compensation must REGISTER only — the closure must not run \
+             until the unwind"
+        );
+
+        // And it does run on the unwind.
+        saga.compensate_all().await.expect("compensation succeeds");
+        assert!(
+            *ran.lock().await,
+            "the registered compensation must run on unwind"
+        );
+        assert_eq!(saga.pending_compensation_count(), 0);
+    }
+
+    /// T22 — `compensate_all_after(original)` reports the CALLER's original
+    /// error (the DAG unwind passes `"one or more DAG tasks failed"`), while
+    /// `compensate_all()` keeps delegating with the legacy manual string.
+    #[tokio::test]
+    async fn compensate_all_after_carries_the_caller_supplied_original() {
+        let ctx = WorkflowContext::new_test();
+
+        let mut saga = Saga::new(&ctx);
+        saga.push_compensation(|| async {
+            Err::<(), _>(HarvestError::workflow_failed_untyped("comp", "comp boom"))
+        });
+
+        let err = saga
+            .compensate_all_after("one or more DAG tasks failed")
+            .await
+            .expect_err("a failing compensation must surface SagaCompensationFailed");
+        match err {
+            HarvestError::SagaCompensationFailed {
+                original,
+                compensation_errors,
+            } => {
+                assert_eq!(
+                    original, "one or more DAG tasks failed",
+                    "compensate_all_after must carry the caller-supplied original verbatim"
+                );
+                assert_eq!(compensation_errors.len(), 1);
+                assert!(
+                    compensation_errors[0].contains("comp boom"),
+                    "compensation error must be preserved, got {:?}",
+                    compensation_errors[0]
+                );
+            }
+            other => panic!("expected SagaCompensationFailed, got {other:?}"),
+        }
+
+        // `compensate_all()` delegates to the same machinery with the legacy
+        // manual-request original — unchanged behaviour for existing callers.
+        let mut manual = Saga::new(&ctx);
+        manual.push_compensation(|| async {
+            Err::<(), _>(HarvestError::workflow_failed_untyped("comp", "comp boom"))
+        });
+        let err = manual
+            .compensate_all()
+            .await
+            .expect_err("a failing compensation must surface SagaCompensationFailed");
+        match err {
+            HarvestError::SagaCompensationFailed { original, .. } => assert_eq!(
+                original, "manual compensation requested",
+                "compensate_all() must keep its legacy original string"
+            ),
+            other => panic!("expected SagaCompensationFailed, got {other:?}"),
+        }
+    }
 }
