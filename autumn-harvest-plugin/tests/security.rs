@@ -398,6 +398,21 @@ async fn eris_unauthenticated_replay_diagnosis_is_blocked() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_rerun_is_blocked() {
+    // Operator re-run of a terminal workflow (issue #777): starts a brand-new
+    // execution from a source's recorded start params — admin-only mutation.
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/rerun",
+            r"{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_legal_hold_set_is_blocked() {
     // Per-execution legal hold (issue #747): admin-only mutation.
     let app = unauthenticated_app();

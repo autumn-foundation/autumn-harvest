@@ -324,6 +324,33 @@ fn schedule_update_route_is_classified() {
 /// exhaustiveness tests only cross-check its lists against each other, never
 /// against the live router, so this pin closes that gap for the new route.
 #[test]
+fn rerun_route_is_classified_and_audited() {
+    use autumn_harvest::audit::{
+        ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, OP_WORKFLOW_RERUN, RouteClass,
+    };
+
+    let route = "POST /workflows/{id}/rerun";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES
+            .iter()
+            .any(|(r, class)| *r == route && *class == RouteClass::Mutating),
+        "{route} must be classified Mutating in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+    assert!(
+        ALL_MUTATION_ROUTES
+            .iter()
+            .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_RERUN)),
+        "{route} must be mapped to OP_WORKFLOW_RERUN in ALL_MUTATION_ROUTES"
+    );
+}
+
+#[test]
 fn fail_now_route_is_classified_and_audited() {
     use autumn_harvest::audit::{
         ALL_MUTATION_ROUTES, CLASSIFIED_ROUTES, OP_ACTIVITY_FAIL_NOW, RouteClass,

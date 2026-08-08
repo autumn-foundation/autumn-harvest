@@ -1010,6 +1010,10 @@ pub enum StartSource {
     ContinueAsNew,
     /// A reset-fork run.
     Reset,
+    /// An operator re-run of a terminal run from its recorded start
+    /// parameters (issue #777). Distinct from [`Self::Reset`], which forks an
+    /// execution mid-history; a re-run starts the whole workflow over.
+    Rerun,
     /// Started by the cross-shard outbox dispatcher.
     Outbox,
     /// Started atomically on a caller-owned Diesel connection/transaction via
@@ -1042,6 +1046,7 @@ impl StartSource {
             Self::Batch => "batch",
             Self::ContinueAsNew => "continue_as_new",
             Self::Reset => "reset",
+            Self::Rerun => "rerun",
             Self::Outbox => "outbox",
             Self::Transactional => "transactional",
             Self::Unknown => "unknown",
@@ -1067,6 +1072,7 @@ impl StartSource {
             "batch" => Self::Batch,
             "continue_as_new" => Self::ContinueAsNew,
             "reset" => Self::Reset,
+            "rerun" => Self::Rerun,
             "outbox" => Self::Outbox,
             "transactional" => Self::Transactional,
             _ => Self::Unknown,
@@ -1767,6 +1773,7 @@ mod tests {
             StartSource::Batch,
             StartSource::ContinueAsNew,
             StartSource::Reset,
+            StartSource::Rerun,
             StartSource::Outbox,
             StartSource::Transactional,
             StartSource::Unknown,

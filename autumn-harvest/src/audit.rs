@@ -46,6 +46,12 @@ pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 pub const OP_WORKFLOW_TERMINATE: &str = "workflow.terminate";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
+/// Audit operation: Operator re-run of a terminal workflow execution from its
+/// recorded start parameters (issue #777). Distinct from
+/// [`OP_WORKFLOW_RESET`], which forks an execution mid-history; a re-run
+/// starts a brand-new execution of the whole workflow. The audit row's
+/// `target_id` is the SOURCE execution id.
+pub const OP_WORKFLOW_RERUN: &str = "workflow.rerun";
 /// Audit operation: Paused an individual workflow execution (issue #383).
 pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
 /// Audit operation: Resumed a paused workflow execution (issue #383).
@@ -434,6 +440,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
     ("POST /workflows/{id}/terminate", RouteClass::Mutating),
+    ("POST /workflows/{id}/rerun", RouteClass::Mutating),
     ("POST /workflows/{id}/pause", RouteClass::Mutating),
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("PATCH /workflows/{id}/triage", RouteClass::Mutating),
@@ -683,6 +690,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_RESUME,
     OP_WORKFLOW_ANNOTATE,
     OP_WORKFLOW_RESET,
+    OP_WORKFLOW_RERUN,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
@@ -913,6 +921,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /workflows/{id}/terminate",
         Some(OP_WORKFLOW_TERMINATE),
     ),
+    ("POST /workflows/{id}/rerun", Some(OP_WORKFLOW_RERUN)),
     ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("PATCH /workflows/{id}/triage", Some(OP_WORKFLOW_ANNOTATE)),
@@ -1458,6 +1467,29 @@ mod tests {
         );
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_SET));
         assert!(AUDITED_OPERATIONS.contains(&OP_LEGAL_HOLD_RELEASE));
+    }
+
+    #[test]
+    fn rerun_route_is_classified_and_audited() {
+        // Operator re-run of a terminal workflow (issue #777): the route is an
+        // admin-only mutation and must be classified + audited. This dedicated
+        // test -- not just the general exhaustiveness guards, which only
+        // cross-check CLASSIFIED_ROUTES and ALL_MUTATION_ROUTES against each
+        // other -- is what catches a route dropped from BOTH lists.
+        let route = "POST /workflows/{id}/rerun";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating),
+            "{route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES (issue #777)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_RERUN)),
+            "{route} must map to OP_WORKFLOW_RERUN in ALL_MUTATION_ROUTES (issue #777)"
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_WORKFLOW_RERUN));
     }
 
     #[test]
@@ -2044,6 +2076,9 @@ mod tests {
             "POST /calendars",
             "PUT /calendars/{name}",
             "DELETE /calendars/{name}",
+            // Operator re-run of a terminal workflow (issue #777): starts a
+            // brand-new execution, so a read-only principal must never reach it.
+            "POST /workflows/{id}/rerun",
         ] {
             assert!(
                 CLASSIFIED_ROUTES

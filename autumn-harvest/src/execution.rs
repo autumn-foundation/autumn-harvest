@@ -4503,6 +4503,382 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
     Ok(outcome)
 }
 
+// ---------------------------------------------------------------------------
+// Operator re-run of a terminal workflow (issue #777)
+// ---------------------------------------------------------------------------
+
+/// The execution states a re-run SOURCE may be in (issue #777, AC2).
+///
+/// Deliberately NOT [`crate::erase::is_terminal_state`]'s set — that one
+/// includes `CONTINUED_AS_NEW`, and re-running a chain predecessor would
+/// duplicate the work its successor is already doing (or has already done).
+/// The chain's LATEST run is the re-runnable one.
+pub const RERUNNABLE_SOURCE_STATES: &[&str] =
+    &["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "TERMINATED"];
+
+/// Caller-supplied inputs for [`rerun_workflow_execution`] (issue #777).
+///
+/// Everything the new run needs that is NOT cloned from the source row: the
+/// operator's optional overrides, the attribution actor, and the server-side
+/// ceilings/caps the calling layer resolves.
+pub struct RerunRequest<'a> {
+    /// Replacement input for the new run. `None` = clone the source's stored
+    /// input VERBATIM. `Some(Value::Null)` IS a real override (it replaces the
+    /// clone with `null`) — the `Option` distinguishes "field absent" from
+    /// "explicit JSON null", which a bare `Value` could not.
+    pub input_override: Option<serde_json::Value>,
+    /// Business-key override. `None` = reuse the source's `workflow_id`.
+    pub workflow_id_override: Option<&'a str>,
+    /// Operator attribution stamped on the new run's `started_by` column
+    /// (issue #740). Re-run is the FIRST writer of this column.
+    pub started_by: Option<&'a str>,
+    /// Pre-resolved per-key concurrency group key (issue #247), resolved by the
+    /// caller from the target `WorkflowInfo` against the EFFECTIVE input.
+    pub concurrency_key: Option<String>,
+    /// Per-key concurrency cap (issue #247); required whenever
+    /// [`Self::concurrency_key`] is `Some`.
+    pub concurrency_limit: Option<u32>,
+    /// Effective workflow-input byte cap (issue #252).
+    pub max_workflow_input_bytes: u64,
+    /// Server-side ceiling on the per-run execution timeout (issue #243).
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Server-side ceiling on the chain-scoped lifetime cap (issue #617).
+    pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+    /// Server-side ceiling on workflow-level retry attempts (issue #523).
+    pub max_workflow_attempts_ceiling: Option<u32>,
+    /// W3C trace context captured at the call site (ADR-0001 §3).
+    pub trace_context: Option<TraceContextCarrier>,
+}
+
+/// Outcome of a successful [`rerun_workflow_execution`] (issue #777).
+#[derive(Debug, Clone)]
+pub struct RerunOutcome {
+    /// The brand-new execution started by the re-run.
+    pub exec_id: ExecutionId,
+    /// Workflow type (always the source's — a re-run never changes it).
+    pub workflow_name: String,
+    /// Business key the new run was started under.
+    pub workflow_id: String,
+    /// State of the new run (normally `RUNNING`).
+    pub state: String,
+    /// The source execution this run was re-run from.
+    pub reran_from: ExecutionId,
+    /// The source's terminal state as observed BEFORE any sealing. Once the
+    /// source is sealed to `CONTINUED_AS_NEW` this is the ONLY surviving
+    /// record of what it actually finished as.
+    pub source_prior_state: String,
+    /// Whether the source row was sealed to `CONTINUED_AS_NEW` to free its
+    /// business key for the new run.
+    pub source_sealed: bool,
+}
+
+/// Re-run a terminal workflow execution: start a BRAND-NEW execution from the
+/// source run's recorded start parameters (issue #777).
+///
+/// The complement to reset (issue #148), which forks an execution *mid-history*
+/// so the surviving prefix is replayed. A re-run replays nothing: it starts the
+/// whole workflow over with the same inputs, which is what an operator wants
+/// after fixing a transient downstream failure.
+///
+/// ## Cloned from the source row
+///
+/// Input (unless overridden), queue, memo, search attributes (minus the six
+/// replay-non-determinism diagnostic keys, issue #603), execution timeout,
+/// chain timeout, SLA, owner/runbook_url/severity, context headers, workflow
+/// retry policy, and completion callbacks. The input is passed VERBATIM and is
+/// never decoded — the stored bytes are byte-for-byte what the original start
+/// wrote, so an encrypted or codec-encoded input re-runs identically.
+///
+/// ## NOT carried over
+///
+/// - `priority` (issue #249) is not stored on the execution row, so it cannot
+///   be recovered; the new run starts at [`Priority::default`].
+/// - `schedule_id` / `scheduled_for` / `origin` are cleared, matching the
+///   reset-fork precedent — an operator intervention is deliberately excluded
+///   from scheduled carryover (issue #488) so re-running an old slot cannot
+///   roll a later run's incremental cursor backward.
+/// - Continue-as-new backlinks and the retry chain: the new run is a fresh
+///   chain origin at attempt 1.
+///
+/// ## Business-key handling
+///
+/// When the new run reuses the source's `workflow_id` (the default), the source
+/// row is SEALED to `CONTINUED_AS_NEW` so the partial active-uniqueness index
+/// frees the key. Its `output`, `error`, and — via an explicit repair — its
+/// original `completed_at` are preserved untouched, so the seal loses no
+/// forensic information beyond the state string, which is returned as
+/// [`RerunOutcome::source_prior_state`].
+///
+/// ## Errors
+///
+/// - [`HarvestError::NotFound`] when `source_exec_id` does not exist.
+/// - [`HarvestError::Config`] (a 409-shaped state conflict) when the source is
+///   non-terminal, is `CONTINUED_AS_NEW`, has an erased input (issue #495) and
+///   no explicit override was supplied, or the target business key is held by a
+///   different live execution.
+/// - [`HarvestError::AlreadyExists`] when a `workflow_id` override collides with
+///   a live execution.
+/// - [`HarvestError::AdmissionBlocked`] when an active gate blocks the start.
+/// - [`HarvestError::Database`] for query failures.
+#[allow(clippy::too_many_lines)] // one atomic transaction: lock, gate, clone, start, seal-repair
+pub async fn rerun_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    source_exec_id: ExecutionId,
+    request: RerunRequest<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<RerunOutcome> {
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
+        Box::pin(conn.transaction::<(
+            RerunOutcome,
+            Vec<DeferredTriggerStart>,
+            Vec<(ExecutionId, String)>,
+            Vec<(String, String)>,
+        ), HarvestError, _>(async |conn| {
+            let request = request;
+
+            // 1. Lock the source row FIRST, checks after: two concurrent re-runs
+            // of the same source must serialize, so the loser observes the
+            // sealed CONTINUED_AS_NEW state and is rejected rather than both
+            // starting a run.
+            let source: WorkflowExecution = harvest_workflow_executions::table
+                .find(source_exec_id.as_uuid())
+                .select(WorkflowExecution::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| {
+                    HarvestError::NotFound(format!("workflow execution {source_exec_id}"))
+                })?;
+
+            // 2. Source-state gate (AC2), with distinct operator-actionable messages.
+            if !RERUNNABLE_SOURCE_STATES.contains(&source.state.as_str()) {
+                return Err(HarvestError::Config(if source.state == "CONTINUED_AS_NEW" {
+                    format!(
+                        "workflow execution {source_exec_id} continued-as-new; \
+                         re-run the chain's latest run instead"
+                    )
+                } else {
+                    format!(
+                        "workflow execution {source_exec_id} is not terminal (state {}); \
+                         re-run is for finished work — cancel or terminate it first, \
+                         or use reset to fork a live run",
+                        source.state
+                    )
+                }));
+            }
+
+            // 3. Erasure gate (issue #495): a tombstoned input would re-run the
+            // workflow against `{"_harvest_erased": true}`. Only applies when we
+            // would actually clone it.
+            if request.input_override.is_none()
+                && crate::erase::execution_input_is_erased(&source.input)
+            {
+                return Err(HarvestError::Config(format!(
+                    "workflow execution {source_exec_id} has had its input erased (issue #495); \
+                     supply an explicit `input` to re-run"
+                )));
+            }
+
+            let target_wf_id = request
+                .workflow_id_override
+                .unwrap_or(source.workflow_id.as_str());
+
+            // 4. Resolve the reuse policy against whoever currently holds the
+            // target business key, under this transaction's lock.
+            let (reuse_policy, will_seal) = if target_wf_id == source.workflow_id {
+                match try_load_active_execution_for_update(
+                    conn,
+                    &source.workflow_name,
+                    target_wf_id,
+                )
+                .await?
+                {
+                    // The source itself still holds the key (COMPLETED / FAILED /
+                    // CANCELLED / TIMED_OUT are all inside the active-uniqueness
+                    // index). Seal it via the replace path to free the key.
+                    Some(other) if other.id == source.id => {
+                        (WorkflowIdReusePolicy::TerminateIfRunning, true)
+                    }
+                    // A DIFFERENT execution now holds the key — never seal it.
+                    Some(other) => {
+                        return Err(HarvestError::Config(format!(
+                            "workflow_id '{target_wf_id}' is now held by a different execution \
+                             {} (state {}); re-run that execution instead, or supply a \
+                             workflow_id override",
+                            ExecutionId::from_uuid(other.id),
+                            other.state
+                        )));
+                    }
+                    // The source is sealed (TERMINATED) and nothing holds the
+                    // key: a plain fresh insert.
+                    None => (WorkflowIdReusePolicy::RejectDuplicate, false),
+                }
+            } else {
+                // An override key: create only if free (an occupied key surfaces
+                // as AlreadyExists → 409).
+                (WorkflowIdReusePolicy::RejectDuplicate, false)
+            };
+
+            // 5. Capture the pre-seal forensic values BEFORE the start path can
+            // overwrite them: the state string is otherwise lost to the seal, and
+            // `replace_execution` stamps `completed_at = now()`.
+            let source_prior_state = source.state.clone();
+            let source_completed_at = source.completed_at;
+            let source_exec_id_str = source_exec_id.to_string();
+
+            // Strip the six replay-non-determinism diagnostic keys (issue #603):
+            // a re-run has never diverged, so it must not display a phantom
+            // "blocked" reason inherited from the source. Guarded on `Some` so a
+            // source with no search_attrs does not gain a stray `{}`.
+            let rerun_search_attrs = source.search_attrs.as_ref().map(|_| {
+                crate::worker::apply_raw_search_attrs_patch_in_memory(
+                    source.search_attrs.clone(),
+                    &crate::worker::nd_search_attrs_clear_patch(),
+                )
+                .unwrap_or_default()
+            });
+
+            let params = StartWorkflowParams {
+                workflow_name: &source.workflow_name,
+                workflow_id: target_wf_id,
+                // Stay on the source's shard: a re-run is the same logical work.
+                exec_id: ExecutionId::new_for_shard(crate::types::ShardId::new(source.shard_id)),
+                // VERBATIM — never decoded. `source.input` is byte-for-byte what
+                // the original start wrote, so decoding here would corrupt an
+                // encrypting deployment's re-run (and re-encrypt on write).
+                input: request
+                    .input_override
+                    .clone()
+                    .unwrap_or_else(|| source.input.clone()),
+                parent_id: None,
+                queue_name: &source.queue_name,
+                // The row value IS the effective (already ceiling-clamped) timeout.
+                execution_timeout: source.execution_timeout,
+                memo: source.memo.clone(),
+                search_attrs: rerun_search_attrs,
+                reuse_policy,
+                conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                trace_context: request.trace_context.clone(),
+                max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                chain_execution_timeout: source.chain_execution_timeout,
+                max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
+                // A re-run is a fresh chain ORIGIN, never a continuation.
+                inherited_chain_deadline_at: None,
+                concurrency_key: request.concurrency_key.clone(),
+                concurrency_limit: request.concurrency_limit,
+                // Documented gap: priority (issue #249) lives on the task-queue
+                // row, not the execution row, so it cannot be recovered here.
+                priority: Priority::default(),
+                max_workflow_input_bytes: request.max_workflow_input_bytes,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: source.owner.as_deref(),
+                runbook_url: source.runbook_url.as_deref(),
+                severity: source.severity.as_deref(),
+                context_headers: source
+                    .context_headers
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                sla: source.sla,
+                // Reset-fork precedent: an operator intervention is excluded
+                // from scheduled carryover (issue #488), so re-running an old
+                // slot cannot roll a later run's cursor backward.
+                schedule_id: None,
+                scheduled_for: None,
+                origin: None,
+                // A fresh retry chain.
+                workflow_attempt: 1,
+                workflow_retry_policy: source
+                    .workflow_retry_policy
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
+                completion_callbacks: source.completion_callbacks.clone(),
+                start_source: StartSource::Rerun,
+                start_source_ref: Some(source_exec_id_str.as_str()),
+                started_by: request.started_by,
+            };
+
+            let (started, deferred_starts, deferred_checks, cancel_metrics) =
+                start_or_load_workflow_execution_collect(
+                    conn,
+                    params,
+                    /* in_outer_transaction = */ true,
+                    /* reject_fresh_if_debounced = */ false,
+                    metrics,
+                    Some(crate::admission_gate::GateMode::Check),
+                )
+                .await?;
+
+            // 6. A re-run MUST create. An attach would return 201 for a run the
+            // operator did not start — reject it and roll the transaction back.
+            if !started.created {
+                return Err(HarvestError::Config(format!(
+                    "re-run of workflow execution {source_exec_id} did not create a new \
+                     execution (attached to {} in state {}); re-run that execution instead",
+                    started.exec_id, started.state
+                )));
+            }
+
+            // 7. `completed_at` repair. `replace_execution` stamps the seal with
+            // `now()`, which would rewrite the source's real finish time — the
+            // one durable record of when the original work actually ended.
+            // Restore it, touching NOTHING else (never state/output/error).
+            if will_seal {
+                diesel::update(
+                    harvest_workflow_executions::table
+                        .find(source.id)
+                        .filter(harvest_workflow_executions::state.eq("CONTINUED_AS_NEW")),
+                )
+                .set(harvest_workflow_executions::completed_at.eq(source_completed_at))
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            }
+
+            Ok((
+                RerunOutcome {
+                    exec_id: started.exec_id,
+                    workflow_name: started.workflow_name,
+                    workflow_id: started.workflow_id,
+                    state: started.state,
+                    reran_from: source_exec_id,
+                    source_prior_state,
+                    source_sealed: will_seal,
+                },
+                deferred_starts,
+                deferred_checks,
+                cancel_metrics,
+            ))
+        }))
+        .await?;
+
+    // Post-commit side effects (mirrors `signal_with_start_workflow_execution_with_metrics`):
+    // a rolled-back transaction must never leave trigger workflows started.
+    for start in deferred_starts {
+        start.spawn();
+    }
+    for check in deferred_checks {
+        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
+    }
+    if let Some(m) = metrics {
+        for (wf_name, q_name) in cancel_metrics {
+            crate::telemetry::emit_workflow_terminal(
+                m,
+                &wf_name,
+                &q_name,
+                crate::telemetry::WorkflowStatus::Cancelled,
+            );
+        }
+    }
+
+    Ok(outcome)
+}
+
 /// Pick the policy `start_or_load_workflow_execution` is invoked with, given
 /// the caller's requested policy and the current prior-run state. For
 /// signal-with-start, `AllowDuplicate` and `AllowDuplicateFailedOnly` are
@@ -6571,5 +6947,35 @@ mod triage_tests {
         assert_eq!(patch.owner, None);
         assert_eq!(patch.severity, None);
         assert_eq!(patch.note, None);
+    }
+
+    /// Issue #777 AC2: the re-runnable source-state set must EXCLUDE
+    /// `CONTINUED_AS_NEW`. It is deliberately NOT `erase::TERMINAL_STATES`,
+    /// which includes it — re-running a chain predecessor would duplicate the
+    /// work its successor is already doing (or has already done).
+    #[test]
+    fn rerunnable_source_states_exclude_continued_as_new() {
+        assert!(
+            !RERUNNABLE_SOURCE_STATES.contains(&"CONTINUED_AS_NEW"),
+            "a continued-as-new source must not be re-runnable (issue #777)"
+        );
+        assert_eq!(
+            RERUNNABLE_SOURCE_STATES.len(),
+            5,
+            "exactly the five genuinely-finished terminal states are re-runnable"
+        );
+        for state in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "TERMINATED"] {
+            assert!(
+                RERUNNABLE_SOURCE_STATES.contains(&state),
+                "{state} must be re-runnable"
+            );
+        }
+        // Non-terminal states are never re-runnable.
+        for state in ["RUNNING", "PAUSED"] {
+            assert!(
+                !RERUNNABLE_SOURCE_STATES.contains(&state),
+                "{state} is not terminal and must not be re-runnable"
+            );
+        }
     }
 }

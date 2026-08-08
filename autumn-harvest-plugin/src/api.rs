@@ -2070,6 +2070,24 @@ struct TerminateWorkflowResponse {
     failed_task_count: usize,
 }
 
+/// Response for `POST /workflows/{id}/rerun` (issue #777).
+///
+/// Deliberately carries NO `input` field: the payload may be sensitive, and a
+/// re-run response has no reason to echo it back.
+#[derive(Debug, Serialize)]
+struct RerunWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+    /// The source execution this run was re-run from.
+    reran_from: String,
+    /// The source's terminal state observed BEFORE any sealing — the only
+    /// surviving record once the source is sealed to `CONTINUED_AS_NEW`.
+    source_prior_state: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PauseWorkflowResponse {
     ok: bool,
@@ -2617,6 +2635,20 @@ struct CancelWorkflowRequest {
 #[derive(Debug, Default, Deserialize)]
 struct TerminateWorkflowRequest {
     reason: Option<String>,
+}
+
+/// Optional body for `POST /workflows/{id}/rerun` (issue #777).
+///
+/// `input` is `Option<Value>` deliberately: an ABSENT field means "clone the
+/// source's stored input verbatim", while an explicit JSON `null` IS a real
+/// override that replaces the clone with `null`. A bare `Value` could not
+/// distinguish the two.
+#[derive(Debug, Default, Deserialize)]
+struct RerunWorkflowRequest {
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    workflow_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4428,6 +4460,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(terminate_workflow).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/rerun",
+            post(rerun_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
         )
@@ -5418,6 +5454,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/update-with-start"),
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/terminate"),
+        ("POST", "/workflows/{id}/rerun"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("PATCH", "/workflows/{id}/triage"),
@@ -5698,6 +5735,11 @@ pub const fn management_api_request_fields()
         ),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
         ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/rerun",
+            Some(&["input", "workflow_id"]),
+        ),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         (
@@ -6273,6 +6315,19 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_terminated",
                 "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/rerun",
+            Some(&[
+                "ok",
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "reran_from",
+                "source_prior_state",
             ]),
         ),
         (
@@ -18558,6 +18613,309 @@ async fn terminate_workflow(
                     failed_task_count: terminated.failed_task_count,
                 }),
             ))
+        }
+    }
+}
+
+/// `POST /workflows/{id}/rerun` — operator re-run of a terminal workflow
+/// (issue #777).
+///
+/// Starts a BRAND-NEW execution from the source run's recorded start
+/// parameters. Admin-only, audited under [`OP_WORKFLOW_RERUN`] against the
+/// SOURCE execution id. The response never echoes the input payload.
+#[allow(clippy::too_many_lines)] // mirrors the start route's validation ladder
+async fn rerun_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    // Optional body (the contract marks it `required: false`). Raw `Bytes`
+    // rather than `Option<Json<…>>`: axum 0.8's optional-JSON extractor still
+    // rejects a zero-byte body sent with `Content-Type: application/json`, so a
+    // body-less re-run would 422 before the defaulted path runs.
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let (actor, source_kind, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/rerun";
+
+    // Best-effort failed-audit helper: a rejection must still leave a trail.
+    let audit_failed = |target: Option<String>, summary: String| {
+        let api_state = api_state.clone();
+        let actor = actor.clone();
+        let source_kind = source_kind.clone();
+        let request_id = request_id.clone();
+        async move {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_RERUN,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: target.as_deref(),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some(summary.as_str()),
+                    shard_id: None,
+                    source: &source_kind,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+        }
+    };
+
+    let request: RerunWorkflowRequest = if body.is_empty() {
+        RerunWorkflowRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                audit_failed(Some(id.clone()), "malformed JSON body".to_string()).await;
+                return AutumnError::bad_request_msg(format!("invalid JSON body: {e}"))
+                    .into_response();
+            }
+        }
+    };
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            audit_failed(Some(id.clone()), "malformed execution id".to_string()).await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let source = match load_execution(&mut conn, exec_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            audit_failed(Some(exec_id_str.clone()), "execution not found".to_string()).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // Fail closed if the runtime is not installed (the boot window).
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // The workflow type must still be registered on this node — otherwise the
+    // fresh run would immediately wedge in HandlerNotFound replay failure.
+    if !runtime.registry.workflows.contains_key(&source.workflow_name) {
+        audit_failed(
+            Some(exec_id_str.clone()),
+            "workflow type not registered".to_string(),
+        )
+        .await;
+        return AutumnError::not_found_msg(format!(
+            "workflow type '{}' is not registered on this node",
+            source.workflow_name
+        ))
+        .into_response();
+    }
+
+    if runtime.is_registered_dag(&source.workflow_name) {
+        audit_failed(
+            Some(exec_id_str.clone()),
+            "registered DAG cannot be re-run via workflow route".to_string(),
+        )
+        .await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{}' is a registered DAG; use POST /dags/{}/trigger or the \
+             DAG retry route instead",
+            source.workflow_name, source.workflow_name
+        ))
+        .into_response();
+    }
+
+    // The EFFECTIVE input decides key resolution for every policy below.
+    let effective_input = request
+        .input
+        .clone()
+        .unwrap_or_else(|| source.input.clone());
+
+    // Deferred-start policies are incompatible with a re-run: they admit the
+    // start without creating an execution, so there is no execution_id to
+    // return and the 201 contract cannot be honoured.
+    let deferred_reason = if workflow_has_resolving_debounce(
+        &runtime.registry,
+        &source.workflow_name,
+        &effective_input,
+    ) {
+        Some("debounce")
+    } else if workflow_resolving_throttle(
+        &runtime.registry,
+        &source.workflow_name,
+        &effective_input,
+    )
+    .is_some()
+    {
+        Some("throttle")
+    } else if runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.batch.as_ref())
+        .is_some_and(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(&policy.key_expr, &effective_input)
+                .is_some()
+        }) {
+        Some("batch")
+    } else {
+        None
+    };
+    if let Some(kind) = deferred_reason {
+        audit_failed(
+            Some(exec_id_str.clone()),
+            format!("workflow carries a {kind} policy; re-run is unsupported"),
+        )
+        .await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{}' carries a {kind} policy, which defers the start and returns no \
+             execution id; re-run cannot honour its contract. Start it explicitly via \
+             POST /workflows/{}/start instead.",
+            source.workflow_name, source.workflow_name
+        ))
+        .into_response();
+    }
+
+    // Effective input cap (issue #252): a per-workflow cap RAISES the global.
+    let effective_wf_cap = runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.max_input_bytes)
+        .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(runtime.registry.max_workflow_input_bytes)
+        });
+
+    // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                policy.key_expr,
+                &effective_input,
+            );
+            (key, Some(policy.limit))
+        });
+
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        Arc::clone(&runtime.registry.telemetry().metrics);
+
+    let rerun_request = autumn_harvest::execution::RerunRequest {
+        input_override: request.input.clone(),
+        workflow_id_override: request.workflow_id.as_deref(),
+        started_by: Some(actor.as_str()),
+        concurrency_key,
+        concurrency_limit,
+        max_workflow_input_bytes: effective_wf_cap,
+        max_execution_timeout_ceiling: api_state
+            .max_workflow_execution_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_chain_timeout_ceiling: api_state
+            .max_workflow_chain_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+        trace_context: runtime.registry.telemetry().capture_trace_context(),
+    };
+
+    let result = autumn_harvest::execution::rerun_workflow_execution(
+        &mut conn,
+        exec_id,
+        rerun_request,
+        Some(metrics_ref.as_ref()),
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            // Best-effort success audit (matches the pause / erase posture:
+            // the re-run is already durable, so an audit-write failure must not
+            // fail the response).
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_RERUN,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(source.shard_id),
+                source: &source_kind,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                axum::http::StatusCode::CREATED,
+                Json(RerunWorkflowResponse {
+                    ok: true,
+                    execution_id: outcome.exec_id.to_string(),
+                    workflow_name: outcome.workflow_name,
+                    workflow_id: outcome.workflow_id,
+                    state: outcome.state,
+                    reran_from: outcome.reran_from.to_string(),
+                    source_prior_state: outcome.source_prior_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            audit_failed(
+                Some(exec_id_str.clone()),
+                format!("admission blocked by gate {gate_id}"),
+            )
+            .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response()
+        }
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => {
+            audit_failed(
+                Some(exec_id_str.clone()),
+                "target workflow_id already exists".to_string(),
+            )
+            .await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(AlreadyExistsResponse {
+                    existing_execution_id: existing_exec_id.to_string(),
+                    existing_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(e @ HarvestError::Config(_)) => {
+            let msg = e.to_string();
+            audit_failed(Some(exec_id_str.clone()), msg).await;
+            conflict_from(e).into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            audit_failed(Some(exec_id_str.clone()), msg).await;
+            map_error(e).into_response()
         }
     }
 }
