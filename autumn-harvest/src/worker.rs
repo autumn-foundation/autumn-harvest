@@ -26,7 +26,8 @@ use crate::completion_trigger::DeferredTriggerStart;
 #[cfg(feature = "db")]
 use crate::context::TransactionalState;
 use crate::context::{
-    ActivityContext, SharedState, WorkflowCommand, WorkflowHistoryPolicy, empty_shared_state,
+    ActivityContext, ActivityIdentity, SharedState, WorkflowCommand, WorkflowHistoryPolicy,
+    empty_shared_state,
 };
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
@@ -2673,6 +2674,50 @@ async fn persist_external_signal_inline(
     Ok(new_events)
 }
 
+/// The owning run's identity, read off the execution row the caller already
+/// loaded (issue #783) — no extra query.
+///
+/// A named struct rather than a `(&str, &str)` tuple: `workflow_id` and
+/// `workflow_type` are both plain strings on the same row, so a positional
+/// transposition would type-check silently and mislabel the owning run in every
+/// log line and idempotency key this feature exists to produce.
+#[derive(Debug, Clone, Copy)]
+struct OwningRun<'a> {
+    /// The run's business-level workflow identifier
+    /// (`harvest_workflow_executions.workflow_id`).
+    workflow_id: &'a str,
+    /// The run's logical workflow type
+    /// (`harvest_workflow_executions.workflow_name`).
+    workflow_type: &'a str,
+}
+
+/// The wall-clock budget a **workflow** task dispatch actually gets (issue
+/// #494).
+///
+/// `Duration::ZERO` disables the feature. Otherwise the configured
+/// `workflow_task_timeout` is raised to at least
+/// `max_local_activity_start_to_close`: local activities execute **inline**
+/// inside the workflow task, so a budget below the local cap would kill a
+/// workflow that is legitimately waiting on an in-progress local activity.
+///
+/// That `max` is load-bearing for issue #783's local-activity
+/// [`ActivityContext::deadline`]: a local attempt reports `now +
+/// per_attempt_timeout`, itself clamped to `max_local_activity_start_to_close`,
+/// so on any config this keeps the enclosing budget from being the *shorter*
+/// clock (on stock defaults, `max(10s, 60s) = 60s` against a 60s local cap).
+/// It does **not** make the enclosing budget strictly longer than the reported
+/// deadline in every case — see the "Local activities" caveat on
+/// [`ActivityContext::deadline`].
+const fn effective_workflow_task_timeout(configured: Duration, local_cap: Duration) -> Duration {
+    if configured.is_zero() {
+        Duration::ZERO
+    } else if configured.as_nanos() >= local_cap.as_nanos() {
+        configured
+    } else {
+        local_cap
+    }
+}
+
 /// Run a local activity inline, appending durability events to `harvest_events`.
 ///
 /// Retries the handler up to `max_attempts` times (per the retry policy),
@@ -2690,9 +2735,12 @@ async fn run_local_activity_inline(
     max_start_to_close: Duration,
     next_event_id: &mut i32,
     context_headers: std::sync::Arc<std::collections::HashMap<String, String>>,
-    // Owning workflow task queue, used only as the `queue` label on the
-    // contained-local-activity-panic metric (issue #782).
+    // Owning workflow task queue, used as the `queue` label on the
+    // contained-local-activity-panic metric (issue #782) and reported by
+    // `ActivityContext::queue_name()` (issue #783) — a local activity runs on
+    // the owning workflow task, so it has no queue of its own.
     queue_name: &str,
+    owner: OwningRun<'_>,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -2827,14 +2875,43 @@ async fn run_local_activity_inline(
     let invocation = crate::interceptor::ActivityInvocation::new(&run.name, true, queue_name);
 
     for attempt in start_attempt..=max_attempts {
-        let ctx =
-            ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
-                .with_context_headers(std::sync::Arc::clone(&context_headers))
-                .with_metrics(registry.telemetry().metrics.clone())
-                .with_idempotency_key(local_idempotency_key.clone())
-                .with_attempt(attempt)
-                .with_max_attempts(max_attempts)
-                .with_previous_failure(previous_failure.clone());
+        // Issue #783: the per-attempt deadline is `now + per_attempt_timeout` —
+        // the same budget the per-attempt `tokio::time::timeout` below enforces.
+        // `per_attempt_timeout` is already clamped to
+        // `WorkerConfig::max_local_activity_start_to_close`, so an unset (or
+        // above-cap) `start_to_close` reports the cap, per AC5.
+        //
+        // It is NOT the only clock, though: the whole workflow-task dispatch is
+        // wrapped in `effective_workflow_task_timeout(..)` (issue #494), which
+        // starts at the top of the decision cycle rather than here. That `max`
+        // keeps the enclosing budget from being the shorter clock outright, but
+        // cycle time spent BEFORE this attempt (history load, earlier commands,
+        // a previous attempt of this same local activity) is charged to it and
+        // not to us — so a late attempt can out-live the enclosing budget.
+        // Documented on `ActivityContext::deadline`; deliberately not clamped
+        // here, since the cycle-start instant is not threaded into this path.
+        let attempt_deadline = chrono::Duration::from_std(per_attempt_timeout)
+            .ok()
+            .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
+        let ctx = ActivityContext::new_local_activity(
+            registry.shared_state(),
+            CancellationToken::new(),
+            ActivityIdentity::new(
+                exec_id,
+                owner.workflow_id,
+                owner.workflow_type,
+                run.name.clone(),
+                run.activity_id,
+            ),
+        )
+        .with_queue_name(queue_name.to_string())
+        .with_deadline(attempt_deadline)
+        .with_context_headers(std::sync::Arc::clone(&context_headers))
+        .with_metrics(registry.telemetry().metrics.clone())
+        .with_idempotency_key(local_idempotency_key.clone())
+        .with_attempt(attempt)
+        .with_max_attempts(max_attempts)
+        .with_previous_failure(previous_failure.clone());
         // Issue #782: contain a local-activity handler panic. Local activities
         // run inline in the workflow task, so an uncaught panic here would
         // unwind the whole workflow-task dispatch. Catch it and flatten into a
@@ -3374,16 +3451,31 @@ fn pending_activity_id_for_task(
     find_pending_scheduled_activity(history, activity_name).map(Some)
 }
 
+/// The activity id claimed by [`append_activity_started_if_pending`], plus the
+/// owning workflow's identity read off the row that call already locks.
+///
+/// The `SELECT ... FOR UPDATE` behind the append loads the full
+/// [`WorkflowExecution`] row regardless, so surfacing `workflow_id` /
+/// `workflow_name` here costs no extra query — it is what lets
+/// `ActivityContext::info()` (issue #783) report the owning workflow's identity
+/// without the dispatch path growing a lookup.
+struct StartedActivity {
+    activity_id: ActivityExecId,
+    workflow_id: String,
+    workflow_name: String,
+}
+
 async fn append_activity_started_if_pending(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
     activity_name: &str,
     worker_id: &str,
-) -> HarvestResult<Option<ActivityExecId>> {
+) -> HarvestResult<Option<StartedActivity>> {
     Box::pin(
-        conn.transaction::<Option<ActivityExecId>, HarvestError, _>(async |conn| {
-            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+        conn.transaction::<Option<StartedActivity>, HarvestError, _>(async |conn| {
+            let (execution, history) =
+                lock_workflow_execution_row_and_load_history(conn, exec_id).await?;
             let Some(activity_id) =
                 pending_activity_id_for_task(&history.events, task, activity_name)?
             else {
@@ -3401,7 +3493,11 @@ async fn append_activity_started_if_pending(
                 worker_id: WorkerId::new(worker_id),
             };
             store::append_events(conn, exec_id, &[started_event], history.next_event_id).await?;
-            Ok(Some(activity_id))
+            Ok(Some(StartedActivity {
+                activity_id,
+                workflow_id: execution.workflow_id,
+                workflow_name: execution.workflow_name,
+            }))
         }),
     )
     .await
@@ -8367,12 +8463,13 @@ async fn process_activity_task(
     // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
-    let activity_id = {
+    let started = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result =
             append_activity_started_if_pending(&mut conn, task, exec_id, activity_name, worker_id)
                 .await;
-        let Some(id) = fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
+        let Some(started) =
+            fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
         else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
@@ -8399,9 +8496,10 @@ async fn process_activity_task(
             }
             return Ok(());
         };
-        id
+        started
         // conn is dropped here, returning the slot to the pool
     };
+    let activity_id = started.activity_id;
 
     // Schedule-to-start latency (issue #501): record here, once the activity has
     // genuinely started (ActivityStarted appended). This is *past* the
@@ -8494,6 +8592,15 @@ async fn process_activity_task(
             || std::sync::Arc::new(std::collections::HashMap::new()),
             std::sync::Arc::new,
         );
+    // Issue #783: identity is resolved from the row `append_activity_started_if_pending`
+    // already locked (no extra query) plus the claimed task row.
+    let activity_identity = ActivityIdentity::new(
+        exec_id,
+        started.workflow_id,
+        started.workflow_name,
+        activity_name.to_string(),
+        activity_id,
+    );
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx),
@@ -8501,7 +8608,18 @@ async fn process_activity_task(
         cancel.clone(),
         task.id,
         pool.clone(),
+        activity_identity,
     )
+    .with_queue_name(task.queue_name.clone())
+    // The attempt deadline is the earliest of this attempt's `start_to_close`
+    // budget and the activity's cross-retry `schedule_to_close` deadline
+    // (issue #378) — the scanner kills a RUNNING row on either, so reporting
+    // only the per-attempt budget would over-report the time available.
+    .with_deadline(crate::context::attempt_deadline(
+        task.started_at,
+        task.start_to_close,
+        task.schedule_to_close_at,
+    ))
     .with_trace_context(trace_carrier.clone())
     .with_context_headers(activity_context_headers)
     // Issue #682: surface the activity's heartbeat timeout so a handler can
@@ -8549,7 +8667,13 @@ async fn process_activity_task(
         { ATTR_ATTEMPT } = task.attempt,
         { ATTR_QUEUE } = %task.queue_name,
     );
-    let started_at = std::time::Instant::now();
+    // Monotonic clock for this attempt's duration metric and the WASM
+    // start-to-close anchor. Deliberately NOT named `started_at`: that name
+    // belongs to `task.started_at`, the wall-clock `TIMESTAMPTZ` the
+    // start-to-close *scanner* compares against and the anchor
+    // `ctx.deadline()` is derived from (issue #783). Conflating the two would
+    // silently disagree with the mechanism that actually kills the attempt.
+    let attempt_clock_start = std::time::Instant::now();
 
     // Issue #782: wrap the activity handler in a panic-containing value adapter.
     // A caught panic is flattened into the existing `Result<Value, String>` Err
@@ -8617,11 +8741,11 @@ async fn process_activity_task(
                         // whole pre-guest interval — resolution (this checkout +
                         // active-hash lookup + cold-cache byte fetch) plus compile
                         // — against the guest deadline, not just compile (issue
-                        // #965 review round 7). `started_at` was captured above,
+                        // #965 review round 7). `attempt_clock_start` was captured above,
                         // just before this dispatch resolution began, so it
                         // aligns with the start-to-close clock that started when
                         // `ActivityStarted` was recorded.
-                        started_at,
+                        attempt_clock_start,
                     )
                     .await
                     // `conn` is dropped at the end of this arm, before the guest runs.
@@ -8787,7 +8911,7 @@ async fn process_activity_task(
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
 
-    let duration_secs = started_at.elapsed().as_secs_f64();
+    let duration_secs = attempt_clock_start.elapsed().as_secs_f64();
     let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
@@ -11892,6 +12016,10 @@ async fn process_workflow_task(
                     &mut next_event_id,
                     local_context_headers,
                     &task.queue_name,
+                    OwningRun {
+                        workflow_id: prepared.execution.workflow_id.as_str(),
+                        workflow_type: prepared.execution.workflow_name.as_str(),
+                    },
                 )
                 .await
                 {
@@ -16411,21 +16539,11 @@ impl Worker {
         let workflow_cache = Arc::clone(&self.workflow_cache);
 
         // Workflow-task timeout (issue #494): only apply to workflow tasks.
-        // Local activities execute inline inside the workflow task, so the
-        // effective budget must be at least as large as
-        // max_local_activity_start_to_close to avoid prematurely killing a
-        // workflow that is legitimately waiting for an in-progress local
-        // activity.  When workflow_task_timeout is 0 the feature is disabled.
         let workflow_task_timeout = match kind {
-            ClaimedTaskKind::Workflow => {
-                if self.config.workflow_task_timeout.is_zero() {
-                    Duration::ZERO
-                } else {
-                    self.config
-                        .workflow_task_timeout
-                        .max(self.config.max_local_activity_start_to_close)
-                }
-            }
+            ClaimedTaskKind::Workflow => effective_workflow_task_timeout(
+                self.config.workflow_task_timeout,
+                self.config.max_local_activity_start_to_close,
+            ),
             ClaimedTaskKind::Activity => Duration::ZERO,
         };
         let poison_pill_threshold = self.config.poison_pill_threshold;
@@ -17997,6 +18115,48 @@ mod tests {
         assert_eq!(
             latest_current_details_update(&cmds),
             CurrentDetailsUpdate::Clear
+        );
+    }
+
+    /// Issue #783: the enclosing workflow-task budget must never be the shorter
+    /// clock than a local activity's reported deadline, which is itself clamped
+    /// to `max_local_activity_start_to_close`. On stock defaults (10s task
+    /// timeout vs a 60s local cap) that means the raise is load-bearing — drop
+    /// the `max` and every default-config local activity would report ~60s
+    /// remaining against a real ~10s cut-off, the destructive direction.
+    #[test]
+    fn effective_workflow_task_timeout_is_never_below_the_local_activity_cap() {
+        let stock_task_timeout = Duration::from_secs(10);
+        let stock_local_cap = Duration::from_secs(60);
+        assert_eq!(
+            effective_workflow_task_timeout(stock_task_timeout, stock_local_cap),
+            stock_local_cap,
+            "a task timeout below the local cap must be raised to the cap"
+        );
+
+        // Already above the cap: left alone.
+        assert_eq!(
+            effective_workflow_task_timeout(Duration::from_secs(120), stock_local_cap),
+            Duration::from_secs(120)
+        );
+        // Exactly equal: left alone (no off-by-one raise).
+        assert_eq!(
+            effective_workflow_task_timeout(stock_local_cap, stock_local_cap),
+            stock_local_cap
+        );
+        // Zero disables the feature entirely — never raised to the cap.
+        assert_eq!(
+            effective_workflow_task_timeout(Duration::ZERO, stock_local_cap),
+            Duration::ZERO,
+            "a zero task timeout disables the budget; raising it would enable it"
+        );
+        // Sub-second precision is preserved (no truncation to whole seconds).
+        assert_eq!(
+            effective_workflow_task_timeout(
+                Duration::from_millis(1500),
+                Duration::from_millis(500)
+            ),
+            Duration::from_millis(1500)
         );
     }
 

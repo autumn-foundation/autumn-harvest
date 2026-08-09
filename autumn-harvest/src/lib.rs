@@ -301,11 +301,11 @@ pub use completion_trigger::{
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
 };
 pub use context::{
-    ActivityContext, AutoHeartbeatGuard, DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION,
-    DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard,
-    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
-    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
-    is_reserved_session_activity_name,
+    ActivityContext, ActivityExecutionInfo, ActivityIdentity, AutoHeartbeatGuard,
+    DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
+    DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard, MutexHandle, RaceBuilder, RaceWinner, Session,
+    SessionOptions, TimerHandle, TimerOutcome, WorkflowCommand, WorkflowContext,
+    WorkflowExecutionInfo, WorkflowHistoryPolicy, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{
