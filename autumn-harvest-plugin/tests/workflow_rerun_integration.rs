@@ -38,7 +38,7 @@ use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -574,7 +574,7 @@ async fn tasks_of(conn: &mut AsyncPgConnection, exec_id: &str) -> Vec<TaskRow> {
     .expect("load tasks")
 }
 
-#[derive(diesel::QueryableByName)]
+#[derive(diesel::QueryableByName, Debug)]
 struct AuditRow {
     #[diesel(sql_type = Text)]
     actor: String,
@@ -602,6 +602,289 @@ fn unique(prefix: &str) -> String {
 
 fn rerun_uri(exec_id: &str) -> String {
     format!("/workflows/{exec_id}/rerun")
+}
+
+// ── Multi-shard harness (Codex review, PR #1152) ────────────────────────────
+//
+// A second, fully-migrated shard database on the SAME Postgres server as
+// `admin_url`, mirroring `lineage_tree_integration.rs`'s multi-shard harness.
+// Every other test in this file is single-shard; these helpers are additive
+// and touch nothing the rest of the suite depends on.
+
+/// Admin URL of a Postgres that can `CREATE DATABASE`, plus a keep-alive guard.
+async fn setup_shard_server() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres container should start");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    (url, Some(container))
+}
+
+/// Create a fresh, fully-migrated database off `admin_url` and return its URL.
+async fn create_shard_db(admin_url: &str, name: &str) -> String {
+    let mut admin = AsyncPgConnection::establish(admin_url)
+        .await
+        .expect("connect to admin database");
+    let _ = diesel::sql_query(format!("CREATE DATABASE \"{name}\""))
+        .execute(&mut admin)
+        .await;
+    let (prefix, _) = admin_url
+        .rsplit_once('/')
+        .expect("url has a database segment");
+    let url = format!("{prefix}/{name}");
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to fresh shard database");
+    let bundle = String::from_utf8(init_sql()).expect("migration bundle is utf-8");
+    conn.batch_execute(&bundle)
+        .await
+        .expect("apply migration bundle");
+    url
+}
+
+fn two_shard_router() -> ShardRouter {
+    let shards = vec![
+        autumn_harvest::types::ShardId::new(0),
+        autumn_harvest::types::ShardId::new(1),
+    ];
+    ShardRouter::new(
+        shards.clone(),
+        shards,
+        autumn_harvest::types::ShardId::new(0),
+    )
+}
+
+fn build_multi_shard_app(
+    pool0: &DbPool,
+    pool1: &DbPool,
+    infos: Vec<WorkflowInfo>,
+) -> HarvestApiApp {
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(autumn_harvest::types::ShardId::new(0), pool0.clone());
+    pools.insert(autumn_harvest::types::ShardId::new(1), pool1.clone());
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(
+        autumn_harvest::shard::ShardedDbPool::from_map(
+            pools,
+            autumn_harvest::types::ShardId::new(0),
+        ),
+    ));
+    let registry = HandlerRegistry::new(infos, vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("rerun-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        two_shard_router(),
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Seed a terminal (COMPLETED) source directly on shard 0's connection, with
+/// an explicitly shard-0-encoded exec id (`ExecutionId::new_for_shard`)
+/// rather than relying on the table's default UUID generator, whose shard
+/// bits would be effectively random.
+async fn seed_terminal_on_shard0(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> String {
+    let exec_id =
+        autumn_harvest::types::ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
+    let now = Utc::now();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (id, workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
+             queue_name)
+         VALUES ($1, $2, $3, 0, 'COMPLETED', $4, $5, $5, 'default')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Jsonb, _>(json!({}))
+    .bind::<Timestamptz, _>(now)
+    .execute(conn)
+    .await
+    .expect("insert execution");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data)
+         VALUES ($1, 0, 'WorkflowStarted',
+                 '{\"type\":\"WorkflowStarted\",\"data\":{\"input\":{},\"timestamp\":\"2026-01-01T00:00:00Z\"}}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("insert event");
+
+    exec_id.to_string()
+}
+
+/// Codex review finding (PR #1152, P1): `rerun_workflow_execution` always
+/// minted the new execution's id on `source.shard_id`, ignoring where
+/// `ShardRouter::pick_for_new_workflow` — the SAME function every ordinary
+/// explicit-`workflow_id` start uses (`api.rs:13162`) — would route the
+/// override. In a multi-shard deployment this could silently create the
+/// override's execution on the WRONG shard: invisible to the override's own
+/// `RejectDuplicate` uniqueness check (which only queries the source's shard
+/// connection) and to by-id addressing (issue #751), which resolves a
+/// `WorkflowId` target's shard via the identical hash. Fixed by rejecting a
+/// `workflow_id` override that hashes to a different shard than the source.
+#[tokio::test]
+async fn rerun_workflow_id_override_that_hashes_to_a_different_shard_is_rejected() {
+    let (admin, _guard) = setup_shard_server().await;
+    let url0 = create_shard_db(&admin, &unique("rerun_x0").replace('-', "_")).await;
+    let url1 = create_shard_db(&admin, &unique("rerun_x1").replace('-', "_")).await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+    let mut conn0 = AsyncPgConnection::establish(&url0)
+        .await
+        .expect("connect shard 0");
+    let mut conn1 = AsyncPgConnection::establish(&url1)
+        .await
+        .expect("connect shard 1");
+
+    let router = two_shard_router();
+    let wf = "rr_xshard_wf";
+    let source_wf_id = unique("rr-xshard-src");
+
+    // Find an override workflow_id the router hashes to a DIFFERENT shard
+    // than the source's (shard 0) — computed via the SAME hashing function
+    // every ordinary start uses, not hand-picked.
+    let override_id = (0..1000)
+        .map(|i| format!("rr-xshard-override-{i}"))
+        .find(|candidate| {
+            router.pick_for_new_workflow(wf, candidate) != autumn_harvest::types::ShardId::new(0)
+        })
+        .expect("a candidate hashing to a different shard exists within 1000 tries");
+
+    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
+
+    let app = build_multi_shard_app(&pool0, &pool1, vec![plain_info(wf)]);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::from(
+                    json!({ "workflow_id": override_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    // `conflict_from` (autumn-web `AutumnError::bad_request_msg`) surfaces
+    // the core's `Config` message under RFC 7807's "detail" key, not
+    // "error" (which is reserved for a handful of hand-built JSON bodies
+    // elsewhere in this file, e.g. the admission-blocked/validation-failure
+    // responses).
+    let msg = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        msg.to_lowercase().contains("shard"),
+        "error should name the shard mismatch: {msg}"
+    );
+
+    // No execution was created for the override key on EITHER physical
+    // database — the whole point of rejecting rather than silently
+    // corrupting the routing invariant.
+    let on_shard0 = load_execs_for_key(&mut conn0, wf, &override_id).await;
+    let on_shard1 = load_execs_for_key(&mut conn1, wf, &override_id).await;
+    assert!(
+        on_shard0.is_empty() && on_shard1.is_empty(),
+        "no execution should exist for the override key on either shard: \
+         shard0={on_shard0:?} shard1={on_shard1:?}"
+    );
+
+    // The source is untouched (state, still COMPLETED — never sealed).
+    let source_row = load_exec(&mut conn0, &source).await;
+    assert_eq!(source_row.state, "COMPLETED");
+
+    // A failed audit row was written.
+    let rows = audit_rows(&mut conn0, "workflow.rerun", &source).await;
+    assert!(
+        rows.iter().any(|r| r.status == "failed"),
+        "expected a failed audit row: {rows:?}"
+    );
+}
+
+/// Regression guard for the fix above: an override that hashes to the SAME
+/// shard as the source must still succeed (the guard must not over-fire on
+/// same-shard overrides, which is the common case even in a multi-shard
+/// deployment).
+#[tokio::test]
+async fn rerun_workflow_id_override_that_hashes_to_the_same_shard_still_succeeds() {
+    let (admin, _guard) = setup_shard_server().await;
+    let url0 = create_shard_db(&admin, &unique("rerun_s0").replace('-', "_")).await;
+    let url1 = create_shard_db(&admin, &unique("rerun_s1").replace('-', "_")).await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+    let mut conn0 = AsyncPgConnection::establish(&url0)
+        .await
+        .expect("connect shard 0");
+
+    let router = two_shard_router();
+    let wf = "rr_sameshard_wf";
+    let source_wf_id = unique("rr-sameshard-src");
+
+    let override_id = (0..1000)
+        .map(|i| format!("rr-sameshard-override-{i}"))
+        .find(|candidate| {
+            router.pick_for_new_workflow(wf, candidate) == autumn_harvest::types::ShardId::new(0)
+        })
+        .expect("a candidate hashing to shard 0 exists within 1000 tries");
+
+    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
+
+    let app = build_multi_shard_app(&pool0, &pool1, vec![plain_info(wf)]);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::from(
+                    json!({ "workflow_id": override_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let new_exec = body["execution_id"].as_str().unwrap().to_string();
+
+    let rows = load_execs_for_key(&mut conn0, wf, &override_id).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one execution under the override key"
+    );
+    assert_eq!(
+        autumn_harvest::types::ExecutionId::from_uuid(uuid::Uuid::parse_str(&new_exec).unwrap())
+            .shard(),
+        autumn_harvest::types::ShardId::new(0),
+        "the new execution must land on the shard the router actually picked"
+    );
 }
 
 // ── R-12 .. R-41 ─────────────────────────────────────────────────────────────
