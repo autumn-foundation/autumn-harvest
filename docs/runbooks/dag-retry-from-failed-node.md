@@ -116,19 +116,27 @@ HTTP 409 Conflict
 (`POST /dags/{dag_name}/trigger`). The unwind already restored the pre-run
 state, so a fresh run is the correct — and safe — recovery.
 
-Detection uses two independent signals, so it only ever fires for a run that
+Detection uses three independent signals, so it only ever fires for a run that
 genuinely unwound:
 
-1. a `saga_compensat*` marker in the run's recorded history, or
-2. a recorded dispatch of one of that DAG's own declared compensator
+1. a `saga_compensat*` marker in the run's recorded history,
+2. a recorded activity dispatch whose **input is a compensation envelope**
+   (`{"dag_compensate": …, "input": …, "output": …}`), or
+3. a recorded dispatch whose **name** is one of that DAG's declared compensator
    activities.
 
-The second signal is load-bearing, not belt-and-braces: a run that received an
+Signals 2 and 3 are load-bearing, not belt-and-braces. A run that received an
 unsolicited signal unwinds **without** recording a marker (see
 [a stray signal silences unwind observability](../saga.md#known-limitation--a-stray-signal-silences-unwind-observability)),
-so a marker-only check would leave that fully rolled-back run retryable. A DAG
-that failed **without** any compensator declared triggers neither signal and
-remains fully retryable, exactly as before.
+so a marker-only check would leave that fully rolled-back run retryable. And
+because this endpoint resolves against the **currently registered** DAG
+definition (see the limitation below), a deployment that renamed or removed a
+compensator after such a run would defeat signal 3 alone — signal 2 reads the
+envelope recorded in history and never consults the registry, so it survives the
+rename.
+
+A DAG that failed **without** any compensator declared triggers none of the
+three and remains fully retryable, exactly as before.
 
 ## Limitation: build-id routing and topology changes
 

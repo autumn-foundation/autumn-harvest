@@ -464,18 +464,29 @@ succeeded upstream nodes — which is exactly the set the unwind just undid. A
 retry would therefore resume as if those side effects still existed and
 double-spend the compensation.
 
-Detection uses **two** independent signals — a `saga_compensat*` marker in the
-run's history, **or** a recorded dispatch of one of that DAG's declared
-compensator activities. The second is required, not redundant: an unwind at a
+Detection uses **three** independent signals:
+
+1. a `saga_compensat*` marker in the run's history;
+2. a recorded activity dispatch whose **input is a compensation envelope** —
+   the reserved `{"dag_compensate": …, "input": …, "output": …}` shape written
+   only by the unwind; or
+3. a recorded dispatch whose **name** is one of that DAG's declared compensator
+   activities.
+
+Signals 2 and 3 are required, not redundant. An unwind at a
 [drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
 records no marker at all, so a marker-only check would leave that fully
-rolled-back run retryable. It is also unambiguous by construction —
+rolled-back run retryable. And the retry endpoint resolves against the
+**currently registered** DAG definition, so a deployment that renamed or removed
+a compensator after such a run would defeat signal 3 on its own — signal 2 reads
+the envelope straight out of recorded history and never consults the registry,
+so it survives the rename. Signal 3 is in turn unambiguous by construction:
 [`CompensatorNameCollidesWithNode`](#build-time-guards) forbids a compensator
 from sharing any forward node's name, so a compensator dispatch can never be
 mistaken for a forward step.
 
 A DAG run that failed **without** compensators (and every pre-#780 history)
-triggers neither signal and stays fully retryable.
+triggers none of the three and stays fully retryable.
 
 ### Divergence *inside* an unwind still nd-blocks
 

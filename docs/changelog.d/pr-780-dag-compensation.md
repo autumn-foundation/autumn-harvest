@@ -574,3 +574,56 @@ That is correct, honest behaviour (continue-not-abort), but it means a
 compensable node running close to the activity-input cap can have its rollback
 rejected. The fixture was restructured to hang the payload off a
 non-compensated node.
+
+### P1 — the marker-less unwind guard was blind to a renamed compensator
+
+A follow-on to the marker-less fix above, and the sharper half of it. The
+retry endpoint hands the resolver the **currently registered** `DagDefinition`,
+not the one that produced the history. So the name-based signal — "an
+`ActivityScheduled` naming one of this DAG's declared compensators" — silently
+stops matching the moment a deployment renames or removes that compensator. A
+run that unwound *without a marker* (the drained-signal-frontier case) and whose
+compensator has since been renamed therefore became retryable again, carrying
+over nodes whose side effects were already rolled back: the exact double-spend
+the guard exists to prevent, re-opened by an ordinary refactor.
+
+The fix is a signal that is **durable and definition-independent**: the
+compensation **envelope**. `unwind_dag_compensations` dispatches every
+compensator with the reserved shape
+
+```json
+{"dag_compensate": "<compensated node>", "input": …, "output": …}
+```
+
+and that envelope is recorded verbatim in the dispatch's own
+`ActivityScheduled.input`. Reading it consults no registry, so it survives any
+rename, removal, or topology change.
+
+`is_compensation_envelope` matches **structurally**, not on mere key presence:
+exactly three keys (`dag_compensate` / `input` / `output`) with a string
+`dag_compensate`. A forward node's input is either the `{conf, dag_task}`
+wrapper, a raw bound upstream output, or a mapped cell — none of that shape. The
+failure direction is safe regardless: a false positive makes a retryable run
+non-retryable (start a fresh run), whereas a false negative is the double-spend.
+
+The name-based signal is **kept** as defence-in-depth: it is unambiguous by
+construction (`CompensatorNameCollidesWithNode`) and would still fire for a
+history predating the envelope shape.
+
+RED evidence (before the fix — a marker-less unwind whose compensator was
+renamed to `undo_a_v1_RENAMED`):
+
+```
+left:  Ok(DagRetryPlan { reset_to_event_id: 2,
+        nodes_to_re_execute: ["b", "c", "d"], nodes_carried_over: ["a"] })
+right: Err(CompensatedRun)
+```
+
+Pinned by `resolve_rejects_a_marker_less_unwind_whose_compensator_was_since_renamed`,
+the near-miss suite `compensation_envelope_predicate_accepts_only_the_real_envelope`
+(2-key subset, 4-key superset, non-string `dag_compensate`, the forward
+`{conf, dag_task}` wrapper, a mapped-cell array, `null`), and the false-positive
+guard `resolve_allows_a_run_whose_forward_inputs_are_plain_objects`. The
+cross-crate coupling is guarded from the other side too: the core suite already
+pins the envelope's exact shape with an `assert_eq!`, so changing it fails there
+loudly rather than silently blinding this detector.
