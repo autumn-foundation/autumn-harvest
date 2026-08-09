@@ -1291,6 +1291,35 @@ enum WorkflowCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Re-run a terminal workflow execution as a brand-new run.
+    ///
+    /// The complement to `reset`: reset forks an execution mid-history so the
+    /// surviving prefix is replayed, whereas a re-run replays nothing — it
+    /// starts the whole workflow over from the source run's recorded start
+    /// parameters (input, queue, memo, search attributes, timeouts, SLA,
+    /// owner/severity, context headers, retry policy, completion callbacks).
+    /// The source must be terminal (`COMPLETED`, `FAILED`, `CANCELLED`,
+    /// `TIMED_OUT`, `TERMINATED`); a `RUNNING`/`PAUSED` or already-sealed
+    /// `CONTINUED_AS_NEW` source is rejected. Admin-only, and NOT idempotent —
+    /// re-running the default way seals the source to `CONTINUED_AS_NEW` to
+    /// free its business key, so a second identical call returns `409`.
+    Rerun {
+        /// Workflow execution ID of the terminal source run.
+        execution_id: String,
+        /// Inline JSON input override for the new run. Omit to clone the
+        /// source's stored input verbatim; required when the source's input
+        /// has been erased.
+        #[arg(long, conflicts_with = "input_file")]
+        input_json: Option<String>,
+        /// File containing the JSON input override. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "input_json")]
+        input_file: Option<PathBuf>,
+        /// Business-key override for the new run. Omit to reuse the source's
+        /// workflow ID, which seals the source to `CONTINUED_AS_NEW`; supplying
+        /// one starts under a different key and leaves the source untouched.
+        #[arg(long)]
+        workflow_id: Option<String>,
+    },
     /// Send a signal to a workflow execution.
     Signal {
         /// Workflow execution ID.
@@ -5728,6 +5757,28 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 Some(Value::Object(body)),
             ))
         }
+        WorkflowCommand::Rerun {
+            execution_id,
+            input_json,
+            input_file,
+            workflow_id,
+        } => {
+            let mut body = Map::new();
+            // `input` is TRI-STATE server-side: absent = clone the source's
+            // stored input verbatim, explicit JSON null = override with null.
+            // So the key is inserted ONLY when the operator actually supplied
+            // one — never defaulted to null to mean "unset".
+            if let Some(input) =
+                parse_json_source(input_json.as_deref(), input_file.as_deref(), "rerun input")?
+            {
+                body.insert("input".to_string(), input);
+            }
+            insert_string(&mut body, "workflow_id", workflow_id.as_deref());
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/rerun", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            ))
+        }
         WorkflowCommand::Signal {
             execution_id,
             signal_name,
@@ -9644,6 +9695,98 @@ mod fail_activity_cli_tests {
         assert!(
             body.get("reason").is_none() || body["reason"].is_null(),
             "omitting --reason must not send the field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rerun_cli_tests {
+    use super::*;
+
+    fn request(args: &[&str]) -> ApiRequest {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn rerun_builds_post_request_with_correct_path() {
+        let req = request(&["workflow", "rerun", "exec-123"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/exec-123/rerun");
+    }
+
+    #[test]
+    fn rerun_bare_sends_empty_object_body() {
+        let req = request(&["workflow", "rerun", "exec-123"]);
+        assert_eq!(
+            req.body,
+            Some(Value::Object(Map::new())),
+            "the body is optional server-side but the CLI sends an empty object"
+        );
+    }
+
+    #[test]
+    fn rerun_without_input_flags_sends_no_input_key() {
+        let req = request(&["workflow", "rerun", "exec-123"]);
+        let body = req.body.as_ref().expect("should have a body");
+        // The server's `input` field is TRI-STATE: absent = clone the source's
+        // stored input verbatim, explicit null = override with null.  Injecting
+        // a null for "the operator did not pass --input-*" would silently wipe
+        // the cloned input, so the key must be ABSENT (not present-and-null).
+        assert!(
+            body.get("input").is_none(),
+            "omitting --input-json/--input-file must send no `input` key at all"
+        );
+    }
+
+    #[test]
+    fn rerun_with_workflow_id_sends_workflow_id_body() {
+        let req = request(&["workflow", "rerun", "exec-123", "--workflow-id", "order-9"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["workflow_id"], "order-9");
+        assert!(
+            body.get("input").is_none(),
+            "--workflow-id alone must not add an `input` key"
+        );
+    }
+
+    #[test]
+    fn rerun_with_inline_input_json_sends_input_body() {
+        let req = request(&[
+            "workflow",
+            "rerun",
+            "exec-123",
+            "--input-json",
+            r#"{"k":1}"#,
+        ]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["input"], serde_json::json!({"k": 1}));
+    }
+
+    #[test]
+    fn rerun_with_explicit_null_input_sends_null_input() {
+        let req = request(&["workflow", "rerun", "exec-123", "--input-json", "null"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert!(
+            body.get("input").is_some(),
+            "an operator-supplied JSON null IS a legitimate override and must be sent"
+        );
+        assert_eq!(body["input"], Value::Null);
+    }
+
+    #[test]
+    fn rerun_path_encodes_the_execution_id() {
+        let req = request(&["workflow", "rerun", "exec 123/../x"]);
+        assert!(
+            !req.path.contains("../"),
+            "execution id must be path-encoded, got {}",
+            req.path
+        );
+        assert_eq!(
+            req.path,
+            format!("/workflows/{}/rerun", path_segment("exec 123/../x"))
         );
     }
 }
