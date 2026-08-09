@@ -4593,7 +4593,8 @@ pub struct RerunOutcome {
 /// ## Cloned from the source row
 ///
 /// Input (unless overridden), queue, memo, search attributes (minus the six
-/// replay-non-determinism diagnostic keys, issue #603), execution timeout,
+/// replay-non-determinism diagnostic keys, issue #603, and dropped entirely when
+/// the source was PII-erased, issue #495), execution timeout,
 /// chain timeout, SLA, `owner`/`runbook_url`/`severity`, context headers, workflow
 /// retry policy, and completion callbacks. The input is passed VERBATIM and is
 /// never decoded — the stored bytes are byte-for-byte what the original start
@@ -4619,13 +4620,39 @@ pub struct RerunOutcome {
 /// forensic information beyond the state string, which is returned as
 /// [`RerunOutcome::source_prior_state`].
 ///
+/// A **schedule-attributed** source (`schedule_id IS NOT NULL`) may NOT be
+/// sealed: `CONTINUED_AS_NEW` falls outside `resolve_carryover`'s state sets, so
+/// sealing the most recent slot would roll the next fire's incremental cursor
+/// backward (issue #488) and deflate the schedule's success ratio (issue #534).
+/// Such a source is rejected with [`HarvestError::Config`]; re-run it under an
+/// explicit `workflow_id` override, which never seals.
+///
+/// ## Lock ordering
+///
+/// This is the only primitive that locks TWO execution rows, and it does so in
+/// **source-PK order first, then business-key-occupant order**: the source row
+/// is taken `FOR UPDATE` by primary key (step 1), and only then is the current
+/// holder of the target `workflow_id` locked (step 4). Two concurrent re-runs of
+/// the SAME source serialize correctly on the first lock — the loser observes
+/// the sealed `CONTINUED_AS_NEW` state and is rejected rather than double-starting.
+///
+/// The one contrived ABBA window is two concurrent re-runs that cross-reference
+/// each other's `workflow_id` override (A's source is B's target key and vice
+/// versa). Postgres self-heals that via `deadlock_timeout`, aborting one side —
+/// which surfaces as a `Database` error (500) the operator simply retries. It is
+/// not prevented by construction because no total order over the two rows exists
+/// without a lookup that would itself need a lock. Compare the per-table
+/// conventions documented in `timeout.rs`.
+///
 /// ## Errors
 ///
 /// - [`HarvestError::NotFound`] when `source_exec_id` does not exist.
 /// - [`HarvestError::Config`] (a 409-shaped state conflict) when the source is
 ///   non-terminal, is `CONTINUED_AS_NEW`, has an erased input (issue #495) and
-///   no explicit override was supplied, or the target business key is held by a
-///   different live execution.
+///   no explicit override was supplied, is schedule-attributed and would need to
+///   be sealed (see above), the target business key is held by a different live
+///   execution, or a stored `context_headers` / `workflow_retry_policy` value
+///   cannot be parsed (a faithful clone must never silently drop a field).
 /// - [`HarvestError::AlreadyExists`] when a `workflow_id` override collides with
 ///   a live execution.
 /// - [`HarvestError::AdmissionBlocked`] when an active gate blocks the start.
@@ -4733,6 +4760,33 @@ pub async fn rerun_workflow_execution(
                 (WorkflowIdReusePolicy::RejectDuplicate, false)
             };
 
+            // 4b. A schedule-attributed source may NOT be sealed (issues #488 /
+            // #534). `replace_execution` sets only `state` + `completed_at`, so
+            // the sealed row keeps its `schedule_id`/`scheduled_for` while its
+            // state becomes `CONTINUED_AS_NEW` — a state in NEITHER of
+            // `resolve_carryover`'s sets. The next scheduled fire would then
+            // resolve `last_completion_result` from the PRIOR slot, rolling an
+            // incremental cursor BACKWARD, and `schedule_run_state_summary`
+            // would silently move the slot out of `succeeded`, deflating the
+            // cadence success ratio. The `workflow_id`-override path does not
+            // seal and stays fully available (its new run carries
+            // `schedule_id: None`, matching the reset-fork precedent that
+            // operator interventions are excluded from scheduled carryover).
+            if will_seal && source.schedule_id.is_some() {
+                return Err(HarvestError::Config(format!(
+                    "source execution {source_exec_id} is schedule-attributed (schedule {}, \
+                     slot {}); sealing it would break the schedule's carryover and \
+                     run-history lineage — re-run with an explicit workflow_id override \
+                     instead",
+                    source
+                        .schedule_id
+                        .map_or_else(|| "?".to_string(), |s| s.to_string()),
+                    source
+                        .scheduled_for
+                        .map_or_else(|| "?".to_string(), |s| s.to_rfc3339()),
+                )));
+            }
+
             // 5. Capture the pre-seal forensic values BEFORE the start path can
             // overwrite them: the state string is otherwise lost to the seal, and
             // `replace_execution` stamps `completed_at = now()`.
@@ -4740,17 +4794,63 @@ pub async fn rerun_workflow_execution(
             let source_completed_at = source.completed_at;
             let source_exec_id_str = source_exec_id.to_string();
 
+            // issue #495 interaction: `erase_workflow_payloads` tombstones the
+            // `memo` and `search_attrs` columns to `{"_harvest_erased": true}`
+            // as well as `input`. The erasure gate in step 3 inspects only
+            // `input` and is skipped entirely when an override is supplied, so
+            // without this a re-run-with-override of an erased source would
+            // clone those tombstones verbatim onto a fresh, NEVER-erased run —
+            // polluting `?search_attr=` filtering and misleading compliance
+            // tooling into believing the new run had been erased. Drop them.
+            // (`context_headers` is NULLed rather than tombstoned by the row
+            // scrub, so it needs no equivalent test.)
+            let source_memo = source
+                .memo
+                .clone()
+                .filter(|v| !crate::erase::is_erasure_tombstone(v));
+
             // Strip the six replay-non-determinism diagnostic keys (issue #603):
             // a re-run has never diverged, so it must not display a phantom
             // "blocked" reason inherited from the source. Guarded on `Some` so a
             // source with no search_attrs does not gain a stray `{}`.
-            let rerun_search_attrs = source.search_attrs.as_ref().map(|_| {
-                crate::worker::apply_raw_search_attrs_patch_in_memory(
-                    source.search_attrs.clone(),
-                    &crate::worker::nd_search_attrs_clear_patch(),
-                )
-                .unwrap_or_default()
-            });
+            let rerun_search_attrs = source
+                .search_attrs
+                .clone()
+                .filter(|v| !crate::erase::is_erasure_tombstone(v))
+                .map(|attrs| {
+                    crate::worker::apply_raw_search_attrs_patch_in_memory(
+                        Some(attrs),
+                        &crate::worker::nd_search_attrs_clear_patch(),
+                    )
+                    .unwrap_or_default()
+                });
+
+            // Faithful clone of the two stored-JSON start parameters (issue
+            // #777 review): a parse failure must NOT silently DROP the field —
+            // that would start the new run without the retry policy or the
+            // context headers the operator believes it inherited. Both values
+            // were written by a validated start path, so this is defensive; a
+            // corrupt stored value surfaces loudly on an operator route rather
+            // than degrading the re-run, matching the repo's fail-loud posture.
+            let rerun_context_headers = match source.context_headers.clone() {
+                None => None,
+                Some(v) => Some(serde_json::from_value(v).map_err(|e| {
+                    HarvestError::Config(format!(
+                        "source execution {source_exec_id} has an unparseable stored \
+                         `context_headers` value ({e}); re-run cannot faithfully clone it"
+                    ))
+                })?),
+            };
+            let rerun_retry_policy = match source.workflow_retry_policy.clone() {
+                None => None,
+                Some(v) => Some(serde_json::from_value(v).map_err(|e| {
+                    HarvestError::Config(format!(
+                        "source execution {source_exec_id} has an unparseable stored \
+                         `workflow_retry_policy` value ({e}); re-run cannot faithfully \
+                         clone it"
+                    ))
+                })?),
+            };
 
             let params = StartWorkflowParams {
                 workflow_name: &source.workflow_name,
@@ -4768,7 +4868,7 @@ pub async fn rerun_workflow_execution(
                 queue_name: &source.queue_name,
                 // The row value IS the effective (already ceiling-clamped) timeout.
                 execution_timeout: source.execution_timeout,
-                memo: source.memo.clone(),
+                memo: source_memo,
                 search_attrs: rerun_search_attrs,
                 reuse_policy,
                 conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
@@ -4790,10 +4890,7 @@ pub async fn rerun_workflow_execution(
                 owner: source.owner.as_deref(),
                 runbook_url: source.runbook_url.as_deref(),
                 severity: source.severity.as_deref(),
-                context_headers: source
-                    .context_headers
-                    .clone()
-                    .and_then(|v| serde_json::from_value(v).ok()),
+                context_headers: rerun_context_headers,
                 sla: source.sla,
                 // Reset-fork precedent: an operator intervention is excluded
                 // from scheduled carryover (issue #488), so re-running an old
@@ -4803,10 +4900,7 @@ pub async fn rerun_workflow_execution(
                 origin: None,
                 // A fresh retry chain.
                 workflow_attempt: 1,
-                workflow_retry_policy: source
-                    .workflow_retry_policy
-                    .clone()
-                    .and_then(|v| serde_json::from_value(v).ok()),
+                workflow_retry_policy: rerun_retry_policy,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                 completion_callbacks: source.completion_callbacks.clone(),
@@ -4840,13 +4934,20 @@ pub async fn rerun_workflow_execution(
             // `now()`, which would rewrite the source's real finish time — the
             // one durable record of when the original work actually ended.
             // Restore it, touching NOTHING else (never state/output/error).
-            if will_seal {
+            //
+            // Guarded on `Some`: writing NULL back would UNDO `replace_execution`'s
+            // `now()` stamp and leave the sealed row permanently retention-
+            // ineligible (retention requires `completed_at IS NOT NULL`), so a
+            // source with no recorded finish time keeps the seal's stamp instead.
+            // Defensive — every engine writer that reaches a re-runnable terminal
+            // state stamps `completed_at`, so a `None` here is not reachable today.
+            if let (true, Some(completed_at)) = (will_seal, source_completed_at) {
                 diesel::update(
                     harvest_workflow_executions::table
                         .find(source.id)
                         .filter(harvest_workflow_executions::state.eq("CONTINUED_AS_NEW")),
                 )
-                .set(harvest_workflow_executions::completed_at.eq(source_completed_at))
+                .set(harvest_workflow_executions::completed_at.eq(completed_at))
                 .execute(conn)
                 .await
                 .map_err(database_error)?;

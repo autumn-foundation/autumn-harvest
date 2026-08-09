@@ -18643,7 +18643,7 @@ struct RerunAuditCtx<'a> {
 }
 
 /// Build the failed-audit record for a rejected re-run.
-fn rerun_failure_record<'a>(
+const fn rerun_failure_record<'a>(
     ctx: &'a RerunAuditCtx<'a>,
     target_id: Option<&'a str>,
     error_summary: &'a str,
@@ -18734,8 +18734,13 @@ async fn rerun_workflow(
         match serde_json::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
-                audit_rerun_failure_via_pool(&api_state, &audit_ctx, Some(&id), "malformed JSON body")
-                    .await;
+                audit_rerun_failure_via_pool(
+                    &api_state,
+                    &audit_ctx,
+                    Some(&id),
+                    "malformed JSON body",
+                )
+                .await;
                 return AutumnError::bad_request_msg(format!("invalid JSON body: {e}"))
                     .into_response();
             }
@@ -18745,8 +18750,13 @@ async fn rerun_workflow(
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
         Err(e) => {
-            audit_rerun_failure_via_pool(&api_state, &audit_ctx, Some(&id), "malformed execution id")
-                .await;
+            audit_rerun_failure_via_pool(
+                &api_state,
+                &audit_ctx,
+                Some(&id),
+                "malformed execution id",
+            )
+            .await;
             return e.into_response();
         }
     };
@@ -18817,6 +18827,35 @@ async fn rerun_workflow(
 
     // The EFFECTIVE input decides key resolution for every policy below.
     let input_override = request.input_override();
+
+    // issue #373: validate an explicitly supplied OVERRIDE against the target
+    // workflow's published input schema, at the edge, before anything is
+    // started. "Validate the override, not the clone": a VERBATIM clone is
+    // deliberately never re-validated, because a run started under an older or
+    // looser schema must stay re-runnable — re-validating the clone would
+    // silently strand every historical run of that workflow type the moment an
+    // author tightened the schema, which is exactly when re-running matters.
+    if let Some(ref override_input) = input_override
+        && let Some(info) = runtime.registry.workflows.get(&source.workflow_name)
+        && let Err(violations) = info.validate_input(override_input)
+    {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "input validation failed",
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
+
     let effective_input = input_override
         .clone()
         .unwrap_or_else(|| source.input.clone());

@@ -114,6 +114,16 @@ fn plain_info(name: &'static str) -> WorkflowInfo {
     }
 }
 
+/// A stored workflow-level retry policy (issue #523), in the exact serde shape
+/// `RetryPolicy` round-trips through, so a faithful clone compares equal.
+fn retry_policy_json() -> Value {
+    serde_json::to_value(autumn_harvest::RetryPolicy::exponential(
+        3,
+        std::time::Duration::from_secs(1),
+    ))
+    .expect("RetryPolicy serialises")
+}
+
 /// The published input schema used by the issue #373 override-validation tests:
 /// an object requiring an integer `order`.
 fn order_input_schema() -> Value {
@@ -460,8 +470,6 @@ struct ExecRow {
     chain_execution_timeout_secs: Option<i64>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
     chain_deadline_at: Option<DateTime<Utc>>,
-    #[diesel(sql_type = Nullable<Text>)]
-    concurrency_key: Option<String>,
 }
 
 const EXEC_SELECT: &str = "SELECT state, workflow_id, queue_name, input, output, error,
@@ -474,7 +482,7 @@ const EXEC_SELECT: &str = "SELECT state, workflow_id, queue_name, input, output,
         continued_from_exec_id, first_exec_id, workflow_attempt,
         context_headers, workflow_retry_policy,
         EXTRACT(EPOCH FROM chain_execution_timeout)::bigint AS chain_execution_timeout_secs,
-        chain_deadline_at, concurrency_key
+        chain_deadline_at
      FROM harvest_workflow_executions ";
 
 async fn load_exec(conn: &mut AsyncPgConnection, exec_id: &str) -> ExecRow {
@@ -549,11 +557,15 @@ struct TaskRow {
     state: String,
     #[diesel(sql_type = Text)]
     task_type: String,
+    /// Per-key concurrency group key (issue #247) — resolved at start time from
+    /// the EFFECTIVE input and stamped on the task row, not the execution row.
+    #[diesel(sql_type = Nullable<Text>)]
+    concurrency_key: Option<String>,
 }
 
 async fn tasks_of(conn: &mut AsyncPgConnection, exec_id: &str) -> Vec<TaskRow> {
     diesel::sql_query(
-        "SELECT state, task_type FROM harvest_task_queue
+        "SELECT state, task_type, concurrency_key FROM harvest_task_queue
          WHERE workflow_exec_id = $1::uuid ORDER BY created_at",
     )
     .bind::<Text, _>(exec_id)
@@ -629,6 +641,13 @@ async fn rerun_completed_source_creates_new_execution() {
     assert_eq!(evs.len(), 1, "a fresh run has exactly one event");
     assert_eq!(evs[0].event_id, 0);
     assert_eq!(evs[0].event_type, "WorkflowStarted");
+
+    // The new run must be DISPATCHABLE, not merely present: an execution row
+    // with no queued workflow task would sit RUNNING forever and never execute.
+    let tasks = tasks_of(&mut conn, &new_id).await;
+    assert_eq!(tasks.len(), 1, "exactly one workflow task is enqueued");
+    assert_eq!(tasks[0].state, "PENDING", "and it is claimable");
+    assert_eq!(tasks[0].task_type, "workflow");
 }
 
 /// R-13: the re-run clones the source's recorded start parameters verbatim.
@@ -657,6 +676,8 @@ async fn rerun_clones_start_params_verbatim() {
             runbook_url: Some("https://runbook.example/orders"),
             severity: Some("high"),
             completion_callbacks: Some(json!([{"url": "https://hook.example/done"}])),
+            context_headers: Some(json!({"traceparent": "00-abc-def-01"})),
+            workflow_retry_policy: Some(retry_policy_json()),
             ..Seed::default()
         },
     )
@@ -682,6 +703,18 @@ async fn rerun_clones_start_params_verbatim() {
     assert_eq!(
         row.completion_callbacks,
         Some(json!([{"url": "https://hook.example/done"}]))
+    );
+    // Both stored-JSON start parameters must round-trip byte-for-byte: a parse
+    // failure is fail-loud, never a silently dropped field.
+    assert_eq!(
+        row.context_headers,
+        Some(json!({"traceparent": "00-abc-def-01"})),
+        "context_headers must be cloned faithfully"
+    );
+    assert_eq!(
+        row.workflow_retry_policy,
+        Some(retry_policy_json()),
+        "workflow_retry_policy must be cloned faithfully"
     );
 }
 
@@ -1099,6 +1132,13 @@ async fn rerun_rejects_when_business_key_held_by_another_run() {
         2,
         "no third run may be created"
     );
+
+    // The occupant-409 audit row rides the CALLER'S connection (issue #777
+    // review); before that fix a second pool checkout could silently lose it.
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "the occupant rejection must be audited");
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].actor, TEST_ACTOR);
 }
 
 /// R-28b: a `workflow_id` OVERRIDE onto a key already held by a live run is
@@ -1236,8 +1276,9 @@ async fn rerun_respects_admission_gate() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let api_state = api_state_with(vec![plain_info(wf)], &pool, true);
+    let gate_id = uuid::Uuid::new_v4();
     api_state.initialize_gate_cache(vec![AdmissionGate {
-        id: AdmissionGateId(uuid::Uuid::new_v4()),
+        id: AdmissionGateId(gate_id),
         scope: GateScope::WorkflowName(wf.to_string()),
         reason: "incident".to_string(),
         message: None,
@@ -1255,8 +1296,12 @@ async fn rerun_respects_admission_gate() {
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], json!("admission blocked"));
-    assert!(body.get("gate_id").is_some(), "gate_id in body: {body}");
-    assert!(body.get("reason").is_some(), "reason in body: {body}");
+    assert_eq!(
+        body["gate_id"].as_str(),
+        Some(gate_id.to_string().as_str()),
+        "the body names the gate that actually blocked it: {body}"
+    );
+    assert_eq!(body["reason"], json!("incident"));
 
     assert_eq!(
         load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
@@ -1267,6 +1312,22 @@ async fn rerun_respects_admission_gate() {
         load_exec(&mut conn, &source).await.state,
         "COMPLETED",
         "a gated re-run must not seal the source"
+    );
+
+    // The failed audit row rides the CALLER'S connection (issue #777 review):
+    // before that fix it was written through a second pool checkout and could
+    // silently vanish under connection pressure.
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "a gated re-run must still be audited");
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].actor, TEST_ACTOR);
+    assert!(
+        rows[0]
+            .error_summary
+            .as_deref()
+            .is_some_and(|s| s.contains("admission blocked")),
+        "the audit row records why: {:?}",
+        rows[0].error_summary
     );
 }
 
@@ -1293,16 +1354,35 @@ async fn rerun_requires_admin() {
     assert_eq!(load_exec(&mut conn, &source).await.state, "COMPLETED");
 }
 
-/// R-33: an unknown execution id returns 404.
+/// R-33: an unknown execution id returns 404 FROM THE HANDLER.
+///
+/// A bare `assert_eq!(status, NOT_FOUND)` would pass vacuously: axum answers an
+/// unmatched route with 404 too, so a typo in `rerun_uri` or a dropped route
+/// registration would keep this test green while the handler never ran. The
+/// body message and the failed audit row are what prove it reached the handler.
 #[tokio::test]
 async fn rerun_unknown_execution_returns_404() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool, vec![plain_info("rr_unknown_wf")]);
+    let mut conn = pool.get().await.unwrap();
 
     let missing = autumn_harvest::types::ExecutionId::new().to_string();
     let (status, body) = post_json(&app, &rerun_uri(&missing), json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.to_string().contains(&missing),
+        "the handler's own not-found message names the execution, so this is not \
+         axum's unmatched-route 404: {body}"
+    );
+
+    let rows = audit_rows(&mut conn, "workflow.rerun", &missing).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the handler ran and audited the rejection (an unmatched route would not)"
+    );
+    assert_eq!(rows[0].status, "failed");
 }
 
 /// R-34: a malformed execution id returns 400 and writes a failed audit row.
@@ -1438,6 +1518,12 @@ async fn rerun_strips_nd_diagnostic_search_attrs() {
 
 /// R-38: schedule provenance (issue #488/#534) is NOT carried onto the re-run,
 /// matching the reset-fork precedent.
+///
+/// Uses the `workflow_id`-OVERRIDE path: a default-key re-run of a
+/// schedule-attributed source is rejected outright (see
+/// `rerun_of_schedule_attributed_source_is_rejected`), because sealing it would
+/// break the schedule's carryover lineage. The override path is the supported
+/// way to re-run scheduled work, and it is where this assertion belongs.
 #[tokio::test]
 async fn rerun_does_not_carry_schedule_provenance() {
     let (url, _c) = setup_database().await;
@@ -1461,7 +1547,13 @@ async fn rerun_does_not_carry_schedule_provenance() {
     )
     .await;
 
-    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    let fresh_key = unique("rr-sched-fresh");
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({ "workflow_id": fresh_key }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let new_id = body["execution_id"].as_str().unwrap().to_string();
 
@@ -1543,11 +1635,34 @@ async fn rerun_source_result_route_reports_continued_as_new() {
     // consequence of reusing the business key) so a future change is a
     // conscious decision, not a silent regression.
     let (s_after, b_after) = get_json(&app, &format!("/workflows/{source}/result")).await;
-    assert_ne!(
+    // Observed exactly: `200 {"completed_at": "...", "state": "continued_as_new"}`
+    // — `error` and `output` are omitted entirely (skip_serializing_if), which
+    // indexes as JSON null below.
+    assert_eq!(s_after, StatusCode::OK, "{b_after}");
+    assert_eq!(
         b_after["state"],
-        json!("failed"),
-        "sealing the source changes what /result reports for it (documented R1 \
-         consequence): {s_after} {b_after}"
+        json!("continued_as_new"),
+        "the sealed source now reports as a chain predecessor: {b_after}"
+    );
+    // The KNOWN CONSEQUENCE, pinned exactly: the original failure reason is
+    // dropped from THIS surface. It survives in `harvest_events` (the terminal
+    // event) and on the describe surface (`execution.error`), and the pre-seal
+    // state is returned by the re-run response and persisted in the succeeded
+    // `workflow.rerun` audit row — so nothing is lost overall, but a caller
+    // polling /result for the SOURCE id can no longer see why it failed.
+    assert_eq!(
+        b_after["error"],
+        Value::Null,
+        "the original failure reason is dropped from /result: {b_after}"
+    );
+
+    // ...and it IS still recoverable from the describe surface.
+    let (s_desc, b_desc) = get_json(&app, &format!("/workflows/{source}")).await;
+    assert_eq!(s_desc, StatusCode::OK, "{b_desc}");
+    assert_eq!(
+        b_desc["execution"]["error"],
+        json!("original failure"),
+        "describe still carries the original error: {b_desc}"
     );
 }
 
@@ -1704,5 +1819,917 @@ async fn rerun_input_override_satisfying_schema_is_accepted() {
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({"input": {"order": 7}})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let new_id = body["execution_id"].as_str().unwrap().to_string();
-    assert_eq!(load_exec(&mut conn, &new_id).await.input, json!({"order": 7}));
+    assert_eq!(
+        load_exec(&mut conn, &new_id).await.input,
+        json!({"order": 7})
+    );
+}
+
+/// R-45 (issue #488 / #534): a default-key re-run of a SCHEDULE-ATTRIBUTED
+/// source is rejected. Sealing it to CONTINUED_AS_NEW would put the slot in a
+/// state `resolve_carryover` recognises in neither of its sets, rolling the
+/// next fire's incremental cursor backward and deflating the schedule's
+/// success ratio. The source row must be left byte-untouched.
+#[tokio::test]
+async fn rerun_of_schedule_attributed_source_is_rejected() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_sched_seal_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-sched-seal");
+    let schedule_id = uuid::Uuid::new_v4();
+    let slot = Utc::now();
+    let completed = Utc::now();
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "COMPLETED",
+        Seed {
+            schedule_id: Some(schedule_id),
+            scheduled_for: Some(slot),
+            origin: Some("scheduled"),
+            completed_at: Some(completed),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let before = load_exec(&mut conn, &source).await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.to_string().contains("schedule-attributed"),
+        "the 409 explains why and points at the override: {body}"
+    );
+
+    // The source is byte-untouched: still COMPLETED, same completed_at, still
+    // attributed to its schedule slot.
+    let after = load_exec(&mut conn, &source).await;
+    assert_eq!(after.state, "COMPLETED");
+    assert_eq!(after.completed_at, before.completed_at);
+    assert_eq!(after.schedule_id, Some(schedule_id));
+    assert_eq!(after.scheduled_for, before.scheduled_for);
+    assert_eq!(after.origin.as_deref(), Some("scheduled"));
+
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "nothing may be started"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "the rejection must be audited");
+    assert_eq!(rows[0].status, "failed");
+}
+
+/// R-46: the supported way to re-run scheduled work — an explicit `workflow_id`
+/// override never seals, so the schedule's lineage is untouched and the new run
+/// is deliberately NOT schedule-attributed.
+#[tokio::test]
+async fn rerun_of_schedule_attributed_source_with_override_is_allowed() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_sched_override_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-sched-ovr");
+    let schedule_id = uuid::Uuid::new_v4();
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            schedule_id: Some(schedule_id),
+            scheduled_for: Some(Utc::now()),
+            origin: Some("scheduled"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let before = load_exec(&mut conn, &source).await;
+
+    let fresh_key = unique("rr-sched-ovr-new");
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({ "workflow_id": fresh_key }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+
+    // Source untouched — no seal, lineage intact.
+    let after = load_exec(&mut conn, &source).await;
+    assert_eq!(after.state, "FAILED");
+    assert_eq!(after.completed_at, before.completed_at);
+    assert_eq!(after.schedule_id, Some(schedule_id));
+
+    let row = load_exec(&mut conn, &new_id).await;
+    assert_eq!(row.workflow_id, fresh_key);
+    assert_eq!(
+        row.schedule_id, None,
+        "an operator re-run is excluded from scheduled carryover"
+    );
+    assert_eq!(row.start_source.as_deref(), Some("rerun"));
+    assert_eq!(row.start_source_ref.as_deref(), Some(source.as_str()));
+}
+
+/// R-47 (issue #495): a re-run-with-override of an ERASED source must not clone
+/// the erasure tombstones out of `memo` / `search_attrs` onto the fresh,
+/// never-erased run — that would pollute `?search_attr=` filtering and mislead
+/// compliance tooling into believing the new run had been erased.
+#[tokio::test]
+async fn rerun_of_erased_source_does_not_propagate_tombstones() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_erased_tombstone_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-erased-tomb");
+    let tombstone = json!({ "_harvest_erased": true });
+    // Shaped exactly like an `erase_workflow_payloads` row scrub: input, memo
+    // and search_attrs tombstoned; context_headers NULLed.
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(tombstone.clone()),
+            memo: Some(tombstone.clone()),
+            search_attrs: Some(tombstone.clone()),
+            context_headers: None,
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({"input": {"reconstructed": true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+
+    let row = load_exec(&mut conn, &new_id).await;
+    assert_eq!(row.input, json!({"reconstructed": true}));
+    assert_eq!(row.memo, None, "an erased memo must not be cloned");
+    assert_eq!(
+        row.search_attrs, None,
+        "erased search attributes must not be cloned"
+    );
+    assert_eq!(row.context_headers, None);
+    assert!(
+        !serde_json::to_string(&row.memo)
+            .unwrap()
+            .contains("_harvest_erased")
+            && !serde_json::to_string(&row.search_attrs)
+                .unwrap()
+                .contains("_harvest_erased"),
+        "no tombstone key may survive onto the new run"
+    );
+}
+
+/// R-48 (issue #617): the chain-scoped lifetime cap is CLONED, but its absolute
+/// deadline is RE-ANCHORED — a re-run is a fresh chain origin, so it must not
+/// inherit the source's already-elapsed `chain_deadline_at`.
+#[tokio::test]
+async fn rerun_clones_chain_timeout_and_reanchors_its_deadline() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_chain_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-chain");
+    // A deadline far in the PAST: if it were inherited, the new run would be
+    // born already over its chain cap.
+    let stale_deadline = Utc::now() - chrono::Duration::hours(24);
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            chain_execution_timeout_secs: Some(7200),
+            chain_deadline_at: Some(stale_deadline),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let before = Utc::now();
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+    let after = Utc::now();
+
+    let row = load_exec(&mut conn, &new_id).await;
+    assert_eq!(
+        row.chain_execution_timeout_secs,
+        Some(7200),
+        "the declared chain cap is cloned"
+    );
+    let deadline = row
+        .chain_deadline_at
+        .expect("a cloned chain cap anchors a fresh deadline");
+    assert!(
+        deadline > stale_deadline,
+        "the stale deadline must NOT be inherited: {deadline} vs {stale_deadline}"
+    );
+    // Fresh anchor = (start instant) + 7200s, bracketed by the request window.
+    assert!(
+        deadline >= before + chrono::Duration::seconds(7200)
+            && deadline <= after + chrono::Duration::seconds(7200),
+        "the deadline is re-anchored at now + chain cap: {deadline} not in \
+         [{before} + 2h, {after} + 2h]"
+    );
+}
+
+/// R-49: a body-less POST (zero bytes, no `Content-Type` JSON payload) is
+/// accepted and clones the source input verbatim — the whole reason the handler
+/// takes raw `Bytes` rather than `Option<Json<…>>`.
+#[tokio::test]
+async fn rerun_with_empty_body_clones_input() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_empty_body_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-empty-body");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "COMPLETED",
+        Seed {
+            input: Some(json!({"kept": "verbatim"})),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("POST request");
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        load_exec(&mut conn, &new_id).await.input,
+        json!({"kept": "verbatim"})
+    );
+}
+
+/// R-50 (issue #247): the per-key concurrency group key is resolved from the
+/// EFFECTIVE input — the override when one is supplied, the clone otherwise.
+#[tokio::test]
+async fn rerun_resolves_concurrency_key_from_effective_input() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_conc_wf";
+    let app = build_app(&pool, vec![concurrency_info(wf, "input.tenant_id", 4)]);
+    let mut conn = pool.get().await.unwrap();
+
+    // (a) An override re-keys the new run onto the OVERRIDE's tenant.
+    let wf_id = unique("rr-conc-override");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(json!({"tenant_id": "acme"})),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({"input": {"tenant_id": "zeta"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+    let tasks = tasks_of(&mut conn, &new_id).await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        tasks[0].concurrency_key.as_deref(),
+        Some("zeta"),
+        "the key resolves from the OVERRIDE, not the source input"
+    );
+
+    // (b) With no override it resolves from the cloned source input.
+    let wf_id2 = unique("rr-conc-clone");
+    let source2 = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id2,
+        "FAILED",
+        Seed {
+            input: Some(json!({"tenant_id": "acme"})),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status2, body2) = post_json(&app, &rerun_uri(&source2), json!({})).await;
+    assert_eq!(status2, StatusCode::CREATED, "{body2}");
+    let new_id2 = body2["execution_id"].as_str().unwrap().to_string();
+    let tasks2 = tasks_of(&mut conn, &new_id2).await;
+    assert_eq!(tasks2.len(), 1);
+    assert_eq!(tasks2[0].concurrency_key.as_deref(), Some("acme"));
+}
+
+/// R-51: a source whose workflow type is no longer registered on this node is
+/// rejected 404 — the fresh run would otherwise wedge immediately in
+/// HandlerNotFound replay failure.
+#[tokio::test]
+async fn rerun_unregistered_workflow_type_returns_404() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    // The app registers a DIFFERENT workflow than the source's type.
+    let app = build_app(&pool, vec![plain_info("rr_registered_wf")]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf = "rr_retired_wf";
+    let wf_id = unique("rr-retired");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.to_string().contains("not registered"),
+        "the 404 explains the type is retired: {body}"
+    );
+
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "nothing may be started"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "the rejection must be audited");
+    assert_eq!(rows[0].status, "failed");
+}
+
+/// R-52: a batched workflow (issue #518) cannot be re-run — its start is
+/// deferred, so no execution id could be returned.
+#[tokio::test]
+async fn rerun_rejects_batched_workflow() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_batched_wf";
+    let mut info = plain_info(wf);
+    info.batch = Some(autumn_harvest::event_batch::BatchPolicy {
+        key_expr: "input.tenant_id".to_string(),
+        max_size: 10,
+        max_wait: std::time::Duration::from_secs(30),
+    });
+    let app = build_app(&pool, vec![info]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-batched");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "COMPLETED",
+        Seed {
+            input: Some(json!({"tenant_id": "acme"})),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("batch"),
+        "the 400 names the offending policy: {body}"
+    );
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "nothing may be started"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+}
+
+/// R-53: a registered unified DAG is rejected 400 — DAGs have their own
+/// trigger/retry routes.
+#[tokio::test]
+async fn rerun_rejects_registered_dag() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let dag = "rr_dag_wf";
+    let app = build_app_with(
+        &pool,
+        vec![plain_info(dag)],
+        AppOpts {
+            dag_names: vec![dag],
+            ..AppOpts::default()
+        },
+    );
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-dag");
+    let source = seed_terminal(&mut conn, dag, &wf_id, "FAILED").await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("DAG"),
+        "the 400 points at the DAG routes: {body}"
+    );
+    assert_eq!(
+        load_execs_for_key(&mut conn, dag, &wf_id).await.len(),
+        1,
+        "nothing may be started"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+}
+
+/// R-54: a malformed JSON body returns 400 and writes a failed audit row.
+#[tokio::test]
+async fn rerun_malformed_body_returns_400_and_audits_failure() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_bad_body_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-bad-body");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::from("{\"input\": }"))
+                .unwrap(),
+        )
+        .await
+        .expect("POST request");
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "a malformed body must start nothing"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "a malformed body must still be audited");
+    assert_eq!(rows[0].status, "failed");
+}
+
+/// R-55: the describe surface carries the issue #740 provenance of the new run,
+/// so an operator can see WHERE it came from without reading the audit log.
+#[tokio::test]
+async fn rerun_describe_surface_shows_provenance() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_describe_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-describe");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+
+    let (s, b) = get_json(&app, &format!("/workflows/{new_id}")).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["execution"]["start_source"], json!("rerun"));
+    assert_eq!(b["execution"]["start_source_ref"], json!(source));
+    assert_eq!(b["execution"]["started_by"], json!(TEST_ACTOR));
+}
+
+/// R-56: re-running a re-run works, and provenance is ONE HOP — the second
+/// run's `start_source_ref` points at the run it was re-run from, never
+/// transitively back at the original source.
+#[tokio::test]
+async fn rerun_of_a_rerun_records_one_hop_provenance() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_rerun_of_rerun_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-rerun2");
+    let first = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
+
+    let (s1, b1) = post_json(&app, &rerun_uri(&first), json!({})).await;
+    assert_eq!(s1, StatusCode::CREATED, "{b1}");
+    let second = b1["execution_id"].as_str().unwrap().to_string();
+
+    // Seal the second run terminally so it becomes re-runnable in turn.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions
+         SET state = 'FAILED', completed_at = NOW(), error = 'still broken'
+         WHERE id = $1::uuid",
+    )
+    .bind::<Text, _>(second.as_str())
+    .execute(&mut conn)
+    .await
+    .expect("seal the second run");
+
+    let (s2, b2) = post_json(&app, &rerun_uri(&second), json!({})).await;
+    assert_eq!(s2, StatusCode::CREATED, "{b2}");
+    let third = b2["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(b2["source_prior_state"], json!("FAILED"));
+
+    let row = load_exec(&mut conn, &third).await;
+    assert_eq!(row.start_source.as_deref(), Some("rerun"));
+    assert_eq!(
+        row.start_source_ref.as_deref(),
+        Some(second.as_str()),
+        "provenance is one hop: the SECOND run, not the original source"
+    );
+    assert_ne!(row.start_source_ref.as_deref(), Some(first.as_str()));
+}
+
+/// R-57 (issue #252): an oversized `input` override is rejected 413 rather than
+/// being persisted. Uses a deliberately tiny cap so the test stays fast.
+#[tokio::test]
+async fn rerun_oversized_input_override_returns_413() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_oversized_wf";
+    let app = build_app_with(
+        &pool,
+        vec![plain_info(wf)],
+        AppOpts {
+            max_workflow_input_bytes: Some(64),
+            ..AppOpts::default()
+        },
+    );
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-oversized");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+
+    let big = "x".repeat(4096);
+    let (status, body) =
+        post_json(&app, &rerun_uri(&source), json!({"input": {"blob": big}})).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "an oversized re-run must start nothing"
+    );
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "COMPLETED",
+        "and must not seal the source"
+    );
+}
+
+/// R-58: a `workflow_id` override colliding with a COMPLETED (terminal but
+/// still key-holding) run is rejected 409 — RejectDuplicate surfaces
+/// AlreadyExists, and the occupant is never disturbed.
+#[tokio::test]
+async fn rerun_override_onto_completed_occupant_is_rejected() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_completed_occupant_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let source_key = unique("rr-occ-source");
+    let source = seed_terminal(&mut conn, wf, &source_key, "FAILED").await;
+
+    // A COMPLETED run still sits inside the partial active-uniqueness index.
+    let occupied_key = unique("rr-occ-target");
+    let occupant = seed_terminal(&mut conn, wf, &occupied_key, "COMPLETED").await;
+
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({ "workflow_id": occupied_key }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["existing_execution_id"].as_str(),
+        Some(occupant.as_str()),
+        "the 409 names the occupant: {body}"
+    );
+    assert_eq!(body["existing_state"], json!("COMPLETED"));
+
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &occupied_key).await.len(),
+        1,
+        "the occupied key gains no run"
+    );
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "FAILED",
+        "the source must not be sealed"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+}
+
+/// R-59: the succeeded audit row persists the source's pre-seal state, so the
+/// operator trail is self-contained once the row itself reads CONTINUED_AS_NEW.
+#[tokio::test]
+async fn rerun_success_audit_records_source_prior_state() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_audit_state_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-audit-state");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "TIMED_OUT").await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["source_prior_state"], json!("TIMED_OUT"));
+
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "succeeded");
+    assert_eq!(
+        rows[0].error_summary.as_deref(),
+        Some("reran from state TIMED_OUT"),
+        "the pre-seal state survives in the audit trail"
+    );
+    // ...and the row itself now reads CONTINUED_AS_NEW, which is exactly why
+    // the audit row has to carry it.
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "CONTINUED_AS_NEW"
+    );
+}
+
+/// R-60 (issue #701): a re-run does NOT join the source's continue-as-new run
+/// chain. Provenance is `start_source`/`start_source_ref`, not CAN back-links —
+/// co-opting the CAN linkage would misrepresent an operator restart as a
+/// continue-as-new. This PINS what `/run-chain` reports for both ids so the
+/// separation is a conscious contract, and asserts the endpoint never 500s.
+#[tokio::test]
+async fn rerun_run_chain_endpoint_reports_separate_chains() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_chainview_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-chainview");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+
+    // The NEW run: a standalone chain of one. It carries no back-link columns,
+    // so #701's legacy forward-walk finds no predecessor.
+    let (s_new, b_new) = get_json(&app, &format!("/workflows/{new_id}/run-chain")).await;
+    assert_eq!(s_new, StatusCode::OK, "run-chain must never 500: {b_new}");
+    let runs_new = b_new["runs"].as_array().expect("runs array");
+    assert_eq!(
+        runs_new.len(),
+        1,
+        "the re-run is its own chain head, not a CAN successor: {b_new}"
+    );
+    assert_eq!(runs_new[0]["exec_id"].as_str(), Some(new_id.as_str()));
+    assert_eq!(runs_new[0]["sequence"], json!(0));
+    assert_eq!(
+        runs_new[0]["continued_to_exec_id"],
+        Value::Null,
+        "tail of its own chain"
+    );
+
+    // The SOURCE: sealed CONTINUED_AS_NEW by the key reuse, but with no
+    // `WorkflowContinuedAsNew` event and no back-link, so #701 cannot resolve a
+    // successor for it either.
+    let (s_src, b_src) = get_json(&app, &format!("/workflows/{source}/run-chain")).await;
+    assert_eq!(s_src, StatusCode::OK, "run-chain must never 500: {b_src}");
+    let runs_src = b_src["runs"].as_array().expect("runs array");
+    assert!(
+        runs_src
+            .iter()
+            .any(|r| r["exec_id"].as_str() == Some(source.as_str())),
+        "the source is present in its own chain view: {b_src}"
+    );
+    assert!(
+        !runs_src
+            .iter()
+            .any(|r| r["exec_id"].as_str() == Some(new_id.as_str())),
+        "the re-run must NOT appear in the source's chain: {b_src}"
+    );
+}
+
+/// R-61: two concurrent re-runs of the SAME source serialize on the source
+/// row's `FOR UPDATE` lock — exactly one creates a run, the loser observes the
+/// sealed CONTINUED_AS_NEW state and is rejected. A double-start here would
+/// duplicate real work under one business key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reruns_of_one_source_start_exactly_one_run() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_concurrent_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-concurrent");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
+
+    let a = {
+        let app = app.clone();
+        let uri = rerun_uri(&source);
+        tokio::spawn(async move { post_json(&app, &uri, json!({})).await })
+    };
+    let b = {
+        let app = app.clone();
+        let uri = rerun_uri(&source);
+        tokio::spawn(async move { post_json(&app, &uri, json!({})).await })
+    };
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+
+    let statuses = [ra.0, rb.0];
+    let created = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::CREATED)
+        .count();
+    let conflicts = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::CONFLICT)
+        .count();
+    assert_eq!(
+        created, 1,
+        "exactly one re-run may create: {:?} / {:?}",
+        ra, rb
+    );
+    assert_eq!(
+        conflicts, 1,
+        "the loser must be rejected 409, never silently succeed: {:?} / {:?}",
+        ra, rb
+    );
+
+    // The source plus exactly ONE new run — never two.
+    let rows = load_execs_for_key(&mut conn, wf, &wf_id).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "source + one new run only, found {}",
+        rows.len()
+    );
+    let running = rows.iter().filter(|r| r.state == "RUNNING").count();
+    assert_eq!(running, 1, "exactly one live run under the business key");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.state == "CONTINUED_AS_NEW")
+            .count(),
+        1,
+        "the source is sealed exactly once"
+    );
+}
+
+/// R-62 (issue #777 review, the P2-1 fix): every failure audit raised AFTER the
+/// caller's connection is checked out must ride THAT connection.
+///
+/// Pinned with a SIZE-1 pool, which is what makes the assertion load-bearing:
+/// the previous pool-acquiring form asked for a second connection while this
+/// handler still held the only one, so the checkout blocked until the pool
+/// timeout and the audit was silently dropped (`let _ =`). Mirrors the #608
+/// round-2 `decode_audit_reuses_callers_connection_under_single_connection_pool`.
+#[tokio::test]
+async fn failure_audits_ride_the_callers_connection_under_a_size_one_pool() {
+    let (url, _c) = setup_database().await;
+    // Seed and verify on a normal pool; drive the HTTP request on a size-1 one.
+    let seed_pool = build_pool(&url);
+    let mut conn = seed_pool.get().await.unwrap();
+
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
+    let tiny: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("size-1 pool");
+    let wf = "rr_size1_wf";
+    let app = build_app(&tiny, vec![plain_info(wf)]);
+
+    // A RUNNING source: rejected 409 by the state gate, i.e. a failure raised
+    // well after `db_conn_for_execution` handed out the pool's only connection.
+    let wf_id = unique("rr-size1");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "RUNNING").await;
+
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        post_json(&app, &rerun_uri(&source), json!({})),
+    )
+    .await
+    .expect("the handler must not stall waiting on a second connection");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the failure audit must be written on the caller's own connection"
+    );
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].actor, TEST_ACTOR);
+}
+
+/// R-63 (issue #777 review, the P2 clone-fidelity fix): an unparseable stored
+/// `workflow_retry_policy` / `context_headers` is FAIL-LOUD, never a silently
+/// dropped field. Silently dropping would start the new run without the retry
+/// policy the operator believes it inherited.
+#[tokio::test]
+async fn rerun_rejects_unparseable_stored_start_parameters() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_corrupt_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    // (a) A retry policy that is valid JSON but not a `RetryPolicy`.
+    let wf_id = unique("rr-corrupt-retry");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            workflow_retry_policy: Some(json!({"garbage": true})),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.to_string().contains("workflow_retry_policy"),
+        "the rejection names the offending field: {body}"
+    );
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "nothing may be started"
+    );
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "FAILED",
+        "and the source must not be sealed"
+    );
+
+    // (b) Context headers that are not a string map.
+    let wf_id2 = unique("rr-corrupt-headers");
+    let source2 = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id2,
+        "FAILED",
+        Seed {
+            context_headers: Some(json!({"trace": {"nested": "not-a-string"}})),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status2, body2) = post_json(&app, &rerun_uri(&source2), json!({})).await;
+    assert_eq!(status2, StatusCode::CONFLICT, "{body2}");
+    assert!(
+        body2.to_string().contains("context_headers"),
+        "the rejection names the offending field: {body2}"
+    );
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id2).await.len(),
+        1,
+        "nothing may be started"
+    );
 }

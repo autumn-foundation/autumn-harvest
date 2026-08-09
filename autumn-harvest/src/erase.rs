@@ -74,6 +74,23 @@ pub fn erasure_tombstone() -> Value {
     json!({ ERASURE_TOMBSTONE_KEY: true })
 }
 
+/// Returns `true` if `value` is exactly the erasure tombstone
+/// `{"_harvest_erased": true}` — the FIELD-AGNOSTIC predicate (issue #495).
+///
+/// [`erase_workflow_payloads`] writes this same canonical value into the
+/// execution row's `input`, `memo`, and `search_attrs` columns (and into every
+/// payload-bearing event field), so any consumer that must not PROPAGATE an
+/// erased value can test it with this regardless of which column it came from.
+/// [`execution_input_is_erased`] is the `input`-specific spelling used by the
+/// O(1) erased-row check; prefer this one for any other column.
+///
+/// Note `context_headers` is `NULL`ed rather than tombstoned by the row scrub,
+/// so it never needs this test.
+#[must_use]
+pub fn is_erasure_tombstone(value: &Value) -> bool {
+    is_tombstone(value)
+}
+
 /// Returns `true` if `value` is already the erasure tombstone.
 fn is_tombstone(value: &Value) -> bool {
     value
