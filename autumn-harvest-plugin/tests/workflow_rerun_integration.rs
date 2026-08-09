@@ -189,7 +189,7 @@ struct AppOpts {
     dag_names: Vec<&'static str>,
 }
 
-fn build_app_with(pool: &DbPool, infos: Vec<WorkflowInfo>, opts: AppOpts) -> HarvestApiApp {
+fn build_app_with(pool: &DbPool, infos: Vec<WorkflowInfo>, opts: &AppOpts) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
@@ -2248,7 +2248,7 @@ async fn rerun_rejects_registered_dag() {
     let app = build_app_with(
         &pool,
         vec![plain_info(dag)],
-        AppOpts {
+        &AppOpts {
             dag_names: vec![dag],
             ..AppOpts::default()
         },
@@ -2390,7 +2390,7 @@ async fn rerun_oversized_input_override_returns_413() {
     let app = build_app_with(
         &pool,
         vec![plain_info(wf)],
-        AppOpts {
+        &AppOpts {
             max_workflow_input_bytes: Some(64),
             ..AppOpts::default()
         },
@@ -2590,15 +2590,10 @@ async fn concurrent_reruns_of_one_source_start_exactly_one_run() {
         .iter()
         .filter(|s| **s == StatusCode::CONFLICT)
         .count();
-    assert_eq!(
-        created, 1,
-        "exactly one re-run may create: {:?} / {:?}",
-        ra, rb
-    );
+    assert_eq!(created, 1, "exactly one re-run may create: {ra:?} / {rb:?}");
     assert_eq!(
         conflicts, 1,
-        "the loser must be rejected 409, never silently succeed: {:?} / {:?}",
-        ra, rb
+        "the loser must be rejected 409, never silently succeed: {ra:?} / {rb:?}"
     );
 
     // The source plus exactly ONE new run — never two.
