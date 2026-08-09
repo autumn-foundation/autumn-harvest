@@ -4651,12 +4651,13 @@ pub struct RerunOutcome {
 ///   non-terminal, is `CONTINUED_AS_NEW`, already has an automatic workflow-level
 ///   retry successor (issue #523 — see the retry-chain gate above), has an
 ///   erased input (issue #495) and no explicit override was supplied, is
-///   schedule-attributed and would need to be sealed (see above), the target
-///   business key is held by a different live execution, a `workflow_id`
-///   override routes to a different shard than the source (see the
-///   shard-consistency guard above), or a stored `context_headers` /
-///   `workflow_retry_policy` value cannot be parsed (a faithful clone must
-///   never silently drop a field).
+///   schedule-attributed and would need to be sealed (see above), the source's
+///   shard has been drained out of `writable_shards` (see the
+///   shard-writability gate above), the target business key is held by a
+///   different live execution, a `workflow_id` override routes to a
+///   different shard than the source (see the shard-consistency guard
+///   above), or a stored `context_headers` / `workflow_retry_policy` value
+///   cannot be parsed (a faithful clone must never silently drop a field).
 /// - [`HarvestError::AlreadyExists`] when a `workflow_id` override collides with
 ///   a live execution.
 /// - [`HarvestError::AdmissionBlocked`] when an active gate blocks the start.
@@ -4759,6 +4760,39 @@ pub async fn rerun_workflow_execution(
                 )));
             }
 
+            // 2c. Shard-writability gate (Codex review, issue #777 PR #1152):
+            // this entire transaction is already pinned to `source.shard_id`
+            // by the caller (the connection is acquired via
+            // `db_conn_for_execution(source_exec_id)` before this function is
+            // even entered) — a re-run can only ever land the NEW execution
+            // on that same physical shard, whether or not a `workflow_id`
+            // override is supplied below. A re-run is a brand-new admission
+            // (a fresh `WorkflowStarted`), exactly the operation
+            // `writable_shards` exists to gate: "placing new work on a shard
+            // the operator is draining contradicts the drain"
+            // (`docs/sharding.md`). The override path is already protected
+            // indirectly — `ShardRouter::pick_for_new_workflow` (used by the
+            // shard-consistency guard below) can only ever resolve to a
+            // WRITABLE shard — but the DEFAULT (no-override) path had no
+            // protection at all: reject up front rather than silently
+            // landing the new run on a shard an operator has removed from
+            // `writable_shards`. When the process-global router is
+            // unavailable, fall back to "assume writable" — the same
+            // documented fallback the shard-consistency guard below uses.
+            let source_shard = crate::types::ShardId::new(source.shard_id);
+            let source_shard_writable = crate::shard::GLOBAL_SHARD_ROUTER
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .is_none_or(|router| router.is_writable(source_shard));
+            if !source_shard_writable {
+                return Err(HarvestError::Config(format!(
+                    "source execution {source_exec_id} lives on shard {source_shard}, which \
+                     is not currently accepting new workflows; it is being drained — re-run \
+                     is not supported while its shard is non-writable"
+                )));
+            }
+
             let target_wf_id = request
                 .workflow_id_override
                 .unwrap_or(source.workflow_id.as_str());
@@ -4789,17 +4823,16 @@ pub async fn rerun_workflow_execution(
                     .map(|router| {
                         router.pick_for_new_workflow(&source.workflow_name, target_wf_id)
                     });
-                if let Some(expected) = expected_shard {
-                    let source_shard = crate::types::ShardId::new(source.shard_id);
-                    if expected != source_shard {
-                        return Err(HarvestError::Config(format!(
-                            "workflow_id override '{target_wf_id}' routes to shard {expected} \
-                             but the source execution {source_exec_id} lives on shard \
-                             {source_shard}; cross-shard workflow_id overrides are not \
-                             supported — re-run without an override, or start a fresh \
-                             execution directly under the target workflow_id"
-                        )));
-                    }
+                if let Some(expected) = expected_shard
+                    && expected != source_shard
+                {
+                    return Err(HarvestError::Config(format!(
+                        "workflow_id override '{target_wf_id}' routes to shard {expected} \
+                         but the source execution {source_exec_id} lives on shard \
+                         {source_shard}; cross-shard workflow_id overrides are not \
+                         supported — re-run without an override, or start a fresh \
+                         execution directly under the target workflow_id"
+                    )));
                 }
             }
 
@@ -4935,7 +4968,7 @@ pub async fn rerun_workflow_execution(
                 workflow_name: &source.workflow_name,
                 workflow_id: target_wf_id,
                 // Stay on the source's shard: a re-run is the same logical work.
-                exec_id: ExecutionId::new_for_shard(crate::types::ShardId::new(source.shard_id)),
+                exec_id: ExecutionId::new_for_shard(source_shard),
                 // VERBATIM — never decoded. `source.input` is byte-for-byte what
                 // the original start wrote, so decoding here would corrupt an
                 // encrypting deployment's re-run (and re-encrypt on write).

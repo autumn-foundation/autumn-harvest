@@ -1054,6 +1054,198 @@ async fn rerun_malformed_body_audits_via_source_shard_when_default_shard_is_unav
     assert_eq!(rows[0].status, "failed");
 }
 
+/// A router matching [`two_shard_router`]'s shard SET but with shard 0
+/// removed from `writable_shards` — a deployment mid-drain of shard 0.
+fn two_shard_router_shard0_drained() -> ShardRouter {
+    ShardRouter::new(
+        vec![
+            autumn_harvest::types::ShardId::new(0),
+            autumn_harvest::types::ShardId::new(1),
+        ],
+        vec![autumn_harvest::types::ShardId::new(1)],
+        autumn_harvest::types::ShardId::new(0),
+    )
+}
+
+/// The mirror image: shard 1 drained, shard 0 (where every test source in
+/// this section lives) stays writable — the negative control proving the
+/// gate below checks the SOURCE's own shard, not "is any shard in the
+/// deployment drained".
+fn two_shard_router_shard1_drained() -> ShardRouter {
+    ShardRouter::new(
+        vec![
+            autumn_harvest::types::ShardId::new(0),
+            autumn_harvest::types::ShardId::new(1),
+        ],
+        vec![autumn_harvest::types::ShardId::new(0)],
+        autumn_harvest::types::ShardId::new(0),
+    )
+}
+
+/// Variant of [`build_multi_shard_app`] taking an explicit router, for tests
+/// that need a non-default writable-shard configuration (a drained shard).
+fn build_multi_shard_app_with_router(
+    pool0: &DbPool,
+    pool1: &DbPool,
+    infos: Vec<WorkflowInfo>,
+    router: ShardRouter,
+) -> HarvestApiApp {
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(autumn_harvest::types::ShardId::new(0), pool0.clone());
+    pools.insert(autumn_harvest::types::ShardId::new(1), pool1.clone());
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(
+        autumn_harvest::shard::ShardedDbPool::from_map(
+            pools,
+            autumn_harvest::types::ShardId::new(0),
+        ),
+    ));
+    let registry = HandlerRegistry::new(infos, vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("rerun-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router,
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Codex review finding (PR #1152, P1): the DEFAULT (no `workflow_id`
+/// override) rerun path constructs the new execution's id unconditionally
+/// via `ExecutionId::new_for_shard(source.shard_id)`, with NO check that
+/// `source.shard_id` is still in `writable_shards`. Unlike the override
+/// path — guarded above by the shard-consistency check, which can only ever
+/// resolve to a WRITABLE shard via `ShardRouter::pick_for_new_workflow` —
+/// the default path had no protection at all: an operator draining shard 0
+/// (removing it from `writable_shards` so it stops accepting new
+/// admissions) would still see re-runs of shard-0 work silently land
+/// brand-new executions there. A re-run is a fresh admission — exactly what
+/// `writable_shards` exists to gate (`docs/sharding.md`: "placing new work
+/// on a shard the operator is draining contradicts the drain"). Fixed by
+/// rejecting a re-run whose source lives on a non-writable shard.
+#[tokio::test]
+async fn rerun_is_rejected_when_the_source_shard_has_been_drained() {
+    let (admin, _guard) = setup_shard_server().await;
+    let url0 = create_shard_db(&admin, &unique("rerun_drain0").replace('-', "_")).await;
+    let url1 = create_shard_db(&admin, &unique("rerun_drain1").replace('-', "_")).await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+    let mut conn0 = AsyncPgConnection::establish(&url0)
+        .await
+        .expect("connect shard 0");
+    let mut conn1 = AsyncPgConnection::establish(&url1)
+        .await
+        .expect("connect shard 1");
+
+    let wf = "rr_drained_wf";
+    let source_wf_id = unique("rr-drained-src");
+    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
+
+    // Shard 0 (where the source lives) is readable but NOT writable —
+    // deliberately drained mid-transition.
+    let app = build_multi_shard_app_with_router(
+        &pool0,
+        &pool1,
+        vec![plain_info(wf)],
+        two_shard_router_shard0_drained(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    let msg = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        msg.to_lowercase().contains("shard") && msg.to_lowercase().contains("drain"),
+        "error should name the drained shard: {msg}"
+    );
+
+    // No new execution was created anywhere — neither shard.
+    let on_shard0 = load_execs_for_key(&mut conn0, wf, &source_wf_id).await;
+    let on_shard1 = load_execs_for_key(&mut conn1, wf, &source_wf_id).await;
+    assert_eq!(
+        on_shard0.len(),
+        1,
+        "only the original source row should exist on shard 0: {on_shard0:?}"
+    );
+    assert!(
+        on_shard1.is_empty(),
+        "nothing should have landed on shard 1: {on_shard1:?}"
+    );
+
+    // The source is untouched (never sealed).
+    let source_row = load_exec(&mut conn0, &source).await;
+    assert_eq!(source_row.state, "COMPLETED");
+
+    let rows = audit_rows(&mut conn0, "workflow.rerun", &source).await;
+    assert!(
+        rows.iter().any(|r| r.status == "failed"),
+        "expected a failed audit row: {rows:?}"
+    );
+}
+
+/// Negative control for the fix above: draining a DIFFERENT shard (shard 1)
+/// while the source's own shard (0) stays writable must not affect the
+/// re-run — the gate must check the SOURCE's specific shard, not "is any
+/// shard in the deployment drained".
+#[tokio::test]
+async fn rerun_still_succeeds_when_a_different_shard_is_drained() {
+    let (admin, _guard) = setup_shard_server().await;
+    let url0 = create_shard_db(&admin, &unique("rerun_okdrain0").replace('-', "_")).await;
+    let url1 = create_shard_db(&admin, &unique("rerun_okdrain1").replace('-', "_")).await;
+    let pool0 = build_pool(&url0);
+    let pool1 = build_pool(&url1);
+    let mut conn0 = AsyncPgConnection::establish(&url0)
+        .await
+        .expect("connect shard 0");
+
+    let wf = "rr_okdrain_wf";
+    let source_wf_id = unique("rr-okdrain-src");
+    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
+
+    let app = build_multi_shard_app_with_router(
+        &pool0,
+        &pool1,
+        vec![plain_info(wf)],
+        two_shard_router_shard1_drained(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    let rows = load_execs_for_key(&mut conn0, wf, &source_wf_id).await;
+    assert_eq!(rows.len(), 2, "the source plus the fresh re-run: {rows:?}");
+}
+
 // ── R-12 .. R-41 ─────────────────────────────────────────────────────────────
 
 /// R-12: a re-run of a COMPLETED source creates a brand-new execution with a

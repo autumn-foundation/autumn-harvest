@@ -1452,7 +1452,7 @@
         },
         {
           "status": 409,
-          "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source input has been erased (issue #495) and no explicit input was supplied; or the target business key is currently held by a different live execution (including a workflow_id override that is already in use)."
+          "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source already has an automatic workflow-level retry successor (issue #523 — re-run the chain's latest attempt instead); source input has been erased (issue #495) and no explicit input was supplied; the source's shard has been drained out of writable_shards (this entire operation is pinned to the source's physical shard — a re-run can only ever land there, so an operator draining that shard blocks new re-runs of its work just like any other new admission); a workflow_id override routes to a DIFFERENT shard than the source (cross-shard workflow_id overrides are not supported — re-run without an override, or start a fresh execution directly under the target workflow_id); source is schedule-attributed and sealing it would break the schedule's carryover and run-history lineage (issues #488 / #534 — re-run with an explicit workflow_id override instead, which never seals the source); the target business key is currently held by a different live execution (including a workflow_id override that is already in use); or a stored context_headers / workflow_retry_policy value on the source cannot be parsed as JSON (a faithful clone must never silently drop a field)."
         },
         {
           "status": 413,
