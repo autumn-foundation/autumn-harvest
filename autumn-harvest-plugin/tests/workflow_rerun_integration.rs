@@ -114,6 +114,32 @@ fn plain_info(name: &'static str) -> WorkflowInfo {
     }
 }
 
+/// The published input schema used by the issue #373 override-validation tests:
+/// an object requiring an integer `order`.
+fn order_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["order"],
+        "properties": { "order": { "type": "integer" } }
+    })
+}
+
+/// A workflow whose `WorkflowInfo` publishes [`order_input_schema`].
+fn schema_info(name: &'static str) -> WorkflowInfo {
+    WorkflowInfo {
+        input_schema: Some(order_input_schema),
+        ..plain_info(name)
+    }
+}
+
+/// A workflow carrying a per-key concurrency policy (issue #247).
+fn concurrency_info(name: &'static str, key_expr: &'static str, limit: u32) -> WorkflowInfo {
+    WorkflowInfo {
+        concurrency: Some(autumn_harvest::concurrency::ConcurrencyPolicy { key_expr, limit }),
+        ..plain_info(name)
+    }
+}
+
 fn api_state_with(
     infos: Vec<WorkflowInfo>,
     pool: &DbPool,
@@ -139,6 +165,50 @@ fn api_state_with(
 fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     harvest_api_router(api_state_with(infos, pool, true))
         .with_state(AppState::for_test().with_profile("test"))
+}
+
+/// Extra knobs a few tests need beyond `build_app`'s defaults.
+#[derive(Default)]
+struct AppOpts {
+    /// Lower the effective workflow-input byte cap (issue #252) so an oversized
+    /// payload can be exercised without building a multi-megabyte JSON string.
+    max_workflow_input_bytes: Option<u64>,
+    /// Names to register as unified DAGs. `HarvestApiRuntime::new` folds a
+    /// schedule's `dag_name` into `registered_dag_names`, which is exactly what
+    /// `is_registered_dag` consults.
+    dag_names: Vec<&'static str>,
+}
+
+fn build_app_with(pool: &DbPool, infos: Vec<WorkflowInfo>, opts: AppOpts) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let mut registry = HandlerRegistry::new(infos, vec![]);
+    if let Some(cap) = opts.max_workflow_input_bytes {
+        registry = registry.with_payload_caps(cap, cap, cap, cap);
+    }
+    let schedules: Vec<autumn_harvest::WorkflowSchedule> = opts
+        .dag_names
+        .iter()
+        .map(|name| autumn_harvest::WorkflowSchedule {
+            dag_name: Some((*name).to_string()),
+            ..autumn_harvest::WorkflowSchedule::new(
+                (*name).to_string(),
+                autumn_harvest::Schedule::Manual,
+            )
+        })
+        .collect();
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(schedules),
+        Some("rerun-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::default(),
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
 /// An app whose admin-auth boundary is NOT installed, so the `require_admin`
@@ -231,6 +301,8 @@ struct Seed {
     completion_callbacks: Option<Value>,
     context_headers: Option<Value>,
     workflow_retry_policy: Option<Value>,
+    chain_execution_timeout_secs: Option<i64>,
+    chain_deadline_at: Option<DateTime<Utc>>,
     schedule_id: Option<uuid::Uuid>,
     scheduled_for: Option<DateTime<Utc>>,
     origin: Option<&'static str>,
@@ -264,14 +336,16 @@ async fn seed_execution(
              output, error, queue_name, memo, search_attrs,
              execution_timeout, sla, owner, runbook_url, severity,
              completion_callbacks, context_headers, workflow_retry_policy,
-             schedule_id, scheduled_for, origin)
+             schedule_id, scheduled_for, origin,
+             chain_execution_timeout, chain_deadline_at)
          VALUES ($1, $2, 0, $3, $4, $5, $6,
                  $7, $8, COALESCE($9, 'default'), $10, $11,
                  make_interval(secs => $12::double precision),
                  make_interval(secs => $13::double precision),
                  $14, $15, $16,
                  $17, $18, $19,
-                 $20, $21, $22)
+                 $20, $21, $22,
+                 make_interval(secs => $23::double precision), $24)
          RETURNING id",
     )
     .bind::<Text, _>(workflow_name)
@@ -296,6 +370,8 @@ async fn seed_execution(
     .bind::<Nullable<diesel::sql_types::Uuid>, _>(seed.schedule_id)
     .bind::<Nullable<Timestamptz>, _>(seed.scheduled_for)
     .bind::<Nullable<Text>, _>(seed.origin)
+    .bind::<Nullable<diesel::sql_types::BigInt>, _>(seed.chain_execution_timeout_secs)
+    .bind::<Nullable<Timestamptz>, _>(seed.chain_deadline_at)
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -376,6 +452,16 @@ struct ExecRow {
     first_exec_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     workflow_attempt: i32,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    context_headers: Option<Value>,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    workflow_retry_policy: Option<Value>,
+    #[diesel(sql_type = Nullable<diesel::sql_types::BigInt>)]
+    chain_execution_timeout_secs: Option<i64>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    chain_deadline_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = Nullable<Text>)]
+    concurrency_key: Option<String>,
 }
 
 const EXEC_SELECT: &str = "SELECT state, workflow_id, queue_name, input, output, error,
@@ -385,7 +471,10 @@ const EXEC_SELECT: &str = "SELECT state, workflow_id, queue_name, input, output,
         owner, runbook_url, severity, completion_callbacks,
         start_source, start_source_ref, started_by,
         schedule_id, scheduled_for, origin,
-        continued_from_exec_id, first_exec_id, workflow_attempt
+        continued_from_exec_id, first_exec_id, workflow_attempt,
+        context_headers, workflow_retry_policy,
+        EXTRACT(EPOCH FROM chain_execution_timeout)::bigint AS chain_execution_timeout_secs,
+        chain_deadline_at, concurrency_key
      FROM harvest_workflow_executions ";
 
 async fn load_exec(conn: &mut AsyncPgConnection, exec_id: &str) -> ExecRow {
@@ -452,17 +541,40 @@ async fn events_of(conn: &mut AsyncPgConnection, exec_id: &str) -> Vec<EventRow>
     .unwrap()
 }
 
+/// Task-queue rows for one execution, so a re-run can be shown to be actually
+/// DISPATCHABLE (a new execution row with no queued task would never run).
+#[derive(diesel::QueryableByName, Debug)]
+struct TaskRow {
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = Text)]
+    task_type: String,
+}
+
+async fn tasks_of(conn: &mut AsyncPgConnection, exec_id: &str) -> Vec<TaskRow> {
+    diesel::sql_query(
+        "SELECT state, task_type FROM harvest_task_queue
+         WHERE workflow_exec_id = $1::uuid ORDER BY created_at",
+    )
+    .bind::<Text, _>(exec_id)
+    .get_results(conn)
+    .await
+    .expect("load tasks")
+}
+
 #[derive(diesel::QueryableByName)]
 struct AuditRow {
     #[diesel(sql_type = Text)]
     actor: String,
     #[diesel(sql_type = Text)]
     status: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    error_summary: Option<String>,
 }
 
 async fn audit_rows(conn: &mut AsyncPgConnection, operation: &str, target: &str) -> Vec<AuditRow> {
     diesel::sql_query(
-        "SELECT actor, status FROM harvest_audit_log
+        "SELECT actor, status, error_summary FROM harvest_audit_log
          WHERE operation = $1 AND target_id = $2 ORDER BY occurred_at",
     )
     .bind::<Text, _>(operation)
@@ -1465,4 +1577,132 @@ async fn rerun_sets_no_continue_as_new_backlinks() {
         "a re-run begins a fresh retry chain"
     );
     assert_eq!(event_count(&mut conn, &new_id).await, 1);
+}
+
+/// R-42 (issue #373): an explicitly supplied `input` OVERRIDE is validated
+/// against the workflow's published input schema, and a violation is rejected
+/// at the edge with the standard `{error, violations}` body — nothing is
+/// started and the source is not sealed.
+#[tokio::test]
+async fn rerun_input_override_violating_schema_is_rejected() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_schema_override_wf";
+    let app = build_app(&pool, vec![schema_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-schema-override");
+    // The SOURCE input satisfies the schema; only the override violates it.
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(json!({"order": 42})),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({"input": {"order": "not-an-integer"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], json!("input validation failed"));
+    let violations = body["violations"].as_array().expect("violations array");
+    assert!(!violations.is_empty(), "at least one violation: {body}");
+    assert!(
+        violations[0].get("message").is_some() && violations[0].get("field_path").is_some(),
+        "issue #373 violation shape {{message, field_path}}: {body}"
+    );
+
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "a schema-rejected re-run must start nothing"
+    );
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "FAILED",
+        "a schema-rejected re-run must not seal the source"
+    );
+
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert_eq!(rows.len(), 1, "the rejection must be audited");
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].actor, TEST_ACTOR);
+}
+
+/// R-43 (issue #373): the VERBATIM CLONE is deliberately NOT validated. A run
+/// started under an older or looser schema must stay re-runnable even after the
+/// schema is tightened — otherwise tightening a schema would silently strand
+/// every historical run of that workflow type.
+#[tokio::test]
+async fn rerun_does_not_validate_the_cloned_input() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_schema_clone_wf";
+    let app = build_app(&pool, vec![schema_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-schema-clone");
+    // Violates the CURRENT schema (no `order`) — as if it were started before
+    // the schema was published/tightened.
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(json!({"legacy": true})),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a clone is never re-validated: {body}"
+    );
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        load_exec(&mut conn, &new_id).await.input,
+        json!({"legacy": true}),
+        "the schema-violating input is cloned byte-for-byte"
+    );
+}
+
+/// R-44 (issue #373): an override that SATISFIES the schema is accepted, so the
+/// validation gate cannot be passing vacuously.
+#[tokio::test]
+async fn rerun_input_override_satisfying_schema_is_accepted() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_schema_ok_wf";
+    let app = build_app(&pool, vec![schema_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-schema-ok");
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "FAILED",
+        Seed {
+            input: Some(json!({"order": 1})),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({"input": {"order": 7}})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(load_exec(&mut conn, &new_id).await.input, json!({"order": 7}));
 }

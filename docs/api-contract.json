@@ -1440,7 +1440,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); or the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract."
+          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract; or an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body. Only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable."
         },
         {
           "status": 401,
@@ -1453,6 +1453,10 @@
         {
           "status": 409,
           "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source input has been erased (issue #495) and no explicit input was supplied; or the target business key is currently held by a different live execution (including a workflow_id override that is already in use)."
+        },
+        {
+          "status": 413,
+          "description": "The new run's input exceeds the effective workflow-input byte cap (issue #252). Fires on an oversized `input` override, and — notably — can also fire on the VERBATIM CLONE of a source that started successfully under a larger cap, if an operator has since LOWERED `max_workflow_input_bytes` (globally or for this workflow type). In that case the source is re-runnable only by supplying a smaller `input` override or by raising the cap back."
         },
         {
           "status": 503,

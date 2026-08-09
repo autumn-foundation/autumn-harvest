@@ -4535,7 +4535,9 @@ pub struct RerunRequest<'a> {
     /// Business-key override. `None` = reuse the source's `workflow_id`.
     pub workflow_id_override: Option<&'a str>,
     /// Operator attribution stamped on the new run's `started_by` column
-    /// (issue #740). Re-run is the FIRST writer of this column.
+    /// (issue #740). Re-run joins the existing actor-attribution writers
+    /// (the plain start, signal-/update-with-start, batch start, manual
+    /// schedule trigger, and the Vantage UI trigger all stamp it too).
     pub started_by: Option<&'a str>,
     /// Pre-resolved per-key concurrency group key (issue #247), resolved by the
     /// caller from the target `WorkflowInfo` against the EFFECTIVE input.
@@ -4569,8 +4571,11 @@ pub struct RerunOutcome {
     /// The source execution this run was re-run from.
     pub reran_from: ExecutionId,
     /// The source's terminal state as observed BEFORE any sealing. Once the
-    /// source is sealed to `CONTINUED_AS_NEW` this is the ONLY surviving
-    /// record of what it actually finished as.
+    /// source is sealed to `CONTINUED_AS_NEW` this — together with the
+    /// `workflow.rerun` audit row that carries it — is the only ROW-level
+    /// record of what it actually finished as. The source's `harvest_events`
+    /// history survives the seal untouched, so the terminal event itself is
+    /// still the authoritative forensic record.
     pub source_prior_state: String,
     /// Whether the source row was sealed to `CONTINUED_AS_NEW` to free its
     /// business key for the new run.
