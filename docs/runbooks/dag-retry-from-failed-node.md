@@ -121,7 +121,8 @@ genuinely unwound:
 
 1. a `saga_compensat*` marker in the run's recorded history,
 2. a recorded activity dispatch whose **input is a compensation envelope**
-   (`{"dag_compensate": …, "input": …, "output": …}`), or
+   (`{"dag_compensate": …, "input": …, "output": …}`) **and** whose name is not
+   one of the DAG's declared nodes, or
 3. a recorded dispatch whose **name** is one of that DAG's declared compensator
    activities.
 
@@ -133,7 +134,11 @@ because this endpoint resolves against the **currently registered** DAG
 definition (see the limitation below), a deployment that renamed or removed a
 compensator after such a run would defeat signal 3 alone — signal 2 reads the
 envelope recorded in history and never consults the registry, so it survives the
-rename.
+rename. The name condition on signal 2 is what keeps it from misfiring: a
+forward node's input is arbitrary user data (a mapped cell, or a bound upstream
+output) and may legitimately carry those three keys, but a forward dispatch is
+always named after a declared node, and a compensator can never share a node's
+name.
 
 Because signal 2 reads a payload-bearing field, the endpoint loads the run's
 history **inflated and codec-decoded**. Without that, an oversized compensation

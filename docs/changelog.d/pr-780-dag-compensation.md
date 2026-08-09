@@ -668,3 +668,39 @@ Passing the runtime's real codecs (rather than the identity default
 `load_history` uses) additionally makes the endpoint work at all on a
 codec-encrypting deployment, where it previously returned an error. No payload is
 surfaced to the caller — the plan carries only node names and an event id.
+
+### P2 — the envelope signal must corroborate against the dispatch name
+
+`is_compensation_envelope` matched on shape alone (exactly the three keys
+`dag_compensate`/`input`/`output`, with a string `dag_compensate`). That shape is
+reachable by accident: a mapped cell or an `input_from` binding hands a node the
+**raw upstream output**, which is arbitrary user data. A forward activity whose
+input happened to carry those keys was therefore classified as a compensation
+dispatch — 409-ing a perfectly retryable run, and doing so even for a DAG that
+declares **no compensators at all** and so cannot possibly have unwound.
+
+RED evidence (a non-compensating `a → b → c → d` DAG whose `a` input is
+`{"dag_compensate": "looks_like_a_node", "input": 1, "output": 2}`):
+
+```
+a_forward_dispatch_mimicking_the_envelope_is_not_an_unwind
+  panicked: a non-compensating DAG must stay retryable: CompensatedRun
+```
+
+Signal 2 now corroborates against the dispatch's **name**: an envelope-shaped
+input counts only when the dispatch is *not* named after a declared node. Every
+forward dispatch is named after a node, and
+`DagBuildError::CompensatorNameCollidesWithNode` guarantees at build time that no
+compensator shares a node's name — so the corroboration rejects every forward
+dispatch while costing nothing.
+
+Crucially it preserves the rename-resilience signal 2 exists for: a compensator
+that was renamed, or **removed outright**, is still absent from the node set and
+still detected. Pinned by
+`a_genuine_unwind_is_detected_even_after_all_compensators_were_removed` (the
+definition declares zero compensators, yet the marker-less unwind is still
+rejected) alongside the existing rename test.
+
+The envelope's `dag_compensate` *value* is deliberately left unchecked. It names
+a forward node, so validating it against the definition would reintroduce exactly
+the registry dependence signal 2 was introduced to escape.
