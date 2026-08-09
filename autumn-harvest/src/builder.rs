@@ -585,6 +585,25 @@ pub enum HarvestBuilderError {
         signal: String,
     },
 
+    /// A classic (non-unified) DAG declares a node compensator (issue #780).
+    /// Compensation lowers onto the unified workflow-handler execution path
+    /// (`run_unified_dag`'s terminal-failure `Saga` unwind); the classic DAG
+    /// executor has no unwind step, so the compensator would silently never
+    /// run. Enable the `unified-dag-execution` feature (on by default) so the
+    /// `#[dag]` macro emits the workflow handler that can run compensations.
+    #[error(
+        "classic DAG '{dag}' declares compensator '{compensate}' on task '{task}' but is not \
+         unified (workflow_handler is None); compensation requires the unified-dag-execution path"
+    )]
+    DagCompensationRequiresUnifiedExecution {
+        /// DAG containing the compensated node.
+        dag: String,
+        /// The node declaring the compensator.
+        task: String,
+        /// The declared compensator activity name.
+        compensate: String,
+    },
+
     /// A workflow declares `ConcurrencyPolicy { limit: 0 }`, which makes the
     /// saturation check `(SELECT COUNT(*) ...) < 0` always false, permanently
     /// deferring every start for that workflow.
@@ -2020,6 +2039,7 @@ impl HarvestBuilder {
         )?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
+        validate_classic_dags_have_no_compensators(&self.dags)?;
         validate_dag_schedules(&self.dags)?;
         validate_activity_rate_limits(&self.activities)?;
         #[cfg(feature = "wasm-activities")]
@@ -2144,6 +2164,18 @@ fn validate_dags_do_not_use_local_activities(
                     activity: task.activity_name.clone(),
                 });
             }
+            // A compensator (issue #780) is dispatched through the same DAG
+            // activity-queue lowering as a forward node, so a local activity is
+            // just as invalid there. The error names the COMPENSATOR, not the
+            // forward node that declares it.
+            if let Some(compensate) = &task.compensate
+                && local_activities.contains(compensate.as_str())
+            {
+                return Err(HarvestBuilderError::LocalActivityInDag {
+                    dag: dag.name.to_string(),
+                    activity: compensate.clone(),
+                });
+            }
         }
     }
 
@@ -2171,6 +2203,37 @@ fn validate_classic_dags_have_no_signal_gates(dags: &[DagInfo]) -> Result<(), Ha
                     dag: dag.name.to_string(),
                     signal: gate.signal_name.clone(),
                 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a node compensator on a **classic** (non-unified) DAG
+/// (`workflow_handler.is_none()`) — issue #780.
+///
+/// Compensation lowers onto the unified workflow-handler path
+/// (`run_unified_dag`'s terminal-failure `Saga` unwind); the classic DAG
+/// executor has no unwind step, so the compensator would silently never run —
+/// the worst possible failure mode for an undo. A compensator on a unified DAG
+/// (`workflow_handler.is_some()`, the default `#[dag]` output) is allowed.
+fn validate_classic_dags_have_no_compensators(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        if dag.workflow_handler.is_some() {
+            continue;
+        }
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if let Some(compensate) = &task.compensate {
+                return Err(
+                    HarvestBuilderError::DagCompensationRequiresUnifiedExecution {
+                        dag: dag.name.to_string(),
+                        task: task.activity_name.clone(),
+                        compensate: compensate.clone(),
+                    },
+                );
             }
         }
     }

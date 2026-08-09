@@ -50,7 +50,7 @@ use serde_json::{Value, json};
 
 /// The unbound-node forward input shape when the DAG trigger input is a
 /// NON-object (`run_unified_dag` wraps it under `conf` and injects `dag_task`).
-fn wrapped_dag_task_input(conf: Value, task: &str) -> Value {
+fn wrapped_dag_task_input(conf: &Value, task: &str) -> Value {
     json!({ "conf": conf, "dag_task": task })
 }
 
@@ -281,7 +281,7 @@ async fn compensator_receives_recorded_input_and_output() {
         scheduled_input(outcome.events(), "env_undo_root"),
         json!({
             "dag_compensate": "env_root",
-            "input": wrapped_dag_task_input(trigger, "env_root"),
+            "input": wrapped_dag_task_input(&trigger, "env_root"),
             "output": { "reservation": "rsv-1" },
         }),
         "the compensator envelope must carry the node identity, its resolved \
@@ -538,7 +538,7 @@ async fn m_undo_process(_ctx: &ActivityContext, e: Value) -> Result<Value, Strin
     Ok(Value::Null)
 }
 
-/// CollectAll mapped node: the node SUCCEEDS even with failed cells, so it is
+/// `CollectAll` mapped node: the node SUCCEEDS even with failed cells, so it is
 /// compensated exactly once at node granularity.
 #[dag]
 fn mapped_collect_comp_dag(dag: &mut DagBuilder) {
@@ -551,7 +551,7 @@ fn mapped_collect_comp_dag(dag: &mut DagBuilder) {
     let _fail = dag.activity(m_fail).upstream(&process);
 }
 
-/// FailFast mapped node: a single failed cell FAILS the node, so it is not
+/// `FailFast` mapped node: a single failed cell FAILS the node, so it is not
 /// compensated at all.
 #[dag]
 fn mapped_failfast_comp_dag(dag: &mut DagBuilder) {
@@ -612,7 +612,9 @@ async fn mapped_node_compensation_is_node_granular_not_cell_granular() {
     let cells = envelope
         .get("output")
         .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("the mapped node's output must be the cells array, got {envelope}"));
+        .unwrap_or_else(|| {
+            panic!("the mapped node's output must be the cells array, got {envelope}")
+        });
     assert_eq!(
         cells.len(),
         2,
@@ -706,7 +708,7 @@ fn cancel_forward_history() -> Vec<WorkflowEvent> {
         WorkflowEvent::ActivityScheduled {
             activity_id: ok,
             name: "c_ok".into(),
-            input: wrapped_dag_task_input(Value::Null, "c_ok"),
+            input: wrapped_dag_task_input(&Value::Null, "c_ok"),
             queue: String::new(),
         },
         WorkflowEvent::ActivityCompleted {
@@ -716,7 +718,7 @@ fn cancel_forward_history() -> Vec<WorkflowEvent> {
         WorkflowEvent::ActivityScheduled {
             activity_id: bad,
             name: "c_bad".into(),
-            input: wrapped_dag_task_input(Value::Null, "c_bad"),
+            input: wrapped_dag_task_input(&Value::Null, "c_bad"),
             queue: String::new(),
         },
         WorkflowEvent::ActivityFailed {
@@ -820,7 +822,7 @@ async fn cancel_landing_mid_unwind_terminates_and_never_nd_blocks() {
             name: "c_undo_ok".into(),
             input: json!({
                 "dag_compensate": "c_ok",
-                "input": wrapped_dag_task_input(Value::Null, "c_ok"),
+                "input": wrapped_dag_task_input(&Value::Null, "c_ok"),
                 "output": "ok",
             }),
             queue: String::new(),
@@ -1303,10 +1305,10 @@ fn expected_unwind(upstreams: &[&[usize]; 5], fail_idx: usize) -> Vec<String> {
     let succeeded = succeeded_mask(upstreams, fail_idx);
     let mut pushed: Vec<String> = Vec::new();
     for i in 0..5 {
-        if succeeded[i] {
-            if let Some(comp) = FULFILLMENT_COMPENSATORS[i] {
-                pushed.push(comp.to_string());
-            }
+        if succeeded[i]
+            && let Some(comp) = FULFILLMENT_COMPENSATORS[i]
+        {
+            pushed.push(comp.to_string());
         }
     }
     pushed.reverse();
@@ -1420,10 +1422,26 @@ async fn fulfillment_dag_leaves_zero_uncompensated_side_effects_across_1000_runs
         );
 
         // (c) The produced history replays deterministically.
+        //
+        // A failing DAG's handler returns `Err("one or more DAG tasks failed")`,
+        // and `ReplayStatus::ReplaySucceeded` is reserved for a handler that
+        // returns `Ok` — so *every* failing-DAG history (compensating or not)
+        // replays to `ReplayStatus::WorkflowFailed`, which is precisely
+        // "reproduced the same terminal error with ZERO divergence". Pinning
+        // the exact error rules out `NonDeterminismDetected`, matching the
+        // repo's established failing-DAG replay shape
+        // (`dag_unified_tests.rs`, `dag_input_binding_tests.rs`,
+        // `dag_mapping_tests.rs`, `dag_signal_gate_tests.rs`).
         let report = outcome.replay_check(handler).await;
         assert!(
-            matches!(report.status, ReplayStatus::ReplaySucceeded),
-            "{context}: a compensating history must replay deterministically:\n{report}"
+            matches!(
+                report.status,
+                ReplayStatus::WorkflowFailed { ref error, .. }
+                    if error == "one or more DAG tasks failed"
+            ),
+            "{context}: a compensating history must replay deterministically \
+             (WorkflowFailed with the original DAG error, never \
+             NonDeterminismDetected):\n{report}"
         );
     }
 }

@@ -644,6 +644,19 @@ fn dag_unregistered_activity_failures<'a>(
                     task.activity_name
                 ));
             }
+            // A node's compensator (issue #780) is dispatched through the same
+            // DAG activity-queue lowering on the terminal-failure unwind, so an
+            // unregistered compensator must be flagged BEFORE rollout —
+            // otherwise the miss only surfaces mid-unwind, exactly when the
+            // state is already dangling.
+            if let Some(compensate) = &task.compensate
+                && !is_registered_activity(compensate)
+            {
+                failures.push(format!(
+                    "dag '{dag_name}' references unregistered compensator '{compensate}' for task '{}'",
+                    task.activity_name
+                ));
+            }
         }
     }
     failures
@@ -1436,6 +1449,7 @@ mod tests {
             condition: None,
             signal: None,
             input_from: None,
+            compensate: None,
         }
     }
 

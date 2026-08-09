@@ -201,6 +201,57 @@ impl<'ctx> Saga<'ctx> {
         }
     }
 
+    /// Register a compensation **without** running a forward step (issue #780).
+    ///
+    /// [`step`](Self::step) couples "run the forward action" to "register its
+    /// undo". The declarative DAG unwind already knows from recorded history
+    /// which nodes succeeded, so it must register their compensations without
+    /// re-executing them — that is what this method is for.
+    ///
+    /// The closure is **stored, not invoked**: it runs only when an unwind is
+    /// invoked ([`compensate_all`](Self::compensate_all),
+    /// [`compensate_all_after`](Self::compensate_all_after), or a
+    /// [`step`](Self::step) failure), in LIFO registration order.
+    ///
+    /// The same idempotency and replay-determinism contracts as
+    /// [`step`](Self::step) apply: compensations are re-registered on every
+    /// replay, so the compensating **activity** must be idempotent and the
+    /// closure body itself must contain no non-deterministic side effect.
+    pub(crate) fn push_compensation<C, Fut>(&mut self, compensate: C)
+    where
+        C: FnOnce() -> Fut + Send + 'ctx,
+        Fut: Future<Output = HarvestResult<()>> + Send + 'ctx,
+    {
+        self.compensations
+            .push(Box::new(move || compensate().boxed()));
+    }
+
+    /// Run all pending compensations in reverse registration order, reporting
+    /// `original` as the error that triggered the unwind (issue #780).
+    ///
+    /// Identical to [`compensate_all`](Self::compensate_all) except that the
+    /// caller supplies the original error rather than the fixed
+    /// `"manual compensation requested"` string — so a DAG unwind's
+    /// [`HarvestError::SagaCompensationFailed`] carries the real
+    /// `"one or more DAG tasks failed"` cause.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::SagaCompensationFailed`] if any compensation
+    /// fails. All pending compensations are still attempted before returning.
+    pub(crate) async fn compensate_all_after(
+        &mut self,
+        original: impl Into<String>,
+    ) -> HarvestResult<()> {
+        match self.run_compensations().await {
+            Ok(()) => Ok(()),
+            Err(compensation_errors) => Err(HarvestError::SagaCompensationFailed {
+                original: original.into(),
+                compensation_errors,
+            }),
+        }
+    }
+
     /// Run all pending compensations in reverse registration order.
     ///
     /// Call this explicitly when the workflow needs to abort after successful
@@ -223,13 +274,8 @@ impl<'ctx> Saga<'ctx> {
     /// Returns [`HarvestError::SagaCompensationFailed`] if any compensation
     /// fails. All pending compensations are still attempted before returning.
     pub async fn compensate_all(&mut self) -> HarvestResult<()> {
-        match self.run_compensations().await {
-            Ok(()) => Ok(()),
-            Err(compensation_errors) => Err(HarvestError::SagaCompensationFailed {
-                original: "manual compensation requested".into(),
-                compensation_errors,
-            }),
-        }
+        self.compensate_all_after("manual compensation requested")
+            .await
     }
 
     async fn rollback_after(&mut self, original: HarvestError) -> HarvestError {

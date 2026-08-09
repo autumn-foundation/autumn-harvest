@@ -164,6 +164,7 @@ struct PendingDagTask {
     condition: Option<DagCondition>,
     signal: Option<DagSignalGate>,
     input_from: Option<DagInputBinding>,
+    compensate: Option<String>,
 }
 
 impl fmt::Debug for PendingDagTask {
@@ -180,6 +181,7 @@ impl fmt::Debug for PendingDagTask {
             .field("condition", &self.condition)
             .field("signal", &self.signal)
             .field("input_from", &self.input_from)
+            .field("compensate", &self.compensate)
             .finish()
     }
 }
@@ -219,6 +221,24 @@ pub struct DagTask {
     /// [`DagInputBinding::Merged`] — instead of the trigger-input + `dag_task`
     /// wrapper the unbound path uses.
     pub input_from: Option<DagInputBinding>,
+    /// Optional compensator activity name (issue #780).
+    ///
+    /// Opt-in per node, and **unified-dag-execution only** (a classic DAG has no
+    /// unwind step, so a compensator there is rejected at
+    /// `HarvestBuilder::try_build`). When the DAG reaches a terminal failure
+    /// (`Err("one or more DAG tasks failed")`), the engine dispatches this
+    /// activity for each node that **completed successfully**, in **reverse
+    /// topological order** (LIFO over the levels-forward / ascending-index push
+    /// order) through the existing [`Saga`](crate::saga::Saga) unwind, using the
+    /// ordinary activity lowering on the compensated node's own queue.
+    ///
+    /// The compensator receives the fixed envelope
+    /// `{"dag_compensate": <node>, "input": <the node's resolved forward
+    /// input>, "output": <the node's recorded output>}`.
+    ///
+    /// Set via [`DagTaskRef::compensate`] (typed, typo-proof) or
+    /// [`DagTaskRef::compensate_named`] (explicit string).
+    pub compensate: Option<String>,
 }
 
 impl DagTask {
@@ -269,6 +289,7 @@ impl From<PendingDagTask> for DagTask {
             condition: task.condition,
             signal: task.signal,
             input_from: task.input_from,
+            compensate: task.compensate,
         }
     }
 }
@@ -341,6 +362,37 @@ pub enum DagBuildError {
         /// The signal name (identity) of the offending gate node.
         task: String,
     },
+    /// A signal-gate node declares a compensator (issue #780). A gate
+    /// dispatches no activity, so it performs no side effect for a compensator
+    /// to undo; declaring one is almost certainly a mistake and is rejected
+    /// rather than silently ignored.
+    CompensateOnGate {
+        /// The signal name (identity) of the offending gate node.
+        task: String,
+    },
+    /// A node declares an empty (or whitespace-only) compensator name
+    /// (issue #780). The unwind dispatches compensators **by name**, so an
+    /// empty name would schedule a nameless activity at exactly the moment the
+    /// state is already dangling; reject it at build time instead.
+    EmptyCompensator {
+        /// The activity name of the offending node.
+        task: String,
+    },
+    /// A compensator name collides with a **forward node's** identity
+    /// (issue #780) — another node's activity name, the declaring node's own
+    /// name, or a signal gate's signal name.
+    ///
+    /// The unwind dispatches compensators through the ordinary activity
+    /// lowering, so a collision makes the compensation indistinguishable from
+    /// the forward node in recorded history — corrupting the name-keyed
+    /// classification the DAG run-graph (issue #690) and retry-from-node
+    /// (issue #366) surfaces depend on.
+    CompensatorNameCollidesWithNode {
+        /// The activity name of the node declaring the compensator.
+        task: String,
+        /// The colliding compensator name.
+        compensator: String,
+    },
 }
 
 impl fmt::Display for DagBuildError {
@@ -366,6 +418,18 @@ impl fmt::Display for DagBuildError {
             Self::InputBindingOnGate { task } => write!(
                 f,
                 "dag task '{task}' is a signal gate and cannot have an input binding; use `.upstream()` to add a dependency"
+            ),
+            Self::CompensateOnGate { task } => write!(
+                f,
+                "dag task '{task}' is a signal gate and cannot have a compensator; a gate dispatches no activity, so it has no side effect to undo"
+            ),
+            Self::EmptyCompensator { task } => write!(
+                f,
+                "dag task '{task}' declares an empty compensator name; name the activity that undoes this node"
+            ),
+            Self::CompensatorNameCollidesWithNode { task, compensator } => write!(
+                f,
+                "dag task '{task}' declares compensator '{compensator}', which collides with a forward node's name; a compensator dispatched under a node's name would corrupt the name-keyed history classification used by the DAG run graph and retry-from-node"
             ),
         }
     }
@@ -608,6 +672,69 @@ impl DagTaskRef {
         })
     }
 
+    /// Declare the activity that **undoes** this node when the DAG fails
+    /// (issue #780), derived from the activity fn item exactly like
+    /// [`DagBuilder::activity`] — so a typo is a compile error, not a
+    /// mid-unwind dispatch failure.
+    ///
+    /// If the DAG reaches a terminal failure and this node **succeeded**, the
+    /// compensator is dispatched on this node's queue with the envelope
+    /// `{"dag_compensate": <node>, "input": <resolved forward input>,
+    /// "output": <recorded output>}`. Compensators run in reverse topological
+    /// (LIFO) order through the [`Saga`](crate::saga::Saga) unwind. A node that
+    /// was skipped, never reached, or itself failed is never compensated.
+    ///
+    /// Last call wins: repeating `compensate*` replaces the previous
+    /// declaration.
+    ///
+    /// # Build errors
+    ///
+    /// * [`DagBuildError::CompensateOnGate`] — a signal gate dispatches no
+    ///   activity, so there is nothing for a compensator to undo.
+    /// * [`DagBuildError::CompensatorNameCollidesWithNode`] — the compensator
+    ///   name matches a forward node's identity.
+    /// * [`DagBuildError::EmptyCompensator`] — the name is empty/whitespace.
+    ///
+    /// ```rust
+    /// use autumn_harvest::dag::DagBuilder;
+    ///
+    /// fn reserve_inventory() {}
+    /// fn release_inventory() {}
+    /// fn charge_payment() {}
+    ///
+    /// let mut dag = DagBuilder::new();
+    /// let reserve = dag.activity(reserve_inventory).compensate(release_inventory);
+    /// let _charge = dag.activity(charge_payment).upstream(&reserve);
+    /// ```
+    #[must_use]
+    pub fn compensate<F>(self, activity: F) -> Self
+    where
+        F: Copy + 'static,
+    {
+        let name = short_activity_name(type_name_of_val(&activity));
+        self.mutate(|task| task.compensate = Some(name))
+    }
+
+    /// Declare the compensator by **name** (issue #780) — the escape hatch for
+    /// a compensator whose fn item is not in scope (a remote/polyglot worker's
+    /// activity, or a name computed by a macro).
+    ///
+    /// Prefer [`compensate`](Self::compensate), which derives the name from the
+    /// fn item and is therefore typo-proof. Semantics are otherwise identical;
+    /// last call wins.
+    ///
+    /// # Build errors
+    ///
+    /// Same as [`compensate`](Self::compensate):
+    /// [`DagBuildError::CompensateOnGate`],
+    /// [`DagBuildError::CompensatorNameCollidesWithNode`], and
+    /// [`DagBuildError::EmptyCompensator`] for an empty/whitespace-only name.
+    #[must_use]
+    pub fn compensate_named(self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        self.mutate(|task| task.compensate = Some(name))
+    }
+
     fn mutate(self, update: impl FnOnce(&mut PendingDagTask)) -> Self {
         {
             let mut tasks = self.tasks.borrow_mut();
@@ -732,6 +859,7 @@ impl DagBuilder {
             condition: None,
             signal: None,
             input_from: None,
+            compensate: None,
         });
 
         DagTaskRef {
@@ -761,6 +889,7 @@ impl DagBuilder {
             condition: None,
             signal: None,
             input_from: None,
+            compensate: None,
         });
 
         DagMapTaskRef {
@@ -856,6 +985,7 @@ impl DagBuilder {
             condition: None,
             signal: Some(gate),
             input_from: None,
+            compensate: None,
         });
 
         DagTaskRef {
@@ -872,6 +1002,8 @@ impl DagBuilder {
     /// cycle.
     pub fn build(&self) -> Result<DagDefinition, DagBuildError> {
         let tasks = self.tasks.borrow().clone();
+
+        validate_compensators(&tasks)?;
 
         // Input-binding validation (issue #702).
         for task in &tasks {
@@ -1000,6 +1132,49 @@ impl DagBuilder {
     }
 }
 
+/// Validate every node's compensator declaration (issue #780).
+///
+/// A compensator must be dispatchable by name on the terminal-failure unwind,
+/// and must stay distinguishable from every forward node in recorded history.
+/// One compensator **shared by several nodes** is fine — the unwind envelope's
+/// `dag_compensate` field disambiguates which node it is undoing.
+fn validate_compensators(tasks: &[PendingDagTask]) -> Result<(), DagBuildError> {
+    // The node-identity set is built once and includes gates (whose identity
+    // is their signal name).
+    let node_names: std::collections::HashSet<&str> = tasks
+        .iter()
+        .map(|task| task.activity_name.as_str())
+        .collect();
+    for task in tasks {
+        let Some(compensator) = &task.compensate else {
+            continue;
+        };
+        // A gate dispatches no activity, so it has no side effect to undo.
+        if task.signal.is_some() {
+            return Err(DagBuildError::CompensateOnGate {
+                task: task.activity_name.clone(),
+            });
+        }
+        // An empty name would dispatch a nameless activity mid-unwind.
+        if compensator.trim().is_empty() {
+            return Err(DagBuildError::EmptyCompensator {
+                task: task.activity_name.clone(),
+            });
+        }
+        // A compensator sharing a forward node's identity would be
+        // indistinguishable from that node in recorded history, corrupting the
+        // name-keyed classification the run graph (#690) and retry-from-node
+        // (#366) depend on.
+        if node_names.contains(compensator.as_str()) {
+            return Err(DagBuildError::CompensatorNameCollidesWithNode {
+                task: task.activity_name.clone(),
+                compensator: compensator.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a bound node's activity input from upstream outputs (issue #702):
 /// the raw output for a [`DagInputBinding::Single`], or a keyed JSON object for
 /// a [`DagInputBinding::Merged`]. No `dag_task` injection, no `conf` wrapping.
@@ -1057,6 +1232,15 @@ fn short_activity_name(type_name: &str) -> String {
 /// Returns `Err` if the workflow-context propagates a non-activity error (e.g.
 /// a non-determinism divergence), or `Err("one or more DAG tasks failed")` when
 /// any task reaches [`TaskStatus::Failed`].
+///
+/// A terminal failure additionally triggers the issue #780 compensation unwind
+/// (see [`unwind_dag_compensations`]) when any **succeeded** node declares a
+/// [`DagTask::compensate`]: a successful unwind still returns the original
+/// `"one or more DAG tasks failed"` error unchanged, while a failing
+/// compensation surfaces a stringified
+/// [`HarvestError::SagaCompensationFailed`](crate::error::HarvestError::SagaCompensationFailed)
+/// carrying both the original error and the compensation errors. A **cancelled**
+/// run never unwinds (`docs/saga.md`: cancellation does not auto-compensate).
 #[allow(clippy::too_many_lines, clippy::type_complexity)]
 pub async fn run_unified_dag(
     ctx: &crate::context::WorkflowContext,
@@ -1074,6 +1258,10 @@ pub async fn run_unified_dag(
     let n = tasks.len();
     let mut statuses: Vec<TaskStatus> = vec![TaskStatus::Skipped; n];
     let mut outputs: Vec<Value> = vec![Value::Null; n];
+    // Resolved forward inputs, retained ONLY for nodes that declare a
+    // compensator (issue #780) so the unwind envelope can carry them. Every
+    // other slot stays `Value::Null` and costs nothing.
+    let mut inputs: Vec<Value> = vec![Value::Null; n];
 
     for level in &levels {
         // ── Signal/timer gate (issue #746) ──────────────────────────────────
@@ -1163,6 +1351,12 @@ pub async fn run_unified_dag(
 
             if let Some(upstream_idx) = tasks[task_idx].map_upstream {
                 let upstream_val = outputs[upstream_idx].clone();
+                // A mapped node is compensated at NODE granularity (issue
+                // #780), so its "resolved forward input" is the whole mapped
+                // upstream array, not any single cell's item.
+                if tasks[task_idx].compensate.is_some() {
+                    inputs[task_idx] = upstream_val.clone();
+                }
                 let policy = tasks[task_idx].map_failure_policy;
                 let activity_name_clone = activity_name.clone();
                 let queue_str_clone = queue_str.clone();
@@ -1292,6 +1486,13 @@ pub async fn run_unified_dag(
                     |binding| bind_activity_input(binding, &outputs),
                 );
 
+                // Retain the resolved forward input for the compensation
+                // envelope (issue #780) before it is moved into the dispatch
+                // future. Uncompensated nodes clone nothing.
+                if tasks[task_idx].compensate.is_some() {
+                    inputs[task_idx] = activity_input.clone();
+                }
+
                 activity_futs.push(Box::pin(async move {
                     let (status, val) = match ctx
                         .execute_activity_raw_with_opts(
@@ -1322,10 +1523,81 @@ pub async fn run_unified_dag(
     }
 
     if statuses.iter().any(|s| matches!(s, TaskStatus::Failed)) {
-        return Err("one or more DAG tasks failed".to_owned());
+        let original = "one or more DAG tasks failed".to_owned();
+        // `docs/saga.md`: cancellation does NOT auto-compensate. Skipping the
+        // unwind here also avoids dispatching into an unconsumed
+        // `WorkflowCancelled`, which would nd-block (issue #603) a run the
+        // operator already cancelled.
+        if ctx.is_cancelled() {
+            return Err(original);
+        }
+        return unwind_dag_compensations(
+            ctx, &levels, &tasks, &statuses, &inputs, &outputs, original,
+        )
+        .await;
     }
 
     Ok(Value::Null)
+}
+
+/// Compensate every **succeeded** node that declares a compensator, in reverse
+/// topological (LIFO) order, after a terminal DAG failure (issue #780).
+///
+/// Compensations are pushed in levels-forward / ascending-index order — the
+/// DAG's own topological order — and the [`Saga`](crate::saga::Saga) unwind
+/// pops them LIFO, so an undo never runs before the undo of a node that
+/// depended on it. Each compensator is dispatched through the ordinary
+/// activity lowering on the compensated node's own queue, so compensation
+/// rides existing `ActivityScheduled`/`ActivityCompleted` events and adds **no
+/// new `WorkflowEvent` variant**.
+///
+/// A node that was skipped, never reached, or itself failed is never
+/// compensated: only a successful forward step has an effect to undo.
+///
+/// # Errors
+///
+/// Returns the caller's `original` DAG error when every compensation succeeds,
+/// or [`HarvestError::SagaCompensationFailed`](crate::error::HarvestError::SagaCompensationFailed)
+/// (stringified) when any compensation fails — every remaining compensation is
+/// still attempted first (continue-not-abort).
+async fn unwind_dag_compensations(
+    ctx: &crate::context::WorkflowContext,
+    levels: &[Vec<usize>],
+    tasks: &[DagTask],
+    statuses: &[TaskStatus],
+    inputs: &[Value],
+    outputs: &[Value],
+    original: String,
+) -> Result<Value, String> {
+    let mut saga = crate::saga::Saga::new(ctx);
+
+    for level in levels {
+        for &i in level {
+            if !matches!(statuses[i], TaskStatus::Succeeded) {
+                continue;
+            }
+            let Some(comp_name) = tasks[i].compensate.clone() else {
+                continue;
+            };
+            let queue = tasks[i].queue.clone().unwrap_or_default();
+            let envelope = serde_json::json!({
+                "dag_compensate": tasks[i].activity_name,
+                "input": inputs[i],
+                "output": outputs[i],
+            });
+            saga.push_compensation(move || async move {
+                ctx.execute_activity_raw_with_opts(&comp_name, envelope, &queue, None, None)
+                    .await
+                    .map(|_| ())
+            });
+        }
+    }
+
+    // `Vec::pop` inside the unwind ⇒ reverse-topological LIFO order.
+    match saga.compensate_all_after(original.clone()).await {
+        Ok(()) => Err(original),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[cfg(test)]
