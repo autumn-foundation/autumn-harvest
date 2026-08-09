@@ -410,3 +410,48 @@ iteration count or DAG depth is also off the table: the issue's success metric
 mandates 1,000 runs on the 5-node DAG. The cost is documented here instead: the
 `dag_compensation` CI row takes roughly **8–10 minutes** of serial Linux CI time,
 almost all of it in this one test.
+
+## Post-PR review (Codex on PR #1153)
+
+### P1 — a marker-less unwind escaped the retry guard
+
+The `CompensatedRun` guard added above detected an unwind **only** by its
+`saga_compensat*` marker. That marker is not guaranteed for a DAG: issue #801's
+matcher deliberately leaves an unwind uncounted at a **drained signal frontier**,
+so a DAG run that received an unsolicited signal dispatches its compensators and
+rolls its side effects back while recording no marker at all (the known
+limitation already documented in `docs/saga.md`). Such a run therefore stayed
+retryable, and the level-granular cut carried over exactly the nodes the unwind
+had just undone — the compensation double-spend the guard exists to prevent.
+
+The observability gap and the retry guard were each reviewed and documented in
+isolation; the defect was their intersection — the marker became load-bearing for
+*correctness* while remaining best-effort for *observability*.
+
+`ran_compensation_unwind` now takes the `DagDefinition` and accepts **either**
+signal: the marker, **or** an `ActivityScheduled` naming one of that DAG's
+declared compensators. The second signal is unambiguous by construction —
+`DagBuildError::CompensatorNameCollidesWithNode` already rejects at build time
+any compensator sharing a forward node's name, precisely so a compensation
+dispatch stays distinguishable in recorded history for the name-keyed run graph
+(#690) and this resolver (#366). A DAG with no compensators collects an empty
+set, so it can never enter this branch and stays byte-identically retryable.
+
+RED evidence (marker-less compensated history, before the fix):
+
+```
+left:  Ok(DagRetryPlan { reset_to_event_id: 2,
+        nodes_to_re_execute: ["b", "c", "d"], nodes_carried_over: ["a"] })
+right: Err(CompensatedRun)
+```
+
+`nodes_carried_over: ["a"]` is the double-spend: `undo_a` had already rolled `a`
+back.
+
+Pinned by `resolve_rejects_a_marker_less_compensated_run` (a history with an
+unsolicited `SignalReceived`, a compensator dispatch, and **no** marker) and the
+regression guard `resolve_allows_a_compensating_dag_whose_unwind_never_dispatched`
+(a compensating DAG that failed before any compensator ran stays retryable).
+Docs corrected in `docs/saga.md` (both the #366 section and the stray-signal
+limitation, which is now explicitly scoped to observability only),
+`docs/runbooks/dag-retry-from-failed-node.md`, and the `dag_retry` module doc.

@@ -64,9 +64,11 @@
 //! resolver would CARRY OVER, so a retry of a compensated run would resume on
 //! rolled-back state. Such a run is therefore rejected outright with
 //! [`DagRetryResolveError::CompensatedRun`] (`409`); start a fresh DAG run
-//! instead. Detection is the presence of a `saga_compensat*` marker in the
-//! recorded history — a run that failed WITHOUT compensators (and every
-//! pre-#780 history) records none and stays fully retryable.
+//! instead. Detection uses TWO signals — a `saga_compensat*` marker, OR an
+//! `ActivityScheduled` naming one of this DAG's declared compensators — because
+//! a DAG unwind at a drained signal frontier records no marker (see
+//! [`ran_compensation_unwind`]). A run that failed WITHOUT compensators (and
+//! every pre-#780 history) triggers neither and stays fully retryable.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -162,15 +164,38 @@ const SAGA_UNWIND_MARKER_PREFIX: &str = "saga_compensat";
 
 /// Whether the recorded history shows an issue #780 / #801 compensation unwind.
 ///
-/// Pure and cheap: a single scan for a `MarkerRecorded` whose name carries the
-/// saga-unwind prefix.
+/// Two independent signals, because **neither alone is sufficient**:
+///
+/// 1. A `saga_compensat*` [`WorkflowEvent::MarkerRecorded`]. This is the
+///    general signal and the only one available for a non-DAG saga, but it is
+///    NOT guaranteed for a DAG: issue #801's matcher deliberately leaves an
+///    unwind uncounted when the history sits at a **drained signal frontier**,
+///    so a DAG run that received an unsolicited signal records no marker even
+///    though its compensators dispatched (documented in `docs/saga.md`, "a
+///    stray signal silences unwind observability").
+/// 2. An [`WorkflowEvent::ActivityScheduled`] whose name is a compensator
+///    declared by THIS DAG. This closes the marker-less hole and is
+///    unambiguous by construction:
+///    `DagBuildError::CompensatorNameCollidesWithNode` rejects at build time
+///    any compensator that shares a forward node's name, precisely so a
+///    compensation dispatch stays distinguishable in recorded history for the
+///    name-keyed run graph (#690) and this retry resolver (#366).
+///
+/// Pure and cheap: one pass over the definition to collect compensator names
+/// (usually empty — a DAG with no compensators can never be in this state) and
+/// one pass over the events.
 #[must_use]
-fn ran_compensation_unwind(events: &[WorkflowEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with(SAGA_UNWIND_MARKER_PREFIX)
-        )
+fn ran_compensation_unwind(def: &DagDefinition, events: &[WorkflowEvent]) -> bool {
+    let compensators: BTreeSet<&str> = def
+        .tasks()
+        .iter()
+        .filter_map(|task| task.compensate.as_deref())
+        .collect();
+
+    events.iter().any(|event| match event {
+        WorkflowEvent::MarkerRecorded { name, .. } => name.starts_with(SAGA_UNWIND_MARKER_PREFIX),
+        WorkflowEvent::ActivityScheduled { name, .. } => compensators.contains(name.as_str()),
+        _ => false,
     })
 }
 
@@ -383,7 +408,7 @@ pub fn resolve_retry_plan(
     // as if their effects still existed — a double-spend of the compensation.
     // Checked before any node validation so the operator gets the state answer
     // ("this run is not retryable") rather than a node-shaped one.
-    if ran_compensation_unwind(events) {
+    if ran_compensation_unwind(def, events) {
         return Err(DagRetryResolveError::CompensatedRun);
     }
 
@@ -505,6 +530,18 @@ mod tests {
     fn c() {}
     fn d() {}
     fn e() {}
+
+    fn undo_a() {}
+
+    fn linear_compensating_dag() -> DagDefinition {
+        // a -> b -> c -> d, where `a` declares a compensator.
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a).compensate(undo_a);
+        let nb = builder.activity(b).upstream(&na);
+        let nc = builder.activity(c).upstream(&nb);
+        let _nd = builder.activity(d).upstream(&nc);
+        builder.build().expect("linear compensating dag builds")
+    }
 
     fn linear_dag() -> DagDefinition {
         // a -> b -> c -> d
@@ -873,6 +910,67 @@ mod tests {
         assert_eq!(
             resolve_retry_plan(&def, &events, &["b".to_string()]),
             Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// A DAG unwind does not ALWAYS leave a marker: a run that received an
+    /// unsolicited signal ends its history at a drained-signal frontier, which
+    /// issue #801's matcher deliberately leaves uncounted — no
+    /// `saga_compensated:{seq}` marker, no counters — even though the
+    /// compensators still dispatch and still replay (documented in
+    /// `docs/saga.md`, "a stray signal silences unwind observability").
+    ///
+    /// Detecting the unwind by marker ALONE therefore leaves such a fully
+    /// rolled-back run retryable, which is exactly the double-spend
+    /// [`DagRetryResolveError::CompensatedRun`] exists to prevent. The
+    /// definition-driven check closes it: a compensator's dispatch is
+    /// unambiguous in history because
+    /// `DagBuildError::CompensatorNameCollidesWithNode` forbids a compensator
+    /// from sharing any forward node's name.
+    #[test]
+    fn resolve_rejects_a_marker_less_compensated_run() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu, isig) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let _ = isig;
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // An unsolicited signal put the unwind at a drained-signal
+            // frontier, so NO `saga_compensat*` marker was recorded...
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            // ...but the compensator still ran and rolled `a` back.
+            scheduled("undo_a", iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// REGRESSION GUARD: a compensating DAG that failed BEFORE any compensator
+    /// dispatched (e.g. the first node itself failed, so nothing succeeded)
+    /// left nothing rolled back and stays retryable.
+    #[test]
+    fn resolve_allows_a_compensating_dag_whose_unwind_never_dispatched() {
+        let def = linear_compensating_dag();
+        let ia = ActivityExecId::new();
+        let events = vec![started(), scheduled("a", ia), failed(ia)];
+        let plan = resolve_retry_plan(&def, &events, &["a".to_string()]).expect("plan");
+        assert!(
+            plan.nodes_carried_over.is_empty(),
+            "nothing succeeded, so nothing is carried over"
         );
     }
 

@@ -354,6 +354,12 @@ to a DAG run** can put it in that state. The compensations still run, and still
 replay deterministically — only the observability is lost for that run. Do not
 send ad-hoc signals to DAG executions.
 
+This is an **observability** gap only. Anything that must be *correct* in the
+presence of a marker-less unwind does not rely on the marker: the
+[retry guard](#retrying-a-compensated-run-issue-366-interaction) also detects a
+recorded compensator dispatch, so a marker-less rolled-back run is still
+correctly refused a retry.
+
 ### Known limitation — compensation is node-granular
 
 Compensation operates on **nodes**, never on individual mapped cells
@@ -425,9 +431,20 @@ A DAG run that executed its unwind is **not retryable from a failed node**.
 The reason is structural: retry-from-node deliberately **carries over** the
 succeeded upstream nodes — which is exactly the set the unwind just undid. A
 retry would therefore resume as if those side effects still existed and
-double-spend the compensation. Detection is the presence of a `saga_compensat*`
-marker in the run's history, so a DAG run that failed **without** compensators
-(and every pre-#780 history) stays fully retryable.
+double-spend the compensation.
+
+Detection uses **two** independent signals — a `saga_compensat*` marker in the
+run's history, **or** a recorded dispatch of one of that DAG's declared
+compensator activities. The second is required, not redundant: an unwind at a
+[drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
+records no marker at all, so a marker-only check would leave that fully
+rolled-back run retryable. It is also unambiguous by construction —
+[`CompensatorNameCollidesWithNode`](#build-time-guards) forbids a compensator
+from sharing any forward node's name, so a compensator dispatch can never be
+mistaken for a forward step.
+
+A DAG run that failed **without** compensators (and every pre-#780 history)
+triggers neither signal and stays fully retryable.
 
 ### Divergence *inside* an unwind still nd-blocks
 

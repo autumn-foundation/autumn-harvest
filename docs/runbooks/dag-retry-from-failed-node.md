@@ -116,10 +116,19 @@ HTTP 409 Conflict
 (`POST /dags/{dag_name}/trigger`). The unwind already restored the pre-run
 state, so a fresh run is the correct — and safe — recovery.
 
-Detection is the presence of a `saga_compensat*` marker in the run's recorded
-history, so this only ever fires for a run that genuinely unwound. A DAG that
-failed **without** any compensator declared records no such marker and remains
-fully retryable, exactly as before.
+Detection uses two independent signals, so it only ever fires for a run that
+genuinely unwound:
+
+1. a `saga_compensat*` marker in the run's recorded history, or
+2. a recorded dispatch of one of that DAG's own declared compensator
+   activities.
+
+The second signal is load-bearing, not belt-and-braces: a run that received an
+unsolicited signal unwinds **without** recording a marker (see
+[a stray signal silences unwind observability](../saga.md#known-limitation--a-stray-signal-silences-unwind-observability)),
+so a marker-only check would leave that fully rolled-back run retryable. A DAG
+that failed **without** any compensator declared triggers neither signal and
+remains fully retryable, exactly as before.
 
 ## Limitation: build-id routing and topology changes
 
