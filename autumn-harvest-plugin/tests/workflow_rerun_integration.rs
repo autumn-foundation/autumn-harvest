@@ -1828,6 +1828,73 @@ async fn rerun_strips_nd_diagnostic_search_attrs() {
     );
 }
 
+/// R-37b (Codex review, issue #777): `search_attrs` is an unvalidated JSON
+/// value at the model layer -- the start API and core accept a scalar or
+/// array, not only an object. The ND-diagnostic strip above must not
+/// silently discard such a value into `{}`: none of the six diagnostic keys
+/// could ever exist inside a non-object value, so stripping them is a no-op
+/// by definition, and the "clone verbatim" contract demands it survive.
+#[tokio::test]
+async fn rerun_preserves_non_object_search_attrs_verbatim() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_scalar_attrs_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    // A scalar (string) source.
+    let wf_id_str = unique("rr-scalar-attrs");
+    let source_str = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id_str,
+        "COMPLETED",
+        Seed {
+            search_attrs: Some(json!("legacy-caller-sent-a-bare-string")),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status, body) = post_json(&app, &rerun_uri(&source_str), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id_str = body["execution_id"].as_str().unwrap().to_string();
+    let attrs_str = load_exec(&mut conn, &new_id_str)
+        .await
+        .search_attrs
+        .expect("cloned search attrs");
+    assert_eq!(
+        attrs_str,
+        json!("legacy-caller-sent-a-bare-string"),
+        "a non-object string search_attrs must survive the rerun verbatim, not collapse to {{}}"
+    );
+
+    // An array source.
+    let wf_id_arr = unique("rr-array-attrs");
+    let source_arr = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id_arr,
+        "COMPLETED",
+        Seed {
+            search_attrs: Some(json!(["tag-a", "tag-b"])),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let (status, body) = post_json(&app, &rerun_uri(&source_arr), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id_arr = body["execution_id"].as_str().unwrap().to_string();
+    let attrs_arr = load_exec(&mut conn, &new_id_arr)
+        .await
+        .search_attrs
+        .expect("cloned search attrs");
+    assert_eq!(
+        attrs_arr,
+        json!(["tag-a", "tag-b"]),
+        "a non-object array search_attrs must survive the rerun verbatim, not collapse to {{}}"
+    );
+}
+
 /// R-38: schedule provenance (issue #488/#534) is NOT carried onto the re-run,
 /// matching the reset-fork precedent.
 ///
