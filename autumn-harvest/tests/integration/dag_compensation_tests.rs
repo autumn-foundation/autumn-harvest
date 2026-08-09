@@ -670,6 +670,177 @@ async fn mapped_node_compensation_is_node_granular_not_cell_granular() {
 }
 
 // ===========================================================================
+// T13b — post-review P1-B: a FailFast mapped node whose failing cell is NOT
+//        the last one polled must still unwind cleanly
+// ===========================================================================
+
+/// Drive `history` to completion on a fresh replay context and report the
+/// terminal result together with the engine's non-determinism slot.
+///
+/// Issue #603 gates the permanent nd-block on `WorkflowContext::take_nd_details`
+/// (the executor reads it on the `Ok(Err(..))` arm), NOT on
+/// `take_deferred_nd_error` — which only the infallible issue #384 primitives
+/// ever write. A test that asserts the deferred slot would pass even while the
+/// run wedges forever, so every "must never nd-block" assertion in this suite
+/// reads `nd_details`.
+async fn drive_replay_for_nd_details(
+    handler: autumn_harvest::WorkflowHandlerFn,
+    history: Vec<WorkflowEvent>,
+) -> (
+    Result<Value, String>,
+    Option<autumn_harvest::error::NonDeterministicDetails>,
+) {
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handler(&ctx, Value::Null),
+    )
+    .await
+    .expect("a replayed terminal history must terminate, not suspend forever");
+    let nd = ctx.take_nd_details();
+    (result, nd)
+}
+
+/// T13b — **post-review P1-B (blocker).** A `FailFast` mapped node aborts its
+/// instance stream on the FIRST failing cell. When that cell is not the last one
+/// the stream yields, the remaining instances are never polled, so their
+/// recorded `ActivityScheduled` events stay unconsumed and the replay cursor is
+/// left parked on one of them. Issue #780's unwind is the first thing to consume
+/// history after the level loop, so it dispatched the first compensator straight
+/// into that stale cursor: `match_activity` diverged, the divergence poisoned
+/// `nd_details`, and the run both (a) skipped compensation entirely and (b)
+/// wedged in a permanent, non-self-healing nd-block (issue #603).
+///
+/// The failure position is the whole point: T13's `[1, -1]` fixture fails at the
+/// LAST cell, which happens to leave a clean cursor. This fixture fails in the
+/// MIDDLE.
+#[tokio::test]
+async fn failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks() {
+    let handler = __autumn_workflow_info_mapped_failfast_comp_dag().handler;
+    let outcome = WorkflowTestEnv::new()
+        // THREE cells, failing in the MIDDLE — so at least one instance is left
+        // unpolled by the fail-fast abort.
+        .mock_activity("m_root", |_| Ok(json!([1, -1, 2])))
+        .mock_activity("m_process", |item| {
+            if item.as_i64().is_some_and(|n| n < 0) {
+                Err("negative".to_string())
+            } else {
+                Ok(json!(item.as_i64().unwrap_or_default() * 10))
+            }
+        })
+        .mock_activity("m_undo_root", |_| Ok(Value::Null))
+        .mock_activity("m_undo_process", |_| Ok(Value::Null))
+        .run(handler, Value::Null)
+        .await;
+
+    // (a) The compensator for the SUCCEEDED root must still dispatch.
+    assert_eq!(
+        scheduled_names_among(outcome.events(), &["m_undo_root", "m_undo_process"]),
+        vec!["m_undo_root".to_string()],
+        "a FailFast mapped node failing mid-array must still unwind the \
+         succeeded prefix (the failed mapped node itself is not compensated)"
+    );
+
+    // (b) The terminal error is the ORIGINAL DAG error — a stale-cursor
+    //     divergence would have been swallowed into `SagaCompensationFailed`.
+    assert_eq!(
+        outcome
+            .result
+            .as_ref()
+            .expect_err("the DAG must fail")
+            .as_str(),
+        "one or more DAG tasks failed",
+        "the unwind must succeed cleanly, leaving the original DAG error"
+    );
+
+    // (c) No non-determinism was recorded — this is the issue #603 nd-block gate.
+    let (replayed, nd) = drive_replay_for_nd_details(handler, outcome.events().to_vec()).await;
+    assert_eq!(
+        nd, None,
+        "a mid-array FailFast failure must never record a non-determinism \
+         divergence (issue #603 would nd-block the run permanently)"
+    );
+    assert_eq!(
+        replayed
+            .as_ref()
+            .expect_err("the replay must fail")
+            .as_str(),
+        "one or more DAG tasks failed"
+    );
+
+    // (d) …and the produced history replays deterministically.
+    let report = outcome.replay_check(handler).await;
+    assert!(
+        matches!(
+            report.status,
+            ReplayStatus::WorkflowFailed { ref error, .. }
+                if error == "one or more DAG tasks failed"
+        ),
+        "a mid-array FailFast history must replay deterministically:\n{report}"
+    );
+}
+
+/// T13c — the randomized sibling of T13b: sweep the failing cell across EVERY
+/// position of a `FailFast` mapped node. Only the last position was covered
+/// before (T13), which is exactly the one position that masked P1-B.
+#[tokio::test]
+async fn failfast_mapped_node_compensates_for_every_failing_cell_position() {
+    let handler = __autumn_workflow_info_mapped_failfast_comp_dag().handler;
+    const CELLS: usize = 5;
+
+    for fail_pos in 0..CELLS {
+        // Cell values are their index; the failing one is negated so the mock
+        // rejects exactly it.
+        let cells: Vec<i64> = (0..CELLS)
+            .map(|i| {
+                let v = i64::try_from(i).unwrap_or_default() + 1;
+                if i == fail_pos { -v } else { v }
+            })
+            .collect();
+        let cells_json = json!(cells);
+
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("m_root", move |_| Ok(cells_json.clone()))
+            .mock_activity("m_process", |item| {
+                if item.as_i64().is_some_and(|n| n < 0) {
+                    Err("negative".to_string())
+                } else {
+                    Ok(json!(item.as_i64().unwrap_or_default() * 10))
+                }
+            })
+            .mock_activity("m_undo_root", |_| Ok(Value::Null))
+            .mock_activity("m_undo_process", |_| Ok(Value::Null))
+            .run(handler, Value::Null)
+            .await;
+
+        let context = format!("failing cell position {fail_pos} of {CELLS}");
+
+        assert_eq!(
+            scheduled_names_among(outcome.events(), &["m_undo_root", "m_undo_process"]),
+            vec!["m_undo_root".to_string()],
+            "{context}: the succeeded prefix must be compensated regardless of \
+             WHICH cell fails"
+        );
+        assert_eq!(
+            outcome
+                .result
+                .as_ref()
+                .expect_err("the DAG must fail")
+                .as_str(),
+            "one or more DAG tasks failed",
+            "{context}: the unwind must leave the original DAG error"
+        );
+
+        let (_, nd) = drive_replay_for_nd_details(handler, outcome.events().to_vec()).await;
+        assert_eq!(
+            nd, None,
+            "{context}: no failing-cell position may record a non-determinism \
+             divergence"
+        );
+    }
+}
+
+// ===========================================================================
 // T14 — cancellation does NOT auto-compensate
 // ===========================================================================
 

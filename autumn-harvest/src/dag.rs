@@ -723,6 +723,18 @@ impl DagTaskRef {
     /// fn item and is therefore typo-proof. Semantics are otherwise identical;
     /// last call wins.
     ///
+    /// The name is **trimmed** on insert, so surrounding whitespace can never
+    /// produce a dispatch name that differs from the registered activity — the
+    /// same normalisation [`DagBuildError::EmptyCompensator`] already applies
+    /// when deciding whether a name is empty.
+    ///
+    /// The name must still be **registered with the builder**: the plugin's
+    /// startup preflight fails the boot for a DAG compensator that resolves to
+    /// no registered activity, exactly as it does for a forward node. This is a
+    /// name-based dispatch escape hatch (e.g. an activity routed to a different
+    /// queue, or a name computed by a macro), not a way to reference an activity
+    /// that only exists on a remote/polyglot worker.
+    ///
     /// # Build errors
     ///
     /// Same as [`compensate`](Self::compensate):
@@ -731,7 +743,7 @@ impl DagTaskRef {
     /// [`DagBuildError::EmptyCompensator`] for an empty/whitespace-only name.
     #[must_use]
     pub fn compensate_named(self, name: impl Into<String>) -> Self {
-        let name = name.into();
+        let name = name.into().trim().to_owned();
         self.mutate(|task| task.compensate = Some(name))
     }
 
@@ -1401,6 +1413,35 @@ pub async fn run_unified_dag(
                         let mut stream = instance_futs
                             .into_iter()
                             .collect::<futures::stream::FuturesUnordered<_>>();
+                        // The stream is DRAINED even after the first failure
+                        // (issue #780, post-review P1-B). Abandoning it mid-way
+                        // used to leave the unyielded instances unpolled, so
+                        // their recorded `ActivityScheduled` events stayed
+                        // unconsumed and the replay cursor was parked on one of
+                        // them. That was harmless while the terminal check
+                        // returned immediately, but the compensation unwind now
+                        // consumes history after this loop and would dispatch
+                        // its first compensator straight into the stale cursor:
+                        // `match_activity` diverges, which issue #603 turns into
+                        // a PERMANENT nd-block (the divergence is data-caused,
+                        // so every retry replays it identically) *and* silently
+                        // skips compensation.
+                        //
+                        // Draining is also the only cursor-clean option: polling
+                        // a still-in-flight instance once would push a
+                        // `WaitForActivity` command that the unwind's
+                        // `ScheduleActivity` batch cannot legally share.
+                        //
+                        // Semantics preserved: FIRST failure wins (`status` only
+                        // ever moves Succeeded -> Failed, and `final_val` is
+                        // built solely from the all-succeeded case). A
+                        // non-activity error (e.g. a genuine non-determinism
+                        // divergence) still propagates rather than being
+                        // swallowed. The one behavioural change is timing: the
+                        // DAG now settles every instance of the failed mapped
+                        // node before terminating, instead of abandoning the
+                        // in-flight siblings — which never durably cancelled
+                        // them anyway.
                         while let Some((i, res)) = stream.next().await {
                             match res {
                                 Ok(v) => results[i] = v,
@@ -1408,8 +1449,6 @@ pub async fn run_unified_dag(
                                     HarvestError::ActivityFailed { .. }
                                     | HarvestError::Timeout { .. } => {
                                         status = TaskStatus::Failed;
-                                        drop(stream);
-                                        break;
                                     }
                                     _ => return Err(err.to_string()),
                                 },
@@ -2429,6 +2468,105 @@ mod tests {
         assert_eq!(
             other.build().unwrap().tasks()[0].compensate.as_deref(),
             Some("refund_payment")
+        );
+    }
+
+    /// T6 (post-review P3-6) — "last call wins" is a documented contract, so pin
+    /// it across all four `compensate*` orderings.
+    #[test]
+    fn repeated_compensate_calls_are_last_wins() {
+        // typed -> typed
+        let mut b1 = DagBuilder::new();
+        let _ = b1
+            .activity(dummy_activity)
+            .compensate(release_inventory)
+            .compensate(refund_payment);
+        assert_eq!(
+            b1.build().unwrap().tasks()[0].compensate.as_deref(),
+            Some("refund_payment"),
+            "a later typed `.compensate` must replace the earlier one"
+        );
+
+        // typed -> named
+        let mut b2 = DagBuilder::new();
+        let _ = b2
+            .activity(dummy_activity)
+            .compensate(release_inventory)
+            .compensate_named("undo_by_name");
+        assert_eq!(
+            b2.build().unwrap().tasks()[0].compensate.as_deref(),
+            Some("undo_by_name"),
+            "`.compensate_named` must replace an earlier typed `.compensate`"
+        );
+
+        // named -> typed
+        let mut b3 = DagBuilder::new();
+        let _ = b3
+            .activity(dummy_activity)
+            .compensate_named("undo_by_name")
+            .compensate(refund_payment);
+        assert_eq!(
+            b3.build().unwrap().tasks()[0].compensate.as_deref(),
+            Some("refund_payment"),
+            "a typed `.compensate` must replace an earlier `.compensate_named`"
+        );
+
+        // named -> named
+        let mut b4 = DagBuilder::new();
+        let _ = b4
+            .activity(dummy_activity)
+            .compensate_named("first_undo")
+            .compensate_named("second_undo");
+        assert_eq!(
+            b4.build().unwrap().tasks()[0].compensate.as_deref(),
+            Some("second_undo"),
+            "a later `.compensate_named` must replace the earlier one"
+        );
+    }
+
+    /// T7 (post-review P3-7) — `compensate_named` TRIMS. Storing a padded name
+    /// verbatim would dispatch `" undo "`, which resolves to no registered
+    /// activity, while `EmptyCompensator` already judges emptiness on the
+    /// trimmed form — an inconsistency that only surfaced mid-unwind.
+    #[test]
+    fn compensate_named_trims_surrounding_whitespace() {
+        let mut builder = DagBuilder::new();
+        let _ = builder
+            .activity(dummy_activity)
+            .compensate_named("  release_inventory\t\n");
+        assert_eq!(
+            builder.build().unwrap().tasks()[0].compensate.as_deref(),
+            Some("release_inventory"),
+            "`compensate_named` must trim so the dispatched name matches the \
+             registered activity"
+        );
+
+        // A whitespace-only name is still the empty-name build error, and the
+        // trim must not turn it into a silently-accepted `""`.
+        let mut ws = DagBuilder::new();
+        let _ = ws.activity(dummy_activity).compensate_named("   ");
+        assert!(
+            matches!(
+                ws.build().unwrap_err(),
+                DagBuildError::EmptyCompensator { ref task } if task == "dummy_activity"
+            ),
+            "a whitespace-only compensator name must still be a build error"
+        );
+
+        // Trimming must not create a NEW collision blind spot: a padded name
+        // that trims onto a forward node is still rejected.
+        let mut collide = DagBuilder::new();
+        let _a = collide.activity(dummy_activity);
+        let _b = collide
+            .activity(dummy_activity2)
+            .compensate_named(" dummy_activity ");
+        assert!(
+            matches!(
+                collide.build().unwrap_err(),
+                DagBuildError::CompensatorNameCollidesWithNode { ref compensator, .. }
+                    if compensator == "dummy_activity"
+            ),
+            "a padded name that trims onto a forward node must still collide"
         );
     }
 }
