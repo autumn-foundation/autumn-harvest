@@ -44,12 +44,13 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
     OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
+    OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -2639,16 +2640,31 @@ struct TerminateWorkflowRequest {
 
 /// Optional body for `POST /workflows/{id}/rerun` (issue #777).
 ///
-/// `input` is `Option<Value>` deliberately: an ABSENT field means "clone the
-/// source's stored input verbatim", while an explicit JSON `null` IS a real
-/// override that replaces the clone with `null`. A bare `Value` could not
-/// distinguish the two.
+/// `input` is a serde TRI-STATE (`Option<Option<Value>>` via
+/// [`deserialize_tristate`]) because the three cases are genuinely distinct
+/// and a plain `Option<Value>` cannot express them: an ABSENT field means
+/// "clone the source's stored input verbatim", while an explicit JSON `null`
+/// IS a real override that replaces the clone with `null`. Serde's stock
+/// `Option<Value>` deserializes JSON `null` to `None` — indistinguishable
+/// from absent — which would silently clone instead of overriding.
 #[derive(Debug, Default, Deserialize)]
 struct RerunWorkflowRequest {
-    #[serde(default)]
-    input: Option<serde_json::Value>,
+    #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    input: Option<Option<serde_json::Value>>,
     #[serde(default)]
     workflow_id: Option<String>,
+}
+
+impl RerunWorkflowRequest {
+    /// Collapse the tri-state `input` into the core primitive's override:
+    /// absent → `None` (clone the source), explicit `null` → `Some(Null)`,
+    /// a value → `Some(value)`.
+    fn input_override(&self) -> Option<serde_json::Value> {
+        self.input
+            .as_ref()
+            .map(|inner| inner.clone().unwrap_or(serde_json::Value::Null))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -18710,7 +18726,11 @@ async fn rerun_workflow(
 
     // The workflow type must still be registered on this node — otherwise the
     // fresh run would immediately wedge in HandlerNotFound replay failure.
-    if !runtime.registry.workflows.contains_key(&source.workflow_name) {
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&source.workflow_name)
+    {
         audit_failed(
             Some(exec_id_str.clone()),
             "workflow type not registered".to_string(),
@@ -18738,8 +18758,8 @@ async fn rerun_workflow(
     }
 
     // The EFFECTIVE input decides key resolution for every policy below.
-    let effective_input = request
-        .input
+    let input_override = request.input_override();
+    let effective_input = input_override
         .clone()
         .unwrap_or_else(|| source.input.clone());
 
@@ -18768,7 +18788,8 @@ async fn rerun_workflow(
         .is_some_and(|policy| {
             autumn_harvest::debounce::resolve_debounce_key(&policy.key_expr, &effective_input)
                 .is_some()
-        }) {
+        })
+    {
         Some("batch")
     } else {
         None
@@ -18812,11 +18833,11 @@ async fn rerun_workflow(
             (key, Some(policy.limit))
         });
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        Arc::clone(&runtime.registry.telemetry().metrics);
+    let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
+        Some(runtime.registry.telemetry().metrics.as_ref());
 
     let rerun_request = autumn_harvest::execution::RerunRequest {
-        input_override: request.input.clone(),
+        input_override: input_override.clone(),
         workflow_id_override: request.workflow_id.as_deref(),
         started_by: Some(actor.as_str()),
         concurrency_key,
@@ -18836,7 +18857,7 @@ async fn rerun_workflow(
         &mut conn,
         exec_id,
         rerun_request,
-        Some(metrics_ref.as_ref()),
+        metrics_ref,
     )
     .await;
 

@@ -13,6 +13,12 @@
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::doc_markdown)]
+// `rerun_respects_admission_gate` holds `TEST_SERIAL` across `.await` points to
+// serialize its process-global gate-cache mutation — same as the admission-gate
+// suites (`start_idempotency_integration.rs`, `admission_gate_authoritative_localpg.rs`).
+#![allow(clippy::await_holding_lock)]
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -108,7 +114,11 @@ fn plain_info(name: &'static str) -> WorkflowInfo {
     }
 }
 
-fn api_state_with(infos: Vec<WorkflowInfo>, pool: &DbPool, admin_boundary: bool) -> HarvestApiState {
+fn api_state_with(
+    infos: Vec<WorkflowInfo>,
+    pool: &DbPool,
+    admin_boundary: bool,
+) -> HarvestApiState {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(admin_boundary);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
@@ -318,8 +328,6 @@ async fn seed_terminal(
 
 #[derive(diesel::QueryableByName, Debug)]
 struct ExecRow {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    id: uuid::Uuid,
     #[diesel(sql_type = Text)]
     state: String,
     #[diesel(sql_type = Text)]
@@ -370,7 +378,7 @@ struct ExecRow {
     workflow_attempt: i32,
 }
 
-const EXEC_SELECT: &str = "SELECT id, state, workflow_id, queue_name, input, output, error,
+const EXEC_SELECT: &str = "SELECT state, workflow_id, queue_name, input, output, error,
         completed_at, memo, search_attrs,
         EXTRACT(EPOCH FROM execution_timeout)::bigint AS execution_timeout_secs,
         EXTRACT(EPOCH FROM sla)::bigint AS sla_secs,
@@ -388,11 +396,23 @@ async fn load_exec(conn: &mut AsyncPgConnection, exec_id: &str) -> ExecRow {
         .expect("load execution")
 }
 
-async fn load_execs_for(conn: &mut AsyncPgConnection, workflow_name: &str) -> Vec<ExecRow> {
+/// Load every execution under one `(workflow_name, workflow_id)` business key.
+///
+/// Scoped to the KEY, never just the workflow name: `HARVEST_TEST_DATABASE_URL`
+/// points at a shared, persistent database, so a name-scoped count would
+/// accumulate rows from previous runs of this suite and make the "no new run
+/// was created" assertions drift. Every test mints a `uuid`-suffixed
+/// `workflow_id`, so the key is unique per test invocation.
+async fn load_execs_for_key(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Vec<ExecRow> {
     diesel::sql_query(format!(
-        "{EXEC_SELECT} WHERE workflow_name = $1 ORDER BY started_at, id"
+        "{EXEC_SELECT} WHERE workflow_name = $1 AND workflow_id = $2 ORDER BY started_at"
     ))
     .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
     .get_results(conn)
     .await
     .expect("load executions")
@@ -405,14 +425,12 @@ struct CountRow {
 }
 
 async fn event_count(conn: &mut AsyncPgConnection, exec_id: &str) -> i64 {
-    diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM harvest_events WHERE workflow_exec_id = $1::uuid",
-    )
-    .bind::<Text, _>(exec_id)
-    .get_result::<CountRow>(conn)
-    .await
-    .unwrap()
-    .n
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_events WHERE workflow_exec_id = $1::uuid")
+        .bind::<Text, _>(exec_id)
+        .get_result::<CountRow>(conn)
+        .await
+        .unwrap()
+        .n
 }
 
 #[derive(diesel::QueryableByName)]
@@ -442,14 +460,10 @@ struct AuditRow {
     status: String,
 }
 
-async fn audit_rows(
-    conn: &mut AsyncPgConnection,
-    operation: &str,
-    target: &str,
-) -> Vec<AuditRow> {
+async fn audit_rows(conn: &mut AsyncPgConnection, operation: &str, target: &str) -> Vec<AuditRow> {
     diesel::sql_query(
         "SELECT actor, status FROM harvest_audit_log
-         WHERE operation = $1 AND target_id = $2 ORDER BY created_at",
+         WHERE operation = $1 AND target_id = $2 ORDER BY occurred_at",
     )
     .bind::<Text, _>(operation)
     .bind::<Text, _>(target)
@@ -484,7 +498,10 @@ async fn rerun_completed_source_creates_new_execution() {
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let new_id = body["execution_id"].as_str().expect("execution_id").to_string();
+    let new_id = body["execution_id"]
+        .as_str()
+        .expect("execution_id")
+        .to_string();
     assert_ne!(new_id, source, "a re-run must create a NEW execution");
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["reran_from"].as_str(), Some(source.as_str()));
@@ -629,16 +646,15 @@ async fn rerun_input_override_replaces_clone() {
     )
     .await;
 
-    let (status, body) = post_json(
-        &app,
-        &rerun_uri(&source),
-        json!({"input": {"replaced": 7}}),
-    )
-    .await;
+    let (status, body) =
+        post_json(&app, &rerun_uri(&source), json!({"input": {"replaced": 7}})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let new_id = body["execution_id"].as_str().unwrap().to_string();
 
-    assert_eq!(load_exec(&mut conn, &new_id).await.input, json!({"replaced": 7}));
+    assert_eq!(
+        load_exec(&mut conn, &new_id).await.input,
+        json!({"replaced": 7})
+    );
     assert_eq!(
         load_exec(&mut conn, &source).await.input,
         json!({"original": true}),
@@ -838,7 +854,13 @@ async fn rerun_accepts_all_five_terminal_states() {
     let app = build_app(&pool, vec![plain_info(wf)]);
     let mut conn = pool.get().await.unwrap();
 
-    for state in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "TERMINATED"] {
+    for state in [
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMED_OUT",
+        "TERMINATED",
+    ] {
         let wf_id = unique(&format!("rr-state-{}", state.to_lowercase()));
         let source = seed_terminal(&mut conn, wf, &wf_id, state).await;
         let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
@@ -860,7 +882,11 @@ async fn rerun_rejects_running_source() {
     let source = seed_terminal(&mut conn, wf, &wf_id, "RUNNING").await;
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(load_execs_for(&mut conn, wf).await.len(), 1, "no new run");
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run"
+    );
 }
 
 /// R-25: a PAUSED source is rejected (409).
@@ -876,7 +902,11 @@ async fn rerun_rejects_paused_source() {
     let source = seed_terminal(&mut conn, wf, &wf_id, "PAUSED").await;
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(load_execs_for(&mut conn, wf).await.len(), 1, "no new run");
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run"
+    );
 }
 
 /// R-26: a CONTINUED_AS_NEW source is rejected (409) with a message pointing
@@ -898,7 +928,11 @@ async fn rerun_rejects_continued_as_new_source() {
         msg.contains("continued") && (msg.contains("chain") || msg.contains("latest")),
         "the 409 must point at the chain's latest run: {body}"
     );
-    assert_eq!(load_execs_for(&mut conn, wf).await.len(), 1, "no new run");
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run"
+    );
 }
 
 /// R-27: a re-run is NOT idempotent — the second identical call is rejected
@@ -918,13 +952,9 @@ async fn rerun_twice_is_rejected_the_second_time() {
     assert_eq!(s1, StatusCode::CREATED, "{b1}");
 
     let (s2, b2) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(s2, StatusCode::CONFLICT, "a re-run is not idempotent: {b2}");
     assert_eq!(
-        s2,
-        StatusCode::CONFLICT,
-        "a re-run is not idempotent: {b2}"
-    );
-    assert_eq!(
-        load_execs_for(&mut conn, wf).await.len(),
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
         2,
         "the rejected second call must create nothing"
     );
@@ -953,10 +983,45 @@ async fn rerun_rejects_when_business_key_held_by_another_run() {
         "the 409 must name the occupying execution: {body}"
     );
     assert_eq!(
-        load_execs_for(&mut conn, wf).await.len(),
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
         2,
         "no third run may be created"
     );
+}
+
+/// R-28b: a `workflow_id` OVERRIDE onto a key already held by a live run is
+/// rejected via the distinct `AlreadyExists` path (a different response body
+/// from the same-key R-28 conflict), and starts nothing.
+#[tokio::test]
+async fn rerun_workflow_id_override_onto_occupied_key_is_rejected() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_override_occupied_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-ovr-src");
+    let taken = unique("rr-ovr-taken");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+    let occupant = seed_terminal(&mut conn, wf, &taken, "RUNNING").await;
+
+    let (status, body) = post_json(
+        &app,
+        &rerun_uri(&source),
+        json!({"workflow_id": taken.clone()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["existing_execution_id"].as_str(),
+        Some(occupant.as_str()),
+        "the AlreadyExists body must name the occupying run: {body}"
+    );
+    // Nothing started under either key, and the source is NOT sealed (an
+    // override never seals).
+    assert_eq!(load_execs_for_key(&mut conn, wf, &taken).await.len(), 1);
+    assert_eq!(load_execs_for_key(&mut conn, wf, &wf_id).await.len(), 1);
+    assert_eq!(load_exec(&mut conn, &source).await.state, "COMPLETED");
 }
 
 /// R-29: an erased source input (issue #495) is rejected without an override.
@@ -987,7 +1052,11 @@ async fn rerun_rejects_erased_source_input() {
         body.to_string().to_lowercase().contains("eras"),
         "the 409 must explain the erasure: {body}"
     );
-    assert_eq!(load_execs_for(&mut conn, wf).await.len(), 1, "no new run");
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run"
+    );
 }
 
 /// R-30: an erased source IS re-runnable when the operator supplies an input.
@@ -1065,8 +1134,7 @@ async fn rerun_respects_admission_gate() {
         expires_at: None,
     }]);
     set_global_admission_gate_cache(Some(api_state.gate_cache()));
-    let app =
-        harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
 
     let mut conn = pool.get().await.unwrap();
     let wf_id = unique("rr-gated");
@@ -1079,7 +1147,7 @@ async fn rerun_respects_admission_gate() {
     assert!(body.get("reason").is_some(), "reason in body: {body}");
 
     assert_eq!(
-        load_execs_for(&mut conn, wf).await.len(),
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
         1,
         "a gated re-run must start nothing"
     );
@@ -1106,7 +1174,7 @@ async fn rerun_requires_admin() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     assert_eq!(
-        load_execs_for(&mut conn, wf).await.len(),
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
         1,
         "an unauthenticated re-run must not mutate the database"
     );
@@ -1133,11 +1201,13 @@ async fn rerun_malformed_id_returns_400_and_audits_failure() {
     let app = build_app(&pool, vec![plain_info("rr_malformed_wf")]);
     let mut conn = pool.get().await.unwrap();
 
-    let bad = "not-a-uuid";
-    let (status, body) = post_json(&app, &rerun_uri(bad), json!({})).await;
+    // Unique per run: the audit target_id is the raw id string, and the
+    // shared persistent DB would otherwise accumulate rows across runs.
+    let bad = format!("not-a-uuid-{}", uuid::Uuid::new_v4());
+    let (status, body) = post_json(&app, &rerun_uri(&bad), json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-    let rows = audit_rows(&mut conn, "workflow.rerun", bad).await;
+    let rows = audit_rows(&mut conn, "workflow.rerun", &bad).await;
     assert_eq!(rows.len(), 1, "a malformed id must still be audited");
     assert_eq!(rows[0].status, "failed");
 }
@@ -1173,7 +1243,11 @@ async fn rerun_rejects_debounced_workflow() {
 
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(load_execs_for(&mut conn, wf).await.len(), 1, "no new run");
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run"
+    );
 }
 
 /// R-36: a throttled workflow cannot be re-run (same deferred-start reason).
@@ -1197,7 +1271,11 @@ async fn rerun_rejects_throttled_workflow() {
 
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(load_execs_for(&mut conn, wf).await.len(), 1, "no new run");
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run"
+    );
 }
 
 /// R-37: the six replay-non-determinism diagnostic keys (issue #603) are
@@ -1354,7 +1432,8 @@ async fn rerun_source_result_route_reports_continued_as_new() {
     // conscious decision, not a silent regression.
     let (s_after, b_after) = get_json(&app, &format!("/workflows/{source}/result")).await;
     assert_ne!(
-        b_after["state"], json!("failed"),
+        b_after["state"],
+        json!("failed"),
         "sealing the source changes what /result reports for it (documented R1 \
          consequence): {s_after} {b_after}"
     );
@@ -1381,6 +1460,9 @@ async fn rerun_sets_no_continue_as_new_backlinks() {
         "a re-run is NOT a continue-as-new successor"
     );
     assert_eq!(row.first_exec_id, None, "a re-run begins a fresh chain");
-    assert_eq!(row.workflow_attempt, 1, "a re-run begins a fresh retry chain");
+    assert_eq!(
+        row.workflow_attempt, 1,
+        "a re-run begins a fresh retry chain"
+    );
     assert_eq!(event_count(&mut conn, &new_id).await, 1);
 }

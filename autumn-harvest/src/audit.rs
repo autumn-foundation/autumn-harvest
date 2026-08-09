@@ -46,11 +46,11 @@ pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 pub const OP_WORKFLOW_TERMINATE: &str = "workflow.terminate";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
-/// Audit operation: Operator re-run of a terminal workflow execution from its
-/// recorded start parameters (issue #777). Distinct from
-/// [`OP_WORKFLOW_RESET`], which forks an execution mid-history; a re-run
-/// starts a brand-new execution of the whole workflow. The audit row's
-/// `target_id` is the SOURCE execution id.
+/// Audit operation: Operator re-run of a terminal workflow (issue #777).
+///
+/// Distinct from [`OP_WORKFLOW_RESET`], which forks an execution mid-history;
+/// a re-run starts a brand-new execution of the whole workflow. The audit
+/// row's `target_id` is the SOURCE execution id.
 pub const OP_WORKFLOW_RERUN: &str = "workflow.rerun";
 /// Audit operation: Paused an individual workflow execution (issue #383).
 pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";

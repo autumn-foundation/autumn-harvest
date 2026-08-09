@@ -4513,8 +4513,13 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
 /// includes `CONTINUED_AS_NEW`, and re-running a chain predecessor would
 /// duplicate the work its successor is already doing (or has already done).
 /// The chain's LATEST run is the re-runnable one.
-pub const RERUNNABLE_SOURCE_STATES: &[&str] =
-    &["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "TERMINATED"];
+pub const RERUNNABLE_SOURCE_STATES: &[&str] = &[
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "TERMINATED",
+];
 
 /// Caller-supplied inputs for [`rerun_workflow_execution`] (issue #777).
 ///
@@ -4584,7 +4589,7 @@ pub struct RerunOutcome {
 ///
 /// Input (unless overridden), queue, memo, search attributes (minus the six
 /// replay-non-determinism diagnostic keys, issue #603), execution timeout,
-/// chain timeout, SLA, owner/runbook_url/severity, context headers, workflow
+/// chain timeout, SLA, `owner`/`runbook_url`/`severity`, context headers, workflow
 /// retry policy, and completion callbacks. The input is passed VERBATIM and is
 /// never decoded — the stored bytes are byte-for-byte what the original start
 /// wrote, so an encrypted or codec-encoded input re-runs identically.
@@ -4654,19 +4659,21 @@ pub async fn rerun_workflow_execution(
 
             // 2. Source-state gate (AC2), with distinct operator-actionable messages.
             if !RERUNNABLE_SOURCE_STATES.contains(&source.state.as_str()) {
-                return Err(HarvestError::Config(if source.state == "CONTINUED_AS_NEW" {
-                    format!(
-                        "workflow execution {source_exec_id} continued-as-new; \
+                return Err(HarvestError::Config(
+                    if source.state == "CONTINUED_AS_NEW" {
+                        format!(
+                            "workflow execution {source_exec_id} continued-as-new; \
                          re-run the chain's latest run instead"
-                    )
-                } else {
-                    format!(
-                        "workflow execution {source_exec_id} is not terminal (state {}); \
+                        )
+                    } else {
+                        format!(
+                            "workflow execution {source_exec_id} is not terminal (state {}); \
                          re-run is for finished work — cancel or terminate it first, \
                          or use reset to fork a live run",
-                        source.state
-                    )
-                }));
+                            source.state
+                        )
+                    },
+                ));
             }
 
             // 3. Erasure gate (issue #495): a tombstoned input would re-run the
@@ -6948,6 +6955,11 @@ mod triage_tests {
         assert_eq!(patch.severity, None);
         assert_eq!(patch.note, None);
     }
+}
+
+#[cfg(test)]
+mod rerun_tests {
+    use super::RERUNNABLE_SOURCE_STATES;
 
     /// Issue #777 AC2: the re-runnable source-state set must EXCLUDE
     /// `CONTINUED_AS_NEW`. It is deliberately NOT `erase::TERMINAL_STATES`,
@@ -6964,7 +6976,13 @@ mod triage_tests {
             5,
             "exactly the five genuinely-finished terminal states are re-runnable"
         );
-        for state in ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "TERMINATED"] {
+        for state in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "TERMINATED",
+        ] {
             assert!(
                 RERUNNABLE_SOURCE_STATES.contains(&state),
                 "{state} must be re-runnable"
