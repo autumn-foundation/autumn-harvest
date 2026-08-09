@@ -966,3 +966,40 @@ pass), `graph_history_needs_inflation_detects_opaque_payload_fields`, and two
 end-to-end run-graph tests — a codec-encoded compensator named like a current
 forward node is excluded (status `pending`, no timing, zero attempts) while an
 ordinary codec-encoded forward dispatch still reads normally.
+
+### Post-review hardening (round 6) — a bare unwind marker is not proof of rollback
+
+An automated review found a **P1** in the compensated-run retry guard: signal 1
+accepted a `saga_compensat*` marker on its own, but the marker is recorded
+*before* anything is rolled back.
+
+`Saga::run_compensations` calls `observe_saga_unwind_start` — which records
+`saga_compensated:{seq}` — and only then enters the compensation loop. A
+compensator can be rejected *pre-dispatch*: `execute_activity_raw` returns
+`PayloadTooLarge` before `push_command(ScheduleActivity)` when the
+`{dag_compensate, input, output}` envelope exceeds the activity-input cap and no
+payload offloading is configured. A run whose sole compensator is rejected that
+way therefore ends as `[…, saga_compensated:1, saga_compensation_failed:1,
+WorkflowFailed]` — a marker, zero `ActivityScheduled` events, and the upstream
+side effect still live.
+
+The guard read that marker as "already rolled back" and returned `409
+CompensatedRun`, telling the operator to start a fresh DAG run — which **repeats**
+the still-live upstream side effect. The rejection was in the dangerous direction:
+it refused the safe recovery and recommended the unsafe one.
+
+Signal 1 now requires a `saga_compensat*` marker **followed by at least one
+activity dispatch**. The check is positional (any `ActivityScheduled` after the
+marker's index), never name- or payload-keyed, which is why signal 1 is *refined*
+rather than dropped: an issue #495 payload erasure tombstones the envelope's
+contents so signal 2 goes blind, and only signal 1 keeps a genuinely rolled-back
+run non-retryable. Because a DAG compensator is always dispatched as an activity,
+the marker always precedes it, and no forward dispatch can follow it (the unwind
+runs only after the level walk returns), the refinement introduces no false
+negative.
+
+Pinned by `a_marker_only_unwind_that_dispatched_nothing_stays_retryable` (a
+marker pair with zero dispatches resolves `Ok`) and by
+`resolve_rejects_a_run_whose_compensation_failed_after_dispatching`, which was
+strengthened to dispatch its compensator so it proves the rejection path for a
+real rollback rather than for a bare marker.

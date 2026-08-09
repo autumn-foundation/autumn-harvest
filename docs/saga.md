@@ -558,7 +558,7 @@ double-spend the compensation.
 Detection uses **two** independent signals, both read from the run's own
 recorded history and never from the registered definition:
 
-1. a `saga_compensat*` marker in the run's history; or
+1. a `saga_compensat*` marker **followed by at least one activity dispatch**; or
 2. a recorded activity dispatch whose **input is a compensation envelope** —
    the reserved `{"dag_compensate": …, "input": …, "output": …}` shape written
    only by the unwind — **whose `dag_compensate` names a node that was
@@ -568,6 +568,27 @@ Signal 2 is required, not redundant. An unwind at a
 [drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
 records no marker at all, so a marker-only check would leave that fully
 rolled-back run retryable.
+
+The "followed by a dispatch" half of signal 1 is required in the *opposite*
+direction. `Saga::run_compensations` records its `saga_compensated:{seq}` marker
+**before** running the first compensation, so a compensator whose dispatch is
+rejected pre-dispatch — an oversized `{dag_compensate, input, output}` envelope
+against the [activity-input cap](#known-limitation--raising-a-payload-cap-during-an-unwind-diverges)
+with no payload offloading configured — leaves a marker in a run that rolled
+back **nothing**.
+Treating the bare marker as proof would 409 a perfectly safe retry and send the
+operator to a fresh run, re-running an upstream node whose side effect is still
+live. A marker with no dispatch after it therefore stays retryable.
+
+The check is positional (any `ActivityScheduled` after the marker index), not
+name- or payload-keyed, which is what lets it survive **payload erasure**: an
+issue #495 tombstone blanks the envelope's *contents* but never removes or
+reorders events, so signal 1 still sees the dispatch on a run whose envelopes
+signal 2 can no longer read — which is why signal 1 is refined rather than
+dropped, since a rolled-back-but-erased run must stay non-retryable. It
+also cannot go blind to a genuine unwind: a DAG compensator is always dispatched
+as an activity, the marker always precedes it, and no forward dispatch can
+follow the marker — the unwind runs only after the level walk has returned.
 
 Signal 2 does not rely on shape alone, because the shape is reachable by
 accident: a mapped cell or an `input_from` binding hands a node the raw upstream

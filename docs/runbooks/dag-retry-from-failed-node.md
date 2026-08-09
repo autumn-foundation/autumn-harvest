@@ -119,7 +119,7 @@ state, so a fresh run is the correct — and safe — recovery.
 Detection uses two independent signals, **both read from the run's own recorded
 history and never from the registered definition**:
 
-1. a `saga_compensat*` marker in the run's recorded history, or
+1. a `saga_compensat*` marker **followed by at least one activity dispatch**, or
 2. a recorded activity dispatch whose **input is a compensation envelope**
    (`{"dag_compensate": …, "input": …, "output": …}`) whose `dag_compensate`
    names a node that was **dispatched in the same run**.
@@ -128,6 +128,15 @@ Signal 2 is load-bearing, not belt-and-braces. A run that received an
 unsolicited signal unwinds **without** recording a marker (see
 [a stray signal silences unwind observability](../saga.md#known-limitation--a-stray-signal-silences-unwind-observability)),
 so a marker-only check would leave that fully rolled-back run retryable.
+
+The "followed by a dispatch" half of signal 1 matters just as much, in the
+opposite direction. The unwind records its marker *before* running the first
+compensation, so a compensator whose dispatch is rejected pre-dispatch — an
+oversized `{dag_compensate, input, output}` envelope with no payload offloading
+— leaves a marker in a run that rolled back **nothing**. Treating that as proof
+would 409 a perfectly safe retry and send you to a fresh run, re-running an
+upstream node whose side effect is still live. A marker with no dispatch after
+it therefore stays retryable.
 
 The dispatched-node condition on signal 2 is what keeps it from misfiring — a
 forward node's input is arbitrary user data (a mapped cell, or a bound upstream

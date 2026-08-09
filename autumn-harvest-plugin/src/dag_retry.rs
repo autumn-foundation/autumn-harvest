@@ -163,8 +163,9 @@ pub enum DagRetryResolveError {
 /// (`autumn_harvest::replay::saga_compensated_marker_name`) is `pub(crate)`.
 ///
 /// Matching by prefix covers both `saga_compensated:{seq}` and
-/// `saga_compensation_failed:{seq}`: either one proves an unwind ran, and a
-/// unwind that FAILED leaves the run in an even less retryable state.
+/// `saga_compensation_failed:{seq}`. Either one proves an unwind was
+/// **attempted** — not that anything was rolled back, which is why the marker
+/// is only half of signal 1 (see [`dispatched_after`]).
 const SAGA_UNWIND_MARKER_PREFIX: &str = "saga_compensat";
 
 /// The reserved key issue #780's compensation envelope is built around. The
@@ -252,13 +253,21 @@ pub fn compensates_a_dispatched_node(
 ///
 /// **Two** signals, because neither alone is sufficient:
 ///
-/// 1. A `saga_compensat*` [`WorkflowEvent::MarkerRecorded`]. The general signal,
-///    and the only one available for a non-DAG saga — but NOT guaranteed for a
-///    DAG: issue #801's matcher deliberately leaves an unwind uncounted when the
-///    history sits at a **drained signal frontier**, so a DAG run that received
-///    an unsolicited signal records no marker even though its compensators
-///    dispatched (`docs/saga.md`, "a stray signal silences unwind
-///    observability").
+/// 1. A `saga_compensat*` [`WorkflowEvent::MarkerRecorded`] **corroborated by an
+///    activity dispatch recorded after it** ([`dispatched_after`]). The marker
+///    alone proves only that an unwind was *attempted*: `Saga::run_compensations`
+///    records it before running the first compensation, so a compensator
+///    rejected pre-dispatch leaves a marker that rolled nothing back. Requiring
+///    a dispatch after it is what makes this signal mean "something was actually
+///    undone". It is positional, so it still answers correctly for a run whose
+///    payloads were **erased** (issue #495) — the one case the envelope signal
+///    cannot see.
+///
+///    Not guaranteed for a DAG: issue #801's matcher deliberately leaves an
+///    unwind uncounted when the history sits at a **drained signal frontier**,
+///    so a DAG run that received an unsolicited signal records no marker even
+///    though its compensators dispatched (`docs/saga.md`, "a stray signal
+///    silences unwind observability").
 /// 2. An [`WorkflowEvent::ActivityScheduled`] whose recorded `input` is a
 ///    **compensation envelope** whose `dag_compensate` names a node that was
 ///    **actually dispatched in this run** ([`compensates_a_dispatched_node`]).
@@ -316,15 +325,61 @@ pub fn compensates_a_dispatched_node(
 /// Pure and cheap: a bounded number of passes over the events.
 #[must_use]
 fn ran_compensation_unwind(events: &[WorkflowEvent]) -> bool {
-    let dispatched = dispatched_activity_names(events);
+    // Signal 1: an unwind-start marker CORROBORATED by a dispatch after it.
+    if let Some(idx) = first_unwind_marker_index(events)
+        && dispatched_after(events, idx)
+    {
+        return true;
+    }
 
+    // Signal 2: a compensation envelope naming a node dispatched in the same
+    // run. Covers the marker-less unwind (issue #801's drained-signal
+    // frontier), which signal 1 cannot see at all.
+    let dispatched = dispatched_activity_names(events);
     events.iter().any(|event| match event {
-        WorkflowEvent::MarkerRecorded { name, .. } => name.starts_with(SAGA_UNWIND_MARKER_PREFIX),
         WorkflowEvent::ActivityScheduled { input, .. } => {
             compensates_a_dispatched_node(input, &dispatched)
         }
         _ => false,
     })
+}
+
+/// Index of the unwind's **start** marker, if the run recorded one.
+///
+/// `SAGA_UNWIND_MARKER_PREFIX` matches both `saga_compensated:{seq}` and
+/// `saga_compensation_failed:{seq}`; `Saga::run_compensations` records the
+/// former first, so `position` finds the unwind's start.
+fn first_unwind_marker_index(events: &[WorkflowEvent]) -> Option<usize> {
+    events.iter().position(|event| {
+        matches!(event, WorkflowEvent::MarkerRecorded { name, .. }
+            if name.starts_with(SAGA_UNWIND_MARKER_PREFIX))
+    })
+}
+
+/// Did the run dispatch **any** activity after the unwind started?
+///
+/// This is what turns an unwind-start marker from "an unwind was attempted"
+/// into "something was actually rolled back". `Saga::run_compensations` records
+/// the marker *before* running the first compensation closure, so a compensator
+/// whose dispatch is rejected pre-dispatch (`execute_activity_raw` returns
+/// `PayloadTooLarge` before `push_command` — an oversized
+/// `{dag_compensate, input, output}` envelope with no payload offloading) leaves
+/// the marker with nothing beside it. The terminal persist path produces the
+/// same shape: it replays `RecordMarker` but not `ScheduleActivity`.
+///
+/// Reading it positionally rather than by name or payload is deliberate. It
+/// needs no decoded payload, so it still answers correctly for a run whose
+/// payloads were **erased** (issue #495 tombstones `input` but never removes or
+/// reorders the event) — a case the envelope signal alone cannot see.
+///
+/// Any `ActivityScheduled` after the marker is a compensation dispatch: the
+/// unwind runs only once the forward level walk has returned, so every forward
+/// dispatch precedes it.
+fn dispatched_after(events: &[WorkflowEvent], marker_index: usize) -> bool {
+    events
+        .iter()
+        .skip(marker_index.saturating_add(1))
+        .any(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
 }
 
 /// A resolved, dry-runnable retry plan: the reset point plus the explicit
@@ -1190,12 +1245,19 @@ mod tests {
         );
     }
 
-    /// The failure marker alone (a compensation that ITSELF failed) also means
-    /// the unwind ran, so the run is equally unsafe to retry.
+    /// A compensation that ITSELF failed **after dispatching** is still unsafe:
+    /// the compensator activity ran, so its rollback may be partially applied.
+    ///
+    /// Contrast the zero-dispatch case below — a marker alone does not prove a
+    /// rollback, which is why this fixture carries an actual dispatch.
     #[test]
-    fn resolve_rejects_a_run_whose_compensation_failed() {
+    fn resolve_rejects_a_run_whose_compensation_failed_after_dispatching() {
         let def = linear_dag();
-        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
         let events = vec![
             started(),
             scheduled("a", ia),
@@ -1203,11 +1265,53 @@ mod tests {
             scheduled("b", ib),
             failed(ib),
             marker("saga_compensated:1"),
+            // The compensator was dispatched — the activity ran — and then
+            // failed. Rollback is potentially partially applied.
+            scheduled("undo_a", iu),
+            failed(iu),
             marker("saga_compensation_failed:1"),
         ];
         assert_eq!(
             resolve_retry_plan(&def, &events, &["b".to_string()]),
             Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// An unwind that recorded its start marker but **dispatched nothing**
+    /// rolled nothing back, so the run stays retryable.
+    ///
+    /// `Saga::run_compensations` records `saga_compensated:{seq}` *before* it
+    /// runs the first compensation closure, so a compensator whose dispatch is
+    /// rejected **pre-dispatch** — `execute_activity_raw` returns
+    /// `PayloadTooLarge` before `push_command`, e.g. an oversized
+    /// `{dag_compensate, input, output}` envelope with no payload offloading —
+    /// leaves the marker in history with no `ActivityScheduled` beside it.
+    /// (The terminal persist path replays `RecordMarker` but not
+    /// `ScheduleActivity`, so it produces the same shape.)
+    ///
+    /// Treating that marker as proof of rollback inverts the guard: it would
+    /// 409 a **safe** retry and send the operator to a fresh run, re-running
+    /// node `a` whose side effect is still live — a duplicate side effect,
+    /// the mirror image of the double-spend this guard exists to prevent.
+    #[test]
+    fn a_marker_only_unwind_that_dispatched_nothing_stays_retryable() {
+        let def = linear_compensating_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // Unwind started...
+            marker("saga_compensated:1"),
+            // ...and immediately failed with NO dispatch: nothing rolled back.
+            marker("saga_compensation_failed:1"),
+        ];
+        assert!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]).is_ok(),
+            "an unwind that dispatched nothing rolled nothing back, so node `a`'s side \
+             effect is still live and carrying it over on a retry is correct"
         );
     }
 
