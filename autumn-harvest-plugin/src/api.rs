@@ -18782,10 +18782,17 @@ async fn rerun_workflow(
         }
     };
 
-    // Fail closed if the runtime is not installed (the boot window).
+    // Fail closed if the runtime is not installed (the boot window). `conn`
+    // and `exec_id_str` are already in scope, so — like every other
+    // rejection path in this handler — this audits through the caller's own
+    // connection rather than silently dropping an observable mutation
+    // attempt from the trail (issue #605/#777 review, Codex).
     let runtime = match api_state.runtime() {
         Ok(rt) => rt,
-        Err(e) => return map_error(e).into_response(),
+        Err(e) => {
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &e.to_string()).await;
+            return map_error(e).into_response();
+        }
     };
 
     // The workflow type must still be registered on this node — otherwise the
@@ -40773,6 +40780,132 @@ mod tests {
             signal_count, 0,
             "the signal must not have been durably enqueued while the runtime was unavailable"
         );
+    }
+
+    /// Codex P2 finding (issue #605/#777 review, PR #1152): during the
+    /// plugin-startup boot window (storage pool installed, `install(runtime)`
+    /// not yet complete) `rerun_workflow`'s runtime lookup returned an error
+    /// WITHOUT writing the failed `workflow.rerun` audit row -- unlike every
+    /// other rejection path in this handler, which all audit through the
+    /// caller's own connection (`conn`/`exec_id_str` are already in scope by
+    /// this point). Reproduce that exact state and assert the audit row is
+    /// now written, mirroring the sibling boot-window tests above.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // matches the sibling boot-window tests above
+    async fn rerun_workflow_audits_failure_when_runtime_not_installed() {
+        #[derive(diesel::QueryableByName)]
+        struct AuditRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            status: String,
+        }
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to rerun_workflow test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "rerun_no_runtime",
+                workflow_id: "rerun-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                chain_execution_timeout: None,
+                max_workflow_chain_timeout_ceiling: None,
+                inherited_chain_deadline_at: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup window.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = rerun_workflow(
+            Extension(state),
+            Path(exec_id.to_string()),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "rerun_workflow must fail closed when the runtime isn't installed yet"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // The regression under test: a failed `workflow.rerun` audit row must
+        // exist for this rejection, matching every other rejection path in
+        // the handler -- previously this branch returned before ever calling
+        // `audit_rerun_failure_on`.
+        let rows: Vec<AuditRow> = diesel::sql_query(
+            "SELECT status FROM harvest_audit_log WHERE operation = $1 AND target_id = $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(OP_WORKFLOW_RERUN)
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .load(&mut conn)
+        .await
+        .expect("audit query should run");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one workflow.rerun audit row for this rejection, got {}",
+            rows.len()
+        );
+        assert_eq!(rows[0].status, "failed");
     }
 
     fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {

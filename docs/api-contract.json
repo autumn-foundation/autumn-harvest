@@ -1440,7 +1440,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract; or an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body. Only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable."
+          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract; an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body (only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable); or the source's stored `completion_callbacks` value cannot be parsed as JSON (issue #605) — a standard RFC 7807 {detail: <message>} body naming the source execution."
         },
         {
           "status": 401,
@@ -1457,6 +1457,10 @@
         {
           "status": 413,
           "description": "The new run's input exceeds the effective workflow-input byte cap (issue #252). Fires on an oversized `input` override, and — notably — can also fire on the VERBATIM CLONE of a source that started successfully under a larger cap, if an operator has since LOWERED `max_workflow_input_bytes` (globally or for this workflow type). In that case the source is re-runnable only by supplying a smaller `input` override or by raising the cap back."
+        },
+        {
+          "status": 422,
+          "description": "A completion callback target CLONED VERBATIM from the source (issue #605) is no longer admissible under the live SSRF policy — e.g. it was valid when the source started but has since been dropped from the host allowlist. Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object (tag: `code`, e.g. HostNotAllowlisted/SchemeNotAllowed/IpLiteralNotAllowed). Only fires when the source has `completion_callbacks` recorded; a source with none is unaffected. Nothing is started and the source is never sealed."
         },
         {
           "status": 503,
