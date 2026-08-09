@@ -149,6 +149,10 @@ name = "dag_data_flow"
 required-features = ["unified-dag-execution"]
 
 [[example]]
+name = "dag_compensation"
+required-features = ["unified-dag-execution"]
+
+[[example]]
 name = "child_with_timeout"
 
 [[example]]
