@@ -1003,3 +1003,17 @@ marker pair with zero dispatches resolves `Ok`) and by
 `resolve_rejects_a_run_whose_compensation_failed_after_dispatching`, which was
 strengthened to dispatch its compensator so it proves the rejection path for a
 real rollback rather than for a bare marker.
+
+**Final detection contract** (supersedes the two-signal lists in the earlier
+rounds above, which record what each round found rather than the end state). A
+run is treated as compensated iff **either**:
+
+1. a `saga_compensat*` marker is followed by at least one `ActivityScheduled`, or
+2. an `ActivityScheduled` carries a `{dag_compensate, input, output}` envelope
+   whose `dag_compensate` names an activity **dispatched** in the same run.
+
+Both read only the run's own recorded history — never the registered definition.
+A partial unwind still trips signal 1: if any compensator dispatched, the `409`
+stands even when a later one is rejected. Only an unwind that dispatched
+*nothing* stays retryable, which is precisely the case where nothing was rolled
+back.
