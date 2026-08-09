@@ -407,6 +407,30 @@ consequences for a [mapped node](getting-started/08-dags-and-schedules.md#dynami
   cells commit real side effects, prefer `CollectAll` plus a
   cell-aware compensator, or make each cell self-compensating.
 
+### Compensation dispatches are excluded from name-keyed history reads
+
+A compensator dispatch is an ordinary `ActivityScheduled` event carrying the
+compensator's activity name — a **new class** of event issue #780 introduced,
+which every name-keyed history reader must now exclude.
+
+Within one definition version [`CompensatorNameCollidesWithNode`](#build-time-guards)
+keeps a compensator distinguishable from a forward node. That is a
+*per-definition-version* guarantee, though: a later definition may introduce a
+**forward node** named after an older definition's compensator. Reading the old
+compensation dispatch would then report a node that never executed as
+succeeded/failed, with the compensation's timestamps.
+
+Both readers therefore skip a dispatch whose input is a compensation envelope
+naming a node that succeeded in the same run — the same history-only
+corroboration the [retry guard](#retrying-a-compensated-run-issue-366-interaction)
+uses, so it cannot drift across versions in either direction:
+
+* `dag_retry::node_outcome` — node status (also feeds the run-graph view, #690);
+* `dag_graph::latest_scheduled` — node timing, attempts, and error.
+
+Keeping the exclusion in **both** is what stops `status` and the timings from
+disagreeing about which attempt they describe.
+
 ### Known limitation — raising a payload cap *during* an unwind diverges
 
 A deterministic pre-dispatch rejection — today only

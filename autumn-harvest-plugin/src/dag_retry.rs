@@ -203,7 +203,7 @@ fn is_compensation_envelope(input: &serde_json::Value) -> bool {
 ///
 /// Correlation is by `activity_id`, because `ActivityCompleted` carries no name.
 #[must_use]
-fn succeeded_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
+pub fn succeeded_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
     let completed: std::collections::HashSet<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -227,8 +227,14 @@ fn succeeded_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
 ///
 /// The history-only corroboration for signal 2 — see [`ran_compensation_unwind`]
 /// for why it is drawn from history rather than the current definition.
+///
+/// Doubles as the **forward-dispatch exclusion** used by every name-keyed
+/// history reader ([`node_outcome`], and `dag_graph`'s `latest_scheduled`): a
+/// dispatch this returns `true` for is a compensator's, never a forward node's,
+/// so it must not contribute a node's outcome or timing. See
+/// [`is_compensation_dispatch`].
 #[must_use]
-fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTreeSet<&str>) -> bool {
+pub fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTreeSet<&str>) -> bool {
     is_compensation_envelope(input)
         && input
             .get(COMPENSATION_ENVELOPE_KEY)
@@ -426,9 +432,36 @@ fn level_granular_reexecute_set(
         .collect()
 }
 
+/// Is this recorded `ActivityScheduled` an issue #780 **compensator** dispatch
+/// rather than a forward node's dispatch?
+///
+/// Every name-keyed history reader must exclude these. Issue #780 introduced a
+/// new class of `ActivityScheduled` event, and while
+/// `DagBuildError::CompensatorNameCollidesWithNode` keeps a compensator
+/// distinguishable from a forward node *within one definition version*, that is
+/// a per-version guarantee: a later definition may introduce a forward node
+/// named after an older definition's compensator. Reading the old compensation
+/// dispatch as that node's outcome or timing reports a node that never
+/// executed.
+///
+/// `succeeded` comes from [`succeeded_activity_names`] over the same history —
+/// hoist it out of per-node loops. The check is history-only, so unlike a
+/// definition-derived one it cannot drift across versions in either direction.
+#[must_use]
+pub fn is_compensation_dispatch(input: &serde_json::Value, succeeded: &BTreeSet<&str>) -> bool {
+    compensates_a_succeeded_node(input, succeeded)
+}
+
 /// Determine the outcome of a single node (by activity name) on the source run.
+///
+/// Compensator dispatches are excluded ([`is_compensation_dispatch`]), so a
+/// forward node introduced under a name an older definition used for a
+/// compensator reports `NotAttempted` rather than inheriting the compensation's
+/// outcome.
 #[must_use]
 pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
+    let succeeded = succeeded_activity_names(events);
+
     // Find the activity_id of the *latest* ActivityScheduled with this name.
     // If a node was scheduled more than once (e.g. a re-dispatched attempt with
     // a fresh activity_id), the latest attempt is the one whose terminal state
@@ -436,9 +469,13 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
     let mut scheduled_id = None;
     for event in events.iter().rev() {
         if let WorkflowEvent::ActivityScheduled {
-            activity_id, name, ..
+            activity_id,
+            name,
+            input,
+            ..
         } = event
             && name == node
+            && !is_compensation_dispatch(input, &succeeded)
         {
             scheduled_id = Some(*activity_id);
             break;
@@ -815,6 +852,67 @@ mod tests {
             completed(id2),
         ];
         assert_eq!(node_outcome(&events, "c"), NodeOutcome::Succeeded);
+    }
+
+    /// Issue #780 introduced a *new class* of `ActivityScheduled` event — the
+    /// compensator dispatch — that name-keyed history readers had never seen
+    /// before. Within one definition version
+    /// `CompensatorNameCollidesWithNode` keeps it distinguishable, but that is a
+    /// per-version guarantee: a later definition may introduce a **forward**
+    /// node named after an older definition's compensator. `node_outcome` would
+    /// then report that never-executed node's outcome from the old compensation
+    /// dispatch — surfacing in the run-graph view (#690) and in this resolver's
+    /// per-node validation.
+    ///
+    /// The exclusion is history-only (the same corroboration
+    /// `ran_compensation_unwind` uses), so it needs no definition and cannot
+    /// drift across versions.
+    #[test]
+    fn node_outcome_ignores_a_compensation_dispatch_named_like_a_forward_node() {
+        let (ia, iu) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            // The OLD definition's unwind rolled `a` back. In the CURRENT
+            // definition `undo_a` is an ordinary forward node that never ran.
+            compensator_dispatch("undo_a", "a", iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            node_outcome(&events, "undo_a"),
+            NodeOutcome::NotAttempted,
+            "a compensation dispatch must never be read as a forward node's outcome"
+        );
+        assert_eq!(
+            node_outcome(&events, "a"),
+            NodeOutcome::Succeeded,
+            "the genuinely-executed forward node is unaffected"
+        );
+    }
+
+    /// The exclusion must not swallow a forward dispatch whose *user input*
+    /// happens to be envelope-shaped — the same false-positive vector the retry
+    /// guard corroborates against. `dag_compensate` here names nothing that
+    /// succeeded, so the dispatch stays a forward dispatch.
+    #[test]
+    fn node_outcome_still_reads_a_forward_node_whose_input_mimics_the_envelope() {
+        let ia = ActivityExecId::new();
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ia,
+                name: "a".to_string(),
+                input: serde_json::json!({
+                    "dag_compensate": "not_a_node_that_ran",
+                    "input": Value::Null,
+                    "output": Value::Null,
+                }),
+                queue: "default".to_string(),
+            },
+            completed(ia),
+        ];
+        assert_eq!(node_outcome(&events, "a"), NodeOutcome::Succeeded);
     }
 
     // ---- resolve: linear -------------------------------------------------

@@ -842,3 +842,41 @@ Pinned by `dag_compensation_tests::known_limitation_raising_the_cap_mid_unwind_d
 documented in `docs/saga.md` plus the `is_deterministic_dispatch_rejection` doc
 comment, with the operational guidance: do not change payload caps while
 compensating DAG runs are in flight.
+
+### P2 — the DAG run-graph read compensation dispatches as forward nodes
+
+Issue #780 introduced a **new class** of `ActivityScheduled` event — the
+compensator dispatch — that every name-keyed history reader now sees for the
+first time. The retry resolver was hardened against name reuse across
+definition versions in the previous rounds; the run-graph view (#690) was not,
+and it shares the same readers.
+
+Within one definition version `CompensatorNameCollidesWithNode` keeps a
+compensator distinguishable from a forward node. Across versions it does not: a
+later definition may introduce a **forward node** named after an older
+definition's compensator. `GET /dags/{name}/runs/{id}` would then report that
+never-executed node as succeeded/failed, with the compensation's timestamps.
+
+Both name-keyed readers now skip a compensation dispatch, using the same
+history-only corroboration the retry guard uses (an envelope whose
+`dag_compensate` names a node that succeeded in the same run), so neither can
+drift across versions:
+
+- `dag_retry::node_outcome` — node status (feeds the run-graph view too);
+- `dag_graph::latest_scheduled` — node timing, attempts, and error.
+
+Fixing **both** is load-bearing: they are separate readers of the same
+authoritative attempt, so excluding in only one would leave a name-reused node
+reporting `pending` alongside the old compensation's timestamps. The shared
+predicate is exported as `dag_retry::is_compensation_dispatch`.
+
+RED first, at both levels:
+
+- `node_outcome_ignores_a_compensation_dispatch_named_like_a_forward_node`
+- `a_compensation_dispatch_is_not_read_as_a_same_named_forward_node`
+  (run-graph level; asserts `status`, `started_at`, and `attempts` together)
+
+The user-payload false positive stays closed by the same corroboration
+(`node_outcome_still_reads_a_forward_node_whose_input_mimics_the_envelope`: the
+mimic's `dag_compensate` names nothing that succeeded, so a genuine forward
+dispatch is never swallowed).
