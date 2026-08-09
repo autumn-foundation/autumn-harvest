@@ -12153,9 +12153,24 @@ impl ActivityContext {
     ///
     /// Set automatically by the worker at dispatch; you only need this when
     /// constructing an [`ActivityContext`] manually in tests.
+    ///
+    /// If a default idempotency key is already attached — as
+    /// [`new_test`](Self::new_test) attaches one — it is **re-derived from the
+    /// new id**, so [`info().activity_id`](Self::info) and
+    /// [`idempotency_key`](Self::idempotency_key) can never disagree. That is
+    /// the invariant production dispatch always upholds (both are built from
+    /// the same `activity_id`), and a test context that violated it would
+    /// exercise a shape the engine never produces. A context with no key
+    /// attached still has none — this never manufactures one.
+    ///
+    /// Call [`with_idempotency_key`](Self::with_idempotency_key) *after* this
+    /// if you need a key that is not derived from the id.
     #[must_use]
-    pub const fn with_activity_id(mut self, activity_id: ActivityExecId) -> Self {
+    pub fn with_activity_id(mut self, activity_id: ActivityExecId) -> Self {
         self.identity.activity_id = activity_id;
+        if self.idempotency_key.is_some() {
+            self.idempotency_key = Some(IdempotencyKey::from_activity_exec_id(activity_id));
+        }
         self
     }
 
@@ -12474,14 +12489,16 @@ impl ActivityContext {
     ///   workflow shifts the stored `schedule_to_close` deadline *later* (the
     ///   paused span is not charged), so a resumed attempt reports a value that
     ///   is conservatively early rather than stale-late.
-    /// * **Local activities** report `now + ` the clamped per-attempt budget,
-    ///   which is *not* the only clock either: the whole workflow task is
-    ///   bounded by `WorkerConfig::workflow_task_timeout` (issue #494), raised
-    ///   to at least `max_local_activity_start_to_close` so it is never the
-    ///   shorter clock outright. That enclosing budget starts at the top of the
-    ///   decision cycle, though, so cycle time spent *before* the attempt (an
-    ///   earlier command, or a previous attempt of the same local activity) is
-    ///   charged to it and not to this deadline.
+    /// * **Local activities** take a minimum too, over a different pair: the
+    ///   clamped per-attempt budget (`now + ` the budget, bounded by
+    ///   `max_local_activity_start_to_close`) and the enclosing workflow-task
+    ///   budget (`WorkerConfig::workflow_task_timeout`, issue #494), whose
+    ///   absolute cut-off is threaded in from the dispatch that armed it. The
+    ///   enclosing clock starts at the top of the decision cycle, so time spent
+    ///   before the attempt — history load, an earlier command, a previous
+    ///   attempt of the same local activity — has already been consumed from
+    ///   it; clamping is what keeps a late attempt from claiming a budget that
+    ///   outlives the cycle.
     ///
     /// # Differs from the workflow-side sibling
     ///
@@ -24474,6 +24491,64 @@ mod activity_info_tests {
             .with_queue_name("payments")
             .with_attempt(2)
             .with_max_attempts(5)
+    }
+
+    /// `with_activity_id` must keep the derived idempotency key in step.
+    ///
+    /// The docs promise `activity_id` backs `idempotency_key()`, and production
+    /// dispatch builds both from the same id. A builder that moved only the
+    /// identity would hand tests a context the engine never produces — an
+    /// activity keying an external call off `idempotency_key()` would look
+    /// correct in a test and collide in production.
+    #[test]
+    fn with_activity_id_re_derives_the_idempotency_key() {
+        let first = ActivityContext::new_test();
+        let original = first
+            .idempotency_key()
+            .expect("new_test attaches a key")
+            .clone();
+
+        let moved = ActivityExecId::new();
+        let ctx = first.with_activity_id(moved);
+        let key = ctx.idempotency_key().expect("key survives the move");
+
+        assert_ne!(key, &original, "the key must follow the new activity id");
+        assert_eq!(
+            key,
+            &crate::types::IdempotencyKey::from_activity_exec_id(moved),
+            "and must be exactly the key production would derive from that id"
+        );
+        assert_eq!(ctx.info().activity_id, moved);
+    }
+
+    /// ...but it never manufactures a key on a context that had none.
+    ///
+    /// `new_local_activity` starts keyless until the worker attaches one; a
+    /// builder that invented a key here would turn `idempotency_key()`'s
+    /// documented `Config` error into a silent success.
+    #[test]
+    fn with_activity_id_does_not_invent_a_key_when_none_is_attached() {
+        let ctx = ActivityContext::new_local_activity(
+            super::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        )
+        .with_activity_id(ActivityExecId::new());
+
+        assert!(
+            ctx.idempotency_key().is_err(),
+            "a keyless context must stay keyless"
+        );
+    }
+
+    /// An explicit key set *after* the id wins — the documented escape hatch.
+    #[test]
+    fn explicit_idempotency_key_after_the_id_wins() {
+        let custom = crate::types::IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+        let ctx = ActivityContext::new_test()
+            .with_activity_id(ActivityExecId::new())
+            .with_idempotency_key(custom.clone());
+        assert_eq!(ctx.idempotency_key().expect("custom key"), &custom);
     }
 
     /// AC1: every field the issue names is present and readable.

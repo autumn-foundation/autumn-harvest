@@ -625,7 +625,7 @@ const RESERVE: Duration = Duration::from_millis(4_500);
 /// out one full interval plus a full second of slack — the slack has to cover
 /// `pool.get()` and the UPDATE being *issued*, so it is load-bearing, not
 /// cosmetic.
-const FLUSH_WAIT: Duration = Duration::from_millis(2_000);
+const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
 /// Reads `{"next": n}` from the heartbeat checkpoint, defaulting to 0.
 ///

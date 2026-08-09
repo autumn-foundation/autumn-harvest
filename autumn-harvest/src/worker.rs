@@ -2700,14 +2700,12 @@ struct OwningRun<'a> {
 /// inside the workflow task, so a budget below the local cap would kill a
 /// workflow that is legitimately waiting on an in-progress local activity.
 ///
-/// That `max` is load-bearing for issue #783's local-activity
-/// [`ActivityContext::deadline`]: a local attempt reports `now +
-/// per_attempt_timeout`, itself clamped to `max_local_activity_start_to_close`,
-/// so on any config this keeps the enclosing budget from being the *shorter*
-/// clock (on stock defaults, `max(10s, 60s) = 60s` against a 60s local cap).
-/// It does **not** make the enclosing budget strictly longer than the reported
-/// deadline in every case — see the "Local activities" caveat on
-/// [`ActivityContext::deadline`].
+/// This interacts with issue #783's local-activity
+/// [`ActivityContext::deadline`], which reports the *minimum* of the attempt's
+/// own budget and this enclosing one (see [`local_attempt_deadline`]). Without
+/// the `max`, a workflow-task timeout below the local cap would make the
+/// enclosing clock dominate every local attempt's reported deadline — cutting
+/// it short rather than merely bounding it.
 const fn effective_workflow_task_timeout(configured: Duration, local_cap: Duration) -> Duration {
     if configured.is_zero() {
         Duration::ZERO
@@ -2715,6 +2713,44 @@ const fn effective_workflow_task_timeout(configured: Duration, local_cap: Durati
         configured
     } else {
         local_cap
+    }
+}
+
+/// The deadline a **local** activity attempt reports via
+/// [`ActivityContext::deadline`] (issue #783).
+///
+/// The earlier of the two clocks that can actually cut the attempt off:
+/// * its own per-attempt budget, `now + per_attempt_timeout` — already clamped
+///   to `max_local_activity_start_to_close` — enforced by the per-attempt
+///   `tokio::time::timeout`; and
+/// * the enclosing workflow-task budget (issue #494), an *absolute* instant
+///   captured when that dispatch's `tokio::time::timeout` was armed.
+///
+/// Taking the minimum matters because the enclosing clock starts at the top of
+/// the decision cycle, not at this attempt. Everything spent before we get here
+/// — history load, earlier commands, a previous attempt of this same local
+/// activity — is charged to it and not to us, so `now + per_attempt_timeout`
+/// alone **over-reports**: on stock defaults the two budgets are equal
+/// (`max(10s, 60s)` against a 60s local cap), so even a first attempt drifts,
+/// and a second attempt can claim nearly a full budget moments before the outer
+/// timeout cancels it. Over-reporting is the destructive direction — it is
+/// exactly what makes a deadline-aware activity skip its checkpoint and lose
+/// the work this feature exists to preserve.
+///
+/// `None` for the enclosing budget means the workflow-task timeout is disabled
+/// (`Duration::ZERO`), leaving the per-attempt budget as the only clock.
+fn local_attempt_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    per_attempt_timeout: Duration,
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let own = chrono::Duration::from_std(per_attempt_timeout)
+        .ok()
+        .and_then(|budget| now.checked_add_signed(budget));
+    match (own, workflow_task_deadline) {
+        (Some(own), Some(enclosing)) => Some(own.min(enclosing)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     }
 }
 
@@ -2741,6 +2777,10 @@ async fn run_local_activity_inline(
     // the owning workflow task, so it has no queue of its own.
     queue_name: &str,
     owner: OwningRun<'_>,
+    // Issue #783: absolute instant the enclosing workflow-task dispatch is cut
+    // off at (issue #494), or `None` when that timeout is disabled. Clamps the
+    // reported per-attempt deadline so it can never out-live the cycle.
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -2875,24 +2915,18 @@ async fn run_local_activity_inline(
     let invocation = crate::interceptor::ActivityInvocation::new(&run.name, true, queue_name);
 
     for attempt in start_attempt..=max_attempts {
-        // Issue #783: the per-attempt deadline is `now + per_attempt_timeout` —
-        // the same budget the per-attempt `tokio::time::timeout` below enforces.
-        // `per_attempt_timeout` is already clamped to
-        // `WorkerConfig::max_local_activity_start_to_close`, so an unset (or
-        // above-cap) `start_to_close` reports the cap, per AC5.
-        //
-        // It is NOT the only clock, though: the whole workflow-task dispatch is
-        // wrapped in `effective_workflow_task_timeout(..)` (issue #494), which
-        // starts at the top of the decision cycle rather than here. That `max`
-        // keeps the enclosing budget from being the shorter clock outright, but
-        // cycle time spent BEFORE this attempt (history load, earlier commands,
-        // a previous attempt of this same local activity) is charged to it and
-        // not to us — so a late attempt can out-live the enclosing budget.
-        // Documented on `ActivityContext::deadline`; deliberately not clamped
-        // here, since the cycle-start instant is not threaded into this path.
-        let attempt_deadline = chrono::Duration::from_std(per_attempt_timeout)
-            .ok()
-            .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
+        // Issue #783: the earlier of this attempt's own budget (`now +
+        // per_attempt_timeout`, already clamped to
+        // `WorkerConfig::max_local_activity_start_to_close` per AC5) and the
+        // enclosing workflow-task budget (issue #494), which started at the top
+        // of the decision cycle rather than here. See `local_attempt_deadline`
+        // for why the minimum — not the per-attempt budget alone — is what the
+        // activity must see.
+        let attempt_deadline = local_attempt_deadline(
+            chrono::Utc::now(),
+            per_attempt_timeout,
+            workflow_task_deadline,
+        );
         let ctx = ActivityContext::new_local_activity(
             registry.shared_state(),
             CancellationToken::new(),
@@ -11608,6 +11642,10 @@ async fn process_workflow_task(
     // execution) and the configured re-dispatch budget.
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
+    // (issue #494), forwarded to inline local activities so their reported
+    // deadline cannot out-live the cycle. `None` when that timeout is disabled.
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -12020,6 +12058,7 @@ async fn process_workflow_task(
                         workflow_id: prepared.execution.workflow_id.as_str(),
                         workflow_type: prepared.execution.workflow_name.as_str(),
                     },
+                    workflow_task_deadline,
                 )
                 .await
                 {
@@ -13248,6 +13287,10 @@ async fn process_task(
     // only on the workflow path.
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
+    // (issue #494); `None` when that timeout is disabled. Workflow path only —
+    // an activity task is not wrapped in it.
+    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -13265,6 +13308,7 @@ async fn process_task(
                 dispatched_at,
                 &workflow_panic_strikes,
                 workflow_panic_max_attempts,
+                workflow_task_deadline,
             )
             .await
         }
@@ -16597,6 +16641,13 @@ impl Worker {
             // Apply per-workflow-task wall-clock budget when configured and
             // this is a workflow task with a non-zero timeout.
             if !workflow_task_timeout.is_zero() && task_type == "workflow" {
+                // Issue #783: the absolute instant this dispatch is cut off at,
+                // captured against the same `now` the timeout below is armed
+                // with, and threaded down so an inline local activity's
+                // reported deadline can never out-live the cycle.
+                let workflow_task_deadline = chrono::Duration::from_std(workflow_task_timeout)
+                    .ok()
+                    .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
                 match tokio::time::timeout(
                     workflow_task_timeout,
                     process_task(
@@ -16614,6 +16665,7 @@ impl Worker {
                         &session_slots_in_use,
                         Arc::clone(&panic_strikes),
                         workflow_panic_max_attempts,
+                        workflow_task_deadline,
                     ),
                 )
                 .await
@@ -16753,6 +16805,9 @@ impl Worker {
                     &session_slots_in_use,
                     panic_strikes,
                     workflow_panic_max_attempts,
+                    // No enclosing workflow-task budget on this arm, so the
+                    // local per-attempt budget is the only clock (issue #783).
+                    None,
                 )
                 .await
                 {
@@ -18157,6 +18212,66 @@ mod tests {
                 Duration::from_millis(500)
             ),
             Duration::from_millis(1500)
+        );
+    }
+
+    /// Issue #783: a local attempt must never report a deadline that out-lives
+    /// the enclosing workflow-task budget.
+    ///
+    /// The enclosing clock starts at the top of the decision cycle, so anything
+    /// spent before this attempt — history load, earlier commands, a previous
+    /// attempt — is charged to it and not to the attempt. Reporting `now +
+    /// per_attempt_timeout` alone over-reports, which is the destructive
+    /// direction: a deadline-aware activity skips its checkpoint and loses work.
+    #[test]
+    fn local_attempt_deadline_clamps_to_the_enclosing_workflow_task_budget() {
+        let cycle_start = chrono::Utc::now();
+        let enclosing = cycle_start + chrono::Duration::seconds(60);
+
+        // The stock-defaults case: both budgets are 60s, but the attempt starts
+        // 30s into the cycle (a previous local attempt burned it). Unclamped it
+        // would claim 30s past the kill.
+        let now = cycle_start + chrono::Duration::seconds(30);
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(60), Some(enclosing)),
+            Some(enclosing),
+            "the enclosing cut-off wins once the cycle has burned into the budget"
+        );
+
+        // Even a first attempt drifts: the cycle always starts before us.
+        let now = cycle_start + chrono::Duration::milliseconds(250);
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(60), Some(enclosing)),
+            Some(enclosing),
+            "equal budgets mean the enclosing clock always wins by the cycle head start"
+        );
+
+        // A genuinely shorter per-attempt budget still wins — the clamp only
+        // ever takes the earlier clock, it never extends one.
+        let now = cycle_start;
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(5), Some(enclosing)),
+            Some(now + chrono::Duration::seconds(5)),
+            "a short start_to_close is the earlier clock and must be reported"
+        );
+
+        // Workflow-task timeout disabled: the per-attempt budget is the only clock.
+        assert_eq!(
+            local_attempt_deadline(now, Duration::from_secs(5), None),
+            Some(now + chrono::Duration::seconds(5))
+        );
+
+        // An unrepresentable per-attempt budget falls back to the enclosing
+        // clock rather than reporting nothing.
+        assert_eq!(
+            local_attempt_deadline(now, Duration::MAX, Some(enclosing)),
+            Some(enclosing),
+            "an overflowing own budget must not erase a real enclosing deadline"
+        );
+        assert_eq!(
+            local_attempt_deadline(now, Duration::MAX, None),
+            None,
+            "with neither clock representable there is no deadline to report"
         );
     }
 
