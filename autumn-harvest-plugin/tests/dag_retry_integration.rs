@@ -639,6 +639,76 @@ async fn retry_running_run_is_conflict() {
     );
 }
 
+// ── (e2) retry of a PII-erased run -> 409 ───────────────────────────────────
+
+/// A source run whose payloads were erased (issue #495) must be refused.
+///
+/// Erasure tombstones every payload field, so the issue #780 compensated-run
+/// guard can go blind: `ActivityScheduled.input` is `{"_harvest_erased": true}`
+/// rather than the compensation envelope (signal 2), and a run that unwound at a
+/// drained signal frontier (issue #801) recorded no marker for signal 1 to
+/// anchor on. On that intersection an already-rolled-back run would look
+/// retryable — the double-spend `CompensatedRun` exists to prevent.
+///
+/// The refusal is correct independently of compensation, too: the #148 fork
+/// carries over upstream events whose `output` is now a tombstone, so a
+/// re-executing downstream node with an `input_from` binding would be handed
+/// `{"_harvest_erased": true}` as its input.
+#[tokio::test]
+async fn retry_erased_run_is_conflict() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = establish(&url).await;
+
+    let (events, _ia, _ib) = linear_failed_events();
+    let exec_id = seed_run(
+        &mut conn,
+        "linear_retry_dag",
+        "lin-erased",
+        events,
+        "FAILED",
+    )
+    .await;
+
+    // Erase the run's payloads, exactly as the operator endpoint does.
+    let outcome =
+        autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr subject request")
+            .await
+            .expect("erase payloads");
+    assert!(
+        outcome.fields_tombstoned > 0,
+        "fixture must actually erase something: {outcome:?}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/dags/linear_retry_dag/runs/{exec_id}/retry"),
+        json!({ "from_nodes": ["step_c"], "reason": "x", "operator_id": "oncall" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("erased"),
+        "message must name erasure as the blocker: {body}"
+    );
+    assert!(
+        message.contains("fresh"),
+        "message must point at a fresh run as the remedy: {body}"
+    );
+
+    // Fails closed BEFORE resolving/forking: no new execution was created.
+    let forks: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq("linear_retry_dag"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count runs");
+    assert_eq!(forks, 1, "the refused retry must not fork a new run");
+}
+
 // ── (f) non-existent node -> 400 with declared list ─────────────────────────
 
 #[tokio::test]

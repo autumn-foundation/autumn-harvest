@@ -20243,6 +20243,36 @@ pub(crate) async fn retry_dag_run_inner(
         }
     }
 
+    // Refuse a source run whose payloads were PII-erased (issue #495).
+    //
+    // Two independent reasons, either sufficient:
+    //
+    //  1. The issue #780 compensated-run guard goes BLIND. Erasure tombstones
+    //     every payload field, so `ActivityScheduled.input` is
+    //     `{"_harvest_erased": true}` and the compensation envelope is gone
+    //     (signal 2). Signal 1 normally still holds — the marker's *name* is not
+    //     a payload field, and the positional "dispatch after the marker" check
+    //     needs no payload — but a DAG that unwound at a drained signal frontier
+    //     (issue #801) recorded no marker at all, so on that intersection BOTH
+    //     signals are blind and an already-rolled-back run would look retryable.
+    //     Nothing downstream can recover this: erasure is irreversible.
+    //  2. Independent of compensation, the retry itself would produce garbage.
+    //     The #148 fork CARRIES OVER the upstream events, whose `output` fields
+    //     are now tombstones, so a re-executing downstream node with an
+    //     `input_from` binding (issue #702) would be handed
+    //     `{"_harvest_erased": true}` as its input.
+    //
+    // O(1) row check, matching the issue #612 terminal-query precedent: erasure
+    // always tombstones the execution row's own `input` column first.
+    if erase::execution_input_is_erased(&execution.input) {
+        return Err(DagRetryFailure::StateConflict(
+            "DAG run's payloads were erased (issue #495), so whether it already compensated \
+             cannot be determined and its carried-over node outputs are tombstones; retrying \
+             would resume on unreadable state — start a fresh DAG run instead"
+                .to_string(),
+        ));
+    }
+
     // Walk the recorded history and resolve the node request to a reset point.
     //
     // NOTE (v1 limitation, issue #366): this resolves the cut and node sets from

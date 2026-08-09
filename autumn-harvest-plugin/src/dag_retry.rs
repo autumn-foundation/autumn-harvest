@@ -1798,6 +1798,60 @@ mod tests {
         );
     }
 
+    /// CHARACTERIZATION — documents why the CALLER must fail closed on an
+    /// issue #495 payload-erased source run, because this resolver provably
+    /// cannot detect one.
+    ///
+    /// Erasure tombstones every payload field (`erase::PAYLOAD_FIELDS` includes
+    /// `input` and `details`), so on an erased history:
+    ///
+    /// * signal 2 is blind — `ActivityScheduled.input` is
+    ///   `{"_harvest_erased": true}`, not the three-key envelope; and
+    /// * signal 1 has nothing to anchor on for a run that unwound at a
+    ///   **drained signal frontier** (issue #801), which records no marker at
+    ///   all. (With a marker present signal 1 still fires: the marker's *name*
+    ///   is not a payload field and the "dispatch after it" check reads no
+    ///   payload — that intersection is the whole gap.)
+    ///
+    /// So a fully rolled-back run looks retryable here. Erasure is
+    /// irreversible, so no amount of inflating or decoding recovers it; the
+    /// guard has to live in `api::retry_dag_run_inner`, which has the execution
+    /// row and can test it in O(1).
+    #[test]
+    fn an_erased_marker_less_unwind_is_invisible_and_must_be_refused_by_the_caller() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let tombstone = autumn_harvest::erase::erasure_tombstone();
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // The compensator DID dispatch and DID roll `a` back — but the run
+            // sat at a drained signal frontier, so no marker was recorded, and
+            // erasure has since replaced the envelope with a tombstone.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: iu,
+                name: "undo_a".to_string(),
+                input: tombstone,
+                queue: "default".to_string(),
+            },
+            completed(iu),
+        ];
+
+        assert!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]).is_ok(),
+            "the resolver cannot see an erased unwind — this is the exact blindness \
+             `api::retry_dag_run_inner`'s erasure guard exists to cover; if this ever \
+             starts returning CompensatedRun, the caller guard may be redundant"
+        );
+    }
+
     /// REGRESSION GUARD: a compensating DAG that failed BEFORE any compensator
     /// dispatched (e.g. the first node itself failed, so nothing succeeded)
     /// left nothing rolled back and stays retryable.

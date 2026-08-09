@@ -1017,3 +1017,47 @@ A partial unwind still trips signal 1: if any compensator dispatched, the `409`
 stands even when a later one is rejected. Only an unwind that dispatched
 *nothing* stays retryable, which is precisely the case where nothing was rolled
 back.
+
+### Post-review hardening (round 7) — a PII-erased run is refused outright
+
+An automated review found a **P1** at the intersection of two features neither
+round had considered together: **issue #495 payload erasure** and the
+**drained-signal-frontier** unwind (issue #801).
+
+Erasure tombstones every payload field, so on an erased history
+`ActivityScheduled.input` is `{"_harvest_erased": true}` and **signal 2 is
+blind**. Signal 1 normally still holds — a marker's *name* is not a payload
+field, and the round-6 positional "dispatch after the marker" check reads no
+payload — but a run that unwound at a drained signal frontier recorded **no
+marker at all**, leaving signal 1 nothing to anchor on. On that intersection a
+fully rolled-back run looked retryable, and the retry would carry over upstream
+nodes whose side effects had already been undone. Erasure is irreversible, so no
+amount of inflating or decoding recovers the evidence.
+
+The round-6 changelog and docs claimed the positional check "survives payload
+erasure" without qualifying it — accurate only when a marker exists. Corrected in
+`docs/saga.md`.
+
+`retry_dag_run_inner` now refuses an erased source run before it resolves
+anything, with a `409` naming erasure as the blocker. The check is
+`erase::execution_input_is_erased(&execution.input)` — O(1), and the same guard
+the issue #612 terminal-query path uses (erasure always tombstones the execution
+row's own `input` column first).
+
+**The refusal is correct independently of compensation.** The issue #148 fork
+carries over the upstream events, whose `output` fields are now tombstones, so a
+re-executing downstream node with an `input_from` binding (issue #702) would be
+handed `{"_harvest_erased": true}` as its input. Retry-from-node on an erased run
+produces garbage whether or not it ever compensated.
+
+The cost is a safe-direction false positive: an erased run of a DAG that declares
+no compensators is refused too. Deliberate — "the current definition declares no
+compensators" is exactly the cross-version registry signal earlier rounds removed,
+since the definition that produced the history may have declared them.
+
+Pinned by `retry_erased_run_is_conflict` (erases a seeded FAILED run through the
+real `erase_workflow_payloads`, asserts the `409` names erasure and a fresh run,
+and asserts no fork was created) and by the characterization test
+`an_erased_marker_less_unwind_is_invisible_and_must_be_refused_by_the_caller`,
+which proves the resolver genuinely cannot see an erased unwind — so the guard
+must live in the caller, which holds the execution row.

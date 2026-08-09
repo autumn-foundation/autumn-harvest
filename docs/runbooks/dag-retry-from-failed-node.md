@@ -166,6 +166,28 @@ the compensation envelope and would let an already-rolled-back run be retried.
 A DAG that failed **without** any compensator declared triggers neither signal
 and remains fully retryable, exactly as before.
 
+### A PII-erased run is refused outright
+
+Both signals can be blinded at once by payload erasure (issue #495): the
+tombstone replaces the compensation envelope (signal 2), and a run that unwound
+at a drained signal frontier recorded no marker for signal 1 to anchor on.
+Erasure is irreversible, so nothing downstream can recover the evidence.
+
+The endpoint therefore rejects an erased source run before it resolves anything:
+
+```
+HTTP 409 Conflict
+{"message":"DAG run's payloads were erased (issue #495), so whether it already
+ compensated cannot be determined and its carried-over node outputs are
+ tombstones; retrying would resume on unreadable state — start a fresh DAG run
+ instead"}
+```
+
+This is the right answer even for a DAG with no compensators: the fork carries
+over upstream node outputs, which are now tombstones, so a re-executing
+downstream node bound with `.input_from(...)` would receive
+`{"_harvest_erased": true}` as its input. **Start a fresh run.**
+
 ## Limitation: build-id routing and topology changes
 
 The retry resolves the fork point and the re-execute / carry-over node sets from
@@ -203,6 +225,6 @@ build-compatibility gate is tracked as follow-up work; v1 does not enforce it.
 | `400` | `from_nodes` empty; an unknown node (the response lists the declared nodes); a node that was never attempted; or a node that already succeeded. |
 | `400` | The DAG is classic (non-unified). |
 | `404` | The DAG name is not registered, or the run is not a run of that DAG. |
-| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); the run **already compensated** ([see above](#a-compensated-run-is-not-retryable-issue-780)); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
+| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); the run **already compensated** ([see above](#a-compensated-run-is-not-retryable-issue-780)); the run's payloads were **erased** ([see above](#a-pii-erased-run-is-refused-outright)); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
 | `201` | Retry committed; `new_run_exec_id` identifies the forked run. |
 | `200` | Dry-run plan (no write performed). |

@@ -581,11 +581,13 @@ operator to a fresh run, re-running an upstream node whose side effect is still
 live. A marker with no dispatch after it therefore stays retryable.
 
 The check is positional (any `ActivityScheduled` after the marker index), not
-name- or payload-keyed, which is what lets it survive **payload erasure**: an
-issue #495 tombstone blanks the envelope's *contents* but never removes or
-reorders events, so signal 1 still sees the dispatch on a run whose envelopes
-signal 2 can no longer read — which is why signal 1 is refined rather than
-dropped, since a rolled-back-but-erased run must stay non-retryable. It
+name- or payload-keyed, which is what lets it survive **payload erasure** when a
+marker exists: an issue #495 tombstone blanks the envelope's *contents* (and the
+marker's `details`) but never removes or reorders events, and a marker's *name*
+is not a payload field — so signal 1 still sees the dispatch on a run whose
+envelopes signal 2 can no longer read. That is why signal 1 is refined rather
+than dropped. It does **not** cover an erased run that recorded no marker at all;
+see [erased runs are refused outright](#erased-runs-are-refused-outright). It
 also cannot go blind to a genuine unwind: a DAG compensator is always dispatched
 as an activity, the marker always precedes it, and no forward dispatch can
 follow the marker — the unwind runs only after the level walk has returned.
@@ -639,6 +641,34 @@ would reject every legitimate retry of a big-payload compensating DAG.
 
 A DAG run that failed **without** compensators (and every pre-#780 history)
 triggers neither signal and stays fully retryable.
+
+#### Erased runs are refused outright
+
+Both signals can be blinded at once by **PII erasure** (issue #495). Erasure
+tombstones every payload field, so `ActivityScheduled.input` becomes
+`{"_harvest_erased": true}` and signal 2 is gone; and a run that unwound at a
+[drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
+recorded no marker for signal 1 to anchor on. On that intersection a fully
+rolled-back run would look retryable, and erasure is irreversible — no amount of
+inflating or decoding recovers it.
+
+The retry endpoint therefore refuses an erased source run up front, with a `409`
+naming erasure as the blocker. It is an O(1) check on the execution row's own
+`input` column (erasure always tombstones it first) — the same guard the issue
+#612 terminal-query path uses.
+
+The refusal is correct **independently of compensation**: the issue #148 fork
+carries over the upstream events, whose `output` fields are now tombstones, so a
+re-executing downstream node with an
+[`input_from` binding](getting-started/08-dags-and-schedules.md#passing-data-between-nodes-node-input-binding)
+would be handed `{"_harvest_erased": true}` as its input. Retry-from-node on an
+erased run is broken regardless of whether it compensated.
+
+The cost is a safe-direction false positive: an erased run of a DAG that declares
+no compensators is refused too. That is deliberate — "the current definition
+declares no compensators" is exactly the cross-version registry signal the
+[rounds above](#retrying-a-compensated-run-issue-366-interaction) removed, since
+the definition that produced the history may have declared them.
 
 ### Divergence *inside* an unwind still nd-blocks
 
