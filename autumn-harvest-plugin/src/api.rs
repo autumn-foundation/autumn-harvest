@@ -18908,6 +18908,73 @@ async fn rerun_workflow(
         .into_response();
     }
 
+    // issue #605 review (Codex, PR #1152): a re-run clones the source's
+    // stored `completion_callbacks` VERBATIM (below), so a target that was
+    // admissible when the source started but has since been dropped from
+    // the SSRF allowlist must be re-validated here — otherwise the rerun
+    // silently succeeds (201, possibly sealing the source) while the actual
+    // delivery attempt is skipped without error at
+    // `enqueue_completion_deliveries`'s own live-policy re-validation (a
+    // `tracing::warn!` only, never surfaced to the caller). Both
+    // `api_state.completion_callback_ssrf_policy()` and the process-global
+    // `GLOBAL_CALLBACK_CONFIG` that scanner consults are installed from the
+    // SAME `built.completion_callback_config()` at plugin startup, so this
+    // check predicts the delivery-time outcome exactly.
+    //
+    // This is deliberately the OPPOSITE call from the input-schema decision
+    // above ("validate the override, not the clone"): a run started under a
+    // now-looser input schema is still perfectly re-runnable with its old,
+    // valid input — re-validating it would only strand a legitimate re-run
+    // for no safety benefit. A stale callback target has no such benign
+    // fallback: silently accepting it just defers a real failure to a place
+    // nobody is watching, so the clone IS re-validated here and the whole
+    // re-run is rejected (mirroring the normal start route's own
+    // all-or-nothing target validation) before anything is started or the
+    // source is touched.
+    if let Some(raw) = source.completion_callbacks.clone() {
+        let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+            match serde_json::from_value(raw) {
+                Ok(t) => t,
+                Err(e) => {
+                    audit_rerun_failure_on(
+                        &mut conn,
+                        &audit_ctx,
+                        Some(&exec_id_str),
+                        "malformed stored completion_callbacks",
+                    )
+                    .await;
+                    return AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                         completion_callbacks value ({e}); re-run cannot faithfully clone it"
+                    ))
+                    .into_response();
+                }
+            };
+        let policy = api_state.completion_callback_ssrf_policy();
+        for target in &targets {
+            if let Err(rejection) =
+                autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+            {
+                audit_rerun_failure_on(
+                    &mut conn,
+                    &audit_ctx,
+                    Some(&exec_id_str),
+                    "completion callback target no longer admissible",
+                )
+                .await;
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Effective input cap (issue #252): a per-workflow cap RAISES the global.
     let effective_wf_cap = runtime
         .registry

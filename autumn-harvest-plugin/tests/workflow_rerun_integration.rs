@@ -228,6 +228,20 @@ fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp 
         .with_state(AppState::for_test().with_profile("test"))
 }
 
+/// An app whose completion-callback SSRF policy allowlists `hook.example`
+/// (issue #605), for tests whose seeded `completion_callbacks` must survive
+/// re-run validation intact rather than exercising `build_app`'s default
+/// (empty-allowlist, always-reject) posture — see R-64.
+fn build_app_allowing_hook_example(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
+    let api_state = api_state_with(infos, pool, true);
+    api_state.set_completion_callback_ssrf_policy(
+        autumn_harvest::completion_callback::SsrfPolicy::new(
+            autumn_harvest::completion_callback::HostAllowlist::new().with_pattern("hook.example"),
+        ),
+    );
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
 async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -939,10 +953,24 @@ async fn rerun_clones_start_params_verbatim() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let wf = "rr_clone_wf";
-    let app = build_app(&pool, vec![plain_info(wf)]);
+    // Issue #605 review (R-64): the re-run route now re-validates a cloned
+    // `completion_callbacks` against the live SSRF policy, so this app must
+    // allowlist the seeded target — `build_app`'s default empty allowlist
+    // would otherwise reject it and this test would exercise R-64's
+    // rejection path instead of the verbatim-clone path it's named for.
+    let app = build_app_allowing_hook_example(&pool, vec![plain_info(wf)]);
     let mut conn = pool.get().await.unwrap();
 
     let wf_id = unique("rr-clone");
+    // A schema-complete `CallbackTarget` (with `filter`) — the shape the
+    // production start route and delivery-time re-validation both expect;
+    // a bare `{"url": ...}` object fails deserialization under the new
+    // re-run validation and is not representative of a real stored row.
+    let callback_targets = vec![autumn_harvest::completion_callback::CallbackTarget::new(
+        "https://hook.example/done",
+        autumn_harvest::completion_callback::EventFilter::AnyTerminal,
+    )];
+    let callback_targets_json = serde_json::to_value(&callback_targets).unwrap();
     let source = seed_execution(
         &mut conn,
         wf,
@@ -958,7 +986,7 @@ async fn rerun_clones_start_params_verbatim() {
             owner: Some("payments-team"),
             runbook_url: Some("https://runbook.example/orders"),
             severity: Some("high"),
-            completion_callbacks: Some(json!([{"url": "https://hook.example/done"}])),
+            completion_callbacks: Some(callback_targets_json.clone()),
             context_headers: Some(json!({"traceparent": "00-abc-def-01"})),
             workflow_retry_policy: Some(retry_policy_json()),
             ..Seed::default()
@@ -985,7 +1013,8 @@ async fn rerun_clones_start_params_verbatim() {
     assert_eq!(row.severity.as_deref(), Some("high"));
     assert_eq!(
         row.completion_callbacks,
-        Some(json!([{"url": "https://hook.example/done"}]))
+        Some(callback_targets_json),
+        "completion_callbacks must be cloned byte-for-byte"
     );
     // Both stored-JSON start parameters must round-trip byte-for-byte: a parse
     // failure is fail-loud, never a silently dropped field.
@@ -3010,4 +3039,81 @@ async fn rerun_rejects_unparseable_stored_start_parameters() {
         1,
         "nothing may be started"
     );
+}
+
+/// R-64 (issue #605 review, Codex, PR #1152): a re-run clones the source's
+/// `completion_callbacks` verbatim, so a target that has since been dropped
+/// from the SSRF allowlist must be re-validated BEFORE the re-run is
+/// created — otherwise it silently succeeds and the delivery is later
+/// dropped without error at `enqueue_completion_deliveries`'s own
+/// live-policy re-validation. `build_app`'s `HarvestApiState::new()`
+/// installs `SsrfPolicy::default()` (empty allowlist), so any bare
+/// `https://…` target is already "not (or no longer) allowlisted" without
+/// any extra test setup — exactly the scenario the finding describes.
+#[tokio::test]
+async fn rerun_rejects_a_cloned_completion_callback_no_longer_allowlisted() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_callback_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-callback-stale");
+    let stale_targets = vec![autumn_harvest::completion_callback::CallbackTarget::new(
+        "https://stale-receiver.example.com/hook",
+        autumn_harvest::completion_callback::EventFilter::AnyTerminal,
+    )];
+    let source = seed_execution(
+        &mut conn,
+        wf,
+        &wf_id,
+        "COMPLETED",
+        Seed {
+            completion_callbacks: Some(serde_json::to_value(&stale_targets).unwrap()),
+            ..Seed::default()
+        },
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], json!("completion callback target rejected"));
+    assert_eq!(
+        body["url"].as_str(),
+        Some("https://stale-receiver.example.com/hook")
+    );
+
+    // Nothing was started, and the source was never sealed.
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no execution should be created for a rejected callback target"
+    );
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "COMPLETED",
+        "the source must not be sealed when the re-run is rejected"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert!(
+        rows.iter().any(|r| r.status == "failed"),
+        "expected a failed audit row: {rows:?}"
+    );
+}
+
+/// Regression guard for R-64: a source with NO `completion_callbacks` at all
+/// re-runs exactly as before (the new check is a no-op on the common case).
+#[tokio::test]
+async fn rerun_with_no_completion_callbacks_is_unaffected() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_no_callback_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-no-callback");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
