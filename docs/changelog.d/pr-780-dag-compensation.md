@@ -768,3 +768,36 @@ the node's outcome and stops **downstream** work, while already-dispatched cells
 are drained to completion — with a paragraph stating that `FailFast` is an
 outcome policy, not a cancellation policy, and is not a tool for bounded failure
 latency.
+
+### P1 — an old forward node named like a *current* compensator faked an unwind
+
+The name-only signal 3 (a dispatch whose *name* is a currently-declared
+compensator) was the mirror of the name-reuse hole fixed above, in the other
+direction: a run produced by an **older** definition, where `undo_a` was an
+ordinary forward node, is resolved against a **current** definition that has
+since introduced `undo_a` as a compensator. Signal 3 then reported
+`CompensatedRun` for a run that never unwound at all, blocking a legitimate
+retry with a permanent `409`.
+
+Root cause is the same per-definition-version scope of
+`DagBuildError::CompensatorNameCollidesWithNode`: it guarantees no compensator
+shadows a node *within one build*, and constrains nothing across versions. Two
+consecutive review rounds hit that boundary from opposite sides, so rather than
+add a third name-keyed patch, **signal 3 was removed entirely**. Detection is
+now two signals, both purely historical:
+
+1. a `saga_compensat*` marker, or
+2. a compensation envelope whose `dag_compensate` names a node that **succeeded
+   in the same run**.
+
+Signal 3 was redundant with signal 2 by construction — every unwind this engine
+produces writes the envelope, and only succeeded nodes are ever compensated — so
+dropping it loses no detection while removing the only remaining cross-version
+false-positive vector. No name-keyed check against the current definition
+survives in either direction.
+
+Pinned by `an_old_forward_node_named_like_a_current_compensator_is_not_an_unwind`
+(RED before the change: `CompensatedRun`); the marker-less regression test was
+also rewritten onto a realistic envelope-bearing fixture via a new
+`compensator_dispatch` helper, since the old one asserted on a history the
+engine cannot actually produce (a `Value::Null` input on a compensator dispatch).

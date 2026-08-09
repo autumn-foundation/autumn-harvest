@@ -464,27 +464,19 @@ succeeded upstream nodes — which is exactly the set the unwind just undid. A
 retry would therefore resume as if those side effects still existed and
 double-spend the compensation.
 
-Detection uses **three** independent signals:
+Detection uses **two** independent signals, both read from the run's own
+recorded history and never from the registered definition:
 
-1. a `saga_compensat*` marker in the run's history;
+1. a `saga_compensat*` marker in the run's history; or
 2. a recorded activity dispatch whose **input is a compensation envelope** —
    the reserved `{"dag_compensate": …, "input": …, "output": …}` shape written
    only by the unwind — **whose `dag_compensate` names a node that succeeded in
-   the same run**; or
-3. a recorded dispatch whose **name** is one of that DAG's declared compensator
-   activities.
+   the same run**.
 
-Signals 2 and 3 are required, not redundant. An unwind at a
+Signal 2 is required, not redundant. An unwind at a
 [drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
 records no marker at all, so a marker-only check would leave that fully
-rolled-back run retryable. And the retry endpoint resolves against the
-**currently registered** DAG definition, so a deployment that renamed or removed
-a compensator after such a run would defeat signal 3 on its own — signal 2 reads
-the envelope straight out of recorded history and never consults the registry,
-so it survives the rename. Signal 3 is in turn unambiguous by construction:
-[`CompensatorNameCollidesWithNode`](#build-time-guards) forbids a compensator
-from sharing any forward node's name, so a compensator dispatch can never be
-mistaken for a forward step.
+rolled-back run retryable.
 
 Signal 2 does not rely on shape alone, because the shape is reachable by
 accident: a mapped cell or an `input_from` binding hands a node the raw upstream
@@ -496,13 +488,23 @@ The corroboration is that the envelope's `dag_compensate` value must name an
 activity that **actually succeeded in the same run** — the unwind only ever
 compensates succeeded nodes, so a genuine envelope always satisfies it. It is
 drawn from the *history*, never the definition, so signal 2 has no registry
-dependence and survives every way the definition can drift from the run that
-produced the history: the compensator renamed, removed outright, or a later
-definition **reusing** its name as a forward node. That last case is why
-corroborating against the current node set would be wrong —
-`CompensatorNameCollidesWithNode` is a per-definition-version guarantee, and
-nothing stops a later build from introducing a node named after a since-renamed
-compensator.
+dependence and survives every way the currently registered definition can drift
+from the run that produced the history:
+
+* the compensator was **renamed**;
+* the compensator was **removed outright**;
+* a later definition **reuses** the old compensator's name as a forward node;
+* an **older** definition's forward node shares a name with a compensator the
+  current definition introduces.
+
+Those last two are why **no name-keyed check against the current definition is
+used, in either direction**. An earlier revision also accepted a dispatch whose
+*name* was a currently-declared compensator; that was dropped as redundant (every
+unwind this engine produces writes the envelope, and only succeeded nodes are
+compensated) while being exactly the cross-version false-positive vector.
+[`CompensatorNameCollidesWithNode`](#build-time-guards) is a
+*per-definition-version* guarantee — no compensator shadows a node in the build
+that declared it — and nothing constrains names across versions.
 
 The residual is a documented false positive in the safe direction: a forward
 dispatch whose input is exactly the three envelope keys *and* whose
@@ -514,13 +516,13 @@ Signal 2 reads a payload-bearing field, so the retry endpoint loads history
 **inflated and codec-decoded**. Left un-inflated, an oversized compensation
 envelope stored as a payload-offload reference (issue #524) — or an encrypted
 codec envelope (issue #608) — would replace the whole `input` and hide the three
-compensation keys, silently reopening the marker-less-plus-renamed hole. The
+compensation keys, silently leaving a marker-less rolled-back run retryable. The
 resolver cannot recover this itself: an offloaded input is indistinguishable
 from a large ordinary forward input, so treating one as a compensation signal
 would reject every legitimate retry of a big-payload compensating DAG.
 
 A DAG run that failed **without** compensators (and every pre-#780 history)
-triggers none of the three and stays fully retryable.
+triggers neither signal and stays fully retryable.
 
 ### Divergence *inside* an unwind still nd-blocks
 

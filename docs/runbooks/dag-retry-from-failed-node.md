@@ -116,39 +116,40 @@ HTTP 409 Conflict
 (`POST /dags/{dag_name}/trigger`). The unwind already restored the pre-run
 state, so a fresh run is the correct — and safe — recovery.
 
-Detection uses three independent signals, so it only ever fires for a run that
-genuinely unwound:
+Detection uses two independent signals, **both read from the run's own recorded
+history and never from the registered definition**:
 
-1. a `saga_compensat*` marker in the run's recorded history,
+1. a `saga_compensat*` marker in the run's recorded history, or
 2. a recorded activity dispatch whose **input is a compensation envelope**
    (`{"dag_compensate": …, "input": …, "output": …}`) whose `dag_compensate`
-   names a node that **succeeded in the same run**, or
-3. a recorded dispatch whose **name** is one of that DAG's declared compensator
-   activities.
+   names a node that **succeeded in the same run**.
 
-Signals 2 and 3 are load-bearing, not belt-and-braces. A run that received an
+Signal 2 is load-bearing, not belt-and-braces. A run that received an
 unsolicited signal unwinds **without** recording a marker (see
 [a stray signal silences unwind observability](../saga.md#known-limitation--a-stray-signal-silences-unwind-observability)),
-so a marker-only check would leave that fully rolled-back run retryable. And
-because this endpoint resolves against the **currently registered** DAG
-definition (see the limitation below), a deployment that renamed or removed a
-compensator after such a run would defeat signal 3 alone — signal 2 reads the
-envelope recorded in history and never consults the registry, so it survives the
-rename. The succeeded-node condition on signal 2 is what keeps it from
-misfiring — a forward node's input is arbitrary user data (a mapped cell, or a
-bound upstream output) and may legitimately carry those three keys — while
-keeping it purely historical, so it also survives a compensator being removed
-outright, or a later definition reusing its name as a forward node.
+so a marker-only check would leave that fully rolled-back run retryable.
+
+The succeeded-node condition on signal 2 is what keeps it from misfiring — a
+forward node's input is arbitrary user data (a mapped cell, or a bound upstream
+output) and may legitimately carry those three keys. Keeping the corroboration
+*historical* is what makes it survive every way the currently registered
+definition can drift from the run that produced the history (see the limitation
+below): the compensator being **renamed**, **removed outright**, a later
+definition **reusing** its name as a forward node, or an **older** definition's
+forward node sharing a name with a compensator introduced since. Those last two
+are why no name-keyed check against the current definition is used in either
+direction — `CompensatorNameCollidesWithNode` only guarantees a compensator
+does not shadow a node *within one definition version*, never across versions.
 
 Because signal 2 reads a payload-bearing field, the endpoint loads the run's
 history **inflated and codec-decoded**. Without that, an oversized compensation
 envelope stored as a payload-offload reference (issue #524) — or an encrypted
-codec envelope — would hide the three compensation keys, and a run
-that was both marker-less and renamed would look retryable. Offloaded payloads
-cost one blob fetch here; the endpoint is operator-invoked and low-frequency.
+codec envelope — would hide the three compensation keys, and a marker-less
+rolled-back run would look retryable. Offloaded payloads cost one blob fetch
+here; the endpoint is operator-invoked and low-frequency.
 
-A DAG that failed **without** any compensator declared triggers none of the
-three and remains fully retryable, exactly as before.
+A DAG that failed **without** any compensator declared triggers neither signal
+and remains fully retryable, exactly as before.
 
 ## Limitation: build-id routing and topology changes
 
