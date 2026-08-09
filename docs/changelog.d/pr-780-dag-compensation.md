@@ -880,3 +880,37 @@ The user-payload false positive stays closed by the same corroboration
 (`node_outcome_still_reads_a_forward_node_whose_input_mimics_the_envelope`: the
 mimic's `dag_compensate` names nothing that succeeded, so a genuine forward
 dispatch is never swallowed).
+
+### P1 — a `CollectAll` node whose cells all failed was not detected as compensated
+
+The corroboration for signal 2 (and for the run-graph exclusion above) required
+the envelope's `dag_compensate` to name a node that **completed**. That was too
+strict, on a case the DAG's own status model creates:
+
+a `CollectAll` mapped node folds each cell failure into the cells array and
+never flips the node's `TaskStatus` — only a deterministic dispatch rejection
+does. So a node whose cells **all** failed still settles `Succeeded` at the DAG
+level and is genuinely compensated, while recording **no** `ActivityCompleted`
+under its name. Both guards missed it: retry-from-node stayed available on a
+rolled-back run (the double-spend, when the marker was also absent), and the
+run-graph exclusion failed to skip the compensation dispatch.
+
+Fixed by moving the bar from **completion** to **dispatch** —
+`dispatched_activity_names` / `compensates_a_dispatched_node`. That is precisely
+the unwind's own guard (`dispatched_forward`): a node is compensated only if it
+dispatched forward work, and dispatching records an `ActivityScheduled` under
+the node's activity name. So the corroboration now matches the invariant it was
+always meant to encode, rather than a proxy for it. An empty mapped fan-out is
+excluded for free — it dispatches nothing and is never compensated.
+
+Still purely historical, so every cross-version drift mode stays closed.
+
+Pinned by `a_collect_all_node_whose_cells_all_failed_is_still_detected_as_compensated`
+(RED before the change: `Ok(DagRetryPlan { .. })`). The false-positive guards
+still hold — their mimic envelopes name activities that were never dispatched.
+
+Accepted widening, documented: a forward dispatch whose user input is exactly
+the three envelope keys *and* whose `dag_compensate` names a node that was
+dispatched-but-failed is now a false positive where it previously was not. Same
+safe direction as before — it marks a retryable run non-retryable, never the
+double-spend.

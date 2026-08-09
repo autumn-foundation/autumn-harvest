@@ -247,7 +247,7 @@ fn is_live_state(exec_state: &str) -> bool {
 /// describing the same attempt — without it a name-reused node would report
 /// `pending` alongside the old compensation's timestamps.
 fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, ActivityExecId)> {
-    let succeeded = crate::dag_retry::succeeded_activity_names(events);
+    let dispatched = crate::dag_retry::dispatched_activity_names(events);
     events.iter().enumerate().rev().find_map(|(idx, event)| {
         if let WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -256,7 +256,7 @@ fn latest_scheduled(events: &[WorkflowEvent], node: &str) -> Option<(usize, Acti
             ..
         } = event
         {
-            (name == node && !crate::dag_retry::is_compensation_dispatch(input, &succeeded))
+            (name == node && !crate::dag_retry::is_compensation_dispatch(input, &dispatched))
                 .then_some((idx, *activity_id))
         } else {
             None

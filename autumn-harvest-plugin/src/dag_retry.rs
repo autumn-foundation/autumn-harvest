@@ -66,7 +66,7 @@
 //! [`DagRetryResolveError::CompensatedRun`] (`409`); start a fresh DAG run
 //! instead. Detection uses TWO signals — a `saga_compensat*` marker, or an
 //! `ActivityScheduled` whose recorded input is a **compensation envelope** for a
-//! node that succeeded in the same run — because a DAG unwind at a drained
+//! node dispatched in the same run — because a DAG unwind at a drained
 //! signal frontier records no marker. Both read only the run's own history,
 //! never the registered definition, so they survive a compensator being renamed
 //! or removed and a later definition reusing its name (see
@@ -197,36 +197,39 @@ fn is_compensation_envelope(input: &serde_json::Value) -> bool {
         && object.contains_key("output")
 }
 
-/// Names of activities that were scheduled AND recorded an `ActivityCompleted`
-/// in this history — i.e. the nodes the issue #780 unwind is allowed to
-/// compensate.
+/// Names of activities **dispatched** in this history — every distinct
+/// `ActivityScheduled.name`.
 ///
-/// Correlation is by `activity_id`, because `ActivityCompleted` carries no name.
+/// This is the exact set the issue #780 unwind can compensate, because the
+/// unwind's own guard is `dispatched_forward`: a node is compensated only if it
+/// actually dispatched forward work, and dispatching records an
+/// `ActivityScheduled` under the node's activity name.
+///
+/// Deliberately **not** keyed on completion. A `CollectAll` mapped node whose
+/// cells all failed still settles `TaskStatus::Succeeded` at the DAG level (each
+/// cell failure is folded into the cells array and never flips the node's
+/// status), so it is genuinely compensated while recording no
+/// `ActivityCompleted` under its name. Corroborating on completion would miss
+/// exactly that envelope. An empty mapped fan-out is excluded for free — it sets
+/// `dispatched_forward = false`, dispatches nothing, and is never compensated.
 #[must_use]
-pub fn succeeded_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
-    let completed: std::collections::HashSet<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::ActivityCompleted { activity_id, .. } => Some(*activity_id),
-            _ => None,
-        })
-        .collect();
+pub fn dispatched_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
     events
         .iter()
         .filter_map(|event| match event {
-            WorkflowEvent::ActivityScheduled {
-                activity_id, name, ..
-            } if completed.contains(activity_id) => Some(name.as_str()),
+            WorkflowEvent::ActivityScheduled { name, .. } => Some(name.as_str()),
             _ => None,
         })
         .collect()
 }
 
 /// Is this `ActivityScheduled.input` a compensation envelope whose compensated
-/// node actually **succeeded in this run**?
+/// node was actually **dispatched in this run**?
 ///
 /// The history-only corroboration for signal 2 — see [`ran_compensation_unwind`]
-/// for why it is drawn from history rather than the current definition.
+/// for why it is drawn from history rather than the current definition, and
+/// [`dispatched_activity_names`] for why dispatch (not completion) is the right
+/// bar.
 ///
 /// Doubles as the **forward-dispatch exclusion** used by every name-keyed
 /// history reader ([`node_outcome`], and `dag_graph`'s `latest_scheduled`): a
@@ -234,12 +237,15 @@ pub fn succeeded_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
 /// so it must not contribute a node's outcome or timing. See
 /// [`is_compensation_dispatch`].
 #[must_use]
-pub fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTreeSet<&str>) -> bool {
+pub fn compensates_a_dispatched_node(
+    input: &serde_json::Value,
+    dispatched: &BTreeSet<&str>,
+) -> bool {
     is_compensation_envelope(input)
         && input
             .get(COMPENSATION_ENVELOPE_KEY)
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|node| succeeded.contains(node))
+            .is_some_and(|node| dispatched.contains(node))
 }
 
 /// Whether the recorded history shows an issue #780 / #801 compensation unwind.
@@ -254,8 +260,8 @@ pub fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTree
 ///    dispatched (`docs/saga.md`, "a stray signal silences unwind
 ///    observability").
 /// 2. An [`WorkflowEvent::ActivityScheduled`] whose recorded `input` is a
-///    **compensation envelope** whose `dag_compensate` names a node that
-///    **actually succeeded in this run** ([`compensates_a_succeeded_node`]).
+///    **compensation envelope** whose `dag_compensate` names a node that was
+///    **actually dispatched in this run** ([`compensates_a_dispatched_node`]).
 ///    This is the load-bearing signal for a marker-less unwind.
 ///
 ///    **Caller obligation:** `input` is payload-bearing, so `events` MUST be
@@ -272,9 +278,14 @@ pub fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTree
 /// binding hands a node the raw upstream output, which is arbitrary user data,
 /// and an `input_from_all` alias set could even be named
 /// `dag_compensate`/`input`/`output` outright — so shape alone would 409 a
-/// retryable run, including one whose DAG declares no compensators at all. The
-/// unwind only ever compensates succeeded nodes, so a genuine envelope always
-/// satisfies the corroboration.
+/// retryable run, including one whose DAG declares no compensators at all.
+///
+/// The bar is **dispatch**, not completion, because that is precisely the
+/// unwind's own guard (`dispatched_forward`) — so a genuine envelope always
+/// satisfies it. Completion would be too strict: a `CollectAll` mapped node
+/// whose cells all failed still settles `TaskStatus::Succeeded` at the DAG level
+/// and is genuinely compensated, yet records no `ActivityCompleted` under its
+/// name. See [`dispatched_activity_names`].
 ///
 /// Drawing it from history is what makes signal 2 survive every way the current
 /// definition can drift from the run that produced the history:
@@ -292,25 +303,25 @@ pub fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTree
 /// — and nothing constrains names across versions. An earlier revision of this
 /// function also accepted a dispatch whose *name* was a currently-declared
 /// compensator; that was dropped because it is redundant (every unwind this
-/// engine produces writes the envelope, and only succeeded nodes are
+/// engine produces writes the envelope, and only dispatched nodes are
 /// compensated) while being exactly the cross-version false-positive vector
 /// above.
 ///
 /// Residual, documented and safe-direction: a forward dispatch whose user input
 /// is exactly the three envelope keys *and* whose `dag_compensate` string
-/// happens to name a node that succeeded in the same run is still a false
-/// positive. That marks a retryable run non-retryable (start a fresh run) — the
-/// opposite direction from the double-spend this guard exists to prevent.
+/// happens to name a node dispatched in the same run is still a false positive.
+/// That marks a retryable run non-retryable (start a fresh run) — the opposite
+/// direction from the double-spend this guard exists to prevent.
 ///
 /// Pure and cheap: a bounded number of passes over the events.
 #[must_use]
 fn ran_compensation_unwind(events: &[WorkflowEvent]) -> bool {
-    let succeeded = succeeded_activity_names(events);
+    let dispatched = dispatched_activity_names(events);
 
     events.iter().any(|event| match event {
         WorkflowEvent::MarkerRecorded { name, .. } => name.starts_with(SAGA_UNWIND_MARKER_PREFIX),
         WorkflowEvent::ActivityScheduled { input, .. } => {
-            compensates_a_succeeded_node(input, &succeeded)
+            compensates_a_dispatched_node(input, &dispatched)
         }
         _ => false,
     })
@@ -448,8 +459,8 @@ fn level_granular_reexecute_set(
 /// hoist it out of per-node loops. The check is history-only, so unlike a
 /// definition-derived one it cannot drift across versions in either direction.
 #[must_use]
-pub fn is_compensation_dispatch(input: &serde_json::Value, succeeded: &BTreeSet<&str>) -> bool {
-    compensates_a_succeeded_node(input, succeeded)
+pub fn is_compensation_dispatch(input: &serde_json::Value, dispatched: &BTreeSet<&str>) -> bool {
+    compensates_a_dispatched_node(input, dispatched)
 }
 
 /// Determine the outcome of a single node (by activity name) on the source run.
@@ -460,7 +471,7 @@ pub fn is_compensation_dispatch(input: &serde_json::Value, succeeded: &BTreeSet<
 /// outcome.
 #[must_use]
 pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
-    let succeeded = succeeded_activity_names(events);
+    let dispatched = dispatched_activity_names(events);
 
     // Find the activity_id of the *latest* ActivityScheduled with this name.
     // If a node was scheduled more than once (e.g. a re-dispatched attempt with
@@ -475,7 +486,7 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
             ..
         } = event
             && name == node
-            && !is_compensation_dispatch(input, &succeeded)
+            && !is_compensation_dispatch(input, &dispatched)
         {
             scheduled_id = Some(*activity_id);
             break;
@@ -517,6 +528,17 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
 
 /// Index of the earliest `ActivityScheduled` event whose activity name is in
 /// `reexecute`, if any.
+///
+/// Unlike [`node_outcome`], this deliberately carries **no** issue #780
+/// compensation-dispatch exclusion, because it is unreachable for a run that has
+/// any: [`resolve_retry_plan`] rejects such a run with
+/// [`DagRetryResolveError::CompensatedRun`] before computing a cut, and it does
+/// so using the *same* [`compensates_a_succeeded_node`] predicate the exclusion
+/// would apply. A compensation dispatch that could shift this cut is exactly one
+/// that already 409'd.
+///
+/// That is an ordering invariant, not a local property — keep the
+/// `ran_compensation_unwind` check first in [`resolve_retry_plan`].
 #[must_use]
 fn earliest_schedule_index(
     events: &[WorkflowEvent],
@@ -1076,6 +1098,48 @@ mod tests {
         );
     }
 
+    /// `earliest_schedule_index` carries no compensation-dispatch exclusion,
+    /// relying instead on an **ordering invariant**: `resolve_retry_plan` runs
+    /// `ran_compensation_unwind` first, and that check uses the very same
+    /// predicate the exclusion would. So a compensation dispatch that could
+    /// shift the cut has already produced a `409`.
+    ///
+    /// Pinned rather than left as a comment, because reordering the checks would
+    /// silently reopen it: the cut would land on the compensator's dispatch
+    /// instead of the forward node's.
+    #[test]
+    fn a_compensation_dispatch_can_never_shift_the_cut_because_the_run_409s_first() {
+        // `undo_a` is a FORWARD node here, and it is in the re-execute closure —
+        // so an old compensation dispatch of that name would be a candidate cut
+        // point if it were ever reached.
+        let def = {
+            let mut builder = DagBuilder::new();
+            let na = builder.activity(a);
+            let nu = builder.activity(undo_a).upstream(&na);
+            let _nc = builder.activity(c).upstream(&nu);
+            builder.build().expect("name-reuse dag builds")
+        };
+        let (ia, iu, ic) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            compensator_dispatch("undo_a", "a", iu),
+            completed(iu),
+            scheduled("c", ic),
+            failed(ic),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["c".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "the compensated-run rejection must precede any cut computation"
+        );
+    }
+
     #[test]
     fn resolve_empty_from_nodes_is_rejected() {
         let def = linear_dag();
@@ -1556,6 +1620,50 @@ mod tests {
             Err(DagRetryResolveError::CompensatedRun),
             "a rolled-back run must stay non-retryable even when a later \
              definition reuses the compensator's name as a forward node"
+        );
+    }
+
+    /// A `CollectAll` mapped node whose cells ALL failed still settles
+    /// `TaskStatus::Succeeded` at the DAG level — per-cell failures are folded
+    /// into the cells array and never flip the node's status — so the unwind
+    /// genuinely compensates it. But history holds no `ActivityCompleted` under
+    /// that node's name, so corroborating on *completion* would miss the
+    /// envelope and leave a rolled-back run retryable.
+    ///
+    /// The corroboration is therefore **dispatch**, which is exactly what the
+    /// unwind itself guards on (`dispatched_forward`).
+    #[test]
+    fn a_collect_all_node_whose_cells_all_failed_is_still_detected_as_compensated() {
+        let def = linear_dag();
+        let (c1, c2, iu, ib) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            // Mapped node `a`, two cells, BOTH failed — no ActivityCompleted.
+            scheduled("a", c1),
+            failed(c1),
+            scheduled("a", c2),
+            failed(c2),
+            scheduled("b", ib),
+            failed(ib),
+            // Marker-less (drained-signal frontier), but `a` settled Succeeded
+            // at the DAG level so its compensator ran.
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            compensator_dispatch("undo_a", "a", iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "a CollectAll node with zero completed cells is still compensated, \
+             so its run must not stay retryable"
         );
     }
 

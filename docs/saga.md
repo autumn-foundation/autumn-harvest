@@ -421,7 +421,7 @@ compensation dispatch would then report a node that never executed as
 succeeded/failed, with the compensation's timestamps.
 
 Both readers therefore skip a dispatch whose input is a compensation envelope
-naming a node that succeeded in the same run — the same history-only
+naming a node dispatched in the same run — the same history-only
 corroboration the [retry guard](#retrying-a-compensated-run-issue-366-interaction)
 uses, so it cannot drift across versions in either direction:
 
@@ -532,8 +532,8 @@ recorded history and never from the registered definition:
 1. a `saga_compensat*` marker in the run's history; or
 2. a recorded activity dispatch whose **input is a compensation envelope** —
    the reserved `{"dag_compensate": …, "input": …, "output": …}` shape written
-   only by the unwind — **whose `dag_compensate` names a node that succeeded in
-   the same run**.
+   only by the unwind — **whose `dag_compensate` names a node that was
+   dispatched in the same run**.
 
 Signal 2 is required, not redundant. An unwind at a
 [drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
@@ -547,8 +547,12 @@ even be named `dag_compensate`/`input`/`output` outright. Shape alone would 409 
 perfectly retryable run, including one whose DAG declares no compensators at all.
 
 The corroboration is that the envelope's `dag_compensate` value must name an
-activity that **actually succeeded in the same run** — the unwind only ever
-compensates succeeded nodes, so a genuine envelope always satisfies it. It is
+activity that was **actually dispatched in the same run** — precisely the
+unwind's own guard (`dispatched_forward`), so a genuine envelope always
+satisfies it. Completion would be too strict: a `CollectAll` mapped node whose
+cells all failed still settles `TaskStatus::Succeeded` at the DAG level and is
+genuinely compensated, yet records no `ActivityCompleted` under its name. An
+empty mapped fan-out is excluded for free — it dispatches nothing. It is
 drawn from the *history*, never the definition, so signal 2 has no registry
 dependence and survives every way the currently registered definition can drift
 from the run that produced the history:
@@ -570,7 +574,7 @@ that declared it — and nothing constrains names across versions.
 
 The residual is a documented false positive in the safe direction: a forward
 dispatch whose input is exactly the three envelope keys *and* whose
-`dag_compensate` string happens to name a node that succeeded in the same run.
+`dag_compensate` string happens to name a node dispatched in the same run.
 That marks a retryable run non-retryable (start a fresh run) rather than
 permitting the double-spend.
 

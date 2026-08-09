@@ -122,14 +122,14 @@ history and never from the registered definition**:
 1. a `saga_compensat*` marker in the run's recorded history, or
 2. a recorded activity dispatch whose **input is a compensation envelope**
    (`{"dag_compensate": …, "input": …, "output": …}`) whose `dag_compensate`
-   names a node that **succeeded in the same run**.
+   names a node that was **dispatched in the same run**.
 
 Signal 2 is load-bearing, not belt-and-braces. A run that received an
 unsolicited signal unwinds **without** recording a marker (see
 [a stray signal silences unwind observability](../saga.md#known-limitation--a-stray-signal-silences-unwind-observability)),
 so a marker-only check would leave that fully rolled-back run retryable.
 
-The succeeded-node condition on signal 2 is what keeps it from misfiring — a
+The dispatched-node condition on signal 2 is what keeps it from misfiring — a
 forward node's input is arbitrary user data (a mapped cell, or a bound upstream
 output) and may legitimately carry those three keys. Keeping the corroboration
 *historical* is what makes it survive every way the currently registered
