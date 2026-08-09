@@ -2501,3 +2501,107 @@ async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
          was rejected before dispatch"
     );
 }
+
+/// KNOWN LIMITATION (documented, not fixed): a `PayloadTooLarge` rejection is a
+/// pure function of already-recorded state *plus live configuration*, and leaves
+/// **no history footprint**. So if the activity-input cap is RAISED while a
+/// compensating DAG is mid-unwind, replay re-evaluates the rejection against the
+/// new cap, the previously-rejected node now dispatches, and its
+/// `ScheduleActivity` lands where history records the compensator's — a
+/// divergence.
+///
+/// This is the same class as
+/// `replayer_tests::known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
+/// (issue #601), which pins it with a plain non-fan-out `spawn_child_workflow_raw`
+/// call. Issue #780 **enlarges** the surface rather than creating it: before the
+/// unwind existed, a rejection `?`-escaped and sealed the run FAILED with no
+/// compensation events, so there was nothing for a later dispatch to collide
+/// with.
+///
+/// Requires a four-way conjunction — `PayloadTooLarge` + a compensating DAG + a
+/// cap change + that change landing inside the unwind's decision-cycle window —
+/// and the consequence is a #603 **nd-block**: the run stays `RUNNING` and
+/// retries, recovering when the cap is reverted. It is never a silent partial
+/// rollback, which is why this is pinned rather than papered over.
+///
+/// A durable fix means persisting the rejection so replay reads it back instead
+/// of re-deciding it. That cannot be done locally here: the level dispatches
+/// concurrently through `join_all`, so a marker pushed from inside a task future
+/// has no deterministic position, and a marker pushed after the join is read too
+/// late to gate the dispatch. Doing it properly means giving the *engine's*
+/// activity-dispatch path a history footprint for deterministic pre-dispatch
+/// rejections — an engine-wide change affecting every workflow, well outside
+/// this slice.
+#[tokio::test]
+async fn known_limitation_raising_the_cap_mid_unwind_diverges() {
+    let oversized = Value::String("x".repeat(2048));
+    let root_id = ActivityExecId::new();
+    let big_id = ActivityExecId::new();
+    let undo_id = ActivityExecId::new();
+    // The history the FIRST cycle persisted: `pc_process` was rejected before
+    // dispatch (so it has no events at all) and the unwind scheduled
+    // `pc_undo_root` in its place.
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: root_id,
+            name: "pc_root".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: root_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: big_id,
+            name: "pc_big".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: big_id,
+            output: oversized,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: undo_id,
+            name: "pc_undo_root".to_string(),
+            input: serde_json::json!({
+                "dag_compensate": "pc_root",
+                "input": Value::Null,
+                "output": Value::Null,
+            }),
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: undo_id,
+            output: Value::Null,
+        },
+    ];
+
+    // The deploy that raised the activity-input cap from 512 bytes to 2 MiB.
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), history)
+        .with_workflow_name("payload_cap_comp_dag")
+        .with_queue_name("default")
+        .with_payload_caps(
+            2 * 1024 * 1024,
+            2 * 1024 * 1024,
+            256 * 1024,
+            2 * 1024 * 1024,
+        );
+
+    let handler = __autumn_workflow_info_payload_cap_comp_dag().handler;
+    let _ = drive_replay_tolerating_suspension(&ctx, handler).await;
+
+    assert!(
+        ctx.take_nd_details().is_some(),
+        "raising the cap mid-unwind must surface as a #603 non-determinism \
+         block (a stuck-but-recoverable run), never as a silent divergence"
+    );
+}

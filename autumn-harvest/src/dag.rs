@@ -1706,6 +1706,25 @@ pub async fn run_unified_dag(
 ///
 /// Deliberately narrow: mis-classifying a *transient* error as a node failure
 /// would unwind a run that the engine was merely going to retry.
+///
+/// # Known limitation — the rejection has no history footprint
+///
+/// "Leaves no history footprint" is what makes routing this to the unwind safe,
+/// and is also its one limitation: the decision is re-evaluated on every replay
+/// against *live* configuration. Raise the cap while a compensating DAG is
+/// mid-unwind and the node now dispatches, colliding with the recorded
+/// compensator — a divergence, surfacing as a #603 nd-block (a stuck-but-
+/// recoverable run, never a silent partial rollback).
+///
+/// The same class as the engine-wide `known_limitation_early_config_dependent_
+/// failure_does_not_replay_cleanly` (issue #601); issue #780 enlarges the
+/// surface rather than creating it. A durable fix means persisting the rejection
+/// in the *engine's* dispatch path — it cannot be done here, because a level
+/// dispatches concurrently through `join_all`, so a marker from inside a task
+/// future has no deterministic position and one after the join is read too late
+/// to gate the dispatch. See `docs/saga.md` ("raising a payload cap *during* an
+/// unwind diverges") and
+/// `dag_compensation_tests::known_limitation_raising_the_cap_mid_unwind_diverges`.
 const fn is_deterministic_dispatch_rejection(error: &crate::error::HarvestError) -> bool {
     matches!(error, crate::error::HarvestError::PayloadTooLarge { .. })
 }

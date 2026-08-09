@@ -407,6 +407,44 @@ consequences for a [mapped node](getting-started/08-dags-and-schedules.md#dynami
   cells commit real side effects, prefer `CollectAll` plus a
   cell-aware compensator, or make each cell self-compensating.
 
+### Known limitation — raising a payload cap *during* an unwind diverges
+
+A deterministic pre-dispatch rejection — today only
+`HarvestError::PayloadTooLarge` — is reported as an ordinary node **failure**
+so it routes through the terminal check and runs the unwind, instead of
+`?`-escaping past it and stranding an already-succeeded compensable upstream.
+
+Such a rejection leaves **no history footprint** (no activity id, no command, no
+event) and is a pure function of recorded state *plus live configuration*. So it
+is re-decided on every replay. If the cap is **raised** while the run is
+mid-unwind, the previously-rejected node now dispatches, and its
+`ScheduleActivity` lands where history records the compensator's — a divergence.
+
+The consequence is a **#603 non-determinism block**, not a silent partial
+rollback: the run stays `RUNNING` and retries with backoff, and recovers as soon
+as the cap is reverted. It needs a four-way conjunction (`PayloadTooLarge` + a
+compensating DAG + a cap change + that change landing inside the unwind's
+decision-cycle window).
+
+This is the same class as the pre-existing, engine-wide
+`known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
+(issue #601), which pins it with a plain non-DAG `spawn_child_workflow_raw`
+call. Issue #780 **enlarges** the surface rather than creating it: before the
+unwind existed, a rejection sealed the run `FAILED` with no compensation events,
+so there was nothing for a later dispatch to collide with.
+
+A durable fix means giving the *engine's* activity-dispatch path a history
+footprint for deterministic pre-dispatch rejections, so replay reads the decision
+back instead of re-deciding it. It cannot be done inside the DAG runtime: a level
+dispatches concurrently through `join_all`, so a marker pushed from inside a task
+future has no deterministic position, and one pushed after the join is read too
+late to gate the dispatch. That is an engine-wide change affecting every
+workflow, tracked separately.
+
+**Operationally:** do not change payload caps while compensating DAG runs are
+in flight. Pinned by
+`dag_compensation_tests::known_limitation_raising_the_cap_mid_unwind_diverges`.
+
 ### Build-time guards
 
 Every misuse below is rejected before a single node runs, rather than

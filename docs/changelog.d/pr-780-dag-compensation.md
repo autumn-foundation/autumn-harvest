@@ -801,3 +801,44 @@ Pinned by `an_old_forward_node_named_like_a_current_compensator_is_not_an_unwind
 also rewritten onto a realistic envelope-bearing fixture via a new
 `compensator_dispatch` helper, since the old one asserted on a history the
 engine cannot actually produce (a `Value::Null` input on a compensator dispatch).
+
+### P1 — dispatch rejections have no history footprint (documented, not fixed)
+
+A `PayloadTooLarge` rejection is routed to the unwind as an ordinary node
+failure (that is the earlier P1-A fix, which stops it from `?`-escaping past the
+terminal check and stranding a succeeded compensable upstream). It leaves **no**
+history footprint by design — no activity id, no command, no event — which is
+precisely what makes that routing safe, and is also its one limitation: the
+decision is re-evaluated on every replay against **live** configuration.
+
+Raise the activity-input cap while a compensating DAG is mid-unwind and the
+previously-rejected node now dispatches, colliding with the recorded
+compensator's `ScheduleActivity`.
+
+Assessed and **documented rather than fixed**, for three reasons:
+
+1. The consequence is a #603 **nd-block** — the run stays `RUNNING`, retries with
+   backoff, and recovers when the cap is reverted. Never a silent partial
+   rollback.
+2. It needs a four-way conjunction: `PayloadTooLarge` + a compensating DAG + a
+   cap change + that change landing inside the unwind's decision-cycle window.
+3. It is the same class as the pre-existing engine-wide
+   `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
+   (issue #601), pinned there with a plain non-DAG `spawn_child_workflow_raw`
+   call. Issue #780 **enlarges** the surface rather than creating it: before the
+   unwind existed a rejection sealed the run `FAILED` with no compensation
+   events, so nothing could collide.
+
+The durable fix is out of scope by construction: it means giving the *engine's*
+activity-dispatch path a history footprint for deterministic pre-dispatch
+rejections, so replay reads the decision back instead of re-deciding it. It
+cannot be done inside the DAG runtime — a level dispatches concurrently through
+`join_all`, so a marker pushed from inside a task future has no deterministic
+position, and one pushed after the join is read too late to gate the dispatch.
+That is an engine-wide change affecting every workflow.
+
+Pinned by `dag_compensation_tests::known_limitation_raising_the_cap_mid_unwind_diverges`
+(asserts the divergence surfaces as nd details, i.e. a recoverable block) and
+documented in `docs/saga.md` plus the `is_deterministic_dispatch_rejection` doc
+comment, with the operational guidance: do not change payload caps while
+compensating DAG runs are in flight.
