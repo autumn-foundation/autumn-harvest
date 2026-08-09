@@ -19775,11 +19775,31 @@ struct DagRetryConflictResponse {
     remediation: String,
 }
 
+/// Operator-facing message for a retry of a run that already compensated
+/// (issue #780). Shared by the HTTP `409` body and the Vantage UI flash so the
+/// two surfaces cannot drift.
+const DAG_RETRY_COMPENSATED_RUN_MESSAGE: &str = "this run already executed its compensation unwind, so its succeeded nodes' side effects \
+     were rolled back; retrying would resume on rolled-back state — start a fresh DAG run instead";
+
 fn dag_retry_resolve_error_response(
     error: crate::dag_retry::DagRetryResolveError,
 ) -> axum::response::Response {
     use crate::dag_retry::DagRetryResolveError as E;
     use axum::response::IntoResponse as _;
+
+    // Issue #780: a run that already unwound its compensations is a STATE
+    // conflict about the run (its carried-over side effects were rolled back),
+    // not a malformed node request — so it is the one resolver rejection that
+    // maps to `409`, alongside the sibling COMPLETED/RUNNING state conflicts.
+    if matches!(error, E::CompensatedRun) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     let body = match error {
         E::EmptyFromNodes => DagRetryNodeErrorResponse {
@@ -19816,6 +19836,12 @@ fn dag_retry_resolve_error_response(
         },
         E::NoSchedulePoint => DagRetryNodeErrorResponse {
             message: "could not resolve a reset point for the requested nodes".to_string(),
+            unknown_nodes: None,
+            declared_nodes: None,
+        },
+        // Handled above as a `409`; unreachable here.
+        E::CompensatedRun => DagRetryNodeErrorResponse {
+            message: DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
             unknown_nodes: None,
             declared_nodes: None,
         },
@@ -19920,6 +19946,7 @@ impl DagRetryFailure {
                 R::NoSchedulePoint => {
                     "could not resolve a reset point for the requested nodes".to_string()
                 }
+                R::CompensatedRun => DAG_RETRY_COMPENSATED_RUN_MESSAGE.to_string(),
             },
             Self::Reset(e) => match e {
                 WorkflowResetError::InvalidPoint(invalid) => format!(

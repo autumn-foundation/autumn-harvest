@@ -56,6 +56,17 @@
 //!   [`DagRetryResolveError::AmbiguousNodes`] for the whole DAG (same treatment
 //!   as any duplicate activity name). Give gates signal names distinct from
 //!   activity names to keep a DAG retryable.
+//!
+//! ## Interaction: declarative node compensation (issue #780)
+//!
+//! A DAG whose nodes declare compensators unwinds on terminal failure, undoing
+//! every **succeeded** node's side effect. That is exactly the set of nodes this
+//! resolver would CARRY OVER, so a retry of a compensated run would resume on
+//! rolled-back state. Such a run is therefore rejected outright with
+//! [`DagRetryResolveError::CompensatedRun`] (`409`); start a fresh DAG run
+//! instead. Detection is the presence of a `saga_compensat*` marker in the
+//! recorded history — a run that failed WITHOUT compensators (and every
+//! pre-#780 history) records none and stays fully retryable.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -131,6 +142,36 @@ pub enum DagRetryResolveError {
     /// no reset point can be derived. (Defensive — should not occur once the
     /// per-node attempted check passes.)
     NoSchedulePoint,
+    /// The source run already executed an issue #780 compensation unwind, so
+    /// its succeeded upstream nodes' side effects have been **rolled back**.
+    /// Retrying from the failed node would carry those nodes over and resume on
+    /// state that no longer exists. Unlike every sibling variant this maps to a
+    /// `409 Conflict` — it is a state conflict about the run, not a malformed
+    /// node request.
+    CompensatedRun,
+}
+
+/// Marker-name prefix recorded at the start of a `Saga` unwind (issue #801),
+/// mirrored here because the core helper that formats it
+/// (`autumn_harvest::replay::saga_compensated_marker_name`) is `pub(crate)`.
+///
+/// Matching by prefix covers both `saga_compensated:{seq}` and
+/// `saga_compensation_failed:{seq}`: either one proves an unwind ran, and a
+/// unwind that FAILED leaves the run in an even less retryable state.
+const SAGA_UNWIND_MARKER_PREFIX: &str = "saga_compensat";
+
+/// Whether the recorded history shows an issue #780 / #801 compensation unwind.
+///
+/// Pure and cheap: a single scan for a `MarkerRecorded` whose name carries the
+/// saga-unwind prefix.
+#[must_use]
+fn ran_compensation_unwind(events: &[WorkflowEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with(SAGA_UNWIND_MARKER_PREFIX)
+        )
+    })
 }
 
 /// A resolved, dry-runnable retry plan: the reset point plus the explicit
@@ -324,7 +365,9 @@ fn earliest_schedule_index(
 /// # Errors
 ///
 /// Returns [`DagRetryResolveError`] for empty / unknown / unattempted /
-/// already-succeeded node requests.
+/// already-succeeded node requests, and
+/// [`DagRetryResolveError::CompensatedRun`] when the source run already
+/// executed an issue #780 compensation unwind.
 pub fn resolve_retry_plan(
     def: &DagDefinition,
     events: &[WorkflowEvent],
@@ -332,6 +375,16 @@ pub fn resolve_retry_plan(
 ) -> Result<DagRetryPlan, DagRetryResolveError> {
     if from_nodes.is_empty() {
         return Err(DagRetryResolveError::EmptyFromNodes);
+    }
+
+    // Issue #780 interaction: a run that already unwound its compensations has
+    // had its succeeded upstream side effects ROLLED BACK. The level-granular
+    // cut below deliberately CARRIES those nodes over, so the fork would resume
+    // as if their effects still existed — a double-spend of the compensation.
+    // Checked before any node validation so the operator gets the state answer
+    // ("this run is not retryable") rather than a node-shaped one.
+    if ran_compensation_unwind(events) {
+        return Err(DagRetryResolveError::CompensatedRun);
     }
 
     let declared = declared_nodes(def);
@@ -762,6 +815,85 @@ mod tests {
             resolve_retry_plan(&def, &[], &[]),
             Err(DagRetryResolveError::EmptyFromNodes)
         );
+    }
+
+    // ---- resolve: compensated runs (issue #780 interaction) ---------------
+
+    fn marker(name: &str) -> WorkflowEvent {
+        WorkflowEvent::MarkerRecorded {
+            name: name.to_string(),
+            details: Value::from(1),
+        }
+    }
+
+    /// A DAG run that executed an issue #780 compensation unwind carried over
+    /// side effects that were ROLLED BACK. Retrying from the failed node would
+    /// preserve those (now-undone) upstream nodes and resume on state that no
+    /// longer exists — a double-spend of the compensation.
+    #[test]
+    fn resolve_rejects_a_run_that_already_compensated() {
+        let def = linear_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // The unwind: dedup marker + the compensator's own dispatch.
+            marker("saga_compensated:1"),
+            scheduled("undo_a", iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// The failure marker alone (a compensation that ITSELF failed) also means
+    /// the unwind ran, so the run is equally unsafe to retry.
+    #[test]
+    fn resolve_rejects_a_run_whose_compensation_failed() {
+        let def = linear_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            marker("saga_compensated:1"),
+            marker("saga_compensation_failed:1"),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// REGRESSION GUARD: a failed run with NO compensation unwind (the ordinary
+    /// issue #366 case, and every pre-#780 history) must still resolve.
+    #[test]
+    fn resolve_allows_a_failed_run_without_a_compensation_marker() {
+        let def = linear_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // An UNRELATED marker must not be mistaken for a compensation.
+            marker("dag_skip:3"),
+        ];
+        let plan = resolve_retry_plan(&def, &events, &["b".to_string()]).expect("plan");
+        assert_eq!(plan.reset_to_event_id, 2);
+        assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
     }
 
     #[test]
