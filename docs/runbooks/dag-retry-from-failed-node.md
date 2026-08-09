@@ -148,6 +148,12 @@ codec envelope — would hide the three compensation keys, and a marker-less
 rolled-back run would look retryable. Offloaded payloads cost one blob fetch
 here; the endpoint is operator-invoked and low-frequency.
 
+The inflate/decode pass runs **after the database connection is released**, so a
+slow or unavailable payload store can never hold a pool slot and stall unrelated
+API or worker work. It **fails closed**: any inflate or decode error fails the
+request rather than falling back to the raw history, because a raw history hides
+the compensation envelope and would let an already-rolled-back run be retried.
+
 A DAG that failed **without** any compensator declared triggers neither signal
 and remains fully retryable, exactly as before.
 

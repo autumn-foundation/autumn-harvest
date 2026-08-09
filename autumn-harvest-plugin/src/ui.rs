@@ -787,6 +787,23 @@ async fn dag_detail_ui(
         let timestamped = autumn_harvest::store::load_history_with_timestamps(&mut conn, exec_id)
             .await
             .map_err(map_error)?;
+        // No further DB reads: release the pool slot before any payload-store
+        // fetch, then decode so the issue #780 compensation filter inside
+        // `build_run_graph` sees real payloads rather than opaque codec /
+        // offload envelopes. Shared with the #690 API handler so the two
+        // surfaces can never disagree. See `api::decode_graph_history`.
+        drop(conn);
+        let runtime = api_state.runtime().map_err(map_error)?;
+        let codecs = api_state.payload_codecs();
+        let offloader = runtime.registry().payload_offloader();
+        let timestamped = crate::api::decode_graph_history(
+            timestamped,
+            exec_id,
+            &codecs,
+            offloader,
+            "dag detail UI",
+        )
+        .await;
         let nodes = build_run_graph(&dag.definition, &timestamped, &execution.state);
         Some((nodes, execution.state))
     } else {

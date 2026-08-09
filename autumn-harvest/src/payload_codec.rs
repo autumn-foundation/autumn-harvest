@@ -124,6 +124,26 @@ fn codec_envelope_parts(payload: &Value) -> Option<(&str, &str)> {
     Some((codec_id, encoded_b64))
 }
 
+/// `true` when `payload` is a codec envelope written by
+/// [`PayloadCodecs::encode_event`] — i.e. an opaque stored value whose real
+/// contents this process cannot read without decoding it first.
+///
+/// Delegates to the single authoritative shape check
+/// ([`codec_envelope_parts`]) that the strict and lossy read paths already
+/// share, so a caller's "is this opaque?" question can never drift from what
+/// the decoder itself recognises.
+///
+/// Its sibling for the offload half is
+/// [`crate::payload_store::extract_offload_ref`]. A reader that derives
+/// anything from a payload-bearing field on a RAW (undecoded) history — for
+/// example the DAG run graph's issue #780 compensation-dispatch filter — uses
+/// these two to decide whether it must run an inflate/decode pass before its
+/// derivation is meaningful.
+#[must_use]
+pub fn is_codec_envelope(payload: &Value) -> bool {
+    codec_envelope_parts(payload).is_some()
+}
+
 /// A trait for intercepting and transforming raw payload bytes.
 ///
 /// Implementations of this trait are used by the [`PayloadCodecs`] registry

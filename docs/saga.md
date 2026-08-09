@@ -431,6 +431,35 @@ uses, so it cannot drift across versions in either direction:
 Keeping the exclusion in **both** is what stops `status` and the timings from
 disagreeing about which attempt they describe.
 
+#### The readers must decode before they filter
+
+The corroboration reads `ActivityScheduled.input`, a **payload-bearing** field.
+Both run-graph readers — the [#690 API handler](./management-api.md) and the
+Vantage DAG detail page — load raw history (`store::load_history_with_timestamps`
+explicitly leaves payload fields undecoded), so on a **codec-encrypting** (#608)
+or **payload-offloading** (#524) deployment the filter would be handed an opaque
+envelope, return `false`, and the exclusion would silently stop working — exactly
+the defect it exists to close.
+
+Both therefore run an inflate/decode pass before deriving. Three properties keep
+it cheap and safe:
+
+* **Skipped entirely when nothing is opaque.** A cheap structural scan of the two
+  fields the derivation reads (`ActivityScheduled.input` and
+  `MarkerRecorded.details`) gates the pass, so the default deployment — identity
+  codecs, no payload store — does no extra work and stays on the pre-#780 path.
+* **Runs after the DB connection is released.** Blob inflation is network I/O and
+  must never hold a database pool slot.
+* **Degrades, never errors.** The run graph is a read-only observability
+  surface: on an inflate/decode failure it logs and renders from the raw history
+  (worst case, the narrow cross-version display inaccuracy above) rather than
+  failing the page. The **retry** endpoint takes the opposite posture and fails
+  closed, because there a hidden envelope permits a double-spend.
+
+No payload is surfaced by either reader — the run graph carries node names,
+statuses, timings, attempts, and a truncated `error` (not a payload-bearing
+field) — so decoding here needs no #608 read-decode opt-in or audit row.
+
 ### Known limitation — raising a payload cap *during* an unwind diverges
 
 A deterministic pre-dispatch rejection — today only

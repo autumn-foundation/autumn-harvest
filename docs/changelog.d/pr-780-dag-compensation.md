@@ -914,3 +914,55 @@ the three envelope keys *and* whose `dag_compensate` names a node that was
 dispatched-but-failed is now a false positive where it previously was not. Same
 safe direction as before — it marks a retryable run non-retryable, never the
 double-spend.
+
+### Review round 5 — the run-graph readers must decode before they filter, and no reader may hold a pool slot across blob I/O
+
+Two independent P2s on the same root: the compensation filter reads
+`ActivityScheduled.input`, a **payload-bearing** field, and the surfaces that
+consume it were not set up to see through a stored envelope.
+
+**(1) Codec/offload deployments silently lost the run-graph exclusion.** Both
+run-graph readers — the #690 API handler and the Vantage DAG detail page — load
+raw history (`store::load_history_with_timestamps` explicitly leaves payload
+fields undecoded). On a codec-encrypting (#608) or payload-offloading (#524)
+deployment the filter was handed an opaque envelope, returned `false`, and a
+never-executed forward node was reported with an older definition's compensation
+status, timings, and attempts — exactly the defect the round-4 exclusion exists
+to close, reopened for those deployments.
+
+Fixed with one shared pass (`api::decode_graph_history`) used by both readers, so
+they can never disagree about whether the filter is looking at real payloads:
+
+- **Gated on a cheap structural scan** (`graph_history_needs_inflation`) of only
+  the two fields the derivation reads — `ActivityScheduled.input` and
+  `MarkerRecorded.details`. The identity codec's `encode_payload` is a
+  pass-through, so a default deployment stores no envelope, the scan answers
+  `false`, and the pre-#780 read path runs byte-for-byte unchanged.
+- **Degrades rather than errors**: the run graph is read-only observability, so
+  an inflate/decode failure logs and renders from the raw history instead of
+  failing the page. The retry endpoint keeps the opposite posture — fail closed,
+  because there a hidden envelope permits the double-spend.
+- Surfaces no payload (node names, statuses, timings, attempts, and a truncated
+  `error`, which is not payload-bearing), so it needs no #608 read-decode opt-in
+  or audit row — the same rationale the awaitables endpoint's replay drive uses.
+
+New core predicate `payload_codec::is_codec_envelope`, delegating to the existing
+authoritative `codec_envelope_parts` shape check so a caller's "is this opaque?"
+question cannot drift from what the decoder recognises. Its offload sibling
+(`payload_store::extract_offload_ref`) was already public.
+
+**(2) The retry endpoint held a DB connection across sequential blob fetches.**
+`store::load_history_inflated` loads the rows and then fetches every offloaded
+blob while still holding the connection it loaded them with, so a slow or
+unavailable payload store — or a few concurrent retries over large histories —
+could pin pool slots and stall unrelated API and worker work. The endpoint now
+loads raw, releases the pool slot, inflates/decodes in memory, and reacquires a
+connection for the preview/reset — the discipline the awaitables endpoint
+already established. It still fails closed on any inflate/decode error.
+
+Pinned by `a_codec_encoded_compensation_dispatch_is_only_recognised_after_decoding`
+(asserts the predicate is blind on the raw stored history and correct after the
+pass), `graph_history_needs_inflation_detects_opaque_payload_fields`, and two
+end-to-end run-graph tests — a codec-encoded compensator named like a current
+forward node is excluded (status `pending`, no timing, zero attempts) while an
+ordinary codec-encoded forward dispatch still reads normally.
