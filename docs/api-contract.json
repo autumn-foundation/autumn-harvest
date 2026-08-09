@@ -1395,6 +1395,85 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{id}/rerun",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Re-run a terminal workflow execution: start a BRAND-NEW execution from the source run's recorded start parameters. When the re-run reuses the source's business key (the default), the source row is SEALED to CONTINUED_AS_NEW so the business key is free for the new run — its recorded prior state is returned as source_prior_state, and its output/error/completed_at are preserved untouched. Admin-only. Provenance on the new run is start_source='rerun', start_source_ref=<source execution id>, started_by=<actor>. Cloned verbatim from the source row: input (unless overridden), queue, memo, search attributes (minus the six replay-non-determinism diagnostic keys), execution timeout, chain timeout, SLA, owner/runbook_url/severity, context headers, workflow retry policy, and completion callbacks. NOT preserved: priority (it is not stored on the execution row), and schedule provenance (schedule_id / scheduled_for / origin are cleared, matching the reset-fork precedent — an operator intervention is deliberately excluded from scheduled carryover). The new run always begins a fresh continue-as-new chain and a fresh retry chain (attempt 1).",
+      "idempotency": "NOT idempotent. A second identical re-run returns 409: the first re-run sealed the source to CONTINUED_AS_NEW, which is no longer a re-runnable state — re-run the new run instead. (A re-run under an explicit workflow_id override does not seal the source, so the source stays re-runnable under a different key.)",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID of the terminal source run to re-run."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "input",
+            "required": false,
+            "description": "Optional replacement input for the new run. Omitted = clone the source's stored input VERBATIM — it is never decoded, so an encrypted or codec-encoded input re-runs byte-identically. A JSON null IS a valid override (it replaces the clone with null); omit the field entirely to clone. Required when the source's input has been erased (issue #495)."
+          },
+          {
+            "name": "workflow_id",
+            "required": false,
+            "description": "Optional business-key override for the new run. Omitted = reuse the source's workflow_id (which seals the source to CONTINUED_AS_NEW). When supplied and free, the new run starts under that key and the source is left untouched in its original terminal state."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "ok",
+          "execution_id",
+          "workflow_name",
+          "workflow_id",
+          "state",
+          "reran_from",
+          "source_prior_state"
+        ],
+        "notes": "The response never echoes the input payload. reran_from is the source execution id; source_prior_state is the source's terminal state as observed BEFORE any sealing (e.g. \"FAILED\"), which is otherwise lost once the row is sealed to CONTINUED_AS_NEW."
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed execution id or malformed JSON body; the target is a registered DAG (use the DAG trigger/retry routes); the workflow type carries a debounce, throttle, or batch policy — those defer the start and return no execution id, so a re-run cannot honour its 201 contract; an explicitly supplied `input` override violates the workflow's published input JSON Schema (issue #373), which returns the standard {error: \"input validation failed\", violations: [{message, field_path}]} body (only an OVERRIDE is validated: a verbatim clone of the source's stored input is never re-validated, so a run started under an older or looser schema stays re-runnable); or the source's stored `completion_callbacks` value cannot be parsed as JSON (issue #605) — a standard RFC 7807 {detail: <message>} body naming the source execution."
+        },
+        {
+          "status": 401,
+          "description": "Admin authentication required."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found, or its workflow type is no longer registered."
+        },
+        {
+          "status": 409,
+          "description": "Source is not terminal (RUNNING/PAUSED); source is CONTINUED_AS_NEW (re-run the chain's latest run instead); source already has an automatic workflow-level retry successor (issue #523 — re-run the chain's latest attempt instead); source input has been erased (issue #495) and no explicit input was supplied; the source's shard has been drained out of writable_shards (this entire operation is pinned to the source's physical shard — a re-run can only ever land there, so an operator draining that shard blocks new re-runs of its work just like any other new admission); a workflow_id override routes to a DIFFERENT shard than the source (cross-shard workflow_id overrides are not supported — re-run without an override, or start a fresh execution directly under the target workflow_id); source is schedule-attributed and sealing it would break the schedule's carryover and run-history lineage (issues #488 / #534 — re-run with an explicit workflow_id override instead, which never seals the source); the target business key is currently held by a different live execution (including a workflow_id override that is already in use); or a stored context_headers / workflow_retry_policy value on the source cannot be parsed as JSON (a faithful clone must never silently drop a field)."
+        },
+        {
+          "status": 413,
+          "description": "The new run's input exceeds the effective workflow-input byte cap (issue #252). Fires on an oversized `input` override, and — notably — can also fire on the VERBATIM CLONE of a source that started successfully under a larger cap, if an operator has since LOWERED `max_workflow_input_bytes` (globally or for this workflow type). In that case the source is re-runnable only by supplying a smaller `input` override or by raising the cap back."
+        },
+        {
+          "status": 422,
+          "description": "A completion callback target CLONED VERBATIM from the source (issue #605) is no longer admissible under the live SSRF policy — e.g. it was valid when the source started but has since been dropped from the host allowlist. Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object (tag: `code`, e.g. HostNotAllowlisted/SchemeNotAllowed/IpLiteralNotAllowed). Only fires when the source has `completion_callbacks` recorded; a source with none is unaffected. Nothing is started and the source is never sealed."
+        },
+        {
+          "status": 503,
+          "description": "An admission gate blocked the new start — same body shape as any gated start (error, gate_id, reason)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/pause",
       "category": "workflow",
       "read_only": false,

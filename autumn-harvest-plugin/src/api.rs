@@ -44,12 +44,13 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_SCHEDULE_UPDATE, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN,
     OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW, deny_readonly_mutation,
+    OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    deny_readonly_mutation,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -2070,6 +2071,24 @@ struct TerminateWorkflowResponse {
     failed_task_count: usize,
 }
 
+/// Response for `POST /workflows/{id}/rerun` (issue #777).
+///
+/// Deliberately carries NO `input` field: the payload may be sensitive, and a
+/// re-run response has no reason to echo it back.
+#[derive(Debug, Serialize)]
+struct RerunWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+    /// The source execution this run was re-run from.
+    reran_from: String,
+    /// The source's terminal state observed BEFORE any sealing — the only
+    /// surviving record once the source is sealed to `CONTINUED_AS_NEW`.
+    source_prior_state: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PauseWorkflowResponse {
     ok: bool,
@@ -2617,6 +2636,35 @@ struct CancelWorkflowRequest {
 #[derive(Debug, Default, Deserialize)]
 struct TerminateWorkflowRequest {
     reason: Option<String>,
+}
+
+/// Optional body for `POST /workflows/{id}/rerun` (issue #777).
+///
+/// `input` is a serde TRI-STATE (`Option<Option<Value>>` via
+/// [`deserialize_tristate`]) because the three cases are genuinely distinct
+/// and a plain `Option<Value>` cannot express them: an ABSENT field means
+/// "clone the source's stored input verbatim", while an explicit JSON `null`
+/// IS a real override that replaces the clone with `null`. Serde's stock
+/// `Option<Value>` deserializes JSON `null` to `None` — indistinguishable
+/// from absent — which would silently clone instead of overriding.
+#[derive(Debug, Default, Deserialize)]
+struct RerunWorkflowRequest {
+    #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    input: Option<Option<serde_json::Value>>,
+    #[serde(default)]
+    workflow_id: Option<String>,
+}
+
+impl RerunWorkflowRequest {
+    /// Collapse the tri-state `input` into the core primitive's override:
+    /// absent → `None` (clone the source), explicit `null` → `Some(Null)`,
+    /// a value → `Some(value)`.
+    fn input_override(&self) -> Option<serde_json::Value> {
+        self.input
+            .as_ref()
+            .map(|inner| inner.clone().unwrap_or(serde_json::Value::Null))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4428,6 +4476,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(terminate_workflow).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/rerun",
+            post(rerun_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
         )
@@ -5418,6 +5470,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/update-with-start"),
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/terminate"),
+        ("POST", "/workflows/{id}/rerun"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("PATCH", "/workflows/{id}/triage"),
@@ -5698,6 +5751,11 @@ pub const fn management_api_request_fields()
         ),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
         ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/rerun",
+            Some(&["input", "workflow_id"]),
+        ),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         (
@@ -6273,6 +6331,19 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_terminated",
                 "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/rerun",
+            Some(&[
+                "ok",
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "reran_from",
+                "source_prior_state",
             ]),
         ),
         (
@@ -18558,6 +18629,526 @@ async fn terminate_workflow(
                     failed_task_count: terminated.failed_task_count,
                 }),
             ))
+        }
+    }
+}
+
+/// The invariant audit fields for one `POST /workflows/{id}/rerun` request,
+/// bundled so the failure helpers stay under the argument-count lint.
+struct RerunAuditCtx<'a> {
+    actor: &'a str,
+    source_kind: &'a str,
+    request_id: Option<&'a str>,
+    route: &'static str,
+}
+
+/// Build the failed-audit record for a rejected re-run.
+const fn rerun_failure_record<'a>(
+    ctx: &'a RerunAuditCtx<'a>,
+    target_id: Option<&'a str>,
+    error_summary: &'a str,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor: ctx.actor,
+        operation: OP_WORKFLOW_RERUN,
+        target_type: TARGET_WORKFLOW,
+        target_id,
+        route_or_command: ctx.route,
+        request_id: ctx.request_id,
+        idempotency_key: None,
+        status: STATUS_FAILED,
+        error_summary: Some(error_summary),
+        shard_id: None,
+        source: ctx.source_kind,
+    }
+}
+
+/// Best-effort failed-audit on the CALLER'S connection (issue #777).
+///
+/// Every rejection that happens after `db_conn_for_execution` succeeded must
+/// use this form: acquiring a second pool connection while the caller still
+/// holds one stalls a size-1 pool until the checkout times out (the audit then
+/// silently no-ops), and on a multi-shard deployment the pool-acquiring form
+/// lands the row on the DEFAULT shard instead of the execution's own. Mirrors
+/// the connection-threading `audit_decoded_read` adopted for the same reason
+/// (issue #608 round 2).
+async fn audit_rerun_failure_on(
+    conn: &mut AsyncPgConnection,
+    ctx: &RerunAuditCtx<'_>,
+    target_id: Option<&str>,
+    error_summary: &str,
+) {
+    let record = rerun_failure_record(ctx, target_id, error_summary);
+    let _ = audit::insert_audit(conn, &record).await;
+}
+
+/// Best-effort failed-audit for the rejections that happen BEFORE a connection
+/// exists (a malformed execution id or body). Acquires its own connection on
+/// the default shard, which is the only shard resolvable at that point.
+async fn audit_rerun_failure_via_pool(
+    api_state: &HarvestApiState,
+    ctx: &RerunAuditCtx<'_>,
+    target_id: Option<&str>,
+    error_summary: &str,
+) {
+    let Ok(pool) = api_state.storage_pool() else {
+        return;
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return;
+    };
+    audit_rerun_failure_on(&mut conn, ctx, target_id, error_summary).await;
+}
+
+/// `POST /workflows/{id}/rerun` — operator re-run of a terminal workflow
+/// (issue #777).
+///
+/// Starts a BRAND-NEW execution from the source run's recorded start
+/// parameters. Admin-only, audited under [`OP_WORKFLOW_RERUN`] against the
+/// SOURCE execution id. The response never echoes the input payload.
+#[allow(clippy::too_many_lines)] // mirrors the start route's validation ladder
+async fn rerun_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    // Optional body (the contract marks it `required: false`). Raw `Bytes`
+    // rather than `Option<Json<…>>`: axum 0.8's optional-JSON extractor still
+    // rejects a zero-byte body sent with `Content-Type: application/json`, so a
+    // body-less re-run would 422 before the defaulted path runs.
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let (actor, source_kind, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/rerun";
+    let audit_ctx = RerunAuditCtx {
+        actor: &actor,
+        source_kind: &source_kind,
+        request_id: request_id.as_deref(),
+        route,
+    };
+
+    // Parse the execution id FIRST (issue #777 review, Codex): once a
+    // well-formed shard-encoded id is known, every later rejection — including
+    // a malformed body, below — can audit through the execution's OWNING shard
+    // via `db_conn_for_execution` rather than the pool-acquiring default-shard
+    // fallback, which is the only form usable before an id is known at all. A
+    // malformed id (or a request malformed in both ways) still audits via the
+    // pool, unchanged.
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            audit_rerun_failure_via_pool(
+                &api_state,
+                &audit_ctx,
+                Some(&id),
+                "malformed execution id",
+            )
+            .await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+
+    let request: RerunWorkflowRequest = if body.is_empty() {
+        RerunWorkflowRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                // The id is well-formed, so route this audit through the
+                // execution's own shard rather than the default-shard pool
+                // fallback (issue #777 review, Codex): in a multi-shard
+                // deployment where the source shard is healthy but the
+                // default shard is unavailable, the pool-acquiring form
+                // would silently drop this audit even though the owning
+                // connection could have recorded it. If the owning shard
+                // itself is unreachable there is genuinely no connection to
+                // audit through — skip, matching every other
+                // `db_conn_for_execution` failure in this handler (below).
+                if let Ok(mut c) = db_conn_for_execution(&api_state, exec_id).await {
+                    audit_rerun_failure_on(
+                        &mut c,
+                        &audit_ctx,
+                        Some(&exec_id_str),
+                        "malformed JSON body",
+                    )
+                    .await;
+                }
+                return AutumnError::bad_request_msg(format!("invalid JSON body: {e}"))
+                    .into_response();
+            }
+        }
+    };
+
+    // From here on every failure audit rides the CALLER'S connection: acquiring
+    // a second pool connection while this one is held deadlocks a size-1 pool
+    // (the audit then silently no-ops), and on a multi-shard deployment the
+    // pool-acquiring form writes the row to the DEFAULT shard rather than the
+    // execution's own. Mirrors `audit_decoded_read`'s conn-threading (#608).
+    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let source = match load_execution(&mut conn, exec_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Not necessarily "not found": a DB failure surfaces here too and
+            // maps to 500, so record the real error rather than a fixed string.
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &e.to_string()).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // Fail closed if the runtime is not installed (the boot window). `conn`
+    // and `exec_id_str` are already in scope, so — like every other
+    // rejection path in this handler — this audits through the caller's own
+    // connection rather than silently dropping an observable mutation
+    // attempt from the trail (issue #605/#777 review, Codex).
+    let runtime = match api_state.runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &e.to_string()).await;
+            return map_error(e).into_response();
+        }
+    };
+
+    // The workflow type must still be registered on this node — otherwise the
+    // fresh run would immediately wedge in HandlerNotFound replay failure.
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&source.workflow_name)
+    {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "workflow type not registered",
+        )
+        .await;
+        return AutumnError::not_found_msg(format!(
+            "workflow type '{}' is not registered on this node",
+            source.workflow_name
+        ))
+        .into_response();
+    }
+
+    if runtime.is_registered_dag(&source.workflow_name) {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "registered DAG cannot be re-run via workflow route",
+        )
+        .await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{}' is a registered DAG; use POST /dags/{}/trigger or the \
+             DAG retry route instead",
+            source.workflow_name, source.workflow_name
+        ))
+        .into_response();
+    }
+
+    // The EFFECTIVE input decides key resolution for every policy below.
+    let input_override = request.input_override();
+
+    // issue #373: validate an explicitly supplied OVERRIDE against the target
+    // workflow's published input schema, at the edge, before anything is
+    // started. "Validate the override, not the clone": a VERBATIM clone is
+    // deliberately never re-validated, because a run started under an older or
+    // looser schema must stay re-runnable — re-validating the clone would
+    // silently strand every historical run of that workflow type the moment an
+    // author tightened the schema, which is exactly when re-running matters.
+    if let Some(ref override_input) = input_override
+        && let Some(info) = runtime.registry.workflows.get(&source.workflow_name)
+        && let Err(violations) = info.validate_input(override_input)
+    {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            "input validation failed",
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
+
+    let effective_input = input_override
+        .clone()
+        .unwrap_or_else(|| source.input.clone());
+
+    // Deferred-start policies are incompatible with a re-run: they admit the
+    // start without creating an execution, so there is no execution_id to
+    // return and the 201 contract cannot be honoured.
+    let deferred_reason = if workflow_has_resolving_debounce(
+        &runtime.registry,
+        &source.workflow_name,
+        &effective_input,
+    ) {
+        Some("debounce")
+    } else if workflow_resolving_throttle(
+        &runtime.registry,
+        &source.workflow_name,
+        &effective_input,
+    )
+    .is_some()
+    {
+        Some("throttle")
+    } else if runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.batch.as_ref())
+        .is_some_and(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(&policy.key_expr, &effective_input)
+                .is_some()
+        })
+    {
+        Some("batch")
+    } else {
+        None
+    };
+    if let Some(kind) = deferred_reason {
+        audit_rerun_failure_on(
+            &mut conn,
+            &audit_ctx,
+            Some(&exec_id_str),
+            &format!("workflow carries a {kind} policy; re-run is unsupported"),
+        )
+        .await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{}' carries a {kind} policy, which defers the start and returns no \
+             execution id; re-run cannot honour its contract. Start it explicitly via \
+             POST /workflows/{}/start instead.",
+            source.workflow_name, source.workflow_name
+        ))
+        .into_response();
+    }
+
+    // issue #605 review (Codex, PR #1152): a re-run clones the source's
+    // stored `completion_callbacks` VERBATIM (below), so a target that was
+    // admissible when the source started but has since been dropped from
+    // the SSRF allowlist must be re-validated here — otherwise the rerun
+    // silently succeeds (201, possibly sealing the source) while the actual
+    // delivery attempt is skipped without error at
+    // `enqueue_completion_deliveries`'s own live-policy re-validation (a
+    // `tracing::warn!` only, never surfaced to the caller). Both
+    // `api_state.completion_callback_ssrf_policy()` and the process-global
+    // `GLOBAL_CALLBACK_CONFIG` that scanner consults are installed from the
+    // SAME `built.completion_callback_config()` at plugin startup, so this
+    // check predicts the delivery-time outcome exactly.
+    //
+    // This is deliberately the OPPOSITE call from the input-schema decision
+    // above ("validate the override, not the clone"): a run started under a
+    // now-looser input schema is still perfectly re-runnable with its old,
+    // valid input — re-validating it would only strand a legitimate re-run
+    // for no safety benefit. A stale callback target has no such benign
+    // fallback: silently accepting it just defers a real failure to a place
+    // nobody is watching, so the clone IS re-validated here and the whole
+    // re-run is rejected (mirroring the normal start route's own
+    // all-or-nothing target validation) before anything is started or the
+    // source is touched.
+    if let Some(raw) = source.completion_callbacks.clone() {
+        let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+            match serde_json::from_value(raw) {
+                Ok(t) => t,
+                Err(e) => {
+                    audit_rerun_failure_on(
+                        &mut conn,
+                        &audit_ctx,
+                        Some(&exec_id_str),
+                        "malformed stored completion_callbacks",
+                    )
+                    .await;
+                    return AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                         completion_callbacks value ({e}); re-run cannot faithfully clone it"
+                    ))
+                    .into_response();
+                }
+            };
+        let policy = api_state.completion_callback_ssrf_policy();
+        for target in &targets {
+            if let Err(rejection) =
+                autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+            {
+                audit_rerun_failure_on(
+                    &mut conn,
+                    &audit_ctx,
+                    Some(&exec_id_str),
+                    "completion callback target no longer admissible",
+                )
+                .await;
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Effective input cap (issue #252): a per-workflow cap RAISES the global.
+    let effective_wf_cap = runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.max_input_bytes)
+        .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(runtime.registry.max_workflow_input_bytes)
+        });
+
+    // Per-key concurrency (issue #247), resolved against the EFFECTIVE input.
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&source.workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(
+                policy.key_expr,
+                &effective_input,
+            );
+            (key, Some(policy.limit))
+        });
+
+    let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
+        Some(runtime.registry.telemetry().metrics.as_ref());
+
+    let rerun_request = autumn_harvest::execution::RerunRequest {
+        input_override: input_override.clone(),
+        workflow_id_override: request.workflow_id.as_deref(),
+        started_by: Some(actor.as_str()),
+        concurrency_key,
+        concurrency_limit,
+        max_workflow_input_bytes: effective_wf_cap,
+        max_execution_timeout_ceiling: api_state
+            .max_workflow_execution_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_chain_timeout_ceiling: api_state
+            .max_workflow_chain_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok()),
+        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+        trace_context: runtime.registry.telemetry().capture_trace_context(),
+    };
+
+    let result = autumn_harvest::execution::rerun_workflow_execution(
+        &mut conn,
+        exec_id,
+        rerun_request,
+        metrics_ref,
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            // Propagate a success-audit write failure (issue #777 review,
+            // Codex — matches `cancel_workflow`/`terminate_workflow`, the
+            // adjacent single-execution admin mutations, both of which
+            // `.map_err(map_error)?` this same insert rather than swallowing
+            // it): the re-run is already durable by this point, but an
+            // unrecorded success is an admin mutation missing from the audit
+            // trail, and this row is the ONLY durable place
+            // `source_prior_state` survives once the source is sealed to
+            // CONTINUED_AS_NEW — losing the write silently would lose that
+            // detail for good. A client that sees this 500 and retries hits
+            // the state gate cleanly (the source is already sealed), so this
+            // can never double-start a run.
+            //
+            // `error_summary` is the free-text detail column on a succeeded
+            // row (precedent: the scheduler's `skipped_overlap` / `deferred`
+            // rows).
+            let prior_state_detail = format!("reran from state {}", outcome.source_prior_state);
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_RERUN,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: Some(prior_state_detail.as_str()),
+                shard_id: Some(source.shard_id),
+                source: &source_kind,
+            };
+            if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                return map_error(e).into_response();
+            }
+            (
+                axum::http::StatusCode::CREATED,
+                Json(RerunWorkflowResponse {
+                    ok: true,
+                    execution_id: outcome.exec_id.to_string(),
+                    workflow_name: outcome.workflow_name,
+                    workflow_id: outcome.workflow_id,
+                    state: outcome.state,
+                    reran_from: outcome.reran_from.to_string(),
+                    source_prior_state: outcome.source_prior_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            audit_rerun_failure_on(
+                &mut conn,
+                &audit_ctx,
+                Some(&exec_id_str),
+                &format!("admission blocked by gate {gate_id}"),
+            )
+            .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response()
+        }
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => {
+            audit_rerun_failure_on(
+                &mut conn,
+                &audit_ctx,
+                Some(&exec_id_str),
+                "target workflow_id already exists",
+            )
+            .await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(AlreadyExistsResponse {
+                    existing_execution_id: existing_exec_id.to_string(),
+                    existing_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(e @ HarvestError::Config(_)) => {
+            let msg = e.to_string();
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
+            conflict_from(e).into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
+            map_error(e).into_response()
         }
     }
 }
@@ -40216,6 +40807,132 @@ mod tests {
             signal_count, 0,
             "the signal must not have been durably enqueued while the runtime was unavailable"
         );
+    }
+
+    /// Codex P2 finding (issue #605/#777 review, PR #1152): during the
+    /// plugin-startup boot window (storage pool installed, `install(runtime)`
+    /// not yet complete) `rerun_workflow`'s runtime lookup returned an error
+    /// WITHOUT writing the failed `workflow.rerun` audit row -- unlike every
+    /// other rejection path in this handler, which all audit through the
+    /// caller's own connection (`conn`/`exec_id_str` are already in scope by
+    /// this point). Reproduce that exact state and assert the audit row is
+    /// now written, mirroring the sibling boot-window tests above.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // matches the sibling boot-window tests above
+    async fn rerun_workflow_audits_failure_when_runtime_not_installed() {
+        #[derive(diesel::QueryableByName)]
+        struct AuditRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            status: String,
+        }
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to rerun_workflow test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "rerun_no_runtime",
+                workflow_id: "rerun-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                chain_execution_timeout: None,
+                max_workflow_chain_timeout_ceiling: None,
+                inherited_chain_deadline_at: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+                completion_callbacks: None,
+                start_source: autumn_harvest::StartSource::Api,
+                start_source_ref: None,
+                started_by: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup window.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = rerun_workflow(
+            Extension(state),
+            Path(exec_id.to_string()),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "rerun_workflow must fail closed when the runtime isn't installed yet"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // The regression under test: a failed `workflow.rerun` audit row must
+        // exist for this rejection, matching every other rejection path in
+        // the handler -- previously this branch returned before ever calling
+        // `audit_rerun_failure_on`.
+        let rows: Vec<AuditRow> = diesel::sql_query(
+            "SELECT status FROM harvest_audit_log WHERE operation = $1 AND target_id = $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(OP_WORKFLOW_RERUN)
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .load(&mut conn)
+        .await
+        .expect("audit query should run");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one workflow.rerun audit row for this rejection, got {}",
+            rows.len()
+        );
+        assert_eq!(rows[0].status, "failed");
     }
 
     fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {

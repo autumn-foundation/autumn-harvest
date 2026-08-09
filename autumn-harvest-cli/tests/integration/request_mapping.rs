@@ -2098,6 +2098,134 @@ fn workflow_resume_maps_to_post_resume_route_with_no_body() {
     assert_eq!(request.body, None, "resume sends no body");
 }
 
+// ── rerun (operator re-run of a terminal execution, issue #777) ───────────────
+
+#[test]
+fn workflow_rerun_maps_to_post_rerun_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/rerun"
+    );
+}
+
+#[test]
+fn workflow_rerun_without_flags_sends_empty_object_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    // No `input` key at all: the server treats an absent `input` as "clone the
+    // source's stored input verbatim" and an explicit JSON null as an override,
+    // so the CLI must never inject a null to mean "the operator said nothing".
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn workflow_rerun_with_input_json_and_workflow_id() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+        "--input-json",
+        r#"{"user_id": 7}"#,
+        "--workflow-id",
+        "order-42-retry",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.body,
+        Some(json!({ "input": { "user_id": 7 }, "workflow_id": "order-42-retry" }))
+    );
+}
+
+#[test]
+fn workflow_rerun_with_input_file_and_workflow_id() {
+    let mut tmp = tempfile::NamedTempFile::new().expect("tmp file");
+    std::io::Write::write_all(&mut tmp, br#"{"user_id": 7, "retry": true}"#).expect("write input");
+    let path = tmp.into_temp_path();
+    let path_str = path.to_str().expect("temp path is utf-8");
+
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+        "--input-file",
+        path_str,
+        "--workflow-id",
+        "order-42-retry",
+    ])
+    .expect("workflow rerun args should parse");
+    let request = cli.api_request().expect("rerun request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/rerun"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "input": { "user_id": 7, "retry": true },
+            "workflow_id": "order-42-retry",
+        }))
+    );
+}
+
+#[test]
+fn workflow_rerun_input_json_and_input_file_conflict() {
+    // Positive controls: each flag alone must parse, so the conflict assertion
+    // below cannot pass merely because the subcommand or flags are unknown.
+    for flag in ["--input-json", "--input-file"] {
+        assert!(
+            Cli::try_parse_from([
+                "harvest",
+                "workflow",
+                "rerun",
+                "00000000-0000-0000-0000-000000000001",
+                flag,
+                "{}",
+            ])
+            .is_ok(),
+            "{flag} alone should parse"
+        );
+    }
+
+    assert!(
+        Cli::try_parse_from([
+            "harvest",
+            "workflow",
+            "rerun",
+            "00000000-0000-0000-0000-000000000001",
+            "--input-json",
+            "{}",
+            "--input-file",
+            "input.json",
+        ])
+        .is_err(),
+        "--input-json and --input-file are mutually exclusive"
+    );
+}
+
 // ── annotate (operator-mutable triage tags, issue #759) ───────────────────────
 
 #[test]

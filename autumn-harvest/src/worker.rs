@@ -4714,11 +4714,31 @@ fn apply_search_attrs_patch_in_memory(
 /// `search_attrs` (issue #603 fix: kept the two callers' snapshots from
 /// silently reintroducing cleared ND diagnostic keys, e.g. into a
 /// continue-as-new successor built from the stale pre-clear reference).
+///
+/// `search_attrs` is an unvalidated `Option<serde_json::Value>` at the model
+/// layer (the start API accepts any JSON value, not only objects), so `base`
+/// can legitimately be a scalar or array. When the patch contains ONLY
+/// removals — the shape every current caller passes
+/// ([`nd_search_attrs_clear_patch`]'s six-key diagnostic strip, used by the
+/// rerun (#777) and reset-fork (#148/#538) clones and the #603 recovery
+/// clear) — none of the patch's keys can possibly exist inside a
+/// scalar/array value, so applying it is a no-op by definition; return `base`
+/// UNCHANGED rather than silently discarding it into a fresh empty object.
+/// Only when the patch contains at least one INSERTION do we coerce a
+/// non-object base to a map, since representing new key/value data requires
+/// an object shape and there is no faithful alternative.
 pub(crate) fn apply_raw_search_attrs_patch_in_memory(
     base: Option<serde_json::Value>,
     patch: &std::collections::HashMap<String, Option<serde_json::Value>>,
 ) -> Option<serde_json::Value> {
     if patch.is_empty() {
+        return base;
+    }
+    let has_insertion = patch.values().any(Option::is_some);
+    if !has_insertion
+        && let Some(v) = &base
+        && !v.is_object()
+    {
         return base;
     }
     let mut merged = match base {
@@ -20113,6 +20133,41 @@ mod tests {
         patch.insert("build_id".to_string(), Some(serde_json::json!("v1")));
         let result = apply_raw_search_attrs_patch_in_memory(None, &patch);
         assert_eq!(result, Some(serde_json::json!({"build_id": "v1"})));
+    }
+
+    /// Issue #777 review (Codex): `search_attrs` is an unvalidated JSON value
+    /// at the model layer -- a string or array base with a removal-only
+    /// patch (the shape `nd_search_attrs_clear_patch` always produces) must
+    /// be preserved verbatim, not silently discarded into `{}`.
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_non_object_base_removal_only_patch_preserves_base() {
+        let string_base = Some(serde_json::json!("just_a_string"));
+        let array_base = Some(serde_json::json!([1, 2, 3]));
+        let removal_only = nd_search_attrs_clear_patch();
+
+        assert_eq!(
+            apply_raw_search_attrs_patch_in_memory(string_base.clone(), &removal_only),
+            string_base,
+            "a non-object string base must survive a removal-only patch unchanged"
+        );
+        assert_eq!(
+            apply_raw_search_attrs_patch_in_memory(array_base.clone(), &removal_only),
+            array_base,
+            "a non-object array base must survive a removal-only patch unchanged"
+        );
+    }
+
+    /// Documents the deliberate asymmetry: a non-object base survives a
+    /// removal-only patch, but a patch that also INSERTS a key has no
+    /// faithful non-object representation, so it still coerces to a fresh
+    /// object -- unchanged from the pre-fix behavior for this shape.
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_non_object_base_with_insertion_still_coerces() {
+        let base = Some(serde_json::json!("just_a_string"));
+        let mut patch = std::collections::HashMap::new();
+        patch.insert("key".to_string(), Some(serde_json::json!("val")));
+        let result = apply_raw_search_attrs_patch_in_memory(base, &patch);
+        assert_eq!(result, Some(serde_json::json!({"key": "val"})));
     }
 
     #[test]

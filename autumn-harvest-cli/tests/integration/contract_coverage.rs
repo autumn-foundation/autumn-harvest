@@ -359,6 +359,11 @@ fn workflow_resume_is_covered() {
 }
 
 #[test]
+fn workflow_rerun_is_covered() {
+    assert_covered(&["workflow", "rerun", "00000000-0000-0000-0000-000000000001"]);
+}
+
+#[test]
 fn workflow_annotate_is_covered() {
     assert_covered(&[
         "workflow",
@@ -758,6 +763,22 @@ fn workflow_pause_body_fields_are_documented() {
         "00000000-0000-0000-0000-000000000001",
         "--reason",
         "test",
+    ]);
+}
+
+#[test]
+fn workflow_rerun_body_fields_are_documented() {
+    // The bare form sends `{}`, which `assert_body_fields_documented` skips —
+    // pass both flags so `input` and `workflow_id` are actually cross-checked
+    // against the contract's `request_body.fields`.
+    assert_body_fields_documented(&[
+        "workflow",
+        "rerun",
+        "00000000-0000-0000-0000-000000000001",
+        "--input-json",
+        r#"{"user_id": 7}"#,
+        "--workflow-id",
+        "order-42-retry",
     ]);
 }
 
