@@ -4648,13 +4648,15 @@ pub struct RerunOutcome {
 ///
 /// - [`HarvestError::NotFound`] when `source_exec_id` does not exist.
 /// - [`HarvestError::Config`] (a 409-shaped state conflict) when the source is
-///   non-terminal, is `CONTINUED_AS_NEW`, has an erased input (issue #495) and
-///   no explicit override was supplied, is schedule-attributed and would need to
-///   be sealed (see above), the target business key is held by a different live
-///   execution, a `workflow_id` override routes to a different shard than the
-///   source (see the shard-consistency guard above), or a stored
-///   `context_headers` / `workflow_retry_policy` value cannot be parsed (a
-///   faithful clone must never silently drop a field).
+///   non-terminal, is `CONTINUED_AS_NEW`, already has an automatic workflow-level
+///   retry successor (issue #523 — see the retry-chain gate above), has an
+///   erased input (issue #495) and no explicit override was supplied, is
+///   schedule-attributed and would need to be sealed (see above), the target
+///   business key is held by a different live execution, a `workflow_id`
+///   override routes to a different shard than the source (see the
+///   shard-consistency guard above), or a stored `context_headers` /
+///   `workflow_retry_policy` value cannot be parsed (a faithful clone must
+///   never silently drop a field).
 /// - [`HarvestError::AlreadyExists`] when a `workflow_id` override collides with
 ///   a live execution.
 /// - [`HarvestError::AdmissionBlocked`] when an active gate blocks the start.
@@ -4708,6 +4710,41 @@ pub async fn rerun_workflow_execution(
                         )
                     },
                 ));
+            }
+
+            // 2b. Retry-chain gate (Codex review, issue #777 PR #1152): a FAILED
+            // source may already have an automatic workflow-level retry
+            // successor (issue #523) — `persist_workflow_failure` atomically
+            // starts one, with `retry_of_exec_id` pointing back here, in the
+            // SAME transaction that seals this row FAILED, whenever attempts
+            // remain. Re-running such a predecessor would race a THIRD
+            // execution against the successor the engine already started,
+            // duplicating whatever side effects the workflow performs. This is
+            // the same "the chain's LATEST run is the re-runnable one" rule the
+            // CONTINUED_AS_NEW branch above already enforces, applied to the
+            // retry chain instead of the continue-as-new chain. Existence alone
+            // is disqualifying regardless of the successor's own state — even a
+            // successor that has SINCE completed means this predecessor's
+            // failure was already superseded. Only FAILED sources can have a
+            // retry successor (workflow-level retry never fires from
+            // COMPLETED/CANCELLED/TIMED_OUT/TERMINATED), so the query is
+            // skipped entirely for the other four re-runnable states.
+            if source.state == "FAILED" {
+                let has_retry_successor: bool = diesel::select(diesel::dsl::exists(
+                    harvest_workflow_executions::table.filter(
+                        harvest_workflow_executions::retry_of_exec_id
+                            .eq(Some(source_exec_id.as_uuid())),
+                    ),
+                ))
+                .get_result(conn)
+                .await
+                .map_err(database_error)?;
+                if has_retry_successor {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {source_exec_id} already has an automatic retry \
+                         successor (issue #523); re-run the chain's latest attempt instead"
+                    )));
+                }
             }
 
             // 3. Erasure gate (issue #495): a tombstoned input would re-run the

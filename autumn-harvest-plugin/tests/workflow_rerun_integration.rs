@@ -424,6 +424,56 @@ async fn seed_terminal(
     seed_execution(conn, workflow_name, workflow_id, state, Seed::default()).await
 }
 
+/// Seed a minimal execution row whose `retry_of_exec_id` points at
+/// `predecessor` (issue #523's workflow-level retry chain), so a re-run of
+/// `predecessor` can be shown to detect an in-flight or already-run automatic
+/// retry successor (Codex review, issue #777 PR #1152). `state` need not be
+/// terminal — the retry-chain gate under test disqualifies on EXISTENCE of a
+/// successor row, not on its state.
+async fn seed_retry_successor(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    predecessor: &str,
+    state: &str,
+) -> String {
+    let now = Utc::now();
+    let completed_at = if matches!(state, "RUNNING" | "PAUSED") {
+        None
+    } else {
+        Some(now)
+    };
+    let id: uuid::Uuid = diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
+             queue_name, retry_of_exec_id, workflow_attempt)
+         VALUES ($1, $2, 0, $3, '{}'::jsonb, $4, $5, 'default', $6::uuid, 2)
+         RETURNING id",
+    )
+    .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Text, _>(state)
+    .bind::<Timestamptz, _>(now)
+    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Text, _>(predecessor)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("insert retry successor")
+    .id;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data)
+         VALUES ($1, 0, 'WorkflowStarted',
+                 '{\"type\":\"WorkflowStarted\",\"data\":{\"input\":{},\"timestamp\":\"2026-01-01T00:00:00Z\"}}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .execute(conn)
+    .await
+    .expect("insert event");
+
+    autumn_harvest::types::ExecutionId::from_uuid(id).to_string()
+}
+
 // ── Row readers ──────────────────────────────────────────────────────────────
 
 #[derive(diesel::QueryableByName, Debug)]
@@ -3283,6 +3333,107 @@ async fn rerun_with_no_completion_callbacks_is_unaffected() {
 
     let wf_id = unique("rr-no-callback");
     let source = seed_terminal(&mut conn, wf, &wf_id, "COMPLETED").await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// R-65 (Codex review, issue #777 PR #1152, P1): a FAILED source that already
+/// has an automatic workflow-level retry successor (issue #523,
+/// `retry_of_exec_id`) is rejected. `persist_workflow_failure` atomically
+/// starts that successor in the SAME transaction that seals the predecessor
+/// FAILED whenever attempts remain, so without this gate an operator could
+/// re-run the FAILED predecessor while its successor is RUNNING — a THIRD
+/// execution racing the engine's own retry. Existence alone disqualifies,
+/// regardless of the successor's own state: this test uses RUNNING (the
+/// literal race the finding names).
+#[tokio::test]
+async fn rerun_rejects_failed_source_with_a_running_retry_successor() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_retry_running_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-retry-running");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
+    let _successor = seed_retry_successor(
+        &mut conn,
+        wf,
+        &unique("rr-retry-running-succ"),
+        &source,
+        "RUNNING",
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let msg = body.to_string().to_lowercase();
+    assert!(
+        msg.contains("retry") && (msg.contains("chain") || msg.contains("latest")),
+        "the 409 must point at the chain's latest attempt: {body}"
+    );
+
+    // Nothing new was started under the source's own key, and the source was
+    // never sealed — a rejected re-run must be a pure no-op.
+    assert_eq!(
+        load_execs_for_key(&mut conn, wf, &wf_id).await.len(),
+        1,
+        "no new run under the source's key"
+    );
+    assert_eq!(
+        load_exec(&mut conn, &source).await.state,
+        "FAILED",
+        "the source must not be sealed when the re-run is rejected"
+    );
+    let rows = audit_rows(&mut conn, "workflow.rerun", &source).await;
+    assert!(
+        rows.iter().any(|r| r.status == "failed"),
+        "expected a failed audit row: {rows:?}"
+    );
+}
+
+/// R-65b: existence of a retry successor is disqualifying regardless of ITS
+/// state — a successor that has SINCE completed still means this
+/// predecessor's failure was already superseded by the chain moving on, so
+/// re-running the stale predecessor would still duplicate completed work.
+#[tokio::test]
+async fn rerun_rejects_failed_source_with_a_completed_retry_successor() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_retry_completed_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-retry-completed");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
+    let _successor = seed_retry_successor(
+        &mut conn,
+        wf,
+        &unique("rr-retry-completed-succ"),
+        &source,
+        "COMPLETED",
+    )
+    .await;
+
+    let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// R-65c: regression guard — a plain FAILED source with NO retry successor
+/// (the overwhelmingly common case: a manual failure with no configured
+/// workflow-level retry policy, or one whose attempts are simply not yet
+/// exhausted-and-superseded) re-runs exactly as before.
+#[tokio::test]
+async fn rerun_of_failed_source_with_no_retry_successor_still_works() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let wf = "rr_retry_none_wf";
+    let app = build_app(&pool, vec![plain_info(wf)]);
+    let mut conn = pool.get().await.unwrap();
+
+    let wf_id = unique("rr-retry-none");
+    let source = seed_terminal(&mut conn, wf, &wf_id, "FAILED").await;
 
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
