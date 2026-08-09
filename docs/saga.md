@@ -469,7 +469,8 @@ Detection uses **three** independent signals:
 1. a `saga_compensat*` marker in the run's history;
 2. a recorded activity dispatch whose **input is a compensation envelope** —
    the reserved `{"dag_compensate": …, "input": …, "output": …}` shape written
-   only by the unwind — **and whose name is not a declared node**; or
+   only by the unwind — **whose `dag_compensate` names a node that succeeded in
+   the same run**; or
 3. a recorded dispatch whose **name** is one of that DAG's declared compensator
    activities.
 
@@ -485,17 +486,29 @@ so it survives the rename. Signal 3 is in turn unambiguous by construction:
 from sharing any forward node's name, so a compensator dispatch can never be
 mistaken for a forward step.
 
-That same build-time guarantee is what lets signal 2 corroborate cheaply. The
-envelope shape alone is reachable by accident — a mapped cell or an `input_from`
-binding hands a node the raw upstream output, which is arbitrary user data and
-may legitimately carry those three keys — so shape alone would 409 a perfectly
-retryable run, including one whose DAG declares no compensators at all. Requiring
-that the dispatch's **name is not a declared node** rejects every forward
-dispatch while preserving exactly the rename-resilience signal 2 exists for: a
-compensator that was renamed, or removed outright, is still absent from the node
-set. The envelope's `dag_compensate` *value* is deliberately not checked — it
-names a forward node, so validating it would reintroduce the registry dependence
-signal 2 was added to escape.
+Signal 2 does not rely on shape alone, because the shape is reachable by
+accident: a mapped cell or an `input_from` binding hands a node the raw upstream
+output, which is arbitrary user data, and an `input_from_all` alias set could
+even be named `dag_compensate`/`input`/`output` outright. Shape alone would 409 a
+perfectly retryable run, including one whose DAG declares no compensators at all.
+
+The corroboration is that the envelope's `dag_compensate` value must name an
+activity that **actually succeeded in the same run** — the unwind only ever
+compensates succeeded nodes, so a genuine envelope always satisfies it. It is
+drawn from the *history*, never the definition, so signal 2 has no registry
+dependence and survives every way the definition can drift from the run that
+produced the history: the compensator renamed, removed outright, or a later
+definition **reusing** its name as a forward node. That last case is why
+corroborating against the current node set would be wrong —
+`CompensatorNameCollidesWithNode` is a per-definition-version guarantee, and
+nothing stops a later build from introducing a node named after a since-renamed
+compensator.
+
+The residual is a documented false positive in the safe direction: a forward
+dispatch whose input is exactly the three envelope keys *and* whose
+`dag_compensate` string happens to name a node that succeeded in the same run.
+That marks a retryable run non-retryable (start a fresh run) rather than
+permitting the double-spend.
 
 Signal 2 reads a payload-bearing field, so the retry endpoint loads history
 **inflated and codec-decoded**. Left un-inflated, an oversized compensation

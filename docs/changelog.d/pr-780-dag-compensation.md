@@ -704,3 +704,67 @@ rejected) alongside the existing rename test.
 The envelope's `dag_compensate` *value* is deliberately left unchecked. It names
 a forward node, so validating it against the definition would reintroduce exactly
 the registry dependence signal 2 was introduced to escape.
+
+### P1 — the envelope corroboration must be historical, not definition-based
+
+The previous round corroborated the envelope signal against the **current node
+set**: an envelope-shaped input counted only when the dispatch was not named
+after a declared node. That closed the user-payload false positive, but
+introduced a new blindness — `CompensatorNameCollidesWithNode` is a
+*per-definition-version* guarantee. It stops a compensator from sharing a node's
+name in the build that declared it; nothing stops a **later** build from
+introducing a forward node named after a compensator that has since been renamed
+away. The current-definition check then suppressed a genuine envelope.
+
+RED evidence (current definition `a → undo_a → c` with `undo_a` now a forward
+node and no compensator declared; history carries a marker-less unwind that
+dispatched `undo_a`):
+
+```
+a_genuine_unwind_is_detected_even_when_a_later_node_reuses_the_compensator_name
+  left:  Ok(DagRetryPlan { reset_to_event_id: 2,
+          nodes_to_re_execute: ["c", "undo_a"], nodes_carried_over: ["a"] })
+  right: Err(CompensatedRun)
+```
+
+`nodes_carried_over: ["a"]` is the double-spend — `undo_a` had already rolled
+`a` back.
+
+The corroboration is now drawn from **history only**: the envelope's
+`dag_compensate` value must name an activity that actually **succeeded in this
+run** (correlated `ActivityScheduled` → `ActivityCompleted` by `activity_id`,
+since the completion event carries no name). The unwind only ever compensates
+succeeded nodes, so a genuine envelope always satisfies it.
+
+Signal 2 therefore has **no registry dependence at all**, and survives every way
+the definition can drift from the run that produced the history — compensator
+renamed, removed outright, or its name later reused as a forward node. All three
+are pinned:
+
+- `resolve_rejects_a_marker_less_unwind_whose_compensator_was_since_renamed`
+- `a_genuine_unwind_is_detected_even_after_all_compensators_were_removed`
+- `a_genuine_unwind_is_detected_even_when_a_later_node_reuses_the_compensator_name`
+
+The user-payload false positive stays closed
+(`a_forward_dispatch_mimicking_the_envelope_is_not_an_unwind`: the mimic's
+`dag_compensate` names nothing that succeeded).
+
+Residual, documented and safe-direction: a forward dispatch whose input is
+exactly the three envelope keys *and* whose `dag_compensate` happens to name a
+node that succeeded in the same run is still a false positive — which marks a
+retryable run non-retryable (start a fresh run), never the double-spend.
+
+### P2 — the FailFast policy table described cancellation it never performed
+
+`docs/getting-started/08-dags-and-schedules.md` promised `FailFast` would "stop
+execution and cancel in-flight instances on first failure". The cancellation half
+was **never** true: a mapped cell is a durable `harvest_task_queue` row, so
+abandoning the workflow's future never cancelled it. The stop-execution half
+became inaccurate with this PR's P1-B fix, which drains the instance stream so
+the replay cursor stays clean for the unwind.
+
+The table now describes what actually happens — the first cell failure decides
+the node's outcome and stops **downstream** work, while already-dispatched cells
+are drained to completion — with a paragraph stating that `FailFast` is an
+outcome policy, not a cancellation policy, and is not a tool for bounded failure
+latency.

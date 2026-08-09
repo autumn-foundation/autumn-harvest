@@ -134,8 +134,18 @@ let process = dag.map_activity(process_partition)
 
 | Policy | Behavior | Downstream Input |
 |---|---|---|
-| `FailFast` *(default)* | Stop execution and cancel in-flight instances on first failure. The mapped task fails. | Downstream does not run (unless trigger rule permits). |
+| `FailFast` *(default)* | The **first** cell failure fails the mapped task; later cell failures do not change the outcome. Instances already dispatched are **drained** (awaited to completion), not cancelled — see below. | Downstream does not run (unless trigger rule permits). |
 | `CollectAll` | Execute all N instances to completion. Gathers outcomes for all slots into a status array. Mapped task succeeds. | Downstream receives array of outcome objects: `[{"status":"succeeded","value":v}, {"status":"failed","error":"err"}]`. |
+
+`FailFast` names *outcome* semantics, not cancellation: the first cell failure
+decides the node's result and stops **downstream** work, but every cell already
+dispatched runs to completion. A mapped cell is a durable `harvest_task_queue`
+row, so it was never cancellable by the workflow abandoning its future — the
+in-flight instances always ran regardless. The mapped node now waits for them
+before the DAG terminates, which also keeps the replay cursor clean for the
+issue #780 compensation unwind. Choose `FailFast` for "don't run the rest of the
+graph", not for bounded failure latency or to prevent already-dispatched cells
+from completing.
 
 ### Behavior and Guarantees
 

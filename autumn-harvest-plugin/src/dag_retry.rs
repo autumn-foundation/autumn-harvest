@@ -65,9 +65,9 @@
 //! rolled-back state. Such a run is therefore rejected outright with
 //! [`DagRetryResolveError::CompensatedRun`] (`409`); start a fresh DAG run
 //! instead. Detection uses THREE signals — a `saga_compensat*` marker, an
-//! `ActivityScheduled` whose recorded input is a **compensation envelope** and
-//! whose name is not a declared node, or one whose *name* is a compensator this
-//! DAG declares — because a DAG unwind at
+//! `ActivityScheduled` whose recorded input is a **compensation envelope** for a
+//! node that succeeded in the same run, or one whose *name* is a compensator
+//! this DAG declares — because a DAG unwind at
 //! a drained signal frontier records no marker, and because this resolver is
 //! handed the *currently registered* definition, which may have renamed the
 //! compensator since (see [`ran_compensation_unwind`]). The envelope signal
@@ -232,26 +232,80 @@ fn is_compensation_envelope(input: &serde_json::Value) -> bool {
 ///    name-keyed run graph (#690) and this resolver), and it still fires for a
 ///    pre-envelope history should the envelope shape ever change.
 ///
-/// Signal 2 additionally **corroborates against the dispatch's name**, because
-/// the envelope shape alone is reachable by accident: a mapped cell or an
+/// Names of activities that were scheduled AND recorded an `ActivityCompleted`
+/// in this history — i.e. the nodes the issue #780 unwind is allowed to
+/// compensate.
+///
+/// Correlation is by `activity_id`, because `ActivityCompleted` carries no name.
+#[must_use]
+fn succeeded_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
+    let completed: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityCompleted { activity_id, .. } => Some(*activity_id),
+            _ => None,
+        })
+        .collect();
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if completed.contains(activity_id) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Is this `ActivityScheduled.input` a compensation envelope whose compensated
+/// node actually **succeeded in this run**?
+///
+/// The history-only corroboration for signal 2 — see [`ran_compensation_unwind`]
+/// for why it is drawn from history rather than the current definition.
+#[must_use]
+fn compensates_a_succeeded_node(input: &serde_json::Value, succeeded: &BTreeSet<&str>) -> bool {
+    is_compensation_envelope(input)
+        && input
+            .get(COMPENSATION_ENVELOPE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|node| succeeded.contains(node))
+}
+
+/// Signal 2 additionally **corroborates the envelope against recorded history**,
+/// because the shape alone is reachable by accident: a mapped cell or an
 /// `input_from` binding hands a node the raw upstream output, which is arbitrary
-/// user data and may legitimately carry exactly those three keys. Shape alone
-/// would then 409 a retryable run — including one whose DAG declares no
-/// compensators at all and therefore cannot have unwound.
+/// user data and may legitimately carry exactly those three keys (an
+/// `input_from_all` alias set could even be named `dag_compensate`/`input`/
+/// `output` outright). Shape alone would then 409 a retryable run — including
+/// one whose DAG declares no compensators at all and therefore cannot have
+/// unwound.
 ///
-/// The corroboration is free and rename-proof: every **forward** dispatch is
-/// named after a declared node, while
-/// `DagBuildError::CompensatorNameCollidesWithNode` guarantees at build time
-/// that no compensator shares a node's name. So an envelope-shaped input on a
-/// dispatch whose name is NOT a declared node can only be a compensation
-/// dispatch — and it stays detectable even if the compensator was renamed or
-/// removed outright, which is exactly what signal 2 exists for. Deliberately
-/// *not* corroborated against the envelope's `dag_compensate` value: that names
-/// a forward node in the definition, so checking it would reintroduce the
-/// registry dependence signal 2 was added to escape.
+/// The corroboration is that the envelope's `dag_compensate` value must name an
+/// activity that **actually succeeded in this run** — the unwind only ever
+/// compensates succeeded nodes, so a genuine envelope always satisfies it.
 ///
-/// Pure and cheap: two passes over the definition to collect compensator and
-/// node names, and one pass over the events.
+/// It is deliberately drawn from the *history*, never the definition, so signal
+/// 2 has no registry dependence at all and survives every way the definition can
+/// drift away from the run that produced the history:
+///
+/// * the compensator was **renamed** — its name is not in `compensators`;
+/// * the compensator was **removed outright** — `compensators` is empty;
+/// * a later definition **reuses** the old compensator's name as a forward node.
+///
+/// That last case is why corroborating against the current *node* set would be
+/// wrong: `DagBuildError::CompensatorNameCollidesWithNode` is a
+/// per-definition-version guarantee (no compensator shares a node's name in the
+/// build that declared it), and nothing stops a later build from introducing a
+/// node named after a since-renamed compensator.
+///
+/// Residual, documented and safe-direction: a forward dispatch whose user input
+/// is exactly the three envelope keys *and* whose `dag_compensate` string
+/// happens to name a node that succeeded in the same run is still a false
+/// positive. That marks a retryable run non-retryable (start a fresh run) — the
+/// opposite direction from the double-spend this guard exists to prevent.
+///
+/// Pure and cheap: one pass over the definition for compensator names, and a
+/// bounded number of passes over the events.
 #[must_use]
 fn ran_compensation_unwind(def: &DagDefinition, events: &[WorkflowEvent]) -> bool {
     let compensators: BTreeSet<&str> = def
@@ -259,17 +313,12 @@ fn ran_compensation_unwind(def: &DagDefinition, events: &[WorkflowEvent]) -> boo
         .iter()
         .filter_map(|task| task.compensate.as_deref())
         .collect();
-    let node_names: BTreeSet<&str> = def
-        .tasks()
-        .iter()
-        .map(|task| task.activity_name.as_str())
-        .collect();
+    let succeeded = succeeded_activity_names(events);
 
     events.iter().any(|event| match event {
         WorkflowEvent::MarkerRecorded { name, .. } => name.starts_with(SAGA_UNWIND_MARKER_PREFIX),
         WorkflowEvent::ActivityScheduled { name, input, .. } => {
-            compensators.contains(name.as_str())
-                || (is_compensation_envelope(input) && !node_names.contains(name.as_str()))
+            compensators.contains(name.as_str()) || compensates_a_succeeded_node(input, &succeeded)
         }
         _ => false,
     })
@@ -1310,6 +1359,63 @@ mod tests {
             Err(DagRetryResolveError::CompensatedRun),
             "a rolled-back run must stay non-retryable even after every \
              compensator was removed from the definition"
+        );
+    }
+
+    /// Name **reuse** must not blind the envelope signal.
+    ///
+    /// `CompensatorNameCollidesWithNode` is a *per-definition-version*
+    /// guarantee: it stops a compensator from sharing a node's name in the build
+    /// that declared it. Nothing stops a LATER deployment from introducing a
+    /// forward node named after a compensator that has since been renamed away.
+    /// Corroborating against the *current* node set would then suppress a
+    /// genuine envelope — so the corroboration is historical instead.
+    #[test]
+    fn a_genuine_unwind_is_detected_even_when_a_later_node_reuses_the_compensator_name() {
+        // Current definition: `undo_a` is now an ordinary FORWARD node, and no
+        // compensator is declared at all (the old one was renamed away).
+        let def = {
+            let mut builder = DagBuilder::new();
+            let na = builder.activity(a);
+            let nu = builder.activity(undo_a).upstream(&na);
+            let _nc = builder.activity(c).upstream(&nu);
+            builder.build().expect("name-reuse dag builds")
+        };
+        let (ia, ic, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("c", ic),
+            failed(ic),
+            // Marker-less (drained-signal frontier).
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            // The genuine compensation dispatch from the OLD definition. Its
+            // name is now a forward node in the CURRENT definition.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: iu,
+                name: "undo_a".to_string(),
+                input: serde_json::json!({
+                    "dag_compensate": "a",
+                    "input": Value::Null,
+                    "output": Value::Null,
+                }),
+                queue: "default".to_string(),
+            },
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["c".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "a rolled-back run must stay non-retryable even when a later \
+             definition reuses the compensator's name as a forward node"
         );
     }
 
