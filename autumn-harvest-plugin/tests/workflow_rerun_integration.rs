@@ -705,6 +705,42 @@ fn build_multi_shard_app(
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
+/// Variant of [`build_multi_shard_app`] whose SHARDED-POOL default is shard 1
+/// (independent of the router's own default, which only affects id-less
+/// `pick_for_new_workflow` routing — irrelevant here). For tests that need
+/// `HarvestDbPool::default_pool()` specifically to resolve to a given shard,
+/// while an execution explicitly encoded onto a DIFFERENT shard still routes
+/// correctly via `pool_for_execution`.
+fn build_multi_shard_app_default_shard1(
+    pool0: &DbPool,
+    pool1: &DbPool,
+    infos: Vec<WorkflowInfo>,
+) -> HarvestApiApp {
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(autumn_harvest::types::ShardId::new(0), pool0.clone());
+    pools.insert(autumn_harvest::types::ShardId::new(1), pool1.clone());
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(
+        autumn_harvest::shard::ShardedDbPool::from_map(
+            pools,
+            autumn_harvest::types::ShardId::new(1),
+        ),
+    ));
+    let registry = HandlerRegistry::new(infos, vec![]);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(registry),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("rerun-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        two_shard_router(),
+    ));
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
 /// Seed a terminal (COMPLETED) source directly on shard 0's connection, with
 /// an explicitly shard-0-encoded exec id (`ExecutionId::new_for_shard`)
 /// rather than relying on the table's default UUID generator, whose shard
@@ -899,6 +935,73 @@ async fn rerun_workflow_id_override_that_hashes_to_the_same_shard_still_succeeds
         autumn_harvest::types::ShardId::new(0),
         "the new execution must land on the shard the router actually picked"
     );
+}
+
+/// Codex review finding (PR #1152, P2): the malformed-JSON-body audit ran
+/// BEFORE the execution id was parsed and always wrote through
+/// `pool.default_pool()`. When the caller's execution id IS well-formed, its
+/// shard is already known — so the audit should route through THAT shard's
+/// connection instead, the same way every post-id-parse failure in this
+/// handler already does. Proven end to end: two shards, with the
+/// SHARDED-POOL default deliberately pointed at an unreachable address while
+/// the source lives on a DIFFERENT, healthy shard — the pre-fix code would
+/// have silently dropped this audit entirely (`acquire_conn` on the broken
+/// default pool fails and the whole `audit_rerun_failure_via_pool` call is a
+/// silent no-op by design).
+#[tokio::test]
+async fn rerun_malformed_body_audits_via_source_shard_when_default_shard_is_unavailable() {
+    let (admin, _guard) = setup_shard_server().await;
+    let url0 = create_shard_db(&admin, &unique("rerun_mb0").replace('-', "_")).await;
+    let pool0 = build_pool(&url0);
+    // Deliberately unreachable (loopback, refused instantly) — proves the
+    // audit does NOT route via the default-shard pool, which the pre-fix code
+    // always used for this case regardless of whether the id was well-formed.
+    let broken_pool1 = build_pool("postgres://postgres:postgres@127.0.0.1:1/nonexistent");
+    let mut conn0 = AsyncPgConnection::establish(&url0)
+        .await
+        .expect("connect shard 0");
+
+    let wf = "rr_mb_default_down_wf";
+    let source_wf_id = unique("rr-mb-default-down");
+    let source = seed_terminal_on_shard0(&mut conn0, wf, &source_wf_id).await;
+
+    let app = build_multi_shard_app_default_shard1(&pool0, &broken_pool1, vec![plain_info(wf)]);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(rerun_uri(&source))
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .header("x-harvest-actor", TEST_ACTOR)
+                .body(Body::from("{\"input\": }"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = read_response(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(
+        load_execs_for_key(&mut conn0, wf, &source_wf_id)
+            .await
+            .len(),
+        1,
+        "a malformed body must start nothing"
+    );
+
+    // The failed audit row landed on the SOURCE's own (healthy) shard even
+    // though the sharded-pool default (shard 1) is unreachable — this would
+    // have been silently dropped entirely before the fix.
+    let rows = audit_rows(&mut conn0, "workflow.rerun", &source).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "a malformed body must still be audited via the source's own shard \
+         even when the default shard is unavailable"
+    );
+    assert_eq!(rows[0].status, "failed");
 }
 
 // ── R-12 .. R-41 ─────────────────────────────────────────────────────────────

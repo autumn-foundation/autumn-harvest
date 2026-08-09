@@ -18728,25 +18728,13 @@ async fn rerun_workflow(
         route,
     };
 
-    let request: RerunWorkflowRequest = if body.is_empty() {
-        RerunWorkflowRequest::default()
-    } else {
-        match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                audit_rerun_failure_via_pool(
-                    &api_state,
-                    &audit_ctx,
-                    Some(&id),
-                    "malformed JSON body",
-                )
-                .await;
-                return AutumnError::bad_request_msg(format!("invalid JSON body: {e}"))
-                    .into_response();
-            }
-        }
-    };
-
+    // Parse the execution id FIRST (issue #777 review, Codex): once a
+    // well-formed shard-encoded id is known, every later rejection — including
+    // a malformed body, below — can audit through the execution's OWNING shard
+    // via `db_conn_for_execution` rather than the pool-acquiring default-shard
+    // fallback, which is the only form usable before an id is known at all. A
+    // malformed id (or a request malformed in both ways) still audits via the
+    // pool, unchanged.
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
         Err(e) => {
@@ -18761,6 +18749,37 @@ async fn rerun_workflow(
         }
     };
     let exec_id_str = exec_id.to_string();
+
+    let request: RerunWorkflowRequest = if body.is_empty() {
+        RerunWorkflowRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                // The id is well-formed, so route this audit through the
+                // execution's own shard rather than the default-shard pool
+                // fallback (issue #777 review, Codex): in a multi-shard
+                // deployment where the source shard is healthy but the
+                // default shard is unavailable, the pool-acquiring form
+                // would silently drop this audit even though the owning
+                // connection could have recorded it. If the owning shard
+                // itself is unreachable there is genuinely no connection to
+                // audit through — skip, matching every other
+                // `db_conn_for_execution` failure in this handler (below).
+                if let Ok(mut c) = db_conn_for_execution(&api_state, exec_id).await {
+                    audit_rerun_failure_on(
+                        &mut c,
+                        &audit_ctx,
+                        Some(&exec_id_str),
+                        "malformed JSON body",
+                    )
+                    .await;
+                }
+                return AutumnError::bad_request_msg(format!("invalid JSON body: {e}"))
+                    .into_response();
+            }
+        }
+    };
 
     // From here on every failure audit rides the CALLER'S connection: acquiring
     // a second pool connection while this one is held deadlocks a size-1 pool
@@ -19036,16 +19055,22 @@ async fn rerun_workflow(
 
     match result {
         Ok(outcome) => {
-            // Best-effort success audit (matches the pause / erase posture:
-            // the re-run is already durable, so an audit-write failure must not
-            // fail the response).
+            // Propagate a success-audit write failure (issue #777 review,
+            // Codex — matches `cancel_workflow`/`terminate_workflow`, the
+            // adjacent single-execution admin mutations, both of which
+            // `.map_err(map_error)?` this same insert rather than swallowing
+            // it): the re-run is already durable by this point, but an
+            // unrecorded success is an admin mutation missing from the audit
+            // trail, and this row is the ONLY durable place
+            // `source_prior_state` survives once the source is sealed to
+            // CONTINUED_AS_NEW — losing the write silently would lose that
+            // detail for good. A client that sees this 500 and retries hits
+            // the state gate cleanly (the source is already sealed), so this
+            // can never double-start a run.
             //
-            // `error_summary` is the free-text detail column on a succeeded row
-            // (precedent: the scheduler's `skipped_overlap` / `deferred` rows).
-            // Carrying the source's pre-seal state here makes the operator
-            // audit trail self-contained: once the source is sealed to
-            // CONTINUED_AS_NEW, the response and this row are the only ROW-level
-            // records of what it actually finished as.
+            // `error_summary` is the free-text detail column on a succeeded
+            // row (precedent: the scheduler's `skipped_overlap` / `deferred`
+            // rows).
             let prior_state_detail = format!("reran from state {}", outcome.source_prior_state);
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -19060,7 +19085,9 @@ async fn rerun_workflow(
                 shard_id: Some(source.shard_id),
                 source: &source_kind,
             };
-            let _ = audit::insert_audit(&mut conn, &ar).await;
+            if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+                return map_error(e).into_response();
+            }
             (
                 axum::http::StatusCode::CREATED,
                 Json(RerunWorkflowResponse {
