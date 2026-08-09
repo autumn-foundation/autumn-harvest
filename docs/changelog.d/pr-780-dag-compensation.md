@@ -1061,3 +1061,43 @@ and asserts no fork was created) and by the characterization test
 `an_erased_marker_less_unwind_is_invisible_and_must_be_refused_by_the_caller`,
 which proves the resolver genuinely cannot see an erased unwind — so the guard
 must live in the caller, which holds the execution row.
+
+### Post-review hardening (round 8) — a scheduled compensator is not a started one
+
+An automated review found a **P1** one level deeper than round 6: both signals
+treated an `ActivityScheduled` as proof that a compensator ran.
+
+An operator cancel landing mid-unwind fails every open task row
+(`queue::fail_open_tasks_for_execution`) **without appending any event**, so a
+compensator that was dispatched but never claimed sits in history as a bare
+`ActivityScheduled` having rolled back nothing. Both signals fired on it,
+returned `409 CompensatedRun`, and sent the operator to a fresh run — re-running
+an upstream node whose side effect is still live. Same failure direction as round
+6: refusing the safe recovery and recommending the unsafe one.
+
+Both signals now require the dispatch to have **started**. New
+`started_activity_ids` collects every `ActivityStarted`; signal 1 requires a
+*started* dispatch after the marker, and signal 2 requires the envelope-carrying
+dispatch to have started.
+
+**Why `ActivityStarted` is the right bar** (verified in `worker.rs`): the worker
+appends it in a setup phase *before* invoking the handler, and a failed append
+aborts the dispatch — so *body executed ⇒ `ActivityStarted` exists*. Its absence
+therefore proves the body never ran. Deliberately **not** keyed on a terminal
+event: a worker that started and then crashed mid-body may or may not have landed
+the rollback, and that ambiguity must resolve to "compensated" (refuse the retry),
+not to "safe". Neither `activity_id` nor `worker_id` is a payload field, so the
+signal also survives issue #495 erasure.
+
+The shared `compensates_a_dispatched_node` predicate is **unchanged**, because it
+is also the forward-dispatch exclusion used by `node_outcome` and
+`dag_graph::latest_scheduled` — a compensator dispatch must be excluded from
+name-keyed node reads whether or not it started. The start requirement is applied
+only in `ran_compensation_unwind`.
+
+Pinned by `a_scheduled_but_never_started_compensator_stays_retryable` (RED before
+the change) and its mirror `a_started_compensator_with_no_terminal_still_blocks_retry`
+(a started-then-crashed compensator still refuses the retry). Seven existing
+fixtures were made realistic — a compensator that reaches a terminal event always
+carried an `ActivityStarted` in a real history; they had omitted it only because
+nothing read it.

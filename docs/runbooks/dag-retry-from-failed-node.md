@@ -119,8 +119,8 @@ state, so a fresh run is the correct — and safe — recovery.
 Detection uses two independent signals, **both read from the run's own recorded
 history and never from the registered definition**:
 
-1. a `saga_compensat*` marker **followed by at least one activity dispatch**, or
-2. a recorded activity dispatch whose **input is a compensation envelope**
+1. a `saga_compensat*` marker **followed by a started activity dispatch**, or
+2. a **started** activity dispatch whose **input is a compensation envelope**
    (`{"dag_compensate": …, "input": …, "output": …}`) whose `dag_compensate`
    names a node that was **dispatched in the same run**.
 
@@ -128,6 +128,16 @@ Signal 2 is load-bearing, not belt-and-braces. A run that received an
 unsolicited signal unwinds **without** recording a marker (see
 [a stray signal silences unwind observability](../saga.md#known-limitation--a-stray-signal-silences-unwind-observability)),
 so a marker-only check would leave that fully rolled-back run retryable.
+
+Both signals require the compensator to have **started**, not merely been
+scheduled. Cancelling a run mid-unwind fails every open task without recording
+an event, so a compensator dispatched-but-never-claimed appears in history
+having rolled back nothing — and 409-ing that would push you to a fresh run
+that re-runs an upstream node whose side effect is still live. The engine
+appends `ActivityStarted` before it invokes a handler, so its absence proves
+the compensator never ran. A compensator that started and then crashed
+mid-body counts as compensated: whether the rollback landed is genuinely
+unknown, and that ambiguity resolves against retrying.
 
 The "followed by a dispatch" half of signal 1 matters just as much, in the
 opposite direction. The unwind records its marker *before* running the first

@@ -75,10 +75,11 @@
 //! failed WITHOUT compensators (and every pre-#780 history) triggers neither and
 //! stays fully retryable.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use autumn_harvest::dag::DagDefinition;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::types::ActivityExecId;
 
 /// Terminal (or non-terminal) outcome of a single DAG node on the source run,
 /// derived purely from the recorded event history.
@@ -336,10 +337,11 @@ fn ran_compensation_unwind(events: &[WorkflowEvent]) -> bool {
     // run. Covers the marker-less unwind (issue #801's drained-signal
     // frontier), which signal 1 cannot see at all.
     let dispatched = dispatched_activity_names(events);
+    let started = started_activity_ids(events);
     events.iter().any(|event| match event {
-        WorkflowEvent::ActivityScheduled { input, .. } => {
-            compensates_a_dispatched_node(input, &dispatched)
-        }
+        WorkflowEvent::ActivityScheduled {
+            activity_id, input, ..
+        } => started.contains(activity_id) && compensates_a_dispatched_node(input, &dispatched),
         _ => false,
     })
 }
@@ -376,10 +378,48 @@ fn first_unwind_marker_index(events: &[WorkflowEvent]) -> Option<usize> {
 /// unwind runs only once the forward level walk has returned, so every forward
 /// dispatch precedes it.
 fn dispatched_after(events: &[WorkflowEvent], marker_index: usize) -> bool {
+    let started = started_activity_ids(events);
     events
         .iter()
         .skip(marker_index.saturating_add(1))
-        .any(|event| matches!(event, WorkflowEvent::ActivityScheduled { .. }))
+        .any(|event| match event {
+            WorkflowEvent::ActivityScheduled { activity_id, .. } => started.contains(activity_id),
+            _ => false,
+        })
+}
+
+/// Activity ids a worker actually CLAIMED — every `ActivityStarted`.
+///
+/// This is the engine's proof that a body ran. The worker appends
+/// `ActivityStarted` in a setup phase **before** invoking the handler, and a
+/// failed append aborts the dispatch, so *body executed implies an
+/// `ActivityStarted` exists*. Its absence therefore proves the body never ran.
+///
+/// Load-bearing for both signals: an operator cancel landing mid-unwind fails
+/// every open task row (`queue::fail_open_tasks_for_execution`) **without
+/// appending any event**, so a compensator dispatched-but-not-yet-claimed
+/// leaves an `ActivityScheduled` in history having rolled back nothing.
+/// Treating that schedule as proof would `409` a safe retry and send the
+/// operator to a fresh run that re-runs an upstream node whose side effect is
+/// still live.
+///
+/// Deliberately NOT keyed on a terminal event. A worker that appended
+/// `ActivityStarted` and then crashed mid-body may or may not have landed the
+/// rollback; that is genuinely ambiguous, so it is treated as compensated (the
+/// conservative direction). `ActivityStarted` is the earliest point at which a
+/// rollback side effect could have occurred.
+///
+/// Survives issue #495 erasure: neither `activity_id` nor `worker_id` is a
+/// payload field, so a tombstone leaves this signal intact.
+#[must_use]
+fn started_activity_ids(events: &[WorkflowEvent]) -> HashSet<ActivityExecId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityStarted { activity_id, .. } => Some(*activity_id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A resolved, dry-runnable retry plan: the reset point plus the explicit
@@ -843,6 +883,15 @@ mod tests {
         }
     }
 
+    /// The event a worker appends when it CLAIMS an activity, before invoking
+    /// the handler. Its presence is the proof that a body actually ran.
+    fn activity_started(id: ActivityExecId) -> WorkflowEvent {
+        WorkflowEvent::ActivityStarted {
+            activity_id: id,
+            worker_id: autumn_harvest::types::WorkerId::new("w1"),
+        }
+    }
+
     fn completed(id: ActivityExecId) -> WorkflowEvent {
         WorkflowEvent::ActivityCompleted {
             activity_id: id,
@@ -954,6 +1003,7 @@ mod tests {
             // The OLD definition's unwind rolled `a` back. In the CURRENT
             // definition `undo_a` is an ordinary forward node that never ran.
             compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1184,6 +1234,7 @@ mod tests {
             scheduled("a", ia),
             completed(ia),
             compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
             completed(iu),
             scheduled("c", ic),
             failed(ic),
@@ -1237,6 +1288,7 @@ mod tests {
             // fire — this isolates signal 1.
             marker("saga_compensated:1"),
             scheduled("undo_a", iu),
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1268,6 +1320,7 @@ mod tests {
             // The compensator was dispatched — the activity ran — and then
             // failed. Rollback is potentially partially applied.
             scheduled("undo_a", iu),
+            activity_started(iu),
             failed(iu),
             marker("saga_compensation_failed:1"),
         ];
@@ -1349,6 +1402,7 @@ mod tests {
             },
             // ...but the compensator still ran and rolled `a` back.
             compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1451,6 +1505,7 @@ mod tests {
                 }),
                 queue: "default".to_string(),
             },
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1517,6 +1572,7 @@ mod tests {
                     input,
                     queue: "default".to_string(),
                 },
+                activity_started(iu),
                 completed(iu),
             ]
         };
@@ -1625,6 +1681,7 @@ mod tests {
                 }),
                 queue: "default".to_string(),
             },
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1658,6 +1715,7 @@ mod tests {
             // ...but in the OLD definition `undo_a` was an ordinary forward
             // node. No envelope, no marker — this run never unwound.
             scheduled("undo_a", iu),
+            activity_started(iu),
             completed(iu),
             scheduled("b", ib),
             failed(ib),
@@ -1717,6 +1775,7 @@ mod tests {
                 }),
                 queue: "default".to_string(),
             },
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1761,6 +1820,7 @@ mod tests {
                 payload: Value::Null,
             },
             compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
             completed(iu),
         ];
         assert_eq!(
@@ -1795,6 +1855,75 @@ mod tests {
             plan.nodes_carried_over,
             vec!["a".to_string()],
             "a forward dispatch must never be mistaken for a compensation"
+        );
+    }
+
+    /// A compensator that was SCHEDULED but never CLAIMED rolled nothing back.
+    ///
+    /// An operator cancel landing mid-unwind fails every open task row
+    /// (`queue::fail_open_tasks_for_execution`) without appending any event, so
+    /// the compensator's `ActivityScheduled` is in history but no worker ever
+    /// ran its body. Treating the schedule alone as proof would `409` a
+    /// perfectly safe retry and send the operator to a fresh run, re-running an
+    /// upstream node whose side effect is still live.
+    ///
+    /// `ActivityStarted` is the correct bar: the worker appends it in a setup
+    /// phase BEFORE invoking the handler, and a failed append aborts the run —
+    /// so a body that executed always has one. Its absence therefore proves the
+    /// body never ran.
+    #[test]
+    fn a_scheduled_but_never_started_compensator_stays_retryable() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            marker("saga_compensated:1"),
+            // Dispatched — then the run was cancelled before a worker claimed
+            // it, so there is no ActivityStarted and no rollback happened.
+            compensator_dispatch("undo_a", "a", iu),
+        ];
+        assert!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]).is_ok(),
+            "a compensator that never started rolled nothing back, so node `a`'s side \
+             effect is still live and carrying it over on a retry is correct"
+        );
+    }
+
+    /// The mirror of the test above: once the compensator has STARTED, a
+    /// rollback may have landed, so the run must stay non-retryable — including
+    /// when the worker crashed mid-body and never recorded a terminal.
+    #[test]
+    fn a_started_compensator_with_no_terminal_still_blocks_retry() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            marker("saga_compensated:1"),
+            compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
+        ];
+        assert!(
+            matches!(
+                resolve_retry_plan(&def, &events, &["b".to_string()]),
+                Err(DagRetryResolveError::CompensatedRun)
+            ),
+            "a started compensator may have rolled back, so retry must be refused"
         );
     }
 
@@ -1841,6 +1970,7 @@ mod tests {
                 input: tombstone,
                 queue: "default".to_string(),
             },
+            activity_started(iu),
             completed(iu),
         ];
 

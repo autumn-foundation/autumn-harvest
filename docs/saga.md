@@ -558,8 +558,8 @@ double-spend the compensation.
 Detection uses **two** independent signals, both read from the run's own
 recorded history and never from the registered definition:
 
-1. a `saga_compensat*` marker **followed by at least one activity dispatch**; or
-2. a recorded activity dispatch whose **input is a compensation envelope** —
+1. a `saga_compensat*` marker **followed by a started activity dispatch**; or
+2. a **started** activity dispatch whose **input is a compensation envelope** —
    the reserved `{"dag_compensate": …, "input": …, "output": …}` shape written
    only by the unwind — **whose `dag_compensate` names a node that was
    dispatched in the same run**.
@@ -568,6 +568,19 @@ Signal 2 is required, not redundant. An unwind at a
 [drained signal frontier](#known-limitation--a-stray-signal-silences-unwind-observability)
 records no marker at all, so a marker-only check would leave that fully
 rolled-back run retryable.
+
+Both signals require the dispatch to have **started**, not merely been
+scheduled. An operator cancel landing mid-unwind fails every open task row
+without appending any event, so a compensator that was dispatched but never
+claimed sits in history as an `ActivityScheduled` having rolled back
+*nothing*. `ActivityStarted` is the right bar: the worker appends it in a setup
+phase **before** invoking the handler, and a failed append aborts the dispatch,
+so a body that executed always has one — its absence proves the body never ran.
+Deliberately not keyed on a *terminal* event: a worker that started and then
+crashed mid-body may or may not have landed the rollback, and that ambiguity
+must resolve to "compensated" (refuse the retry), not to "safe". Neither
+`activity_id` nor `worker_id` is a payload field, so this signal survives
+erasure too.
 
 The "followed by a dispatch" half of signal 1 is required in the *opposite*
 direction. `Saga::run_compensations` records its `saga_compensated:{seq}` marker
