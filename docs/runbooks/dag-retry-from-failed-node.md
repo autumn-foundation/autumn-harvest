@@ -95,6 +95,32 @@ valid boundary and a hint to wait for it to settle or cancel the run first.
 
 ---
 
+## A compensated run is not retryable (issue #780)
+
+A DAG whose nodes declare compensators (`.compensate(undo_fn)`) **unwinds** on
+terminal failure, undoing every node that succeeded. Retry-from-node
+deliberately CARRIES OVER those same succeeded upstream nodes — so a retry
+would resume as if their side effects still existed, double-spending the
+compensation.
+
+The endpoint therefore rejects such a run outright:
+
+```
+HTTP 409 Conflict
+{"message":"this run already executed its compensation unwind, so its succeeded
+ nodes' side effects were rolled back; retrying would resume on rolled-back
+ state — start a fresh DAG run instead"}
+```
+
+**What to do instead:** start a **fresh DAG run**
+(`POST /dags/{dag_name}/trigger`). The unwind already restored the pre-run
+state, so a fresh run is the correct — and safe — recovery.
+
+Detection is the presence of a `saga_compensat*` marker in the run's recorded
+history, so this only ever fires for a run that genuinely unwound. A DAG that
+failed **without** any compensator declared records no such marker and remains
+fully retryable, exactly as before.
+
 ## Limitation: build-id routing and topology changes
 
 The retry resolves the fork point and the re-execute / carry-over node sets from
@@ -132,6 +158,6 @@ build-compatibility gate is tracked as follow-up work; v1 does not enforce it.
 | `400` | `from_nodes` empty; an unknown node (the response lists the declared nodes); a node that was never attempted; or a node that already succeeded. |
 | `400` | The DAG is classic (non-unified). |
 | `404` | The DAG name is not registered, or the run is not a run of that DAG. |
-| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
+| `409` | The run succeeded (use a fresh run); the run is still running (cancel first); the run **already compensated** ([see above](#a-compensated-run-is-not-retryable-issue-780)); or the fork point lands inside an unresolved upstream side effect (remediation hint included). |
 | `201` | Retry committed; `new_run_exec_id` identifies the forked run. |
 | `200` | Dry-run plan (no write performed). |

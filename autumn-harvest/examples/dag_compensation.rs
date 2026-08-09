@@ -243,13 +243,27 @@ mod tests {
         "void_label",
     ];
 
-    /// Forward node → the ledger resource it commits (`None` = no side effect).
-    const RESOURCES: [(&str, Option<&str>); 5] = [
-        ("reserve_inventory", Some("inventory")),
-        ("charge_payment", Some("payment")),
-        ("allocate_shipment", Some("shipment")),
-        ("print_label", Some("label")),
-        ("notify_customer", None),
+    /// Forward node → (ledger resource it commits (`None` = no side effect),
+    /// the key of the DISTINCT output blob it returns).
+    ///
+    /// Each node returns a different payload so an envelope assertion can only
+    /// pass if the engine carried THAT node's recorded output (a single shared
+    /// blob would make every `output` assertion pass regardless).
+    const RESOURCES: [(&str, Option<&str>, &str); 5] = [
+        ("reserve_inventory", Some("inventory"), "reservation_id"),
+        ("charge_payment", Some("payment"), "charge_id"),
+        ("allocate_shipment", Some("shipment"), "shipment_id"),
+        ("print_label", Some("label"), "label_id"),
+        ("notify_customer", None, "notification_id"),
+    ];
+
+    /// The per-node output value paired with the key above.
+    const OUTPUT_VALUES: [(&str, &str); 5] = [
+        ("reserve_inventory", "rsv-9001"),
+        ("charge_payment", "ch_abc123"),
+        ("allocate_shipment", "shp-77"),
+        ("print_label", "lbl-5"),
+        ("notify_customer", "ntf-1"),
     ];
 
     /// Compensator → the ledger resource it releases.
@@ -277,10 +291,16 @@ mod tests {
     fn env_with_ledger(ledger: &Ledger, failing_node: Option<&'static str>) -> WorkflowTestEnv {
         let mut env = WorkflowTestEnv::new();
 
-        for (node, resource) in RESOURCES {
+        for (node, resource, output_key) in RESOURCES {
             let resource = resource.map(str::to_string);
             let should_fail = failing_node == Some(node);
             let ledger = Arc::clone(ledger);
+            let output_key = output_key.to_string();
+            let output_value = OUTPUT_VALUES
+                .iter()
+                .find(|(n, _)| *n == node)
+                .map(|(_, v)| (*v).to_string())
+                .expect("every node declares an output value");
             env = env.mock_activity(node, move |_| {
                 if should_fail {
                     // A failed step commits nothing, so it credits nothing.
@@ -289,12 +309,9 @@ mod tests {
                 if let Some(resource) = &resource {
                     bump(&ledger, resource, 1);
                 }
-                Ok(json!({
-                    "reservation_id": "rsv-9001",
-                    "charge_id": "ch_abc123",
-                    "shipment_id": "shp-77",
-                    "label_id": "lbl-5",
-                }))
+                // A DISTINCT blob per node, so an `output` assertion cannot pass
+                // by accident.
+                Ok(json!({ output_key.clone(): output_value.clone() }))
             });
         }
 
@@ -410,14 +427,22 @@ mod tests {
             json!("charge_payment"),
             "the envelope must identify the compensated node, got {envelope}"
         );
+        // `charge_payment` returns a blob no other node returns, so this can only
+        // pass if the engine carried THAT node's recorded output.
         assert_eq!(
-            envelope["output"]["charge_id"],
-            json!("ch_abc123"),
+            envelope["output"],
+            json!({ "charge_id": "ch_abc123" }),
             "the envelope must carry the node's recorded output, got {envelope}"
         );
-        assert!(
-            envelope.get("input").is_some(),
-            "the envelope must always carry an `input` key, got {envelope}"
+        // Pinned by exact value: `is_some()` would also accept `Null`, which is
+        // exactly what dropping the forward-input capture produces.
+        assert_eq!(
+            envelope.get("input"),
+            Some(&json!({
+                "conf": Value::Null,
+                "dag_task": "charge_payment",
+            })),
+            "the envelope must carry the node's RESOLVED FORWARD INPUT, got {envelope}"
         );
     }
 

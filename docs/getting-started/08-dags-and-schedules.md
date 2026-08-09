@@ -560,10 +560,14 @@ Two builder methods, opt-in per node (at most one per node; last call wins):
 | Method | Compensator name |
 |--------|------------------|
 | `.compensate(undo_fn)` | Derived from the fn item, like `dag.activity(…)` — typo-proof |
-| `.compensate_named("undo")` | The given string verbatim — for a compensator whose fn item isn't in scope |
+| `.compensate_named("undo")` | The given string (trimmed) — for a compensator whose fn item isn't in scope |
 
 One compensator activity may be shared by several nodes; the envelope's
 `dag_compensate` field says which node it is undoing.
+
+`compensate_named` is name-based dispatch, **not** remote dispatch: the named
+activity must still be registered with the builder, or plugin preflight fails
+the boot (see [Errors you can hit at build time](#errors-you-can-hit-at-build-time)).
 
 ### What runs, and what doesn't
 
@@ -594,11 +598,20 @@ One fixed envelope:
 
 * `dag_compensate` — the compensated node's activity name, so one generic
   compensator can serve several nodes.
-* `input` — the node's resolved forward input: the raw upstream output for an
-  [`.input_from(…)`-bound node](#passing-data-between-nodes-node-input-binding),
-  the `{ "conf": …, "dag_task": … }` wrapper for an unbound node, or the whole
-  mapped array for a mapped node.
+* `input` — the node's resolved forward input, in one of four shapes:
+
+  | Node kind | `input` |
+  |-----------|---------|
+  | Unbound | the `{ "conf": …, "dag_task": … }` wrapper |
+  | [`.input_from(&up)`](#passing-data-between-nodes-node-input-binding) | the raw upstream output |
+  | `.input_from_all(…)` / `.input_from_aliased(…)` | the **keyed object** the binding produced (`{"extract": …, "enrich": …}`) |
+  | Mapped (`.map_activity(…).over(&up)`) | the **whole** mapped array |
+
 * `output` — the node's recorded output.
+
+The envelope embeds the node's whole input *and* output, so the issue #252
+activity-input cap applies to the **envelope** — for a mapped node over a large
+array it can be much larger than the node's own input was.
 
 **Compensate by ID, read out of `output`.** Compensations re-run wholesale on
 replay, so a compensator must be idempotent — `release_inventory(rsv-9001)` is
@@ -661,9 +674,25 @@ uncompensated. If a mapped node's cells commit real side effects, prefer
 `CollectAll` with a cell-aware compensator, or make each cell
 self-compensating.
 
+### Other limitations worth knowing
+
+* **Compensators are not DAG nodes.** A compensation is recorded as an ordinary
+  activity, so it appears in the event history but **not** in the DAG run-graph
+  view or any definition-derived rendering. Read the history (or the
+  `saga_compensated:{seq}` marker) to see whether a run unwound.
+* **A compensated run is not retryable from a failed node.**
+  `POST /dags/{name}/runs/{id}/retry` returns `409` — retry carries succeeded
+  upstream nodes over, and the unwind just undid them. Start a fresh run.
+* **An unsolicited signal silences the rollback counters.** A DAG consumes no
+  signals of its own, so a stray signal leaves the unwind uncounted (it still
+  runs, and still replays deterministically).
+* **Rolling the engine back past this feature mid-unwind truncates it
+  silently** — drain in-flight compensating runs first. See
+  [`docs/saga.md`](../saga.md).
+
 A worked end-to-end example lives in
 `autumn-harvest/examples/dag_compensation.rs`; the full contract (unwind order,
-failure semantics, observability counters, forward compatibility) is in
+failure semantics, observability counters, rollback ordering) is in
 [`docs/saga.md`](../saga.md).
 
 ## Signal / approval gates

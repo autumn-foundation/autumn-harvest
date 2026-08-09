@@ -187,7 +187,14 @@ Two builder methods, opt-in per node, at most one per node (last call wins):
 | Method | Compensator name |
 |--------|------------------|
 | `.compensate(undo_fn)` | Derived from the fn item, exactly like `DagBuilder::activity` — a typo is a compile error, not a mid-unwind dispatch failure |
-| `.compensate_named("undo")` | The given string verbatim — the escape hatch for a compensator whose fn item is not in scope (a remote/polyglot worker's activity, or a macro-computed name) |
+| `.compensate_named("undo")` | The given string (trimmed) — the escape hatch for a compensator whose fn item is not in scope (an activity behind a feature flag, or a macro-computed name) |
+
+**`compensate_named` is name-based dispatch, not remote dispatch.** The named
+activity must still be **registered with the builder**: plugin preflight fails
+the boot for a DAG compensator that resolves to no registered activity, exactly
+as it does for a forward node (see [Build-time guards](#build-time-guards)).
+It buys you a name computed at build time — not a reference to an activity that
+only exists on a remote/polyglot worker.
 
 ```rust
 #[dag]
@@ -240,12 +247,24 @@ Every compensator receives one fixed shape:
 
 * `dag_compensate` — the compensated node's `activity_name`. One generic
   compensator can therefore serve N nodes by branching on this field.
-* `input` — the node's **resolved forward input**: the raw upstream output for
-  a node with an `.input_from(…)` binding (issue #702), the
-  `{ "conf": …, "dag_task": … }` wrapper for an unbound node, and the whole
-  mapped upstream array for a mapped node.
+* `input` — the node's **resolved forward input**, in one of four shapes:
+
+  | Node kind | `input` shape |
+  |-----------|---------------|
+  | Unbound | the `{ "conf": …, "dag_task": … }` wrapper the forward dispatch used |
+  | `.input_from(&up)` (issue #702) | the raw upstream output, verbatim |
+  | `.input_from_all(…)` / `.input_from_aliased(…)` | the **keyed object** the binding produced (e.g. `{"extract": …, "enrich": …}`) — *not* any single upstream's raw output |
+  | Mapped (`.map_activity(…).over(&up)`) | the **whole** mapped upstream array (node granularity — never one cell's item) |
+
 * `output` — the node's recorded output, sourced from its `ActivityCompleted`
   event.
+
+**Payload caps apply to the envelope.** The envelope embeds the node's whole
+resolved input *and* its whole output, so for a mapped node over a large array
+it can be substantially larger than either. It is dispatched through the
+ordinary activity lowering, so the issue #252 activity-input cap applies to the
+**envelope**, not to the node's original input — a node whose forward input sat
+just under the cap can still produce an over-cap compensation envelope.
 
 **Compensate by ID, read out of `output`.** The same idempotency contract as
 the rest of this document applies verbatim: compensations re-run wholesale on
@@ -307,6 +326,34 @@ will not schedule new durable work for a cancelled execution. The unwind is
 guaranteed to terminate (never nd-block), but the remaining state is
 genuinely dangling and needs manual reconciliation (or reset, issue #148).
 
+### Known limitation — compensators are invisible to the DAG topology surfaces
+
+A compensation is recorded as an **ordinary activity** (that is the whole point:
+no new `WorkflowEvent` variant), and it is not a declared DAG node. So it is
+visible in the raw event history and the execution timeline, but **not** as a
+node in:
+
+* the DAG run-graph view (`GET /dags/{name}/runs/{id}`, issue #690) — its
+  topology comes from the registered `DagDefinition`, which carries forward
+  nodes only;
+* `dag_export` / any other definition-derived rendering.
+
+To see whether a run unwound, read its history (or the `saga_compensated:{seq}`
+marker) rather than its graph.
+
+### Known limitation — a stray signal silences unwind observability
+
+The `saga_compensated:{seq}` marker match is deliberately conservative about a
+**drained signal frontier** (issue #801): when the recorded history ends in
+un-awaited signals at the point the unwind begins, the unwind is left
+*uncounted* — no marker, and neither saga counter fires.
+
+A DAG consumes no signals of its own (a [signal gate](getting-started/08-dags-and-schedules.md#signal--approval-gates)
+consumes exactly the gate's own signal), so **any unsolicited signal delivered
+to a DAG run** can put it in that state. The compensations still run, and still
+replay deterministically — only the observability is lost for that run. Do not
+send ad-hoc signals to DAG executions.
+
 ### Known limitation — compensation is node-granular
 
 Compensation operates on **nodes**, never on individual mapped cells
@@ -341,14 +388,61 @@ Plugin **preflight** additionally flags a compensator that names an
 for task '…'`), so a missing compensator is caught before rollout rather than
 mid-unwind.
 
-### Forward compatibility
+### Rolling back to a pre-#780 build — drain in-flight unwinds first
 
-A #780 history — one that recorded a `saga_compensated:{seq}` marker — does
-**not** replay under a pre-#780 build: the marker is unknown to the old
-matcher, so a rollback nd-blocks (#603, non-terminal and recoverable) until
-rolled forward. This is the standard marker-feature rule, identical to #801's.
-Pre-existing histories are untouched: the saga is only reached on the failure
+Rolling the *engine* back while a DAG run is **mid-unwind** silently truncates
+that unwind. This is NOT the usual nd-block-and-roll-forward rule, so it is
+worth stating precisely:
+
+* A pre-#780 `run_unified_dag` returns `Err("one or more DAG tasks failed")` at
+  the terminal-failure check **before consuming anything** — there is no unwind
+  step to reach the recorded compensation events.
+* `saga_compensated:{seq}` is an issue #801 marker that the old matcher already
+  knows, so it is not an "unknown marker" that would trip replay either.
+
+The result: the old build **seals the run terminally FAILED, with a partial
+unwind and no error signal at all** — the compensations already dispatched
+stay applied, the ones still pending never run, and nothing nd-blocks to tell
+you. The dangling state must be reconciled manually (or via reset, issue #148).
+
+**Operator rule:** before rolling back past #780, drain in-flight *compensating*
+runs (a DAG run in a terminal-failure unwind is short-lived), or roll forward
+instead. Alert on `harvest.saga.compensated` going quiet while
+`harvest.workflow.terminal{outcome="failed"}` does not.
+
+Runs that never unwind are unaffected: the saga is reached only on the failure
 branch, so a DAG that succeeds is byte-identical to a pre-#780 build.
+
+### Retrying a compensated run (issue #366 interaction)
+
+A DAG run that executed its unwind is **not retryable from a failed node**.
+`POST /dags/{name}/runs/{id}/retry` rejects it with `409 Conflict`:
+
+> this run already executed its compensation unwind, so its succeeded nodes'
+> side effects were rolled back; retrying would resume on rolled-back state —
+> start a fresh DAG run instead
+
+The reason is structural: retry-from-node deliberately **carries over** the
+succeeded upstream nodes — which is exactly the set the unwind just undid. A
+retry would therefore resume as if those side effects still existed and
+double-spend the compensation. Detection is the presence of a `saga_compensat*`
+marker in the run's history, so a DAG run that failed **without** compensators
+(and every pre-#780 history) stays fully retryable.
+
+### Divergence *inside* an unwind still nd-blocks
+
+`Saga` collects every compensation error — including a
+`HarvestError::NonDeterministic` — into `compensation_errors`, so a genuine
+code-drift divergence during an unwind surfaces as `SagaCompensationFailed`.
+That is the *author-visible* result; the *engine* result is different and takes
+precedence: the divergence also sets the run's non-determinism details, so the
+worker nd-blocks it under issue #603 rather than sealing it FAILED.
+
+That is the correct outcome — a divergence during an unwind is a deploy problem,
+not a dangling-state problem, and #603's block is non-terminal and recoverable by
+rolling the workflow code back. Do not read a `SagaCompensationFailed` in the
+logs as "the unwind ran and failed" without checking whether the run is
+nd-blocked (`GET /workflows?nd_blocked=true`).
 
 ---
 
@@ -500,8 +594,24 @@ The declarative DAG unwind (issue #780) is locked in by
 | `fulfillment_dag_leaves_zero_uncompensated_side_effects_across_1000_runs` | **Success metric.** Across 1000 deterministically-seeded runs (two topologies × every failure position) a ledger nets to zero, the dispatch order is the exact reverse of the compensable succeeded prefix, and every produced history replays deterministically |
 | `dag_compensation_suite_is_wired_into_ci` | The suite has a real CI run row in `.github/ci/integration-suites.txt`, so its guarantees actually execute |
 
+Added by the post-review hardening pass:
+
+| Test | What it proves |
+|------|----------------|
+| `failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks` | **P1-B (blocker).** A `FailFast` mapped node whose failing cell is not the last one polled still unwinds cleanly: the compensator dispatches, the terminal error stays the original DAG error, `nd_details` is `None` (issue #603's nd-block gate), and the history replays deterministically |
+| `failfast_mapped_node_compensates_for_every_failing_cell_position` | The randomized sibling: every failing-cell position over a 5-cell mapped node behaves identically (only the LAST position was covered before, and that is exactly the one that masked P1-B) |
+| `unwind_order_is_reverse_topological_not_reverse_declaration_index` | The unwind follows EXECUTION LEVELS, not builder declaration order — pinned with a fixture that declares a child before its parent |
+| `a_node_recovered_by_retry_compensates_nothing` | A node whose `.retry(…)` policy recovers it never reaches a terminal failure, so nothing is compensated |
+| `a_node_that_exhausts_its_retries_unwinds_the_prefix_but_not_itself` | Retry exhaustion is a terminal node failure: the succeeded prefix unwinds and the exhausted node is not compensated |
+| `a_compensator_inherits_no_retry_or_timeout_override_from_its_node` | The compensator command carries neither the node's `retry_policy_override` nor its `start_to_close_override` |
+| `an_unwind_resumed_mid_flight_dispatches_only_the_remaining_compensations` | Crash recovery: a partially-recorded unwind resumes, replaying the already-dispatched compensator and issuing only the remainder, with no non-determinism and no double-count |
+| `a_successful_unwind_fires_the_compensated_counter_once_with_labels` | `harvest.saga.compensated` fires exactly once per unwind (not per compensation) with the run's own `(workflow, queue)` labels |
+| `two_failing_compensators_collect_both_errors_and_page_once` | Continue-not-abort with several failures: both errors are collected and the page counter still fires once |
+| `failing_dag_without_compensators_emits_no_saga_commands_or_metrics` | The FAILURE path of an uncompensated DAG is unchanged: the empty unwind allocates no seq, records no marker, and emits no metric |
+
 Build-time and preflight guards are covered by unit tests in
-`autumn-harvest/src/dag.rs` (gate / empty / collision / shared-compensator),
+`autumn-harvest/src/dag.rs` (gate / empty / collision / shared-compensator /
+last-wins / `compensate_named` trimming),
 `autumn-harvest/src/builder.rs` (classic-DAG and local-activity rejections),
 `autumn-harvest/src/saga.rs` (`push_compensation` registers without running;
 `compensate_all_after` carries the caller's original error), and

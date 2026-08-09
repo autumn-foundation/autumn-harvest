@@ -149,12 +149,15 @@ cause. The public `compensate_all()` now delegates to
 for every existing caller, and one shared unwind implementation rather than
 two.
 
-**Forward compatibility.** A #780 history — one that recorded a
-`saga_compensated:{seq}` marker — does not replay under a pre-#780 build (the
-marker is unknown to the old matcher); a rollback nd-blocks (#603,
-non-terminal, recoverable) until rolled forward. The standard marker-feature
-rule, identical to #801's. Pre-existing histories are untouched, since the saga
-is only reached on the failure branch.
+**Rolling the engine back mid-unwind truncates it silently** (corrected during
+post-review — see the hardening section below; the original claim that a
+rollback nd-blocks was empirically false). `saga_compensated:{seq}` is an issue
+#801 marker the pre-#780 matcher already knows, AND pre-#780 `run_unified_dag`
+returns `Err` at the terminal-failure check **before consuming anything** — so
+an old build seals a mid-unwind run terminally FAILED with a partial unwind and
+**no error signal at all**. Operators must drain in-flight *compensating* runs
+before rolling back past #780, or roll forward. Runs that never unwind are
+unaffected (the saga is only reached on the failure branch).
 
 **CI.** One new manifest row in `.github/ci/integration-suites.txt`
 (`linux  autumn-harvest  integration  testing  dag_compensation`) so the suite
@@ -234,3 +237,176 @@ an author-facing "Automatic rollback — node compensation" section with the
 five-node fulfillment example, a what-runs-and-what-doesn't table, a concrete
 envelope sample, the errors an author can hit with their message gist, and
 pointers to `docs/saga.md` for the full contract.
+
+---
+
+## Post-review hardening (four-angle adversarial review)
+
+Four reviews — cross-crate, saga-contract, replay-determinism, and test-quality
+— returned **two P1s and a batch of P2/P3s**, every one of them fixed below.
+Both P1s were genuine engine bugs found (and reproduced) by review rather than
+by the original test suite; both are fixed TDD-style with the RED failure
+captured before the fix.
+
+### P1-B (blocker) — `FailFast` mapped node, failing cell not last: unwind diverged into a permanent nd-block
+
+**The bug.** `run_unified_dag`'s `FailFast` mapped-node arm abandoned its
+`FuturesUnordered` instance stream (`drop(stream); break;`) on the first failing
+cell. On a resume/replay cycle every instance resolves synchronously from
+history, and `FuturesUnordered::poll_next` returns as soon as ONE future is
+ready — so the instances not yet yielded were **never polled**, their recorded
+`ActivityScheduled` events stayed unconsumed, and the replay cursor was left
+parked on one of them.
+
+That was harmless before #780 (the terminal check returned `Err` immediately and
+nothing consumed history afterwards). #780 made the unwind the first thing to
+consume history after the level loop, so it dispatched the first compensator
+straight into that stale cursor: `match_activity` diverged, `Saga` swallowed the
+divergence into `compensation_errors` — **but the divergence also set
+`nd_details`**, so the executor's `Ok(Err(..))` arm handed the worker a
+`WorkflowOutcome::Failed { non_deterministic_details: Some(..) }` and issue #603
+**nd-blocked the run permanently**. Data-caused, so not self-healing: every
+retry replays it identically. Net effect: the compensator silently never ran AND
+the run wedged `RUNNING` forever — for **every** failing index except the last
+one polled (9/10 of a 10-cell fan-out).
+
+The original T13 fixture missed it because its `[1, -1]` array fails at the LAST
+cell, the one position that happens to leave a clean cursor.
+
+**The fix** (`autumn-harvest/src/dag.rs`): drain the instance stream instead of
+abandoning it. The reviewer's alternative — gating the unwind on a cursor-clean
+precondition and skipping it — was rejected: it preserves timing at the cost of
+the compensation guarantee, which is the whole point of the feature. Draining is
+also the only cursor-clean option, because polling a still-in-flight instance
+once (the latency-preserving alternative) would push a `WaitForActivity` command
+that the unwind's `ScheduleActivity` batch cannot legally share.
+
+*Semantics preserved:* first failure wins (`status` only ever moves
+`Succeeded -> Failed`, and `final_val` is built solely from the all-succeeded
+case); a non-activity error (a genuine non-determinism divergence) still
+propagates rather than being swallowed; `CollectAll` is untouched (`join_all`
+already polls every instance); the LIVE pass is unchanged (instances suspend, so
+the stream ends via suspension and the drain path is never reached).
+*One behavioural change:* a `FailFast` mapped node now settles every instance
+before the DAG terminates, instead of abandoning the in-flight siblings. The
+`MapFailurePolicy::FailFast` doc comment claimed those siblings were "cancelled"
+— they never were (the activities keep running on their workers; `drop` only
+abandoned the local futures), so the doc was corrected rather than the
+behaviour.
+
+*RED evidence,* captured against the unmodified `dag.rs`:
+
+```
+assertion `left == right` failed: a FailFast mapped node failing mid-array must
+still unwind the succeeded prefix (the failed mapped node itself is not compensated)
+  left: []
+ right: ["m_undo_root"]
+```
+
+*Pinned by* `failfast_mapped_node_failing_mid_array_compensates_and_never_nd_blocks`
+(3-cell array failing in the middle; asserts the compensator dispatched, the
+error is the ORIGINAL DAG error rather than a swallowed `SagaCompensationFailed`,
+`nd_details` is `None`, and `replay_check` reports `WorkflowFailed` with that
+exact error) and its randomized sibling
+`failfast_mapped_node_compensates_for_every_failing_cell_position`, which sweeps
+the failing cell across every position of a 5-cell node.
+
+### P1-A — retrying a compensated DAG run double-spent the compensation
+
+**The bug.** A terminal-FAILED DAG run that executed its unwind could still be
+retried via `POST /dags/{name}/runs/{id}/retry` (issue #366). The resolver cuts
+at the failed node's level and **carries over** the succeeded upstream nodes —
+which is precisely the set the unwind just rolled back. The retried run then
+proceeded as if those side effects still existed.
+
+**The fix.** A guard in the pure `resolve_retry_plan`
+(`autumn-harvest-plugin/src/dag_retry.rs`): a `MarkerRecorded` whose name
+carries the `saga_compensat` prefix (covering both `saga_compensated:{seq}` and
+`saga_compensation_failed:{seq}` — either proves an unwind ran) rejects the
+request with the new `DagRetryResolveError::CompensatedRun`. Checked before any
+node validation, so the operator gets the *state* answer rather than a
+node-shaped one. HTTP mapping is a **`409 Conflict`** — the one resolver
+rejection that is a state conflict about the run rather than a malformed node
+request — alongside the existing COMPLETED/RUNNING conflicts; the message is
+shared with the Vantage UI flash via one constant so the two surfaces cannot
+drift. A run that failed **without** compensators (and every pre-#780 history)
+records no such marker and stays fully retryable.
+
+*RED evidence:* `error[E0599]: no variant or associated item named
+`CompensatedRun` found for enum `dag_retry::DagRetryResolveError``.
+
+*Pinned by* `resolve_rejects_a_run_that_already_compensated`,
+`resolve_rejects_a_run_whose_compensation_failed`, and the regression guard
+`resolve_allows_a_failed_run_without_a_compensation_marker` (which also asserts
+an unrelated `dag_skip:` marker is not mistaken for a compensation).
+
+### P2 / P3 batch
+
+| Finding | Fix |
+|---------|-----|
+| **P2-B** — T15 asserted the wrong ND slot | `take_deferred_nd_error` is only written by the infallible issue #384 primitives; issue #603 gates the nd-block on `take_nd_details`. The old assertion would have passed while the run wedged forever. Switched to `nd_details`, and the same assertion is used by every new "must never nd-block" test. T15 also gained a zero-further-dispatch assertion (parity with T14) |
+| **P2-C** — T13's mapped-envelope `input` assertion was tautological | `envelope.get("input").is_some()` also accepts `Null` — which is exactly what deleting the mapped-node input capture produces (verified: the mutant passed all 14 original tests). Replaced with `assert_eq!(…, Some(&json!([1, -1])))`; the same tautology in `examples/dag_compensation.rs` was replaced with an exact-value assertion too |
+| **P2-D** — no fixture distinguished level order from index order | Every original fixture declared nodes in topological order, so a flat `for i in 0..tasks.len()` push passed all 14 (verified mutant). New `unwind_order_is_reverse_topological_not_reverse_declaration_index` declares a child BEFORE its parent, making declaration index the exact reverse of topological order |
+| **P2-E** — AC2 "not recovered by retry" had zero evidence | No test applied `.retry(…)` to a DAG node. Added both halves: `a_node_recovered_by_retry_compensates_nothing` and `a_node_that_exhausts_its_retries_unwinds_the_prefix_but_not_itself` |
+| **P2-F** — AC5 mid-unwind RESUME (crash recovery) untested | Added `an_unwind_resumed_mid_flight_dispatches_only_the_remaining_compensations`: a hand-built history carrying the forward pass, the `saga_compensated:1` marker, and the first compensator already scheduled AND completed. Asserts only the remainder is dispatched, no non-determinism, and no double-count of the counter. Drives through the new `drive_replay_tolerating_suspension` helper: a `for_replay` context has no driver, so the *remaining* compensation — genuinely new durable work — parks on its oneshot, which is the correct resume shape rather than a failure. The `ScheduleActivity` command is pushed before the await, so the assertion still observes it, and an empty command list would fail the `assert_eq!` (the test cannot pass vacuously) |
+| **P2-2** — no positive metric assertion | `CompRecordingMetrics` now captures the `(workflow, queue)` labels. New `a_successful_unwind_fires_the_compensated_counter_once_with_labels` (exactly once per UNWIND, not per compensation, with the run's own labels); T16 gained label assertions plus a `failed ≤ compensated` check |
+| **P3-B2** — no failure-path byte-identity test | New `failing_dag_without_compensators_emits_no_saga_commands_or_metrics`. This is the one that actually **reaches** `unwind_dag_compensations` and proves the empty-stack early return allocates no seq, records no marker, and emits no metric (T19 only covers the success path, which never constructs a saga at all) |
+| **P3-6** — "last call wins" documented but untested | New `repeated_compensate_calls_are_last_wins` over all four typed/named orderings |
+| **P3-7** — `compensate_named` did not trim while `EmptyCompensator` judged on the trimmed form | `compensate_named` now trims on insert. New `compensate_named_trims_surrounding_whitespace` also pins that a whitespace-only name is still a build error and that a padded name which trims onto a forward node still collides |
+| **P3-T4** — cheap probes unpinned | Added `two_failing_compensators_collect_both_errors_and_page_once` (continue-not-abort with several failures; the page counter is per-unwind) and `a_compensator_inherits_no_retry_or_timeout_override_from_its_node` (pinned on the emitted `ScheduleActivity`, whose `retry_policy_override` / `start_to_close_override` are exactly where an inherited override would ride — `unwind_dag_compensations` passes `None, None`, so the compensator activity's own `#[activity(…)]` attributes apply) |
+| **P3-2** — T24 could be credited by an unrelated short filter | Widened the tokenized match: the filter must both start with `dag_compensation` and be a prefix of the module name. The `linux` field check is deliberately **kept** — it is load-bearing, since an `allos` row runs `--no-default-features`, which `cfg`s the whole file away |
+| **P3-3** — `#780` in a `ci.yml` step name | An unquoted `#` after whitespace starts a YAML comment, truncating the name at `(issue`. Quoted the step name |
+| **P3-T2** — the example's forward mocks all returned the same blob | Each node now returns a distinct output, so an `output` assertion can only pass if the engine carried THAT node's recorded output |
+| **P3-T3** — T19's "byte-for-byte" doc over-claimed | Reworded to what it asserts (dispatches / markers / metrics), pointing at the new failure-path test as its complement |
+
+### Docs corrected
+
+* **P2-1 (factually wrong).** The forward-compatibility paragraph claimed a
+  rollback to a pre-#780 build mid-unwind nd-blocks. Empirically false:
+  `saga_compensated:{seq}` is an issue #801 marker old builds already know, AND
+  pre-#780 `run_unified_dag` returns `Err` at the terminal check *before
+  consuming anything*. The real behaviour is worse and needed saying: the old
+  build seals the run terminally FAILED with a **partial unwind and no error
+  signal at all**. Rewritten in `docs/saga.md` (and the corresponding paragraph
+  in this fragment) with the operator rule — drain in-flight compensating runs
+  before rolling back, or roll forward.
+* **P2-3.** `compensate_named` was described as supporting "remote/polyglot"
+  compensators, but plugin preflight fails the boot for a compensator name not
+  in the registry. Softened in both `docs/saga.md` and
+  `docs/getting-started/08-dags-and-schedules.md`: it is name-based dispatch,
+  and the name must still be registered.
+* **P2-G.** Documented that a genuine code-drift divergence *inside* an unwind
+  nd-blocks (issue #603) rather than sealing `SagaCompensationFailed`, even
+  though `Saga` collects the error string — and that this is the correct
+  outcome, since a divergence during an unwind is a deploy problem.
+* **P3-4.** Compensations are ordinary activities and are **not** rendered as
+  nodes in the DAG run-graph view (issue #690) or any definition-derived export.
+* **P3-5.** The compensation envelope embeds the node's whole input *and*
+  output, so the issue #252 activity-input cap applies to the **envelope** — for
+  a mapped node over a large array it can be much larger than the node's own
+  input was.
+* **P3-B1.** An unsolicited signal to a DAG run leaves its unwind *uncounted*
+  (inheriting #801's drained-signal-frontier conservatism): the compensations
+  still run and still replay, only the observability is lost.
+* **P3-T1.** The envelope's `input` documentation enumerated three node kinds
+  but not the fourth: a **Merged** binding (`.input_from_all` /
+  `.input_from_aliased`) yields the KEYED OBJECT, not a raw upstream output.
+  Both docs now carry a four-row table.
+* **#366 interaction.** `docs/saga.md` and
+  `docs/runbooks/dag-retry-from-failed-node.md` document that a compensated run
+  is not retryable, with the exact `409` body and the "start a fresh run"
+  remediation.
+* **P3-1** was checked and found already correct: both docs say the compensator
+  dispatches on the *node's own* queue, which matches
+  `tasks[i].queue.clone().unwrap_or_default()`. No change needed.
+
+### Deliberately NOT changed
+
+**P3-8 (T20's ~8 min runtime).** The test-quality review measured the cost as
+100% `WorkflowTestEnv::run` (≈0.5 s/iteration = 5 levels × the 100 ms
+`SUSPENSION_TIMEOUT`), **not** `replay_check` — so the originally-proposed fix
+(sampling `replay_check` every Nth iteration) would save nothing. Reducing the
+iteration count or DAG depth is also off the table: the issue's success metric
+mandates 1,000 runs on the 5-node DAG. The cost is documented here instead: the
+`dag_compensation` CI row takes roughly **8–10 minutes** of serial Linux CI time,
+almost all of it in this one test.
