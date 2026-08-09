@@ -580,6 +580,7 @@ A node is compensated **iff** it BOTH succeeded AND declares a compensator:
 | Skipped by a trigger rule or a `.condition(…)` | no — it never ran |
 | Never reached (an upstream failed or was skipped) | no |
 | Failed, **even with a compensator declared** | no — only a *successful* step has an effect to undo |
+| Succeeded **vacuously** — a mapped node over an *empty* upstream array | no — nothing was dispatched, so there is nothing to undo |
 
 A DAG that **succeeds** builds no rollback machinery at all: zero compensator
 dispatches, zero extra events.

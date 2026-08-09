@@ -221,6 +221,19 @@ it BOTH reached `TaskStatus::Succeeded` AND declares a compensator:
 | Skipped (trigger rule) or skipped (`.condition(…)` returned false) | no — it never ran, so there is no effect to undo |
 | Never reached (an upstream failed/skipped) | no |
 | Failed — **even when it declares a compensator** | no — by the saga contract only a *successful* forward step has an effect to undo |
+| Succeeded **vacuously** — a mapped node over an *empty* upstream array | no — zero instances dispatched, so there is no effect to undo |
+
+That last row is the one non-obvious case: a mapped
+(`.map_activity(…).over(&up)`) node whose upstream produced `[]` settles
+`Succeeded` without dispatching anything. Compensating it would undo work that
+was never done, so the unwind skips any node whose forward pass dispatched
+nothing.
+
+A mapped node whose upstream output is **not a JSON array** is a deterministic
+input-shape rejection: the node is reported `Failed` (so it is not itself
+compensated), the run reaches its terminal failure, and **the unwind still
+runs** — every succeeded upstream is rolled back. The caller-visible error still
+names the precise cause rather than the generic DAG failure.
 
 ### Order — reverse topological (LIFO)
 

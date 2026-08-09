@@ -577,6 +577,91 @@ fn mapped_failfast_comp_dag(dag: &mut DagBuilder) {
         .compensate(m_undo_process);
 }
 
+/// A mapped node over an EMPTY upstream array dispatches zero forward
+/// instances but is still marked `Succeeded` (a pre-existing, tested unified-DAG
+/// behaviour — see `dag_mapping_tests::empty_upstream_collection_mapping`).
+/// Compensating it would undo an activity that never executed — a refund for a
+/// charge that never happened.
+#[dag]
+fn mapped_empty_comp_dag(dag: &mut DagBuilder) {
+    let root = dag.activity(m_root).compensate(m_undo_root);
+    let process = dag
+        .map_activity(m_process)
+        .over(&root)
+        .compensate(m_undo_process);
+    let _fail = dag.activity(m_fail).upstream(&process);
+}
+
+/// A mapped node whose upstream output is NOT a JSON array cannot run. The
+/// upstream that already succeeded still has a side effect to undo.
+#[dag]
+fn mapped_non_array_comp_dag(dag: &mut DagBuilder) {
+    let root = dag.activity(m_root).compensate(m_undo_root);
+    let _process = dag
+        .map_activity(m_process)
+        .over(&root)
+        .compensate(m_undo_process);
+}
+
+/// A zero-instance mapped node reaches `Succeeded` without ever dispatching a
+/// forward activity, so there is nothing to undo. Compensating it would be a
+/// spurious rollback of work that never happened.
+#[tokio::test]
+async fn an_empty_mapped_fan_out_is_never_compensated() {
+    let outcome = WorkflowTestEnv::new()
+        // Empty upstream array → the mapped node dispatches zero instances.
+        .mock_activity("m_root", |_| Ok(json!([])))
+        .mock_activity("m_process", |_| Ok(Value::Null))
+        .mock_activity("m_fail", |_| Err("nope".to_string()))
+        .mock_activity("m_undo_root", |_| Ok(Value::Null))
+        .mock_activity("m_undo_process", |_| Ok(Value::Null))
+        .run(
+            __autumn_workflow_info_mapped_empty_comp_dag().handler,
+            Value::Null,
+        )
+        .await;
+
+    assert!(outcome.result.is_err());
+    let dispatched = scheduled_names_among(outcome.events(), &["m_undo_root", "m_undo_process"]);
+    assert_eq!(
+        dispatched,
+        vec!["m_undo_root".to_string()],
+        "the zero-instance mapped node must NOT be compensated (its forward \
+         activity never ran); the real upstream still must be"
+    );
+}
+
+/// A mapped node fed a non-array upstream output fails the DAG deterministically
+/// before dispatching anything. The upstream's side effect is still real, so the
+/// unwind must run — while the precise diagnostic stays operator-visible.
+#[tokio::test]
+async fn a_non_array_mapped_input_still_unwinds_the_succeeded_upstream() {
+    let outcome = WorkflowTestEnv::new()
+        // NOT an array → the mapped node cannot run.
+        .mock_activity("m_root", |_| Ok(json!({"not": "an array"})))
+        .mock_activity("m_process", |_| Ok(Value::Null))
+        .mock_activity("m_undo_root", |_| Ok(Value::Null))
+        .mock_activity("m_undo_process", |_| Ok(Value::Null))
+        .run(
+            __autumn_workflow_info_mapped_non_array_comp_dag().handler,
+            Value::Null,
+        )
+        .await;
+
+    let err = outcome.result.clone().expect_err("the DAG must fail");
+    assert!(
+        err.contains("not a JSON array"),
+        "the specific shape diagnostic must stay operator-visible, got: {err}"
+    );
+    let dispatched = scheduled_names_among(outcome.events(), &["m_undo_root", "m_undo_process"]);
+    assert_eq!(
+        dispatched,
+        vec!["m_undo_root".to_string()],
+        "the succeeded upstream must be compensated even though the DAG failed \
+         on a deterministic input-shape error; the mapped node itself never ran"
+    );
+}
+
 /// T13 — mapped-node compensation is **node**-granular: a `CollectAll` mapped
 /// node that reaches `Succeeded` (despite failed cells) is compensated exactly
 /// ONCE with the whole cells array as its recorded output; a `FailFast` mapped

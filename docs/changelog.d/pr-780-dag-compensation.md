@@ -455,3 +455,59 @@ regression guard `resolve_allows_a_compensating_dag_whose_unwind_never_dispatche
 Docs corrected in `docs/saga.md` (both the #366 section and the stray-signal
 limitation, which is now explicitly scoped to observability only),
 `docs/runbooks/dag-retry-from-failed-node.md`, and the `dag_retry` module doc.
+
+### P1 — a mapped node's two non-dispatching outcomes broke the unwind in opposite directions
+
+Two independent findings on the same code path, both reproduced RED before the
+fix. A mapped (fan-out) node has two outcomes in which it settles **without
+dispatching any forward work**, and the unwind got each one wrong:
+
+**(a) An invalid mapped input skipped the unwind entirely.** A mapped node whose
+upstream output is not a JSON array is a deterministic, pre-dispatch *input
+shape* rejection. It returned `Err(...)`, which `activity_result?` propagated
+straight out of the level loop — **past the terminal-failure check**, and
+therefore past the unwind. A compensable upstream that had already succeeded was
+left un-rolled-back, which is precisely the dangling-side-effect state this
+feature exists to prevent.
+
+**(b) An empty mapped fan-out was compensated for work that never ran.** A
+mapped node over an *empty* upstream array dispatches zero instances and settles
+`Succeeded` vacuously (the pre-existing `n_instances == 0` guard). The unwind's
+only test was "did this node succeed?", so it dispatched that node's compensator
+— undoing an effect that was never produced.
+
+**The fix is one coherent change**, because the two outcomes are the same shape
+(settled, no dispatch) read from opposite ends. Each level member's dispatch
+future now returns a five-field `NodeRun`
+(`(task_idx, status, output, dispatched_forward, shape_failure_reason)`):
+
+- **`dispatched_forward: bool`** — `false` for both non-dispatching outcomes,
+  `true` for every node that actually ran something. `unwind_dag_compensations`
+  skips any node whose forward pass dispatched nothing, so a vacuous success has
+  nothing to undo. The four per-node parallel arrays it consults are bundled into
+  a small `NodeUnwindState<'_>` struct.
+- **`shape_failure_reason: Option<String>`** — the invalid-shape branch now
+  reports an ordinary node **failure** instead of returning `Err`, so it routes
+  through the normal terminal path (and therefore the unwind), while the precise
+  diagnostic is carried out-of-band and still surfaces as the caller-visible
+  error. This deliberately preserves the exact `"not a JSON array"` message
+  `dag_signal_gate_tests` pins, rather than collapsing it into the generic
+  `"one or more DAG tasks failed"`.
+
+Genuine replay / non-determinism errors are untouched: they still propagate
+directly via `?` and never trigger an unwind. That distinction is load-bearing —
+unwinding from a diverged cursor is exactly the P1-B nd-block failure fixed
+above.
+
+RED evidence (before the fix):
+
+```
+a_non_array_mapped_input_still_unwinds_the_succeeded_upstream
+  left: []                                  right: ["m_undo_root"]
+
+an_empty_mapped_fan_out_is_never_compensated
+  left: ["m_undo_process", "m_undo_root"]   right: ["m_undo_root"]
+```
+
+Pinned by those two tests plus the `mapped_empty_comp_dag` /
+`mapped_non_array_comp_dag` fixtures in `dag_compensation_tests.rs`.

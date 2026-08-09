@@ -1267,6 +1267,11 @@ pub async fn run_unified_dag(
     use crate::futures;
     use crate::policy::{MapFailurePolicy, TaskStatus};
 
+    /// One level-member's dispatch result:
+    /// `(task_idx, status, output, dispatched_forward, shape_failure_reason)`
+    /// — see `dispatched_forward` / `shape_failure` below (issue #780).
+    type NodeRun = (usize, TaskStatus, Value, bool, Option<String>);
+
     let n = tasks.len();
     let mut statuses: Vec<TaskStatus> = vec![TaskStatus::Skipped; n];
     let mut outputs: Vec<Value> = vec![Value::Null; n];
@@ -1274,6 +1279,15 @@ pub async fn run_unified_dag(
     // compensator (issue #780) so the unwind envelope can carry them. Every
     // other slot stays `Value::Null` and costs nothing.
     let mut inputs: Vec<Value> = vec![Value::Null; n];
+    // Whether each node actually dispatched forward work. A mapped node over an
+    // EMPTY upstream array reaches `Succeeded` without dispatching a single
+    // instance, so it has NO side effect to undo — compensating it would issue
+    // a refund for a charge that never happened (issue #780 post-PR review).
+    let mut dispatched_forward: Vec<bool> = vec![false; n];
+    // The first deterministic, pre-dispatch input-shape rejection, if any. It
+    // fails the DAG like any node failure (so the unwind runs) while keeping
+    // the precise diagnostic operator-visible.
+    let mut shape_failure: Option<String> = None;
 
     for level in &levels {
         // ── Signal/timer gate (issue #746) ──────────────────────────────────
@@ -1337,7 +1351,7 @@ pub async fn run_unified_dag(
 
         // ── Non-gate level: activity / mapped-activity dispatch ──────────────
         let mut activity_futs: Vec<
-            Pin<Box<dyn Future<Output = Result<(usize, TaskStatus, Value), String>> + Send + '_>>,
+            Pin<Box<dyn Future<Output = Result<NodeRun, String>> + Send + '_>>,
         > = Vec::new();
 
         for &task_idx in level {
@@ -1376,11 +1390,38 @@ pub async fn run_unified_dag(
                 let stc_override_clone = stc_override;
                 activity_futs.push(Box::pin(async move {
                     let Value::Array(array) = &upstream_val else {
-                        return Err("mapped upstream output is not a JSON array".to_owned());
+                        // A deterministic, pre-dispatch input-shape rejection —
+                        // NOT an engine error (issue #780 post-PR review). It
+                        // used to `return Err`, which `activity_result?`
+                        // propagated straight past the terminal check, so a
+                        // compensable upstream that had already succeeded was
+                        // left un-rolled-back. Reporting it as an ordinary node
+                        // FAILURE routes it through the normal terminal path
+                        // (and therefore the unwind), while `shape_failure`
+                        // keeps the precise diagnostic in the returned error.
+                        // Genuine replay/non-determinism errors still propagate
+                        // directly via `?` and never trigger an unwind, which
+                        // matters: unwinding from a diverged cursor is exactly
+                        // the P1-B nd-block failure fixed above.
+                        return Ok((
+                            task_idx,
+                            TaskStatus::Failed,
+                            Value::Null,
+                            false,
+                            Some("mapped upstream output is not a JSON array".to_owned()),
+                        ));
                     };
                     let n_instances = array.len();
                     if n_instances == 0 {
-                        return Ok((task_idx, TaskStatus::Succeeded, Value::Array(Vec::new())));
+                        // Zero instances dispatched: the node succeeds
+                        // vacuously, so it has nothing to compensate.
+                        return Ok((
+                            task_idx,
+                            TaskStatus::Succeeded,
+                            Value::Array(Vec::new()),
+                            false,
+                            None,
+                        ));
                     }
 
                     let mut instance_futs = Vec::new();
@@ -1487,7 +1528,7 @@ pub async fn run_unified_dag(
                         final_val = Value::Array(collect_results);
                     }
 
-                    Ok::<_, String>((task_idx, status, final_val))
+                    Ok::<_, String>((task_idx, status, final_val, true, None))
                 }));
             } else {
                 // Highest priority (issue #702): an explicit input binding
@@ -1549,20 +1590,28 @@ pub async fn run_unified_dag(
                         }
                         Err(error) => return Err(error.to_string()),
                     };
-                    Ok::<_, String>((task_idx, status, val))
+                    Ok::<_, String>((task_idx, status, val, true, None))
                 }));
             }
         }
 
         for activity_result in futures::future::join_all(activity_futs).await {
-            let (task_idx, status, val) = activity_result?;
+            let (task_idx, status, val, dispatched, reason) = activity_result?;
             statuses[task_idx] = status;
             outputs[task_idx] = val;
+            dispatched_forward[task_idx] = dispatched;
+            if shape_failure.is_none() {
+                shape_failure = reason;
+            }
         }
     }
 
     if statuses.iter().any(|s| matches!(s, TaskStatus::Failed)) {
-        let original = "one or more DAG tasks failed".to_owned();
+        // A deterministic input-shape rejection keeps its precise message so
+        // the operator still sees *why* (the generic DAG error names no node);
+        // any other failure uses the generic error, since per-node detail is
+        // already in the recorded `ActivityFailed` event.
+        let original = shape_failure.unwrap_or_else(|| "one or more DAG tasks failed".to_owned());
         // `docs/saga.md`: cancellation does NOT auto-compensate. Skipping the
         // unwind here also avoids dispatching into an unconsumed
         // `WorkflowCancelled`, which would nd-block (issue #603) a run the
@@ -1571,12 +1620,36 @@ pub async fn run_unified_dag(
             return Err(original);
         }
         return unwind_dag_compensations(
-            ctx, &levels, &tasks, &statuses, &inputs, &outputs, original,
+            ctx,
+            &levels,
+            &tasks,
+            &NodeUnwindState {
+                statuses: &statuses,
+                dispatched_forward: &dispatched_forward,
+                inputs: &inputs,
+                outputs: &outputs,
+            },
+            original,
         )
         .await;
     }
 
     Ok(Value::Null)
+}
+
+/// Per-node forward-run state consulted by [`unwind_dag_compensations`] when it
+/// decides which nodes have a side effect to undo (issue #780).
+struct NodeUnwindState<'a> {
+    /// Terminal status of each node in the forward run.
+    statuses: &'a [TaskStatus],
+    /// Whether the node actually dispatched forward work. A mapped node over an
+    /// empty upstream array succeeds *vacuously* — nothing ran, so nothing is
+    /// compensated.
+    dispatched_forward: &'a [bool],
+    /// Resolved forward input of each node, echoed to its compensator.
+    inputs: &'a [Value],
+    /// Recorded output of each node, echoed to its compensator.
+    outputs: &'a [Value],
 }
 
 /// Compensate every **succeeded** node that declares a compensator, in reverse
@@ -1591,7 +1664,9 @@ pub async fn run_unified_dag(
 /// new `WorkflowEvent` variant**.
 ///
 /// A node that was skipped, never reached, or itself failed is never
-/// compensated: only a successful forward step has an effect to undo.
+/// compensated: only a successful forward step has an effect to undo. Nor is a
+/// node that succeeded WITHOUT dispatching forward work — a mapped node over an
+/// empty upstream array (`dispatched_forward`).
 ///
 /// # Errors
 ///
@@ -1603,16 +1678,19 @@ async fn unwind_dag_compensations(
     ctx: &crate::context::WorkflowContext,
     levels: &[Vec<usize>],
     tasks: &[DagTask],
-    statuses: &[TaskStatus],
-    inputs: &[Value],
-    outputs: &[Value],
+    state: &NodeUnwindState<'_>,
     original: String,
 ) -> Result<Value, String> {
     let mut saga = crate::saga::Saga::new(ctx);
 
     for level in levels {
         for &i in level {
-            if !matches!(statuses[i], TaskStatus::Succeeded) {
+            if !matches!(state.statuses[i], TaskStatus::Succeeded) {
+                continue;
+            }
+            // A vacuous success (a mapped node over an empty array) dispatched
+            // nothing, so there is no side effect to undo.
+            if !state.dispatched_forward[i] {
                 continue;
             }
             let Some(comp_name) = tasks[i].compensate.clone() else {
@@ -1621,8 +1699,8 @@ async fn unwind_dag_compensations(
             let queue = tasks[i].queue.clone().unwrap_or_default();
             let envelope = serde_json::json!({
                 "dag_compensate": tasks[i].activity_name,
-                "input": inputs[i],
-                "output": outputs[i],
+                "input": state.inputs[i],
+                "output": state.outputs[i],
             });
             saga.push_compensation(move || async move {
                 ctx.execute_activity_raw_with_opts(&comp_name, envelope, &queue, None, None)
