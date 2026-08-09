@@ -20128,7 +20128,29 @@ pub(crate) async fn retry_dag_run_inner(
     // an incompatible deploy, the worker that replays the fork may run a
     // different definition than the one used to pick the cut. v1 does not gate on
     // build compatibility; see docs/runbooks/dag-retry-from-failed-node.md.
-    let history = store::load_history(&mut conn, exec_id)
+    // Load INFLATED + codec-decoded history: `resolve_retry_plan`'s
+    // compensated-run guard (issue #780) reads `ActivityScheduled.input` to
+    // recognise a compensation envelope, and `input` is a payload-bearing field.
+    // Plain `store::load_history` would hand the resolver an
+    // `_harvest_offload_envelope` reference (issue #524) or a codec envelope
+    // (issue #608) instead of the real value, hiding the envelope signal — a
+    // silent fail-OPEN that lets an already-rolled-back run be retried onto
+    // rolled-back state. The resolver cannot compensate for this itself: an
+    // offloaded input is indistinguishable from a large ordinary forward input
+    // (see `dag_retry::tests::
+    // an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller`).
+    //
+    // With no `PayloadStore` registered this delegates verbatim to the inline
+    // path, so the default deployment is byte-for-byte unchanged. Only oversized
+    // payloads cost a blob fetch, and this is a low-frequency operator endpoint.
+    // Passing the runtime's real codecs (rather than the identity default
+    // `load_history` uses) additionally lets the guard see envelopes on a
+    // codec-encrypting deployment, where the endpoint previously failed closed
+    // with `UnknownPayloadCodec`. No payload is surfaced to the caller — the
+    // plan carries only node names and an event id.
+    let codecs = api_state.payload_codecs();
+    let offloader = runtime.registry.payload_offloader();
+    let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
         .await
         .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
     let plan = crate::dag_retry::resolve_retry_plan(&dag.definition, &history.events, &from_nodes)

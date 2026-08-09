@@ -135,6 +135,13 @@ compensator after such a run would defeat signal 3 alone — signal 2 reads the
 envelope recorded in history and never consults the registry, so it survives the
 rename.
 
+Because signal 2 reads a payload-bearing field, the endpoint loads the run's
+history **inflated and codec-decoded**. Without that, an oversized compensation
+envelope stored as a payload-offload reference (issue #524) — or an encrypted
+codec envelope — would hide the three compensation keys, and a run
+that was both marker-less and renamed would look retryable. Offloaded payloads
+cost one blob fetch here; the endpoint is operator-invoked and low-frequency.
+
 A DAG that failed **without** any compensator declared triggers none of the
 three and remains fully retryable, exactly as before.
 

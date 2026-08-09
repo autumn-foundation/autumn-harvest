@@ -69,9 +69,10 @@
 //! one whose *name* is a compensator this DAG declares — because a DAG unwind at
 //! a drained signal frontier records no marker, and because this resolver is
 //! handed the *currently registered* definition, which may have renamed the
-//! compensator since (see [`ran_compensation_unwind`]). A run that failed
-//! WITHOUT compensators (and every pre-#780 history) triggers none of them and
-//! stays fully retryable.
+//! compensator since (see [`ran_compensation_unwind`]). The envelope signal
+//! reads a payload-bearing field, so callers must supply INFLATED,
+//! codec-decoded history. A run that failed WITHOUT compensators (and every
+//! pre-#780 history) triggers none of them and stays fully retryable.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -213,6 +214,15 @@ fn is_compensation_envelope(input: &serde_json::Value) -> bool {
 ///    *currently registered* [`DagDefinition`], so a deployment that renamed or
 ///    removed a compensator after the unwind ran would make signal 3 blind and
 ///    a fully rolled-back run would become retryable again.
+///
+///    **Caller obligation:** `input` is payload-bearing, so `events` MUST be
+///    inflated and codec-decoded (the endpoint uses
+///    `store::load_history_inflated`). Left raw, an oversized envelope appears
+///    as an `_harvest_offload_envelope` reference (issue #524) — or a codec
+///    envelope (issue #608) — and this signal misses. It cannot be recovered
+///    here: an offloaded input is indistinguishable from a large ordinary
+///    forward input, so treating it as a compensation signal would reject every
+///    legitimate retry of a big-payload compensating DAG.
 /// 3. An [`WorkflowEvent::ActivityScheduled`] whose *name* is a compensator
 ///    declared by THIS DAG. Kept as defence-in-depth: it is unambiguous by
 ///    construction (`DagBuildError::CompensatorNameCollidesWithNode` rejects at
@@ -1102,6 +1112,88 @@ mod tests {
             Err(DagRetryResolveError::CompensatedRun),
             "a rolled-back run must stay non-retryable even after the \
              compensator it dispatched was renamed out of the definition"
+        );
+    }
+
+    /// **This resolver requires INFLATED history** — the caller must resolve
+    /// payload offloading (issue #524) before calling it.
+    ///
+    /// When a compensation envelope exceeds the offload threshold,
+    /// `append_events_offloaded` replaces the WHOLE `ActivityScheduled.input`
+    /// with an `_harvest_offload_envelope` reference (`input` is in
+    /// `PAYLOAD_FIELD_KEYS`), so the structural envelope signal cannot see the
+    /// three compensation keys. That is unfixable *here*: an offloaded input is
+    /// indistinguishable from a large ordinary forward input, so treating it as
+    /// a compensation signal would reject every legitimate retry of a
+    /// big-payload compensating DAG.
+    ///
+    /// This test pins the blindness so the obligation stays with the endpoint,
+    /// which loads via `store::load_history_inflated`. Do not "simplify" that
+    /// call site back to `store::load_history`.
+    #[test]
+    fn an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        // The exact shape `payload_store::build_offload_envelope` writes.
+        let offloaded_input = serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3",
+            "key": "sha256:deadbeef",
+            "len": 900_000,
+            "checksum": "deadbeef",
+        });
+        assert!(
+            !is_compensation_envelope(&offloaded_input),
+            "an offload reference is not structurally a compensation envelope"
+        );
+
+        let build = |input: Value| {
+            vec![
+                started(),
+                scheduled("a", ia),
+                completed(ia),
+                scheduled("b", ib),
+                failed(ib),
+                // Marker-less (drained-signal frontier)...
+                WorkflowEvent::SignalReceived {
+                    signal_name: "unsolicited".to_string(),
+                    payload: Value::Null,
+                },
+                // ...and the compensator has since been renamed, so only the
+                // envelope shape can identify this dispatch.
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: iu,
+                    name: "undo_a_v1_RENAMED".to_string(),
+                    input,
+                    queue: "default".to_string(),
+                },
+                completed(iu),
+            ]
+        };
+
+        // Fed the OFFLOADED form (what plain `store::load_history` returns),
+        // every definition-independent signal misses and the rolled-back run
+        // looks retryable. This is the fail-open the endpoint must prevent.
+        assert!(
+            resolve_retry_plan(&def, &build(offloaded_input), &["b".to_string()]).is_ok(),
+            "offloaded input hides the envelope from this resolver — the \
+             endpoint MUST inflate before calling it"
+        );
+
+        // Fed the INFLATED form, the guard fires correctly.
+        let inflated = serde_json::json!({
+            "dag_compensate": "a",
+            "input": Value::Null,
+            "output": Value::Null,
+        });
+        assert_eq!(
+            resolve_retry_plan(&def, &build(inflated), &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "with inflated history the rolled-back run is correctly rejected"
         );
     }
 

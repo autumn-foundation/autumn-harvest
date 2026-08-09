@@ -627,3 +627,44 @@ guard `resolve_allows_a_run_whose_forward_inputs_are_plain_objects`. The
 cross-crate coupling is guarded from the other side too: the core suite already
 pins the envelope's exact shape with an `assert_eq!`, so changing it fails there
 loudly rather than silently blinding this detector.
+
+### P1 — the retry endpoint must inflate history before classifying an unwind
+
+The compensation envelope lives in `ActivityScheduled.input`, and `input` is a
+**payload-bearing field**. With payload offloading (issue #524) enabled, an
+oversized envelope is replaced wholesale by an `_harvest_offload_envelope`
+reference before it reaches `harvest_events`; a codec-encrypting deployment
+(issue #608) wraps it likewise. The retry endpoint loaded history with plain
+`store::load_history`, so the structural predicate never saw the three
+compensation keys.
+
+On its own that is only a missed signal, but combined with the other two failure
+modes it reopens the exact hole the previous fix closed: an unwind at a drained
+signal frontier records **no marker** (signal 1 blind), a since-renamed
+compensator defeats the name check (signal 3 blind), and an offloaded envelope
+defeats the shape check (signal 2 blind) — so a fully rolled-back run becomes
+retryable and resumes onto rolled-back state. Unlike the codec case, which fails
+CLOSED (`load_history` hard-errors `UnknownPayloadCodec`), the offload case fails
+**open** and silently.
+
+Fixed at the call site, which is where the information exists:
+`retry_dag_run_inner` now loads via `store::load_history_inflated` with the
+runtime's real codecs and payload offloader.
+
+This is deliberately **not** fixed in `resolve_retry_plan`. An offloaded input is
+indistinguishable from a large ordinary forward input, so treating one as a
+compensation signal would reject every legitimate retry of a big-payload
+compensating DAG. The resolver's contract is therefore "you must hand me
+inflated history", pinned by
+`an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller`,
+which asserts both halves: fed the offloaded form the rolled-back run wrongly
+resolves `Ok` (the fail-open the endpoint prevents), and fed the inflated form it
+correctly resolves `Err(CompensatedRun)`.
+
+With no `PayloadStore` registered `load_history_inflated` delegates verbatim to
+the inline path, so the default deployment is byte-for-byte unchanged; only
+oversized payloads cost a blob fetch, on a low-frequency operator endpoint.
+Passing the runtime's real codecs (rather than the identity default
+`load_history` uses) additionally makes the endpoint work at all on a
+codec-encrypting deployment, where it previously returned an error. No payload is
+surfaced to the caller — the plan carries only node names and an event id.

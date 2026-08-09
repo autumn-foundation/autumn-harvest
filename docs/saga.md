@@ -485,6 +485,15 @@ so it survives the rename. Signal 3 is in turn unambiguous by construction:
 from sharing any forward node's name, so a compensator dispatch can never be
 mistaken for a forward step.
 
+Signal 2 reads a payload-bearing field, so the retry endpoint loads history
+**inflated and codec-decoded**. Left un-inflated, an oversized compensation
+envelope stored as a payload-offload reference (issue #524) — or an encrypted
+codec envelope (issue #608) — would replace the whole `input` and hide the three
+compensation keys, silently reopening the marker-less-plus-renamed hole. The
+resolver cannot recover this itself: an offloaded input is indistinguishable
+from a large ordinary forward input, so treating one as a compensation signal
+would reject every legitimate retry of a big-payload compensating DAG.
+
 A DAG run that failed **without** compensators (and every pre-#780 history)
 triggers none of the three and stays fully retryable.
 
