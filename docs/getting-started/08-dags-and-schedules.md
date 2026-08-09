@@ -585,6 +585,12 @@ A node is compensated **iff** it BOTH succeeded AND declares a compensator:
 A DAG that **succeeds** builds no rollback machinery at all: zero compensator
 dispatches, zero extra events.
 
+A node rejected **before dispatch** — a mapped node fed a non-array upstream
+output, or an input over the [payload cap](07-reliability-knobs.md) — counts as
+`Failed`, so the rollback still runs for every node that *did* succeed. See
+[the saga guide](../saga.md#what-triggers-the-unwind-and-what-it-covers) for the
+full rule, including the errors that deliberately bypass the rollback.
+
 ### What a compensator receives
 
 One fixed envelope:

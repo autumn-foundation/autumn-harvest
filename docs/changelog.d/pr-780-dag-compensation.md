@@ -511,3 +511,66 @@ an_empty_mapped_fan_out_is_never_compensated
 
 Pinned by those two tests plus the `mapped_empty_comp_dag` /
 `mapped_non_array_comp_dag` fixtures in `dag_compensation_tests.rs`.
+
+### P1 — a deterministic pre-dispatch rejection escaped past the unwind
+
+The third finding of the same class as the two above, and the one that forced
+the ad-hoc handling to become a stated rule. `execute_activity_raw_with_opts`
+rejects an oversized activity input with `HarvestError::PayloadTooLarge`
+**before** it allocates an activity id, pushes a `ScheduleActivity` command, or
+records any event. The node future preserved that as `Err`, so
+`activity_result?` exited `run_unified_dag` before the terminal-failure check —
+any compensable upstream (or a succeeded sibling in the same joined level) kept
+its side effect.
+
+Rather than special-case a third error, the classification is now an explicit,
+documented predicate:
+
+```rust
+/// Is this error a **deterministic pre-dispatch rejection** — one the engine
+/// raises *before* it allocates an activity id, pushes any `WorkflowCommand`,
+/// or records any event?
+const fn is_deterministic_dispatch_rejection(error: &HarvestError) -> bool {
+    matches!(error, HarvestError::PayloadTooLarge { .. })
+}
+```
+
+Such an error leaves **no history footprint and no side effect** and is a pure
+function of already-recorded state plus stable configuration, so reporting it as
+an ordinary node **failure** is both safe and necessary: the DAG reaches its
+terminal check and unwinds. Applied at all three dispatch sites (plain,
+mapped-`FailFast`, mapped-`CollectAll`), with the precise diagnostic carried
+out-of-band so it stays operator-visible.
+
+The predicate is deliberately **narrow**. Everything else keeps propagating
+directly, because mis-classifying it would unwind a run that was not actually
+terminal:
+
+* `NonDeterministic` — unwinding from a diverged replay cursor is exactly the
+  permanent nd-block (issue #603) fixed as P1-B above.
+* `Cancelled` — `docs/saga.md`: cancellation does not auto-compensate.
+* Transient engine/storage errors — the workflow task is retried.
+
+**`CollectAll` deliberately does not fold this into a cell.** A pre-dispatch
+rejection is not a per-cell business failure, so it fails the *node*. Folding it
+into the cells array would let the DAG **complete successfully**, silently
+converting a cap violation into a success; failing the node preserves today's
+outcome (the DAG failed before this fix too) and merely adds the unwind.
+
+RED evidence (before the fix):
+
+```
+an_oversized_activity_input_still_unwinds_the_succeeded_upstream
+  left: []   right: ["pc_undo_root"]
+```
+
+**Sizing caveat surfaced while writing the test** (now documented in
+`docs/saga.md`): the compensation envelope embeds the compensated node's whole
+resolved input *and* its whole output, so it is necessarily larger than the
+node's own input. The first draft of the fixture hung the oversized value off
+the compensated node itself, and the *compensator* was then rejected by the same
+cap — surfacing as `SagaCompensationFailed` rather than a dispatched rollback.
+That is correct, honest behaviour (continue-not-abort), but it means a
+compensable node running close to the activity-input cap can have its rollback
+rejected. The fixture was restructured to hang the payload off a
+non-compensated node.

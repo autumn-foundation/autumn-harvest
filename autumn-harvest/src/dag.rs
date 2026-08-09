@@ -1448,6 +1448,9 @@ pub async fn run_unified_dag(
                     let mut results = vec![Value::Null; n_instances];
                     let mut status = TaskStatus::Succeeded;
                     let mut final_val = Value::Null;
+                    // Carries a deterministic pre-dispatch rejection's precise
+                    // diagnostic out to the terminal error (issue #780).
+                    let mut shape_reason: Option<String> = None;
 
                     if policy == MapFailurePolicy::FailFast {
                         use futures::StreamExt as _;
@@ -1491,6 +1494,19 @@ pub async fn run_unified_dag(
                                     | HarvestError::Timeout { .. } => {
                                         status = TaskStatus::Failed;
                                     }
+                                    // A deterministic pre-dispatch rejection
+                                    // fails the NODE (issue #780 post-PR
+                                    // review): the DAG outcome is unchanged
+                                    // (it failed before too), but it now
+                                    // reaches the unwind instead of escaping
+                                    // past it. The first such reason wins,
+                                    // matching the fail-fast contract.
+                                    e if is_deterministic_dispatch_rejection(e) => {
+                                        status = TaskStatus::Failed;
+                                        if shape_reason.is_none() {
+                                            shape_reason = Some(e.to_string());
+                                        }
+                                    }
                                     _ => return Err(err.to_string()),
                                 },
                             }
@@ -1519,16 +1535,34 @@ pub async fn run_unified_dag(
                                         };
                                         serde_json::json!({"status": "failed", "error": err_str})
                                     }
+                                    // A deterministic pre-dispatch rejection is
+                                    // NOT a per-cell business failure, so it is
+                                    // deliberately not folded into the cells
+                                    // array: it fails the NODE (issue #780
+                                    // post-PR review). That keeps today's
+                                    // outcome — the DAG failed before this fix
+                                    // too — while routing it through the
+                                    // unwind. Folding it into a cell would
+                                    // instead let the DAG COMPLETE, silently
+                                    // turning a cap violation into a success.
+                                    e if is_deterministic_dispatch_rejection(e) => {
+                                        status = TaskStatus::Failed;
+                                        if shape_reason.is_none() {
+                                            shape_reason = Some(e.to_string());
+                                        }
+                                        Value::Null
+                                    }
                                     _ => return Err(err.to_string()),
                                 },
                             };
                             collect_results[i] = obj;
                         }
-                        status = TaskStatus::Succeeded;
-                        final_val = Value::Array(collect_results);
+                        if status == TaskStatus::Succeeded {
+                            final_val = Value::Array(collect_results);
+                        }
                     }
 
-                    Ok::<_, String>((task_idx, status, final_val, true, None))
+                    Ok::<_, String>((task_idx, status, final_val, true, shape_reason))
                 }));
             } else {
                 // Highest priority (issue #702): an explicit input binding
@@ -1574,7 +1608,7 @@ pub async fn run_unified_dag(
                 }
 
                 activity_futs.push(Box::pin(async move {
-                    let (status, val) = match ctx
+                    let (status, val, dispatched, reason) = match ctx
                         .execute_activity_raw_with_opts(
                             &activity_name,
                             activity_input,
@@ -1584,13 +1618,25 @@ pub async fn run_unified_dag(
                         )
                         .await
                     {
-                        Ok(v) => (TaskStatus::Succeeded, v),
+                        Ok(v) => (TaskStatus::Succeeded, v, true, None),
                         Err(HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }) => {
-                            (TaskStatus::Failed, Value::Null)
+                            (TaskStatus::Failed, Value::Null, true, None)
                         }
+                        // A deterministic PRE-DISPATCH rejection (issue #780
+                        // post-PR review) — see `is_deterministic_dispatch_rejection`.
+                        // Reported as an ordinary node FAILURE so it routes
+                        // through the terminal path and therefore the unwind,
+                        // instead of `?`-escaping past it and stranding an
+                        // already-succeeded compensable upstream.
+                        Err(error) if is_deterministic_dispatch_rejection(&error) => (
+                            TaskStatus::Failed,
+                            Value::Null,
+                            false,
+                            Some(error.to_string()),
+                        ),
                         Err(error) => return Err(error.to_string()),
                     };
-                    Ok::<_, String>((task_idx, status, val, true, None))
+                    Ok::<_, String>((task_idx, status, val, dispatched, reason))
                 }));
             }
         }
@@ -1635,6 +1681,33 @@ pub async fn run_unified_dag(
     }
 
     Ok(Value::Null)
+}
+
+/// Is this error a **deterministic pre-dispatch rejection** — one the engine
+/// raises *before* it allocates an activity id, pushes any `WorkflowCommand`, or
+/// records any event?
+///
+/// Such an error leaves **no history footprint and no side effect**, and is a
+/// pure function of already-recorded state (the serialised input size) plus
+/// stable configuration. It is therefore safe — and, for the issue #780 unwind,
+/// necessary — to report it as an ordinary node **failure**, so the DAG reaches
+/// its terminal check and runs the compensation unwind instead of `?`-escaping
+/// past it and stranding an already-succeeded compensable upstream.
+///
+/// The complement must keep propagating directly:
+///
+/// * [`HarvestError::NonDeterministic`](crate::error::HarvestError::NonDeterministic)
+///   — unwinding from a diverged replay cursor is exactly the permanent
+///   nd-block (issue #603) this slice already had to fix once.
+/// * [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) —
+///   `docs/saga.md`: cancellation does not auto-compensate.
+/// * Transient engine/storage errors — the workflow task is retried, so the run
+///   is not terminal and must not unwind.
+///
+/// Deliberately narrow: mis-classifying a *transient* error as a node failure
+/// would unwind a run that the engine was merely going to retry.
+const fn is_deterministic_dispatch_rejection(error: &crate::error::HarvestError) -> bool {
+    matches!(error, crate::error::HarvestError::PayloadTooLarge { .. })
 }
 
 /// Per-node forward-run state consulted by [`unwind_dag_compensations`] when it

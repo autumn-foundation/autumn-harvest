@@ -2379,3 +2379,125 @@ fn dag_compensation_suite_is_wired_into_ci() {
          linux        autumn-harvest         integration                      testing                    dag_compensation_tests"
     );
 }
+
+// ===========================================================================
+// Post-PR review (Codex on PR #1153) — P1: a deterministic PRE-DISPATCH
+// rejection must route through the unwind, not escape past it.
+// ===========================================================================
+
+#[activity]
+async fn pc_root(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(Value::Null)
+}
+#[activity]
+async fn pc_big(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(Value::Null)
+}
+#[activity]
+async fn pc_process(_ctx: &ActivityContext, v: Value) -> Result<Value, String> {
+    Ok(v)
+}
+#[activity]
+async fn pc_undo_root(_ctx: &ActivityContext, e: Value) -> Result<Value, String> {
+    let _ = e;
+    Ok(Value::Null)
+}
+
+/// `process` draws its input straight from `big`'s recorded output (issue
+/// #702), so an oversized upstream output makes `process`'s input exceed the
+/// configured activity-input cap — rejected by `execute_activity_raw_with_opts`
+/// BEFORE it allocates an activity id or pushes a `ScheduleActivity` command.
+///
+/// The oversized value deliberately lives on `big`, which declares **no**
+/// compensator: the compensation envelope embeds the compensated node's whole
+/// input *and* output, so hanging the payload off `root` would push `root`'s own
+/// envelope over the same cap and the unwind would report
+/// `SagaCompensationFailed` instead of dispatching.
+#[dag]
+fn payload_cap_comp_dag(dag: &mut DagBuilder) {
+    let root = dag.activity(pc_root).compensate(pc_undo_root);
+    let big = dag.activity(pc_big).upstream(&root);
+    let _process = dag.activity(pc_process).input_from(&big);
+}
+
+/// A `PayloadTooLarge` rejection is deterministic, permanent, and leaves **no**
+/// history footprint and **no** side effect — exactly the class the non-array
+/// mapped-input fix already routes through the unwind. Before the fix it was
+/// returned as `Err` and `activity_result?` propagated it out of the level loop
+/// *past* the terminal-failure check, so `root`'s side effect was left dangling.
+#[tokio::test]
+async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
+    // ~2 KiB of recorded upstream output, against a 512-byte activity-input cap.
+    let oversized = Value::String("x".repeat(2048));
+    let root_id = ActivityExecId::new();
+    let big_id = ActivityExecId::new();
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: root_id,
+            name: "pc_root".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: root_id,
+            output: Value::Null,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: big_id,
+            name: "pc_big".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: big_id,
+            output: oversized,
+        },
+    ];
+
+    let ctx = WorkflowContext::for_replay(ExecutionId::new(), history)
+        .with_workflow_name("payload_cap_comp_dag")
+        .with_queue_name("default")
+        // activity_input = 512 bytes; every other cap left generous.
+        .with_payload_caps(512, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024);
+
+    let handler = __autumn_workflow_info_payload_cap_comp_dag().handler;
+    // `pc_root` and `pc_big` replay from history; `pc_process` is rejected by
+    // the cap; the unwind then dispatches `pc_undo_root`, which is genuinely new
+    // durable work and therefore parks on its oneshot. Parking is correct here.
+    let result = drive_replay_tolerating_suspension(&ctx, handler).await;
+
+    if let Some(result) = result.as_ref() {
+        let err = result.as_ref().expect_err("the DAG must fail");
+        assert!(
+            err.contains("payload too large"),
+            "the specific payload-cap diagnostic must stay operator-visible, got: {err}"
+        );
+    }
+    assert_eq!(
+        ctx.take_nd_details(),
+        None,
+        "a payload-cap rejection must not be mistaken for a replay divergence"
+    );
+
+    let scheduled: Vec<String> = ctx
+        .drain_commands()
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::ScheduleActivity { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        scheduled,
+        vec!["pc_undo_root".to_string()],
+        "the succeeded upstream must be compensated even though the downstream \
+         was rejected before dispatch"
+    );
+}

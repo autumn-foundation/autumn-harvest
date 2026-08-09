@@ -229,11 +229,29 @@ That last row is the one non-obvious case: a mapped
 was never done, so the unwind skips any node whose forward pass dispatched
 nothing.
 
-A mapped node whose upstream output is **not a JSON array** is a deterministic
-input-shape rejection: the node is reported `Failed` (so it is not itself
-compensated), the run reaches its terminal failure, and **the unwind still
-runs** — every succeeded upstream is rolled back. The caller-visible error still
-names the precise cause rather than the generic DAG failure.
+More generally, a **deterministic pre-dispatch rejection** — an error the engine
+raises *before* it allocates an activity id, pushes a command, or records an
+event — is reported as an ordinary node `Failed` rather than escaping the run,
+so the terminal failure is reached and **the unwind still runs**. Two cases
+qualify today: a mapped node whose upstream output is **not a JSON array**, and
+an activity input that exceeds the configured
+[payload cap](getting-started/07-reliability-knobs.md). Both leave no history
+footprint and no side effect, and the caller-visible error still names the
+precise cause rather than the generic DAG failure.
+
+Errors that are *not* in that class keep propagating directly and never trigger
+an unwind: a replay divergence (unwinding from a diverged cursor would
+[nd-block](runbooks/nondeterminism-block.md) the run), a cancellation (see
+above), and transient engine/storage errors (the workflow task is retried, so
+the run is not terminal).
+
+> **Sizing note.** The compensation envelope embeds the compensated node's whole
+> resolved input *and* its whole output, so it is necessarily larger than the
+> node's own input. A node that runs close to the activity-input cap can
+> therefore have its *compensator* rejected by that same cap — surfacing as
+> `SagaCompensationFailed` rather than a dispatched rollback. Keep compensable
+> nodes' payloads well clear of the cap, or offload large values (register a
+> `PayloadStore`, issue #524) so the envelope carries a reference instead.
 
 ### Order — reverse topological (LIFO)
 
