@@ -352,7 +352,13 @@ impl CircuitBreakerPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MapFailurePolicy {
-    /// First instance failure fails the mapped node, and any in-flight instances are cancelled.
+    /// The first instance failure fails the mapped node; downstream levels are
+    /// never dispatched.
+    ///
+    /// The failing instance's outcome wins even when later instances succeed.
+    /// Sibling instances already dispatched are **not** durably cancelled — the
+    /// node settles every instance before the DAG terminates, so the recorded
+    /// history stays replay-clean (issue #780).
     #[default]
     FailFast,
     /// The collect node receives per-slot success/failure, making partial batch failures observable.

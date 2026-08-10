@@ -620,6 +620,7 @@ async fn reset_records_reset_source_referencing_source_execution() {
             operator_id: "op-1".to_string(),
             signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
+            refuse_erased_source: false,
         },
         None,
     )

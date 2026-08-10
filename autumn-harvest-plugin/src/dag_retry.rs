@@ -56,11 +56,30 @@
 //!   [`DagRetryResolveError::AmbiguousNodes`] for the whole DAG (same treatment
 //!   as any duplicate activity name). Give gates signal names distinct from
 //!   activity names to keep a DAG retryable.
+//!
+//! ## Interaction: declarative node compensation (issue #780)
+//!
+//! A DAG whose nodes declare compensators unwinds on terminal failure, undoing
+//! every **succeeded** node's side effect. That is exactly the set of nodes this
+//! resolver would CARRY OVER, so a retry of a compensated run would resume on
+//! rolled-back state. Such a run is therefore rejected outright with
+//! [`DagRetryResolveError::CompensatedRun`] (`409`); start a fresh DAG run
+//! instead. Detection uses TWO signals — a `saga_compensat*` marker, or an
+//! `ActivityScheduled` whose recorded input is a **compensation envelope** for a
+//! node dispatched in the same run — because a DAG unwind at a drained
+//! signal frontier records no marker. Both read only the run's own history,
+//! never the registered definition, so they survive a compensator being renamed
+//! or removed and a later definition reusing its name (see
+//! [`ran_compensation_unwind`]). The envelope signal reads a payload-bearing
+//! field, so callers must supply INFLATED, codec-decoded history. A run that
+//! failed WITHOUT compensators (and every pre-#780 history) triggers neither and
+//! stays fully retryable.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use autumn_harvest::dag::DagDefinition;
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::types::ActivityExecId;
 
 /// Terminal (or non-terminal) outcome of a single DAG node on the source run,
 /// derived purely from the recorded event history.
@@ -131,6 +150,276 @@ pub enum DagRetryResolveError {
     /// no reset point can be derived. (Defensive — should not occur once the
     /// per-node attempted check passes.)
     NoSchedulePoint,
+    /// The source run already executed an issue #780 compensation unwind, so
+    /// its succeeded upstream nodes' side effects have been **rolled back**.
+    /// Retrying from the failed node would carry those nodes over and resume on
+    /// state that no longer exists. Unlike every sibling variant this maps to a
+    /// `409 Conflict` — it is a state conflict about the run, not a malformed
+    /// node request.
+    CompensatedRun,
+}
+
+/// Marker-name prefix recorded at the start of a `Saga` unwind (issue #801),
+/// mirrored here because the core helper that formats it
+/// (`autumn_harvest::replay::saga_compensated_marker_name`) is `pub(crate)`.
+///
+/// Matching by prefix covers both `saga_compensated:{seq}` and
+/// `saga_compensation_failed:{seq}`. Either one proves an unwind was
+/// **attempted** — not that anything was rolled back, which is why the marker
+/// is only half of signal 1 (see [`dispatched_after`]).
+const SAGA_UNWIND_MARKER_PREFIX: &str = "saga_compensat";
+
+/// The reserved key issue #780's compensation envelope is built around. The
+/// envelope is `{"dag_compensate": <node's activity_name>, "input": …,
+/// "output": …}` — written **only** by the DAG unwind, and recorded verbatim in
+/// the compensator dispatch's own `ActivityScheduled.input`.
+const COMPENSATION_ENVELOPE_KEY: &str = "dag_compensate";
+
+/// Is this `ActivityScheduled.input` an issue #780 compensation envelope?
+///
+/// Structural, not merely key-presence: the envelope has exactly the three keys
+/// `dag_compensate` / `input` / `output`, with a string `dag_compensate`. That
+/// makes an accidental collision with a *forward* node's input essentially
+/// impossible — a forward input is either the `{conf, dag_task}` wrapper, a raw
+/// bound upstream output, or a mapped cell, none of which have this shape.
+///
+/// The failure direction is safe anyway: a false positive marks a retryable run
+/// non-retryable (the operator starts a fresh run), whereas a false negative is
+/// the double-spend this guard exists to prevent.
+#[must_use]
+fn is_compensation_envelope(input: &serde_json::Value) -> bool {
+    let Some(object) = input.as_object() else {
+        return false;
+    };
+    object.len() == 3
+        && object
+            .get(COMPENSATION_ENVELOPE_KEY)
+            .is_some_and(serde_json::Value::is_string)
+        && object.contains_key("input")
+        && object.contains_key("output")
+}
+
+/// Names of activities **dispatched** in this history — every distinct
+/// `ActivityScheduled.name`.
+///
+/// This is the exact set the issue #780 unwind can compensate, because the
+/// unwind's own guard is `dispatched_forward`: a node is compensated only if it
+/// actually dispatched forward work, and dispatching records an
+/// `ActivityScheduled` under the node's activity name.
+///
+/// Deliberately **not** keyed on completion. A `CollectAll` mapped node whose
+/// cells all failed still settles `TaskStatus::Succeeded` at the DAG level (each
+/// cell failure is folded into the cells array and never flips the node's
+/// status), so it is genuinely compensated while recording no
+/// `ActivityCompleted` under its name. Corroborating on completion would miss
+/// exactly that envelope. An empty mapped fan-out is excluded for free — it sets
+/// `dispatched_forward = false`, dispatches nothing, and is never compensated.
+#[must_use]
+pub fn dispatched_activity_names(events: &[WorkflowEvent]) -> BTreeSet<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Is this `ActivityScheduled.input` a compensation envelope whose compensated
+/// node was actually **dispatched in this run**?
+///
+/// The history-only corroboration for signal 2 — see [`ran_compensation_unwind`]
+/// for why it is drawn from history rather than the current definition, and
+/// [`dispatched_activity_names`] for why dispatch (not completion) is the right
+/// bar.
+///
+/// Doubles as the **forward-dispatch exclusion** used by every name-keyed
+/// history reader ([`node_outcome`], and `dag_graph`'s `latest_scheduled`): a
+/// dispatch this returns `true` for is a compensator's, never a forward node's,
+/// so it must not contribute a node's outcome or timing. See
+/// [`is_compensation_dispatch`].
+#[must_use]
+pub fn compensates_a_dispatched_node(
+    input: &serde_json::Value,
+    dispatched: &BTreeSet<&str>,
+) -> bool {
+    is_compensation_envelope(input)
+        && input
+            .get(COMPENSATION_ENVELOPE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|node| dispatched.contains(node))
+}
+
+/// Whether the recorded history shows an issue #780 / #801 compensation unwind.
+///
+/// **Two** signals, because neither alone is sufficient:
+///
+/// 1. A `saga_compensat*` [`WorkflowEvent::MarkerRecorded`] **corroborated by an
+///    activity dispatch recorded after it** ([`dispatched_after`]). The marker
+///    alone proves only that an unwind was *attempted*: `Saga::run_compensations`
+///    records it before running the first compensation, so a compensator
+///    rejected pre-dispatch leaves a marker that rolled nothing back. Requiring
+///    a dispatch after it is what makes this signal mean "something was actually
+///    undone". It is positional, so it still answers correctly for a run whose
+///    payloads were **erased** (issue #495) — the one case the envelope signal
+///    cannot see.
+///
+///    Not guaranteed for a DAG: issue #801's matcher deliberately leaves an
+///    unwind uncounted when the history sits at a **drained signal frontier**,
+///    so a DAG run that received an unsolicited signal records no marker even
+///    though its compensators dispatched (`docs/saga.md`, "a stray signal
+///    silences unwind observability").
+/// 2. An [`WorkflowEvent::ActivityScheduled`] whose recorded `input` is a
+///    **compensation envelope** whose `dag_compensate` names a node that was
+///    **actually dispatched in this run** ([`compensates_a_dispatched_node`]).
+///    This is the load-bearing signal for a marker-less unwind.
+///
+///    **Caller obligation:** `input` is payload-bearing, so `events` MUST be
+///    inflated and codec-decoded (the endpoint uses
+///    `store::load_history_inflated`). Left raw, an oversized envelope appears
+///    as an `_harvest_offload_envelope` reference (issue #524) — or a codec
+///    envelope (issue #608) — and this signal misses. It cannot be recovered
+///    here: an offloaded input is indistinguishable from a large ordinary
+///    forward input, so treating it as a compensation signal would reject every
+///    legitimate retry of a big-payload compensating DAG.
+///
+/// Signal 2 corroborates against **recorded history, never the definition**.
+/// Shape alone is reachable by accident — a mapped cell or an `input_from`
+/// binding hands a node the raw upstream output, which is arbitrary user data,
+/// and an `input_from_all` alias set could even be named
+/// `dag_compensate`/`input`/`output` outright — so shape alone would 409 a
+/// retryable run, including one whose DAG declares no compensators at all.
+///
+/// The bar is **dispatch**, not completion, because that is precisely the
+/// unwind's own guard (`dispatched_forward`) — so a genuine envelope always
+/// satisfies it. Completion would be too strict: a `CollectAll` mapped node
+/// whose cells all failed still settles `TaskStatus::Succeeded` at the DAG level
+/// and is genuinely compensated, yet records no `ActivityCompleted` under its
+/// name. See [`dispatched_activity_names`].
+///
+/// Drawing it from history is what makes signal 2 survive every way the current
+/// definition can drift from the run that produced the history:
+///
+/// * the compensator was **renamed**;
+/// * the compensator was **removed outright**;
+/// * a later definition **reuses** the old compensator's name as a forward node;
+/// * an **old** definition's forward node shares a name with a compensator the
+///   current definition introduces.
+///
+/// Those last two are why no name-keyed check against the current definition
+/// survives here, in either direction.
+/// `DagBuildError::CompensatorNameCollidesWithNode` is a *per-definition-version*
+/// guarantee — no compensator shares a node's name in the build that declared it
+/// — and nothing constrains names across versions. An earlier revision of this
+/// function also accepted a dispatch whose *name* was a currently-declared
+/// compensator; that was dropped because it is redundant (every unwind this
+/// engine produces writes the envelope, and only dispatched nodes are
+/// compensated) while being exactly the cross-version false-positive vector
+/// above.
+///
+/// Residual, documented and safe-direction: a forward dispatch whose user input
+/// is exactly the three envelope keys *and* whose `dag_compensate` string
+/// happens to name a node dispatched in the same run is still a false positive.
+/// That marks a retryable run non-retryable (start a fresh run) — the opposite
+/// direction from the double-spend this guard exists to prevent.
+///
+/// Pure and cheap: a bounded number of passes over the events.
+#[must_use]
+fn ran_compensation_unwind(events: &[WorkflowEvent]) -> bool {
+    // Signal 1: an unwind-start marker CORROBORATED by a dispatch after it.
+    if let Some(idx) = first_unwind_marker_index(events)
+        && dispatched_after(events, idx)
+    {
+        return true;
+    }
+
+    // Signal 2: a compensation envelope naming a node dispatched in the same
+    // run. Covers the marker-less unwind (issue #801's drained-signal
+    // frontier), which signal 1 cannot see at all.
+    let dispatched = dispatched_activity_names(events);
+    let started = started_activity_ids(events);
+    events.iter().any(|event| match event {
+        WorkflowEvent::ActivityScheduled {
+            activity_id, input, ..
+        } => started.contains(activity_id) && compensates_a_dispatched_node(input, &dispatched),
+        _ => false,
+    })
+}
+
+/// Index of the unwind's **start** marker, if the run recorded one.
+///
+/// `SAGA_UNWIND_MARKER_PREFIX` matches both `saga_compensated:{seq}` and
+/// `saga_compensation_failed:{seq}`; `Saga::run_compensations` records the
+/// former first, so `position` finds the unwind's start.
+fn first_unwind_marker_index(events: &[WorkflowEvent]) -> Option<usize> {
+    events.iter().position(|event| {
+        matches!(event, WorkflowEvent::MarkerRecorded { name, .. }
+            if name.starts_with(SAGA_UNWIND_MARKER_PREFIX))
+    })
+}
+
+/// Did the run dispatch **any** activity after the unwind started?
+///
+/// This is what turns an unwind-start marker from "an unwind was attempted"
+/// into "something was actually rolled back". `Saga::run_compensations` records
+/// the marker *before* running the first compensation closure, so a compensator
+/// whose dispatch is rejected pre-dispatch (`execute_activity_raw` returns
+/// `PayloadTooLarge` before `push_command` — an oversized
+/// `{dag_compensate, input, output}` envelope with no payload offloading) leaves
+/// the marker with nothing beside it. The terminal persist path produces the
+/// same shape: it replays `RecordMarker` but not `ScheduleActivity`.
+///
+/// Reading it positionally rather than by name or payload is deliberate. It
+/// needs no decoded payload, so it still answers correctly for a run whose
+/// payloads were **erased** (issue #495 tombstones `input` but never removes or
+/// reorders the event) — a case the envelope signal alone cannot see.
+///
+/// Any `ActivityScheduled` after the marker is a compensation dispatch: the
+/// unwind runs only once the forward level walk has returned, so every forward
+/// dispatch precedes it.
+fn dispatched_after(events: &[WorkflowEvent], marker_index: usize) -> bool {
+    let started = started_activity_ids(events);
+    events
+        .iter()
+        .skip(marker_index.saturating_add(1))
+        .any(|event| match event {
+            WorkflowEvent::ActivityScheduled { activity_id, .. } => started.contains(activity_id),
+            _ => false,
+        })
+}
+
+/// Activity ids a worker actually CLAIMED — every `ActivityStarted`.
+///
+/// This is the engine's proof that a body ran. The worker appends
+/// `ActivityStarted` in a setup phase **before** invoking the handler, and a
+/// failed append aborts the dispatch, so *body executed implies an
+/// `ActivityStarted` exists*. Its absence therefore proves the body never ran.
+///
+/// Load-bearing for both signals: an operator cancel landing mid-unwind fails
+/// every open task row (`queue::fail_open_tasks_for_execution`) **without
+/// appending any event**, so a compensator dispatched-but-not-yet-claimed
+/// leaves an `ActivityScheduled` in history having rolled back nothing.
+/// Treating that schedule as proof would `409` a safe retry and send the
+/// operator to a fresh run that re-runs an upstream node whose side effect is
+/// still live.
+///
+/// Deliberately NOT keyed on a terminal event. A worker that appended
+/// `ActivityStarted` and then crashed mid-body may or may not have landed the
+/// rollback; that is genuinely ambiguous, so it is treated as compensated (the
+/// conservative direction). `ActivityStarted` is the earliest point at which a
+/// rollback side effect could have occurred.
+///
+/// Survives issue #495 erasure: neither `activity_id` nor `worker_id` is a
+/// payload field, so a tombstone leaves this signal intact.
+#[must_use]
+fn started_activity_ids(events: &[WorkflowEvent]) -> HashSet<ActivityExecId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityStarted { activity_id, .. } => Some(*activity_id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A resolved, dry-runnable retry plan: the reset point plus the explicit
@@ -249,9 +538,36 @@ fn level_granular_reexecute_set(
         .collect()
 }
 
+/// Is this recorded `ActivityScheduled` an issue #780 **compensator** dispatch
+/// rather than a forward node's dispatch?
+///
+/// Every name-keyed history reader must exclude these. Issue #780 introduced a
+/// new class of `ActivityScheduled` event, and while
+/// `DagBuildError::CompensatorNameCollidesWithNode` keeps a compensator
+/// distinguishable from a forward node *within one definition version*, that is
+/// a per-version guarantee: a later definition may introduce a forward node
+/// named after an older definition's compensator. Reading the old compensation
+/// dispatch as that node's outcome or timing reports a node that never
+/// executed.
+///
+/// `succeeded` comes from [`succeeded_activity_names`] over the same history —
+/// hoist it out of per-node loops. The check is history-only, so unlike a
+/// definition-derived one it cannot drift across versions in either direction.
+#[must_use]
+pub fn is_compensation_dispatch(input: &serde_json::Value, dispatched: &BTreeSet<&str>) -> bool {
+    compensates_a_dispatched_node(input, dispatched)
+}
+
 /// Determine the outcome of a single node (by activity name) on the source run.
+///
+/// Compensator dispatches are excluded ([`is_compensation_dispatch`]), so a
+/// forward node introduced under a name an older definition used for a
+/// compensator reports `NotAttempted` rather than inheriting the compensation's
+/// outcome.
 #[must_use]
 pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
+    let dispatched = dispatched_activity_names(events);
+
     // Find the activity_id of the *latest* ActivityScheduled with this name.
     // If a node was scheduled more than once (e.g. a re-dispatched attempt with
     // a fresh activity_id), the latest attempt is the one whose terminal state
@@ -259,9 +575,13 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
     let mut scheduled_id = None;
     for event in events.iter().rev() {
         if let WorkflowEvent::ActivityScheduled {
-            activity_id, name, ..
+            activity_id,
+            name,
+            input,
+            ..
         } = event
             && name == node
+            && !is_compensation_dispatch(input, &dispatched)
         {
             scheduled_id = Some(*activity_id);
             break;
@@ -303,6 +623,17 @@ pub fn node_outcome(events: &[WorkflowEvent], node: &str) -> NodeOutcome {
 
 /// Index of the earliest `ActivityScheduled` event whose activity name is in
 /// `reexecute`, if any.
+///
+/// Unlike [`node_outcome`], this deliberately carries **no** issue #780
+/// compensation-dispatch exclusion, because it is unreachable for a run that has
+/// any: [`resolve_retry_plan`] rejects such a run with
+/// [`DagRetryResolveError::CompensatedRun`] before computing a cut, and it does
+/// so using the *same* [`compensates_a_succeeded_node`] predicate the exclusion
+/// would apply. A compensation dispatch that could shift this cut is exactly one
+/// that already 409'd.
+///
+/// That is an ordering invariant, not a local property — keep the
+/// `ran_compensation_unwind` check first in [`resolve_retry_plan`].
 #[must_use]
 fn earliest_schedule_index(
     events: &[WorkflowEvent],
@@ -324,7 +655,9 @@ fn earliest_schedule_index(
 /// # Errors
 ///
 /// Returns [`DagRetryResolveError`] for empty / unknown / unattempted /
-/// already-succeeded node requests.
+/// already-succeeded node requests, and
+/// [`DagRetryResolveError::CompensatedRun`] when the source run already
+/// executed an issue #780 compensation unwind.
 pub fn resolve_retry_plan(
     def: &DagDefinition,
     events: &[WorkflowEvent],
@@ -332,6 +665,16 @@ pub fn resolve_retry_plan(
 ) -> Result<DagRetryPlan, DagRetryResolveError> {
     if from_nodes.is_empty() {
         return Err(DagRetryResolveError::EmptyFromNodes);
+    }
+
+    // Issue #780 interaction: a run that already unwound its compensations has
+    // had its succeeded upstream side effects ROLLED BACK. The level-granular
+    // cut below deliberately CARRIES those nodes over, so the fork would resume
+    // as if their effects still existed — a double-spend of the compensation.
+    // Checked before any node validation so the operator gets the state answer
+    // ("this run is not retryable") rather than a node-shaped one.
+    if ran_compensation_unwind(events) {
+        return Err(DagRetryResolveError::CompensatedRun);
     }
 
     let declared = declared_nodes(def);
@@ -453,6 +796,18 @@ mod tests {
     fn d() {}
     fn e() {}
 
+    fn undo_a() {}
+
+    fn linear_compensating_dag() -> DagDefinition {
+        // a -> b -> c -> d, where `a` declares a compensator.
+        let mut builder = DagBuilder::new();
+        let na = builder.activity(a).compensate(undo_a);
+        let nb = builder.activity(b).upstream(&na);
+        let nc = builder.activity(c).upstream(&nb);
+        let _nd = builder.activity(d).upstream(&nc);
+        builder.build().expect("linear compensating dag builds")
+    }
+
     fn linear_dag() -> DagDefinition {
         // a -> b -> c -> d
         let mut builder = DagBuilder::new();
@@ -503,6 +858,37 @@ mod tests {
             name: name.to_string(),
             input: Value::Null,
             queue: "default".to_string(),
+        }
+    }
+
+    /// A compensator dispatch exactly as `unwind_dag_compensations` records it:
+    /// the compensator's own activity name, with the three-key envelope naming
+    /// the **forward node** being rolled back. Fixtures must use this rather than
+    /// [`scheduled`] (whose `input` is `Value::Null`), because the envelope — not
+    /// the name — is what the resolver reads.
+    fn compensator_dispatch(
+        compensator_name: &str,
+        compensates_node: &str,
+        id: ActivityExecId,
+    ) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id,
+            name: compensator_name.to_string(),
+            input: serde_json::json!({
+                "dag_compensate": compensates_node,
+                "input": Value::Null,
+                "output": Value::Null,
+            }),
+            queue: "default".to_string(),
+        }
+    }
+
+    /// The event a worker appends when it CLAIMS an activity, before invoking
+    /// the handler. Its presence is the proof that a body actually ran.
+    fn activity_started(id: ActivityExecId) -> WorkflowEvent {
+        WorkflowEvent::ActivityStarted {
+            activity_id: id,
+            worker_id: autumn_harvest::types::WorkerId::new("w1"),
         }
     }
 
@@ -592,6 +978,68 @@ mod tests {
             completed(id2),
         ];
         assert_eq!(node_outcome(&events, "c"), NodeOutcome::Succeeded);
+    }
+
+    /// Issue #780 introduced a *new class* of `ActivityScheduled` event — the
+    /// compensator dispatch — that name-keyed history readers had never seen
+    /// before. Within one definition version
+    /// `CompensatorNameCollidesWithNode` keeps it distinguishable, but that is a
+    /// per-version guarantee: a later definition may introduce a **forward**
+    /// node named after an older definition's compensator. `node_outcome` would
+    /// then report that never-executed node's outcome from the old compensation
+    /// dispatch — surfacing in the run-graph view (#690) and in this resolver's
+    /// per-node validation.
+    ///
+    /// The exclusion is history-only (the same corroboration
+    /// `ran_compensation_unwind` uses), so it needs no definition and cannot
+    /// drift across versions.
+    #[test]
+    fn node_outcome_ignores_a_compensation_dispatch_named_like_a_forward_node() {
+        let (ia, iu) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            // The OLD definition's unwind rolled `a` back. In the CURRENT
+            // definition `undo_a` is an ordinary forward node that never ran.
+            compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            node_outcome(&events, "undo_a"),
+            NodeOutcome::NotAttempted,
+            "a compensation dispatch must never be read as a forward node's outcome"
+        );
+        assert_eq!(
+            node_outcome(&events, "a"),
+            NodeOutcome::Succeeded,
+            "the genuinely-executed forward node is unaffected"
+        );
+    }
+
+    /// The exclusion must not swallow a forward dispatch whose *user input*
+    /// happens to be envelope-shaped — the same false-positive vector the retry
+    /// guard corroborates against. `dag_compensate` here names nothing that
+    /// succeeded, so the dispatch stays a forward dispatch.
+    #[test]
+    fn node_outcome_still_reads_a_forward_node_whose_input_mimics_the_envelope() {
+        let ia = ActivityExecId::new();
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ia,
+                name: "a".to_string(),
+                input: serde_json::json!({
+                    "dag_compensate": "not_a_node_that_ran",
+                    "input": Value::Null,
+                    "output": Value::Null,
+                }),
+                queue: "default".to_string(),
+            },
+            completed(ia),
+        ];
+        assert_eq!(node_outcome(&events, "a"), NodeOutcome::Succeeded);
     }
 
     // ---- resolve: linear -------------------------------------------------
@@ -755,6 +1203,49 @@ mod tests {
         );
     }
 
+    /// `earliest_schedule_index` carries no compensation-dispatch exclusion,
+    /// relying instead on an **ordering invariant**: `resolve_retry_plan` runs
+    /// `ran_compensation_unwind` first, and that check uses the very same
+    /// predicate the exclusion would. So a compensation dispatch that could
+    /// shift the cut has already produced a `409`.
+    ///
+    /// Pinned rather than left as a comment, because reordering the checks would
+    /// silently reopen it: the cut would land on the compensator's dispatch
+    /// instead of the forward node's.
+    #[test]
+    fn a_compensation_dispatch_can_never_shift_the_cut_because_the_run_409s_first() {
+        // `undo_a` is a FORWARD node here, and it is in the re-execute closure —
+        // so an old compensation dispatch of that name would be a candidate cut
+        // point if it were ever reached.
+        let def = {
+            let mut builder = DagBuilder::new();
+            let na = builder.activity(a);
+            let nu = builder.activity(undo_a).upstream(&na);
+            let _nc = builder.activity(c).upstream(&nu);
+            builder.build().expect("name-reuse dag builds")
+        };
+        let (ia, iu, ic) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
+            completed(iu),
+            scheduled("c", ic),
+            failed(ic),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["c".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "the compensated-run rejection must precede any cut computation"
+        );
+    }
+
     #[test]
     fn resolve_empty_from_nodes_is_rejected() {
         let def = linear_dag();
@@ -762,6 +1253,768 @@ mod tests {
             resolve_retry_plan(&def, &[], &[]),
             Err(DagRetryResolveError::EmptyFromNodes)
         );
+    }
+
+    // ---- resolve: compensated runs (issue #780 interaction) ---------------
+
+    fn marker(name: &str) -> WorkflowEvent {
+        WorkflowEvent::MarkerRecorded {
+            name: name.to_string(),
+            details: Value::from(1),
+        }
+    }
+
+    /// A DAG run that executed an issue #780 compensation unwind carried over
+    /// side effects that were ROLLED BACK. Retrying from the failed node would
+    /// preserve those (now-undone) upstream nodes and resume on state that no
+    /// longer exists — a double-spend of the compensation.
+    #[test]
+    fn resolve_rejects_a_run_that_already_compensated() {
+        let def = linear_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // The unwind's dedup marker. The compensator dispatch that follows
+            // deliberately carries NO envelope (`scheduled` sets `input: Null`)
+            // and `linear_dag` declares no compensators, so signal 2 cannot
+            // fire — this isolates signal 1.
+            marker("saga_compensated:1"),
+            scheduled("undo_a", iu),
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// A compensation that ITSELF failed **after dispatching** is still unsafe:
+    /// the compensator activity ran, so its rollback may be partially applied.
+    ///
+    /// Contrast the zero-dispatch case below — a marker alone does not prove a
+    /// rollback, which is why this fixture carries an actual dispatch.
+    #[test]
+    fn resolve_rejects_a_run_whose_compensation_failed_after_dispatching() {
+        let def = linear_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            marker("saga_compensated:1"),
+            // The compensator was dispatched — the activity ran — and then
+            // failed. Rollback is potentially partially applied.
+            scheduled("undo_a", iu),
+            activity_started(iu),
+            failed(iu),
+            marker("saga_compensation_failed:1"),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// An unwind that recorded its start marker but **dispatched nothing**
+    /// rolled nothing back, so the run stays retryable.
+    ///
+    /// `Saga::run_compensations` records `saga_compensated:{seq}` *before* it
+    /// runs the first compensation closure, so a compensator whose dispatch is
+    /// rejected **pre-dispatch** — `execute_activity_raw` returns
+    /// `PayloadTooLarge` before `push_command`, e.g. an oversized
+    /// `{dag_compensate, input, output}` envelope with no payload offloading —
+    /// leaves the marker in history with no `ActivityScheduled` beside it.
+    /// (The terminal persist path replays `RecordMarker` but not
+    /// `ScheduleActivity`, so it produces the same shape.)
+    ///
+    /// Treating that marker as proof of rollback inverts the guard: it would
+    /// 409 a **safe** retry and send the operator to a fresh run, re-running
+    /// node `a` whose side effect is still live — a duplicate side effect,
+    /// the mirror image of the double-spend this guard exists to prevent.
+    #[test]
+    fn a_marker_only_unwind_that_dispatched_nothing_stays_retryable() {
+        let def = linear_compensating_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // Unwind started...
+            marker("saga_compensated:1"),
+            // ...and immediately failed with NO dispatch: nothing rolled back.
+            marker("saga_compensation_failed:1"),
+        ];
+        assert!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]).is_ok(),
+            "an unwind that dispatched nothing rolled nothing back, so node `a`'s side \
+             effect is still live and carrying it over on a retry is correct"
+        );
+    }
+
+    /// A DAG unwind does not ALWAYS leave a marker: a run that received an
+    /// unsolicited signal ends its history at a drained-signal frontier, which
+    /// issue #801's matcher deliberately leaves uncounted — no
+    /// `saga_compensated:{seq}` marker, no counters — even though the
+    /// compensators still dispatch and still replay (documented in
+    /// `docs/saga.md`, "a stray signal silences unwind observability").
+    ///
+    /// Detecting the unwind by marker ALONE therefore leaves such a fully
+    /// rolled-back run retryable, which is exactly the double-spend
+    /// [`DagRetryResolveError::CompensatedRun`] exists to prevent. The envelope
+    /// signal closes it, reading only the run's own history: the compensator's
+    /// dispatch carries `{"dag_compensate": "a", …}` and `a` did succeed here.
+    #[test]
+    fn resolve_rejects_a_marker_less_compensated_run() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // An unsolicited signal put the unwind at a drained-signal
+            // frontier, so NO `saga_compensat*` marker was recorded...
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            // ...but the compensator still ran and rolled `a` back.
+            compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun)
+        );
+    }
+
+    /// The envelope predicate is a cross-crate coupling: it encodes the shape
+    /// `autumn-harvest`'s `unwind_dag_compensations` writes. The core side pins
+    /// that shape with an exact-value assertion
+    /// (`dag_compensation_tests::…the_compensator_envelope…`), so a change there
+    /// fails loudly; these pin THIS side's reading of it.
+    #[test]
+    fn compensation_envelope_predicate_accepts_only_the_real_envelope() {
+        // The real thing.
+        assert!(is_compensation_envelope(&serde_json::json!({
+            "dag_compensate": "charge_payment",
+            "input": {"order": 7},
+            "output": {"charge_id": "ch_1"},
+        })));
+        // Null input/output are legitimate envelope values.
+        assert!(is_compensation_envelope(&serde_json::json!({
+            "dag_compensate": "a",
+            "input": Value::Null,
+            "output": Value::Null,
+        })));
+
+        // Near-misses must all be rejected.
+        assert!(
+            !is_compensation_envelope(&serde_json::json!({
+                "conf": Value::Null, "dag_task": "a"
+            })),
+            "the ordinary unbound forward wrapper is not a compensation"
+        );
+        assert!(
+            !is_compensation_envelope(&serde_json::json!({
+                "dag_compensate": "a", "input": Value::Null
+            })),
+            "a 2-key subset is not the envelope"
+        );
+        assert!(
+            !is_compensation_envelope(&serde_json::json!({
+                "dag_compensate": "a", "input": Value::Null,
+                "output": Value::Null, "extra": 1
+            })),
+            "a 4-key superset is not the envelope"
+        );
+        assert!(
+            !is_compensation_envelope(&serde_json::json!({
+                "dag_compensate": 42, "input": Value::Null, "output": Value::Null
+            })),
+            "`dag_compensate` must be the compensated node's NAME"
+        );
+        assert!(
+            !is_compensation_envelope(&serde_json::json!([1, 2, 3])),
+            "a mapped cell array is not the envelope"
+        );
+        assert!(!is_compensation_envelope(&Value::Null));
+    }
+
+    /// POST-PR REVIEW P1 (Codex on #1153): the retry endpoint passes the
+    /// **currently registered** `DagDefinition`, not the one that produced the
+    /// history. A deployment that renamed (or removed) a compensator after a
+    /// marker-less unwind ran would make the name-based signal blind, and the
+    /// already-rolled-back run would become retryable again.
+    ///
+    /// The compensation ENVELOPE is the durable, definition-independent signal:
+    /// it is recorded in the dispatch's own `ActivityScheduled.input` and never
+    /// consults the registry.
+    #[test]
+    fn resolve_rejects_a_marker_less_unwind_whose_compensator_was_since_renamed() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // No `saga_compensat*` marker (drained-signal frontier)...
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            // ...and the compensator that actually ran has since been RENAMED,
+            // so its recorded name is absent from the current definition. Only
+            // the envelope shape identifies it now.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: iu,
+                name: "undo_a_v1_RENAMED".to_string(),
+                input: serde_json::json!({
+                    "dag_compensate": "a",
+                    "input": Value::Null,
+                    "output": Value::Null,
+                }),
+                queue: "default".to_string(),
+            },
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "a rolled-back run must stay non-retryable even after the \
+             compensator it dispatched was renamed out of the definition"
+        );
+    }
+
+    /// **This resolver requires INFLATED history** — the caller must resolve
+    /// payload offloading (issue #524) before calling it.
+    ///
+    /// When a compensation envelope exceeds the offload threshold,
+    /// `append_events_offloaded` replaces the WHOLE `ActivityScheduled.input`
+    /// with an `_harvest_offload_envelope` reference (`input` is in
+    /// `PAYLOAD_FIELD_KEYS`), so the structural envelope signal cannot see the
+    /// three compensation keys. That is unfixable *here*: an offloaded input is
+    /// indistinguishable from a large ordinary forward input, so treating it as
+    /// a compensation signal would reject every legitimate retry of a
+    /// big-payload compensating DAG.
+    ///
+    /// This test pins the blindness so the obligation stays with the endpoint,
+    /// which loads via `store::load_history_inflated`. Do not "simplify" that
+    /// call site back to `store::load_history`.
+    #[test]
+    fn an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        // The exact shape `payload_store::build_offload_envelope` writes.
+        let offloaded_input = serde_json::json!({
+            "_harvest_offload_envelope": 1,
+            "store_id": "s3",
+            "key": "sha256:deadbeef",
+            "len": 900_000,
+            "checksum": "deadbeef",
+        });
+        assert!(
+            !is_compensation_envelope(&offloaded_input),
+            "an offload reference is not structurally a compensation envelope"
+        );
+
+        let build = |input: Value| {
+            vec![
+                started(),
+                scheduled("a", ia),
+                completed(ia),
+                scheduled("b", ib),
+                failed(ib),
+                // Marker-less (drained-signal frontier)...
+                WorkflowEvent::SignalReceived {
+                    signal_name: "unsolicited".to_string(),
+                    payload: Value::Null,
+                },
+                // ...and the compensator has since been renamed, so only the
+                // envelope shape can identify this dispatch.
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: iu,
+                    name: "undo_a_v1_RENAMED".to_string(),
+                    input,
+                    queue: "default".to_string(),
+                },
+                activity_started(iu),
+                completed(iu),
+            ]
+        };
+
+        // Fed the OFFLOADED form (what plain `store::load_history` returns),
+        // every definition-independent signal misses and the rolled-back run
+        // looks retryable. This is the fail-open the endpoint must prevent.
+        assert!(
+            resolve_retry_plan(&def, &build(offloaded_input), &["b".to_string()]).is_ok(),
+            "offloaded input hides the envelope from this resolver — the \
+             endpoint MUST inflate before calling it"
+        );
+
+        // Fed the INFLATED form, the guard fires correctly.
+        let inflated = serde_json::json!({
+            "dag_compensate": "a",
+            "input": Value::Null,
+            "output": Value::Null,
+        });
+        assert_eq!(
+            resolve_retry_plan(&def, &build(inflated), &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "with inflated history the rolled-back run is correctly rejected"
+        );
+    }
+
+    /// A **forward** dispatch is never an unwind, even if the user's own
+    /// payload happens to have the envelope's exact three keys.
+    ///
+    /// A mapped cell or an `input_from` binding hands a node the raw upstream
+    /// output, which is arbitrary user data — so `{"dag_compensate": <string>,
+    /// "input": …, "output": …}` is reachable by accident. Shape alone would
+    /// then 409 a perfectly retryable run, and (worse) would do so for a DAG
+    /// that declares no compensators at all and therefore cannot have unwound.
+    ///
+    /// The corroboration is the dispatch's *name*: every forward dispatch is
+    /// named after a declared node, and
+    /// `DagBuildError::CompensatorNameCollidesWithNode` guarantees no
+    /// compensator can share a node's name.
+    #[test]
+    fn a_forward_dispatch_mimicking_the_envelope_is_not_an_unwind() {
+        // A DAG with NO compensators — an unwind is impossible by construction.
+        let def = linear_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let mimic = serde_json::json!({
+            "dag_compensate": "looks_like_a_node",
+            "input": 1,
+            "output": 2,
+        });
+        assert!(
+            is_compensation_envelope(&mimic),
+            "the mimic is envelope-shaped — corroboration, not shape, is what \
+             must reject it"
+        );
+        let events = vec![
+            started(),
+            // `a` is a real forward node; its input is user data that happens
+            // to be envelope-shaped.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ia,
+                name: "a".to_string(),
+                input: mimic,
+                queue: "default".to_string(),
+            },
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+        ];
+        let plan = resolve_retry_plan(&def, &events, &["b".to_string()])
+            .expect("a non-compensating DAG must stay retryable");
+        assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
+    }
+
+    /// The corroboration must NOT cost the rename-resilience it was added for:
+    /// a genuine compensation dispatch is still detected after **every**
+    /// compensator has been removed from the definition, because its name is
+    /// still absent from the forward node set.
+    #[test]
+    fn a_genuine_unwind_is_detected_even_after_all_compensators_were_removed() {
+        // The current definition declares NO compensators — they were all
+        // removed after this run unwound.
+        let def = linear_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // Marker-less (drained-signal frontier).
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: iu,
+                name: "undo_a".to_string(),
+                input: serde_json::json!({
+                    "dag_compensate": "a",
+                    "input": Value::Null,
+                    "output": Value::Null,
+                }),
+                queue: "default".to_string(),
+            },
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "a rolled-back run must stay non-retryable even after every \
+             compensator was removed from the definition"
+        );
+    }
+
+    /// Name reuse in the OTHER direction must not fabricate an unwind.
+    ///
+    /// The mirror of the envelope case: an OLD definition's forward node can
+    /// share a name with a compensator the CURRENT definition introduces. A
+    /// name-only check against the current compensator set then reports
+    /// `CompensatedRun` for a run that never unwound at all — blocking a
+    /// legitimate retry with a 409.
+    #[test]
+    fn an_old_forward_node_named_like_a_current_compensator_is_not_an_unwind() {
+        // Current definition declares `undo_a` as `a`'s compensator...
+        let def = linear_compensating_dag();
+        let (ia, iu, ib) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            // ...but in the OLD definition `undo_a` was an ordinary forward
+            // node. No envelope, no marker — this run never unwound.
+            scheduled("undo_a", iu),
+            activity_started(iu),
+            completed(iu),
+            scheduled("b", ib),
+            failed(ib),
+        ];
+        let plan = resolve_retry_plan(&def, &events, &["b".to_string()])
+            .expect("a run that never unwound must stay retryable");
+        assert!(
+            plan.nodes_carried_over.contains(&"a".to_string()),
+            "the succeeded upstream is carried over as usual"
+        );
+    }
+
+    /// Name **reuse** must not blind the envelope signal.
+    ///
+    /// `CompensatorNameCollidesWithNode` is a *per-definition-version*
+    /// guarantee: it stops a compensator from sharing a node's name in the build
+    /// that declared it. Nothing stops a LATER deployment from introducing a
+    /// forward node named after a compensator that has since been renamed away.
+    /// Corroborating against the *current* node set would then suppress a
+    /// genuine envelope — so the corroboration is historical instead.
+    #[test]
+    fn a_genuine_unwind_is_detected_even_when_a_later_node_reuses_the_compensator_name() {
+        // Current definition: `undo_a` is now an ordinary FORWARD node, and no
+        // compensator is declared at all (the old one was renamed away).
+        let def = {
+            let mut builder = DagBuilder::new();
+            let na = builder.activity(a);
+            let nu = builder.activity(undo_a).upstream(&na);
+            let _nc = builder.activity(c).upstream(&nu);
+            builder.build().expect("name-reuse dag builds")
+        };
+        let (ia, ic, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("c", ic),
+            failed(ic),
+            // Marker-less (drained-signal frontier).
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            // The genuine compensation dispatch from the OLD definition. Its
+            // name is now a forward node in the CURRENT definition.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: iu,
+                name: "undo_a".to_string(),
+                input: serde_json::json!({
+                    "dag_compensate": "a",
+                    "input": Value::Null,
+                    "output": Value::Null,
+                }),
+                queue: "default".to_string(),
+            },
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["c".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "a rolled-back run must stay non-retryable even when a later \
+             definition reuses the compensator's name as a forward node"
+        );
+    }
+
+    /// A `CollectAll` mapped node whose cells ALL failed still settles
+    /// `TaskStatus::Succeeded` at the DAG level — per-cell failures are folded
+    /// into the cells array and never flip the node's status — so the unwind
+    /// genuinely compensates it. But history holds no `ActivityCompleted` under
+    /// that node's name, so corroborating on *completion* would miss the
+    /// envelope and leave a rolled-back run retryable.
+    ///
+    /// The corroboration is therefore **dispatch**, which is exactly what the
+    /// unwind itself guards on (`dispatched_forward`).
+    #[test]
+    fn a_collect_all_node_whose_cells_all_failed_is_still_detected_as_compensated() {
+        let def = linear_dag();
+        let (c1, c2, iu, ib) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            // Mapped node `a`, two cells, BOTH failed — no ActivityCompleted.
+            scheduled("a", c1),
+            failed(c1),
+            scheduled("a", c2),
+            failed(c2),
+            scheduled("b", ib),
+            failed(ib),
+            // Marker-less (drained-signal frontier), but `a` settled Succeeded
+            // at the DAG level so its compensator ran.
+            WorkflowEvent::SignalReceived {
+                signal_name: "unsolicited".to_string(),
+                payload: Value::Null,
+            },
+            compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
+            completed(iu),
+        ];
+        assert_eq!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]),
+            Err(DagRetryResolveError::CompensatedRun),
+            "a CollectAll node with zero completed cells is still compensated, \
+             so its run must not stay retryable"
+        );
+    }
+
+    /// The envelope signal must not fire on an ordinary forward activity whose
+    /// input merely happens to be a JSON object.
+    #[test]
+    fn resolve_allows_a_run_whose_forward_inputs_are_plain_objects() {
+        let def = linear_compensating_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ia,
+                name: "a".to_string(),
+                // The ordinary unbound-node forward envelope.
+                input: serde_json::json!({"conf": Value::Null, "dag_task": "a"}),
+                queue: "default".to_string(),
+            },
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+        ];
+        let plan = resolve_retry_plan(&def, &events, &["b".to_string()]).expect("plan");
+        assert_eq!(
+            plan.nodes_carried_over,
+            vec!["a".to_string()],
+            "a forward dispatch must never be mistaken for a compensation"
+        );
+    }
+
+    /// A compensator that was SCHEDULED but never CLAIMED rolled nothing back.
+    ///
+    /// An operator cancel landing mid-unwind fails every open task row
+    /// (`queue::fail_open_tasks_for_execution`) without appending any event, so
+    /// the compensator's `ActivityScheduled` is in history but no worker ever
+    /// ran its body. Treating the schedule alone as proof would `409` a
+    /// perfectly safe retry and send the operator to a fresh run, re-running an
+    /// upstream node whose side effect is still live.
+    ///
+    /// `ActivityStarted` is the correct bar: the worker appends it in a setup
+    /// phase BEFORE invoking the handler, and a failed append aborts the run —
+    /// so a body that executed always has one. Its absence therefore proves the
+    /// body never ran.
+    #[test]
+    fn a_scheduled_but_never_started_compensator_stays_retryable() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            marker("saga_compensated:1"),
+            // Dispatched — then the run was cancelled before a worker claimed
+            // it, so there is no ActivityStarted and no rollback happened.
+            compensator_dispatch("undo_a", "a", iu),
+        ];
+        assert!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]).is_ok(),
+            "a compensator that never started rolled nothing back, so node `a`'s side \
+             effect is still live and carrying it over on a retry is correct"
+        );
+    }
+
+    /// The mirror of the test above: once the compensator has STARTED, a
+    /// rollback may have landed, so the run must stay non-retryable — including
+    /// when the worker crashed mid-body and never recorded a terminal.
+    #[test]
+    fn a_started_compensator_with_no_terminal_still_blocks_retry() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            marker("saga_compensated:1"),
+            compensator_dispatch("undo_a", "a", iu),
+            activity_started(iu),
+        ];
+        assert!(
+            matches!(
+                resolve_retry_plan(&def, &events, &["b".to_string()]),
+                Err(DagRetryResolveError::CompensatedRun)
+            ),
+            "a started compensator may have rolled back, so retry must be refused"
+        );
+    }
+
+    /// CHARACTERIZATION — documents why the CALLER must fail closed on an
+    /// issue #495 payload-erased source run, because this resolver provably
+    /// cannot detect one.
+    ///
+    /// Erasure tombstones every payload field (`erase::PAYLOAD_FIELDS` includes
+    /// `input` and `details`), so on an erased history:
+    ///
+    /// * signal 2 is blind — `ActivityScheduled.input` is
+    ///   `{"_harvest_erased": true}`, not the three-key envelope; and
+    /// * signal 1 has nothing to anchor on for a run that unwound at a
+    ///   **drained signal frontier** (issue #801), which records no marker at
+    ///   all. (With a marker present signal 1 still fires: the marker's *name*
+    ///   is not a payload field and the "dispatch after it" check reads no
+    ///   payload — that intersection is the whole gap.)
+    ///
+    /// So a fully rolled-back run looks retryable here. Erasure is
+    /// irreversible, so no amount of inflating or decoding recovers it; the
+    /// guard has to live in `api::retry_dag_run_inner`, which has the execution
+    /// row and can test it in O(1).
+    #[test]
+    fn an_erased_marker_less_unwind_is_invisible_and_must_be_refused_by_the_caller() {
+        let def = linear_compensating_dag();
+        let (ia, ib, iu) = (
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+            ActivityExecId::new(),
+        );
+        let tombstone = autumn_harvest::erase::erasure_tombstone();
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // The compensator DID dispatch and DID roll `a` back — but the run
+            // sat at a drained signal frontier, so no marker was recorded, and
+            // erasure has since replaced the envelope with a tombstone.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: iu,
+                name: "undo_a".to_string(),
+                input: tombstone,
+                queue: "default".to_string(),
+            },
+            activity_started(iu),
+            completed(iu),
+        ];
+
+        assert!(
+            resolve_retry_plan(&def, &events, &["b".to_string()]).is_ok(),
+            "the resolver cannot see an erased unwind — this is the exact blindness \
+             `api::retry_dag_run_inner`'s erasure guard exists to cover; if this ever \
+             starts returning CompensatedRun, the caller guard may be redundant"
+        );
+    }
+
+    /// REGRESSION GUARD: a compensating DAG that failed BEFORE any compensator
+    /// dispatched (e.g. the first node itself failed, so nothing succeeded)
+    /// left nothing rolled back and stays retryable.
+    #[test]
+    fn resolve_allows_a_compensating_dag_whose_unwind_never_dispatched() {
+        let def = linear_compensating_dag();
+        let ia = ActivityExecId::new();
+        let events = vec![started(), scheduled("a", ia), failed(ia)];
+        let plan = resolve_retry_plan(&def, &events, &["a".to_string()]).expect("plan");
+        assert!(
+            plan.nodes_carried_over.is_empty(),
+            "nothing succeeded, so nothing is carried over"
+        );
+    }
+
+    /// REGRESSION GUARD: a failed run with NO compensation unwind (the ordinary
+    /// issue #366 case, and every pre-#780 history) must still resolve.
+    #[test]
+    fn resolve_allows_a_failed_run_without_a_compensation_marker() {
+        let def = linear_dag();
+        let (ia, ib) = (ActivityExecId::new(), ActivityExecId::new());
+        let events = vec![
+            started(),
+            scheduled("a", ia),
+            completed(ia),
+            scheduled("b", ib),
+            failed(ib),
+            // An UNRELATED marker must not be mistaken for a compensation.
+            marker("dag_skip:3"),
+        ];
+        let plan = resolve_retry_plan(&def, &events, &["b".to_string()]).expect("plan");
+        assert_eq!(plan.reset_to_event_id, 2);
+        assert_eq!(plan.nodes_carried_over, vec!["a".to_string()]);
     }
 
     #[test]

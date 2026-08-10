@@ -201,6 +201,57 @@ impl<'ctx> Saga<'ctx> {
         }
     }
 
+    /// Register a compensation **without** running a forward step (issue #780).
+    ///
+    /// [`step`](Self::step) couples "run the forward action" to "register its
+    /// undo". The declarative DAG unwind already knows from recorded history
+    /// which nodes succeeded, so it must register their compensations without
+    /// re-executing them — that is what this method is for.
+    ///
+    /// The closure is **stored, not invoked**: it runs only when an unwind is
+    /// invoked ([`compensate_all`](Self::compensate_all),
+    /// [`compensate_all_after`](Self::compensate_all_after), or a
+    /// [`step`](Self::step) failure), in LIFO registration order.
+    ///
+    /// The same idempotency and replay-determinism contracts as
+    /// [`step`](Self::step) apply: compensations are re-registered on every
+    /// replay, so the compensating **activity** must be idempotent and the
+    /// closure body itself must contain no non-deterministic side effect.
+    pub(crate) fn push_compensation<C, Fut>(&mut self, compensate: C)
+    where
+        C: FnOnce() -> Fut + Send + 'ctx,
+        Fut: Future<Output = HarvestResult<()>> + Send + 'ctx,
+    {
+        self.compensations
+            .push(Box::new(move || compensate().boxed()));
+    }
+
+    /// Run all pending compensations in reverse registration order, reporting
+    /// `original` as the error that triggered the unwind (issue #780).
+    ///
+    /// Identical to [`compensate_all`](Self::compensate_all) except that the
+    /// caller supplies the original error rather than the fixed
+    /// `"manual compensation requested"` string — so a DAG unwind's
+    /// [`HarvestError::SagaCompensationFailed`] carries the real
+    /// `"one or more DAG tasks failed"` cause.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::SagaCompensationFailed`] if any compensation
+    /// fails. All pending compensations are still attempted before returning.
+    pub(crate) async fn compensate_all_after(
+        &mut self,
+        original: impl Into<String>,
+    ) -> HarvestResult<()> {
+        match self.run_compensations().await {
+            Ok(()) => Ok(()),
+            Err(compensation_errors) => Err(HarvestError::SagaCompensationFailed {
+                original: original.into(),
+                compensation_errors,
+            }),
+        }
+    }
+
     /// Run all pending compensations in reverse registration order.
     ///
     /// Call this explicitly when the workflow needs to abort after successful
@@ -223,13 +274,8 @@ impl<'ctx> Saga<'ctx> {
     /// Returns [`HarvestError::SagaCompensationFailed`] if any compensation
     /// fails. All pending compensations are still attempted before returning.
     pub async fn compensate_all(&mut self) -> HarvestResult<()> {
-        match self.run_compensations().await {
-            Ok(()) => Ok(()),
-            Err(compensation_errors) => Err(HarvestError::SagaCompensationFailed {
-                original: "manual compensation requested".into(),
-                compensation_errors,
-            }),
-        }
+        self.compensate_all_after("manual compensation requested")
+            .await
     }
 
     async fn rollback_after(&mut self, original: HarvestError) -> HarvestError {
@@ -447,5 +493,100 @@ mod tests {
         // We can't easily assert on the context itself without PartialEq,
         // but we can verify the method exists and returns a reference.
         let _ = saga.context();
+    }
+
+    // ── Issue #780 — register-only compensation + caller-supplied original ──
+
+    /// T21 — `push_compensation` registers a compensation WITHOUT running a
+    /// forward step (the DAG unwind already knows which nodes succeeded from
+    /// recorded history, so it must not re-execute them). The closure is stored,
+    /// not invoked.
+    #[tokio::test]
+    async fn push_compensation_registers_without_a_forward_step() {
+        let ctx = WorkflowContext::new_test();
+        let mut saga = Saga::new(&ctx);
+
+        let ran = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&ran);
+        saga.push_compensation(move || {
+            let flag = Arc::clone(&flag);
+            async move {
+                *flag.lock().await = true;
+                Ok::<(), HarvestError>(())
+            }
+        });
+
+        assert_eq!(
+            saga.pending_compensation_count(),
+            1,
+            "push_compensation must register exactly one pending compensation"
+        );
+        assert!(
+            !*ran.lock().await,
+            "push_compensation must REGISTER only — the closure must not run \
+             until the unwind"
+        );
+
+        // And it does run on the unwind.
+        saga.compensate_all().await.expect("compensation succeeds");
+        assert!(
+            *ran.lock().await,
+            "the registered compensation must run on unwind"
+        );
+        assert_eq!(saga.pending_compensation_count(), 0);
+    }
+
+    /// T22 — `compensate_all_after(original)` reports the CALLER's original
+    /// error (the DAG unwind passes `"one or more DAG tasks failed"`), while
+    /// `compensate_all()` keeps delegating with the legacy manual string.
+    #[tokio::test]
+    async fn compensate_all_after_carries_the_caller_supplied_original() {
+        let ctx = WorkflowContext::new_test();
+
+        let mut saga = Saga::new(&ctx);
+        saga.push_compensation(|| async {
+            Err::<(), _>(HarvestError::workflow_failed_untyped("comp", "comp boom"))
+        });
+
+        let err = saga
+            .compensate_all_after("one or more DAG tasks failed")
+            .await
+            .expect_err("a failing compensation must surface SagaCompensationFailed");
+        match err {
+            HarvestError::SagaCompensationFailed {
+                original,
+                compensation_errors,
+            } => {
+                assert_eq!(
+                    original, "one or more DAG tasks failed",
+                    "compensate_all_after must carry the caller-supplied original verbatim"
+                );
+                assert_eq!(compensation_errors.len(), 1);
+                assert!(
+                    compensation_errors[0].contains("comp boom"),
+                    "compensation error must be preserved, got {:?}",
+                    compensation_errors[0]
+                );
+            }
+            other => panic!("expected SagaCompensationFailed, got {other:?}"),
+        }
+
+        // `compensate_all()` delegates to the same machinery with the legacy
+        // manual-request original — unchanged behaviour for existing callers.
+        let mut manual = Saga::new(&ctx);
+        manual.push_compensation(|| async {
+            Err::<(), _>(HarvestError::workflow_failed_untyped("comp", "comp boom"))
+        });
+        let err = manual
+            .compensate_all()
+            .await
+            .expect_err("a failing compensation must surface SagaCompensationFailed");
+        match err {
+            HarvestError::SagaCompensationFailed { original, .. } => assert_eq!(
+                original, "manual compensation requested",
+                "compensate_all() must keep its legacy original string"
+            ),
+            other => panic!("expected SagaCompensationFailed, got {other:?}"),
+        }
     }
 }

@@ -200,6 +200,11 @@ jobs:
       - name: Run dag_data_flow example tests (issue #702)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_data_flow
+      # Quoted: an unquoted `#` after whitespace starts a YAML comment, which
+      # would silently truncate the step name at "(issue".
+      - name: "Run dag_compensation example tests (issue #780)"
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing,unified-dag-execution --example dag_compensation
       - name: Run interface_schema_workflow example tests (issue #610)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing,schema --example interface_schema_workflow
