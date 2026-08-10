@@ -3215,6 +3215,13 @@ impl WorkflowContext {
     /// records a `SideEffectRecorded` event) is only consulted when a deadline
     /// actually exists.
     ///
+    /// # Differs from the activity-side sibling
+    ///
+    /// [`ActivityContext::time_remaining`] returns a [`std::time::Duration`]
+    /// that **saturates at zero** past its deadline, and is measured against the
+    /// live-enforced *attempt* deadline rather than this replay-stable nominal
+    /// *run* deadline. They are not interchangeable.
+    ///
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned (via
@@ -11435,6 +11442,210 @@ impl std::future::Future for ChildOrTimerRaceFut {
 // ActivityContext
 // ---------------------------------------------------------------------------
 
+/// The subset of an activity attempt's metadata that is **stable across every
+/// retry attempt** of the same logical invocation (issue #783).
+///
+/// Returned by [`ActivityExecutionInfo::identity`]. Two attempts of the same
+/// logical activity compare equal here; only the attempt counter and the
+/// deadline advance between them. Asserting on this value — rather than on a
+/// hand-written list of fields — keeps a stability test honest as fields are
+/// added, since a new identity field automatically joins every existing
+/// comparison.
+///
+/// `is_local`, `attempt`, `max_attempts`, `queue_name`, and `task_id` are
+/// deliberately **not** here: the first is a property of the dispatch path
+/// rather than of the activity's identity, and the rest are per-attempt or
+/// per-dispatch.
+///
+/// `Hash` is derived (unlike on [`ActivityExecutionInfo`]) precisely because
+/// this is the retry-stable subset: it is the value you want as a `HashMap` key
+/// when de-duplicating work per logical invocation.
+///
+/// Because the struct is `#[non_exhaustive]`, downstream code cannot build one
+/// with a struct literal (nor with functional-update syntax). Use
+/// [`new`](Self::new) — or, in a test, [`for_test`](Self::for_test) — instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ActivityIdentity {
+    /// The owning workflow run's execution id.
+    pub execution_id: ExecutionId,
+    /// The owning run's business-level workflow identifier.
+    pub workflow_id: String,
+    /// The owning run's logical workflow type.
+    pub workflow_type: String,
+    /// This activity's registered name.
+    pub activity_type: String,
+    /// This logical invocation's activity execution id.
+    pub activity_id: ActivityExecId,
+}
+
+impl ActivityIdentity {
+    /// Assemble an identity from the values the worker resolves at dispatch.
+    #[must_use]
+    pub fn new(
+        execution_id: ExecutionId,
+        workflow_id: impl Into<String>,
+        workflow_type: impl Into<String>,
+        activity_type: impl Into<String>,
+        activity_id: ActivityExecId,
+    ) -> Self {
+        Self {
+            execution_id,
+            workflow_id: workflow_id.into(),
+            workflow_type: workflow_type.into(),
+            activity_type: activity_type.into(),
+            activity_id,
+        }
+    }
+
+    /// A synthetic, self-consistent identity for tests and for contexts that
+    /// were not built by the worker (issue #783).
+    ///
+    /// Every field is populated with a plausible value — never an empty string
+    /// or a nil UUID — so a test context reports a usable [`info`] out of the
+    /// box and an accidentally-unwired production path is visibly wrong rather
+    /// than plausibly blank.
+    ///
+    /// Gated behind the `testing` feature, matching its only public consumer
+    /// [`ActivityContext::new_test_with_identity`]. The worker builds real
+    /// identities with [`new`](Self::new), so nothing in a default build needs
+    /// this — and gating it keeps the synthetic `"test_workflow"` /
+    /// `"test-workflow-id"` values out of reach of production code.
+    ///
+    /// [`info`]: ActivityContext::info
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_test() -> Self {
+        Self {
+            execution_id: ExecutionId::new(),
+            workflow_id: "test-workflow-id".to_string(),
+            workflow_type: "test_workflow".to_string(),
+            activity_type: "test_activity".to_string(),
+            activity_id: ActivityExecId::new(),
+        }
+    }
+}
+
+/// A read-only snapshot of the currently-executing activity attempt's
+/// owning-run and dispatch metadata (issue #783).
+///
+/// Returned by [`ActivityContext::info`]. Every field is a plain in-memory read
+/// — obtaining it performs **no** I/O, issues **no** query, and sends **no**
+/// heartbeat.
+///
+/// This is the activity-side counterpart of
+/// [`WorkflowExecutionInfo`]: the [`execution_id`](Self::execution_id) here is
+/// the exact identifier the management-API path
+/// (`/api/harvest/workflows/{execution_id}/...`), the dead-letter queue,
+/// reset/pause/cancel, and the ADR-0001 `execution.id` span attribute all key
+/// on — so an activity log line carrying it opens the owning run with zero
+/// directory lookups.
+///
+/// Unlike the workflow side there is **no replay-determinism contract to
+/// satisfy**: an activity handler is never re-run during replay (the recorded
+/// terminal event's value is used instead), so these fields carry no
+/// replay-safety obligation and may be branched on freely.
+///
+/// The attempt's wall-clock deadline is deliberately **not** a field. It is
+/// time-varying, so keeping it out makes this a pure snapshot whose
+/// [`PartialEq`] is a meaningful identity comparison and whose value cannot go
+/// stale while held across an `.await`. Read it live via
+/// [`ActivityContext::deadline`] / [`ActivityContext::time_remaining`].
+///
+/// ```rust,ignore
+/// // `heartbeat_timeout` above `start_to_close` on purpose: the heartbeat
+/// // clock is NOT folded into `ActivityContext::deadline`, so keeping it the
+/// // looser of the two means the reported deadline is the binding one.
+/// #[activity(start_to_close = "5m", heartbeat_timeout = "10m")]
+/// async fn import_rows(ctx: &ActivityContext, job: Job) -> Result<Done, String> {
+///     let info = ctx.info();
+///     tracing::info!(
+///         execution_id = %info.execution_id,   // pasteable into the management API
+///         workflow_type = %info.workflow_type,
+///         activity = %info.activity_type,
+///         attempt = info.attempt,
+///         "starting import"
+///     );
+///     // ...
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ActivityExecutionInfo {
+    /// The owning workflow run's system-generated execution id — the exact
+    /// `{exec_id}` segment of the management-API path. Render it with
+    /// `Display` (`%info.execution_id`), never `Debug`, or the logged string
+    /// is not pasteable.
+    pub execution_id: ExecutionId,
+    /// The owning run's business-level workflow identifier (e.g.
+    /// `"subscription-123"`).
+    pub workflow_id: String,
+    /// The owning run's logical workflow type — the `#[workflow]` function
+    /// name.
+    pub workflow_type: String,
+    /// This activity's registered name — the `#[activity]` function name.
+    pub activity_type: String,
+    /// This logical invocation's activity execution id: the id recorded in the
+    /// `ActivityScheduled` / `LocalActivityScheduled` event, stable across
+    /// every retry attempt, and the same id backing
+    /// [`ActivityContext::idempotency_key`].
+    ///
+    /// This is **not** the id the operator `retry-now` (issue #516) and
+    /// `fail-now` (issue #765) routes take — those address the task-queue row,
+    /// which is [`task_id`](Self::task_id).
+    pub activity_id: ActivityExecId,
+    /// 1-based attempt number for this logical invocation.
+    pub attempt: u32,
+    /// Configured maximum attempts (the retry policy's `max_attempts`, or `1`
+    /// when no policy is set).
+    pub max_attempts: u32,
+    /// `true` when this activity is running **inline** on the workflow worker
+    /// (an `#[activity(local = true)]` dispatch), `false` for a task-queue
+    /// dispatch.
+    pub is_local: bool,
+    /// The task queue this activity was dispatched on. For a local activity
+    /// this is the *owning workflow task's* queue, since a local activity has
+    /// no queue of its own. Empty for a bare [`ActivityContext::new_test`]
+    /// context that never went through the worker.
+    pub queue_name: String,
+    /// The `harvest_task_queue` row id.
+    ///
+    /// `None` for a local activity (which has no task-queue row), and also for
+    /// a bare [`ActivityContext::new_test`] context that never went through the
+    /// worker — so `None` does **not** imply local. Use
+    /// [`is_local`](Self::is_local) to distinguish the dispatch path.
+    ///
+    /// This is the id the operator routes
+    /// `POST /workflows/{id}/activities/{activity_exec_id}/retry-now` (issue
+    /// #516) and `.../fail-now` (issue #765) actually address — despite their
+    /// path segment's name, they look the row up by primary key. Log this
+    /// alongside [`activity_id`](Self::activity_id) if you want an operator to
+    /// be able to act on the activity, not merely find it.
+    ///
+    /// A raw [`uuid::Uuid`] (deliberately, unlike the newtyped
+    /// [`execution_id`](Self::execution_id) / [`activity_id`](Self::activity_id))
+    /// because the task-queue row PK is a bare `Uuid` throughout the storage
+    /// layer and no `TaskId` newtype exists to reach for. The `uuid` crate is
+    /// re-exported as `autumn_harvest::uuid`, so downstream code can always
+    /// name the exact type.
+    pub task_id: Option<uuid::Uuid>,
+}
+
+impl ActivityExecutionInfo {
+    /// The subset of these fields guaranteed stable across every retry attempt
+    /// (issue #783).
+    #[must_use]
+    pub fn identity(&self) -> ActivityIdentity {
+        ActivityIdentity {
+            execution_id: self.execution_id,
+            workflow_id: self.workflow_id.clone(),
+            workflow_type: self.workflow_type.clone(),
+            activity_type: self.activity_type.clone(),
+            activity_id: self.activity_id,
+        }
+    }
+}
+
 /// Context passed to every activity function.
 ///
 /// Activities may perform I/O, call external services, and interact with the
@@ -11514,6 +11725,33 @@ pub struct ActivityContext {
     /// task row's `heartbeat_timeout`; `None` for test / local / no-flusher
     /// contexts unless [`Self::with_heartbeat_timeout`] is called.
     heartbeat_timeout: Option<std::time::Duration>,
+    /// Owning-run and dispatch identity for [`Self::info`] (issue #783).
+    ///
+    /// A **required** constructor argument rather than an optional builder: an
+    /// `Option` here would mean deleting a worker's wiring line still compiles
+    /// and still passes every test that only exercises a hand-built context.
+    /// Making it required turns an unwired dispatch path into a compile error.
+    identity: ActivityIdentity,
+    /// `true` when this activity runs inline on the workflow worker (issue
+    /// #783). Set by the constructor, not by the caller's identity, so it can
+    /// never disagree with the dispatch path that actually built the context.
+    is_local: bool,
+    /// The dispatch task queue (issue #783); the owning workflow task's queue
+    /// for a local activity.
+    queue_name: String,
+    /// The `harvest_task_queue` row id (issue #783). `None` for a local
+    /// activity, which has no task-queue row.
+    task_id: Option<uuid::Uuid>,
+    /// This attempt's absolute deadline (issue #783), or `None` when the
+    /// attempt is unbounded.
+    ///
+    /// Regular path: [`attempt_deadline`] of the task row's `started_at`,
+    /// `start_to_close`, and `schedule_to_close_at` — the earlier of the two
+    /// clocks the timeout scanners actually enforce. Local path:
+    /// `now + per_attempt_timeout`, recomputed on each retry (never `None` —
+    /// an unset local `start_to_close` resolves to
+    /// `WorkerConfig::max_local_activity_start_to_close`).
+    deadline: Option<DateTime<Utc>>,
     /// Shared last-heartbeat payload cell for the auto-heartbeat ticker
     /// (issue #682).
     ///
@@ -11587,6 +11825,7 @@ impl ActivityContext {
         state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
+        identity: ActivityIdentity,
     ) -> Self {
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
@@ -11611,6 +11850,11 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            identity,
+            is_local: false,
+            queue_name: String::new(),
+            task_id: None,
+            deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -11625,6 +11869,7 @@ impl ActivityContext {
         cancel: tokio_util::sync::CancellationToken,
         task_id: uuid::Uuid,
         pool: ActivityCancellationPool,
+        identity: ActivityIdentity,
     ) -> Self {
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
@@ -11656,6 +11901,13 @@ impl ActivityContext {
             context_headers: std::sync::Arc::new(HashMap::new()),
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            identity,
+            is_local: false,
+            queue_name: String::new(),
+            // The queue-row PK this attempt is running under — the id the
+            // operator `retry-now`/`fail-now` routes address (issue #783).
+            task_id: Some(task_id),
+            deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload,
         }
@@ -11665,6 +11917,7 @@ impl ActivityContext {
     pub(crate) fn new_local_activity(
         state: SharedState,
         cancel: tokio_util::sync::CancellationToken,
+        identity: ActivityIdentity,
     ) -> Self {
         Self {
             state,
@@ -11685,6 +11938,13 @@ impl ActivityContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             #[cfg(feature = "db")]
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
+            identity,
+            // Set by the constructor, never by the caller's identity: this IS the
+            // inline dispatch path, so it can never disagree with reality.
+            is_local: true,
+            queue_name: String::new(),
+            task_id: None,
+            deadline: None,
             heartbeat_timeout: None,
             last_heartbeat_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -11841,6 +12101,123 @@ impl ActivityContext {
         self
     }
 
+    // ── Activity run metadata (issue #783) ────────────────────────────────
+    //
+    // The worker sets all of these at dispatch. They are `pub` (not
+    // `testing`-gated) because the worker itself is behind the `db` feature and
+    // could not otherwise call them — the same reason `with_attempt` /
+    // `with_max_attempts` are ungated. The *test constructor*
+    // ([`Self::new_test`]) is what carries the `testing` gate.
+
+    /// Override the owning workflow run's execution id (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub const fn with_execution_id(mut self, exec_id: ExecutionId) -> Self {
+        self.identity.execution_id = exec_id;
+        self
+    }
+
+    /// Override the owning run's business `workflow_id` (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.identity.workflow_id = workflow_id.into();
+        self
+    }
+
+    /// Override the owning run's logical workflow type (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_workflow_type(mut self, workflow_type: impl Into<String>) -> Self {
+        self.identity.workflow_type = workflow_type.into();
+        self
+    }
+
+    /// Override this activity's registered name (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_activity_type(mut self, activity_type: impl Into<String>) -> Self {
+        self.identity.activity_type = activity_type.into();
+        self
+    }
+
+    /// Override this logical invocation's activity execution id (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    ///
+    /// If a default idempotency key is already attached — as
+    /// [`new_test`](Self::new_test) attaches one — it is **re-derived from the
+    /// new id**, so [`info().activity_id`](Self::info) and
+    /// [`idempotency_key`](Self::idempotency_key) can never disagree. That is
+    /// the invariant production dispatch always upholds (both are built from
+    /// the same `activity_id`), and a test context that violated it would
+    /// exercise a shape the engine never produces. A context with no key
+    /// attached still has none — this never manufactures one.
+    ///
+    /// Call [`with_idempotency_key`](Self::with_idempotency_key) *after* this
+    /// if you need a key that is not derived from the id.
+    #[must_use]
+    pub fn with_activity_id(mut self, activity_id: ActivityExecId) -> Self {
+        self.identity.activity_id = activity_id;
+        if self.idempotency_key.is_some() {
+            self.idempotency_key = Some(IdempotencyKey::from_activity_exec_id(activity_id));
+        }
+        self
+    }
+
+    /// Set the dispatch task queue (issue #783).
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    #[must_use]
+    pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
+        self.queue_name = queue_name.into();
+        self
+    }
+
+    /// Set the `harvest_task_queue` row id backing this dispatch (issue #783).
+    ///
+    /// `None` for a local activity, which has no task-queue row. Set
+    /// automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds only: panics on `Some(_)` for a local-activity context, a
+    /// state the worker never produces and which would make
+    /// [`task_id`](Self::task_id) advertise a queue row that does not exist.
+    #[must_use]
+    pub fn with_task_id(mut self, task_id: Option<uuid::Uuid>) -> Self {
+        debug_assert!(
+            !(self.is_local && task_id.is_some()),
+            "a local activity has no harvest_task_queue row; task_id must stay None"
+        );
+        self.task_id = task_id;
+        self
+    }
+
+    /// Set this attempt's absolute deadline (issue #783); `None` for an
+    /// unbounded attempt.
+    ///
+    /// Set automatically by the worker at dispatch; you only need this when
+    /// constructing an [`ActivityContext`] manually in tests — for example to
+    /// exercise a deadline-aware checkpoint branch without waiting on a real
+    /// timeout.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     /// Attach the transactional state needed by [`Self::run_transactional`].
     ///
     /// Called by the worker after the `ActivityStarted` event is committed so
@@ -11964,6 +12341,226 @@ impl ActivityContext {
     #[must_use]
     pub const fn is_retrying(&self) -> bool {
         self.attempt() > 1
+    }
+
+    // ── Run metadata and deadline (issue #783) ─────────────────────────────
+
+    /// Snapshot of this activity attempt's run metadata.
+    ///
+    /// Bundles the owning workflow's identity (`execution_id`, `workflow_id`,
+    /// `workflow_type`), this activity's own identity (`activity_type`,
+    /// `activity_id`), and the per-attempt fields (`attempt`, `max_attempts`,
+    /// `is_local`, `queue_name`, `task_id`).
+    ///
+    /// The `execution_id` is exactly the `{exec_id}` path segment the
+    /// management API keys on, so a log line carrying it opens the owning run
+    /// with zero directory lookups:
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    ///
+    /// # fn example(ctx: &ActivityContext) {
+    /// let info = ctx.info();
+    /// tracing::info!(
+    ///     execution_id = %info.execution_id,
+    ///     workflow = %info.workflow_type,
+    ///     activity = %info.activity_type,
+    ///     attempt = info.attempt,
+    ///     "starting activity",
+    /// );
+    /// # }
+    /// ```
+    ///
+    /// Every field is a plain copy of already-resolved dispatch state — reading
+    /// it performs no I/O, appends no event, and never blocks.
+    #[must_use]
+    pub fn info(&self) -> ActivityExecutionInfo {
+        ActivityExecutionInfo {
+            execution_id: self.identity.execution_id,
+            workflow_id: self.identity.workflow_id.clone(),
+            workflow_type: self.identity.workflow_type.clone(),
+            activity_type: self.identity.activity_type.clone(),
+            activity_id: self.identity.activity_id,
+            attempt: self.attempt(),
+            max_attempts: self.max_attempts(),
+            is_local: self.is_local,
+            queue_name: self.queue_name.clone(),
+            task_id: self.task_id,
+        }
+    }
+
+    /// The retry-stable subset of [`info`](Self::info) (issue #783).
+    ///
+    /// Identical on every attempt of the same logical invocation, so it is the
+    /// value to derive a downstream idempotency key from, to key a dedupe map
+    /// on, or to assert on in a retry-stability test. Cheaper than
+    /// `ctx.info().identity()`, which clones the shared strings twice.
+    #[must_use]
+    pub fn identity(&self) -> ActivityIdentity {
+        self.identity.clone()
+    }
+
+    /// Owning workflow execution id — the management-API `{exec_id}` path segment.
+    #[must_use]
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.identity.execution_id
+    }
+
+    /// Owning workflow's business id (the author-supplied `workflow_id`).
+    #[must_use]
+    pub fn workflow_id(&self) -> &str {
+        &self.identity.workflow_id
+    }
+
+    /// Owning workflow's registered type name.
+    #[must_use]
+    pub fn workflow_type(&self) -> &str {
+        &self.identity.workflow_type
+    }
+
+    /// This activity's registered type name.
+    #[must_use]
+    pub fn activity_type(&self) -> &str {
+        &self.identity.activity_type
+    }
+
+    /// This activity invocation's id (stable across retry attempts).
+    #[must_use]
+    pub const fn activity_id(&self) -> ActivityExecId {
+        self.identity.activity_id
+    }
+
+    /// `true` when this activity is running inline as a local activity.
+    ///
+    /// Local activities run on the workflow worker task and are never enqueued
+    /// to `harvest_task_queue`, so they have no [`task_id`](Self::task_id),
+    /// cannot heartbeat, and are bounded by
+    /// `WorkerConfig::max_local_activity_start_to_close`.
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        self.is_local
+    }
+
+    /// Task queue this activity was dispatched on.
+    ///
+    /// Local activities report the owning workflow's queue (they are never
+    /// dispatched to a queue of their own).
+    #[must_use]
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
+    }
+
+    /// `harvest_task_queue` row id for this attempt, when one exists.
+    ///
+    /// This is the id the operator routes address —
+    /// `POST /workflows/{exec_id}/activities/{task_id}/retry-now` and
+    /// `.../fail-now` — so logging it alongside
+    /// [`execution_id`](Self::execution_id) gives an operator a directly
+    /// actionable pair.
+    ///
+    /// `None` for a local activity (no queue row exists) *and* for a bare
+    /// [`new_test`](Self::new_test) context, so `None` does not imply local —
+    /// use [`is_local`](Self::is_local) for that.
+    #[must_use]
+    pub const fn task_id(&self) -> Option<uuid::Uuid> {
+        self.task_id
+    }
+
+    /// Wall-clock deadline for **this attempt**, when one is bounded.
+    ///
+    /// Resolves to the earliest of the attempt's `start_to_close` budget
+    /// (`started_at + start_to_close`) and the activity's cross-retry
+    /// `schedule_to_close` deadline, when either is set.  Returns `None` when
+    /// the attempt is genuinely unbounded.
+    ///
+    /// Taking the minimum matters: `schedule_to_close` enforcement (issue #378)
+    /// kills a `RUNNING` row, so reporting only the per-attempt budget would
+    /// over-report the time available and let an activity keep working right up
+    /// to a kill that discards everything.
+    ///
+    /// # Caveats
+    ///
+    /// * **The heartbeat clock is not included.** An activity configured with
+    ///   `heartbeat_timeout < start_to_close` can be killed by the heartbeat
+    ///   scanner before this instant; see [`attempt_deadline`] for why that
+    ///   clock cannot be frozen here, and
+    ///   [`heartbeat_timeout`](Self::heartbeat_timeout) to compute it yourself.
+    /// * **This is a claim-time snapshot.** Pausing and resuming the owning
+    ///   workflow shifts the stored `schedule_to_close` deadline *later* (the
+    ///   paused span is not charged), so a resumed attempt reports a value that
+    ///   is conservatively early rather than stale-late.
+    /// * **Local activities** take a minimum too, over a different pair: the
+    ///   clamped per-attempt budget (`now + ` the budget, bounded by
+    ///   `max_local_activity_start_to_close`) and the enclosing workflow-task
+    ///   budget (`WorkerConfig::workflow_task_timeout`, issue #494), whose
+    ///   absolute cut-off is threaded in from the dispatch that armed it. The
+    ///   enclosing clock starts at the top of the decision cycle, so time spent
+    ///   before the attempt — history load, an earlier command, a previous
+    ///   attempt of the same local activity — has already been consumed from
+    ///   it; clamping is what keeps a late attempt from claiming a budget that
+    ///   outlives the cycle.
+    ///
+    /// # Differs from the workflow-side sibling
+    ///
+    /// [`WorkflowContext::deadline`] reports the **nominal** run deadline
+    /// (`started_at + execution_timeout`), deliberately replay-stable and
+    /// therefore ignoring pause extensions. This one reports the **live
+    /// enforced** attempt deadline. They are not interchangeable.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.deadline
+    }
+
+    /// Time left before [`deadline`](Self::deadline), saturating at zero.
+    ///
+    /// Returns `None` when the attempt is unbounded.  Never returns a negative
+    /// duration — an already-elapsed deadline reports
+    /// `Some(Duration::ZERO)`, so callers can compare against a reserve
+    /// without special-casing overrun.
+    ///
+    /// For a queue-dispatched activity the deadline is anchored to a Postgres
+    /// `NOW()` (the claim timestamp) while `now` here is the worker host's
+    /// clock, so a host running behind the database over-reports by the skew.
+    /// Assumes NTP-synced hosts, as elsewhere in the engine; keep the reserve
+    /// passed to [`is_expiring_within`](Self::is_expiring_within) comfortably
+    /// above any skew you tolerate. Local activities read both sides from the
+    /// host clock and are unaffected.
+    ///
+    /// # Differs from the workflow-side sibling
+    ///
+    /// [`WorkflowContext::time_until_deadline`] returns a
+    /// [`chrono::Duration`] that goes **negative** past the deadline. This
+    /// returns a [`std::time::Duration`], which cannot be negative, so it
+    /// saturates instead — the right shape for a reserve comparison, but it
+    /// means `Some(Duration::ZERO)` cannot distinguish "exactly at the
+    /// deadline" from "ten minutes over". To measure overrun, subtract
+    /// directly: `ctx.deadline().map(|d| Utc::now() - d)`.
+    #[must_use]
+    pub fn time_remaining(&self) -> Option<std::time::Duration> {
+        time_remaining_from(self.deadline, Utc::now())
+    }
+
+    /// `true` when less than `reserve` remains before the attempt deadline.
+    ///
+    /// Always `false` for an unbounded attempt — the guard reads "we are close
+    /// to a deadline", and no deadline means we never are.  Prefer this over
+    /// comparing `time_remaining()` directly: `Option`'s ordering makes
+    /// `None < Some(_)`, so a naive `ctx.time_remaining() < Some(reserve)`
+    /// checkpoints *immediately* on an unbounded activity.
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example(ctx: &ActivityContext) {
+    /// if ctx.is_expiring_within(Duration::from_secs(10)) {
+    ///     // Flush a checkpoint and return early; the retry resumes from it.
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn is_expiring_within(&self, reserve: std::time::Duration) -> bool {
+        should_checkpoint(self.time_remaining(), reserve)
     }
 
     /// Access typed shared state.
@@ -12622,12 +13219,119 @@ impl ActivityContext {
     #[must_use]
     pub fn new_test() -> Self {
         let id = ActivityExecId::new();
+        // Reuse the same id for the identity so `info().activity_id` and the
+        // default idempotency key never disagree in an author's logs.
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
         Self::new(
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            identity,
         )
         .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but on the **local** dispatch path, so
+    /// a test can exercise the `is_local() == true` branch (issue #783).
+    ///
+    /// [`is_local`](Self::is_local) is constructor-set (never a builder), so
+    /// without this there is no way for downstream code to unit-test an
+    /// activity that branches on it — e.g. one that skips checkpointing because
+    /// a local activity cannot heartbeat. Reports `task_id() == None`, matching
+    /// the real inline dispatch.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_local() -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new_local_activity(
+            empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Like [`new_test`](Self::new_test) but wired to a heartbeat channel, so a
+    /// test can exercise an activity that checkpoints with
+    /// [`heartbeat`](Self::heartbeat) — the durable-progress half of the
+    /// deadline-aware pattern in `examples/activity_ctx_info.rs` (issue #783).
+    ///
+    /// Pair it with [`with_deadline`](Self::with_deadline) to drive
+    /// [`time_remaining`](Self::time_remaining) /
+    /// [`is_expiring_within`](Self::is_expiring_within) deterministically,
+    /// without a worker or a database.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_heartbeat(
+        heartbeat_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    ) -> Self {
+        let id = ActivityExecId::new();
+        let identity = ActivityIdentity {
+            activity_id: id,
+            ..ActivityIdentity::for_test()
+        };
+        Self::new(
+            empty_shared_state(),
+            Some(heartbeat_tx),
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+        .with_attempt(1)
+        .with_max_attempts(1)
+    }
+
+    /// Seeds the resume snapshot a retry attempt would see, so a test can drive
+    /// the "resume from the last checkpoint" half of the deadline-aware pattern
+    /// without a worker or a database (issue #783).
+    ///
+    /// This is what the worker passes from `harvest_task_queue.heartbeat_details`
+    /// on a retry; [`heartbeat_details`](Self::heartbeat_details) reads it back.
+    /// It also seeds the auto-heartbeat re-send cell, exactly as the worker does
+    /// (issue #682), so a liveness ping preserves the resumed checkpoint rather
+    /// than clobbering it.
+    ///
+    /// This does **not** attach a flusher: reading the value back still requires
+    /// one, since a real retry attempt always has one. Build the context with
+    /// [`new_test_with_heartbeat`](Self::new_test_with_heartbeat) — a bare
+    /// [`new_test`](Self::new_test) context rejects every heartbeat call,
+    /// including [`heartbeat_details`](Self::heartbeat_details).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_heartbeat_details(mut self, details: Option<serde_json::Value>) -> Self {
+        self.heartbeat_details.clone_from(&details);
+        *self
+            .last_heartbeat_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = details;
+        self
+    }
+
+    /// Like [`new_test`](Self::new_test) but with a caller-supplied identity, so
+    /// two contexts can share one logical invocation's identity while differing
+    /// in attempt number (issue #783).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_test_with_identity(identity: ActivityIdentity) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new(
+            empty_shared_state(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            identity,
+        )
+        .with_idempotency_key(key)
         .with_attempt(1)
         .with_max_attempts(1)
     }
@@ -12641,6 +13345,7 @@ impl ActivityContext {
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         )
     }
 }
@@ -14450,6 +15155,7 @@ mod tests {
         let ctx = ActivityContext::new_local_activity(
             empty_shared_state(),
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         );
 
         let result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
@@ -14465,6 +15171,7 @@ mod tests {
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         );
 
         let heartbeat_result = ctx.heartbeat(serde_json::json!({"progress": 1})).await;
@@ -14482,7 +15189,12 @@ mod tests {
     async fn activity_context_heartbeat_sends_on_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
 
         // Send a couple of heartbeats with different payloads.
         ctx.heartbeat(serde_json::json!({"progress": 50}))
@@ -14504,7 +15216,12 @@ mod tests {
     async fn activity_context_detects_cancellation() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel.clone());
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        );
 
         // Before cancellation -- should not be cancelled.
         assert!(!ctx.is_cancelled());
@@ -14526,7 +15243,12 @@ mod tests {
     async fn activity_check_cancellation_returns_ok_when_not_cancelled() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
         assert!(ctx.check_cancellation().await.is_ok());
     }
 
@@ -14534,7 +15256,12 @@ mod tests {
     async fn activity_check_cancellation_returns_activity_cancelled_when_token_set() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel.clone());
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        );
         cancel.cancel();
         let result = ctx.check_cancellation().await;
         assert!(
@@ -14556,8 +15283,13 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel.clone())
-            .with_heartbeat_timeout(timeout);
+        let ctx = ActivityContext::new(
+            empty_shared_state(),
+            Some(tx),
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        )
+        .with_heartbeat_timeout(timeout);
         (ctx, rx, cancel)
     }
 
@@ -14790,6 +15522,7 @@ mod tests {
             cancel,
             uuid::Uuid::new_v4(),
             pool,
+            ActivityIdentity::for_test(),
         )
         .with_heartbeat_timeout(Duration::from_secs(3));
 
@@ -14817,7 +15550,12 @@ mod tests {
         // rather than silently spawning a ticker whose pings are never checked.
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(empty_shared_state(), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            empty_shared_state(),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
 
         assert!(
             matches!(
@@ -14842,6 +15580,7 @@ mod tests {
         let ctx = ActivityContext::new_local_activity(
             empty_shared_state(),
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         )
         .with_heartbeat_timeout(Duration::from_secs(3));
 
@@ -14865,6 +15604,7 @@ mod tests {
             empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
         )
         .with_heartbeat_timeout(Duration::from_secs(3));
         assert!(
@@ -14881,7 +15621,12 @@ mod tests {
         // Local activities have no heartbeat channel; check_cancellation must
         // still detect token cancellation correctly.
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), None, cancel.clone());
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            None,
+            cancel.clone(),
+            ActivityIdentity::for_test(),
+        );
         assert!(ctx.check_cancellation().await.is_ok());
         cancel.cancel();
         let result = ctx.check_cancellation().await;
@@ -14912,7 +15657,12 @@ mod tests {
     async fn activity_context_heartbeat_errors_when_channel_closed() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = ActivityContext::new(Arc::new(HashMap::new()), Some(tx), cancel);
+        let ctx = ActivityContext::new(
+            Arc::new(HashMap::new()),
+            Some(tx),
+            cancel,
+            ActivityIdentity::for_test(),
+        );
 
         // Drop the receiver -- channel is now closed.
         drop(rx);
@@ -23464,5 +24214,569 @@ mod tests {
         let info = ctx.info();
         let cloned = info.clone();
         assert_eq!(info, cloned);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Activity run metadata: pure deadline helpers (issue #783)
+// ---------------------------------------------------------------------------
+
+/// The absolute instant at which the engine will kill the current activity
+/// attempt, or `None` when the attempt is genuinely unbounded (issue #783).
+///
+/// This is the **earlier** of the two *static* clocks that can terminate a
+/// `RUNNING` activity row:
+///
+/// * the per-attempt `start_to_close` budget — `started_at + start_to_close`,
+///   byte-for-byte the predicate `timeout::start_to_close_timeout_query`
+///   enforces; and
+/// * the cross-retry `schedule_to_close_at` wall-clock deadline (issue #378),
+///   whose scanner (`timeout::schedule_to_close_timeout_query`) matches
+///   `state IN ('RUNNING', 'PENDING')` and therefore kills an in-flight
+///   attempt too.
+///
+/// Both inputs NULL-propagate exactly as the scanners' SQL does: a row with no
+/// `started_at` (or no `start_to_close`) is never start-to-close-timed-out, so
+/// that clock contributes no deadline. In particular this must **never** fall
+/// back to `scheduled_at` — the schedule-to-start *metric* does that, but doing
+/// it here would report a deadline the enforcer does not honour.
+///
+/// Over-reporting is the destructive direction: an activity that believes it
+/// has more budget than it does keeps working and is killed mid-flight, losing
+/// everything since its last checkpoint. Under-reporting merely costs one
+/// avoidable retry.
+///
+/// # The heartbeat clock is deliberately excluded
+///
+/// A third scanner predicate also matches `state = 'RUNNING'`:
+/// `COALESCE(last_heartbeat_at, started_at) + heartbeat_timeout < NOW()`. It is
+/// **not** folded in here, for two reasons:
+///
+/// * it is *dynamic* — every flushed `ctx.heartbeat(..)` pushes it forward, so
+///   there is no single instant to freeze at claim time. Folding in the
+///   worst case (`started_at + heartbeat_timeout`) would make a *correctly
+///   heartbeating* activity with a short `heartbeat_timeout` believe it is
+///   permanently out of budget, so a `is_expiring_within` guard would yield on
+///   every attempt and the activity would never make progress — a strictly
+///   worse failure than the one it would prevent; and
+/// * "heartbeat-timeout remaining time" is explicitly out of scope for issue
+///   #783.
+///
+/// The practical consequence: an activity configured with
+/// `heartbeat_timeout < start_to_close` can be killed by the heartbeat scanner
+/// *before* [`ActivityContext::deadline`], so it must actually heartbeat rather
+/// than rely on [`ActivityContext::is_expiring_within`] alone.
+/// [`ActivityContext::heartbeat_timeout`] exposes the configured value for an
+/// author who wants to compute that clock themselves.
+///
+/// The only non-test caller is the `db`-gated worker dispatch path, so the
+/// no-`db` build sees it as dead code (same treatment as
+/// [`ActivityContext::new_local_activity`]).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn attempt_deadline(
+    started_at: Option<DateTime<Utc>>,
+    start_to_close: Option<chrono::Duration>,
+    schedule_to_close_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let per_attempt = started_at
+        .zip(start_to_close)
+        .and_then(|(started, budget)| started.checked_add_signed(budget));
+    match (per_attempt, schedule_to_close_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// Time left before `deadline` as of `now`, **saturating at zero** (issue
+/// #783). `None` when the attempt is unbounded.
+///
+/// `chrono::Duration::to_std` fails only for a negative duration (a positive
+/// one cannot overflow `u64` seconds within `chrono`'s representable range), so
+/// the `unwrap_or(ZERO)` saturates an elapsed deadline exactly as AC2 requires
+/// and can never mis-report a far-future deadline as zero.
+pub(crate) fn time_remaining_from(
+    deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<std::time::Duration> {
+    let deadline = deadline?;
+    Some(
+        (deadline - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO),
+    )
+}
+
+/// Whether an activity should stop and checkpoint: `true` iff the attempt has a
+/// known deadline **and** strictly less than `reserve` remains (issue #783).
+///
+/// An unbounded attempt returns `false`. That case is the whole reason this
+/// helper exists: `Option`'s `Ord` orders `None` **before** `Some(_)`, so the
+/// natural-looking `ctx.time_remaining() < Some(reserve)` is `true` for an
+/// unbounded activity and spins it in a bail-checkpoint-retry loop that never
+/// makes progress.
+pub(crate) fn should_checkpoint(
+    remaining: Option<std::time::Duration>,
+    reserve: std::time::Duration,
+) -> bool {
+    remaining.is_some_and(|left| left < reserve)
+}
+
+#[cfg(test)]
+mod activity_deadline_helper_tests {
+    use super::{attempt_deadline, should_checkpoint, time_remaining_from};
+    use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+    use std::time::Duration;
+
+    fn at(secs: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    #[test]
+    fn attempt_deadline_is_started_at_plus_start_to_close() {
+        assert_eq!(
+            attempt_deadline(Some(at(0)), Some(ChronoDuration::seconds(30)), None),
+            Some(at(30))
+        );
+    }
+
+    /// TRAP 1: the scanner's SQL NULL-propagates, so a row with no `started_at`
+    /// is never start-to-close-timed-out. Falling back to `scheduled_at` (as
+    /// the schedule-to-start *metric* does) would disagree with the enforcer.
+    #[test]
+    fn attempt_deadline_is_none_without_started_at() {
+        assert_eq!(
+            attempt_deadline(None, Some(ChronoDuration::seconds(30)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn attempt_deadline_is_none_without_start_to_close() {
+        assert_eq!(attempt_deadline(Some(at(0)), None, None), None);
+    }
+
+    #[test]
+    fn attempt_deadline_is_none_when_both_absent() {
+        assert_eq!(attempt_deadline(None, None, None), None);
+    }
+
+    /// `schedule_to_close_at` (issue #378) also kills a RUNNING activity, so
+    /// the reported deadline must be the EARLIER of the two clocks. Reporting
+    /// only `start_to_close` would over-report remaining time — the
+    /// destructive direction (the activity keeps working and is killed).
+    #[test]
+    fn attempt_deadline_takes_the_earlier_of_start_to_close_and_schedule_to_close() {
+        // schedule_to_close is earlier -> it wins.
+        assert_eq!(
+            attempt_deadline(
+                Some(at(0)),
+                Some(ChronoDuration::seconds(300)),
+                Some(at(60))
+            ),
+            Some(at(60))
+        );
+        // start_to_close is earlier -> it wins.
+        assert_eq!(
+            attempt_deadline(
+                Some(at(0)),
+                Some(ChronoDuration::seconds(30)),
+                Some(at(600))
+            ),
+            Some(at(30))
+        );
+    }
+
+    /// A cross-retry deadline binds even when this attempt has no
+    /// `start_to_close` of its own.
+    #[test]
+    fn attempt_deadline_uses_schedule_to_close_alone() {
+        assert_eq!(
+            attempt_deadline(Some(at(0)), None, Some(at(90))),
+            Some(at(90))
+        );
+        assert_eq!(attempt_deadline(None, None, Some(at(90))), Some(at(90)));
+    }
+
+    #[test]
+    fn attempt_deadline_overflow_saturates_to_none() {
+        assert_eq!(
+            attempt_deadline(
+                Some(chrono::DateTime::<Utc>::MAX_UTC),
+                Some(ChronoDuration::seconds(1)),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn time_remaining_from_is_none_when_unbounded() {
+        assert_eq!(time_remaining_from(None, at(0)), None);
+    }
+
+    #[test]
+    fn time_remaining_from_reports_the_gap() {
+        assert_eq!(
+            time_remaining_from(Some(at(30)), at(10)),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    /// AC2: `time_remaining()` is never negative.
+    #[test]
+    fn time_remaining_from_saturates_at_zero_past_the_deadline() {
+        assert_eq!(
+            time_remaining_from(Some(at(10)), at(600)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            time_remaining_from(Some(at(10)), at(10)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// Misuse guard: `Option: Ord` makes `None < Some(_)`, so a naive
+    /// `ctx.time_remaining() < Some(reserve)` is TRUE for an unbounded
+    /// activity — an infinite bail loop. `should_checkpoint` returns `false`.
+    #[test]
+    fn should_checkpoint_is_false_when_unbounded() {
+        assert!(!should_checkpoint(None, Duration::from_secs(5)));
+        // Demonstrate the trap the helper exists to avoid.
+        assert!(None::<Duration> < Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn should_checkpoint_is_true_below_the_reserve() {
+        assert!(should_checkpoint(
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(5)
+        ));
+        assert!(should_checkpoint(
+            Some(Duration::ZERO),
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn should_checkpoint_boundary_is_strict() {
+        // Exactly at the reserve is NOT yet expiring.
+        assert!(!should_checkpoint(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        ));
+        assert!(!should_checkpoint(
+            Some(Duration::from_secs(6)),
+            Duration::from_secs(5)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod activity_info_tests {
+    use super::{ActivityContext, ActivityExecutionInfo, ActivityIdentity};
+    use crate::types::{ActivityExecId, ExecutionId};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::time::Duration;
+
+    fn configured() -> ActivityContext {
+        ActivityContext::new_test()
+            .with_execution_id(ExecutionId::new())
+            .with_workflow_id("cart-42")
+            .with_workflow_type("checkout")
+            .with_activity_type("charge_card")
+            .with_activity_id(ActivityExecId::new())
+            .with_queue_name("payments")
+            .with_attempt(2)
+            .with_max_attempts(5)
+    }
+
+    /// `with_activity_id` must keep the derived idempotency key in step.
+    ///
+    /// The docs promise `activity_id` backs `idempotency_key()`, and production
+    /// dispatch builds both from the same id. A builder that moved only the
+    /// identity would hand tests a context the engine never produces — an
+    /// activity keying an external call off `idempotency_key()` would look
+    /// correct in a test and collide in production.
+    #[test]
+    fn with_activity_id_re_derives_the_idempotency_key() {
+        let first = ActivityContext::new_test();
+        let original = first
+            .idempotency_key()
+            .expect("new_test attaches a key")
+            .clone();
+
+        let moved = ActivityExecId::new();
+        let ctx = first.with_activity_id(moved);
+        let key = ctx.idempotency_key().expect("key survives the move");
+
+        assert_ne!(key, &original, "the key must follow the new activity id");
+        assert_eq!(
+            key,
+            &crate::types::IdempotencyKey::from_activity_exec_id(moved),
+            "and must be exactly the key production would derive from that id"
+        );
+        assert_eq!(ctx.info().activity_id, moved);
+    }
+
+    /// ...but it never manufactures a key on a context that had none.
+    ///
+    /// `new_local_activity` starts keyless until the worker attaches one; a
+    /// builder that invented a key here would turn `idempotency_key()`'s
+    /// documented `Config` error into a silent success.
+    #[test]
+    fn with_activity_id_does_not_invent_a_key_when_none_is_attached() {
+        let ctx = ActivityContext::new_local_activity(
+            super::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        )
+        .with_activity_id(ActivityExecId::new());
+
+        assert!(
+            ctx.idempotency_key().is_err(),
+            "a keyless context must stay keyless"
+        );
+    }
+
+    /// An explicit key set *after* the id wins — the documented escape hatch.
+    #[test]
+    fn explicit_idempotency_key_after_the_id_wins() {
+        let custom = crate::types::IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+        let ctx = ActivityContext::new_test()
+            .with_activity_id(ActivityExecId::new())
+            .with_idempotency_key(custom.clone());
+        assert_eq!(ctx.idempotency_key().expect("custom key"), &custom);
+    }
+
+    /// AC1: every field the issue names is present and readable.
+    #[test]
+    fn info_exposes_every_ac1_field() {
+        let exec_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let task_id = uuid::Uuid::new_v4();
+        let ctx = ActivityContext::new_test()
+            .with_execution_id(exec_id)
+            .with_workflow_id("cart-42")
+            .with_workflow_type("checkout")
+            .with_activity_type("charge_card")
+            .with_activity_id(activity_id)
+            .with_queue_name("payments")
+            .with_task_id(Some(task_id))
+            .with_attempt(3)
+            .with_max_attempts(7);
+
+        let info: ActivityExecutionInfo = ctx.info();
+        assert_eq!(info.execution_id, exec_id);
+        assert_eq!(info.workflow_id, "cart-42");
+        assert_eq!(info.workflow_type, "checkout");
+        assert_eq!(info.activity_type, "charge_card");
+        assert_eq!(info.activity_id, activity_id);
+        assert_eq!(info.attempt, 3);
+        assert_eq!(info.max_attempts, 7);
+        assert!(!info.is_local);
+        assert_eq!(info.queue_name, "payments");
+        assert_eq!(info.task_id, Some(task_id));
+    }
+
+    /// AC1: `info()` agrees with each standalone accessor — one source of truth.
+    #[test]
+    fn info_agrees_with_the_standalone_accessors() {
+        let ctx = configured();
+        let info = ctx.info();
+        assert_eq!(info.execution_id, ctx.execution_id());
+        assert_eq!(info.workflow_id, ctx.workflow_id());
+        assert_eq!(info.workflow_type, ctx.workflow_type());
+        assert_eq!(info.activity_type, ctx.activity_type());
+        assert_eq!(info.activity_id, ctx.activity_id());
+        assert_eq!(info.attempt, ctx.attempt());
+        assert_eq!(info.max_attempts, ctx.max_attempts());
+        assert_eq!(info.is_local, ctx.is_local());
+        assert_eq!(info.queue_name, ctx.queue_name());
+        assert_eq!(info.task_id, ctx.task_id());
+        // Pin the projection field-by-field, so an `identity()` that returns a
+        // constant (or drops a field) cannot hide behind an equality-only
+        // retry-stability assertion.
+        assert_eq!(
+            info.identity(),
+            ActivityIdentity::new(
+                info.execution_id,
+                &info.workflow_id,
+                &info.workflow_type,
+                &info.activity_type,
+                info.activity_id,
+            )
+        );
+        // The cheap context-level accessor must agree with the info-level one.
+        assert_eq!(ctx.identity(), info.identity());
+    }
+
+    /// `with_heartbeat_details` seeds the resume snapshot a retry attempt reads
+    /// back — but only on a context that actually has a flusher, matching a real
+    /// retry. It must NOT paper over a missing flusher: silently accepting a
+    /// checkpoint that goes nowhere is worse than rejecting it.
+    #[test]
+    fn with_heartbeat_details_seeds_the_resume_snapshot_when_a_flusher_is_attached() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let ctx = ActivityContext::new_test_with_heartbeat(tx)
+            .with_heartbeat_details(Some(serde_json::json!({"next": 4})));
+        assert_eq!(
+            ctx.heartbeat_details::<serde_json::Value>()
+                .expect("a flusher-backed context can read its resume snapshot"),
+            Some(serde_json::json!({"next": 4}))
+        );
+
+        // Without a flusher the read is rejected, exactly as `heartbeat()` is —
+        // a checkpoint written here would be silently dropped.
+        let bare = ActivityContext::new_test()
+            .with_heartbeat_details(Some(serde_json::json!({"next": 4})));
+        assert!(
+            bare.heartbeat_details::<serde_json::Value>().is_err(),
+            "a flusher-less context must not pretend to carry a checkpoint"
+        );
+    }
+
+    /// `new_test_local` is the only way downstream code can reach the
+    /// `is_local() == true` branch, since `is_local` is constructor-set.
+    #[test]
+    fn new_test_local_reports_the_local_dispatch_path() {
+        let ctx = ActivityContext::new_test_local();
+        assert!(ctx.is_local(), "must report the local dispatch path");
+        assert_eq!(
+            ctx.task_id(),
+            None,
+            "a local activity has no harvest_task_queue row"
+        );
+        assert_eq!(ctx.info().is_local, ctx.is_local());
+        // And it genuinely cannot heartbeat, matching real inline dispatch.
+        assert!(ctx.heartbeat_details::<serde_json::Value>().is_err());
+    }
+
+    /// AC3: the reported id is the exact management-API `{exec_id}` path
+    /// segment — it must round-trip through `Display` / `FromStr` unchanged,
+    /// because that string is what an operator pastes into a URL.
+    #[test]
+    fn info_execution_id_round_trips_through_its_string_form() {
+        let ctx = configured();
+        let rendered = ctx.info().execution_id.to_string();
+        let parsed: ExecutionId = rendered.parse().expect("execution id must parse back");
+        assert_eq!(parsed, ctx.info().execution_id);
+        // The pasteable form must be the bare UUID, never a Debug wrapper.
+        assert!(!rendered.contains("ExecutionId"), "got {rendered}");
+        assert_eq!(rendered, ctx.info().execution_id.as_uuid().to_string());
+    }
+
+    /// AC4: only `attempt` (and the deadline) advance between retries.
+    #[test]
+    fn identity_is_stable_across_attempts_while_attempt_advances() {
+        let exec_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let build = |attempt: u32| {
+            ActivityContext::new_test()
+                .with_execution_id(exec_id)
+                .with_workflow_id("cart-42")
+                .with_workflow_type("checkout")
+                .with_activity_type("charge_card")
+                .with_activity_id(activity_id)
+                .with_attempt(attempt)
+        };
+        let first = build(1).info();
+        let second = build(2).info();
+
+        let a: ActivityIdentity = first.identity();
+        let b: ActivityIdentity = second.identity();
+        assert_eq!(a, b, "identity must be stable across attempts");
+        assert_ne!(first.attempt, second.attempt);
+        assert_eq!(first.attempt, 1);
+        assert_eq!(second.attempt, 2);
+    }
+
+    /// The identity subset must exclude the per-attempt fields, or the AC4
+    /// assertion above would be vacuous the moment `attempt` joined it.
+    #[test]
+    fn identity_excludes_the_per_attempt_fields() {
+        let ctx = configured();
+        let identity = ctx.info().identity();
+        let rendered = format!("{identity:?}");
+        assert!(
+            !rendered.contains("attempt"),
+            "identity must not carry attempt: {rendered}"
+        );
+        assert!(rendered.contains("cart-42"));
+        assert!(rendered.contains("charge_card"));
+    }
+
+    /// AC5: `is_local` distinguishes the two dispatch paths.
+    #[test]
+    fn is_local_is_false_for_a_queue_dispatch_and_true_for_an_inline_one() {
+        assert!(!ActivityContext::new_test().is_local());
+        let local = ActivityContext::new_local_activity(
+            crate::context::empty_shared_state(),
+            tokio_util::sync::CancellationToken::new(),
+            ActivityIdentity::for_test(),
+        );
+        assert!(local.is_local());
+        assert!(local.info().is_local);
+    }
+
+    /// AC2: no `start_to_close` configured -> unbounded.
+    #[test]
+    fn deadline_and_time_remaining_are_none_when_unbounded() {
+        let ctx = ActivityContext::new_test();
+        assert_eq!(ctx.deadline(), None);
+        assert_eq!(ctx.time_remaining(), None);
+        // Misuse guard: the convenience predicate must not fire when unbounded.
+        assert!(!ctx.is_expiring_within(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn deadline_round_trips_and_time_remaining_is_positive_for_a_future_deadline() {
+        let deadline = Utc::now() + ChronoDuration::seconds(60);
+        let ctx = ActivityContext::new_test().with_deadline(Some(deadline));
+        assert_eq!(ctx.deadline(), Some(deadline));
+        let left = ctx
+            .time_remaining()
+            .expect("bounded attempt has remaining time");
+        assert!(
+            left > Duration::from_secs(50) && left <= Duration::from_secs(60),
+            "expected ~60s, got {left:?}"
+        );
+        assert!(!ctx.is_expiring_within(Duration::from_secs(5)));
+        assert!(ctx.is_expiring_within(Duration::from_secs(120)));
+    }
+
+    /// AC2: never negative.
+    #[test]
+    fn time_remaining_saturates_at_zero_for_an_elapsed_deadline() {
+        let ctx = ActivityContext::new_test()
+            .with_deadline(Some(Utc::now() - ChronoDuration::minutes(10)));
+        assert_eq!(ctx.time_remaining(), Some(Duration::ZERO));
+        assert!(ctx.is_expiring_within(Duration::from_secs(1)));
+    }
+
+    /// `new_test()` must mint a coherent identity out of the box: the
+    /// `activity_id` reported by `info()` is the same one backing the
+    /// idempotency key, so the two never disagree in an author's logs.
+    #[test]
+    fn new_test_mints_a_coherent_identity() {
+        let ctx = ActivityContext::new_test();
+        let info = ctx.info();
+        let key = ctx
+            .idempotency_key()
+            .expect("new_test sets an idempotency key");
+        assert_eq!(key.as_str(), info.activity_id.as_uuid().to_string());
+        assert_eq!(info.attempt, 1);
+        assert_eq!(info.max_attempts, 1);
+        assert_eq!(info.task_id, None);
+    }
+
+    #[test]
+    fn info_is_clone_and_eq() {
+        let info = configured().info();
+        assert_eq!(info.clone(), info);
+        let identity = info.identity();
+        assert_eq!(identity.clone(), identity);
     }
 }

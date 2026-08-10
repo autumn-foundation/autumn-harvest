@@ -50,6 +50,7 @@ compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
 linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
+linux        autumn-harvest         integration                      -                          activity_info_tests
 linux        autumn-harvest         integration                      -                          activity_interceptor_tests
 linux        autumn-harvest         integration                      -                          admission_gate_authoritative
 linux        autumn-harvest         integration                      -                          auto_heartbeat_tests
@@ -86,6 +87,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      testing                    nd_block
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
+linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
 linux        autumn-harvest-plugin  awaitables_integration           -                          -

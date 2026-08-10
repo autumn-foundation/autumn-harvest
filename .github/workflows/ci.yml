@@ -185,6 +185,9 @@ jobs:
       - name: Run typed_workflow_failure example tests (issue #767)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example typed_workflow_failure
+      - name: Run activity_ctx_info example tests (issue #783)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_ctx_info
       - name: Run activity_interceptor example tests (issue #680)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features --features testing --example activity_interceptor

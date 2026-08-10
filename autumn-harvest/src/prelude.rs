@@ -13,9 +13,9 @@ pub use crate::circuit_breaker::{
     DispatchDecision, DispatchToken,
 };
 pub use crate::context::{
-    ActivityContext, AutoHeartbeatGuard, DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard,
-    MutexHandle, Session, SessionOptions, TimerHandle, TimerOutcome, WorkflowContext,
-    WorkflowExecutionInfo,
+    ActivityContext, ActivityExecutionInfo, ActivityIdentity, AutoHeartbeatGuard,
+    DEFAULT_SESSION_ACQUISITION_TIMEOUT, MutexGuard, MutexHandle, Session, SessionOptions,
+    TimerHandle, TimerOutcome, WorkflowContext, WorkflowExecutionInfo,
 };
 pub use crate::dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,

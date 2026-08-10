@@ -4,6 +4,8 @@
 mod active_workflow_gauge_tests;
 mod activity_default_floor_tests;
 mod activity_failure_tests;
+#[cfg(feature = "db")]
+mod activity_info_tests;
 mod activity_interceptor_tests;
 mod activity_outcome_metrics_tests;
 mod admission_gate_authoritative_tests;

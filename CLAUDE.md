@@ -1049,7 +1049,7 @@ async fn checkout(ctx: &WorkflowContext, cart: Cart) -> Result<(), String> {
 
 `execution_id` is the exact identifier the management API path (`/api/harvest/workflows/{exec_id}/...`), the DLQ, reset/pause/cancel, and the ADR-0001 `execution.id` span attribute all use — so a log line carrying `ctx.info().execution_id` opens that run with **zero** directory lookups. `parent_execution_id` is `None` for a top-level run and the spawning parent's id for a child (threaded by the worker from the execution row's `parent_id`). Two sibling `const fn` accessors also exist: `ctx.start_time()` (the **raw** frozen `WorkflowStarted` timestamp — deliberately **not** the advancing virtual clock that `ctx.now()` moves under the test harness) and `ctx.parent_execution_id()`.
 
-**Guarantees:** every field derives from already-recorded state (the `WorkflowStarted` event + the execution row the executor already loads), so `info()` is **replay-deterministic** (byte-identical on every worker and every replay pass) and **leaves zero footprint** — it appends no `harvest_events` and emits no `WorkflowCommand`, the same leave-no-trace property as a query handler. Usable from any `#[workflow]` body with **no feature flag**. **No new `WorkflowEvent` variant, no migration.** One exception to the byte-identical/branch-safe claim: `is_replaying` is **observability-only** — it intentionally differs live-vs-replay (it *is* the replay indicator), so do not branch command-affecting logic on it or include it in an activity input (doing so records different commands live vs replay → non-determinism). See `autumn-harvest/examples/ctx_info.rs`.
+**Guarantees:** every field derives from already-recorded state (the `WorkflowStarted` event + the execution row the executor already loads), so `info()` is **replay-deterministic** (byte-identical on every worker and every replay pass) and **leaves zero footprint** — it appends no `harvest_events` and emits no `WorkflowCommand`, the same leave-no-trace property as a query handler. Usable from any `#[workflow]` body with **no feature flag**. **No new `WorkflowEvent` variant, no migration.** One exception to the byte-identical/branch-safe claim: `is_replaying` is **observability-only** — it intentionally differs live-vs-replay (it *is* the replay indicator), so do not branch command-affecting logic on it or include it in an activity input (doing so records different commands live vs replay → non-determinism). See `autumn-harvest/examples/ctx_info.rs`. The activity-side counterpart is `ActivityContext::info()` — see "Activity run metadata and deadline" below (issue #783).
 
 ### Patched / Code Evolution (issue #687)
 
@@ -1110,6 +1110,8 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 | `schedule_to_start` timeout | **Not supported** | Supported |
 | Custom task queue | **Not supported** | Supported |
 | Retry policy | Supported | Supported |
+| `ctx.info().task_id` | `None` (no `harvest_task_queue` row exists) | `Some(task_id)` — the id the operator `retry-now`/`fail-now` routes address |
+| `ctx.deadline()` | `now + min(start_to_close, WorkerConfig::max_local_activity_start_to_close)` — always bounded | `min(started_at + start_to_close, schedule_to_close_at)`, or `None` when both are unset |
 | Durability / replay | Full (events appended to history) | Full (events appended to history) |
 
 **Use a local activity when:**
@@ -1122,6 +1124,79 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 - You need the activity to run on a different worker pool or machine
 - The operation might take more than 60 s or needs heartbeating to signal liveness
 - You want `schedule_to_start` timeout enforcement
+
+### Activity run metadata and deadline — `ctx.info()` (issue #783)
+
+`ctx.info()` is the activity-side counterpart of the workflow-side `ctx.info()` (issue #698): a read-only, zero-footprint snapshot of **who owns this attempt** and **how much of its budget is left**. Reading it performs no I/O, appends no event, and sends no heartbeat.
+
+```rust
+#[activity(start_to_close = "30s")]
+async fn charge_card(ctx: &ActivityContext, amount_cents: i64) -> Result<String, String> {
+    let info = ctx.info();
+    // One-hop correlation: `execution_id` IS the management-API path segment —
+    // GET /api/harvest/workflows/{execution_id} opens the owning run.
+    tracing::info!(
+        execution_id = %info.execution_id,   // owning run
+        workflow = %info.workflow_type,      // e.g. "order_flow"
+        workflow_id = %info.workflow_id,     // e.g. "order-42"
+        activity = %info.activity_type,
+        attempt = info.attempt, max = info.max_attempts,
+        task_id = ?info.task_id,             // the retry-now / fail-now id
+        "charging card",
+    );
+    // A run-scoped idempotency key, stable across every retry attempt:
+    let key = format!("charge-{}-{}", info.execution_id, info.activity_id);
+    // ...
+    Ok(format!("charged {amount_cents} cents"))
+}
+```
+
+`ActivityExecutionInfo` fields: `execution_id`, `workflow_id`, `workflow_type`, `activity_type`, `activity_id`, `attempt`, `max_attempts`, `is_local`, `queue_name`, `task_id`. Each also has a standalone accessor (`ctx.execution_id()`, `ctx.workflow_id()`, …).
+
+**Identity is stable across retries.** `info.identity()` returns the `ActivityIdentity` subset — `execution_id` / `workflow_id` / `workflow_type` / `activity_type` / `activity_id` — that is byte-identical on every attempt of the same logical invocation. Only `attempt` and the deadline advance. Deriving an idempotency key from `identity()` therefore reuses one key across retries; assert on `identity()` (not a hand-written field list) so a test stays honest as fields are added.
+
+#### Deadline-aware checkpointing
+
+| Method | Returns |
+|--------|---------|
+| `ctx.deadline()` | `Option<DateTime<Utc>>` — the **earliest** of `started_at + start_to_close` and the cross-retry `schedule_to_close` deadline; `None` when unbounded |
+| `ctx.time_remaining()` | `Option<Duration>` — time left, **saturating at zero** (never negative); `None` when unbounded |
+| `ctx.is_expiring_within(reserve)` | `bool` — `true` when less than `reserve` remains; **always `false` when unbounded** |
+
+Taking the **minimum** of the two clocks matters: `schedule_to_close` enforcement (issue #378) kills a `RUNNING` row, so reporting only the per-attempt budget would over-report the time available and let an activity work right up to a kill that discards everything.
+
+**Prefer `is_expiring_within` over comparing `time_remaining()` yourself.** `Option` orders `None` *below* `Some(_)`, so a naive `ctx.time_remaining() < Some(reserve)` checkpoints **immediately** on an unbounded activity — exactly backwards.
+
+The pattern this enables — yield cleanly instead of being killed mid-item, so a retry re-executes **nothing**:
+
+```rust
+#[activity(start_to_close = "30s", heartbeat_timeout = "60s")]
+async fn import_rows(ctx: &ActivityContext, req: ImportRequest) -> Result<u32, String> {
+    // 1. resume from the checkpoint (empty on the first attempt)
+    let mut next = ctx.heartbeat_details::<ImportCheckpoint>()
+        .map_err(|e| e.to_string())?.unwrap_or_default().next;
+    while next < req.total_rows {
+        // 2. is the budget nearly spent?
+        if ctx.is_expiring_within(Duration::from_secs(3)) {
+            // 3. yield with a RETRYABLE error — the checkpoint survives the requeue.
+            //    Wait out one flusher interval first: the batched heartbeat flusher
+            //    ticks ~1 s and does NOT drain on cancel, so a checkpoint sent
+            //    immediately before returning can be lost.
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            return Err(format!("deadline reserve reached at row {next}"));
+        }
+        // 4. ... do the work ... then checkpoint
+        next += 1;
+        ctx.heartbeat(serde_json::to_value(ImportCheckpoint { next }).map_err(|e| e.to_string())?)
+            .await.map_err(|e| e.to_string())?;
+    }
+    Ok(next)
+}
+```
+
+Size the reserve above the ~1 s flusher interval plus the cost of one unit of work. Local activities cannot heartbeat, so this pattern is regular-activity-only; a local activity's `deadline()` is still reported (from the worker cap) and is useful for bailing out early.
+
+See `autumn-harvest/examples/activity_ctx_info.rs`. **No new `WorkflowEvent` variant, no migration** — every field is already-resolved dispatch state.
 
 ### Worker Sessions (issue #606)
 

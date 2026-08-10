@@ -99,6 +99,10 @@ required-features = ["db"]
 name = "timezone_cron_schedule"
 
 [[example]]
+name = "activity_ctx_info"
+required-features = ["testing"]
+
+[[example]]
 name = "auto_heartbeat"
 
 [[example]]
