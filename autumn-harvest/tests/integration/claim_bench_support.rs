@@ -439,6 +439,66 @@ pub fn budget_from_env(default_ms: f64) -> f64 {
     budget_from_str(std::env::var(BUDGET_ENV_VAR).ok().as_deref(), default_ms)
 }
 
+/// Strip userinfo from a connection URL so it is safe to print.
+///
+/// `HARVEST_TEST_DATABASE_URL` is an *admin* connection string and normally
+/// carries a password. Both the benchmark and the CI gate print the
+/// [`db::SkipReason`] they fail with, so an unredacted URL in that message is a
+/// credential leaked into a CI log that anyone with read access can scroll
+/// back through.
+///
+/// Host, port and database are kept — those are what make the message
+/// diagnostic — and only the `user:password@` segment is replaced.
+///
+/// Our interpolation was the only leak: `diesel`/`tokio-postgres` were probed
+/// with a password-bearing URL across connection-refused, DNS-failure and
+/// malformed-string cases and reported only `"error connecting to server"` /
+/// `"invalid connection string"`, never the URL. So redacting here closes the
+/// exposure rather than merely narrowing it — but the call site still passes
+/// the redacted form on principle, so a future driver that starts echoing its
+/// input cannot silently reopen it.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (prefix, rest) = url.split_at(scheme_end + 3);
+    // Userinfo, if present, runs to the last '@' before the authority ends.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    authority.rfind('@').map_or_else(
+        || url.to_string(),
+        |at| {
+            format!(
+                "{prefix}***@{}{}",
+                &authority[at + 1..],
+                &rest[authority_end..]
+            )
+        },
+    )
+}
+
+/// Rewrite a connection URL to point at a different database.
+///
+/// Replaces **only** the path component, preserving any query string. Naively
+/// splicing at the last `/` breaks two real cases: it silently drops
+/// `?sslmode=require` (so a server that requires TLS becomes unreachable via
+/// the advertised existing-server mode), and when a parameter value itself
+/// contains a slash — `?sslrootcert=/etc/ssl/root.crt` — it splices *inside the
+/// query* and produces a malformed URL.
+///
+/// Userinfo may not contain an unencoded `/`, `?` or `#` in a valid URI, so
+/// locating the authority by the first such character is sound.
+#[must_use]
+pub fn with_db_name(url: &str, db: &str) -> String {
+    let (prefix, rest) = url.find("://").map_or(("", url), |i| url.split_at(i + 3));
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    // Whatever follows the path — query and/or fragment — is carried over.
+    let suffix_start = tail.find(['?', '#']).unwrap_or(tail.len());
+    format!("{prefix}{authority}/{db}{}", &tail[suffix_start..])
+}
+
 // ---------------------------------------------------------------------------
 // Pure unit tests (run on every OS, no Docker, no `db` feature).
 // ---------------------------------------------------------------------------
@@ -456,7 +516,8 @@ mod pure_tests {
     use super::{
         BACKLOG_SWEEP, BudgetVerdict, ClaimGate, DEFAULT_SCENARIO_BUDGET_SECS,
         HEADLINE_P50_BUDGET_MS, LatencyStats, budget_from_str, budget_verdict, claims_for_claimer,
-        headline_scenario, measured_claims_for, percentile_ms, warmup_claims_for,
+        headline_scenario, measured_claims_for, percentile_ms, redact_url, warmup_claims_for,
+        with_db_name,
     };
 
     #[test]
@@ -612,6 +673,82 @@ mod pure_tests {
     }
 
     #[test]
+    fn redact_url_removes_the_password_but_keeps_the_endpoint() {
+        // The whole point: this string ends up in a CI log.
+        let redacted = redact_url("postgres://alice:hunter2@db.internal:5432/postgres");
+        assert!(
+            !redacted.contains("hunter2") && !redacted.contains("alice"),
+            "userinfo survived redaction: {redacted}",
+        );
+        // Still diagnostic — an operator must be able to tell *which* server.
+        assert!(
+            redacted.contains("db.internal:5432") && redacted.contains("postgres"),
+            "redaction destroyed the endpoint: {redacted}",
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_a_credential_free_url_alone() {
+        for url in [
+            "postgres://localhost:5432/postgres",
+            "postgres://db.internal/harvest?sslmode=require",
+            "not-a-url",
+        ] {
+            assert_eq!(redact_url(url), url, "rewrote a URL with no userinfo");
+        }
+    }
+
+    #[test]
+    fn redact_url_handles_a_password_containing_an_at_sign() {
+        // Percent-encoding is the correct spelling, but an operator who pastes
+        // a raw '@' must still not have it echoed. The *last* '@' in the
+        // authority is the delimiter.
+        let redacted = redact_url("postgres://u:p@ss@host:5432/db");
+        assert!(!redacted.contains("p@ss"), "password survived: {redacted}");
+        assert!(
+            redacted.contains("host:5432/db"),
+            "endpoint lost: {redacted}"
+        );
+    }
+
+    #[test]
+    fn with_db_name_preserves_query_parameters() {
+        // Dropping `?sslmode=require` makes a TLS-requiring server unreachable
+        // through the advertised existing-server mode.
+        assert_eq!(
+            with_db_name("postgres://u:p@h:5432/postgres?sslmode=require", "bench_1"),
+            "postgres://u:p@h:5432/bench_1?sslmode=require",
+        );
+    }
+
+    #[test]
+    fn with_db_name_does_not_splice_inside_a_query_value() {
+        // `rfind('/')` lands in the middle of the certificate path and yields a
+        // malformed URL.
+        assert_eq!(
+            with_db_name(
+                "postgres://h:5432/postgres?sslrootcert=/etc/ssl/root.crt",
+                "bench_1",
+            ),
+            "postgres://h:5432/bench_1?sslrootcert=/etc/ssl/root.crt",
+        );
+    }
+
+    #[test]
+    fn with_db_name_handles_urls_with_no_path_or_no_query() {
+        assert_eq!(
+            with_db_name("postgres://postgres:postgres@localhost:5432/postgres", "b"),
+            "postgres://postgres:postgres@localhost:5432/b",
+        );
+        assert_eq!(with_db_name("postgres://host", "b"), "postgres://host/b");
+        assert_eq!(with_db_name("postgres://host/", "b"), "postgres://host/b");
+        assert_eq!(
+            with_db_name("postgres://host?sslmode=require", "b"),
+            "postgres://host/b?sslmode=require",
+        );
+    }
+
+    #[test]
     fn every_gate_is_ordered_after_its_comparand() {
         // The report renders a row's `p50 vs` against its comparand's already
         // measured p50, streaming each row as it completes rather than
@@ -748,9 +885,12 @@ pub mod db {
     /// and exits cleanly instead of failing.
     pub async fn setup_bench_db() -> Result<BenchDb, SkipReason> {
         if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+            // Redacted: this message is printed by both the bench and the CI
+            // gate, and an admin URL normally carries a password.
+            let safe_url = super::redact_url(&admin_url);
             let mut admin = AsyncPgConnection::establish(&admin_url)
                 .await
-                .map_err(|e| SkipReason(format!("connect {admin_url}: {e}")))?;
+                .map_err(|e| SkipReason(format!("connect {safe_url}: {e}")))?;
             drop_stale_bench_databases(&mut admin).await;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
             let db = format!("harvest_claim_bench_{}_{}", std::process::id(), n);
@@ -758,7 +898,7 @@ pub mod db {
                 .execute(&mut admin)
                 .await
                 .map_err(|e| SkipReason(format!("create database {db}: {e}")))?;
-            let url = with_db_name(&admin_url, &db);
+            let url = super::with_db_name(&admin_url, &db);
             let mut conn = AsyncPgConnection::establish(&url)
                 .await
                 .map_err(|e| SkipReason(format!("connect {db}: {e}")))?;
@@ -845,6 +985,16 @@ pub mod db {
                 // Unparseable name: not ours to reclaim.
                 None => continue,
             }
+            // The pid check above only answers for *this* host. When several
+            // machines share one admin URL, a run on another host has a pid
+            // that is absent from the local `/proc` and therefore looks dead —
+            // and `WITH (FORCE)` would terminate it mid-measurement. So ask the
+            // server, which is the one party that can see every client: a
+            // benchmark in flight holds a pool open against its own database,
+            // so any backend at all means "in use, not ours to reclaim".
+            if database_has_connections(admin, &row.datname).await {
+                continue;
+            }
             let _ = diesel::sql_query(format!(
                 "DROP DATABASE IF EXISTS {} WITH (FORCE)",
                 row.datname
@@ -852,6 +1002,28 @@ pub mod db {
             .execute(admin)
             .await;
         }
+    }
+
+    /// Does any backend currently hold a connection to `datname`?
+    ///
+    /// Host-agnostic, unlike a local pid probe: the server sees every client
+    /// regardless of which machine or PID namespace it runs in.
+    ///
+    /// Conservative in the same direction as [`process_is_alive`] — a failed
+    /// check reports "in use", so the worst outcome is a leaked database, never
+    /// a live run dropped out from under itself.
+    async fn database_has_connections(admin: &mut AsyncPgConnection, datname: &str) -> bool {
+        #[derive(QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        diesel::sql_query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = $1")
+            .bind::<diesel::sql_types::Text, _>(datname)
+            .get_result::<CountRow>(admin)
+            .await
+            .map_or(true, |row| row.n > 0)
     }
 
     /// Best-effort liveness check for a pid that may own a bench database.
@@ -869,11 +1041,6 @@ pub mod db {
             let _ = pid;
             true
         }
-    }
-
-    fn with_db_name(url: &str, db: &str) -> String {
-        url.rfind('/')
-            .map_or_else(|| format!("{url}/{db}"), |i| format!("{}/{db}", &url[..i]))
     }
 
     /// Build a pool sized to the claimer count, so a measured claim never
@@ -1268,22 +1435,42 @@ pub mod db {
                     // depth, so an operation count alone does not bound a deep
                     // sweep (or a regression). Stop early and report the
                     // samples collected rather than running for minutes.
-                    if Instant::now() >= deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
                         truncated = true;
                         break;
                     }
-                    let t0 = Instant::now();
-                    let got = queue::claim_task(
-                        &mut conn,
-                        &queues,
-                        &worker,
-                        &build_id,
-                        None,
-                        &cb_set,
-                        &[],
+                    let t0 = now;
+                    // Bound the call, not just the loop head. `claim_task` is
+                    // an unbounded await, so a single stalled claim — exactly
+                    // the regression or database stall this ceiling exists to
+                    // catch — would sit here for minutes while the loop-top
+                    // check never runs again, and the advertised cap would be
+                    // a fiction.
+                    //
+                    // A timeout abandons the connection mid-query, which can
+                    // leave it unusable. That is fine and terminal: we break
+                    // immediately, the pool recycles it, and `truncated` makes
+                    // the gate fail loudly rather than publish a percentile
+                    // computed from a partial run.
+                    let claimed = tokio::time::timeout(
+                        deadline - now,
+                        queue::claim_task(
+                            &mut conn,
+                            &queues,
+                            &worker,
+                            &build_id,
+                            None,
+                            &cb_set,
+                            &[],
+                        ),
                     )
-                    .await
-                    .expect("claim_task failed");
+                    .await;
+                    let Ok(got) = claimed else {
+                        truncated = true;
+                        break;
+                    };
+                    let got = got.expect("claim_task failed");
                     let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
                     observed.push((elapsed, got.is_some()));
                 }

@@ -477,6 +477,13 @@ ANALYZE` of the claim query.
   cold-start measurement. Applying the fraction post-hoc also means a scenario
   cut short by its wall-clock budget still reports the samples it took instead
   of discarding all of them and printing a confident-looking `0.00 ms`.
+* **The wall-clock ceiling bounds each claim, not just the loop.** `claim_task`
+  is an unbounded `await`, so checking the deadline only between calls would let
+  a single stalled claim — exactly the regression or database stall the ceiling
+  exists to catch — run for minutes past the advertised cap. Each call is
+  wrapped in a timeout derived from the remaining budget; expiry marks the run
+  truncated, which the gate treats as "measurement unsound" rather than
+  publishing a percentile from a partial run.
 * **`ANALYZE` runs after every seed.** Without it the planner works from stale
   statistics on a freshly bulk-loaded table and picks plans that are neither
   representative nor stable.
