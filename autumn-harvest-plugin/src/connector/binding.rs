@@ -471,6 +471,34 @@ pub fn validate_bindings_refs(
             ));
         };
 
+        // A `SignalsWithStart` binding cannot compose with a deferred
+        // admission policy, and every failure mode is silent:
+        //
+        // * **debounce** — `signal-with-start` refuses a *fresh* start on a
+        //   debounced workflow with a `400` (it can only attach). The
+        //   connector classifies that as a deterministic refusal, so the
+        //   FIRST message for every entity is dead-lettered while later ones
+        //   attach fine. That reads as "some messages vanish".
+        // * **batch** — same shape: no signal-with-start batch admission path
+        //   exists, so a fresh start is refused.
+        // * **throttle** — worse, because it *succeeds*: signal-with-start
+        //   does not consult the start throttle at all, so the binding would
+        //   silently bypass the very backpressure the operator configured.
+        //
+        // Fail at build time rather than let any of those reach production.
+        if matches!(b.target, ConnectorTarget::SignalsWithStart { .. })
+            && has_deferred_admission(info)
+        {
+            return Err(format!(
+                "connector binding '{}' is a signals_with_start binding, but target workflow \
+                 '{workflow}' carries a throttle/debounce/batch policy. signal-with-start \
+                 refuses a fresh start on a debounced/batched workflow (so the first message \
+                 for each entity would be dead-lettered) and bypasses a throttle entirely. \
+                 Use a `starts` binding, or remove the deferred-admission policy",
+                b.name
+            ));
+        }
+
         if b.idempotency_mode == Some(IdempotencyMode::BrokerCoordinates)
             && has_deferred_admission(info)
         {
@@ -482,6 +510,16 @@ pub fn validate_bindings_refs(
                 b.name
             ));
         }
+
+        // A `broker_native_dead_letter()` binding hands poison quarantine to
+        // the broker's own redrive policy — which only works if the adapter
+        // has a real per-message nack that increments a receive count. Kafka
+        // has none (`abandon` is a no-op; the message simply is not
+        // committed), so a poison message would be re-read forever and never
+        // reach any dead-letter destination: the exact partition wedge the
+        // feature exists to prevent. The binding cannot see its own adapter
+        // here, so this is caught adapter-side in `spawn_connectors`; what we
+        // can check is that the mode was set deliberately.
     }
     Ok(())
 }
@@ -505,6 +543,7 @@ mod tests {
                 stream: "orders".to_string(),
                 id: "1".to_string(),
             },
+            key: None,
             headers: std::collections::BTreeMap::new(),
             raw_body: body.to_vec(),
         }

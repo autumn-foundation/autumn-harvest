@@ -60,21 +60,29 @@
 //! The runtime dispatches up to `max_in_flight` messages concurrently and does
 //! **not** preserve broker partition ordering across them. For per-key
 //! ordering, use a `SignalsWithStart` binding whose mapping function derives a
-//! stable `workflow_id` from the partition key: the entity workflow serializes
-//! its own signals. See `docs/getting-started/13-broker-connectors.md`.
+//! stable `workflow_id` from the partition key (`ctx.key_str()` on Kafka, or a
+//! body field / header on a broker with no key): the entity workflow
+//! serializes its own signals. Set `.max_in_flight(1)` as well if messages for
+//! the *same* key must reach that workflow in queue order — the entity
+//! workflow serializes them either way, but the order it sees them in is the
+//! order they were dispatched, which concurrency does not preserve. See
+//! `docs/getting-started/13-broker-connectors.md`.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use autumn_harvest_plugin::connector::{ConnectorTarget, SourceBinding};
+//! use autumn_harvest_plugin::connector::{ConnectorTarget, MappedMessage, SourceBinding};
 //!
-//! #[derive(serde::Deserialize)]
+//! #[derive(serde::Deserialize, serde::Serialize)]
 //! struct OrderPlaced {
 //!     order_id: String,
 //! }
 //!
 //! let binding = SourceBinding::starts("orders", "orders.placed", "fulfil_order")
-//!     .map_json(|_ctx, event: OrderPlaced| Ok::<_, String>((event.order_id.clone(), event)))
+//!     .map_json(|_ctx, event: OrderPlaced| {
+//!         let payload = serde_json::to_value(&event).map_err(|e| e.to_string())?;
+//!         Ok::<_, String>(MappedMessage::new(format!("order-{}", event.order_id), payload))
+//!     })
 //!     .max_in_flight(32);
 //!
 //! assert!(matches!(binding.target, ConnectorTarget::Starts { .. }));

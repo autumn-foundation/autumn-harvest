@@ -355,6 +355,10 @@ metric is emitted in the source code.
 | `harvest.mutex.wait_duration` | Histogram | `worker.rs` — `persist_mutex_acquire_park`, on grant: wall-clock seconds a workflow waited to acquire a durable mutex, from request (enqueued as a FIFO waiter) to grant (issue #691) |
 | `harvest.mutex.held_duration` | Histogram | `worker.rs` — `process_mutex_releases_from_commands`, on release: wall-clock seconds a durable mutex was held, from grant (`MutexGranted.acquired_at`) to release (drop / explicit / terminal sweep / lease reclaim) (issue #691) |
 | `harvest.mutex.contention_depth` | Gauge | `worker.rs` — `persist_mutex_acquire_park`, at the moment a grant is made: the FIFO waiter-queue length for the key (number of workflows waiting on that mutex key) (issue #691) |
+| `harvest.connector.received` | Counter | `connector/runtime.rs` (plugin) — once per message pulled from a broker source, before dispatch, regardless of outcome (issue #944) |
+| `harvest.connector.dispatched` | Counter | `connector/runtime.rs` (plugin) — the **settlement breakdown**: exactly one sample per received message, so the series sums to `harvest.connector.received`. `dispatched` (a fresh execution), `idempotent_replay` (harvest recognised the redelivery and returned the existing run), `deferred` (a start throttle, issue #607, parked it — a **success** for ack purposes), `dead_lettered` (poison; see `harvest.connector.poisoned` for the reason), or `retried` (a transient harvest-side failure; the message is left un-acked for redelivery) (issue #944) |
+| `harvest.connector.poisoned` | Counter | `connector/runtime.rs` (plugin) — once per message quarantined to a dead-letter destination: a deterministic decode failure (`deserialize_failed`), a mapping-function rejection repeated `poison_threshold` times (`mapping_rejected`, default 3, mirroring `poison_pill_threshold` #367), or a permanent harvest rejection (`permanent_failure`). A poisoned message is **acked** so one bad message never wedges a partition (issue #944) |
+| `harvest.connector.lag` | Gauge | `connector/runtime.rs` (plugin) — sampled per pass from `EventSource::lag()`, for sources whose client exposes it (Kafka: high-watermark minus committed offset, summed across assigned partitions; SQS: `ApproximateNumberOfMessages`). Sources with no lag concept simply never emit (issue #944) |
 
 ### Label sets
 
@@ -405,6 +409,10 @@ metric is emitted in the source code.
 | `harvest.canary.roundtrip` | `queue`, `shard` (probed task queue + writable shard; **no `execution.id`** — issue #796) |
 | `harvest.canary.success` | `queue`, `shard` |
 | `harvest.canary.failure` | `queue`, `shard` |
+| `harvest.connector.received` | `source` (the binding's `source_name`, a registered `SourceBinding` — closed set) — the message key, partition, and offset are **never** labels (ADR-0001 §7, issue #944) |
+| `harvest.connector.dispatched` | `source`, `outcome` (`dispatched\|idempotent_replay\|deferred\|dead_lettered\|retried` — bounded enum) |
+| `harvest.connector.poisoned` | `source`, `reason` (`deserialize_failed\|mapping_rejected\|permanent_failure` — bounded enum) |
+| `harvest.connector.lag` | `source` |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by

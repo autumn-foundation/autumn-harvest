@@ -19,6 +19,7 @@ struct MockState {
     pending: VecDeque<InboundMessage>,
     acked: Vec<MessageHandle>,
     abandoned: Vec<MessageHandle>,
+    nacked_for_dead_letter: Vec<MessageHandle>,
     closed: bool,
 }
 
@@ -49,6 +50,21 @@ impl MockSource {
 
     /// Queue a message with explicit Kafka-shaped coordinates.
     pub fn push_kafka(&self, partition: i32, offset: i64, payload: impl AsRef<[u8]>) {
+        self.push_kafka_keyed(partition, offset, None::<&[u8]>, payload);
+    }
+
+    /// Queue a Kafka-shaped message carrying a partition key.
+    ///
+    /// The keyed form exists so a test can exercise the per-key ordering
+    /// remedy (mapping `ctx.key_str()` to a stable `workflow_id`) without a
+    /// live broker.
+    pub fn push_kafka_keyed(
+        &self,
+        partition: i32,
+        offset: i64,
+        key: Option<impl AsRef<[u8]>>,
+        payload: impl AsRef<[u8]>,
+    ) {
         let coordinates = MessageCoordinates::KafkaOffset {
             topic: self.stream.clone(),
             partition,
@@ -58,6 +74,7 @@ impl MockSource {
         self.push_message(InboundMessage {
             coordinates,
             payload: payload.as_ref().to_vec(),
+            key: key.map(|k| k.as_ref().to_vec()),
             headers: std::collections::BTreeMap::new(),
             handle,
         });
@@ -73,6 +90,7 @@ impl MockSource {
         self.push_message(InboundMessage {
             coordinates,
             payload: payload.as_ref().to_vec(),
+            key: None,
             headers: std::collections::BTreeMap::new(),
             handle: MessageHandle::opaque(id),
         });
@@ -101,6 +119,17 @@ impl MockSource {
     #[must_use]
     pub fn acked(&self) -> Vec<MessageHandle> {
         self.lock().acked.clone()
+    }
+
+    /// Handles the runtime nack'd toward broker-native dead-lettering.
+    ///
+    /// Distinct from [`Self::abandoned`]: the two are opposite intents (gentle
+    /// transient retry vs. fastest possible redelivery so the broker's redrive
+    /// claims the message), and an adapter like SQS implements them
+    /// differently.
+    #[must_use]
+    pub fn nacked_for_dead_letter(&self) -> Vec<MessageHandle> {
+        self.lock().nacked_for_dead_letter.clone()
     }
 
     /// Handles the runtime abandoned, in order.
@@ -137,6 +166,17 @@ impl EventSource for MockSource {
 
     async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
         self.lock().acked.push(handle.clone());
+        Ok(())
+    }
+
+    fn has_native_dead_letter(&self) -> bool {
+        // The mock can stand in for either adapter shape, so it advertises
+        // support and lets a test choose the binding's dead-letter mode.
+        true
+    }
+
+    async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+        self.lock().nacked_for_dead_letter.push(handle.clone());
         Ok(())
     }
 

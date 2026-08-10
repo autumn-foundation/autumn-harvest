@@ -2540,6 +2540,15 @@ pub(crate) struct SignalWithStartRequest {
     /// `#[serde(skip)]` so it is never part of the public JSON body.
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
+    /// Internal workflow-start provenance *reference* override (issue #740).
+    /// Set by [`Self::from_broker`] to the rendered broker coordinates so a
+    /// broker-triggered fresh run records the same `start_source_ref` shape
+    /// whichever binding kind produced it (issue #944); without it the
+    /// signal-with-start path defaults to the connector's derived, bounded
+    /// idempotency key. `#[serde(skip)]` so it is never part of the public
+    /// JSON body.
+    #[serde(default, skip)]
+    start_source_ref_override: Option<String>,
 }
 
 impl SignalWithStartRequest {
@@ -2574,6 +2583,9 @@ impl SignalWithStartRequest {
             // Webhook-delegated signal-with-start records `webhook` provenance
             // on a fresh run (#740/#344).
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
+            // Unchanged for webhooks: the core's default (the idempotency key,
+            // i.e. the verified delivery id) is already the right reference.
+            start_source_ref_override: None,
         }
     }
 
@@ -2595,6 +2607,7 @@ impl SignalWithStartRequest {
         signal_name: String,
         idempotency_key: Option<String>,
         queue: Option<String>,
+        coordinates: Option<String>,
     ) -> Self {
         Self {
             workflow_id,
@@ -2610,6 +2623,11 @@ impl SignalWithStartRequest {
             // Broker-delegated signal-with-start records `broker` provenance on
             // a fresh run (#740/#944).
             start_source_override: Some(autumn_harvest::StartSource::Broker),
+            // ...and the rendered coordinates, so the documented provenance
+            // query returns the same shape for BOTH binding kinds. Without
+            // this the core defaults to the connector's derived, bounded
+            // idempotency key, which reads nothing like `topic:partition:offset`.
+            start_source_ref_override: coordinates,
         }
     }
 }
@@ -17725,6 +17743,7 @@ pub(crate) async fn signal_with_start_workflow(
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             workflow_info: runtime.registry.workflows.get(&workflow_name),
             start_source_override: request.start_source_override,
+            start_source_ref_override: request.start_source_ref_override.clone(),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the

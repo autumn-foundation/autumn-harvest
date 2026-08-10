@@ -221,6 +221,10 @@ impl EventSource for SqsSource {
                     id,
                 },
                 payload: message.body.unwrap_or_default().into_bytes(),
+                // SQS has no partition-key concept (a FIFO `MessageGroupId` is
+                // an ordering group, not a routing key), so there is nothing
+                // honest to surface here.
+                key: None,
                 headers,
                 handle: MessageHandle::opaque(receipt),
             });
@@ -239,11 +243,32 @@ impl EventSource for SqsSource {
         Ok(())
     }
 
-    async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
-        // Zero the visibility timeout so the message is redelivered
-        // immediately rather than after the queue's default lapses. This also
-        // increments `ApproximateReceiveCount`, which is what drives a native
-        // redrive policy toward the queue's DLQ.
+    fn has_native_dead_letter(&self) -> bool {
+        // `abandon` resets the visibility timeout, which makes SQS redeliver
+        // and increment `ApproximateReceiveCount` — so a queue with a redrive
+        // policy really does move the message to its DLQ once `maxReceiveCount`
+        // is reached. That is what `DeadLetterMode::BrokerNative` relies on.
+        true
+    }
+
+    async fn abandon(&self, _handle: &MessageHandle) -> Result<(), ConnectorError> {
+        // Deliberately a no-op. Simply *not* deleting the message is already
+        // sufficient for redelivery: its visibility timeout lapses and SQS
+        // hands it back. Zeroing the visibility here (as this once did) would
+        // turn a transient harvest failure — usually harvest under pressure —
+        // into a tight redelivery loop against an already-struggling system,
+        // and would burn `ApproximateReceiveCount` faster than necessary
+        // toward a redrive policy's `maxReceiveCount`.
+        //
+        // The visibility timeout *is* the retry backoff; size it with
+        // `SqsSourceConfig::visibility_timeout_secs`.
+        Ok(())
+    }
+
+    async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+        // The poison path, where fast redelivery is exactly the point: each
+        // one increments `ApproximateReceiveCount`, driving the message toward
+        // the queue's redrive `maxReceiveCount` and thus its DLQ.
         self.client
             .change_message_visibility()
             .queue_url(&self.queue_url)

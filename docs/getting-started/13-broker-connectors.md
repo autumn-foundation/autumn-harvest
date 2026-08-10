@@ -85,11 +85,70 @@ Runnable: [`examples/kafka_connector_quickstart.rs`](../../autumn-harvest-plugin
 `SourceBinding::starts(binding_name, stream, workflow)` says *what* a message
 maps to; `KafkaSource` is the adapter that feeds it. The mapping function is
 **synchronous** and returns a `MappedMessage`: the workflow id, and the JSON
-payload to hand the workflow as its start input. `HarvestPlugin::build` fails
-fast (panics) if the target workflow is not registered, the binding has no
-mapping function, two bindings share a name, or the adapter's stream does not
-match the binding's — misconfigurations that would otherwise surface as a
-silently idle consumer.
+payload to hand the workflow as its start input.
+
+`HarvestPlugin::build` **panics** on any of these, rather than letting them
+surface as a silently idle consumer or a message that retries forever:
+
+| Rejected | Why |
+|---|---|
+| Empty binding name, or empty stream | The name is the metrics `source` label and the idempotency-key namespace |
+| No mapping function | Nothing to map with |
+| Two bindings share a name | They would silently deduplicate each other's messages |
+| Two bindings consume the same stream into the same target | Every message would start twice |
+| Target is a registered DAG | Trigger DAGs via `POST /dags/{name}/trigger` |
+| Target workflow is not registered | Call `.workflows(...)` before `.connector(...)` |
+| Adapter's `stream()` does not match the binding's | The consumer would never deliver anything |
+| `IdempotencyMode::BrokerCoordinates` on a throttled / debounced / batched target | The start route rejects a keyed start for a deferred admission (`400`) |
+| `signals_with_start` onto a throttled / debounced / batched target | signal-with-start refuses a fresh start on a debounced/batched workflow (so the first message per entity would be dead-lettered) and bypasses a throttle entirely |
+| `.broker_native_dead_letter()` on an adapter with no real nack (Kafka) | Nothing advances a receive count, so a poison message would be re-read forever |
+
+## Before you start: apply the plugin migration
+
+The default dead-letter destination is `harvest_connector_dead_letters`, a
+**plugin**-owned table shipped in
+`autumn-harvest-plugin/migrations/harvest/`. It is applied to the **harvest**
+database (the same one the core `harvest_*` tables live in), so under
+`harvest.mode = split` or `external` it lands where the connector actually
+writes, not in your application database.
+
+Under `AUTUMN_PROFILE=dev` the plugin applies it automatically at startup.
+Outside dev, a pending migration is only *warned* about — run your normal
+migration step before enabling a connector, or the first poison message will
+fail its dead-letter write, be downgraded to a retry, and redeliver forever.
+(Use `.broker_native_dead_letter()` on SQS if you would rather not have the
+table at all.)
+
+### Production configuration
+
+The 17-line wiring above is honest for a local broker. Two things a managed one
+needs, neither of which changes the shape:
+
+```rust
+// Kafka: any librdkafka property — SASL, TLS, fetch tuning.
+KafkaSourceConfig::new(brokers, "harvest-orders", "orders.placed")
+    .property("security.protocol", "SASL_SSL")
+    .property("sasl.mechanisms", "PLAIN")
+    .property("sasl.username", &user)
+    .property("sasl.password", &pass);
+
+// SQS: build the client yourself for explicit credentials, an assumed role,
+// or a LocalStack/ElasticMQ endpoint. `SqsSource::connect` uses the ambient
+// AWS config chain instead.
+SqsSource::new(my_sqs_client, SqsSourceConfig::new(queue_url));
+```
+
+Note the small asymmetry: `KafkaSource::connect(&config)` is **sync** and takes
+a reference (librdkafka connects lazily); `SqsSource::connect(config)` is
+**async** and takes the config by value.
+
+Polling knobs live on `ConnectorRuntimeConfig`, passed via
+`.connector_with_config(binding, source, Some(config))`. The defaults are tuned
+for a cheap idle binding — a 1s poll (so SQS **long**-polls rather than
+short-polls, which would bill an API call per round trip), a 200ms idle
+backoff, and a consumer-lag sample at most every 15s. Lower `poll_timeout` for
+faster pickup at the cost of more idle API calls; raise `max_batch` for a
+high-throughput topic.
 
 ## 2. SQS → an entity workflow (start-or-signal)
 
@@ -212,17 +271,33 @@ Where it goes depends on the binding:
 * `.broker_native_dead_letter()` — hand the message back to the broker's own
   machinery instead. For SQS the visibility timeout is reset to `0`, so SQS
   re-delivers, counts the receive, and moves the message to the queue's
-  configured DLQ once `maxReceiveCount` is hit.
+  configured DLQ once `maxReceiveCount` is hit. This mode is **rejected at
+  build time** for an adapter with no real nack: Kafka's "abandon" is simply
+  not committing, which never advances any counter, so a poison message would
+  be re-read forever instead of quarantined.
 
-A transient harvest failure (a `5xx`, a pool exhaustion) is **never**
-dead-lettered no matter how many times it recurs — it is not the message's
-fault. It stays unacked and is redelivered.
+A transient harvest failure (a `5xx`, a pool exhaustion) is **never** written to
+`harvest_connector_dead_letters` no matter how many times it recurs — it is not
+the message's fault. It stays unacked and is redelivered, with whatever backoff
+the broker provides: an SQS visibility timeout lapsing (size it with
+`SqsSourceConfig::visibility_timeout_secs`), or a Kafka offset simply not being
+committed. The connector deliberately does **not** rush a transient retry back;
+that is reserved for the poison path, where fast redelivery is the point.
+
+> **SQS + redrive caveat.** Every redelivery increments
+> `ApproximateReceiveCount`, including one caused by a transient harvest
+> failure. So on a queue with a redrive policy, a failure that persists past
+> `maxReceiveCount` redeliveries *will* eventually reach the queue's DLQ — SQS
+> cannot distinguish "harvest was down" from "this message is bad". Size
+> `maxReceiveCount` above your expected outage length, or use the default
+> harvest-sink mode, where a transient failure is genuinely never
+> dead-lettered.
 
 ## Backpressure
 
 `max_in_flight` (default `16`) bounds concurrently-dispatched messages per
-binding. It composes with the start throttle
-([issue #607](07-reliability-knobs.md)): a throttled start returns `202` with no
+binding. It composes with the start throttle (issue #607 — see
+`autumn-harvest/examples/throttle_fanout.rs`): a throttled start returns `202` with no
 execution id, and the connector treats that as a **successful** dispatch and
 acks. Busy-retrying a deferred start would defeat the throttle and stampede the
 admission path; the throttle already owns the pacing and will fire the start
@@ -235,13 +310,39 @@ to `max_in_flight` messages concurrently, so two messages from the same
 partition can commit out of order. This is deliberate — serialising every
 message would cap throughput at one dispatch per round trip.
 
-If you need per-key ordering, do not lower `max_in_flight` to 1 and hope; use
-the entity pattern. A `signals_with_start` binding whose mapping function
-derives a stable `workflow_id` from the partition key routes every message for
-that key into the **same execution**, and a workflow processes its own signals
-in the order they were recorded. Ordering then holds per entity — which is
-almost always the property you actually wanted — while distinct entities still
-run concurrently.
+If you need per-key ordering, use the entity pattern. A `signals_with_start`
+binding whose mapping function derives a stable `workflow_id` from the
+partition key routes every message for that key into the **same execution**,
+and a workflow processes its own signals in the order they were recorded.
+Ordering then holds per entity — which is almost always the property you
+actually wanted — while distinct entities still run concurrently.
+
+The key is on the mapping context:
+
+```rust
+.map_json(|ctx, event: Reading| {
+    // Kafka's record key — the thing the broker partitioned by, so all
+    // messages for one key are already in one partition, in order.
+    let entity = ctx.key_str().unwrap_or("unkeyed");
+    Ok::<_, String>(MappedMessage::new(
+        format!("device-{entity}"),
+        serde_json::to_value(&event).map_err(|e| e.to_string())?,
+    ))
+})
+```
+
+`ctx.key_str()` is `Some` only where the broker has a partition-key concept and
+the key is UTF-8 (`ctx.key` is the raw bytes). **SQS has no record key**, so
+derive the entity id from a body field or a message attribute
+(`ctx.header("...")`) there instead.
+
+**One caveat on the entity pattern, stated plainly.** The entity workflow
+serializes the signals it receives, but the *order it receives them in* is the
+order the connector dispatched them — and the connector dispatches up to
+`max_in_flight` concurrently, including two messages for the same key. So the
+entity pattern alone gives you *"all of one key's messages land in one run"*,
+not *"in queue order"*. If you need the stronger property, add
+`.max_in_flight(1)` to that binding; you trade throughput for it.
 
 Global total ordering across a whole topic is out of scope.
 
@@ -255,7 +356,9 @@ Global total ordering across a whole topic is out of scope.
 | Crash between commit and ack | no → redelivered | Dedupe collapses the replay onto the original run |
 | Start deferred by a throttle (`202`) | yes | The throttle fires it later. `deferred` |
 | Body does not decode | yes | Dead-lettered `malformed` |
-| Start route rejects it (`4xx`) | yes | Dead-lettered `target_rejected` |
+| Mapping function *panics* | yes | Contained and dead-lettered `malformed` (a panic is deterministic in the payload) |
+| Start route rejects it deterministically (schema validation, a mutually-exclusive option) | yes | Dead-lettered `target_rejected` |
+| Start route returns a *transient* `4xx` (boot window, target paused, `429`) | no → redelivered | Never dead-lettered; it clears on its own |
 | Mapping function rejects it, under threshold | no → redelivered | `retried` |
 | Mapping function rejects it, at threshold | yes | Dead-lettered `mapping_rejected` |
 | Transient harvest failure (`5xx`, pool exhausted) | no → redelivered | Never dead-lettered |
@@ -272,11 +375,21 @@ the message key, offset and execution id are **never** labels:
 | `harvest.connector.received` | counter | `source` (binding name) |
 | `harvest.connector.dispatched` | counter | `source`, `outcome` ∈ `dispatched` / `idempotent_replay` / `deferred` / `dead_lettered` / `retried` |
 | `harvest.connector.poisoned` | counter | `source`, `reason` ∈ `malformed` / `mapping_rejected` / `target_rejected` |
-| `harvest.connector.lag` | gauge | `source` — where the broker client exposes it (Kafka high-watermark minus committed offset; SQS `ApproximateNumberOfMessages`) |
+| `harvest.connector.lag` | gauge | `source` — where the broker client exposes it (Kafka high-watermark minus the consumer's current *read position*; SQS `ApproximateNumberOfMessages`). Sampled at most once per `lag_sample_interval` (default 15s), since it is a billed broker round-trip. |
+
+> Kafka lag is measured against the read position, not the committed offset.
+> Because the connector deliberately withholds commits for an in-flight
+> contiguous prefix, position ≥ committed, so this gauge slightly
+> **under**-reports the backlog an un-acked crash would replay.
 
 A broker-triggered execution also records `start_source = 'broker'` with
 `start_source_ref` set to the rendered coordinates, so a run traces back to the
-exact message that produced it:
+exact message that produced it. That holds for **both** binding kinds — a
+`signals_with_start` binding threads the same coordinates through, so the query
+below does not need to special-case it. (Only the *fresh start* records
+provenance; a later signal attaching to an existing run leaves the original
+run's `start_source_ref` alone, which is the honest answer for "what created
+this execution".)
 
 ```sql
 SELECT id, workflow_name, start_source_ref
@@ -292,6 +405,39 @@ FROM harvest_connector_dead_letters
 GROUP BY binding, reason ORDER BY 3 DESC;
 ```
 
+### Replaying a dead letter
+
+There is no management API route or CLI command for this table yet (unlike the
+engine's own DLQ, which has `/dead-letters` and `harvest dlq …`) — replay is a
+manual, three-step recipe. Read the raw payload out:
+
+```sql
+SELECT coordinates, reason, detail, convert_from(payload, 'UTF8') AS body
+FROM harvest_connector_dead_letters
+WHERE binding = 'orders' AND reason = 'mapping_rejected'
+ORDER BY failed_at DESC LIMIT 20;
+```
+
+Fix the mapping function or the workflow, deploy, then re-submit the body
+through the ordinary start route — the same thing the connector would have
+done:
+
+```bash
+curl -X POST "$HARVEST/api/harvest/workflows/fulfil_order/start" \
+  -H 'content-type: application/json' \
+  -d '{"workflow_id":"order-A-1001","input":{...the body...}}'
+```
+
+Finally delete the row, so it does not show up in the next triage:
+
+```sql
+DELETE FROM harvest_connector_dead_letters WHERE id = '...';
+```
+
+Re-publishing to the topic instead also works, and is often easier — the
+connector will dedupe it against the original coordinates only if the *same*
+offset comes back, so a genuine re-publish starts a fresh run.
+
 ## Testing without a broker
 
 The `connectors` feature alone ships `MockSource`, which implements
@@ -300,7 +446,21 @@ Drive the real `ConnectorRuntime` against it and every guarantee above — ack
 ordering, dedupe, poison isolation, backpressure — is under test with no Docker:
 
 ```rust
+use autumn_harvest_plugin::connector::{
+    ConnectorRuntime, IdempotencyMode, MockSource, RecordingDeadLetterSink, SourceBinding,
+};
+
 let source = Arc::new(MockSource::new("orders.placed"));
+let sink = Arc::new(RecordingDeadLetterSink::new());
+let runtime = ConnectorRuntime::new(
+    Arc::new(binding),           // the SourceBinding you are testing
+    Arc::clone(&source) as Arc<dyn autumn_harvest_plugin::connector::EventSource>,
+    api_state,                   // a HarvestApiState with storage + runtime installed
+    Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    IdempotencyMode::BrokerCoordinates,
+)
+.with_dead_letter_sink(Arc::clone(&sink));
+
 source.push_kafka(0, 41, br#"{"order_id":"A-1"}"#);
 source.push_kafka(0, 41, br#"{"order_id":"A-1"}"#); // deliberate redelivery
 
@@ -316,8 +476,10 @@ the finer-grained split (`dispatched` vs `idempotent_replay` vs `deferred`)
 is on the `harvest.connector.dispatched` counter's `outcome` label, so assert
 it with a recording `MetricsRecorder`.
 
-See [`connector_integration.rs`](../../autumn-harvest-plugin/tests/connector_integration.rs)
-for the acceptance-criteria suite, including the soak test that pushes 10,000
+The `HarvestApiState` is the fiddly part; copy the `api_state(...)` helper from
+[`connector_integration.rs`](../../autumn-harvest-plugin/tests/connector_integration.rs),
+which builds one over a test Postgres in about a dozen lines. That file is also
+the acceptance-criteria suite, including the soak test that pushes 10,000
 messages with 5% forced redeliveries and 10 poison messages and asserts exactly
 9,990 executions, zero duplicates and 10 dead letters.
 
@@ -325,12 +487,12 @@ messages with 5% forced redeliveries and 10 poison messages and asserts exactly
 
 Deliberately not shipped: NATS / RabbitMQ / Pub-Sub / Kinesis adapters (only
 `EventSource` is broker-specific, so they are follow-ups rather than rewrites);
-outbound event *publishing* (see the transactional outbox in
-[chapter 10](10-operations.md)); Kafka exactly-once / transactional semantics;
+outbound event *publishing* (the plugin's transactional outbox covers the
+"write a row in my business transaction, start a workflow reliably" direction); Kafka exactly-once / transactional semantics;
 ordering guarantees beyond the entity pattern above; and schema-registry
 (Avro / Protobuf) decoding — the mapping function receives raw bytes, so a
 registry client is yours to call.
 
 ---
 
-Previous: [Chapter 12: Inbound webhooks](12-webhooks.md)
+[← Prev](12-webhooks.md) · [Index](README.md)

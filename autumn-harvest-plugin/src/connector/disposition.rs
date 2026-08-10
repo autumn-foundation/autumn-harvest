@@ -258,6 +258,22 @@ impl PoisonTracker {
 /// in-flight message. That is what makes "ack only after the dispatch
 /// committed" true for a partitioned broker under concurrency, not just for a
 /// per-message-ack broker like SQS.
+///
+/// # Offsets the broker never delivers
+///
+/// A partition's *delivered* offsets are not guaranteed contiguous. Kafka
+/// reserves offsets for transaction control records, aborted-transaction
+/// records are filtered out under `read_committed`, and log compaction can
+/// remove a record entirely. A tracker that waited for an offset it will never
+/// be handed would stall that partition's commit **permanently** — the
+/// messages are all processed, but the mark never advances, so every restart
+/// replays them.
+///
+/// So the tracker distinguishes *in flight* (delivered to us, not yet
+/// completed — must block) from *never delivered* (a hole below the highest
+/// offset we have actually seen — safe to step over). Only the second is
+/// skipped, and only strictly below the highest delivered offset, so the mark
+/// can never run ahead into offsets the broker may still hand us.
 #[derive(Debug, Default)]
 pub struct OffsetTracker {
     partitions: HashMap<i32, PartitionOffsets>,
@@ -265,6 +281,9 @@ pub struct OffsetTracker {
 
 #[derive(Debug, Default)]
 struct PartitionOffsets {
+    /// Offsets delivered to us but not yet completed. These block the prefix;
+    /// an offset absent from BOTH this and `completed` was never delivered.
+    inflight: std::collections::BTreeSet<i64>,
     /// Offsets completed out of order, awaiting a contiguous prefix.
     completed: std::collections::BTreeSet<i64>,
     /// Highest offset known contiguous-complete, if any.
@@ -272,6 +291,9 @@ struct PartitionOffsets {
     /// Lowest offset this tracker has ever seen for the partition, which
     /// anchors the prefix after a rebalance/seek.
     floor: Option<i64>,
+    /// Highest offset ever delivered for the partition. A gap is only safe to
+    /// step over when it lies strictly below this.
+    ceiling: Option<i64>,
 }
 
 impl OffsetTracker {
@@ -284,10 +306,18 @@ impl OffsetTracker {
     /// Note that `offset` on `partition` is in flight.
     ///
     /// Establishes the prefix anchor so the first completed offset after a
-    /// rebalance is not mistaken for a gap.
+    /// rebalance is not mistaken for a gap, and records the offset as
+    /// delivered so it blocks the prefix until it completes (as distinct from
+    /// an offset the broker never handed us, which is stepped over).
     pub fn observe(&mut self, partition: i32, offset: i64) {
         let entry = self.partitions.entry(partition).or_default();
         entry.floor = Some(entry.floor.map_or(offset, |f| f.min(offset)));
+        entry.ceiling = Some(entry.ceiling.map_or(offset, |c| c.max(offset)));
+        // Below the mark it is already settled; re-adding would re-block a
+        // prefix that has legitimately moved past it.
+        if entry.committed.is_none_or(|c| offset > c) {
+            entry.inflight.insert(offset);
+        }
     }
 
     /// Mark `offset` on `partition` durably handled.
@@ -298,6 +328,8 @@ impl OffsetTracker {
     pub fn complete(&mut self, partition: i32, offset: i64) -> Option<i64> {
         let entry = self.partitions.entry(partition).or_default();
         entry.floor = Some(entry.floor.map_or(offset, |f| f.min(offset)));
+        entry.ceiling = Some(entry.ceiling.map_or(offset, |c| c.max(offset)));
+        entry.inflight.remove(&offset);
 
         // A redelivery at or below the high-water mark is ALREADY durably
         // settled — a rebalance or an un-acked crash replays it. Report the
@@ -319,7 +351,22 @@ impl OffsetTracker {
             .map_or_else(|| entry.floor.unwrap_or(offset), |c| c + 1);
 
         let mut advanced = None;
-        while entry.completed.remove(&next) {
+        loop {
+            if entry.completed.remove(&next) {
+                advanced = Some(next);
+                entry.committed = Some(next);
+                next += 1;
+                continue;
+            }
+            // `next` is not completed. Step over it ONLY when the broker never
+            // delivered it AND it lies strictly below the highest offset we
+            // have seen — i.e. it is a hole the broker itself skipped (a
+            // control record, an aborted-transaction record, a compacted-away
+            // key), not an offset still to come. An offset that IS in flight
+            // blocks, which is the whole point of the contiguous prefix.
+            if entry.inflight.contains(&next) || entry.ceiling.is_none_or(|c| next >= c) {
+                break;
+            }
             advanced = Some(next);
             entry.committed = Some(next);
             next += 1;
@@ -663,5 +710,82 @@ mod tests {
         let mut t = OffsetTracker::new();
         assert_eq!(t.complete(2, 77), Some(77));
         assert_eq!(t.complete(2, 78), Some(78));
+    }
+
+    #[test]
+    fn an_offset_the_broker_never_delivered_does_not_wedge_the_prefix_forever() {
+        // Kafka reserves offsets for transaction control records, filters
+        // aborted-transaction records under `read_committed`, and compaction
+        // can remove a record entirely -- so delivered offsets are NOT
+        // contiguous. Waiting for a hole we will never be handed stalls this
+        // partition's commit permanently: every message IS processed, but the
+        // mark never advances, so each restart replays all of them.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 10);
+        t.observe(0, 11);
+        // 12 is a control record; the broker hands us 13 next.
+        t.observe(0, 13);
+
+        assert_eq!(t.complete(0, 10), Some(10));
+        // 13 was already delivered, which PROVES 12 is a hole -- so the mark
+        // steps over it the moment 11 lands rather than waiting for a 12 that
+        // is never coming.
+        assert_eq!(
+            t.complete(0, 11),
+            Some(12),
+            "the undelivered hole at 12 must be stepped over, not waited on",
+        );
+        assert_eq!(t.complete(0, 13), Some(13));
+        assert_eq!(t.committable(0), Some(13));
+    }
+
+    #[test]
+    fn an_undelivered_hole_is_only_stepped_over_below_the_highest_delivered_offset() {
+        // The mark must never run ahead into offsets the broker may still
+        // hand us -- that would silently skip a message on crash.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 5);
+        assert_eq!(t.complete(0, 5), Some(5));
+        assert_eq!(
+            t.committable(0),
+            Some(5),
+            "nothing above 5 was delivered, so the mark stops at 5",
+        );
+    }
+
+    #[test]
+    fn an_in_flight_gap_still_blocks_the_prefix() {
+        // The distinction that makes stepping over holes safe: an offset we
+        // WERE handed and have not finished must keep blocking.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 1);
+        t.observe(0, 2);
+        t.observe(0, 3);
+
+        assert_eq!(t.complete(0, 1), Some(1));
+        assert_eq!(
+            t.complete(0, 3),
+            None,
+            "2 is in flight, so the mark may not pass it",
+        );
+        assert_eq!(t.committable(0), Some(1));
+        assert_eq!(t.complete(0, 2), Some(3), "2 lands, the prefix runs to 3");
+    }
+
+    #[test]
+    fn a_hole_between_two_in_flight_offsets_resolves_once_both_land() {
+        let mut t = OffsetTracker::new();
+        t.observe(0, 20);
+        t.observe(0, 21);
+        // 22 undelivered.
+        t.observe(0, 23);
+
+        assert_eq!(t.complete(0, 21), None, "20 is still in flight");
+        assert_eq!(t.complete(0, 23), None, "20 is still in flight");
+        assert_eq!(
+            t.complete(0, 20),
+            Some(23),
+            "20 lands: 21 completes it, 22 is a hole, 23 completes it",
+        );
     }
 }

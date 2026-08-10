@@ -51,7 +51,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const CONNECTOR_DLQ_SQL: &str =
-    include_str!("../migrations/20260716000000_harvest_connector_dead_letters/up.sql");
+    include_str!("../migrations/harvest/20260716000000_harvest_connector_dead_letters/up.sql");
 
 fn init_sql() -> Vec<u8> {
     let mut sql = autumn_harvest::full_migrations_sql().to_string();
@@ -271,6 +271,109 @@ async fn redelivered_message_creates_exactly_one_execution() {
         "and exactly one WorkflowStarted event"
     );
     assert_eq!(source.acked().len(), 3, "every delivery is acknowledged");
+}
+
+/// A mapper whose `workflow_id` is different on every call.
+///
+/// Stands in for the realistic hazard: a mapping function that folds a
+/// timestamp, a UUID, or any evolving field into the id. Under
+/// [`IdempotencyMode::WorkflowId`] such a mapper cannot dedupe a redelivery,
+/// because the id IS the dedupe key.
+fn drifting_id_mapper(
+    ctx: &autumn_harvest_plugin::connector::MessageCtx,
+) -> Result<MappedMessage, MappingError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let payload: Value = serde_json::from_slice(&ctx.raw_body)
+        .map_err(|e| MappingError::Deserialize(e.to_string()))?;
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    Ok(MappedMessage {
+        workflow_id: WorkflowId::new(format!("drift-{n}")),
+        payload,
+    })
+}
+
+#[tokio::test]
+async fn broker_coordinate_dedupe_survives_a_mapper_whose_workflow_id_drifts() {
+    // AC3's load-bearing claim: the dedupe key comes from STABLE BROKER
+    // COORDINATES, not from whatever the mapping function computed. That is
+    // precisely why `BrokerCoordinates` is the default for a `Starts` binding
+    // -- it holds even when the mapper's id does not.
+    let (url, _c) = setup_database().await;
+    let mut conn = connect(&url).await;
+    reset(&mut conn).await;
+    let pool = build_pool(&url, 8);
+    let state = api_state(&pool, vec![workflow_info("fulfil_order")]);
+
+    let source = Arc::new(MockSource::new("orders"));
+    let rt = runtime_for(
+        SourceBinding::starts("orders", "orders", "fulfil_order")
+            .map_raw(drifting_id_mapper)
+            .idempotency_mode(IdempotencyMode::BrokerCoordinates),
+        &source,
+        &state,
+        &pool,
+    );
+
+    for _ in 0..3 {
+        source.push_kafka(0, 404, br#"{"order_id":"o-drift"}"#);
+        rt.run_once().await.expect("pass");
+    }
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = 'fulfil_order'"
+        )
+        .await,
+        1,
+        "the broker coordinate deduped all three, despite three distinct workflow_ids",
+    );
+    assert_eq!(source.acked().len(), 3);
+}
+
+#[tokio::test]
+async fn workflow_id_dedupe_cannot_survive_a_mapper_whose_workflow_id_drifts() {
+    // The falsifying control for the test above. Without it, "BrokerCoordinates
+    // dedupes" would be unfalsifiable -- every dedupe assertion would pass
+    // under either mode, because a stable mapper makes the two indistinguishable.
+    //
+    // This is also the honest warning for `SignalsWithStart`, which is forced
+    // into `WorkflowId` mode (a keyed start is mutually exclusive with the
+    // signal-with-start path): its mapping function MUST derive a stable id.
+    let (url, _c) = setup_database().await;
+    let mut conn = connect(&url).await;
+    reset(&mut conn).await;
+    let pool = build_pool(&url, 8);
+    let state = api_state(&pool, vec![workflow_info("fulfil_order")]);
+
+    let source = Arc::new(MockSource::new("orders"));
+    let rt = runtime_for(
+        SourceBinding::starts("orders", "orders", "fulfil_order")
+            .map_raw(drifting_id_mapper)
+            .idempotency_mode(IdempotencyMode::WorkflowId),
+        &source,
+        &state,
+        &pool,
+    );
+
+    for _ in 0..3 {
+        source.push_kafka(0, 505, br#"{"order_id":"o-drift"}"#);
+        rt.run_once().await.expect("pass");
+    }
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = 'fulfil_order'"
+        )
+        .await,
+        3,
+        "workflow_id dedupe cannot collapse ids that differ -- the two modes \
+         are genuinely distinct, which is what makes the sibling test meaningful",
+    );
 }
 
 #[tokio::test]

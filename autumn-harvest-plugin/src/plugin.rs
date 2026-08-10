@@ -27,7 +27,21 @@ use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::DbPool;
 
 const HARVEST_MIGRATIONS: EmbeddedMigrations = autumn_harvest::MIGRATIONS;
-const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+/// Plugin migrations that belong to the **application** database — the
+/// transactional-outbox table an embedder writes to in their own business
+/// transaction.
+const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/app");
+
+/// Plugin migrations that belong to the **harvest** database.
+///
+/// Split from [`OUTBOX_MIGRATIONS`] because the two are different databases
+/// under `HarvestMode::Split`/`External`. The connector dead-letter table
+/// (issue #944) is written by `PostgresDeadLetterSink`, which is built from
+/// the *harvest* pool — applying it only to the app database left the table
+/// missing where the sink actually writes, so every dead-letter write failed,
+/// `settle` downgraded the poison message to a retry, and it was redelivered
+/// forever: exactly the partition wedge the feature exists to prevent.
+const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/harvest");
 
 struct OutboxRuntime {
     shutdown: CancellationToken,
@@ -165,6 +179,7 @@ pub struct HarvestPlugin {
 struct ConnectorRegistration {
     binding: std::sync::Arc<crate::connector::SourceBinding>,
     source: std::sync::Arc<dyn crate::connector::EventSource>,
+    config: Option<crate::connector::ConnectorRuntimeConfig>,
 }
 
 /// A running connector consumer loop.
@@ -583,13 +598,34 @@ impl HarvestPlugin {
     #[cfg(feature = "connectors")]
     #[must_use]
     pub fn connector(
+        self,
+        binding: crate::connector::SourceBinding,
+        source: std::sync::Arc<dyn crate::connector::EventSource>,
+    ) -> Self {
+        self.connector_with_config(binding, source, None)
+    }
+
+    /// [`Self::connector`] with explicit polling knobs.
+    ///
+    /// `None` uses [`ConnectorRuntimeConfig::default`][c], which is tuned for
+    /// a cheap idle binding (a ≥ 1s poll so SQS *long*-polls rather than
+    /// short-polls, an idle backoff, and a throttled consumer-lag sample).
+    /// Override it to trade idle API cost against pickup latency, or to raise
+    /// `max_batch` for a high-throughput topic.
+    ///
+    /// [c]: crate::connector::ConnectorRuntimeConfig
+    #[cfg(feature = "connectors")]
+    #[must_use]
+    pub fn connector_with_config(
         mut self,
         binding: crate::connector::SourceBinding,
         source: std::sync::Arc<dyn crate::connector::EventSource>,
+        config: Option<crate::connector::ConnectorRuntimeConfig>,
     ) -> Self {
         self.connectors.push(ConnectorRegistration {
             binding: std::sync::Arc::new(binding),
             source,
+            config,
         });
         self
     }
@@ -605,6 +641,46 @@ impl HarvestPlugin {
 /// Panics when a binding is invalid or when its adapter's `stream()` does not
 /// match the binding's declared `stream` — both are startup misconfigurations
 /// that would otherwise surface as a silently idle consumer.
+/// Whether a binding's declared stream matches the stream its adapter
+/// actually consumes (issue #944).
+///
+/// A mismatch is silent and total: the consumer connects, polls forever, and
+/// delivers nothing, with no error anywhere. Pure so the decision is
+/// unit-testable without standing up a whole `Plugin::build`.
+#[cfg(feature = "connectors")]
+const fn binding_stream_matches_adapter(declared: &str, adapter: &str) -> bool {
+    // `const fn` cannot use `==` on `&str`.
+    let (a, b) = (declared.as_bytes(), adapter.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether a binding's dead-letter mode is one its adapter can actually
+/// honour (issue #944).
+///
+/// Broker-native dead-lettering quarantines a poison message by *abandoning*
+/// it and letting the broker route it away. On an adapter with no real nack
+/// (Kafka: not committing IS the mechanism, so `abandon` is a no-op) that
+/// never terminates — the message is re-read forever and reaches no
+/// dead-letter destination at all, wedging the partition. Only a binding whose
+/// adapter genuinely feeds a broker DLQ may use it.
+#[cfg(feature = "connectors")]
+const fn broker_native_dead_letter_is_supported(
+    mode: crate::connector::DeadLetterMode,
+    adapter_has_native: bool,
+) -> bool {
+    !matches!(mode, crate::connector::DeadLetterMode::BrokerNative) || adapter_has_native
+}
+
 #[cfg(feature = "connectors")]
 fn spawn_connectors(
     registrations: &[ConnectorRegistration],
@@ -618,11 +694,19 @@ fn spawn_connectors(
         crate::connector::PostgresDeadLetterSink::new(dead_letter_pool.clone()),
     );
 
+    // Resolve the target's `WorkflowInfo` **last-wins**, matching what
+    // `HandlerRegistry` itself does when it collapses the builder's `Vec` into
+    // a `HashMap` — a `.find()` here would be first-wins, so a workflow
+    // registered twice could hand the connector a different (e.g. differently
+    // throttled) info than the one the engine will actually execute, silently
+    // resolving the wrong `IdempotencyMode`. Also matches the validation pass,
+    // which builds its own last-wins map.
+    let by_name: std::collections::HashMap<&str, &WorkflowInfo> =
+        workflows.iter().map(|w| (w.name, w)).collect();
+
     for registration in registrations {
         let binding = std::sync::Arc::clone(&registration.binding);
-        let info = workflows
-            .iter()
-            .find(|w| w.name == binding.target.workflow());
+        let info = by_name.get(binding.target.workflow()).copied();
         let runtime = crate::connector::ConnectorRuntime::for_binding(
             std::sync::Arc::clone(&binding),
             std::sync::Arc::clone(&registration.source),
@@ -631,6 +715,10 @@ fn spawn_connectors(
             info,
         )
         .with_dead_letter_sink(std::sync::Arc::clone(&sink));
+        let runtime = match registration.config {
+            Some(config) => runtime.with_config(config),
+            None => runtime,
+        };
 
         let shutdown = CancellationToken::new();
         let cancel = shutdown.child_token();
@@ -749,13 +837,30 @@ impl Plugin for HarvestPlugin {
             }
             for registration in &connectors {
                 assert!(
-                    registration.source.stream() == registration.binding.stream,
+                    binding_stream_matches_adapter(
+                        &registration.binding.stream,
+                        registration.source.stream(),
+                    ),
                     "harvest connector binding '{}' declares stream '{}' but its adapter \
                      consumes '{}': the two must match or the consumer would silently \
                      never deliver anything",
                     registration.binding.name,
                     registration.binding.stream,
                     registration.source.stream()
+                );
+                assert!(
+                    broker_native_dead_letter_is_supported(
+                        registration.binding.dead_letter_mode,
+                        registration.source.has_native_dead_letter(),
+                    ),
+                    "harvest connector binding '{}' asks for broker-native dead-lettering, but \
+                     its adapter for stream '{}' has no dead-letter destination that abandoning \
+                     a message feeds (Kafka has no per-message nack). A poison message would be \
+                     re-read forever instead of being quarantined. Drop \
+                     `.broker_native_dead_letter()` so poison messages land in \
+                     `harvest_connector_dead_letters` instead",
+                    registration.binding.name,
+                    registration.binding.stream,
                 );
             }
         }
@@ -1933,6 +2038,17 @@ fn ensure_runtime_migrations(
         harvest_database_url,
         HARVEST_MIGRATIONS,
         "Harvest storage",
+    )?;
+
+    // Plugin-owned tables that live in the harvest database (issue #944's
+    // connector dead-letter table). Applied to the same URL as the core
+    // migrations above so `Split`/`External` deployments get them where the
+    // code that writes them actually connects.
+    apply_migrations_for_profile(
+        profile,
+        harvest_database_url,
+        PLUGIN_HARVEST_MIGRATIONS,
+        "Harvest plugin storage",
     )
 }
 
@@ -2724,5 +2840,103 @@ mod tests {
             .expect("valid retention config should build");
         assert_eq!(built.retention().max_age_secs, Some(42));
         assert_eq!(built.retention().tick_interval_secs, 7);
+    }
+
+    // ── Connector build-time validation (issue #944) ──────────────────────
+    //
+    // These guard the two inline `assert!`s in `Plugin::build`, which are
+    // otherwise only reachable by standing up a whole plugin. Both failures
+    // are SILENT in production if they slip through: a stream mismatch makes
+    // the consumer poll forever and deliver nothing, and an unsupported
+    // broker-native mode re-reads a poison message forever.
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn a_binding_whose_stream_does_not_match_its_adapter_is_rejected() {
+        assert!(binding_stream_matches_adapter("orders", "orders"));
+        assert!(!binding_stream_matches_adapter("orders", "orders.v2"));
+        assert!(!binding_stream_matches_adapter("orders", "payments"));
+        // Length-equal but different, so a naive length check cannot pass.
+        assert!(!binding_stream_matches_adapter("orders", "ordera"));
+        assert!(binding_stream_matches_adapter("", ""));
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn broker_native_dead_lettering_requires_an_adapter_that_supports_it() {
+        use crate::connector::DeadLetterMode;
+
+        // The rejected combination: the mode is only honourable on an adapter
+        // with a real nack. Kafka has none, so abandoning never terminates.
+        assert!(!broker_native_dead_letter_is_supported(
+            DeadLetterMode::BrokerNative,
+            false,
+        ));
+        assert!(broker_native_dead_letter_is_supported(
+            DeadLetterMode::BrokerNative,
+            true,
+        ));
+        // The harvest sink always works -- it is the plugin's own table.
+        assert!(broker_native_dead_letter_is_supported(
+            DeadLetterMode::HarvestSink,
+            false,
+        ));
+        assert!(broker_native_dead_letter_is_supported(
+            DeadLetterMode::HarvestSink,
+            true,
+        ));
+    }
+
+    #[cfg(feature = "connectors")]
+    #[test]
+    fn connector_target_workflow_resolution_is_last_wins_like_the_registry() {
+        // `spawn_connectors` resolves a binding's target `WorkflowInfo` from a
+        // last-wins map because that is what `HandlerRegistry` itself does
+        // when it collapses the builder's `Vec` into a `HashMap`. A first-wins
+        // `.find()` would hand the connector a DIFFERENT info than the engine
+        // will actually execute -- e.g. an un-throttled one -- silently
+        // resolving the wrong `IdempotencyMode` and defeating the very
+        // backpressure the operator configured.
+        let mut plain = fake_workflow_info();
+        plain.name = "dup";
+        let mut throttled = fake_workflow_info();
+        throttled.name = "dup";
+        throttled.throttle = Some(autumn_harvest::throttle::ThrottlePolicy {
+            refill_per_sec: 1.0,
+            burst: 1.0,
+            key_expr: None,
+            schedule_to_start: None,
+        });
+
+        let workflows = [plain, throttled];
+        let by_name: std::collections::HashMap<&str, &WorkflowInfo> =
+            workflows.iter().map(|w| (w.name, w)).collect();
+        let resolved = by_name.get("dup").copied().expect("registered");
+
+        assert!(
+            resolved.throttle.is_some(),
+            "last-wins must win: the engine executes the LAST registration, so \
+             the connector must resolve its idempotency mode from that one",
+        );
+        // ...and that really does change the mode, so the distinction matters.
+        assert_eq!(
+            crate::connector::resolve_idempotency_mode(
+                crate::connector::ConnectorTarget::Starts { workflow: "dup" },
+                None,
+                Some(resolved),
+            ),
+            crate::connector::IdempotencyMode::WorkflowId,
+            "a deferred-admission target cannot carry a keyed start",
+        );
+        assert_eq!(
+            crate::connector::resolve_idempotency_mode(
+                crate::connector::ConnectorTarget::Starts { workflow: "dup" },
+                None,
+                Some(&workflows[0]),
+            ),
+            crate::connector::IdempotencyMode::BrokerCoordinates,
+            "the FIRST registration would have resolved differently -- which is \
+             exactly the silent bug last-wins resolution prevents",
+        );
     }
 }

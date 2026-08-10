@@ -81,6 +81,15 @@ pub struct InboundMessage {
     /// the connector never assumes a wire format (issue #944 scopes
     /// schema-registry decoding out of this slice).
     pub payload: Vec<u8>,
+    /// The broker's **partition key** for this message, when it has one
+    /// (Kafka's record key; `None` for SQS, which has no such concept).
+    ///
+    /// This is the field the documented ordering remedy relies on: a broker
+    /// that partitions by key guarantees per-key order *within* a partition,
+    /// so mapping the key to a stable `workflow_id` funnels one key's
+    /// messages into one entity workflow, which then serializes them itself.
+    /// Raw bytes, since a key need not be UTF-8.
+    pub key: Option<Vec<u8>>,
     /// Broker-supplied headers/attributes, if the adapter exposes them.
     pub headers: BTreeMap<String, String>,
     /// The adapter's own handle for this message, used to acknowledge or
@@ -139,6 +148,10 @@ pub struct MessageCtx {
     pub binding: &'static str,
     /// Stable broker coordinates for this message.
     pub coordinates: MessageCoordinates,
+    /// The broker's partition key, when it has one (Kafka's record key;
+    /// `None` for SQS). See [`InboundMessage::key`] — deriving the
+    /// `workflow_id` from this is the documented per-key ordering remedy.
+    pub key: Option<Vec<u8>>,
     /// Broker-supplied headers/attributes.
     pub headers: BTreeMap<String, String>,
     /// The raw message body.
@@ -152,6 +165,7 @@ impl MessageCtx {
         Self {
             binding,
             coordinates: message.coordinates.clone(),
+            key: message.key.clone(),
             headers: message.headers.clone(),
             raw_body: message.payload.clone(),
         }
@@ -161,6 +175,37 @@ impl MessageCtx {
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
+    }
+
+    /// The broker's partition key as UTF-8, when it has one and it decodes.
+    ///
+    /// The convenience form of [`Self::key`] for the overwhelmingly common
+    /// case of a string key. Returns `None` both when the broker supplied no
+    /// key and when the key is not valid UTF-8 — a mapping function that
+    /// needs to distinguish the two should read [`Self::key`] directly.
+    ///
+    /// ```
+    /// # use autumn_harvest_plugin::connector::{InboundMessage, MessageCoordinates, MessageCtx, MessageHandle};
+    /// # use std::collections::BTreeMap;
+    /// let message = InboundMessage {
+    ///     coordinates: MessageCoordinates::KafkaOffset {
+    ///         topic: "orders".to_string(),
+    ///         partition: 0,
+    ///         offset: 7,
+    ///     },
+    ///     payload: b"{}".to_vec(),
+    ///     key: Some(b"tenant-42".to_vec()),
+    ///     headers: BTreeMap::new(),
+    ///     handle: MessageHandle::positioned("orders:0:7", 0, 7),
+    /// };
+    /// let ctx = MessageCtx::new("orders", &message);
+    /// assert_eq!(ctx.key_str(), Some("tenant-42"));
+    /// ```
+    #[must_use]
+    pub fn key_str(&self) -> Option<&str> {
+        self.key
+            .as_deref()
+            .and_then(|k| std::str::from_utf8(k).ok())
     }
 }
 
@@ -208,6 +253,7 @@ mod tests {
                 id: "1".to_string(),
             },
             payload: b"{\"a\":1}".to_vec(),
+            key: None,
             headers: BTreeMap::from([("ce-type".to_string(), "order.created".to_string())]),
             handle: MessageHandle::opaque("1"),
         };
@@ -216,5 +262,25 @@ mod tests {
         assert_eq!(ctx.header("ce-type"), Some("order.created"));
         assert_eq!(ctx.header("missing"), None);
         assert_eq!(ctx.raw_body, b"{\"a\":1}");
+        assert_eq!(ctx.key_str(), None, "no key on a keyless broker");
+    }
+
+    #[test]
+    fn a_non_utf8_key_is_reported_as_absent_by_the_string_helper() {
+        // `key_str` is the convenience form; a mapping function that must
+        // distinguish "no key" from "binary key" reads `key` directly.
+        let msg = InboundMessage {
+            coordinates: MessageCoordinates::Opaque {
+                stream: "q".to_string(),
+                id: "1".to_string(),
+            },
+            payload: Vec::new(),
+            key: Some(vec![0xff, 0xfe]),
+            headers: BTreeMap::new(),
+            handle: MessageHandle::opaque("1"),
+        };
+        let ctx = MessageCtx::new("orders", &msg);
+        assert_eq!(ctx.key_str(), None);
+        assert_eq!(ctx.key.as_deref(), Some([0xff, 0xfe].as_slice()));
     }
 }

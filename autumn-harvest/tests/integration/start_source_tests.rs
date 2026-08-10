@@ -288,6 +288,7 @@ async fn signal_with_start_records_signal_with_start_source() {
             reject_fresh_if_debounced: false,
             workflow_info: None,
             start_source_override: None,
+            start_source_ref_override: None,
         },
         None,
         None,

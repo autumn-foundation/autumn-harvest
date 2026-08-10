@@ -1,3 +1,8 @@
+// `#[workflow]` requires an `async fn` signature, so a workflow body that
+// happens to do no I/O still has to be async. Matches the convention in
+// `autumn-harvest/examples/`.
+#![allow(clippy::unused_async)]
+
 //! Trigger a durable workflow from a Kafka topic (issue #944).
 //!
 //! Run with:

@@ -96,6 +96,10 @@ pub async fn dispatch(
                 signal_name.to_string(),
                 Some(request.idempotency_key.to_string()),
                 request.queue.map(str::to_string),
+                // So a `SignalsWithStart` fresh run records the SAME
+                // `start_source_ref` shape as a `Starts` one — the rendered
+                // coordinates, not the derived bounded idempotency key.
+                Some(request.coordinates.to_string()),
             );
             Box::pin(crate::api::signal_with_start_workflow(
                 Extension(api_state.clone()),
@@ -133,11 +137,20 @@ async fn classify_response(
     };
 
     if status.is_client_error() {
-        // A deterministic refusal: schema validation, a mutually-exclusive
-        // option, an already-exists conflict. Retrying cannot help.
+        let detail = truncate(&String::from_utf8_lossy(&body), 1000);
+        // Most 4xx from the start/signal-with-start routes ARE deterministic
+        // refusals of this exact message (schema validation, a
+        // mutually-exclusive option) — retrying cannot help, so they poison.
+        // But a handful are transient *engine* states wearing a 4xx, and
+        // quarantining a perfectly good message because harvest happened to be
+        // booting or an operator happened to be pausing a run would be a real
+        // data-loss-shaped bug. Those are retried instead.
+        if is_transient_client_error(status.as_u16(), &detail) {
+            return DispatchOutcome::Transient(format!("{}: {detail}", status.as_u16()));
+        }
         return DispatchOutcome::TargetRejected {
             status: status.as_u16(),
-            detail: truncate(&String::from_utf8_lossy(&body), 1000),
+            detail,
         };
     }
 
@@ -192,6 +205,36 @@ fn classify_success(status: u16, ids: &DispatchIds, workflow_id: String) -> Disp
     DispatchOutcome::IdempotentReplay {
         execution_id,
         workflow_id,
+    }
+}
+
+/// Is this 4xx a transient *engine* state rather than a refusal of this
+/// message?
+///
+/// The default for a 4xx is "deterministic refusal → poison", because that is
+/// what nearly all of them are on the start / signal-with-start routes. The
+/// exceptions below are states that clear on their own, where quarantining a
+/// perfectly good message would be a data-loss-shaped bug:
+///
+/// * **`400` "harvest runtime is not started"** — the boot window. Every route
+///   fails closed with this until `on_startup` installs the runtime; a message
+///   consumed in that window is fine and will dispatch on the next pass.
+/// * **`409` `WorkflowPaused`** — an operator paused the target run (issue
+///   #383). Resuming it makes the exact same message succeed.
+/// * **`503`** is not a client error at all, so it already falls through to the
+///   generic transient arm below.
+///
+/// A `409 AlreadyExists` is deliberately **not** here: it is classified
+/// upstream as an idempotent replay (the run this message wanted already
+/// exists), which is a success, not a retry.
+fn is_transient_client_error(status: u16, detail: &str) -> bool {
+    match status {
+        400 => detail.contains("harvest runtime is not started"),
+        409 => detail.contains("paused"),
+        // 408/425/429 are engine-level backpressure or timing, never a
+        // statement about this message's content.
+        408 | 425 | 429 => true,
+        _ => false,
     }
 }
 
@@ -360,6 +403,57 @@ mod tests {
         )
         .await;
         assert!(matches!(out, DispatchOutcome::Transient(_)), "{out:?}");
+    }
+
+    #[test]
+    fn a_boot_window_400_is_retried_not_quarantined() {
+        // Every route fails closed with this until the runtime installs. A
+        // message consumed in that window is perfectly good; poisoning it
+        // would lose it for a purely transient reason.
+        assert!(is_transient_client_error(
+            400,
+            "harvest runtime is not started"
+        ));
+    }
+
+    #[test]
+    fn a_paused_target_409_is_retried_not_quarantined() {
+        // An operator pause (issue #383) clears; the same message succeeds
+        // once the run resumes.
+        assert!(is_transient_client_error(
+            409,
+            "workflow execution is paused"
+        ));
+    }
+
+    #[test]
+    fn engine_backpressure_statuses_are_retried() {
+        for status in [408, 425, 429] {
+            assert!(
+                is_transient_client_error(status, "whatever"),
+                "{status} is timing/backpressure, never a statement about the payload"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuine_deterministic_refusal_still_poisons() {
+        // The default must stay "poison", or one malformed payload wedges the
+        // partition forever — the exact failure the feature exists to prevent.
+        assert!(!is_transient_client_error(
+            400,
+            "input validation failed: missing required field 'email'"
+        ));
+        assert!(!is_transient_client_error(
+            400,
+            "idempotency_key cannot be combined with a throttle policy"
+        ));
+        assert!(!is_transient_client_error(404, "unknown workflow"));
+        assert!(
+            !is_transient_client_error(409, "workflow_id already has an existing execution"),
+            "an already-exists conflict is classified upstream as a replay, \
+             and must not be re-routed to retry here"
+        );
     }
 
     #[test]

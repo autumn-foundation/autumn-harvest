@@ -76,7 +76,16 @@ pub trait EventSource: Send + Sync {
     /// will simply be redelivered and dedupe as an idempotent replay.
     async fn ack(&self, handle: &MessageHandle) -> Result<(), ConnectorError>;
 
-    /// Return a message to the broker for redelivery (nack / reset visibility).
+    /// Return a message to the broker for **retry** after a transient
+    /// harvest-side failure.
+    ///
+    /// The message should come back *eventually*, with whatever natural
+    /// backoff the broker provides — an SQS visibility timeout lapsing, a
+    /// Kafka offset simply not being committed. Deliberately **not** an
+    /// "immediately redeliver" request: a transient failure is usually harvest
+    /// being under pressure, and hammering it with a tight redelivery loop
+    /// makes that worse. Use [`Self::nack_for_dead_letter`] when the intent is
+    /// to push a *poison* message toward the broker's own redrive policy.
     ///
     /// # Errors
     ///
@@ -85,11 +94,52 @@ pub trait EventSource: Send + Sync {
     /// is already sufficient for redelivery.
     async fn abandon(&self, handle: &MessageHandle) -> Result<(), ConnectorError>;
 
+    /// Return a **poison** message to the broker so its own dead-letter
+    /// routing claims it.
+    ///
+    /// Only called for a binding in
+    /// [`DeadLetterMode::BrokerNative`][bn], which
+    /// [`Self::has_native_dead_letter`] gates. Unlike [`Self::abandon`] this
+    /// *does* want the fastest possible redelivery, because each one advances
+    /// the broker's receive count toward the threshold that moves the message
+    /// to its DLQ.
+    ///
+    /// The default delegates to [`Self::abandon`], which is right for any
+    /// adapter whose redelivery mechanism is the same either way.
+    ///
+    /// [bn]: super::binding::DeadLetterMode::BrokerNative
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::Broker`] when the operation fails.
+    async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
+        self.abandon(handle).await
+    }
+
     /// Current consumer lag, for adapters whose client exposes it.
     ///
     /// The default returns `None`, so an adapter that cannot report lag simply
     /// never emits the `harvest.connector.lag` gauge.
     async fn lag(&self) -> Option<i64> {
         None
+    }
+
+    /// Whether this broker has a dead-letter destination of its own that
+    /// [`Self::abandon`] actually feeds.
+    ///
+    /// This gates [`super::binding::DeadLetterMode::BrokerNative`], which
+    /// quarantines a poison message by *abandoning* it and letting the broker
+    /// route it away. That only terminates if abandoning increments something
+    /// the broker eventually acts on — SQS's `ApproximateReceiveCount` against
+    /// a redrive policy's `maxReceiveCount`.
+    ///
+    /// Kafka has no such thing: `abandon` is a no-op (not committing is the
+    /// whole mechanism), so a poison message would be re-read **forever** and
+    /// never reach any dead-letter destination — precisely the partition wedge
+    /// the poison-message handling exists to prevent. The default is therefore
+    /// `false`, and a binding that asks for broker-native dead-lettering on
+    /// such a source is rejected at build time rather than silently wedging.
+    fn has_native_dead_letter(&self) -> bool {
+        false
     }
 }

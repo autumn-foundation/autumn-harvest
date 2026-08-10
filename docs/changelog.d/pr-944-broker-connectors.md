@@ -95,7 +95,17 @@ harvest-side failure leaves the message unacked. For Kafka there is one extra
 rule, because an offset commit is a **high-water mark**: committing `N` asserts
 everything below `N` is done, so the runtime commits only the **contiguous
 completed prefix** via `OffsetTracker` — if 11 and 12 finish while 10 is still
-in flight, nothing commits until 10 lands, then all three commit at once. Kafka
+in flight, nothing commits until 10 lands, then all three commit at once. The
+tracker distinguishes *in flight* (delivered to us, not yet settled — blocks the
+prefix) from *never delivered* (a hole below the highest offset actually seen —
+stepped over), because a partition's delivered offsets are **not** contiguous:
+Kafka reserves offsets for transaction control records, filters
+aborted-transaction records under `read_committed`, and compaction can remove a
+record entirely. Waiting on a hole that will never arrive would stall that
+partition's commit permanently — every message processed, but the mark frozen,
+so every restart replays all of them. A hole is only stepped over strictly
+*below* the highest delivered offset, so the mark can never run ahead into
+offsets the broker may still hand us. Kafka
 auto-commit is force-disabled *last* in `to_client_config()` so a caller-supplied
 `extra` property can never re-enable it and silently break the contract.
 
@@ -122,6 +132,19 @@ is `UNIQUE`, so dead-lettering is itself idempotent) or —
 visibility timeout is reset to `0`, so SQS re-delivers, counts the receive, and
 moves the message to the queue's DLQ once `maxReceiveCount` is hit).
 
+`EventSource` therefore has **two** distinct negative-acknowledgement verbs,
+because the two intents are opposite: `abandon` is the gentle return of a
+message that hit a *transient* harvest failure (SQS lets the visibility timeout
+expire naturally, which is also the backoff), while `nack_for_dead_letter` asks
+for the *fastest possible* redelivery so the broker's own redrive claims the
+message (SQS resets visibility to `0`). Conflating them made the docs' "the
+visibility timeout expires" claim false for the transient path. An adapter with
+no real nack keeps the default, which routes both to `abandon`; a binding that
+asks for `.broker_native_dead_letter()` on such an adapter is **rejected at
+build time** (`broker_native_dead_letter_is_supported`), because abandoning
+there never terminates — the poison message would be re-read forever and reach
+no dead-letter destination at all.
+
 ### Ordering caveat, documented honestly (AC7)
 
 The runtime dispatches up to `max_in_flight` messages concurrently and does
@@ -140,6 +163,9 @@ per ADR-0001 §7 the message key, offset and execution id are never labels:
 `idempotent_replay` / `deferred` / `dead_lettered` / `retried`),
 `harvest.connector.poisoned{source, reason}` (`malformed` /
 `mapping_rejected` / `target_rejected`), and `harvest.connector.lag{source}`
+— note `dispatched` is the **settlement breakdown**, one sample per received
+message, so the series sums to `received` and a dashboard can show the full
+disposition mix rather than only the successes —
 where the client exposes it (Kafka high-watermark minus committed offset; SQS
 `ApproximateNumberOfMessages`). A broker-triggered execution also records
 `start_source = 'broker'` with `start_source_ref` set to the rendered
@@ -158,6 +184,40 @@ coordinates, so a run traces back to the exact message.
   reports the existing mark — a commit is idempotent — without ever advancing
   past an in-flight gap.
 
+### Further defects the code review found
+
+* **The prefix stalled forever on an offset the broker never delivers.** Kafka
+  control records, filtered aborted-transaction records, and compacted-away
+  keys all leave holes in a partition's delivered offsets. The tracker waited
+  on them, freezing that partition's commit permanently. Fixed by tracking
+  in-flight offsets explicitly, so a hole below the highest delivered offset is
+  stepped over while a genuinely in-flight offset still blocks.
+* **A panicking mapping function was retried forever.** `(binding.mapper)` is
+  embedder-supplied code; an `unwrap()` in it unwound the dispatch task, which
+  the runtime correctly declined to ack — and then re-read the same message on
+  every pass. It is now caught (`catch_unwind`) and classified as `Malformed`,
+  which is deterministic and therefore dead-lettered on sight.
+* **`ack` committed the message's own offset rather than the advanced mark.**
+  The contiguous-prefix computation was correct but its result was discarded,
+  so a batch that completed out of order committed a *lower* mark than it had
+  earned and re-read the gap on restart.
+* **The dead-letter record under-reported its strike count.** `settle` recorded
+  a hard-coded attempt count rather than the real consecutive-strike total, so
+  an operator triaging a quarantined message could not see how many times it
+  had actually been tried.
+* **`start_source_ref` recorded the wrong shape on the signal-with-start path.**
+  The core resolved it from the idempotency key, which for a
+  `signals_with_start` binding is the *namespaced* key rather than the raw
+  broker coordinates — so provenance was inconsistent between the two binding
+  kinds. `SignalWithStartParams` gained an explicit
+  `start_source_ref_override` so both paths record the rendered coordinates
+  uniformly.
+* **Three docs sites documented the wrong `outcome` label values.** They
+  claimed **4** values named `started`/`idempotent_replay`/`deferred`/`retry`;
+  the shipped enum has **5**, named `dispatched`/`idempotent_replay`/
+  `deferred`/`dead_lettered`/`retried`. Caught by a test that asserts the
+  emitted label rather than merely that emission did not panic.
+
 ### Success metric
 
 > an embedder wires a Kafka topic to a workflow in ≤ 30 lines of
@@ -168,7 +228,7 @@ coordinates, so a run traces back to the exact message.
 Both halves are **falsifiable in CI**. The wiring budget is measured, not
 claimed: `tests/connector_example_budget.rs` reads the shipped
 `examples/kafka_connector_quickstart.rs` and counts the code between its
-`connector` markers (**18 lines**), failing if the API ever grows enough
+`connector` markers (**17 lines**; the SQS example is 24), failing if the API ever grows enough
 boilerplate to exceed 30 — with a companion test asserting the marked block
 still contains a real binding, mapping function and source, so the budget
 cannot be met by an example that stopped demonstrating the thing. The soak is

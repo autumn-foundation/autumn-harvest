@@ -175,6 +175,12 @@ jobs:
       - name: Run plugin connector tests (issue #944)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # No CI step ran the plugin's doctests, so a broken `///` example landed
+      # silently (issue #944 review found exactly that). These are compile-only
+      # (`no_run`), so they cost seconds and need no database.
+      - name: Run plugin doctests (issue #944 review)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo test --doc -p autumn-harvest-plugin --features connectors
       - name: Run plugin MCP tool tests (issue #597, DAG MCP tools issue #601 follow-up)
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
@@ -184,12 +190,13 @@ jobs:
       - name: Compile plugin metrics scrape example
         if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
-      # issue #944: the Kafka example is the success metric's measured artifact
-      # (see tests/connector_example_budget.rs), so it must keep compiling.
-      # Linux-only for the same librdkafka reason as the broker suite.
+      # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
       - name: Compile plugin SQS connector example (issue #944)
         if: needs.changes.outputs.code == 'true'
         run: cargo build -p autumn-harvest-plugin --example sqs_connector_quickstart --features sqs
+      # issue #944: the Kafka example is the success metric's measured artifact
+      # (see tests/connector_example_budget.rs), so it must keep compiling.
+      # Linux-only for the same librdkafka reason as the broker suite.
       - name: Compile plugin Kafka connector example (issue #944, Linux)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: |

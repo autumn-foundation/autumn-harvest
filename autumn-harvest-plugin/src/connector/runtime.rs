@@ -50,19 +50,44 @@ use crate::api::HarvestApiState;
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectorRuntimeConfig {
     /// Longest a `receive` call waits for the first message.
+    ///
+    /// This is also the SQS **long-poll** window: the adapter passes it
+    /// straight through as `WaitTimeSeconds` (clamped to SQS's 20s maximum),
+    /// so a sub-second value degrades to *short polling* — an empty
+    /// `ReceiveMessage` returned immediately, billed, and retried as fast as
+    /// the network allows. The default is deliberately ≥ 1s so an idle SQS
+    /// binding costs roughly one API call per second rather than thousands.
     pub poll_timeout: std::time::Duration,
     /// Most messages pulled per `receive` call.
     pub max_batch: usize,
     /// How long to back off after a broker error before polling again.
     pub error_backoff: std::time::Duration,
+    /// How long to pause after a poll that returned nothing.
+    ///
+    /// Belt-and-braces on top of `poll_timeout`: an adapter whose `receive`
+    /// returns immediately when idle (rather than blocking for the timeout)
+    /// would otherwise spin. Kafka's `recv` genuinely blocks, so this is a
+    /// no-op there.
+    pub idle_backoff: std::time::Duration,
+    /// Shortest interval between consumer-lag samples.
+    ///
+    /// Lag is a per-call broker query (SQS bills a `GetQueueAttributes`;
+    /// Kafka does a `fetch_watermarks` round-trip), so sampling it on *every*
+    /// pass doubles the connector's idle call rate for a gauge that only
+    /// needs to move on a scrape cadence.
+    pub lag_sample_interval: std::time::Duration,
 }
 
 impl Default for ConnectorRuntimeConfig {
     fn default() -> Self {
         Self {
-            poll_timeout: std::time::Duration::from_millis(500),
+            // ≥ 1s so SQS long-polls rather than short-polls (see the field
+            // doc). One idle receive per second, not one per round-trip.
+            poll_timeout: std::time::Duration::from_secs(1),
             max_batch: 32,
             error_backoff: std::time::Duration::from_secs(1),
+            idle_backoff: std::time::Duration::from_millis(200),
+            lag_sample_interval: std::time::Duration::from_secs(15),
         }
     }
 }
@@ -79,6 +104,9 @@ pub struct ConnectorRuntime {
     permits: Arc<Semaphore>,
     poison: Arc<tokio::sync::Mutex<PoisonTracker>>,
     offsets: Arc<tokio::sync::Mutex<OffsetTracker>>,
+    /// When the consumer-lag gauge was last sampled, so an idle binding does
+    /// not issue a billed broker query on every pass.
+    last_lag_sample: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// What one `run_once` pass did, for tests and diagnostics.
@@ -117,6 +145,7 @@ impl ConnectorRuntime {
             permits,
             poison: Arc::new(tokio::sync::Mutex::new(PoisonTracker::new())),
             offsets: Arc::new(tokio::sync::Mutex::new(OffsetTracker::new())),
+            last_lag_sample: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -173,6 +202,16 @@ impl ConnectorRuntime {
             tokio::select! {
                 () = cancel.cancelled() => break,
                 result = self.run_once() => match result {
+                    Ok(summary) if summary.received == 0 => {
+                        // An adapter whose `receive` returns immediately when
+                        // idle would otherwise spin this loop (and, for a
+                        // billed API like SQS, the operator's invoice) as fast
+                        // as the network allows.
+                        tokio::select! {
+                            () = cancel.cancelled() => break,
+                            () = tokio::time::sleep(self.config.idle_backoff) => {}
+                        }
+                    }
                     Ok(_) => {}
                     Err(ConnectorError::Closed) => {
                         tracing::info!(source = source_name, "connector source closed");
@@ -208,7 +247,11 @@ impl ConnectorRuntime {
             .receive(self.config.max_batch, self.config.poll_timeout)
             .await?;
 
-        if let Some(lag) = self.source.lag().await {
+        // Throttled: `lag()` is a billed broker round-trip, and the gauge only
+        // needs to move on a scrape cadence.
+        if self.lag_sample_is_due()
+            && let Some(lag) = self.source.lag().await
+        {
             self.metrics.record_connector_lag(self.binding.name, lag);
         }
 
@@ -256,6 +299,14 @@ impl ConnectorRuntime {
                 Err(e) => {
                     // A panicking dispatch task must not ack: leaving the
                     // message unacknowledged is the safe direction.
+                    //
+                    // A panic in the *mapping function* — the message-
+                    // attributable, deterministic case — is already contained
+                    // in `map_and_dispatch` and quarantined as `Malformed`, so
+                    // it never reaches here. What is left is an engine-side
+                    // panic, which is not a property of this message; retrying
+                    // is correct. Known limit: a persistently panicking engine
+                    // path redelivers forever rather than dead-lettering.
                     tracing::error!(
                         source = self.binding.name,
                         error = %e,
@@ -267,6 +318,24 @@ impl ConnectorRuntime {
         }
 
         Ok(summary)
+    }
+
+    /// Whether enough time has passed to re-sample the consumer-lag gauge.
+    ///
+    /// Records the sample instant as a side effect, so a caller that gets
+    /// `true` must actually take the sample. Uses a plain `std::sync::Mutex`
+    /// held across two trivial operations only — never across an `.await`.
+    fn lag_sample_is_due(&self) -> bool {
+        let now = std::time::Instant::now();
+        let mut last = self
+            .last_lag_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = last.is_none_or(|t| now.duration_since(t) >= self.config.lag_sample_interval);
+        if due {
+            *last = Some(now);
+        }
+        due
     }
 
     fn clone_handles(&self) -> Self {
@@ -281,6 +350,7 @@ impl ConnectorRuntime {
             permits: Arc::clone(&self.permits),
             poison: Arc::clone(&self.poison),
             offsets: Arc::clone(&self.offsets),
+            last_lag_sample: Arc::clone(&self.last_lag_sample),
         }
     }
 
@@ -313,7 +383,16 @@ impl ConnectorRuntime {
         // metrics and the strike bookkeeping must describe what actually
         // happened rather than what was intended.
         let effective = self
-            .settle(&message, &coordinates, &key, &outcome, decided)
+            .settle(
+                &message,
+                &coordinates,
+                &key,
+                &outcome,
+                decided,
+                // A mapping rejection has accumulated `strikes` deliveries; a
+                // deterministic poison is quarantined on its first.
+                strikes.max(1),
+            )
             .await;
 
         // Once a message reaches a terminal disposition its strike history is
@@ -334,10 +413,31 @@ impl ConnectorRuntime {
         coordinates: &str,
     ) -> DispatchOutcome {
         let ctx = MessageCtx::new(self.binding.name, message);
-        let mapped = match (self.binding.mapper)(&ctx) {
-            Ok(m) => m,
-            Err(MappingError::Deserialize(m)) => return DispatchOutcome::Malformed(m),
-            Err(MappingError::Rejected(m)) => return DispatchOutcome::MappingRejected(m),
+        // A mapping function is embedder code operating on an untrusted broker
+        // payload, so a stray `unwrap()` on a malformed message is a realistic
+        // failure. Contain it exactly like the engine contains a `#[workflow]`
+        // /`#[activity]` panic (issue #782): a panic here is deterministic in
+        // the message (the same bytes panic on every redelivery), so treating
+        // it as `Malformed` quarantines the one bad message rather than letting
+        // it wedge the partition forever. `AssertUnwindSafe` is sound: the
+        // mapper is a plain `fn` and its (discarded) output is the only state
+        // crossing the boundary.
+        let mapping =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.binding.mapper)(&ctx)));
+        let mapped = match mapping {
+            Ok(Ok(m)) => m,
+            Ok(Err(MappingError::Deserialize(m))) => return DispatchOutcome::Malformed(m),
+            Ok(Err(MappingError::Rejected(m))) => return DispatchOutcome::MappingRejected(m),
+            Err(payload) => {
+                let detail = autumn_harvest::error::panic_message(payload);
+                tracing::error!(
+                    source = self.binding.name,
+                    coordinates,
+                    detail = %detail,
+                    "connector mapping function panicked; quarantining the message"
+                );
+                return DispatchOutcome::Malformed(format!("mapping function panicked: {detail}"));
+            }
         };
 
         dispatch(
@@ -388,6 +488,7 @@ impl ConnectorRuntime {
         key: &str,
         outcome: &DispatchOutcome,
         disposition: MessageDisposition,
+        attempts: u32,
     ) -> MessageDisposition {
         match disposition {
             MessageDisposition::Ack => {
@@ -405,7 +506,8 @@ impl ConnectorRuntime {
                 MessageDisposition::Retry
             }
             MessageDisposition::DeadLetter(reason) => {
-                let entry = self.dead_letter_entry(message, coordinates, key, outcome, reason);
+                let entry =
+                    self.dead_letter_entry(message, coordinates, key, outcome, reason, attempts);
                 match self.sink.write(&entry).await {
                     Ok(()) => {
                         tracing::warn!(
@@ -438,7 +540,11 @@ impl ConnectorRuntime {
                     reason = reason.as_str(),
                     "connector message abandoned to broker-native dead-lettering"
                 );
-                self.abandon(&message.handle).await;
+                // The poison path wants the FASTEST redelivery (each one
+                // advances the broker's receive count toward its redrive
+                // threshold), unlike `abandon`, which is the gentler
+                // transient-retry return.
+                self.nack_for_dead_letter(&message.handle).await;
                 MessageDisposition::AbandonToBrokerDeadLetter(reason)
             }
         }
@@ -451,6 +557,7 @@ impl ConnectorRuntime {
         key: &str,
         outcome: &DispatchOutcome,
         reason: PoisonReason,
+        attempts: u32,
     ) -> ConnectorDeadLetter {
         let detail = match outcome {
             DispatchOutcome::Malformed(m) | DispatchOutcome::MappingRejected(m) => m.clone(),
@@ -465,7 +572,13 @@ impl ConnectorRuntime {
             workflow_name: self.binding.target.workflow().to_string(),
             reason,
             detail,
-            attempts: i32::try_from(self.binding.poison_threshold.max(1)).unwrap_or(i32::MAX),
+            // What actually happened, not what was configured: the strike
+            // count at the moment of quarantine. A deterministic poison
+            // (malformed payload, permanent rejection) is dead-lettered on
+            // its FIRST delivery, so it records 1 — recording the configured
+            // threshold there would tell an operator it had been retried
+            // twice when it never was.
+            attempts: i32::try_from(attempts.max(1)).unwrap_or(i32::MAX),
             payload: message.payload.clone(),
             failed_at: Utc::now(),
         }
@@ -475,12 +588,26 @@ impl ConnectorRuntime {
         // For a positionally-ordered broker (Kafka), only advance the
         // high-water mark to the contiguous completed prefix — committing past
         // an in-flight lower offset would silently skip it on a crash.
+        //
+        // The offset actually committed is the tracker's advanced mark, NOT
+        // this handle's own position: when offsets 2 then 1 settle in that
+        // order, offset 2 is held, and it is 1's completion that advances the
+        // prefix to 2. Committing 1's handle there would leave 2 uncommitted
+        // and re-read on a crash. Kafka's `ack` addresses the commit purely by
+        // `(partition, position)` (the token is unused), so a synthesized
+        // handle at the mark is the correct thing to hand it.
+        let mut owned;
+        let mut handle = handle;
         if let (Some(partition), Some(position)) = (handle.partition, handle.position) {
-            let advanced = self.offsets.lock().await.complete(partition, position);
-            if advanced.is_none() {
-                // Earlier offsets are still in flight; the adapter will commit
-                // this one as part of a later contiguous advance.
+            let Some(advanced) = self.offsets.lock().await.complete(partition, position) else {
+                // Earlier offsets are still in flight; this one will be
+                // committed as part of a later contiguous advance.
                 return;
+            };
+            if advanced != position {
+                owned = handle.clone();
+                owned.position = Some(advanced);
+                handle = &owned;
             }
         }
         if let Err(e) = self.source.ack(handle).await {
@@ -503,6 +630,16 @@ impl ConnectorRuntime {
             );
         }
     }
+
+    async fn nack_for_dead_letter(&self, handle: &MessageHandle) {
+        if let Err(e) = self.source.nack_for_dead_letter(handle).await {
+            tracing::warn!(
+                source = self.binding.name,
+                error = %e,
+                "connector nack-for-dead-letter failed; relying on broker-native redelivery"
+            );
+        }
+    }
 }
 
 /// Dead-letter mode helper re-exported for the plugin wiring.
@@ -518,6 +655,70 @@ mod tests {
     use crate::connector::dead_letter::RecordingDeadLetterSink;
     use crate::connector::mock::MockSource;
     use autumn_harvest::telemetry::NoOpMetrics;
+    use std::sync::Mutex;
+
+    /// A `MetricsRecorder` that captures every connector sample, so a test can
+    /// assert what was actually emitted rather than merely that emitting did
+    /// not panic.
+    #[derive(Debug, Default)]
+    struct RecordingMetrics {
+        received: Mutex<Vec<String>>,
+        dispatched: Mutex<Vec<(String, ConnectorOutcome)>>,
+        poisoned: Mutex<Vec<(String, PoisonReason)>>,
+        lag: Mutex<Vec<(String, i64)>>,
+    }
+
+    impl RecordingMetrics {
+        fn received(&self) -> Vec<String> {
+            self.received.lock().unwrap().clone()
+        }
+        fn dispatched(&self) -> Vec<(String, ConnectorOutcome)> {
+            self.dispatched.lock().unwrap().clone()
+        }
+        fn poisoned(&self) -> Vec<(String, PoisonReason)> {
+            self.poisoned.lock().unwrap().clone()
+        }
+        fn lag(&self) -> Vec<(String, i64)> {
+            self.lag.lock().unwrap().clone()
+        }
+    }
+
+    impl MetricsRecorder for RecordingMetrics {
+        fn record_connector_received(&self, source: &str) {
+            self.received.lock().unwrap().push(source.to_string());
+        }
+        fn record_connector_dispatched(&self, source: &str, outcome: ConnectorOutcome) {
+            self.dispatched
+                .lock()
+                .unwrap()
+                .push((source.to_string(), outcome));
+        }
+        fn record_connector_poisoned(&self, source: &str, reason: PoisonReason) {
+            self.poisoned
+                .lock()
+                .unwrap()
+                .push((source.to_string(), reason));
+        }
+        fn record_connector_lag(&self, source: &str, lag: i64) {
+            self.lag.lock().unwrap().push((source.to_string(), lag));
+        }
+    }
+
+    fn runtime_with_metrics(
+        binding: Arc<SourceBinding>,
+        source: Arc<MockSource>,
+        sink: Arc<RecordingDeadLetterSink>,
+        metrics: Arc<RecordingMetrics>,
+    ) -> ConnectorRuntime {
+        ConnectorRuntime::new(
+            binding,
+            source,
+            HarvestApiState::new(),
+            metrics,
+            IdempotencyMode::BrokerCoordinates,
+        )
+        .with_dead_letter_sink(sink)
+    }
 
     /// A binding whose mapper always rejects (a semantic refusal, so it is
     /// strike-counted rather than dead-lettered on sight).
@@ -571,6 +772,76 @@ mod tests {
         assert_eq!(entries[0].coordinates, "orders:0:1");
         assert_eq!(entries[0].payload, b"{{{");
         // Acked so the poison message stops blocking the partition.
+        assert_eq!(source.acked().len(), 1);
+        // The recorded attempt count is what actually happened. A malformed
+        // payload is quarantined on its FIRST delivery, so recording the
+        // configured `poison_threshold` (3) would tell an operator it had been
+        // retried twice when it never was.
+        assert_eq!(entries[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_repeatedly_rejected_message_records_its_real_strike_count() {
+        // The other half: a mapping rejection genuinely accumulates strikes,
+        // so the dead-letter row must show the threshold it actually reached.
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| Err(MappingError::Rejected("no tenant".to_string())))
+                .poison_threshold(3),
+        );
+        let rt = runtime(binding, Arc::clone(&source), Arc::clone(&sink));
+
+        // Redeliver the SAME coordinates three times, as a broker would.
+        for _ in 0..3 {
+            source.push_kafka(0, 1, b"{}");
+            rt.run_once().await.unwrap();
+        }
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1, "quarantined once, on the third strike");
+        assert_eq!(entries[0].reason, PoisonReason::MappingRejected);
+        assert_eq!(entries[0].attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_mapping_function_is_quarantined_not_retried_forever() {
+        // A mapping function is embedder code over an untrusted payload, so a
+        // stray `unwrap()` is realistic. The panic is deterministic in the
+        // message, so retrying it forever would wedge the partition — the
+        // engine contains it exactly as it contains a `#[workflow]` panic
+        // (issue #782) and quarantines the one bad message.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 1, b"boom");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let binding = Arc::new(
+            SourceBinding::starts("orders", "orders", "order_flow")
+                .map_raw(|_ctx| panic!("mapper exploded")),
+        );
+        let rt = runtime(binding, Arc::clone(&source), Arc::clone(&sink));
+
+        let summary = rt.run_once().await.unwrap();
+
+        assert_eq!(summary.received, 1);
+        assert_eq!(
+            summary.dead_lettered, 1,
+            "a panicking mapper quarantines the message"
+        );
+        assert_eq!(
+            summary.retried, 0,
+            "and never leaves it circulating for redelivery"
+        );
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reason, PoisonReason::Malformed);
+        assert!(
+            entries[0].detail.contains("mapper exploded"),
+            "the panic message is preserved for triage, got {:?}",
+            entries[0].detail
+        );
+        // Acked, so one panicking payload cannot block the partition.
         assert_eq!(source.acked().len(), 1);
     }
 
@@ -683,7 +954,39 @@ mod tests {
         assert_eq!(summary.dead_lettered, 1);
         assert!(sink.entries().is_empty(), "the broker owns the DLQ here");
         assert!(source.acked().is_empty());
+        // The POISON path, not the transient-retry path: the two are opposite
+        // intents (drive the receive count toward the redrive threshold vs.
+        // return gently with backoff) and SQS implements them differently.
+        assert_eq!(source.nacked_for_dead_letter().len(), 1);
+        assert!(
+            source.abandoned().is_empty(),
+            "a poison quarantine must not go through the gentle retry return"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_uses_the_gentle_retry_return_not_the_poison_nack() {
+        // The mirror image. A transient harvest failure must NOT rush the
+        // message back: on SQS that would both hammer an already-struggling
+        // harvest and burn `ApproximateReceiveCount` toward a redrive policy's
+        // `maxReceiveCount`, eventually dead-lettering a perfectly good
+        // message for a purely transient reason.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_opaque("m-1", b"{{{");
+        // A sink that always fails downgrades the dead-letter to a Retry.
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        sink.fail_writes(true);
+        let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink));
+
+        let summary = rt.run_once().await.unwrap();
+
+        assert_eq!(summary.retried, 1);
+        assert!(source.acked().is_empty());
         assert_eq!(source.abandoned().len(), 1);
+        assert!(
+            source.nacked_for_dead_letter().is_empty(),
+            "a transient retry must not use the poison nack"
+        );
     }
 
     #[tokio::test]
@@ -764,10 +1067,38 @@ mod tests {
             "offset 5 must not commit while 4 is in flight"
         );
 
-        // Completing 4 advances the prefix through 5.
+        // Completing 4 advances the prefix through 5 — and the commit MUST be
+        // at 5, the advanced mark, not at 4 (the handle that happened to
+        // trigger the advance). Committing 4 here would leave 5 uncommitted
+        // and re-read it on a crash, even though it is durably settled.
         rt.ack(&MessageHandle::positioned("orders:0:4", 0, 4)).await;
         assert_eq!(source.acked().len(), 1);
-        assert_eq!(source.acked()[0].position, Some(4));
+        assert_eq!(
+            source.acked()[0].position,
+            Some(5),
+            "the commit must be at the advanced high-water mark, not the \
+             triggering handle's own offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_order_ack_commits_its_own_offset_unchanged() {
+        // The common case: offsets settle in order, so the advanced mark IS
+        // the handle's own position and no synthesis happens.
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let rt = runtime(malformed_binding(), Arc::clone(&source), sink);
+
+        rt.offsets.lock().await.observe(0, 7);
+        rt.ack(&MessageHandle::positioned("orders:0:7", 0, 7)).await;
+
+        assert_eq!(source.acked().len(), 1);
+        assert_eq!(source.acked()[0].position, Some(7));
+        assert_eq!(
+            source.acked()[0].token,
+            "orders:0:7",
+            "an unsynthesized ack keeps the adapter's own token"
+        );
     }
 
     #[tokio::test]
@@ -781,29 +1112,148 @@ mod tests {
         assert_eq!(source.acked().len(), 1);
     }
 
-    #[tokio::test]
+    // Multi-thread: the observation below blocks its worker thread, which on
+    // the default current-thread runtime would serialize the dispatches and
+    // make the test pass vacuously with a peak of 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn in_flight_dispatch_is_bounded_by_max_in_flight() {
         // AC5: the connector bounds its own concurrency so a backlog cannot
-        // stampede the admission path.
+        // stampede the admission path. Assert the OBSERVED peak, not merely
+        // the semaphore's initial permit count -- a bound that is never
+        // actually taken would satisfy the latter while stampeding anyway.
+        const LIMIT: usize = 4;
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (peak_m, live_m) = (Arc::clone(&peak), Arc::clone(&live));
+
+        // The mapper runs while the permit is held, so it is the observation
+        // point for real in-flight concurrency.
         let binding = Arc::new(
             SourceBinding::starts("orders", "orders", "order_flow")
-                .map_raw(|_ctx| Err(MappingError::Deserialize("x".to_string())))
-                .max_in_flight(4),
+                .map_raw(move |_ctx| {
+                    use std::sync::atomic::Ordering;
+                    let now = live_m.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_m.fetch_max(now, Ordering::SeqCst);
+                    // Spin briefly so concurrent dispatches genuinely overlap.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    live_m.fetch_sub(1, Ordering::SeqCst);
+                    Err(MappingError::Deserialize("x".to_string()))
+                })
+                .max_in_flight(LIMIT),
         );
+
         let source = Arc::new(MockSource::new("orders"));
+        for offset in 0..32 {
+            source.push_kafka(0, offset, b"{}");
+        }
         let sink = Arc::new(RecordingDeadLetterSink::new());
-        let rt = runtime(binding, source, sink);
-        assert_eq!(rt.permits.available_permits(), 4);
+        let rt = runtime(binding, Arc::clone(&source), sink);
+
+        let summary = rt.run_once().await.unwrap();
+        assert_eq!(summary.received, 32, "the whole backlog is drained");
+
+        let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "the test must actually exercise concurrency, saw peak {observed}",
+        );
+        assert!(
+            observed <= LIMIT,
+            "peak in-flight {observed} exceeded max_in_flight {LIMIT}",
+        );
     }
 
     #[tokio::test]
     async fn lag_is_reported_to_metrics_when_the_source_exposes_it() {
+        // AC8: consumer lag reaches the recorder with the binding name as its
+        // only label.
         let source = Arc::new(MockSource::new("orders"));
         source.set_lag(Some(42));
         let sink = Arc::new(RecordingDeadLetterSink::new());
-        let rt = runtime(malformed_binding(), Arc::clone(&source), sink);
-        // NoOpMetrics swallows it; the assertion is simply that reporting lag
-        // never fails a pass.
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = runtime_with_metrics(
+            malformed_binding(),
+            Arc::clone(&source),
+            sink,
+            Arc::clone(&metrics),
+        );
+
         assert_eq!(rt.run_once().await.unwrap(), PassSummary::default());
+        assert_eq!(
+            metrics.lag(),
+            vec![("orders".to_string(), 42)],
+            "lag must be emitted with the binding name, not swallowed",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_reports_no_lag_emits_no_lag_sample() {
+        // A gauge fabricated from `None` would read as "zero lag" on a
+        // dashboard, which is materially different from "unknown".
+        let source = Arc::new(MockSource::new("orders"));
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = runtime_with_metrics(malformed_binding(), source, sink, Arc::clone(&metrics));
+
+        rt.run_once().await.unwrap();
+        assert!(metrics.lag().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_message_emits_received_and_poisoned_with_bounded_labels() {
+        // AC8: every metric carries ONLY the binding name and a closed-set
+        // outcome -- never the message key, offset, or payload (ADR-0001 §7).
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 1, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = runtime_with_metrics(
+            malformed_binding(),
+            Arc::clone(&source),
+            Arc::clone(&sink),
+            Arc::clone(&metrics),
+        );
+
+        rt.run_once().await.unwrap();
+
+        assert_eq!(metrics.received(), vec!["orders".to_string()]);
+        assert_eq!(
+            metrics.poisoned(),
+            vec![("orders".to_string(), PoisonReason::Malformed)],
+        );
+        // `harvest.connector.dispatched` is the SETTLEMENT breakdown, not a
+        // count of messages that reached harvest: every received message
+        // records exactly one outcome, so the series sums to
+        // `harvest.connector.received` and a dashboard can show the full mix.
+        assert_eq!(
+            metrics.dispatched(),
+            vec![("orders".to_string(), ConnectorOutcome::DeadLettered)],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_sink_failure_still_counts_the_poison_but_does_not_ack() {
+        // The strike bookkeeping and the metric must describe what ACTUALLY
+        // happened: the message was poison, the record did not land, so the
+        // message is retried rather than silently dropped.
+        let source = Arc::new(MockSource::new("orders"));
+        source.push_kafka(0, 1, b"{{{");
+        let sink = Arc::new(RecordingDeadLetterSink::new());
+        sink.fail_writes(true);
+        let metrics = Arc::new(RecordingMetrics::default());
+        let rt = runtime_with_metrics(
+            malformed_binding(),
+            Arc::clone(&source),
+            Arc::clone(&sink),
+            Arc::clone(&metrics),
+        );
+
+        rt.run_once().await.unwrap();
+
+        assert_eq!(metrics.received(), vec!["orders".to_string()]);
+        assert!(
+            source.acked().is_empty(),
+            "acking a message whose dead-letter record failed would lose it",
+        );
     }
 }

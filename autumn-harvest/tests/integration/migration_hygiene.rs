@@ -175,6 +175,15 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // Separate plugin app-DB `harvest_workflow_outbox` migration — not part of
     // the core `migrations/` bundle that `full_migrations_sql()` emits.
     "autumn-harvest-plugin/tests/outbox_integration.rs",
+    // The three connector suites (issue #944) each build
+    // `full_migrations_sql()` and then append the plugin-owned
+    // `harvest_connector_dead_letters` migration, which likewise lives in
+    // `autumn-harvest-plugin/migrations/harvest/` rather than the core bundle.
+    // The paved path is used for everything it covers; only the one plugin
+    // table is hand-appended.
+    "autumn-harvest-plugin/tests/connector_integration.rs",
+    "autumn-harvest-plugin/tests/connector_kafka_broker.rs",
+    "autumn-harvest-plugin/tests/connector_sqs_broker.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a
@@ -302,7 +311,7 @@ fn line_detector_flags_a_handrolled_include_and_ignores_others() {
         r#"    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),"#
     ));
     assert!(line_is_handrolled_migration_include(
-        r#"    include_str!("../migrations/20260409010000_harvest_workflow_outbox/up.sql");"#
+        r#"    include_str!("../migrations/app/20260409010000_harvest_workflow_outbox/up.sql");"#
     ));
     // A non-migration `include_str!` (the paved-path helper's own CI includes)
     // must NOT be flagged — it lacks both `migrations` and `up.sql`.

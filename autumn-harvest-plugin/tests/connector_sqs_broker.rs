@@ -47,7 +47,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const CONNECTOR_DLQ_SQL: &str =
-    include_str!("../migrations/20260716000000_harvest_connector_dead_letters/up.sql");
+    include_str!("../migrations/harvest/20260716000000_harvest_connector_dead_letters/up.sql");
 
 const QUEUE: &str = "orders";
 
@@ -239,6 +239,37 @@ async fn harness() -> (
     (client, queue_url, pool, conn, state, (mq, pg))
 }
 
+/// `(visible, in_flight)` message counts straight from the broker.
+///
+/// This is what makes the ack assertion falsifiable. A message that was
+/// *received but never deleted* is **invisible** for its visibility timeout,
+/// so a follow-up `receive` returns nothing whether or not the ack actually
+/// deleted it — `received == 0` alone cannot tell the two apart. The queue's
+/// own attributes can: an acked message leaves BOTH counters at zero, while a
+/// no-op ack parks the messages in `NotVisible`.
+async fn queue_depth(client: &Client, queue_url: &str) -> (i64, i64) {
+    use aws_sdk_sqs::types::QueueAttributeName;
+
+    let out = client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+        .send()
+        .await
+        .expect("get queue attributes");
+    let read = |name: &QueueAttributeName| -> i64 {
+        out.attributes()
+            .and_then(|a| a.get(name))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (
+        read(&QueueAttributeName::ApproximateNumberOfMessages),
+        read(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible),
+    )
+}
+
 async fn send(client: &Client, queue_url: &str, bodies: &[Value]) {
     for body in bodies {
         client
@@ -275,8 +306,17 @@ async fn a_burst_on_a_real_queue_yields_exactly_one_execution_per_message() {
         "exactly one execution per message"
     );
 
-    // The falsifiable half of AC4: an ack really is a DeleteMessage, so a
-    // further poll finds an empty queue. A no-op ack would re-read all twelve.
+    // The falsifiable half of AC4: an ack really is a DeleteMessage. Asking
+    // the broker directly is what makes this a real assertion -- a no-op ack
+    // would leave all twelve sitting in `NotVisible` until their visibility
+    // timeout expired, which a mere `received == 0` could never distinguish.
+    let (visible, in_flight) = queue_depth(&client, &queue_url).await;
+    assert_eq!(
+        (visible, in_flight),
+        (0, 0),
+        "an acked message is deleted from the queue, not merely made invisible",
+    );
+
     let pass = runtime.run_once().await.expect("pass");
     assert_eq!(pass.received, 0, "acked messages are deleted, not re-read");
 }
@@ -325,7 +365,14 @@ async fn an_abandoned_message_is_redelivered_and_dedupes() {
         "the valid message still ran, exactly once, despite the poison sibling"
     );
 
-    // Everything settled: the queue drains.
+    // Everything settled: the queue really is empty, in-flight included, so
+    // neither the poison message nor the valid one is left circulating.
     let pass = runtime.run_once().await.expect("pass");
     assert_eq!(pass.received, 0, "nothing is left circulating");
+    let (visible, in_flight) = queue_depth(&client, &queue_url).await;
+    assert_eq!(
+        (visible, in_flight),
+        (0, 0),
+        "a dead-lettered message is acked off the queue, not left in flight",
+    );
 }

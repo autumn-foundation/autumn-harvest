@@ -133,12 +133,13 @@ impl KafkaSource {
 
 /// Copy one borrowed Kafka message into an owned [`InboundMessage`].
 ///
-/// Pure over the four fields it needs, so the coordinate/handle shape is
-/// testable without a broker.
+/// Pure over the fields it needs, so the coordinate/handle shape is testable
+/// without a broker.
 fn to_inbound(
     topic: &str,
     partition: i32,
     offset: i64,
+    key: Option<Vec<u8>>,
     payload: Vec<u8>,
     headers: BTreeMap<String, String>,
 ) -> InboundMessage {
@@ -151,6 +152,10 @@ fn to_inbound(
     InboundMessage {
         coordinates,
         payload,
+        // The record key is what Kafka partitions by, so surfacing it is what
+        // makes the documented per-key ordering remedy actually reachable
+        // from a mapping function (`ctx.key_str()`).
+        key,
         headers,
         handle,
     }
@@ -195,6 +200,7 @@ impl EventSource for KafkaSource {
                 message.topic(),
                 message.partition(),
                 message.offset(),
+                message.key().map(<[u8]>::to_vec),
                 message.payload().unwrap_or_default().to_vec(),
                 headers,
             ));
@@ -286,11 +292,40 @@ mod tests {
 
     #[test]
     fn inbound_messages_carry_ordered_handles() {
-        let msg = to_inbound("orders", 3, 91, b"x".to_vec(), BTreeMap::new());
+        let msg = to_inbound("orders", 3, 91, None, b"x".to_vec(), BTreeMap::new());
         assert_eq!(msg.coordinates.render(), "orders:3:91");
         assert_eq!(msg.handle.partition, Some(3));
         assert_eq!(msg.handle.position, Some(91));
         assert_eq!(msg.handle.token, "orders:3:91");
+    }
+
+    #[test]
+    fn the_record_key_reaches_the_mapping_context() {
+        // The documented per-key ordering remedy tells an author to derive the
+        // `workflow_id` from the partition key, so the key must actually be
+        // reachable from `MessageCtx` — it was not until issue #944's review.
+        let msg = to_inbound(
+            "orders",
+            0,
+            7,
+            Some(b"tenant-42".to_vec()),
+            b"{}".to_vec(),
+            BTreeMap::new(),
+        );
+        assert_eq!(msg.key.as_deref(), Some(b"tenant-42".as_slice()));
+
+        let ctx = crate::connector::MessageCtx::new("orders", &msg);
+        assert_eq!(ctx.key_str(), Some("tenant-42"));
+    }
+
+    #[test]
+    fn a_keyless_record_reports_no_key_rather_than_an_empty_one() {
+        let msg = to_inbound("orders", 0, 7, None, b"{}".to_vec(), BTreeMap::new());
+        assert!(msg.key.is_none());
+        assert_eq!(
+            crate::connector::MessageCtx::new("orders", &msg).key_str(),
+            None
+        );
     }
 
     #[tokio::test]

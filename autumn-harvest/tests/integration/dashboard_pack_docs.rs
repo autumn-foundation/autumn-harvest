@@ -126,6 +126,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_webhook_rejected_total",
     "harvest_session_acquisition_total",
     "harvest_worker_tuner_decisions_total",
+    "harvest_connector_received_total",
+    "harvest_connector_dispatched_total",
+    "harvest_connector_poisoned_total",
     // --- histograms (`_bucket` / `_count` / `_sum`) -------------------------
     "harvest_workflow_duration_bucket",
     "harvest_workflow_duration_count",
@@ -184,6 +187,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_concurrency_in_flight",
     "harvest_concurrency_deferred",
     "harvest_mutex_contention_depth",
+    "harvest_connector_lag",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -318,6 +322,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_webhook_received", &["path", "outcome"]),
     ("harvest_webhook_rejected", &["path", "outcome"]),
     ("harvest_session_acquisition", &["queue", "outcome"]),
+    ("harvest_connector_received", &["source"]),
+    ("harvest_connector_dispatched", &["source", "outcome"]),
+    ("harvest_connector_poisoned", &["source", "reason"]),
+    ("harvest_connector_lag", &["source"]),
 ];
 
 /// Unbounded / dotted label forms that must never appear in an expression or
