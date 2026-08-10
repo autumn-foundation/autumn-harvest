@@ -43,6 +43,9 @@ struct HarvestRuntime {
     runner: HarvestRunner,
     outbox: Option<OutboxRuntime>,
     gate_refresh: Option<GateRefreshRuntime>,
+    /// Running broker connector consumer loops (issue #944).
+    #[cfg(feature = "connectors")]
+    connectors: Vec<ConnectorRuntimeHandle>,
 }
 
 /// Plugin-local shared slot: holds the pre-built `HarvestBuilder` until the
@@ -52,6 +55,11 @@ struct HarvestRuntime {
 struct HarvestRuntimeSlot {
     builder: Option<HarvestBuilder>,
     runtime: Option<HarvestRuntime>,
+    /// Broker connector registrations (issue #944), stashed alongside the
+    /// builder so `start_harvest_runtime` can spawn one consumer loop each
+    /// once the API state and pools exist.
+    #[cfg(feature = "connectors")]
+    connectors: Vec<ConnectorRegistration>,
 }
 
 type ApiMiddlewareFn = Box<
@@ -141,10 +149,29 @@ pub struct HarvestPlugin {
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
     webhook_triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
+    /// Broker event-source connectors (issue #944). Set via
+    /// [`Self::connector`] (feature `connectors`). Each entry pairs one
+    /// binding with the adapter that feeds it.
+    #[cfg(feature = "connectors")]
+    connectors: Vec<ConnectorRegistration>,
     /// Built-in Prometheus scrape endpoint (issue #355). Set via
     /// [`Self::with_metrics_scrape`] (feature `metrics`).
     #[cfg(feature = "metrics")]
     metrics_scrape_enabled: bool,
+}
+
+/// One registered broker connector: a binding plus the source that feeds it.
+#[cfg(feature = "connectors")]
+struct ConnectorRegistration {
+    binding: std::sync::Arc<crate::connector::SourceBinding>,
+    source: std::sync::Arc<dyn crate::connector::EventSource>,
+}
+
+/// A running connector consumer loop.
+#[cfg(feature = "connectors")]
+struct ConnectorRuntimeHandle {
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 impl Default for HarvestPlugin {
@@ -171,6 +198,8 @@ impl HarvestPlugin {
             canary_config: None,
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
+            #[cfg(feature = "connectors")]
+            connectors: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
         }
@@ -528,6 +557,87 @@ impl HarvestPlugin {
         self.metrics_scrape_enabled = true;
         self
     }
+
+    /// Bind a broker topic/queue to a workflow (issue #944).
+    ///
+    /// `binding` says *what* a message maps to; `source` is the adapter that
+    /// feeds it ([`KafkaSource`][k], [`SqsSource`][s], [`MockSource`][m], or
+    /// your own [`EventSource`][e]). A consumer loop is spawned per binding at
+    /// startup and cancelled on shutdown.
+    ///
+    /// Call `.workflows(...)` with every binding's target workflow **before**
+    /// this — `HarvestPlugin::build` fails fast (panics) on an unregistered
+    /// target, a DAG target, a duplicate binding name, a missing mapping
+    /// function, or a `BrokerCoordinates` dedupe mode explicitly requested on a
+    /// workflow whose admission is deferred by a throttle/debounce/batch
+    /// policy (the start route rejects that combination with `400`).
+    ///
+    /// Accumulates across repeated calls, mirroring `.workflows` / `.webhooks`.
+    ///
+    /// [k]: crate::connector::KafkaSource
+    /// [s]: crate::connector::SqsSource
+    /// [m]: crate::connector::MockSource
+    /// [e]: crate::connector::EventSource
+    ///
+    /// See `docs/getting-started/13-broker-connectors.md`.
+    #[cfg(feature = "connectors")]
+    #[must_use]
+    pub fn connector(
+        mut self,
+        binding: crate::connector::SourceBinding,
+        source: std::sync::Arc<dyn crate::connector::EventSource>,
+    ) -> Self {
+        self.connectors.push(ConnectorRegistration {
+            binding: std::sync::Arc::new(binding),
+            source,
+        });
+        self
+    }
+}
+
+/// Validate every registered binding, then spawn one consumer loop per binding.
+///
+/// Split out of `start_harvest_runtime` so the wiring stays readable, and so
+/// the validation half is reachable from `build()` for fail-fast.
+///
+/// # Panics
+///
+/// Panics when a binding is invalid or when its adapter's `stream()` does not
+/// match the binding's declared `stream` — both are startup misconfigurations
+/// that would otherwise surface as a silently idle consumer.
+#[cfg(feature = "connectors")]
+fn spawn_connectors(
+    registrations: &[ConnectorRegistration],
+    api_state: &crate::api::HarvestApiState,
+    metrics: &std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>,
+    workflows: &[WorkflowInfo],
+    dead_letter_pool: &DbPool,
+) -> Vec<ConnectorRuntimeHandle> {
+    let mut handles = Vec::with_capacity(registrations.len());
+    let sink: std::sync::Arc<dyn crate::connector::DeadLetterSink> = std::sync::Arc::new(
+        crate::connector::PostgresDeadLetterSink::new(dead_letter_pool.clone()),
+    );
+
+    for registration in registrations {
+        let binding = std::sync::Arc::clone(&registration.binding);
+        let info = workflows
+            .iter()
+            .find(|w| w.name == binding.target.workflow());
+        let runtime = crate::connector::ConnectorRuntime::for_binding(
+            std::sync::Arc::clone(&binding),
+            std::sync::Arc::clone(&registration.source),
+            api_state.clone(),
+            std::sync::Arc::clone(metrics),
+            info,
+        )
+        .with_dead_letter_sink(std::sync::Arc::clone(&sink));
+
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.child_token();
+        let handle = tokio::spawn(async move { runtime.run(cancel).await });
+        handles.push(ConnectorRuntimeHandle { shutdown, handle });
+    }
+    handles
 }
 
 /// Whether the generated MCP tool routes are about to be registered with no
@@ -555,6 +665,8 @@ impl Plugin for HarvestPlugin {
             canary_config,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
+            #[cfg(feature = "connectors")]
+            connectors,
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
         } = self;
@@ -607,6 +719,46 @@ impl Plugin for HarvestPlugin {
                 &api_state,
             )
         };
+
+        // Issue #944: validate broker bindings before the builder is stashed
+        // in the runtime slot (`builder.workflow_infos()` is only available
+        // pre-build), so a misconfigured binding is a startup panic rather
+        // than a consumer that silently never dispatches anything.
+        #[cfg(feature = "connectors")]
+        if !connectors.is_empty() {
+            let bindings: Vec<_> = connectors
+                .iter()
+                .map(|c| std::sync::Arc::clone(&c.binding))
+                .collect();
+            let borrowed: Vec<&crate::connector::SourceBinding> =
+                bindings.iter().map(std::sync::Arc::as_ref).collect();
+            let dag_names: Vec<String> = builder
+                .dag_infos()
+                .iter()
+                .filter(|d| d.workflow_handler.is_some())
+                .map(|d| d.name.to_string())
+                .collect();
+            // `validate_bindings` takes a slice of values; rebuild one from
+            // the Arc'd registrations without cloning the mappers.
+            if let Err(e) = crate::connector::validate_bindings_refs(
+                &borrowed,
+                builder.workflow_infos(),
+                &dag_names,
+            ) {
+                panic!("harvest connector configuration error: {e}");
+            }
+            for registration in &connectors {
+                assert!(
+                    registration.source.stream() == registration.binding.stream,
+                    "harvest connector binding '{}' declares stream '{}' but its adapter \
+                     consumes '{}': the two must match or the consumer would silently \
+                     never deliver anything",
+                    registration.binding.name,
+                    registration.binding.stream,
+                    registration.source.stream()
+                );
+            }
+        }
 
         // Issue #597: generate the MCP tool routes before the builder is
         // stashed in the runtime slot. These are app-level typed routes
@@ -684,6 +836,8 @@ impl Plugin for HarvestPlugin {
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             runtime: None,
+            #[cfg(feature = "connectors")]
+            connectors,
         }));
         // issue #377: arm fail-closed so any request in the window between
         // HTTP server bind and the boot-time gate load is safely rejected.
@@ -884,6 +1038,11 @@ async fn start_harvest_runtime(
         let mut guard = slot.lock().expect("harvest lock poisoned");
         (guard.builder.take(), guard.runtime.is_some())
     };
+    #[cfg(feature = "connectors")]
+    let connector_registrations = {
+        let mut guard = slot.lock().expect("harvest lock poisoned");
+        std::mem::take(&mut guard.connectors)
+    };
 
     if runtime_already_started {
         tracing::warn!("harvest runtime already started; skipping duplicate startup");
@@ -932,6 +1091,15 @@ async fn start_harvest_runtime(
     let mut built = builder
         .try_build()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+    // Issue #944: capture what the connector consumer loops need before
+    // `built` is moved into the runner. `metrics` is Arc-identical to the
+    // recorder the workers use, so connector samples land in the same sink.
+    #[cfg(feature = "connectors")]
+    let (built_metrics, built_workflow_infos) = (
+        Arc::clone(&built.telemetry().metrics),
+        built.workflow_infos().to_vec(),
+    );
 
     // Derive the API stale threshold from the worker heartbeat interval so that
     // /workers correctly classifies workers under non-default configurations.
@@ -1542,12 +1710,30 @@ async fn start_harvest_runtime(
     // `fail` action cannot let a worker claim and terminally fail an orphaned
     // run before the abort. See the gate block above the runner start.
 
+    // Issue #944: spawn one consumer loop per registered broker binding, after
+    // `api_state.install(...)` above so the very first message a connector
+    // pulls can already reach the dispatch path.
+    #[cfg(feature = "connectors")]
+    let connectors = if connector_registrations.is_empty() {
+        Vec::new()
+    } else {
+        spawn_connectors(
+            &connector_registrations,
+            api_state,
+            &built_metrics,
+            &built_workflow_infos,
+            &harvest_db_pool.clone_inner(),
+        )
+    };
+
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");
         guard.runtime = Some(HarvestRuntime {
             runner,
             outbox,
             gate_refresh,
+            #[cfg(feature = "connectors")]
+            connectors,
         });
     }
 
@@ -1657,6 +1843,20 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         .telemetry()
         .metrics
         .clone();
+
+    // Issue #944: stop the broker consumers FIRST, before the runner. Each
+    // `ConnectorRuntime::run` drains its in-flight dispatches before
+    // returning, so a message whose dispatch already committed still gets
+    // acknowledged rather than being redelivered after the restart.
+    #[cfg(feature = "connectors")]
+    for connector in runtime.connectors {
+        connector.shutdown.cancel();
+        if let Err(error) = connector.handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(error = %error, "harvest connector failed during shutdown");
+        }
+    }
 
     if let Some(gate_refresh) = runtime.gate_refresh {
         gate_refresh.shutdown.cancel();

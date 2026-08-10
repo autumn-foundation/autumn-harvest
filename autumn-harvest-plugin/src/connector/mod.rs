@@ -103,7 +103,7 @@ pub use sqs::{SqsSource, SqsSourceConfig};
 pub use binding::{
     ConnectorTarget, DEFAULT_MAX_IN_FLIGHT, DEFAULT_POISON_THRESHOLD, IdempotencyMode,
     MappedMessage, MappingError, MessageMapper, SourceBinding, has_deferred_admission,
-    resolve_idempotency_mode, validate_bindings,
+    resolve_idempotency_mode, validate_bindings, validate_bindings_refs,
 };
 pub use dead_letter::{
     ConnectorDeadLetter, DeadLetterSink, NoopDeadLetterSink, PostgresDeadLetterSink,

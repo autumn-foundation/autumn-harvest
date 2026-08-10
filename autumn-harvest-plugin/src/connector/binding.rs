@@ -367,6 +367,23 @@ pub fn validate_bindings(
     registered_workflows: &[WorkflowInfo],
     registered_dag_names: &[String],
 ) -> Result<(), String> {
+    let refs: Vec<&SourceBinding> = bindings.iter().collect();
+    validate_bindings_refs(&refs, registered_workflows, registered_dag_names)
+}
+
+/// [`validate_bindings`] over borrowed bindings.
+///
+/// The plugin stores each registration behind an `Arc` (its mapping function
+/// is not `Clone`), so it cannot hand over a `&[SourceBinding]`.
+///
+/// # Errors
+///
+/// Same as [`validate_bindings`].
+pub fn validate_bindings_refs(
+    bindings: &[&SourceBinding],
+    registered_workflows: &[WorkflowInfo],
+    registered_dag_names: &[String],
+) -> Result<(), String> {
     let by_name: HashMap<&str, &WorkflowInfo> = registered_workflows
         .iter()
         .map(|w| (w.name, w))

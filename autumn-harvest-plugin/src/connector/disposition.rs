@@ -292,11 +292,24 @@ impl OffsetTracker {
 
     /// Mark `offset` on `partition` durably handled.
     ///
-    /// Returns the new committable high-water mark (the highest contiguously
-    /// completed offset) when it advanced, else `None`.
+    /// Returns the committable high-water mark (the highest contiguously
+    /// completed offset) when this completion makes one available, else
+    /// `None` because an earlier offset is still in flight.
     pub fn complete(&mut self, partition: i32, offset: i64) -> Option<i64> {
         let entry = self.partitions.entry(partition).or_default();
         entry.floor = Some(entry.floor.map_or(offset, |f| f.min(offset)));
+
+        // A redelivery at or below the high-water mark is ALREADY durably
+        // settled — a rebalance or an un-acked crash replays it. Report the
+        // existing mark so the caller still acknowledges (a commit is
+        // idempotent) instead of silently withholding the ack and leaving the
+        // message to be redelivered forever.
+        if let Some(committed) = entry.committed
+            && offset <= committed
+        {
+            return Some(committed);
+        }
+
         entry.completed.insert(offset);
 
         // The next offset we expect is one past the last commit, or the very
@@ -593,6 +606,44 @@ mod tests {
         let mut t = OffsetTracker::new();
         t.observe(0, 5_000);
         assert_eq!(t.complete(0, 5_000), Some(5_000));
+    }
+
+    #[test]
+    fn a_redelivered_offset_at_or_below_the_mark_is_still_ackable() {
+        // A rebalance (or a crash between dispatch-commit and ack) replays an
+        // offset the tracker already committed. The naive contiguous-prefix
+        // advance returns None for it — `next` is already past `offset` — so
+        // the runtime would silently withhold the ack and the broker would
+        // redeliver that message forever. Report the existing mark instead: a
+        // Kafka commit is idempotent, so re-committing it is free and correct.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 10);
+        assert_eq!(t.complete(0, 10), Some(10));
+        assert_eq!(t.complete(0, 11), Some(11));
+
+        // Replay of the last committed offset, and of one below it.
+        assert_eq!(t.complete(0, 11), Some(11), "redelivery must stay ackable");
+        assert_eq!(t.complete(0, 10), Some(11), "reports the current mark");
+
+        // The mark never moves backwards, and a genuinely new offset still
+        // advances normally afterwards.
+        assert_eq!(t.committable(0), Some(11));
+        assert_eq!(t.complete(0, 12), Some(12));
+    }
+
+    #[test]
+    fn a_redelivery_does_not_resurrect_an_in_flight_gap() {
+        // 10 is still in flight while 11 completes; a replay of an already
+        // committed offset must not paper over the gap by advancing past 10.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 9);
+        t.observe(0, 10);
+        t.observe(0, 11);
+        assert_eq!(t.complete(0, 9), Some(9));
+        assert_eq!(t.complete(0, 11), None, "blocked on in-flight 10");
+        assert_eq!(t.complete(0, 9), Some(9), "replay reports the mark only");
+        assert_eq!(t.committable(0), Some(9), "the gap at 10 still holds");
+        assert_eq!(t.complete(0, 10), Some(11));
     }
 
     #[test]
