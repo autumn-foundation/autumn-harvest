@@ -15,8 +15,10 @@ use std::collections::BTreeMap;
 ///
 /// * **Kafka** — `topic` / `partition` / `offset`, or the message key when the
 ///   binding is configured to dedupe by key instead.
-/// * **SQS** — `MessageDeduplicationId` when present (FIFO queues), else
-///   `MessageId`.
+/// * **SQS** — the broker-assigned `MessageId` (falling back to a FIFO
+///   `MessageDeduplicationId` only when the broker gave us no message id at
+///   all; see [`coordinate_id`](crate::connector::sqs::coordinate_id) for why
+///   that order and not the reverse).
 ///
 /// The variants are deliberately *not* `#[non_exhaustive]`: a new adapter that
 /// cannot express its coordinates in one of these shapes should use
@@ -32,9 +34,9 @@ pub enum MessageCoordinates {
         /// The message's offset within `partition`.
         offset: i64,
     },
-    /// A broker-supplied opaque identifier: SQS `MessageDeduplicationId` /
-    /// `MessageId`, a Kafka message key when the binding dedupes by key, or
-    /// any other adapter-native stable id.
+    /// A broker-supplied opaque identifier: an SQS `MessageId`, a Kafka
+    /// message key when the binding dedupes by key, or any other
+    /// adapter-native stable id.
     Opaque {
         /// The logical stream the message came from (topic / queue name).
         stream: String,

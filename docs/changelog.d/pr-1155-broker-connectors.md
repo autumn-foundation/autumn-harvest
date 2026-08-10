@@ -67,9 +67,10 @@ workflow.
 ### Idempotency by construction (AC3)
 
 The dedupe key is derived from stable broker coordinates — Kafka
-`topic:partition:offset`, SQS `MessageDeduplicationId` (FIFO,
-producer-controlled so it survives a *re-publish*) falling back to `MessageId`
-(the honest limit of a standard queue) — namespaced by the binding exactly as
+`topic:partition:offset`, SQS `MessageId` (stable across every redelivery of a
+message and distinct for every distinct message; a FIFO
+`MessageDeduplicationId` is only a last-resort fallback, see the review-fix
+list below) — namespaced by the binding exactly as
 the webhook receiver namespaces `{path}:{signal_name}:{delivery_id}`, and fed
 to harvest's own `idempotency_key` machinery (#808). The encoding is the
 injective, length-bounded `L{len}:{value}` / `H{64hex}` scheme from #699, so a
@@ -217,6 +218,51 @@ coordinates, so a run traces back to the exact message.
   the shipped enum has **5**, named `dispatched`/`idempotent_replay`/
   `deferred`/`dead_lettered`/`retried`. Caught by a test that asserts the
   emitted label rather than merely that emission did not panic.
+* **SQS coordinated on the wrong id, silently dropping valid events.** The
+  adapter preferred a FIFO `MessageDeduplicationId` over the broker-assigned
+  `MessageId`, on the reasoning that a producer-controlled id also survives a
+  *re-publish*. It is wrong in both directions. Inside SQS's five-minute
+  deduplication interval SQS already collapses the re-publish itself, so the
+  second message never reaches a consumer and the preference buys nothing.
+  Outside it, a legitimately reused dedup id (a nightly job keyed on a business
+  id) is a genuinely **new** message with a new `MessageId` — and keying on the
+  dedup id collapsed it onto the earlier message's key, so it was acked as an
+  idempotent replay and its event dropped. `MessageId` is now the coordinate;
+  the dedup id is a last-resort fallback for the case where the broker supplied
+  no message id at all.
+* **`broker_native_dead_letter()` was accepted on SQS queues with no redrive
+  policy.** The adapter reported an unconditional native dead-letter
+  destination, but SQS only *has* one when the queue carries a redrive policy.
+  Without one, abandoning a poison message redelivers it forever — precisely
+  the failure the mode exists to prevent, and now silent rather than caught at
+  build time. `SqsSource::connect` now probes `RedrivePolicy` and the answer
+  **fails closed**: an undeclared, unprobed, or probe-denied queue reports no
+  destination, so the binding is rejected at build time with a message naming
+  the two fixes (add a redrive policy, or declare it with
+  `SqsSourceConfig::has_redrive_policy(true)` when using the sync
+  `SqsSource::new` or when IAM denies `GetQueueAttributes`).
+* **A partition reassigned *behind* the mark committed a stale higher offset.**
+  An operator resetting the group offset, or a rebalance returning a partition
+  another consumer had moved, left the tracker's in-memory mark ahead of the
+  broker's position — so completing one low offset reported the old mark and
+  committed straight over everything in between. A *fresh* delivery at or below
+  the mark is now treated as the reposition it is: the partition's state is
+  reset and the prefix rebuilt from the new position. A redelivery of an offset
+  still in flight (or completed and held) is not a reposition and leaves the
+  live prefix alone.
+* **A permanently blocked commit prefix was silent.** The contiguous-prefix
+  rule means a message that is retried rather than settled blocks its
+  partition's commit. On SQS the visibility timeout resolves that; on Kafka it
+  cannot, because `abandon` is a no-op there (not committing is not a nack), so
+  nothing hands the message back until the consumer is recreated. The connector
+  meanwhile looked healthy — messages flowing, all dispatching, only the commit
+  frozen. New opt-in `ConnectorRuntimeConfig::stall_threshold`: when a
+  partition holds that many completed offsets behind an unsettled head, the
+  pass **fails loudly**, naming the partition, the depth and the remedy, so the
+  supervisor recreates the consumer and the re-read performs the retry. Checked
+  on idle passes too, since a stalled partition usually goes quiet. `0` (off)
+  by default so an upgrade cannot start failing passes on a deployment that
+  tolerates a deep out-of-order backlog.
 
 ### Success metric
 

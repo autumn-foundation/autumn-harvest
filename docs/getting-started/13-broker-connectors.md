@@ -101,7 +101,7 @@ surface as a silently idle consumer or a message that retries forever:
 | Adapter's `stream()` does not match the binding's | The consumer would never deliver anything |
 | `IdempotencyMode::BrokerCoordinates` on a throttled / debounced / batched target | The start route rejects a keyed start for a deferred admission (`400`) |
 | `signals_with_start` onto a throttled / debounced / batched target | signal-with-start refuses a fresh start on a debounced/batched workflow (so the first message per entity would be dead-lettered) and bypasses a throttle entirely |
-| `.broker_native_dead_letter()` on an adapter with no real nack (Kafka) | Nothing advances a receive count, so a poison message would be re-read forever |
+| `.broker_native_dead_letter()` on an adapter with no dead-letter destination (Kafka always; SQS on a queue with no redrive policy) | Nothing quarantines the message, so a poison message would be re-read forever |
 
 ## Before you start: apply the plugin migration
 
@@ -117,7 +117,8 @@ Outside dev, a pending migration is only *warned* about — run your normal
 migration step before enabling a connector, or the first poison message will
 fail its dead-letter write, be downgraded to a retry, and redeliver forever.
 (Use `.broker_native_dead_letter()` on SQS if you would rather not have the
-table at all.)
+table at all — that needs a redrive policy on the queue; see
+[Poison messages](#poison-messages).)
 
 ### Production configuration
 
@@ -136,11 +137,20 @@ KafkaSourceConfig::new(brokers, "harvest-orders", "orders.placed")
 // or a LocalStack/ElasticMQ endpoint. `SqsSource::connect` uses the ambient
 // AWS config chain instead.
 SqsSource::new(my_sqs_client, SqsSourceConfig::new(queue_url));
+
+// `new` is sync, so it cannot probe the queue. If the queue has a redrive
+// policy and you want `.broker_native_dead_letter()`, say so:
+SqsSource::new(
+    my_sqs_client,
+    SqsSourceConfig::new(queue_url).has_redrive_policy(true),
+);
 ```
 
 Note the small asymmetry: `KafkaSource::connect(&config)` is **sync** and takes
 a reference (librdkafka connects lazily); `SqsSource::connect(config)` is
-**async** and takes the config by value.
+**async** and takes the config by value — and uses that async-ness to probe the
+queue's `RedrivePolicy`, so broker-native dead-lettering is validated against
+the queue's real configuration rather than assumed.
 
 Polling knobs live on `ConnectorRuntimeConfig`, passed via
 `.connector_with_config(binding, source, Some(config))`. The defaults are tuned
@@ -214,6 +224,36 @@ A redelivery of an offset *at or below* the current mark is already durably
 settled (a rebalance replays it), so it is re-acked — a commit is idempotent —
 rather than silently withheld.
 
+A partition can also be handed back **behind** the mark: an operator resets the
+group offset, or a rebalance returns a partition another consumer moved. A
+*fresh* delivery below the mark is treated as exactly that — the previous
+generation's mark is discarded and the prefix rebuilt from the new position —
+so one low offset's completion can never commit a stale higher mark and skip
+everything in between.
+
+### When the prefix cannot advance
+
+The contiguous-prefix rule has a corollary worth stating plainly: a message
+that is **retried rather than settled** blocks its partition's commit while
+every later message settles behind it.
+
+On SQS that resolves itself — the visibility timeout lapses and the message
+comes back. On Kafka it does **not**: `abandon` is a no-op there because not
+committing is not a nack, so nothing hands the message back until the consumer
+is recreated and re-reads from the last commit. The stall is silent, because
+the connector otherwise looks healthy: messages keep flowing, they all dispatch,
+only the commit stops moving.
+
+Set `ConnectorRuntimeConfig::stall_threshold` to bound it. When a partition
+holds that many completed offsets behind an unsettled head, the pass **fails
+loudly** — naming the partition, the depth, and the remedy — instead of
+continuing to look healthy. `run` then backs off and re-polls, and a supervisor
+that recreates the consumer performs the retry by re-reading from the last
+commit. It is `0` (off) by default so an upgrade cannot start failing passes on
+a deployment that tolerates a deep out-of-order backlog; size it comfortably
+above `max_in_flight`, which bounds how many messages can legitimately be
+settling out of order at once.
+
 ## Idempotency
 
 The dedupe key is derived from stable broker coordinates, namespaced by the
@@ -223,12 +263,24 @@ binding, and passed to harvest's own `idempotency_key` machinery
 | Broker | Coordinate |
 |---|---|
 | Kafka | `topic:partition:offset` |
-| SQS FIFO | `MessageDeduplicationId` — producer-controlled, so it survives a *re-publish* of the same logical event too |
-| SQS standard | `MessageId` — stable across redeliveries of the same message, but **not** across a re-publish. The honest limit of a standard queue. |
+| SQS (FIFO and standard) | `MessageId` — stable across every redelivery of the same message, and distinct for every distinct message |
 
 Namespacing by binding means two bindings consuming the same topic never alias
 each other. The key is bounded and injectively encoded, so a pathological
 coordinate cannot collide with another message's key or blow the column limit.
+
+A coordinate identifies a **message**, not a logical event. A genuine
+*re-publish* of the same event is a different message, so it dispatches again.
+On a FIFO queue it is tempting to reach for the producer-controlled
+`MessageDeduplicationId` instead — harvest deliberately does not, because it is
+wrong in both directions. Inside SQS's five-minute deduplication interval SQS
+already collapses the re-publish itself, so the second message never reaches a
+consumer and the dedup id buys nothing. Outside that interval a legitimately
+reused dedup id (a nightly job keyed on a business id, say) is a genuinely new
+message; keying on the dedup id would ack it as a replay and **silently drop a
+valid event**. When you need event-level rather than message-level identity, put
+the business key in the mapping function's `workflow_id` and use workflow-id
+dedupe.
 
 There is one interaction worth knowing. Harvest's start route rejects an
 `idempotency_key` combined with a throttle / debounce / batch admission policy
@@ -305,9 +357,19 @@ Where it goes depends on the binding:
   machinery instead. For SQS the visibility timeout is reset to `0`, so SQS
   re-delivers, counts the receive, and moves the message to the queue's
   configured DLQ once `maxReceiveCount` is hit. This mode is **rejected at
-  build time** for an adapter with no real nack: Kafka's "abandon" is simply
-  not committing, which never advances any counter, so a poison message would
-  be re-read forever instead of quarantined.
+  build time** when the adapter reports no dead-letter destination:
+  * **Kafka**, always — its "abandon" is simply not committing, which never
+    advances any counter.
+  * **SQS**, when the queue has no redrive policy — there is nowhere to move
+    the message to, so it would be redelivered forever. `SqsSource::connect`
+    probes `RedrivePolicy` to find out; `SqsSource::new` cannot (it is sync),
+    so it reports *no* destination unless you declare one with
+    `SqsSourceConfig::has_redrive_policy(true)`. A probe that fails — usually
+    an IAM policy without `sqs:GetQueueAttributes` — is logged and also fails
+    closed, so the same declaration is the escape hatch.
+
+  Fail-closed is deliberate: the alternative is a build that succeeds and then
+  loops a poison message forever at runtime.
 
 A transient harvest failure (a `5xx`, a pool exhaustion) is **never** written to
 `harvest_connector_dead_letters` no matter how many times it recurs — it is not

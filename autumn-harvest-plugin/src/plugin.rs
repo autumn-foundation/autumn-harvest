@@ -923,9 +923,12 @@ impl Plugin for HarvestPlugin {
                         registration.source.has_native_dead_letter(),
                     ),
                     "harvest connector binding '{}' asks for broker-native dead-lettering, but \
-                     its adapter for stream '{}' has no dead-letter destination that abandoning \
-                     a message feeds (Kafka has no per-message nack). A poison message would be \
-                     re-read forever instead of being quarantined. Drop \
+                     its adapter for stream '{}' reports no dead-letter destination that \
+                     abandoning a message feeds, so a poison message would be re-read forever \
+                     instead of being quarantined. Kafka has no per-message nack at all. SQS \
+                     needs a redrive policy on the queue: add one, or (when the source was built \
+                     with `SqsSource::new`, or its `GetQueueAttributes` probe was denied) declare \
+                     it with `SqsSourceConfig::has_redrive_policy(true)`. Otherwise drop \
                      `.broker_native_dead_letter()` so poison messages land in \
                      `harvest_connector_dead_letters` instead",
                     registration.binding.name,

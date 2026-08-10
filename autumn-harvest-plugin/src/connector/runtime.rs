@@ -76,6 +76,29 @@ pub struct ConnectorRuntimeConfig {
     /// pass doubles the connector's idle call rate for a gauge that only
     /// needs to move on a scrape cadence.
     pub lag_sample_interval: std::time::Duration,
+    /// Fail the pass when a partition is holding this many completed offsets
+    /// behind a prefix head that has not settled. `0` (the default) disables
+    /// the check.
+    ///
+    /// This is the escape hatch for a **permanently blocked prefix**. On a
+    /// positionally-ordered broker the commit mark can only advance over a
+    /// contiguous completed prefix, so a message that is retried rather than
+    /// settled blocks its partition. On Kafka that block is permanent by
+    /// construction: `abandon` is a no-op (not committing is not a nack), so
+    /// nothing hands the message back until the consumer is recreated and
+    /// re-reads from the last commit. Every later message keeps settling, so
+    /// without this the stall is silent — the partition simply stops
+    /// committing.
+    ///
+    /// Failing the pass is the fix precisely because it is loud and because
+    /// the supervisor's response *is* the retry: `run` backs off and polls
+    /// again, and a supervisor that recreates the consumer re-reads from the
+    /// last commit, which redelivers the blocked message.
+    ///
+    /// Size it above the concurrency you expect to settle out of order —
+    /// `max_in_flight` bounds that, so anything comfortably above it means
+    /// "not settling", not "settling out of order".
+    pub stall_threshold: usize,
 }
 
 impl Default for ConnectorRuntimeConfig {
@@ -88,6 +111,9 @@ impl Default for ConnectorRuntimeConfig {
             error_backoff: std::time::Duration::from_secs(1),
             idle_backoff: std::time::Duration::from_millis(200),
             lag_sample_interval: std::time::Duration::from_secs(15),
+            // Opt-in: a deployment that tolerates a deep out-of-order backlog
+            // should not start failing passes because it upgraded.
+            stall_threshold: 0,
         }
     }
 }
@@ -255,6 +281,12 @@ impl ConnectorRuntime {
             self.metrics.record_connector_lag(self.binding.name, lag);
         }
 
+        // Checked BEFORE the idle short-circuit: a stalled partition often
+        // goes quiet (its head is blocked and the producer moves on), so a
+        // check that only ran when messages arrived would never report the
+        // stalls that matter most.
+        self.check_commit_stall().await?;
+
         if batch.is_empty() {
             return Ok(PassSummary::default());
         }
@@ -317,7 +349,47 @@ impl ConnectorRuntime {
             }
         }
 
+        // Re-checked after settling this batch so a stall that forms *during*
+        // the pass is reported immediately rather than a poll later.
+        self.check_commit_stall().await?;
+
         Ok(summary)
+    }
+
+    /// Fail the pass when a partition's commit prefix is permanently blocked.
+    ///
+    /// A prefix head that never settles blocks its partition's commit on a
+    /// broker whose `abandon` cannot force a redelivery — Kafka, where not
+    /// committing is not a nack. The tracker cannot resolve that on its own:
+    /// only re-reading from the last commit hands the message back. So the
+    /// pass fails loudly, `run` backs off and re-polls, and a supervisor that
+    /// recreates the consumer performs the retry.
+    ///
+    /// Opt-in via [`ConnectorRuntimeConfig::stall_threshold`]; `0` disables.
+    async fn check_commit_stall(&self) -> Result<(), ConnectorError> {
+        let Some((partition, held)) = self
+            .offsets
+            .lock()
+            .await
+            .stalled(self.config.stall_threshold)
+        else {
+            return Ok(());
+        };
+        tracing::error!(
+            source = self.binding.name,
+            stream = %self.binding.stream,
+            partition,
+            held,
+            threshold = self.config.stall_threshold,
+            "connector commit prefix is stalled; the head offset has not settled while later \
+             offsets pile up behind it. Recreate the consumer to re-read from the last commit"
+        );
+        Err(ConnectorError::Broker(format!(
+            "connector '{}' commit prefix stalled on partition {partition}: {held} completed \
+             offsets are held behind an unsettled head (threshold {}). The blocked message is \
+             only redelivered by re-reading from the last commit",
+            self.binding.name, self.config.stall_threshold,
+        )))
     }
 
     /// Whether enough time has passed to re-sample the consumer-lag gauge.
@@ -1254,6 +1326,105 @@ mod tests {
         assert!(
             source.acked().is_empty(),
             "acking a message whose dead-letter record failed would lose it",
+        );
+    }
+
+    // ---- Stall detection ----
+
+    /// A runtime whose partition-0 prefix head (offset 0) was delivered and
+    /// never settled, while `settled` later offsets did — the exact shape a
+    /// retried message leaves behind on Kafka, whose `abandon` cannot force a
+    /// redelivery.
+    ///
+    /// Seeded through the tracker (as `ack_waits_for_the_contiguous_offset_prefix`
+    /// does) rather than through a mapper, because the point under test is the
+    /// commit prefix, not how a particular message came to be retried.
+    async fn stalled_runtime(threshold: usize, settled: i64) -> ConnectorRuntime {
+        let rt = runtime_with_metrics(
+            malformed_binding(),
+            Arc::new(MockSource::new("orders")),
+            Arc::new(RecordingDeadLetterSink::new()),
+            Arc::new(RecordingMetrics::default()),
+        )
+        .with_config(ConnectorRuntimeConfig {
+            stall_threshold: threshold,
+            ..ConnectorRuntimeConfig::default()
+        });
+
+        // The head is delivered and never completes: it blocks the prefix.
+        rt.offsets.lock().await.observe(0, 0);
+        for offset in 1..=settled {
+            rt.offsets.lock().await.observe(0, offset);
+            rt.ack(&MessageHandle::positioned(
+                format!("orders:0:{offset}"),
+                0,
+                offset,
+            ))
+            .await;
+        }
+        rt
+    }
+
+    #[tokio::test]
+    async fn a_permanently_blocked_prefix_fails_the_pass_so_the_supervisor_recreates_the_consumer()
+    {
+        // Kafka's `abandon` is a no-op by design (not committing is not a
+        // nack), so a retried message is only handed back when the consumer is
+        // recreated and re-reads from the last commit. Left unreported the
+        // partition's prefix stays blocked forever and its commit never
+        // advances -- silently, because every later message settles fine.
+        let rt = stalled_runtime(3, 4).await;
+        assert_eq!(rt.offsets.lock().await.held(0), 4);
+
+        // Reported even on an IDLE pass: a stalled partition usually goes
+        // quiet, so a check that only ran when messages arrived would miss it.
+        let err = rt
+            .run_once()
+            .await
+            .expect_err("a blocked prefix past the bound must fail the pass");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("stalled") && rendered.contains("partition 0"),
+            "the error must name the stall and the blocked partition: {rendered}"
+        );
+        assert!(
+            rendered.contains("re-reading from the last commit"),
+            "the error must name the remedy: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_detection_is_off_by_default_and_below_its_bound() {
+        // Off by default: an existing deployment that tolerates a deep
+        // out-of-order backlog must not start failing passes on upgrade.
+        assert_eq!(ConnectorRuntimeConfig::default().stall_threshold, 0);
+
+        let disabled = stalled_runtime(0, 4).await;
+        assert!(
+            disabled.run_once().await.is_ok(),
+            "threshold 0 disables the check"
+        );
+
+        // Configured, but the held depth is below the bound: ordinary
+        // out-of-order settlement must never fail a pass.
+        let under = stalled_runtime(10, 4).await;
+        assert!(under.run_once().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stall_clears_once_the_head_finally_settles() {
+        // The check must not latch: once the blocked head settles (the
+        // recreated consumer redelivered it and it dispatched), the prefix
+        // drains and passes succeed again.
+        let rt = stalled_runtime(3, 4).await;
+        assert!(rt.run_once().await.is_err());
+
+        rt.ack(&MessageHandle::positioned("orders:0:0", 0, 0)).await;
+        assert_eq!(rt.offsets.lock().await.held(0), 0);
+        assert!(
+            rt.run_once().await.is_ok(),
+            "a drained prefix must stop failing passes"
         );
     }
 }

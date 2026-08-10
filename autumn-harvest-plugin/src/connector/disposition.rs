@@ -309,8 +309,24 @@ impl OffsetTracker {
     /// rebalance is not mistaken for a gap, and records the offset as
     /// delivered so it blocks the prefix until it completes (as distinct from
     /// an offset the broker never handed us, which is stepped over).
+    ///
+    /// A **fresh** delivery at or below the current mark means the partition
+    /// was repositioned behind us — an operator reset the group offset, or a
+    /// rebalance handed the partition back after another consumer moved it.
+    /// The previous generation's mark is no longer authoritative, so the
+    /// partition's state is reset and the prefix rebuilt from here. Keeping it
+    /// would let one low offset's completion commit the stale higher mark and
+    /// silently skip everything between. A redelivery of an offset that is
+    /// still in flight (or completed and held) is *not* a reposition, so it
+    /// leaves the live prefix alone.
     pub fn observe(&mut self, partition: i32, offset: i64) {
         let entry = self.partitions.entry(partition).or_default();
+        if entry.committed.is_some_and(|c| offset <= c)
+            && !entry.inflight.contains(&offset)
+            && !entry.completed.contains(&offset)
+        {
+            *entry = PartitionOffsets::default();
+        }
         entry.floor = Some(entry.floor.map_or(offset, |f| f.min(offset)));
         entry.ceiling = Some(entry.ceiling.map_or(offset, |c| c.max(offset)));
         // Below the mark it is already settled; re-adding would re-block a
@@ -384,6 +400,45 @@ impl OffsetTracker {
     pub fn forget(&mut self, partition: i32) {
         self.partitions.remove(&partition);
     }
+
+    /// How many completed offsets `partition` is holding behind a blocked
+    /// prefix head.
+    ///
+    /// Zero at rest. Bounded by the runtime's `max_in_flight` under healthy
+    /// out-of-order settlement, because only that many messages are ever
+    /// outstanding. It grows without bound only when the head *never* settles.
+    #[must_use]
+    pub fn held(&self, partition: i32) -> usize {
+        self.partitions
+            .get(&partition)
+            .map_or(0, |p| p.completed.len())
+    }
+
+    /// The first partition holding at least `threshold` completed offsets.
+    ///
+    /// This is the stall signal. A prefix head that never settles — a message
+    /// abandoned for retry on a broker whose `abandon` cannot force a
+    /// redelivery (Kafka: not committing is not a nack) — blocks its
+    /// partition's commit **permanently** while every later message settles
+    /// behind it. The tracker cannot fix that on its own: only re-reading from
+    /// the last commit will hand the message back. Reporting the stall lets
+    /// the runtime fail its pass loudly so the supervisor recreates the
+    /// consumer, which is what performs the retry.
+    ///
+    /// `threshold == 0` disables the check.
+    #[must_use]
+    pub fn stalled(&self, threshold: usize) -> Option<(i32, usize)> {
+        if threshold == 0 {
+            return None;
+        }
+        // Deterministic: report the lowest-numbered blocked partition rather
+        // than whichever the hash map happens to yield first.
+        self.partitions
+            .iter()
+            .filter(|(_, p)| p.completed.len() >= threshold)
+            .min_by_key(|(partition, _)| **partition)
+            .map(|(partition, p)| (*partition, p.completed.len()))
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +463,113 @@ mod tests {
         DispatchOutcome::Deferred {
             workflow_id: "w1".to_string(),
         }
+    }
+
+    #[test]
+    fn a_backward_delivery_below_the_mark_resets_the_partition_generation() {
+        // A partition can be handed back to us positioned BEHIND our in-memory
+        // mark: an operator resets the group offset, or a rebalance gives us a
+        // partition another consumer advanced differently. Keeping the stale
+        // higher mark would commit it after processing one low offset,
+        // silently skipping every offset in between.
+        let mut t = OffsetTracker::new();
+        for offset in 0..=5 {
+            t.observe(0, offset);
+            t.complete(0, offset);
+        }
+        assert_eq!(t.committable(0), Some(5));
+
+        // Now the broker feeds us offset 1 again as a *fresh* delivery.
+        t.observe(0, 1);
+        assert_eq!(
+            t.committable(0),
+            None,
+            "a backward fresh delivery invalidates the previous generation's mark"
+        );
+        assert_eq!(
+            t.complete(0, 1),
+            Some(1),
+            "the rebuilt prefix commits what this generation actually settled"
+        );
+    }
+
+    #[test]
+    fn a_redelivery_of_an_in_flight_offset_does_not_reset_the_generation() {
+        // Same offset delivered twice before it settles (a duplicate receive,
+        // not a seek). Resetting here would throw away a live prefix.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 0);
+        t.complete(0, 0);
+        t.observe(0, 1);
+        t.observe(0, 1);
+        assert_eq!(t.committable(0), Some(0));
+        assert_eq!(t.complete(0, 1), Some(1));
+    }
+
+    #[test]
+    fn a_settled_redelivery_still_re_acks_after_the_reset() {
+        // The reset must not break the "redelivery of an already-settled
+        // offset is re-acked, never silently withheld" contract: after the
+        // reset the offset is simply re-settled and reported.
+        let mut t = OffsetTracker::new();
+        t.observe(0, 7);
+        assert_eq!(t.complete(0, 7), Some(7));
+        t.observe(0, 7);
+        assert_eq!(t.complete(0, 7), Some(7));
+    }
+
+    #[test]
+    fn forgetting_a_revoked_partition_leaves_others_untouched() {
+        let mut t = OffsetTracker::new();
+        t.observe(0, 3);
+        t.complete(0, 3);
+        t.observe(1, 9);
+        t.complete(1, 9);
+        t.forget(0);
+        assert_eq!(t.committable(0), None);
+        assert_eq!(t.committable(1), Some(9));
+    }
+
+    // ---- Stall detection (a blocked prefix must not be silent) ----
+
+    #[test]
+    fn a_blocked_prefix_accumulates_held_completions() {
+        let mut t = OffsetTracker::new();
+        // Offset 0 is delivered and then abandoned (a retry): it never
+        // completes, so it blocks the prefix forever on a broker whose
+        // `abandon` cannot force a redelivery.
+        t.observe(0, 0);
+        for offset in 1..=4 {
+            t.observe(0, offset);
+            assert_eq!(
+                t.complete(0, offset),
+                None,
+                "offset 0 is still in flight, so nothing is committable"
+            );
+        }
+        assert_eq!(t.held(0), 4);
+        assert_eq!(t.held(99), 0, "an unknown partition holds nothing");
+
+        // The head settling drains everything at once.
+        t.complete(0, 0);
+        assert_eq!(t.held(0), 0);
+    }
+
+    #[test]
+    fn stall_detection_is_opt_in_and_reports_the_blocked_partition() {
+        let mut t = OffsetTracker::new();
+        t.observe(0, 0);
+        for offset in 1..=3 {
+            t.observe(0, offset);
+            t.complete(0, offset);
+        }
+        // Threshold 0 disables the check entirely.
+        assert_eq!(t.stalled(0), None);
+        // Below the bound, a held prefix is normal out-of-order settlement.
+        assert_eq!(t.stalled(4), None);
+        // At the bound it is reported, naming the partition and the depth.
+        assert_eq!(t.stalled(3), Some((0, 3)));
+        assert_eq!(t.stalled(1), Some((0, 3)));
     }
 
     // ---- Ack ordering (AC: ack only after a durable outcome) ----

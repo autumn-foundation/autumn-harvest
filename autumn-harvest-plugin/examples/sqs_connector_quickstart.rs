@@ -24,10 +24,10 @@
 //!   ordering** — the entity workflow serializes its own signals — since the
 //!   connector itself dispatches up to `max_in_flight` messages concurrently
 //!   and does not preserve queue order across them.
-//! * The dedupe key is the message's own SQS coordinates: a FIFO queue's
-//!   `MessageDeduplicationId` when present (producer-controlled, so it survives
-//!   a *re-publish* too), otherwise `MessageId` (stable across redeliveries of
-//!   the same message — the honest limit of a standard queue).
+//! * The dedupe key is the message's own SQS coordinate — its broker-assigned
+//!   `MessageId`, which is stable across every redelivery of that message. A
+//!   genuine *re-publish* is a different message, so map a business key into
+//!   the workflow id when you need event-level identity.
 //!
 //! Deletion happens only after the signal durably committed or was recognised
 //! as a replay; a harvest-side failure leaves the message on the queue for its
@@ -35,6 +35,12 @@
 //! redrive policy via `broker_native_dead_letter()` — the visibility timeout is
 //! reset to 0 so SQS re-delivers, counts the receive, and moves the message to
 //! the configured DLQ once `maxReceiveCount` is hit.
+//!
+//! That mode **requires a redrive policy on the queue**: `SqsSource::connect`
+//! probes for one, and the plugin refuses to start without it rather than
+//! quietly redelivering a poison message forever. Drop
+//! `.broker_native_dead_letter()` to use `harvest_connector_dead_letters`
+//! instead.
 //!
 //! See `docs/getting-started/13-broker-connectors.md`.
 

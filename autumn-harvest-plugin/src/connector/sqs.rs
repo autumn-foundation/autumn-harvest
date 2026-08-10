@@ -50,6 +50,14 @@ pub struct SqsSourceConfig {
     /// uses the queue's own default. Size it above the worst-case dispatch
     /// latency so a message is not redelivered while still in flight.
     pub visibility_timeout: Option<i32>,
+    /// Whether the queue has a redrive policy, i.e. whether SQS actually has
+    /// somewhere to move a poison message.
+    ///
+    /// `None` means "not declared": [`SqsSource::connect`] probes the queue,
+    /// while [`SqsSource::new`] cannot (it is sync and takes an already-built
+    /// client), so an undeclared, unprobed source reports **no** native
+    /// dead-letter destination. See [`SqsSourceConfig::has_redrive_policy`].
+    pub has_redrive_policy: Option<bool>,
 }
 
 impl SqsSourceConfig {
@@ -62,6 +70,7 @@ impl SqsSourceConfig {
             queue_url,
             stream,
             visibility_timeout: None,
+            has_redrive_policy: None,
         }
     }
 
@@ -76,6 +85,22 @@ impl SqsSourceConfig {
     #[must_use]
     pub const fn visibility_timeout_secs(mut self, secs: i32) -> Self {
         self.visibility_timeout = Some(secs);
+        self
+    }
+
+    /// Declare whether the queue has a redrive policy.
+    ///
+    /// Only needed with [`SqsSource::new`], which takes an already-built client
+    /// and so cannot probe the queue; [`SqsSource::connect`] discovers this for
+    /// you. An explicit declaration always wins over the probe, so a queue
+    /// whose IAM policy denies `GetQueueAttributes` can still opt in.
+    ///
+    /// Declaring `true` for a queue that has **no** redrive policy re-arms the
+    /// exact failure `broker_native_dead_letter` exists to prevent: an
+    /// abandoned poison message is redelivered forever instead of quarantined.
+    #[must_use]
+    pub const fn has_redrive_policy(mut self, has_redrive: bool) -> Self {
+        self.has_redrive_policy = Some(has_redrive);
         self
     }
 }
@@ -99,6 +124,8 @@ pub struct SqsSource {
     queue_url: String,
     stream: String,
     visibility_timeout: Option<i32>,
+    /// `None` = not declared and not probed; see [`native_dead_letter_supported`].
+    has_redrive_policy: Option<bool>,
 }
 
 impl SqsSource {
@@ -107,6 +134,12 @@ impl SqsSource {
     /// Taking the client rather than constructing it keeps credential and
     /// endpoint resolution (including a LocalStack/ElasticMQ endpoint
     /// override in tests) entirely in the embedder's hands.
+    ///
+    /// This constructor is sync, so it cannot probe the queue for a redrive
+    /// policy. A source built this way reports **no** native dead-letter
+    /// destination unless the config declares one with
+    /// [`SqsSourceConfig::has_redrive_policy`] — see
+    /// [`EventSource::has_native_dead_letter`].
     #[must_use]
     pub fn new(client: Client, config: SqsSourceConfig) -> Self {
         Self {
@@ -114,34 +147,132 @@ impl SqsSource {
             queue_url: config.queue_url,
             stream: config.stream,
             visibility_timeout: config.visibility_timeout,
+            has_redrive_policy: config.has_redrive_policy,
         }
     }
 
     /// Build a source using the ambient AWS config chain.
     ///
+    /// Probes the queue's `RedrivePolicy` so
+    /// [`EventSource::has_native_dead_letter`] reflects reality, unless the
+    /// config already declared it. A probe that fails (typically an IAM policy
+    /// without `sqs:GetQueueAttributes`) is logged and leaves the answer
+    /// undeclared, which fails closed.
+    ///
     /// # Errors
     ///
     /// Never returns an error today; the signature is fallible so credential
     /// resolution can surface failures in a later revision without a breaking
-    /// change.
+    /// change. A failed redrive probe is deliberately *not* an error — it
+    /// degrades to fail-closed rather than refusing to start.
     pub async fn connect(config: SqsSourceConfig) -> Result<Self, ConnectorError> {
         let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        Ok(Self::new(Client::new(&shared), config))
+        let client = Client::new(&shared);
+        let mut source = Self::new(client, config);
+        if source.has_redrive_policy.is_none() {
+            source.has_redrive_policy = source.probe_redrive_policy().await;
+        }
+        Ok(source)
     }
+
+    /// Ask the queue whether it has a redrive policy.
+    ///
+    /// `None` on any failure, so a denied or unreachable probe never *claims* a
+    /// dead-letter destination the queue may not have.
+    async fn probe_redrive_policy(&self) -> Option<bool> {
+        let response = self
+            .client
+            .get_queue_attributes()
+            .queue_url(&self.queue_url)
+            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::RedrivePolicy)
+            .send()
+            .await;
+        match response {
+            Ok(attrs) => {
+                let policy = attrs
+                    .attributes
+                    .as_ref()
+                    .and_then(|a| a.get(&aws_sdk_sqs::types::QueueAttributeName::RedrivePolicy))
+                    .map(String::as_str);
+                Some(redrive_policy_is_configured(policy))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream = %self.stream,
+                    error = %e,
+                    "could not read the SQS queue's redrive policy; treating the queue as having \
+                     no native dead-letter destination. Declare it with \
+                     `SqsSourceConfig::has_redrive_policy(true)` if it does have one"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Does this `RedrivePolicy` queue attribute name a real dead-letter target?
+///
+/// The attribute is a JSON document like
+/// `{"deadLetterTargetArn":"arn:…","maxReceiveCount":"5"}`. Absent, empty,
+/// unparseable, or naming no destination all mean **no**: abandoning a poison
+/// message on such a queue redelivers it forever rather than quarantining it.
+#[must_use]
+pub fn redrive_policy_is_configured(attribute: Option<&str>) -> bool {
+    let Some(raw) = attribute.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("deadLetterTargetArn"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|arn| !arn.trim().is_empty())
+}
+
+/// Resolve a possibly-undeclared redrive answer into the trait's `bool`.
+///
+/// Fails **closed**: an undeclared, unprobed queue reports no native
+/// dead-letter destination, so `broker_native_dead_letter()` is rejected at
+/// build time with an actionable message rather than silently degrading into a
+/// poison-redelivery loop at runtime.
+#[must_use]
+pub const fn native_dead_letter_supported(has_redrive_policy: Option<bool>) -> bool {
+    matches!(has_redrive_policy, Some(true))
 }
 
 /// Pick the stable broker coordinate for one SQS message.
 ///
-/// Prefers `MessageDeduplicationId` (FIFO queues), which the *producer*
-/// controls and which therefore survives a redelivery **and** a re-publish of
-/// the same logical event. Falls back to `MessageId`, which is stable across
-/// redeliveries of the same message but not across re-publishes — the honest
-/// limit of a standard queue.
+/// Prefers the broker-assigned `MessageId`, which is what a connector
+/// coordinate is *for*: it is stable across every redelivery of the same
+/// message and distinct for every distinct message.
+///
+/// A FIFO `MessageDeduplicationId` looks like a stronger identity — the
+/// *producer* controls it, so it survives a re-publish — but it is the wrong
+/// tool here, in both directions:
+///
+/// * **Inside** SQS's five-minute deduplication interval, SQS already collapses
+///   a re-publish carrying the same dedup id. The second publish never reaches
+///   a consumer, so preferring the dedup id buys nothing in the only window
+///   where it would.
+/// * **Outside** that interval, a legitimately reused dedup id (a nightly job
+///   keyed on a business id, say) produces a genuinely *new* message with a new
+///   `MessageId`. Coordinating on the dedup id would collapse it onto the
+///   earlier message's key, so the connector would ack it as an idempotent
+///   replay and silently drop a valid event.
+///
+/// The dedup id is therefore only a fallback, for the pathological case where
+/// the broker gave us no `MessageId` at all.
+///
+/// The honest limit this leaves: a coordinate identifies a *message*, not a
+/// logical event, so a genuine re-publish of the same event is dispatched
+/// again. Map a business key into the workflow id (see
+/// [`IdempotencyMode::WorkflowId`](super::IdempotencyMode::WorkflowId)) when
+/// event-level identity is what you need.
 #[must_use]
 pub fn coordinate_id(dedup_id: Option<&str>, message_id: Option<&str>) -> Option<String> {
-    dedup_id
+    message_id
         .filter(|s| !s.is_empty())
-        .or_else(|| message_id.filter(|s| !s.is_empty()))
+        .or_else(|| dedup_id.filter(|s| !s.is_empty()))
         .map(str::to_string)
 }
 
@@ -168,6 +299,8 @@ impl EventSource for SqsSource {
             .max_number_of_messages(batch)
             .wait_time_seconds(wait)
             // `MessageDeduplicationId` only arrives when explicitly requested.
+            // It is the last-resort coordinate fallback (see `coordinate_id`),
+            // so ask for it even though `MessageId` normally wins.
             .message_system_attribute_names(
                 aws_sdk_sqs::types::MessageSystemAttributeName::MessageDeduplicationId,
             )
@@ -244,11 +377,13 @@ impl EventSource for SqsSource {
     }
 
     fn has_native_dead_letter(&self) -> bool {
-        // `abandon` resets the visibility timeout, which makes SQS redeliver
-        // and increment `ApproximateReceiveCount` — so a queue with a redrive
-        // policy really does move the message to its DLQ once `maxReceiveCount`
-        // is reached. That is what `DeadLetterMode::BrokerNative` relies on.
-        true
+        // Redelivery drives `ApproximateReceiveCount` toward the queue's
+        // `maxReceiveCount`, at which point SQS moves the message to the
+        // redrive policy's target — that is what `DeadLetterMode::BrokerNative`
+        // relies on. *Without* a redrive policy there is no target, so the
+        // poison message is simply redelivered forever. Hence the answer is
+        // the queue's actual configuration, not an unconditional `true`.
+        native_dead_letter_supported(self.has_redrive_policy)
     }
 
     async fn abandon(&self, _handle: &MessageHandle) -> Result<(), ConnectorError> {
@@ -324,24 +459,120 @@ mod tests {
     }
 
     #[test]
-    fn dedup_id_is_preferred_over_message_id() {
-        // AC3: the producer-controlled dedup id survives a re-publish, so it
-        // is the stronger identity when the queue provides one.
+    fn message_id_is_the_redelivery_identity_not_the_dedup_id() {
+        // AC3: the connector coordinate identifies *this message*, so it must
+        // be the broker-assigned `MessageId` even when a FIFO dedup id is
+        // present. See `coordinate_id`'s doc comment for why preferring the
+        // dedup id silently drops valid events.
         assert_eq!(
             coordinate_id(Some("dedup-1"), Some("msg-1")),
+            Some("msg-1".to_string())
+        );
+        // Only when the broker gave us no message id at all does the
+        // producer's dedup id become the best available identity.
+        assert_eq!(
+            coordinate_id(Some("dedup-1"), None),
             Some("dedup-1".to_string())
         );
         assert_eq!(
             coordinate_id(None, Some("msg-1")),
             Some("msg-1".to_string())
         );
-        // An empty dedup id is not an identity.
+        // An empty string is not an identity on either side.
         assert_eq!(
-            coordinate_id(Some(""), Some("msg-1")),
-            Some("msg-1".to_string())
+            coordinate_id(Some("dedup-1"), Some("")),
+            Some("dedup-1".to_string())
         );
         assert_eq!(coordinate_id(None, None), None);
         assert_eq!(coordinate_id(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn a_reused_dedup_id_past_the_dedup_interval_yields_distinct_coordinates() {
+        // The bug this preference order exists to prevent: a FIFO producer
+        // legitimately reuses a `MessageDeduplicationId` after SQS's 5-minute
+        // deduplication interval. SQS accepts it as a *new* message with a new
+        // `MessageId`. Coordinating on the dedup id would collapse the two
+        // onto one key, so the second would be acked as an idempotent replay
+        // and its event silently dropped.
+        let first = coordinate_id(Some("nightly-rollup"), Some("msg-aaa"));
+        let second = coordinate_id(Some("nightly-rollup"), Some("msg-bbb"));
+        assert_ne!(
+            first, second,
+            "two distinct SQS messages must never share a connector coordinate"
+        );
+
+        // A genuine redelivery — same message, same `MessageId` — still
+        // collapses, which is the at-least-once guarantee doing its job.
+        assert_eq!(
+            coordinate_id(Some("nightly-rollup"), Some("msg-aaa")),
+            first
+        );
+    }
+
+    #[test]
+    fn a_redrive_policy_is_what_makes_native_dead_lettering_real() {
+        // SQS only moves a message to a DLQ when the queue has a redrive
+        // policy naming one. Anything else -- absent, empty, or malformed --
+        // means abandoning a poison message just redelivers it forever.
+        assert!(redrive_policy_is_configured(Some(
+            r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:1:orders-dlq","maxReceiveCount":"5"}"#
+        )));
+        assert!(!redrive_policy_is_configured(None));
+        assert!(!redrive_policy_is_configured(Some("")));
+        assert!(!redrive_policy_is_configured(Some("   ")));
+        // Well-formed JSON that names no destination is not a redrive policy.
+        assert!(!redrive_policy_is_configured(Some("{}")));
+        assert!(!redrive_policy_is_configured(Some(
+            r#"{"maxReceiveCount":"5"}"#
+        )));
+        // An empty destination is not a destination.
+        assert!(!redrive_policy_is_configured(Some(
+            r#"{"deadLetterTargetArn":""}"#
+        )));
+        // Unparseable attribute: fail closed rather than guess.
+        assert!(!redrive_policy_is_configured(Some("not json")));
+    }
+
+    #[test]
+    fn native_dead_lettering_fails_closed_until_a_redrive_policy_is_known() {
+        // The safety property: an unprobed source must NOT claim a native
+        // dead-letter destination, or `broker_native_dead_letter()` would be
+        // accepted at build time and poison messages would loop forever.
+        assert!(!native_dead_letter_supported(None));
+        assert!(!native_dead_letter_supported(Some(false)));
+        assert!(native_dead_letter_supported(Some(true)));
+    }
+
+    #[test]
+    fn an_explicit_redrive_declaration_survives_into_the_source() {
+        let client = || {
+            Client::from_conf(
+                aws_sdk_sqs::Config::builder()
+                    .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+                    .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_sqs::config::Credentials::for_tests())
+                    .build(),
+            )
+        };
+
+        // Undeclared and unprobed: fail closed.
+        let unknown = SqsSource::new(client(), SqsSourceConfig::new("https://h/1/q"));
+        assert!(!unknown.has_native_dead_letter());
+
+        // Declared: the embedder's own knowledge is honoured, so a
+        // bring-your-own-client source can still opt into broker-native DLQ.
+        let declared = SqsSource::new(
+            client(),
+            SqsSourceConfig::new("https://h/1/q").has_redrive_policy(true),
+        );
+        assert!(declared.has_native_dead_letter());
+
+        let declared_absent = SqsSource::new(
+            client(),
+            SqsSourceConfig::new("https://h/1/q").has_redrive_policy(false),
+        );
+        assert!(!declared_absent.has_native_dead_letter());
     }
 
     #[test]

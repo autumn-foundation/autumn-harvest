@@ -8,7 +8,7 @@
 //! construction* rather than trusting the producer to send a key.
 //!
 //! The key is derived from [stable broker coordinates] — `{topic}:{partition}:
-//! {offset}` for Kafka, `MessageDeduplicationId`/`MessageId` for SQS — and is
+//! {offset}` for Kafka, `MessageId` for SQS — and is
 //! **namespaced by the binding** exactly as the inbound webhook receiver
 //! namespaces `{path}:{signal_name}:{delivery_id}` (issue #344, PR #918
 //! review). Without that namespace, two bindings targeting the same
@@ -21,8 +21,8 @@
 //!
 //! # Injectivity
 //!
-//! Components are joined with `:`, but a topic, a queue name, or an SQS
-//! `MessageDeduplicationId` may itself contain `:`. A naive join is therefore
+//! Components are joined with `:`, but a topic, a queue name, or a broker's
+//! own message id may itself contain `:`. A naive join is therefore
 //! **not** injective: binding `a` + id `b:c` and binding `a:b` + id `c` both
 //! flatten to `conn:a:b:c` — two genuinely different messages colliding onto
 //! one dedupe key.
