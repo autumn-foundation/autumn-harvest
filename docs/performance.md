@@ -415,13 +415,24 @@ and compare against the per-gate table above, which runs below saturation
 precisely so it can resolve smaller differences.
 
 **The budget was derived on the reference machine, not on a CI runner.** CI
-hardware is slower and shared, so the first Linux CI runs are the real
-calibration. If the gate proves flaky there rather than catching anything, the
-fix is to re-derive the number from CI observations — not to widen it by
-guesswork and not to delete it; `HARVEST_CLAIM_BUDGET_MS` exists for the
-one-off, and the failure message always carries the full stat line.
+hardware is slower and shared, so the Linux CI runs are the real calibration.
+The first such run (2026-08-10, `ubuntu-latest`, Docker-backed Postgres 16)
+passed all seven gate tests in 108 s, with the headline scenario itself taking
+about 78 s of that — comfortably inside both the 1 500 ms p50 budget and the
+240 s per-scenario ceiling. So the budget derived here holds on CI hardware as
+published; it has not been widened for it. If a later run proves flaky rather
+than catching anything, the fix is to re-derive the number from CI observations
+— not to widen it by guesswork and not to delete it; `HARVEST_CLAIM_BUDGET_MS`
+exists for the one-off, and the failure message always carries the full stat
+line.
 
-The gate also asserts four soundness properties, each of which fails loudly
+Note that the measured stat line is only *printed* when the gate fails: the
+manifest runner does not pass `--nocapture`, and Rust's test harness shows
+captured output for failing tests only. That is the right default for a gate —
+silence means "within budget" — but it does mean CI logs carry no trend data
+between failures. Run the benchmark for that.
+
+The gate also asserts five soundness properties, each of which fails loudly
 rather than reporting a meaningless percentile:
 
 * **at least 100 samples were collected** — a severe regression could otherwise
@@ -429,6 +440,10 @@ rather than reporting a meaningless percentile:
 * **the run was not truncated** by the wall-clock ceiling — a partial run's
   percentiles describe a shorter, differently-warmed window than the published
   ones, so the gate defends a complete scenario or says so;
+* **the scenario finished inside its wall-clock ceiling** (+30 s slack for task
+  join). The truncation flag above is only set where the harness *checks* the
+  deadline, so it cannot catch an `await` that never returns to a check; this
+  assertion measures the clock directly and so does;
 * **at least 90% of measured operations actually claimed a task.** Note what this
   does and does not prove: it rules out "the harness measured an empty queue",
   which is the failure mode that would silently make the gate pass. It does not
