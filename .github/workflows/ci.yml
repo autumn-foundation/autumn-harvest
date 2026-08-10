@@ -149,6 +149,15 @@ jobs:
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --tests --no-run
+      # Issue #786: the claim/enqueue benchmark shares its harness with the
+      # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
+      # the manifest below). Compile-checking it here keeps the published
+      # `docs/performance.md` report from bit-rotting; `cargo bench` itself is
+      # deliberately NOT run per-PR, since the measurement is minutes-long and
+      # the *gate* is the test, not the report.
+      - name: Compile claim/enqueue benchmark (issue #786)
+        if: needs.changes.outputs.code == 'true'
+        run: cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
       - name: Run all-features lib tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --all-features --lib

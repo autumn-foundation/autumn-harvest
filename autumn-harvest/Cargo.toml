@@ -210,5 +210,16 @@ name = "replay_verifier_bench"
 required-features = ["testing"]
 harness = false
 
+# Task-claim / enqueue throughput benchmark (issue #786). `harness = false` +
+# its own `main()`: `claim_task` is destructive (PENDING -> RUNNING), so
+# criterion's repeat-the-closure model would drain the seeded backlog and time
+# an empty queue. Requires `db`; skips cleanly (exit 0) when neither Docker nor
+# HARVEST_TEST_DATABASE_URL is available, so Windows / `--no-default-features`
+# builds are unaffected.
+[[bench]]
+name = "claim_bench"
+required-features = ["db"]
+harness = false
+
 [lints]
 workspace = true

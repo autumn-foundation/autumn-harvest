@@ -29,6 +29,9 @@ mod child_policy_tests;
 mod child_timeout_tests;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
+mod claim_bench_support;
+#[cfg(feature = "db")]
+mod claim_budget_tests;
 mod completion_callback_tests;
 mod concurrency_key_tests;
 mod context_headers_tests;
